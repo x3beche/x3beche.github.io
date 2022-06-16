@@ -7,7 +7,7 @@ categories: [Non-Linear Data Structures, Big Data, Artificial Intelligence]
 
 Since almost everything is data for companies or industries, naturally, this data must be stored in some way to be processed. At this stage, linear and non-linear data structures are used to store the data. In today's world, all companies are slowly moving to non-linear data structures. We can explain the reasons for choosing non-linear under 3 substances. These are the demands of today's technology, speed and running costs.
 
-![alt](https://raw.githubusercontent.com/emirhanpehlevan/emirhanpehlevan.github.io/main/assets/structures.png)
+![alt](https://raw.githubusercontent.com/x3beche/x3beche.github.io/main/assets/structures.png)
 
 Non-linear data structures are created to maximize optimization compared to other data structures. Although non-linear data structures are a bit more difficult to add raw data to data structures than others, however, the time spent to find the data you are looking for in the data pool after writing the data is so short that it cannot be compared with linear and other data structures. For example, social media platforms that have many users, make the data matching while users log in to their accounts with using non-linear data structures.
 

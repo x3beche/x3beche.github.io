@@ -11,7 +11,7 @@ In the design side, trees are designed to reading a data from top to bottom. Whi
 
 In their formations, there is no feature in the trees. However, In the graphs loops can be created within the database. This makes graphs programmable.
 
-![alt](https://raw.githubusercontent.com/emirhanpehlevan/emirhanpehlevan.github.io/main/assets/graph-vs-tree.png)
+![alt](https://raw.githubusercontent.com/x3beche/x3beche.github.io/main/assets/graph-vs-tree.png)
 
 For node requirement, trees must have a root node because of their structure, to reach other nodes, the first node is taken as a starting point and the nodes are skipped one by one to reach data. If the starting point is not taken, the location of the data to be reached on the tree cannot be calculated. In the Graph data type, there is no starting point, it can be started from any point, this feature comes from the fact that graph is basically network struct.
 
