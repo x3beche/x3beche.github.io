@@ -8,14 +8,16 @@ minute: 10
 ---
 
 ##### Science :
-1 - 📑 [Sciencing](https://sciencing.com/){:target="_blank"}<br>
 ---
+1 - 📑 [Sciencing](https://sciencing.com/){:target="_blank"}<br>
 ##### Inspiration :
 ---
 1 - 📽️ [Hyundai (Boston Dynamics) @ CES 2022- MobED](https://www.youtube.com/watch?v=uQqXbXpmkc0){:target="_blank"}
 ##### Programming Languages :
 ---
 1 - 📑 [Tutorialspoint All Languages](https://www.tutorialspoint.com/codingground.htm){:target="_blank"}
+2 - 📑 [Python Cheatsheet](https://www.pythoncheatsheet.org/){:target="_blank"}
+3 - 📑 [Cyanhall Cheatsheet](https://www.cyanhall.com/cheatsheet/){:target="_blank"}
 ##### Embedded Programming :
 ---
 1 - 📑 [STM32 - Guide](https://www.codeinsideout.com/blog/stm32/){:target="_blank"}<br>
@@ -29,3 +31,5 @@ minute: 10
 2 - 📑 [Tech Terms](https://techterms.com/){:target="_blank"}<br>
 3 - ⚙️ [Rapid API](https://rapidapi.com/hub){:target="_blank"}<br>
 4 - 📑 [Cheatography](https://cheatography.com/){:target="_blank"}<br>
+
+
