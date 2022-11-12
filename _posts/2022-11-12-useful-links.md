@@ -10,6 +10,7 @@ minute: 10
 ##### Science :
 ---
 1 - 📑 [Sciencing](https://sciencing.com/){:target="_blank"}<br>
+2 - 📑 [TAMU Science Questions](https://www.wtamu.edu/~cbaird/sq/){:target="_blank"}<br>
 
 ##### Inspiration :
 ---
