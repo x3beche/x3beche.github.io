@@ -11,6 +11,7 @@ minute: 10
 ---
 1 - 📑 [Sciencing](https://sciencing.com/){:target="_blank"}<br>
 2 - 📑 [TAMU Science Questions](https://www.wtamu.edu/~cbaird/sq/){:target="_blank"}<br>
+2 - 📑 [Missouri University of Science and Technology EEE](https://web.mst.edu/~kosbar/ee3430/ff/toc.html){:target="_blank"}<br>
 
 ##### Inspiration :
 ---
