@@ -1,6 +1,6 @@
 ---
 layout: post
-title: Useful Links & Projects
+title: Link Archive
 description: some good links *-*
 summary: some good links *-*
 tags:
