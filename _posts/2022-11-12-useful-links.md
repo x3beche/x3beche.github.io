@@ -14,6 +14,7 @@ minute: 10
 ##### Inspiration :
 ---
 1 - 📽️ [Hyundai (Boston Dynamics) @ CES 2022- MobED](https://www.youtube.com/watch?v=uQqXbXpmkc0){:target="_blank"}<br>
+2 - 📽️ [Visualizing 144 TeraByte of CFD](https://www.youtube.com/watch?v=q4rNIbqvyQI){:target="_blank"}<br>
 
 ##### Programming Languages :
 ---
@@ -28,7 +29,7 @@ minute: 10
 ##### Image Processing :
 ---
 1 - 📑 [Image Processing - University of Edinburgh)](https://homepages.inf.ed.ac.uk/rbf/HIPR2/hipr_top.htm){:target="_blank"}<br>
-3 - 📑 [MachineVision - South Florida](https://www.cse.usf.edu/~r1k/MachineVisionBook/MachineVision.files/MachineVision_Chapter1.pdf){:target="_blank"}<br>
+2 - 📑 [MachineVision - South Florida](https://www.cse.usf.edu/~r1k/MachineVisionBook/MachineVision.files/MachineVision_Chapter1.pdf){:target="_blank"}<br>
 
 ##### Others :
 ---
