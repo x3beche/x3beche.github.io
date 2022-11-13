@@ -21,7 +21,6 @@ minute: 10
 4 - 📽️ [Athletic Power of Quadcopters by Raffaello D'Andrea)](https://www.youtube.com/watch?v=w2itwFJCgFQ){:target="_blank"}<br>
 5 - 📽️ [Giving bug-like, flying robots a boost)](https://www.youtube.com/watch?v=j_YD01uuGtE){:target="_blank"}<br>
 
-Giving bug-like, flying robots a boost
 ##### Programming Languages :
 ---
 1 - 📑 [Tutorialspoint All Languages](https://www.tutorialspoint.com/codingground.htm){:target="_blank"}<br>
