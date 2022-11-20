@@ -29,7 +29,7 @@ minute: 10
 
 ##### Robotic :
 ---
-1 - 🤖 [The Robotic Operating System at a Glance)](http://barraq.github.io/fOSSa2012/slides){:target="_blank"}<br>
+1 - 🤖 [The Robotic Operating System at a Glance](http://barraq.github.io/fOSSa2012/slides){:target="_blank"}<br>
 2 - 🤖 [SLAM & ROS & GAZEBO)](https://marian42.de/article/arpg/){:target="_blank"}<br>
 
 ##### Image Processing :
