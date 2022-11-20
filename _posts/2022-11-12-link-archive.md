@@ -36,9 +36,13 @@ minute: 10
 1 - 📑 [Image Processing - University of Edinburgh)](https://homepages.inf.ed.ac.uk/rbf/HIPR2/hipr_top.htm){:target="_blank"}<br>
 2 - 📑 [MachineVision - South Florida](https://www.cse.usf.edu/~r1k/MachineVisionBook/MachineVision.files/MachineVision_Chapter1.pdf){:target="_blank"}<br>
 
+##### Robotic :
+---
+1 - 🤖 [The Robotic Operating System at a Glance)](http://barraq.github.io/fOSSa2012/slides){:target="_blank"}<br>
+2 - 🤖 [SLAM & ROS & GAZEBO)](https://marian42.de/article/arpg/){:target="_blank"}<br>
+ 
 ##### Others :
 ---
-1 - 🤖 [SLAM & ROS & GAZEBO](https://marian42.de/article/arpg/){:target="_blank"}<br>
 2 - 📑 [Tech Terms](https://techterms.com/){:target="_blank"}<br>
 3 - ⚙️ [Rapid API](https://rapidapi.com/hub){:target="_blank"}<br>
 4 - 📑 [Cheatography](https://cheatography.com/){:target="_blank"}<br>
