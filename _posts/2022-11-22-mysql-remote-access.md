@@ -44,3 +44,6 @@ Config file is (now)
     /etc/mysql/mysql.conf.d/mysqld.cnf 
 
 (at least on standard Ubuntu 16)
+
+
+source : https://stackoverflow.com/questions/11223235/mysql-root-access-from-all-hosts
