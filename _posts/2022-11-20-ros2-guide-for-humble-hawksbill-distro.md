@@ -52,11 +52,3 @@ touch my_first_node.py
 sudo chmod +x my_first_node.py
 ```
 
-# git settings
-```
-git config user.name "x3beche"
-git config user.email "x3beche@gmail.com"
-git remote remove origin
-git remote add origin https://<TOKEN>@github.com/<USERNAME>/<REPO>.git
-git push --set-upstream origin main
-```
