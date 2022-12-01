@@ -18,8 +18,8 @@ minute: 10
 1 - 📽️ [Hyundai (Boston Dynamics) @ CES 2022- MobED](https://www.youtube.com/watch?v=uQqXbXpmkc0){:target="_blank"}<br>
 2 - 📽️ [Visualizing 144 TeraByte of CFD](https://www.youtube.com/watch?v=q4rNIbqvyQI){:target="_blank"}<br>
 3 - 📽️ [Lockheed Martin's Multiple Kill Vehicle (MKV-L)](https://www.youtube.com/watch?v=KBMU6l6GsdM){:target="_blank"}<br>
-4 - 📽️ [Athletic Power of Quadcopters by Raffaello D'Andrea)](https://www.youtube.com/watch?v=w2itwFJCgFQ){:target="_blank"}<br>
-5 - 📽️ [Giving bug-like, flying robots a boost)](https://www.youtube.com/watch?v=j_YD01uuGtE){:target="_blank"}<br>
+4 - 📽️ [Athletic Power of Quadcopters by Raffaello D'Andrea](https://www.youtube.com/watch?v=w2itwFJCgFQ){:target="_blank"}<br>
+5 - 📽️ [Giving bug-like, flying robots a boost](https://www.youtube.com/watch?v=j_YD01uuGtE){:target="_blank"}<br>
 
 ##### Programming Languages :
 ---
