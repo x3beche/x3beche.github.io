@@ -1,6 +1,6 @@
 ---
 layout: post
-title: ROS2
+title: ROS2 Guide For Humble Hawksbill
 description: ROS2 Guide For Humble Hawksbill Distro on Ubuntu 22.04
 summary: ROS2 Guide For Humble Hawksbill Distro on Ubuntu 22.04
 tags: ros2 robotics guide
@@ -51,4 +51,3 @@ cd src/my_robot_controller/my_robot_controller/
 touch my_first_node.py
 sudo chmod +x my_first_node.py
 ```
-
