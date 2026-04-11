@@ -1,0 +1,831 @@
+---
+layout: tutorial
+title: "LLM Inference & Quantization — Modeli Küçült, Hızlandır, Yayınla"
+back_url: "../index.html"
+back_label: "Tüm rehberler"
+---
+
+<header class="header">
+  <div class="meta"><span>Rehber</span><span>Yapay Zeka</span><span>04 · Inference</span></div>
+  <h1>LLM Inference<br><em>&amp; Quantization.</em></h1>
+  <p class="subtitle">Modeli küçült, hızlandır, yayınla. GGUF/GGML format, llama.cpp ile CPU inference, Ollama ile lokal sunucu. AWQ ve GPTQ farkları, KV cache ve Flash Attention optimizasyonları.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçerik</div>
+  <ol>
+    <li><a href="#s0">Çıkarım Zorluğu</a></li>
+    <li><a href="#s1">Quantization Temelleri</a></li>
+    <li><a href="#s2">GPTQ — Gradient Tabanlı PTQ</a></li>
+    <li><a href="#s3">AWQ — Activation-Aware Quantization</a></li>
+    <li><a href="#s4">GGUF/GGML Format</a></li>
+    <li><a href="#s5">llama.cpp ile CPU Inference</a></li>
+    <li><a href="#s6">Ollama — Lokal Model Sunucusu</a></li>
+    <li><a href="#s7">KV Cache ve Flash Attention</a></li>
+    <li><a href="#s8">vLLM ile Production Serving</a></li>
+  </ol>
+</nav>
+
+<main>
+
+  <!-- ── S0: Çıkarım Zorluğu ─────────────────────────────────── -->
+  <section id="s0">
+    <h2><span class="num">00</span> Çıkarım Zorluğu</h2>
+    <p class="section-lead">LLM inference neden bu kadar pahalı ve quantization neden kaçınılmaz bir çözüm haline geldi.</p>
+
+    <p>
+      Bir <em>large language model</em> çalıştırmak, her token üretimi için modelin tüm ağırlık matrislerinin bellekte hazır bulunmasını gerektirir. Üstelik bu ağırlıklar her forward pass'te sıfırdan yeniden okunur — hesaplama yapmadan önce RAM/VRAM'den çekilmesi gereken devasa bir veri yüküdür bu.
+    </p>
+    <p>
+      7 milyar parametreli bir model varsayalım. Her parametre <code class="inline">float32</code> (32 bit = 4 byte) ile saklanıyorsa:
+    </p>
+    <div class="flow">
+      <pre><span class="step-num">01</span> 7,000,000,000 parametre × 4 byte = <span class="accent">28 GB VRAM</span>
+<span class="step-num">02</span> float16 (2 byte) → 14 GB VRAM
+<span class="step-num">03</span> int8 (1 byte)   →  7 GB VRAM
+<span class="step-num">04</span> int4 (0.5 byte) →  3.5 GB VRAM</pre>
+    </div>
+    <p>
+      Tüketici GPU'larının büyük çoğunluğu 8–24 GB arası VRAM'e sahipken, 70B modeller float32'de 280 GB gerektirir. Quantization bu uçurumu kapatmanın temel yöntemidir.
+    </p>
+
+    <h3>Throughput ve Latency</h3>
+    <p>
+      Inference performansını değerlendirirken iki metrik kritiktir. <em>Throughput</em>, saniyede üretilen token sayısıdır (tok/s) ve toplu iş yüklerinde önemlidir. <em>Latency</em> (veya time-to-first-token, TTFT), kullanıcının ilk token'ı ne kadar sürede aldığıdır — etkileşimli uygulamalarda baskın metriktir.
+    </p>
+
+    <table class="file-table">
+      <thead>
+        <tr>
+          <th>Model</th>
+          <th>Parametre</th>
+          <th>FP32 VRAM</th>
+          <th>FP16 VRAM</th>
+          <th>INT4 VRAM</th>
+          <th>Tipik Donanım</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>Llama-3.1 8B</td><td>8B</td><td>32 GB</td><td>16 GB</td><td>4.5 GB</td><td>RTX 3060 (12 GB)</td></tr>
+        <tr><td>Llama-3.1 70B</td><td>70B</td><td>280 GB</td><td>140 GB</td><td>40 GB</td><td>2× A100 80GB</td></tr>
+        <tr><td>Mistral 7B</td><td>7B</td><td>28 GB</td><td>14 GB</td><td>4 GB</td><td>RTX 3070 (8 GB)</td></tr>
+        <tr><td>Mixtral 8×7B</td><td>47B aktif: 13B</td><td>94 GB</td><td>47 GB</td><td>26 GB</td><td>2× RTX 3090</td></tr>
+        <tr><td>Phi-3 Mini</td><td>3.8B</td><td>15 GB</td><td>7.6 GB</td><td>2.2 GB</td><td>Laptop GPU</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout">
+      <div class="label">NOT</div>
+      <p>VRAM hesaplarına ek olarak KV cache bellek maliyetini de eklemeniz gerekir. Uzun context window'larda (32k, 128k token) KV cache, model ağırlıklarından daha fazla yer kaplayabilir.</p>
+    </div>
+  </section>
+
+  <!-- ── S1: Quantization Temelleri ─────────────────────────── -->
+  <section id="s1">
+    <h2><span class="num">01</span> Quantization Temelleri</h2>
+    <p class="section-lead">Ağırlıkları daha az bit ile temsil etmenin matematiksel temeli ve her düzeyin kalite-boyut değiş tokuşu.</p>
+
+    <p>
+      <em>Quantization</em>, bir sürekli değer aralığını daha az bit ile temsil etme işlemidir. Sinir ağlarında ağırlıklar ve/veya aktivasyonlar bu şekilde sıkıştırılır.
+    </p>
+
+    <h3>Bit Genişliği Hiyerarşisi</h3>
+    <div class="flow">
+      <pre><span class="step-num">FP32</span> 32 bit — IEEE 754 tam kayan nokta, eğitim standardı
+<span class="step-num">FP16</span> 16 bit — yarı hassasiyet, GPU'larda hızlı, mixed precision
+<span class="step-num">BF16</span> 16 bit — Brain Float, FP32 ile aynı üs aralığı, TPU/A100
+<span class="step-num">INT8</span>  8 bit — tam sayı, ~2× sıkıştırma, hafif kalite kaybı
+<span class="step-num">INT4</span>  4 bit — ~4× sıkıştırma, dikkatli seçim gerektirir
+<span class="step-num">INT2</span>  2 bit — deneysel, kalite ciddi biçimde düşer</pre>
+    </div>
+
+    <h3>Symmetric ve Asymmetric Quantization</h3>
+    <p>
+      <em>Symmetric quantization</em>'da sıfır noktası (zero-point) 0'a sabitlenir ve değer aralığı [-max, +max] şeklinde simetrik tutulur. Hesaplama daha basittir. <em>Asymmetric quantization</em>'da ise zero-point serbest bir değer alır; bu durum sıfır merkezli olmayan dağılımlar (örn. ReLU çıktıları) için daha az hata üretir.
+    </p>
+    <p>
+      Her iki durumda da iki parametre kullanılır:
+    </p>
+    <div class="params">
+      <div class="param"><span class="name">scale (s)</span><span class="desc">Gerçek değer ile tam sayı temsili arasındaki ölçek faktörü: <code class="inline">x_real = s × x_int</code></span></div>
+      <div class="param"><span class="name">zero_point (z)</span><span class="desc">Sıfırı karşılayan tam sayı değeri; asymmetric'te sıfır değildir</span></div>
+    </div>
+
+    <div class="code-block">
+      <div class="code-header"><span>quantization_math.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> numpy <span class="keyword">as</span> np
+
+<span class="keyword">def</span> <span class="cmd">quantize_asymmetric</span>(x: np.ndarray, n_bits: <span class="cmd">int</span> = <span class="str">8</span>):
+    <span class="str">"""Asimetrik quantization: scale + zero_point hesapla."""</span>
+    x_min, x_max = x.<span class="cmd">min</span>(), x.<span class="cmd">max</span>()
+    q_min, q_max = <span class="str">0</span>, <span class="str">2</span>**n_bits - <span class="str">1</span>      <span class="cmt"># int8: 0..255</span>
+
+    scale = (x_max - x_min) / (q_max - q_min)
+    zero_point = <span class="cmd">round</span>(q_min - x_min / scale)
+    zero_point = <span class="cmd">int</span>(<span class="cmd">np.clip</span>(zero_point, q_min, q_max))
+
+    x_q = <span class="cmd">np.clip</span>(<span class="cmd">np.round</span>(x / scale + zero_point), q_min, q_max).<span class="cmd">astype</span>(np.uint8)
+    <span class="keyword">return</span> x_q, scale, zero_point
+
+<span class="keyword">def</span> <span class="cmd">dequantize</span>(x_q: np.ndarray, scale: <span class="cmd">float</span>, zero_point: <span class="cmd">int</span>):
+    <span class="str">"""Quantize edilmiş değeri geri float'a çevir."""</span>
+    <span class="keyword">return</span> scale * (x_q.<span class="cmd">astype</span>(np.float32) - zero_point)
+
+<span class="cmt"># Örnek kullanım</span>
+weights = np.<span class="cmd">random.randn</span>(<span class="str">1000</span>).<span class="cmd">astype</span>(np.float32)
+w_q, s, z = <span class="cmd">quantize_asymmetric</span>(weights)
+w_reconstructed = <span class="cmd">dequantize</span>(w_q, s, z)
+
+error = np.<span class="cmd">abs</span>(weights - w_reconstructed).<span class="cmd">mean</span>()
+<span class="cmd">print</span>(<span class="str">f"Ortalama mutlak hata: {error:.6f}"</span>)  <span class="cmt"># ~0.001</span>
+</code></pre>
+    </div>
+
+    <h3>PTQ ve QAT</h3>
+    <p>
+      <em>Post-Training Quantization (PTQ)</em>, eğitilmiş modeli tekrar eğitmeden quantize eder — hızlı ve pratiktir ancak kalite kaybı daha yüksek olabilir. <em>Quantization-Aware Training (QAT)</em>, eğitim sırasında simüle edilmiş quantization uygular; model bu gürültüye adapte olur ve sonuç kalitesi çok daha yüksektir, ancak eğitim maliyeti artar.
+    </p>
+
+    <table class="file-table">
+      <thead>
+        <tr><th>Yöntem</th><th>Bit</th><th>Perplexity Artışı</th><th>VRAM Tasarrufu</th><th>Hız</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>FP32 (baseline)</td><td>32</td><td>—</td><td>—</td><td>1×</td></tr>
+        <tr><td>FP16</td><td>16</td><td>~0%</td><td>50%</td><td>1.5–2×</td></tr>
+        <tr><td>INT8 (PTQ)</td><td>8</td><td>&lt;1%</td><td>75%</td><td>2–3×</td></tr>
+        <tr><td>INT4 GPTQ</td><td>4</td><td>2–5%</td><td>87.5%</td><td>3–4×</td></tr>
+        <tr><td>INT4 AWQ</td><td>4</td><td>1–3%</td><td>87.5%</td><td>3–4×</td></tr>
+        <tr><td>INT2</td><td>2</td><td>&gt;20%</td><td>93.75%</td><td>5×</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ── S2: GPTQ ────────────────────────────────────────────── -->
+  <section id="s2">
+    <h2><span class="num">02</span> GPTQ — Gradient Tabanlı PTQ</h2>
+    <p class="section-lead">Hessian matrisini kullanarak katman katman hassas quantization yapan GPTQ yöntemi ve AutoGPTQ kütüphanesi.</p>
+
+    <p>
+      <em>GPTQ</em> (Generative Pre-trained Transformer Quantization), 2022'de Frantar ve ark. tarafından önerilmiştir. Temel fikir şudur: bir katmanın ağırlıklarını quantize ederken, kalan ağırlıkları bu hatayı telafi edecek şekilde güncelle. Bu güncelleme için <em>Hessian matrisi</em> (ikinci türev bilgisi) kullanılır.
+    </p>
+
+    <h3>Algoritma Özeti</h3>
+    <div class="flow">
+      <pre><span class="step-num">01</span> Kalibrasyon verisi ile her katmanın Hessian'ını hesapla
+<span class="step-num">02</span> Bir lineer katmanı al: W ∈ R^{d_out × d_in}
+<span class="step-num">03</span> Sütunları soldan sağa quantize et (OBQ algoritması)
+<span class="step-num">04</span> Her sütun quantize edildikten sonra <span class="accent">Cholesky güncelleme</span>
+<span class="step-num">05</span> Kalan sütunlar hatayı absorbe edecek şekilde güncellenir
+<span class="step-num">06</span> group_size=128: 128 ağırlık için ortak scale</pre>
+    </div>
+
+    <h3>Group Quantization</h3>
+    <p>
+      Tüm katman için tek bir scale faktörü kullanmak yerine, <code class="inline">group_size</code> parametresi ile her 128 ağırlık grubu kendi scale'ine sahip olur. Bu, kaliteyi önemli ölçüde artırır (daha küçük grup = daha iyi kalite, ama daha fazla overhead).
+    </p>
+
+    <div class="code-block">
+      <div class="code-header"><span>gptq_inference.py</span><span class="dot">●</span></div>
+      <pre><code><span class="cmt"># pip install auto-gptq transformers accelerate</span>
+<span class="keyword">from</span> auto_gptq <span class="keyword">import</span> AutoGPTQForCausalLM
+<span class="keyword">from</span> transformers <span class="keyword">import</span> AutoTokenizer
+
+model_name = <span class="str">"TheBloke/Llama-2-7B-GPTQ"</span>
+
+tokenizer = AutoTokenizer.<span class="cmd">from_pretrained</span>(model_name)
+model = AutoGPTQForCausalLM.<span class="cmd">from_quantized</span>(
+    model_name,
+    <span class="field">use_safetensors</span>=<span class="keyword">True</span>,
+    <span class="field">device</span>=<span class="str">"cuda:0"</span>,
+    <span class="field">inject_fused_attention</span>=<span class="keyword">False</span>,
+    <span class="field">bits</span>=<span class="str">4</span>,
+    <span class="field">group_size</span>=<span class="str">128</span>,
+)
+
+prompt = <span class="str">"Yapay zeka nedir?"</span>
+inputs = tokenizer(prompt, <span class="field">return_tensors</span>=<span class="str">"pt"</span>).<span class="cmd">to</span>(<span class="str">"cuda:0"</span>)
+
+output = model.<span class="cmd">generate</span>(
+    **inputs,
+    <span class="field">max_new_tokens</span>=<span class="str">200</span>,
+    <span class="field">temperature</span>=<span class="str">0.7</span>,
+    <span class="field">do_sample</span>=<span class="keyword">True</span>,
+)
+<span class="cmd">print</span>(tokenizer.<span class="cmd">decode</span>(output[<span class="str">0</span>], <span class="field">skip_special_tokens</span>=<span class="keyword">True</span>))
+</code></pre>
+    </div>
+
+    <h3>GPTQ ile Kendi Modelini Quantize Etmek</h3>
+    <div class="code-block">
+      <div class="code-header"><span>gptq_quantize.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">from</span> auto_gptq <span class="keyword">import</span> AutoGPTQForCausalLM, BaseQuantizeConfig
+<span class="keyword">from</span> transformers <span class="keyword">import</span> AutoTokenizer
+<span class="keyword">import</span> torch
+
+pretrained_model_name = <span class="str">"meta-llama/Llama-3.1-8B"</span>
+quantized_model_dir = <span class="str">"./llama-3.1-8b-gptq-4bit"</span>
+
+<span class="cmt"># Quantization konfigürasyonu</span>
+quantize_config = <span class="cmd">BaseQuantizeConfig</span>(
+    <span class="field">bits</span>=<span class="str">4</span>,           <span class="cmt"># 4-bit quantization</span>
+    <span class="field">group_size</span>=<span class="str">128</span>,   <span class="cmt"># 128 ağırlık başına bir scale</span>
+    <span class="field">desc_act</span>=<span class="keyword">False</span>,   <span class="cmt"># activation ordering (kaliteyi artırır ama yavaşlatır)</span>
+)
+
+tokenizer = AutoTokenizer.<span class="cmd">from_pretrained</span>(pretrained_model_name)
+model = AutoGPTQForCausalLM.<span class="cmd">from_pretrained</span>(
+    pretrained_model_name, quantize_config
+)
+
+<span class="cmt"># Kalibrasyon verisi — model kalibrasyon için bu örneklere bakacak</span>
+examples = [
+    tokenizer(<span class="str">"Transformer mimarisi attention mekanizmasını kullanır."</span>,
+              <span class="field">return_tensors</span>=<span class="str">"pt"</span>),
+    tokenizer(<span class="str">"Python programlama dili veri biliminde yaygın kullanılır."</span>,
+              <span class="field">return_tensors</span>=<span class="str">"pt"</span>),
+    <span class="cmt"># ... daha fazla örnek ekleyin (~128 öneri)</span>
+]
+
+model.<span class="cmd">quantize</span>(examples)
+model.<span class="cmd">save_quantized</span>(quantized_model_dir, <span class="field">use_safetensors</span>=<span class="keyword">True</span>)
+tokenizer.<span class="cmd">save_pretrained</span>(quantized_model_dir)
+<span class="cmd">print</span>(<span class="str">f"Model kaydedildi: {quantized_model_dir}"</span>)
+</code></pre>
+    </div>
+    <div class="callout">
+      <div class="label">NOT</div>
+      <p>Kalibrasyon verisi kalitesi GPTQ sonuçlarını doğrudan etkiler. Modelin kullanılacağı domain'den örnekler seçin; genel web metni yerine görev-spesifik veri daha iyi sonuç verir.</p>
+    </div>
+  </section>
+
+  <!-- ── S3: AWQ ─────────────────────────────────────────────── -->
+  <section id="s3">
+    <h2><span class="num">03</span> AWQ — Activation-Aware Quantization</h2>
+    <p class="section-lead">Aktivasyon istatistiklerini kullanarak önemli ağırlıkları koruyan AWQ, genellikle GPTQ'ya göre daha iyi kalite sunar.</p>
+
+    <p>
+      <em>AWQ</em> (Activation-Aware Weight Quantization), 2023'te Lin ve ark. tarafından önerilmiştir. Gözlem şudur: tüm ağırlıklar eşit önemde değildir. Bazı ağırlık kanallarına karşılık gelen aktivasyonlar çok büyük değerler alır — bu ağırlıkları 4 bit'e düşürmek orantısız hata üretir.
+    </p>
+    <p>
+      AWQ bu kritik kanalları tespit edip, onlara özgün ölçekleme faktörleri uygular. Bu sayede hassas kanallar korunurken diğerleri agresif quantization'a tabi tutulur.
+    </p>
+
+    <h3>GPTQ ile Karşılaştırma</h3>
+    <table class="file-table">
+      <thead>
+        <tr><th>Özellik</th><th>GPTQ</th><th>AWQ</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Kalibrasyon</td><td>Hessian (yavaş)</td><td>Aktivasyon istatistikleri (hızlı)</td></tr>
+        <tr><td>Kalite (INT4)</td><td>İyi</td><td>Genellikle daha iyi</td></tr>
+        <tr><td>Quantization hızı</td><td>Yavaş (saatler)</td><td>Hızlı (dakikalar)</td></tr>
+        <tr><td>Hardware support</td><td>CUDA, CPU</td><td>CUDA, Metal, CPU</td></tr>
+        <tr><td>Popüler HF modeller</td><td>TheBloke/*-GPTQ</td><td>TheBloke/*-AWQ</td></tr>
+        <tr><td>group_size</td><td>Ayarlanabilir</td><td>Varsayılan 128</td></tr>
+      </tbody>
+    </table>
+
+    <div class="code-block">
+      <div class="code-header"><span>awq_inference.py</span><span class="dot">●</span></div>
+      <pre><code><span class="cmt"># pip install autoawq transformers</span>
+<span class="keyword">from</span> awq <span class="keyword">import</span> AutoAWQForCausalLM
+<span class="keyword">from</span> transformers <span class="keyword">import</span> AutoTokenizer
+
+model_name = <span class="str">"TheBloke/Llama-2-7B-AWQ"</span>
+
+tokenizer = AutoTokenizer.<span class="cmd">from_pretrained</span>(
+    model_name, <span class="field">trust_remote_code</span>=<span class="keyword">True</span>
+)
+model = AutoAWQForCausalLM.<span class="cmd">from_quantized</span>(
+    model_name,
+    <span class="field">fuse_layers</span>=<span class="keyword">True</span>,      <span class="cmt"># kernel fusion → daha hızlı inference</span>
+    <span class="field">trust_remote_code</span>=<span class="keyword">True</span>,
+    <span class="field">safetensors</span>=<span class="keyword">True</span>,
+)
+
+<span class="cmt"># Basit metin üretimi</span>
+prompt = <span class="str">"[INST] Makine öğrenmesini kısaca açıkla. [/INST]"</span>
+inputs = tokenizer(prompt, <span class="field">return_tensors</span>=<span class="str">"pt"</span>).<span class="cmd">to</span>(<span class="str">"cuda"</span>)
+
+<span class="keyword">with</span> torch.<span class="cmd">no_grad</span>():
+    outputs = model.<span class="cmd">generate</span>(
+        **inputs,
+        <span class="field">max_new_tokens</span>=<span class="str">256</span>,
+        <span class="field">do_sample</span>=<span class="keyword">True</span>,
+        <span class="field">temperature</span>=<span class="str">0.8</span>,
+        <span class="field">top_p</span>=<span class="str">0.95</span>,
+    )
+
+response = tokenizer.<span class="cmd">decode</span>(
+    outputs[<span class="str">0</span>][inputs[<span class="str">"input_ids"</span>].<span class="cmd">shape</span>[<span class="str">1</span>]:],
+    <span class="field">skip_special_tokens</span>=<span class="keyword">True</span>
+)
+<span class="cmd">print</span>(response)
+</code></pre>
+    </div>
+
+    <h3>Kendi Modelini AWQ ile Quantize Etmek</h3>
+    <div class="code-block">
+      <div class="code-header"><span>awq_quantize.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">from</span> awq <span class="keyword">import</span> AutoAWQForCausalLM
+<span class="keyword">from</span> transformers <span class="keyword">import</span> AutoTokenizer
+
+model_path = <span class="str">"meta-llama/Llama-3.1-8B-Instruct"</span>
+quant_path = <span class="str">"./llama-3.1-8b-awq"</span>
+
+quant_config = {
+    <span class="str">"zero_point"</span>: <span class="keyword">True</span>,   <span class="cmt"># asymmetric quantization</span>
+    <span class="str">"q_group_size"</span>: <span class="str">128</span>,
+    <span class="str">"w_bit"</span>: <span class="str">4</span>,
+    <span class="str">"version"</span>: <span class="str">"GEMM"</span>,     <span class="cmt"># GEMM veya GEMV (düşük batch için GEMV)</span>
+}
+
+model = AutoAWQForCausalLM.<span class="cmd">from_pretrained</span>(
+    model_path, <span class="field">low_cpu_mem_usage</span>=<span class="keyword">True</span>
+)
+tokenizer = AutoTokenizer.<span class="cmd">from_pretrained</span>(
+    model_path, <span class="field">trust_remote_code</span>=<span class="keyword">True</span>
+)
+
+model.<span class="cmd">quantize</span>(tokenizer, quant_config=quant_config)
+model.<span class="cmd">save_quantized</span>(quant_path)
+tokenizer.<span class="cmd">save_pretrained</span>(quant_path)
+</code></pre>
+    </div>
+  </section>
+
+  <!-- ── S4: GGUF/GGML Format ────────────────────────────────── -->
+  <section id="s4">
+    <h2><span class="num">04</span> GGUF/GGML Format</h2>
+    <p class="section-lead">llama.cpp'nin kullandığı GGUF formatı, tek dosyada model metadata ve ağırlıkları birleştirir; CPU inference için optimize edilmiştir.</p>
+
+    <p>
+      <em>GGUF</em> (GPT-Generated Unified Format), Georgi Gerganov tarafından geliştirilmiş ve llama.cpp ekosisteminin temel dosya formatıdır. Önceki <em>GGML</em> formatının yerini almıştır. GGUF, model metadata'sını (tokenizer, hiper parametreler, quantization konfigürasyonu) ve ağırlıkları tek bir dosyada saklar.
+    </p>
+
+    <h3>GGUF Quantization Tipleri</h3>
+    <table class="file-table">
+      <thead>
+        <tr><th>Tip</th><th>Bit/Ağırlık</th><th>7B Dosya Boyutu</th><th>Kalite</th><th>Öneri</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Q2_K</td><td>~2.5 bit</td><td>~2.7 GB</td><td>Düşük</td><td>Yalnızca bellek çok kısıtlıysa</td></tr>
+        <tr><td>Q3_K_M</td><td>~3.3 bit</td><td>~3.5 GB</td><td>Orta-düşük</td><td>Çok kısıtlı sistem</td></tr>
+        <tr><td>Q4_K_M</td><td>~4.5 bit</td><td>~4.8 GB</td><td>İyi</td><td>Genel kullanım için tavsiye</td></tr>
+        <tr><td>Q5_K_M</td><td>~5.5 bit</td><td>~5.7 GB</td><td>Çok iyi</td><td>Kalite/boyut dengesi</td></tr>
+        <tr><td>Q6_K</td><td>~6.6 bit</td><td>~6.1 GB</td><td>Mükemmele yakın</td><td>Yüksek kalite gerektiriyorsa</td></tr>
+        <tr><td>Q8_0</td><td>8 bit</td><td>~7.7 GB</td><td>Neredeyse kayıpsız</td><td>VRAM yeterliyse</td></tr>
+        <tr><td>F16</td><td>16 bit</td><td>~14 GB</td><td>Kayıpsız</td><td>Geliştirme/test</td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      İsimlerdeki <code class="inline">K</code> harfi k-quant (karma bit derinliği) anlamına gelir: bazı katmanlar daha yüksek bit ile korunur. <code class="inline">M</code> "medium" yani orta büyüklük demektir (S = small, L = large da mevcuttur).
+    </p>
+
+    <h3>HuggingFace Hub'dan GGUF İndirmek</h3>
+    <div class="code-block">
+      <div class="code-header"><span>download_gguf.sh</span><span class="dot">●</span></div>
+      <pre><code><span class="cmt"># pip install huggingface_hub</span>
+<span class="cmd">huggingface-cli</span> <span class="flag">download</span> \
+    TheBloke/Llama-2-7B-Chat-GGUF \
+    llama-2-7b-chat.Q4_K_M.gguf \
+    <span class="flag">--local-dir</span> <span class="path">./models</span> \
+    <span class="flag">--local-dir-use-symlinks</span> False
+</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-header"><span>download_gguf.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">from</span> huggingface_hub <span class="keyword">import</span> hf_hub_download
+
+model_path = <span class="cmd">hf_hub_download</span>(
+    <span class="field">repo_id</span>=<span class="str">"bartowski/Llama-3.2-3B-Instruct-GGUF"</span>,
+    <span class="field">filename</span>=<span class="str">"Llama-3.2-3B-Instruct-Q4_K_M.gguf"</span>,
+    <span class="field">local_dir</span>=<span class="str">"./models"</span>,
+)
+<span class="cmd">print</span>(<span class="str">f"İndirildi: {model_path}"</span>)
+</code></pre>
+    </div>
+
+    <div class="callout">
+      <div class="label">NOT</div>
+      <p>HuggingFace Hub'da GGUF modelleri genellikle <code class="inline">TheBloke</code>, <code class="inline">bartowski</code> veya <code class="inline">lmstudio-community</code> organizasyonları tarafından yayınlanmaktadır. Orijinal model adına <code class="inline">-GGUF</code> ekleyerek arama yapabilirsiniz.</p>
+    </div>
+  </section>
+
+  <!-- ── S5: llama.cpp ───────────────────────────────────────── -->
+  <section id="s5">
+    <h2><span class="num">05</span> llama.cpp ile CPU Inference</h2>
+    <p class="section-lead">Saf C/C++ ile yazılmış llama.cpp, tüketici donanımlarında LLM inference için en verimli CPU çözümüdür.</p>
+
+    <p>
+      <em>llama.cpp</em>, Georgi Gerganov tarafından geliştirilmiş, bağımlılık gerektirmeyen saf C/C++ LLM inference motorudur. CPU inference için SIMD optimizasyonları (AVX2, AVX-512, ARM NEON) içerir; aynı zamanda CUDA, Metal, OpenCL ve Vulkan backend'lerini destekler.
+    </p>
+
+    <h3>Derleme ve Kurulum</h3>
+    <div class="code-block">
+      <div class="code-header"><span>build.sh</span><span class="dot">●</span></div>
+      <pre><code><span class="cmt"># Kaynak kodu indir</span>
+<span class="cmd">git</span> <span class="flag">clone</span> https://github.com/ggerganov/llama.cpp
+<span class="cmd">cd</span> <span class="path">llama.cpp</span>
+
+<span class="cmt"># CPU-only derleme</span>
+<span class="cmd">cmake</span> <span class="flag">-B</span> <span class="path">build</span>
+<span class="cmd">cmake</span> <span class="flag">--build</span> <span class="path">build</span> <span class="flag">--config</span> Release <span class="flag">-j</span> $(nproc)
+
+<span class="cmt"># CUDA ile derleme</span>
+<span class="cmd">cmake</span> <span class="flag">-B</span> <span class="path">build</span> <span class="flag">-DGGML_CUDA=ON</span>
+<span class="cmd">cmake</span> <span class="flag">--build</span> <span class="path">build</span> <span class="flag">--config</span> Release <span class="flag">-j</span> $(nproc)
+
+<span class="cmt"># macOS Metal ile derleme</span>
+<span class="cmd">cmake</span> <span class="flag">-B</span> <span class="path">build</span> <span class="flag">-DGGML_METAL=ON</span>
+<span class="cmd">cmake</span> <span class="flag">--build</span> <span class="path">build</span> <span class="flag">--config</span> Release <span class="flag">-j</span> $(nproc)
+</code></pre>
+    </div>
+
+    <h3>Komut Satırı Inference</h3>
+    <div class="code-block">
+      <div class="code-header"><span>llama_cli.sh</span><span class="dot">●</span></div>
+      <pre><code><span class="cmt"># Tek seferlik sorgu</span>
+<span class="cmd">./build/bin/llama-cli</span> \
+    <span class="flag">-m</span> <span class="path">./models/llama-3.2-3b-q4_k_m.gguf</span> \
+    <span class="flag">-p</span> <span class="str">"Transformer mimarisi nedir?"</span> \
+    <span class="flag">-n</span> <span class="str">200</span> \      <span class="cmt"># max token sayısı</span>
+    <span class="flag">--threads</span> <span class="str">8</span>   <span class="cmt"># CPU thread sayısı</span>
+
+<span class="cmt"># İnteraktif sohbet modu</span>
+<span class="cmd">./build/bin/llama-cli</span> \
+    <span class="flag">-m</span> <span class="path">./models/llama-3.2-3b-q4_k_m.gguf</span> \
+    <span class="flag">-i</span> \               <span class="cmt"># interactive mode</span>
+    <span class="flag">-c</span> <span class="str">4096</span> \         <span class="cmt"># context window</span>
+    <span class="flag">--threads</span> <span class="str">8</span> \
+    <span class="flag">--temp</span> <span class="str">0.7</span> \      <span class="cmt"># temperature</span>
+    <span class="flag">--top-p</span> <span class="str">0.9</span> \    <span class="cmt"># nucleus sampling</span>
+    <span class="flag">--top-k</span> <span class="str">40</span>       <span class="cmt"># top-k sampling</span>
+</code></pre>
+    </div>
+
+    <h3>Python Binding ile Kullanım</h3>
+    <div class="code-block">
+      <div class="code-header"><span>llama_python.py</span><span class="dot">●</span></div>
+      <pre><code><span class="cmt"># pip install llama-cpp-python</span>
+<span class="cmt"># CUDA: CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python</span>
+<span class="keyword">from</span> llama_cpp <span class="keyword">import</span> Llama
+
+llm = <span class="cmd">Llama</span>(
+    <span class="field">model_path</span>=<span class="str">"./models/llama-3.2-3b-q4_k_m.gguf"</span>,
+    <span class="field">n_ctx</span>=<span class="str">4096</span>,         <span class="cmt"># context window uzunluğu</span>
+    <span class="field">n_threads</span>=<span class="str">8</span>,        <span class="cmt"># CPU thread sayısı (fiziksel çekirdek)</span>
+    <span class="field">n_gpu_layers</span>=<span class="str">0</span>,     <span class="cmt"># GPU'ya yüklenen katman: 0=CPU-only, -1=tümü</span>
+    <span class="field">verbose</span>=<span class="keyword">False</span>,
+)
+
+<span class="cmt"># Basit tamamlama</span>
+output = <span class="cmd">llm</span>(
+    <span class="str">"Makine öğrenmesi nedir? Kısaca açıkla:"</span>,
+    <span class="field">max_tokens</span>=<span class="str">256</span>,
+    <span class="field">temperature</span>=<span class="str">0.7</span>,
+    <span class="field">top_p</span>=<span class="str">0.9</span>,
+    <span class="field">top_k</span>=<span class="str">40</span>,
+    <span class="field">stop</span>=[<span class="str">"\n\n"</span>, <span class="str">"###"</span>],
+    <span class="field">echo</span>=<span class="keyword">False</span>,
+)
+<span class="cmd">print</span>(output[<span class="str">"choices"</span>][<span class="str">0</span>][<span class="str">"text"</span>])
+
+<span class="cmt"># Chat completion (OpenAI uyumlu)</span>
+response = llm.<span class="cmd">create_chat_completion</span>(
+    messages=[
+        {<span class="str">"role"</span>: <span class="str">"system"</span>, <span class="str">"content"</span>: <span class="str">"Sen yardımcı bir asistansın."</span>},
+        {<span class="str">"role"</span>: <span class="str">"user"</span>, <span class="str">"content"</span>: <span class="str">"Türkiye'nin başkenti neresidir?"</span>},
+    ],
+    <span class="field">temperature</span>=<span class="str">0.1</span>,
+    <span class="field">max_tokens</span>=<span class="str">128</span>,
+)
+<span class="cmd">print</span>(response[<span class="str">"choices"</span>][<span class="str">0</span>][<span class="str">"message"</span>][<span class="str">"content"</span>])
+</code></pre>
+    </div>
+
+    <div class="params">
+      <div class="param"><span class="name">n_ctx</span><span class="desc">Bağlam penceresi uzunluğu (token sayısı). Büyük değerler daha fazla RAM kullanır.</span></div>
+      <div class="param"><span class="name">n_threads</span><span class="desc">Kullanılacak CPU thread sayısı. Hyperthreading hariç fiziksel çekirdek sayısına eşit tutun.</span></div>
+      <div class="param"><span class="name">n_gpu_layers</span><span class="desc">GPU'ya offload edilecek katman sayısı. -1 tüm katmanları GPU'ya yükler.</span></div>
+      <div class="param"><span class="name">temperature</span><span class="desc">Örnekleme sıcaklığı. 0 = deterministik, 1 = çeşitli. Genellikle 0.1–0.9 arası.</span></div>
+      <div class="param"><span class="name">top_p</span><span class="desc">Nucleus sampling: olasılık toplamı bu eşiği geçen en küçük token kümesinden örnekle.</span></div>
+      <div class="param"><span class="name">top_k</span><span class="desc">Yalnızca en yüksek k olasılıklı token'dan örnekle. top_p ile birlikte kullanılabilir.</span></div>
+    </div>
+
+    <h3>GPU Offloading</h3>
+    <p>
+      GPU'nuz modelin tamamını barındırmaya yetmiyorsa hibrit mod kullanabilirsiniz: bir kısım katmanı GPU'ya, kalanı CPU'ya yükleyin. <code class="inline">n_gpu_layers=20</code> gibi bir değer deneyerek VRAM'i ne kadar doldurduğunu gözlemleyin.
+    </p>
+    <div class="code-block">
+      <div class="code-header"><span>hybrid_offload.py</span><span class="dot">●</span></div>
+      <pre><code>llm = <span class="cmd">Llama</span>(
+    <span class="field">model_path</span>=<span class="str">"./models/llama-3.1-8b-q4_k_m.gguf"</span>,
+    <span class="field">n_ctx</span>=<span class="str">2048</span>,
+    <span class="field">n_threads</span>=<span class="str">6</span>,
+    <span class="field">n_gpu_layers</span>=<span class="str">20</span>,   <span class="cmt"># 20 katman GPU'ya (RTX 3060 8GB için uygun)</span>
+    <span class="field">n_batch</span>=<span class="str">512</span>,        <span class="cmt"># prompt işleme batch boyutu</span>
+)
+</code></pre>
+    </div>
+  </section>
+
+  <!-- ── S6: Ollama ──────────────────────────────────────────── -->
+  <section id="s6">
+    <h2><span class="num">06</span> Ollama — Lokal Model Sunucusu</h2>
+    <p class="section-lead">Ollama, LLM modellerini Docker benzeri bir deneyimle indirip çalıştırmanı sağlayan lokal model yönetim platformudur.</p>
+
+    <p>
+      <em>Ollama</em>, llama.cpp üzerine inşa edilmiş bir model sunucu ve yönetim aracıdır. Docker'ın imaj sistemi gibi, modelleri "pull" ederek indirip "run" ile başlatırsınız. Otomatik GPU/CPU algılama, model versiyon yönetimi ve REST API ile hem geliştirme hem üretim için uygundur.
+    </p>
+
+    <h3>Kurulum ve Temel Komutlar</h3>
+    <div class="code-block">
+      <div class="code-header"><span>ollama_cli.sh</span><span class="dot">●</span></div>
+      <pre><code><span class="cmt"># Linux/macOS kurulumu</span>
+<span class="cmd">curl</span> <span class="flag">-fsSL</span> https://ollama.com/install.sh | <span class="cmd">sh</span>
+
+<span class="cmt"># Model indir ve çalıştır</span>
+<span class="cmd">ollama</span> <span class="flag">pull</span> llama3.2
+<span class="cmd">ollama</span> <span class="flag">run</span> llama3.2
+
+<span class="cmt"># Diğer faydalı komutlar</span>
+<span class="cmd">ollama</span> <span class="flag">list</span>                   <span class="cmt"># indirilen modelleri listele</span>
+<span class="cmd">ollama</span> <span class="flag">show</span> llama3.2          <span class="cmt"># model bilgilerini göster</span>
+<span class="cmd">ollama</span> <span class="flag">rm</span> llama3.2             <span class="cmt"># modeli sil</span>
+<span class="cmd">ollama</span> <span class="flag">ps</span>                     <span class="cmt"># çalışan modelleri listele</span>
+<span class="cmd">ollama</span> <span class="flag">serve</span>                  <span class="cmt"># sunucuyu manuel başlat (genelde otomatik)</span>
+</code></pre>
+    </div>
+
+    <h3>REST API</h3>
+    <p>
+      Ollama varsayılan olarak <code class="inline">http://localhost:11434</code> adresinde bir REST API sunar. OpenAI uyumlu endpoint'ler de mevcuttur.
+    </p>
+    <div class="code-block">
+      <div class="code-header"><span>ollama_api.sh</span><span class="dot">●</span></div>
+      <pre><code><span class="cmt"># Generate endpoint</span>
+<span class="cmd">curl</span> http://localhost:11434/api/generate <span class="flag">-d</span> <span class="str">'{
+  "model": "llama3.2",
+  "prompt": "Yapay zeka nedir?",
+  "stream": false
+}'</span>
+
+<span class="cmt"># Chat endpoint (OpenAI uyumlu)</span>
+<span class="cmd">curl</span> http://localhost:11434/v1/chat/completions \
+  <span class="flag">-H</span> <span class="str">"Content-Type: application/json"</span> \
+  <span class="flag">-d</span> <span class="str">'{
+    "model": "llama3.2",
+    "messages": [{"role": "user", "content": "Merhaba!"}]
+  }'</span>
+</code></pre>
+    </div>
+
+    <h3>Modelfile ile Özel Model Tanımı</h3>
+    <div class="code-block">
+      <div class="code-header"><span>Modelfile</span><span class="dot">●</span></div>
+      <pre><code><span class="cmt"># Temel model</span>
+<span class="keyword">FROM</span> llama3.2
+
+<span class="cmt"># Sistem prompt'u</span>
+<span class="keyword">SYSTEM</span> <span class="str">"""Sen Türkçe konuşan, yardımsever bir teknik asistansın.
+Cevaplarında her zaman kod örnekleri ver ve açık bir dil kullan."""</span>
+
+<span class="cmt"># Parametreler</span>
+<span class="keyword">PARAMETER</span> <span class="field">temperature</span> <span class="str">0.7</span>
+<span class="keyword">PARAMETER</span> <span class="field">top_p</span> <span class="str">0.9</span>
+<span class="keyword">PARAMETER</span> <span class="field">top_k</span> <span class="str">40</span>
+<span class="keyword">PARAMETER</span> <span class="field">num_ctx</span> <span class="str">4096</span>
+
+<span class="cmt"># Sohbet şablonu (opsiyonel)</span>
+<span class="keyword">TEMPLATE</span> <span class="str">"""{{ if .System }}&lt;|system|&gt;
+{{ .System }}&lt;|end|&gt;
+{{ end }}{{ if .Prompt }}&lt;|user|&gt;
+{{ .Prompt }}&lt;|end|&gt;
+&lt;|assistant|&gt;
+{{ end }}{{ .Response }}&lt;|end|&gt;"""</span>
+</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-header"><span>create_model.sh</span><span class="dot">●</span></div>
+      <pre><code><span class="cmt"># Modelfile'dan özel model oluştur</span>
+<span class="cmd">ollama</span> <span class="flag">create</span> teknik-asistan <span class="flag">-f</span> <span class="path">./Modelfile</span>
+<span class="cmd">ollama</span> <span class="flag">run</span> teknik-asistan
+</code></pre>
+    </div>
+
+    <h3>Python ile Ollama API</h3>
+    <div class="code-block">
+      <div class="code-header"><span>ollama_python.py</span><span class="dot">●</span></div>
+      <pre><code><span class="cmt"># pip install ollama</span>
+<span class="keyword">import</span> ollama
+
+<span class="cmt"># Basit sorgu</span>
+response = ollama.<span class="cmd">chat</span>(
+    <span class="field">model</span>=<span class="str">"llama3.2"</span>,
+    <span class="field">messages</span>=[
+        {<span class="str">"role"</span>: <span class="str">"user"</span>, <span class="str">"content"</span>: <span class="str">"Python'da decorators ne işe yarar?"</span>}
+    ]
+)
+<span class="cmd">print</span>(response[<span class="str">"message"</span>][<span class="str">"content"</span>])
+
+<span class="cmt"># Streaming yanıt</span>
+<span class="keyword">for</span> chunk <span class="keyword">in</span> ollama.<span class="cmd">chat</span>(
+    <span class="field">model</span>=<span class="str">"llama3.2"</span>,
+    <span class="field">messages</span>=[{<span class="str">"role"</span>: <span class="str">"user"</span>, <span class="str">"content"</span>: <span class="str">"Fibonacci serisini açıkla"</span>}],
+    <span class="field">stream</span>=<span class="keyword">True</span>,
+):
+    <span class="cmd">print</span>(chunk[<span class="str">"message"</span>][<span class="str">"content"</span>], <span class="field">end</span>=<span class="str">""</span>, <span class="field">flush</span>=<span class="keyword">True</span>)
+
+<span class="cmt"># OpenAI uyumlu istemci ile</span>
+<span class="keyword">from</span> openai <span class="keyword">import</span> OpenAI
+
+client = <span class="cmd">OpenAI</span>(
+    <span class="field">base_url</span>=<span class="str">"http://localhost:11434/v1"</span>,
+    <span class="field">api_key</span>=<span class="str">"ollama"</span>,   <span class="cmt"># herhangi bir değer olabilir</span>
+)
+
+response = client.chat.completions.<span class="cmd">create</span>(
+    <span class="field">model</span>=<span class="str">"llama3.2"</span>,
+    <span class="field">messages</span>=[{<span class="str">"role"</span>: <span class="str">"user"</span>, <span class="str">"content"</span>: <span class="str">"Merhaba!"</span>}],
+)
+<span class="cmd">print</span>(response.choices[<span class="str">0</span>].message.content)
+</code></pre>
+    </div>
+  </section>
+
+  <!-- ── S7: KV Cache ve Flash Attention ─────────────────────── -->
+  <section id="s7">
+    <h2><span class="num">07</span> KV Cache ve Flash Attention</h2>
+    <p class="section-lead">Inference verimliliğini dramatik biçimde artıran iki temel optimizasyon: KV cache ve IO-aware Flash Attention.</p>
+
+    <h3>KV Cache Nedir?</h3>
+    <p>
+      Transformer'ın attention mekanizması, her token için Key ve Value matrislerini hesaplar. Autoregressive üretimde (bir seferde bir token üretme), önceki token'ların K ve V değerleri değişmez — bunları yeniden hesaplamak gereksiz iştir. <em>KV cache</em>, bu değerleri bellekte saklayarak her adımda yalnızca yeni token'ın K/V'sini hesaplar.
+    </p>
+    <div class="flow">
+      <pre><span class="step-num">KV cache olmadan:</span> Her token üretiminde tüm geçmiş token'lar için K,V hesapla → O(n²) maliyet
+<span class="step-num">KV cache ile:</span>   Yalnızca yeni token K,V hesapla, önbellekten oku → <span class="accent">O(n) maliyet</span></pre>
+    </div>
+    <p>
+      Ancak KV cache bellek maliyeti yüksektir: bir 7B model için 2048 token context window'da birkaç GB yer kaplayabilir.
+    </p>
+
+    <h3>PagedAttention (vLLM)</h3>
+    <p>
+      <em>PagedAttention</em>, işletim sistemlerinin sanal bellek sayfalama konseptini KV cache'e uygular. Cache bloklara (page) ayrılır; bu sayede bellek fragmantasyonu önlenir ve farklı uzunluktaki istek grupları daha verimli işlenir.
+    </p>
+
+    <h3>Flash Attention</h3>
+    <p>
+      Standart attention hesaplaması büyük ara matrisleri HBM (yüksek bant genişlikli bellek, GPU'nun ana VRAM'i) üzerine yazar ve geri okur. <em>Flash Attention</em>, tüm attention hesaplamasını SRAM (on-chip, çok hızlı ama küçük) üzerinde gerçekleştirir; HBM okuma/yazma sayısını dramatik biçimde azaltır.
+    </p>
+    <div class="flow">
+      <pre><span class="step-num">Standart:</span> Q,K,V → HBM'e yaz → S=QK^T okuyup yaz → P=softmax(S) yaz → O=PV yaz
+<span class="step-num">Flash:</span>    Q,K,V → küçük bloklar halinde SRAM'e al → hepsini SRAM'de hesapla → <span class="accent">tek seferde HBM'e yaz</span></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-header"><span>flash_attention.py</span><span class="dot">●</span></div>
+      <pre><code><span class="cmt"># pip install flash-attn --no-build-isolation</span>
+<span class="cmt"># (CUDA 11.8+ ve PyTorch 2.0+ gerektirir)</span>
+<span class="keyword">from</span> transformers <span class="keyword">import</span> AutoModelForCausalLM, AutoTokenizer
+<span class="keyword">import</span> torch
+
+model_name = <span class="str">"meta-llama/Llama-3.1-8B-Instruct"</span>
+
+<span class="cmt"># Flash Attention 2 ile model yükle</span>
+model = AutoModelForCausalLM.<span class="cmd">from_pretrained</span>(
+    model_name,
+    <span class="field">torch_dtype</span>=torch.bfloat16,
+    <span class="field">attn_implementation</span>=<span class="str">"flash_attention_2"</span>,   <span class="cmt"># anahtar parametre</span>
+    <span class="field">device_map</span>=<span class="str">"auto"</span>,
+)
+tokenizer = AutoTokenizer.<span class="cmd">from_pretrained</span>(model_name)
+
+<span class="cmt"># Bellek kullanımını karşılaştır</span>
+<span class="keyword">def</span> <span class="cmd">measure_memory</span>(model, prompt, <span class="field">max_new_tokens</span>=<span class="str">100</span>):
+    inputs = tokenizer(prompt, <span class="field">return_tensors</span>=<span class="str">"pt"</span>).<span class="cmd">to</span>(model.device)
+    torch.cuda.<span class="cmd">reset_peak_memory_stats</span>()
+    _ = model.<span class="cmd">generate</span>(**inputs, <span class="field">max_new_tokens</span>=max_new_tokens)
+    peak_mem = torch.cuda.<span class="cmd">max_memory_allocated</span>() / <span class="str">1e9</span>
+    <span class="keyword">return</span> peak_mem
+
+mem = <span class="cmd">measure_memory</span>(model, <span class="str">"Transformer nedir?"</span>)
+<span class="cmd">print</span>(<span class="str">f"Peak memory (Flash Attn 2): {mem:.2f} GB"</span>)
+</code></pre>
+    </div>
+
+    <div class="callout warn">
+      <div class="label">DİKKAT</div>
+      <p>Flash Attention 2 yalnızca CUDA GPU'larında çalışır ve derlenmiş bir C++ uzantısı gerektirir. Kurulum için CUDA toolkit'in sisteminizde yüklü olması şarttır. CPU ya da Metal backend kullanıyorsanız bu parametreyi kaldırın.</p>
+    </div>
+  </section>
+
+  <!-- ── S8: vLLM ────────────────────────────────────────────── -->
+  <section id="s8">
+    <h2><span class="num">08</span> vLLM ile Production Serving</h2>
+    <p class="section-lead">PagedAttention ve continuous batching ile yüksek throughput LLM servisini sağlayan vLLM, üretim ortamlarının tercihi.</p>
+
+    <p>
+      <em>vLLM</em>, UC Berkeley'den araştırmacılar tarafından geliştirilen yüksek performanslı LLM inference ve serving motorudur. Temel inovasyonu olan <em>PagedAttention</em>, KV cache kullanımını 2–4× daha verimli hale getirir; <em>continuous batching</em> ise gelen istekleri dinamik olarak gruplayarak GPU'yu meşgul tutar.
+    </p>
+
+    <h3>Kurulum ve Sunucu Başlatma</h3>
+    <div class="code-block">
+      <div class="code-header"><span>vllm_server.sh</span><span class="dot">●</span></div>
+      <pre><code><span class="cmt"># pip install vllm</span>
+<span class="cmt"># OpenAI uyumlu API sunucusu başlat</span>
+<span class="cmd">python</span> <span class="flag">-m</span> vllm.entrypoints.openai.api_server \
+    <span class="flag">--model</span> meta-llama/Llama-3.1-8B-Instruct \
+    <span class="flag">--dtype</span> bfloat16 \
+    <span class="flag">--max-model-len</span> <span class="str">8192</span> \
+    <span class="flag">--tensor-parallel-size</span> <span class="str">1</span> \      <span class="cmt"># GPU sayısı</span>
+    <span class="flag">--gpu-memory-utilization</span> <span class="str">0.90</span> \ <span class="cmt"># VRAM kullanım oranı</span>
+    <span class="flag">--port</span> <span class="str">8000</span>
+</code></pre>
+    </div>
+
+    <h3>Python Client</h3>
+    <div class="code-block">
+      <div class="code-header"><span>vllm_client.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">from</span> openai <span class="keyword">import</span> OpenAI
+
+<span class="cmt"># vLLM OpenAI uyumlu endpoint</span>
+client = <span class="cmd">OpenAI</span>(
+    <span class="field">base_url</span>=<span class="str">"http://localhost:8000/v1"</span>,
+    <span class="field">api_key</span>=<span class="str">"vllm"</span>,
+)
+
+response = client.chat.completions.<span class="cmd">create</span>(
+    <span class="field">model</span>=<span class="str">"meta-llama/Llama-3.1-8B-Instruct"</span>,
+    <span class="field">messages</span>=[
+        {<span class="str">"role"</span>: <span class="str">"system"</span>, <span class="str">"content"</span>: <span class="str">"Sen yardımcı bir asistansın."</span>},
+        {<span class="str">"role"</span>: <span class="str">"user"</span>, <span class="str">"content"</span>: <span class="str">"Attention mekanizmasını açıkla."</span>},
+    ],
+    <span class="field">max_tokens</span>=<span class="str">512</span>,
+    <span class="field">temperature</span>=<span class="str">0.7</span>,
+)
+<span class="cmd">print</span>(response.choices[<span class="str">0</span>].message.content)
+
+<span class="cmt"># Toplu istek örneği (throughput testi)</span>
+<span class="keyword">import</span> time
+
+prompts = [
+    <span class="str">"Python nedir?"</span>,
+    <span class="str">"Makine öğrenmesi nedir?"</span>,
+    <span class="str">"Transformer ne anlama gelir?"</span>,
+    <span class="str">"GPU neden AI için önemlidir?"</span>,
+]
+
+start = time.<span class="cmd">time</span>()
+responses = []
+<span class="keyword">for</span> p <span class="keyword">in</span> prompts:
+    r = client.chat.completions.<span class="cmd">create</span>(
+        <span class="field">model</span>=<span class="str">"meta-llama/Llama-3.1-8B-Instruct"</span>,
+        <span class="field">messages</span>=[{<span class="str">"role"</span>: <span class="str">"user"</span>, <span class="str">"content"</span>: p}],
+        <span class="field">max_tokens</span>=<span class="str">128</span>,
+    )
+    responses.<span class="cmd">append</span>(r)
+
+elapsed = time.<span class="cmd">time</span>() - start
+total_tokens = <span class="cmd">sum</span>(r.usage.completion_tokens <span class="keyword">for</span> r <span class="keyword">in</span> responses)
+<span class="cmd">print</span>(<span class="str">f"Toplam: {total_tokens} token | Süre: {elapsed:.2f}s | Throughput: {total_tokens/elapsed:.1f} tok/s"</span>)
+</code></pre>
+    </div>
+
+    <h3>Tensor Parallelism</h3>
+    <p>
+      Birden fazla GPU'ya sahipseniz <code class="inline">--tensor-parallel-size</code> ile model ağırlıklarını GPU'lara dağıtabilirsiniz. 70B gibi büyük modeller için 4× veya 8× GPU gerekebilir.
+    </p>
+
+    <h3>Throughput Karşılaştırması</h3>
+    <table class="file-table">
+      <thead>
+        <tr><th>Motor</th><th>Donanım</th><th>Throughput (tok/s)</th><th>Latency (TTFT)</th><th>Notlar</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>HuggingFace (vanilla)</td><td>A100 80GB</td><td>~40–60</td><td>~800ms</td><td>batch_size=1, FP16</td></tr>
+        <tr><td>vLLM</td><td>A100 80GB</td><td>~150–250</td><td>~200ms</td><td>continuous batching, PagedAttn</td></tr>
+        <tr><td>llama.cpp (CPU)</td><td>32-core CPU</td><td>~15–25</td><td>~2s</td><td>Q4_K_M, 8 thread</td></tr>
+        <tr><td>llama.cpp (GPU)</td><td>RTX 4090</td><td>~80–120</td><td>~300ms</td><td>Q4_K_M, tam GPU offload</td></tr>
+        <tr><td>Ollama</td><td>RTX 4090</td><td>~70–100</td><td>~350ms</td><td>llama.cpp backend</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout">
+      <div class="label">NOT</div>
+      <p>Throughput değerleri, model boyutuna, batch size'a, prompt uzunluğuna ve donanım konfigürasyonuna göre önemli ölçüde değişir. Bu değerler Llama 3.1 8B için yaklaşık referans değerlerdir.</p>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>
