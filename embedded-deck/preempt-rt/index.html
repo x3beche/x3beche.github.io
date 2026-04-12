@@ -1,0 +1,1039 @@
+---
+layout: tutorial
+title: "PREEMPT-RT — Gerçek Zamanlı Linux"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>Rehber</span>
+    <span>Gömülü Linux</span>
+    <span>Real-time</span>
+  </div>
+  <h1>PREEMPT-RT —<br><em>Gerçek Zamanlı Linux.</em></h1>
+  <p class="subtitle">standart kernel'ı RT'ye dönüştür — cyclictest, latency analizi ve CPU isolation.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Real-time nedir ve neden Linux</a></li>
+    <li><a href="#s1">RT kernel derleme veya kurulum</a></li>
+    <li><a href="#s2">cyclictest ile latency ölçümü</a></li>
+    <li><a href="#s3">Priority inversion ve priority inheritance</a></li>
+    <li><a href="#s4">RT task yazımı</a></li>
+    <li><a href="#s5">Threaded IRQ</a></li>
+    <li><a href="#s6">CPU isolation ve affinity</a></li>
+    <li><a href="#s7">Latency kaynakları ve ftrace</a></li>
+    <li><a href="#s8">Pratik: motor kontrolcü örneği</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Real-time nedir ve neden Linux</h2>
+  <p class="section-lead">Real-time hesaplama, sonucun hem doğru hem de zamanında üretilmesini şart koşar — deadline miss'in bedeli sisteme göre değişir, ama RT'nin özü budur.</p>
+
+  <h3>Soft RT ve Hard RT ayrımı</h3>
+
+  <p>Real-time sistemler iki ana kategoriye ayrılır. <strong>Soft RT</strong>'de deadline zaman zaman kaçırılabilir; sonuç hâlâ işe yarar ama kalite düşer. Video akışında bir kare geç gelirse ekran donup açılır — sinir bozucudur, kritik değil. <strong>Hard RT</strong>'de ise tek bir deadline miss felakete yol açabilir: otomotiv ABS sistemi, uçak fly-by-wire kontrol yüzeyi, implante kalp pili. Bu sistemlerde "zamanında değil" ile "yanlış" arasında fark yoktur.</p>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Kategori</th><th>Deadline Miss Sonucu</th><th>Örnek</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Soft RT</td><td>Performans düşüşü (degraded)</td><td>Video codec, UI refresh, ses işleme</td></tr>
+      <tr><td>Hard RT</td><td>Sistem hatası (catastrophic)</td><td>Motor kontrol, ABS, robotik eklem</td></tr>
+      <tr><td>Firm RT</td><td>Sonuç geçersiz, görmezden gelinir</td><td>Finans tick verisi, sensör sampling</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Standart Linux preemption modelleri</h3>
+
+  <p>Linux kernel'i farklı preemption seviyeleriyle derlenebilir. Bu seçim, bir interrupt geldiğinde veya yüksek öncelikli task uyandığında, mevcut task'ın <em>ne kadar çabuk</em> yerini bıraktığını belirler.</p>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>CONFIG seçeneği</th><th>Ad</th><th>Preemption noktası</th><th>Tipik latency</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><span class="flag">PREEMPT_NONE</span></td><td>No Forced Preemption</td><td>Yalnızca explicit yield / syscall dönüşü</td><td>ms – onlarca ms</td></tr>
+      <tr><td><span class="flag">PREEMPT_VOLUNTARY</span></td><td>Voluntary Kernel Preemption</td><td>Ekstra <code class="inline">might_sleep()</code> noktaları</td><td>yüzlerce µs</td></tr>
+      <tr><td><span class="flag">PREEMPT</span></td><td>Low-Latency Desktop</td><td>Tüm kernel kodu (spinlock dışı)</td><td>~100 µs</td></tr>
+      <tr><td><span class="flag">PREEMPT_RT</span></td><td>Full Preemption</td><td>Her nokta — spinlock dahil</td><td>&lt; 50 µs</td></tr>
+    </tbody>
+  </table>
+
+  <h3>PREEMPT_RT ne yapar?</h3>
+
+  <p>PREEMPT_RT patch'inin temel mekanizması üç dönüşümde özetlenir. <strong>Spinlock → RT-mutex:</strong> spinlock'lar sleeping mutex'e dönüştürülür; böylece kilit bekleyen bir thread CPU'yu meşgul etmez, uyur. <strong>IRQ handler → RT thread:</strong> interrupt handler'lar ayrı kernel thread'lerine taşınır, dolayısıyla preempt edilebilir ve priority atanabilir hâle gelir. <strong>Soft IRQ → thread:</strong> softirq'lar da thread olarak çalışır. Sonuç: kernel içinde neredeyse hiçbir non-preemptible bölge kalmaz.</p>
+
+  <div class="flow">
+    <pre>
+  Interrupt gelir
+       │
+       ▼
+  IRQ kernel thread (RT, preemptible)
+       │
+       ├─ PREEMPT_RT:  yüksek prio task varsa → hemen preempt et
+       │
+       └─ Standart:    top-half biter, sonra softirq, sonra schedule
+    </pre>
+  </div>
+
+  <h3>Kullanım alanları</h3>
+
+  <p>PREEMPT_RT en sık şu alanlarda kullanılır: CNC ve robot manipülatör kontrolü (EtherCAT servo döngüsü), endüstriyel PLC yazılımı (IEC 61131 runtime), audio processing (JACK, low-latency audio), telecom baz istasyonları, medikal görüntüleme ekipmanı ve otonom araç algı pipeline'ları.</p>
+
+  <h3>PREEMPT_RT vs RTOS karşılaştırması</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Kriter</th><th>PREEMPT_RT Linux</th><th>FreeRTOS / Zephyr</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Worst-case latency</td><td>10–50 µs (iyi konfigürasyonla)</td><td>1–10 µs</td></tr>
+      <tr><td>POSIX uyumu</td><td>Tam</td><td>Kısmi / yok</td></tr>
+      <tr><td>Sürücü ekosistemi</td><td>Geniş (Linux driver tree)</td><td>Sınırlı BSP</td></tr>
+      <tr><td>Bellek koruma</td><td>MMU ile tam izolasyon</td><td>MPU / opsiyonel</td></tr>
+      <tr><td>Geliştirme araçları</td><td>GDB, perf, ftrace, valgrind</td><td>Sınırlı</td></tr>
+      <tr><td>Determinizm</td><td>Yüksek (bounded)</td><td>Çok yüksek (hard)</td></tr>
+      <tr><td>İşletim maliyeti</td><td>Yüksek (full OS)</td><td>Düşük (&lt; 10 KB ROM)</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>2024 yılında PREEMPT_RT resmi olarak Linux mainline'a girdi: kernel 6.12 ile birlikte <span class="flag">CONFIG_PREEMPT_RT</span> artık ayrı patch gerektirmiyor. Daha eski kernel sürümleri için <a style="color:var(--accent)" href="https://wiki.linuxfoundation.org/realtime/start">kernel.org RT patch arşivini</a> kullanın.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Soft RT ve Hard RT arasındaki fark: deadline miss sonucu</li>
+      <li>Dört preemption modeli ve latency karakteristikleri</li>
+      <li>PREEMPT_RT'nin üç temel dönüşümü: spinlock, IRQ, softirq</li>
+      <li>RTOS ile karşılaştırmalı analiz — ne zaman hangisi?</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> RT kernel derleme veya kurulum</h2>
+  <p class="section-lead">PREEMPT_RT kernel'i edinmenin iki yolu var: hazır paket (hızlı) veya kaynak koddan derleme (tam kontrol).</p>
+
+  <h3>Hazır paket ile kurulum (Debian / Ubuntu)</h3>
+
+  <p>Debian tabanlı sistemlerde RT kernel paketi doğrudan apt deposunda bulunur. x86_64 için:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>terminal</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Mevcut RT kernel paketlerini listele</span>
+<span class="cmd">apt-cache search</span> linux-image-rt
+
+<span class="cmt"># Kur</span>
+<span class="cmd">sudo apt install</span> linux-image-rt-amd64 linux-headers-rt-amd64
+
+<span class="cmt"># Yeniden başlat ve RT kernel'i seç (GRUB menüsünde)</span>
+<span class="cmd">sudo reboot</span>
+
+<span class="cmt"># Doğrula</span>
+<span class="cmd">uname -a</span>
+<span class="cmt"># → Linux hostname 6.1.0-28-rt-amd64 #1 SMP PREEMPT_RT ...</span></code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>Ubuntu 22.04 LTS'de RT kernel paketi <code class="inline">linux-image-lowlatency-hwe-22.04</code> adıyla gelir, ancak bu PREEMPT_RT değil yalnızca PREEMPT'tir. Gerçek <span class="flag">PREEMPT_RT</span> için Ubuntu Pro aboneliği veya manuel derleme gerekir.</p>
+  </div>
+
+  <h3>Kaynak koddan manuel derleme</h3>
+
+  <p>Tam kontrol veya özel donanım desteği için kaynak koddan derleme şart. Kernel 6.12 öncesi sürümler için RT patch indirmek gerekir:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>rt-kernel-build.sh</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1) Kernel kaynağını indir (örnek: 6.6.x)</span>
+<span class="cmd">wget</span> https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.30.tar.xz
+<span class="cmd">tar</span> xf linux-6.6.30.tar.xz
+<span class="cmd">cd</span> linux-6.6.30
+
+<span class="cmt"># 2) Karşılık gelen RT patch'i indir</span>
+<span class="cmd">wget</span> https://cdn.kernel.org/pub/linux/kernel/projects/rt/6.6/\
+patch-6.6.30-rt30.patch.xz
+<span class="cmd">xz</span> -d patch-6.6.30-rt30.patch.xz
+
+<span class="cmt"># 3) Patch'i uygula</span>
+<span class="cmd">patch</span> -p1 &lt; patch-6.6.30-rt30.patch
+
+<span class="cmt"># 4) Mevcut konfigürasyondan başla</span>
+<span class="cmd">cp</span> /boot/config-$(uname -r) .config
+<span class="cmd">make</span> olddefconfig
+
+<span class="cmt"># 5) menuconfig ile PREEMPT_RT'yi aktif et</span>
+<span class="cmd">make</span> menuconfig
+<span class="cmt"># General Setup → Preemption Model → Fully Preemptible Kernel (Real-Time)</span></code></pre>
+  </div>
+
+  <h3>Kritik Kconfig seçenekleri</h3>
+
+  <p>menuconfig'de veya <code class="inline">.config</code> dosyasında şu seçeneklerin doğru ayarlandığından emin olun:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>.config</span><span class="dot">●</span></div>
+    <pre><code><span class="flag">CONFIG_PREEMPT_RT</span>=y          <span class="cmt"># Tam RT preemption</span>
+<span class="flag">CONFIG_HZ_1000</span>=y             <span class="cmt"># 1000 Hz tick — daha iyi resolüsyon</span>
+<span class="flag">CONFIG_NO_HZ_FULL</span>=y          <span class="cmt"># Tickless RT CPU'lar için</span>
+<span class="flag">CONFIG_HIGH_RES_TIMERS</span>=y     <span class="cmt"># Yüksek çözünürlüklü timer</span>
+<span class="flag">CONFIG_CPU_ISOLATION</span>=y       <span class="cmt"># isolcpus desteği</span>
+<span class="flag">CONFIG_IKCONFIG_PROC</span>=y       <span class="cmt"># /proc/config.gz — runtime doğrulama</span>
+
+<span class="cmt"># Kapatılması önerilen özellikler</span>
+<span class="cmt"># CONFIG_NUMA_BALANCING is not set</span>
+<span class="cmt"># CONFIG_TRANSPARENT_HUGEPAGE is not set  (jitter kaynağı)</span></code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>derleme ve kurulum</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Çok çekirdekli derleme (-j ile)</span>
+<span class="cmd">make</span> -j$(nproc) <span class="flag">LOCALVERSION</span>="-rt-custom"
+
+<span class="cmt"># Modülleri kur</span>
+<span class="cmd">sudo make</span> modules_install
+
+<span class="cmt"># Kernel'i kur (GRUB otomatik güncellenir)</span>
+<span class="cmd">sudo make</span> install
+
+<span class="cmd">sudo reboot</span>
+<span class="cmd">uname -v</span>
+<span class="cmt"># → #1 SMP PREEMPT_RT Sat Apr 12 12:00:00 UTC 2025</span></code></pre>
+  </div>
+
+  <h3>Raspberry Pi için RT kernel</h3>
+
+  <p>RPi'da iki seçenek var: Raspberry Pi Foundation'ın kendi <code class="inline">rpi-rt</code> fork'u veya Raspberry Pi OS'un <code class="inline">linux-raspi-rt</code> paketi.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>raspberry-pi-rt.sh</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># RPi OS (Bookworm) üzerinde</span>
+<span class="cmd">sudo apt install</span> linux-image-rt-arm64   <span class="cmt"># RPi 4/5 için</span>
+
+<span class="cmt"># Veya rpi-rt kaynak fork'u ile çapraz derleme:</span>
+<span class="cmd">git clone</span> --depth=1 -b rpi-6.6.y-rt \
+  https://github.com/raspberrypi/linux rpi-rt-kernel
+
+<span class="cmt"># Çapraz derleme toolchain</span>
+<span class="cmd">sudo apt install</span> gcc-aarch64-linux-gnu
+
+<span class="cmd">cd</span> rpi-rt-kernel
+<span class="cmd">ARCH</span>=arm64 <span class="cmd">CROSS_COMPILE</span>=aarch64-linux-gnu- <span class="cmd">make</span> bcm2711_defconfig
+<span class="cmd">ARCH</span>=arm64 <span class="cmd">CROSS_COMPILE</span>=aarch64-linux-gnu- <span class="cmd">make</span> -j$(nproc)</code></pre>
+  </div>
+
+  <h3>Yocto'da RT kernel</h3>
+
+  <p>Yocto tabanlı projelerde RT kernel seçimi <code class="inline">local.conf</code> veya distro katmanında yapılır:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>local.conf</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># linux-yocto-rt recipe'sini kullan</span>
+<span class="flag">PREFERRED_PROVIDER_virtual/kernel</span> = <span class="str">"linux-yocto-rt"</span>
+
+<span class="cmt"># Kernel özelliğini etkinleştir</span>
+<span class="flag">KERNEL_FEATURES:append</span> = <span class="str">" features/preempt-rt/preempt-rt.scc"</span>
+
+<span class="cmt"># RT için önerilen ek konfigürasyon</span>
+<span class="flag">KERNEL_EXTRA_FEATURES</span> = <span class="str">"features/preempt-rt/preempt-rt.scc"</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Hazır paket kurulumu: <code class="inline">linux-image-rt-amd64</code></li>
+      <li>Manuel derleme: RT patch indirme, uygulama, menuconfig</li>
+      <li>Kritik Kconfig seçenekleri: <span class="flag">CONFIG_PREEMPT_RT</span>, <span class="flag">CONFIG_HZ_1000</span>, <span class="flag">CONFIG_HIGH_RES_TIMERS</span></li>
+      <li>Raspberry Pi ve Yocto için RT kernel seçenekleri</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> cyclictest ile latency ölçümü</h2>
+  <p class="section-lead">cyclictest, bir RT thread'i periyodik olarak uyandırarak beklenen ve gerçekleşen wake-up zamanı arasındaki farkı — latency'yi — ölçer.</p>
+
+  <h3>cyclictest nasıl çalışır?</h3>
+
+  <p>Araç şu döngüyü çalıştırır: bir timestamp al, belirtilen aralık kadar uyu (<code class="inline">clock_nanosleep</code>), uyandıktan sonra başka bir timestamp al, farkı hesapla. Bu fark latency'dir. RT thread'inde <code class="inline">SCHED_FIFO</code> policy ile çalışarak kernel scheduler'ının gecikmesini, spinlock bekleme sürelerini ve interrupt handler gecikmelerini ölçer.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>terminal</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># rt-tests paketini kur</span>
+<span class="cmd">sudo apt install</span> rt-tests
+
+<span class="cmt"># Temel ölçüm: 4 thread, 100.000 iterasyon, 1ms periyot, RT prio 99</span>
+<span class="cmd">sudo cyclictest</span> <span class="flag">-p</span> 99 <span class="flag">-t</span> 4 <span class="flag">-n</span> <span class="flag">-i</span> 1000 <span class="flag">-l</span> 100000
+
+<span class="cmt"># CPU 2'ye affinity, quiet mod (yalnızca özet)</span>
+<span class="cmd">sudo cyclictest</span> <span class="flag">-p</span> 99 <span class="flag">-t</span> 1 <span class="flag">-n</span> <span class="flag">-i</span> 1000 <span class="flag">-l</span> 1000000 <span class="flag">-a</span> 2 <span class="flag">-q</span></code></pre>
+  </div>
+
+  <h3>Parametre referansı</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">-p &lt;priority&gt;</span><span class="desc">SCHED_FIFO RT önceliği (1–99). Test thread'i için 99 kullanın.</span></div>
+    <div class="param"><span class="name">-t &lt;threads&gt;</span><span class="desc">Kaç RT thread açılacak. CPU sayısı kadar setin.</span></div>
+    <div class="param"><span class="name">-n</span><span class="desc">nanosleep kullan (clock_nanosleep, daha hassas)</span></div>
+    <div class="param"><span class="name">-i &lt;interval&gt;</span><span class="desc">Periyot, mikrosaniye cinsinden. 1000 = 1 ms.</span></div>
+    <div class="param"><span class="name">-l &lt;loops&gt;</span><span class="desc">Her thread'in döngü sayısı. 0 = sonsuz.</span></div>
+    <div class="param"><span class="name">-a &lt;cpus&gt;</span><span class="desc">CPU affinity maskesi. -a 2 → yalnızca CPU2.</span></div>
+    <div class="param"><span class="name">-q</span><span class="desc">Quiet mod: yalnızca son özeti göster.</span></div>
+    <div class="param"><span class="name">--histogram=&lt;N&gt;</span><span class="desc">N mikrosaniyeye kadar histogram verisi üret.</span></div>
+  </div>
+
+  <h3>Örnek çıktı ve yorumlama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>cyclictest çıktısı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># RT kernel üzerinde tipik çıktı:</span>
+T: 0 ( 1234) P:99 I:1000 C: 100000 Min:      <span class="ok">3</span> Act:    <span class="ok">7</span> Avg:    <span class="ok">8</span> Max:     <span class="ok">42</span>
+T: 1 ( 1235) P:99 I:1000 C: 100000 Min:      <span class="ok">3</span> Act:    <span class="ok">6</span> Avg:    <span class="ok">8</span> Max:     <span class="ok">38</span>
+T: 2 ( 1236) P:99 I:1000 C: 100000 Min:      <span class="ok">4</span> Act:    <span class="ok">9</span> Avg:    <span class="ok">9</span> Max:     <span class="ok">51</span>
+
+<span class="cmt"># Standart kernel (PREEMPT) üzerinde tipik çıktı:</span>
+T: 0 ( 5678) P:99 I:1000 C: 100000 Min:     <span class="warn">12</span> Act:   <span class="warn">85</span> Avg:   <span class="warn">91</span> Max:   <span class="err">4821</span>
+T: 1 ( 5679) P:99 I:1000 C: 100000 Min:     <span class="warn">11</span> Act:  <span class="warn">120</span> Avg:  <span class="warn">102</span> Max:   <span class="err">6340</span></code></pre>
+  </div>
+
+  <p>Çıktı sütunları: <strong>Min</strong> en düşük gözlenen latency (µs), <strong>Avg</strong> ortalama, <strong>Max</strong> worst-case. RT sistemlerde Max değeri kritiktir ve tutarlı kalmalıdır.</p>
+
+  <h3>Histogram analizi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>histogram.sh</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Histogram verisi üret (200 µs'ye kadar)</span>
+<span class="cmd">sudo cyclictest</span> <span class="flag">-p</span> 99 <span class="flag">-t</span> 4 <span class="flag">-n</span> <span class="flag">-i</span> 1000 <span class="flag">-l</span> 1000000 \
+  --histogram=200 --histfile=histogram.dat
+
+<span class="cmt"># gnuplot ile görselleştir</span>
+<span class="cmd">cat</span> &gt; plot.gp &lt;&lt;'EOF'
+set terminal png size 900,400
+set output "latency.png"
+set title "Latency Histogram — PREEMPT_RT"
+set xlabel "Latency (µs)"
+set ylabel "Occurrences"
+set logscale y
+plot "histogram.dat" using 1:2 with impulses lc rgb "#9ab6ff" title "CPU0", \
+     "histogram.dat" using 1:3 with impulses lc rgb "#b07dcc" title "CPU1"
+EOF
+<span class="cmd">gnuplot</span> plot.gp</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Ölçüm sırasında sisteme yük bindirin: <code class="inline">stress-ng --cpu 4 --io 2 &amp;</code> komutuyla. Boşta düşük latency elde edip gerçek yük altında kötü performans görmek, yanlış bir güven yaratır. Worst-case her zaman yük altında ölçülmelidir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>cyclictest çalışma prensibi: RT thread + clock_nanosleep delta ölçümü</li>
+      <li>Temel kullanım: <code class="inline">cyclictest -p 99 -t 4 -n -i 1000 -l 100000</code></li>
+      <li>Parametre tablosu: -p, -t, -n, -i, -l, -a, -q, --histogram</li>
+      <li>RT kernel ile standart kernel latency karşılaştırması</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Priority inversion ve priority inheritance</h2>
+  <p class="section-lead">Priority inversion, düşük öncelikli bir task'ın mutex tutması nedeniyle yüksek öncelikli task'ı bloke ettiği klasik RT tuzağıdır — Mars Pathfinder bunu 1997'de uzayda yaşadı.</p>
+
+  <h3>Senaryo: priority inversion nasıl oluşur?</h3>
+
+  <div class="flow">
+    <pre>
+  LOW   task (prio=10)  → mutex al → çalışıyor
+  MED   task (prio=50)  → LOW'u preempt et → CPU'yu meşgul tut
+  HIGH  task (prio=90)  → mutex bekle → LOW çalışamıyor çünkü MED bloke etti
+
+  Sonuç: HIGH prio=90 task, prio=50 MED task tamamlanana kadar bekler.
+         Bu "inversion" — yüksek öncelik, düşük önceliğin altında işlenir.
+    </pre>
+  </div>
+
+  <h3>Mars Pathfinder krizi (1997)</h3>
+
+  <p>VxWorks RTOS üzerinde çalışan Mars Pathfinder'ın bilgi servisi, priority inversion nedeniyle watchdog timer'ı tetikledi ve sistemin kendini sıfırlamasına neden oldu. Düşük öncelikli meteorolojik veri toplama task'ı, bilgi servisinin beklediği bir mutex'i tutuyordu. Orta öncelikli bir task bu esnada sürekli çalışarak düşük öncelikli task'ın bitmesini engelliyordu. Bu bug görev planlamasında zaten bilinen, ancak ground test'te görülmemiş bir senaryoydu.</p>
+
+  <h3>Çözüm: Priority Inheritance</h3>
+
+  <p>Priority inheritance protokolünde, yüksek öncelikli bir task bir mutex'i almaya çalıştığında kernel, o mutex'i tutan task'ın önceliğini geçici olarak yüksek öncelikli task'ın seviyesine çeker. Mutex serbest bırakılınca orijinal öncelik geri yüklenir.</p>
+
+  <div class="flow">
+    <pre>
+  LOW (prio=10) mutex tutarken HIGH (prio=90) beklerse:
+       │
+       ▼  priority inheritance devreye girer
+  LOW task geçici olarak prio=90 alır
+       │
+       └─ MED task (prio=50) artık LOW'u preempt edemez
+       └─ LOW mutex'i bitirir ve HIGH'a bırakır → orijinal prio=10'a döner
+    </pre>
+  </div>
+
+  <h3>POSIX API: priority inheritance mutex</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>priority_inherit.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">&lt;pthread.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdio.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdlib.h&gt;</span>
+
+<span class="keyword">static</span> <span class="field">pthread_mutex_t</span> g_mutex;
+
+<span class="keyword">void</span> <span class="cmd">init_pi_mutex</span>(<span class="keyword">void</span>) {
+    <span class="field">pthread_mutexattr_t</span> attr;
+
+    <span class="cmt">/* mutex attribute nesnesi oluştur */</span>
+    <span class="cmd">pthread_mutexattr_init</span>(&amp;attr);
+
+    <span class="cmt">/* PTHREAD_PRIO_INHERIT: mutex bekleyen yüksek prio task varsa
+       tutan task'ın prio'sunu geçici yükselt */</span>
+    <span class="cmd">pthread_mutexattr_setprotocol</span>(&amp;attr, <span class="flag">PTHREAD_PRIO_INHERIT</span>);
+
+    <span class="cmt">/* Mutex tipini ERRORCHECK yap (debug için) */</span>
+    <span class="cmd">pthread_mutexattr_settype</span>(&amp;attr, <span class="flag">PTHREAD_MUTEX_ERRORCHECK</span>);
+
+    <span class="cmd">pthread_mutex_init</span>(&amp;g_mutex, &amp;attr);
+    <span class="cmd">pthread_mutexattr_destroy</span>(&amp;attr);
+}
+
+<span class="keyword">int</span> <span class="cmd">main</span>(<span class="keyword">void</span>) {
+    <span class="cmd">init_pi_mutex</span>();
+    <span class="cmt">/* ... RT task'lar bu mutex'i kullanır ... */</span>
+    <span class="cmd">pthread_mutex_destroy</span>(&amp;g_mutex);
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <h3>Priority ceiling alternatifi</h3>
+
+  <p><code class="inline">PTHREAD_PRIO_CEILING</code> protokolünde mutex'e sabit bir tavan önceliği atanır. Mutex'i alan her task, o tavan önceliğine çekilir. Inheritance'dan farkı: bekleme olmadan tavan uygulanır, böylece blocking tamamen önlenebilir. Ancak tavan değerini statik olarak doğru belirlemek gerekir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>priority_ceiling.c</span><span class="dot">●</span></div>
+    <pre><code><span class="field">pthread_mutexattr_t</span> attr;
+<span class="cmd">pthread_mutexattr_init</span>(&amp;attr);
+<span class="cmd">pthread_mutexattr_setprotocol</span>(&amp;attr, <span class="flag">PTHREAD_PRIO_CEILING</span>);
+<span class="cmt">/* Tavan: sistemi kullanan en yüksek RT prio + 1 */</span>
+<span class="cmd">pthread_mutexattr_setprioceiling</span>(&amp;attr, 91);
+<span class="cmd">pthread_mutex_init</span>(&amp;g_mutex, &amp;attr);</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>PREEMPT_RT olmayan standart kernel üzerinde <span class="flag">PTHREAD_PRIO_INHERIT</span> desteği POSIX uyumludur ama RT spinlock dönüşümleri yoktur; dolayısıyla kernel içi priority inversion tam olarak çözülmez. Gerçek RT güvencesi için PREEMPT_RT zorunludur.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Priority inversion mekanizması: LOW mutex tutar, HIGH bekler, MED bloke eder</li>
+      <li>Mars Pathfinder 1997 — gerçek dünya vakası</li>
+      <li>PTHREAD_PRIO_INHERIT ile priority inheritance mutex kurulumu</li>
+      <li>Priority ceiling alternatifi ve farkı</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> RT task yazımı</h2>
+  <p class="section-lead">Doğru yazılmış bir RT task: memory kilitler, önceliğini ayarlar, stack'i prefault eder ve kesin zamanlamayla döngü çalıştırır.</p>
+
+  <h3>Scheduling policy seçimi</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Policy</th><th>Davranış</th><th>Kullanım</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><span class="flag">SCHED_FIFO</span></td><td>Aynı öncelikte preempt olmaz, önce gelen bekler</td><td>Deterministik RT task'lar</td></tr>
+      <tr><td><span class="flag">SCHED_RR</span></td><td>FIFO + round-robin time quantum</td><td>Eşit öncelikli RT task'lar arası adillik</td></tr>
+      <tr><td><span class="flag">SCHED_DEADLINE</span></td><td>CBS (Constant Bandwidth Server): runtime, deadline, period</td><td>Sporadic task'lar, EDF scheduling</td></tr>
+      <tr><td><span class="flag">SCHED_OTHER</span></td><td>CFS, normal nice-based</td><td>RT olmayan görevler</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Tam RT task iskeleti</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>rt_task.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#define</span> _GNU_SOURCE
+<span class="keyword">#include</span> <span class="str">&lt;pthread.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;sched.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;sys/mman.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;string.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;time.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdio.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;errno.h&gt;</span>
+
+<span class="keyword">#define</span> <span class="flag">PERIOD_NS</span>     1000000LL   <span class="cmt">/* 1 ms */</span>
+<span class="keyword">#define</span> <span class="flag">RT_PRIORITY</span>   90
+<span class="keyword">#define</span> <span class="flag">STACK_PREFAULT</span> (8 * 1024 * 1024)  <span class="cmt">/* 8 MB */</span>
+
+<span class="cmt">/* Zaman yardımcıları */</span>
+<span class="keyword">static</span> <span class="keyword">inline</span> <span class="keyword">void</span> <span class="cmd">timespec_add_ns</span>(<span class="keyword">struct</span> <span class="field">timespec</span> *ts, <span class="keyword">long long</span> ns) {
+    ts-&gt;<span class="field">tv_nsec</span> += ns;
+    <span class="keyword">while</span> (ts-&gt;<span class="field">tv_nsec</span> &gt;= 1000000000LL) {
+        ts-&gt;<span class="field">tv_sec</span>++;
+        ts-&gt;<span class="field">tv_nsec</span> -= 1000000000LL;
+    }
+}
+
+<span class="keyword">void</span> *<span class="cmd">rt_task_func</span>(<span class="keyword">void</span> *arg) {
+    <span class="keyword">struct</span> <span class="field">timespec</span> next;
+    <span class="keyword">unsigned char</span> stack_buf[<span class="flag">STACK_PREFAULT</span>];
+
+    <span class="cmt">/* ── Adım 1: Stack prefault — page fault'ları RT döngüsü dışına al ── */</span>
+    <span class="cmd">memset</span>(stack_buf, 0, <span class="keyword">sizeof</span>(stack_buf));
+
+    <span class="cmt">/* ── Adım 2: Scheduling policy ve öncelik ayarla ── */</span>
+    <span class="keyword">struct</span> <span class="field">sched_param</span> sp = { .<span class="field">sched_priority</span> = <span class="flag">RT_PRIORITY</span> };
+    <span class="keyword">if</span> (<span class="cmd">pthread_setschedparam</span>(<span class="cmd">pthread_self</span>(), <span class="flag">SCHED_FIFO</span>, &amp;sp) != 0) {
+        <span class="cmd">perror</span>(<span class="str">"pthread_setschedparam"</span>);
+        <span class="keyword">return</span> NULL;
+    }
+
+    <span class="cmt">/* ── Adım 3: CPU affinity — bu thread'i CPU2'ye pinle ── */</span>
+    <span class="field">cpu_set_t</span> cpuset;
+    <span class="cmd">CPU_ZERO</span>(&amp;cpuset);
+    <span class="cmd">CPU_SET</span>(2, &amp;cpuset);
+    <span class="cmd">pthread_setaffinity_np</span>(<span class="cmd">pthread_self</span>(), <span class="keyword">sizeof</span>(cpuset), &amp;cpuset);
+
+    <span class="cmt">/* ── Adım 4: Başlangıç zamanı al ── */</span>
+    <span class="cmd">clock_gettime</span>(<span class="flag">CLOCK_MONOTONIC</span>, &amp;next);
+
+    <span class="keyword">while</span> (1) {
+        <span class="cmt">/* Bir sonraki periyota ilerle */</span>
+        <span class="cmd">timespec_add_ns</span>(&amp;next, <span class="flag">PERIOD_NS</span>);
+
+        <span class="cmt">/* Mutlak zamana kadar bekle (TIMER_ABSTIME: drift birikmez) */</span>
+        <span class="cmd">clock_nanosleep</span>(<span class="flag">CLOCK_MONOTONIC</span>, <span class="flag">TIMER_ABSTIME</span>, &amp;next, NULL);
+
+        <span class="cmt">/* ── Gerçek RT çalışma kodu buraya ── */</span>
+        <span class="cmd">do_control_loop</span>();
+    }
+    <span class="keyword">return</span> NULL;
+}
+
+<span class="keyword">int</span> <span class="cmd">main</span>(<span class="keyword">void</span>) {
+    <span class="cmt">/* ── Tüm memory'yi kilitle: page fault RT döngüsünde olmasın ── */</span>
+    <span class="keyword">if</span> (<span class="cmd">mlockall</span>(<span class="flag">MCL_CURRENT</span> | <span class="flag">MCL_FUTURE</span>) != 0) {
+        <span class="cmd">perror</span>(<span class="str">"mlockall"</span>);
+        <span class="keyword">return</span> 1;
+    }
+
+    <span class="field">pthread_t</span> tid;
+    <span class="keyword">pthread_attr_t</span> attr;
+    <span class="cmd">pthread_attr_init</span>(&amp;attr);
+    <span class="cmt">/* Stack boyutunu büyüt */</span>
+    <span class="cmd">pthread_attr_setstacksize</span>(&amp;attr, 8 * 1024 * 1024);
+
+    <span class="cmd">pthread_create</span>(&amp;tid, &amp;attr, rt_task_func, NULL);
+    <span class="cmd">pthread_join</span>(tid, NULL);
+
+    <span class="cmd">munlockall</span>();
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <h3>mlockall: neden zorunlu?</h3>
+
+  <p><code class="inline">mlockall(MCL_CURRENT | MCL_FUTURE)</code> process'in tüm sayfalarını fiziksel RAM'de kilitler. ÇağrılmazsA, RT thread ilk kez bir bellek sayfasına eriştiğinde Linux page fault üretir. Page fault handler kernel içinde uzun süre çalışabilir ve worst-case latency'yi onlarca milisaniye artırır. <code class="inline">MCL_FUTURE</code> ile gelecekte yapılacak <code class="inline">malloc</code> çağrıları da otomatik kilitlenir.</p>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p><code class="inline">mlockall</code> root yetkisi gerektirir. Alternativ olarak <code class="inline">setcap cap_ipc_lock+ep ./myapp</code> ile capability bazlı izin verilebilir. Üretim sistemlerinde yetkiyi minimize etmek için capability yaklaşımı tercih edin.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>SCHED_FIFO, SCHED_RR, SCHED_DEADLINE farkları</li>
+      <li>RT task başlatma sırası: mlockall → öncelik → prefault → döngü</li>
+      <li>clock_nanosleep + TIMER_ABSTIME ile drift-free periyodik zamanlama</li>
+      <li>pthread_setaffinity_np ile CPU pinleme</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Threaded IRQ</h2>
+  <p class="section-lead">PREEMPT_RT'nin en önemli yeniliklerinden biri: interrupt handler'ları kernel thread'lerine taşıyarak her yerden preempt edilebilir hâle getirmek.</p>
+
+  <h3>Standart kernel: top-half / bottom-half modeli</h3>
+
+  <div class="flow">
+    <pre>
+  Standart kernel IRQ akışı:
+  ─────────────────────────────────────────────────────────
+  donanım interrupt
+       │
+       ▼
+  top-half handler (non-preemptible, hızlı, kısa)
+       │  IRQ disable sırasında çalışır
+       ▼
+  softirq / tasklet (bottom-half, hâlâ non-preemptible segment)
+       │
+       ▼
+  kernel thread / workqueue (preemptible, ama geç)
+  ─────────────────────────────────────────────────────────
+  PREEMPT_RT kernel IRQ akışı:
+  ─────────────────────────────────────────────────────────
+  donanım interrupt
+       │
+       ▼
+  IRQ kernel thread (irq/XX-devname, SCHED_FIFO, preemptible)
+       │  Diğer RT task'lar bunu preempt edebilir
+       ▼
+  handler tamamlanır → thread uyur
+    </pre>
+  </div>
+
+  <h3>IRQ thread'lerini görme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>terminal</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># /proc/interrupts: her CPU'da interrupt sayıları</span>
+<span class="cmd">cat</span> /proc/interrupts | head -20
+
+<span class="cmt"># IRQ kernel thread'lerini listele (irq/ prefix'i ile)</span>
+<span class="cmd">ps</span> -eo pid,policy,rtprio,comm | <span class="cmd">grep</span> <span class="str">"^.*irq"</span>
+<span class="cmt"># Örnek çıktı:
+#  234 FF  50 irq/32-eth0
+#  235 FF  50 irq/33-snd_hda
+#  189 FF  50 irq/16-ehci_hcd</span>
+
+<span class="cmt"># Belirli IRQ'nun thread bilgisi</span>
+<span class="cmd">cat</span> /proc/irq/32/sched</code></pre>
+  </div>
+
+  <h3>IRQ thread priority ayarlama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>terminal</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># IRQ thread PID'ini bul</span>
+<span class="cmd">IRQ_PID</span>=$(ps -eo pid,comm | <span class="cmd">awk</span> <span class="str">'/irq\/32-eth0/{print $1}'</span>)
+
+<span class="cmt"># Priority'yi SCHED_FIFO:90 yap</span>
+<span class="cmd">sudo chrt</span> <span class="flag">-f</span> <span class="flag">-p</span> 90 $IRQ_PID
+
+<span class="cmt"># Veya doğrudan PID ile</span>
+<span class="cmd">sudo chrt</span> <span class="flag">-f</span> <span class="flag">-p</span> 90 234</code></pre>
+  </div>
+
+  <h3>IRQF_NO_THREAD bayrağı</h3>
+
+  <p>Bazı eski donanım sürücüleri veya zaman kritik kesmeler için IRQ handler'ın thread'e taşınması istenmiyor olabilir. Sürücü içinde <code class="inline">IRQF_NO_THREAD</code> bayrağı ile thread dönüşümü engellenir:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>driver.c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Legacy donanım: threaded IRQ istemiyoruz */</span>
+<span class="cmd">request_irq</span>(irq_num, my_handler,
+            <span class="flag">IRQF_SHARED</span> | <span class="flag">IRQF_NO_THREAD</span>,
+            <span class="str">"my_legacy_device"</span>, dev);
+
+<span class="cmt">/* Modern sürücü: threaded IRQ tercih edilir */</span>
+<span class="cmd">request_threaded_irq</span>(irq_num,
+    my_hardirq_handler,   <span class="cmt">/* top-half: hızlı, ACK yeterli */</span>
+    my_thread_handler,    <span class="cmt">/* bottom-half: thread içinde çalışır */</span>
+    <span class="flag">IRQF_ONESHOT</span>,
+    <span class="str">"my_device"</span>, dev);</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>IRQ thread'lerinin varsayılan önceliği genellikle <code class="inline">SCHED_FIFO:50</code>'dir. RT uygulamanız bu IRQ thread'lerinden daha yüksek öncelikte çalışıyorsa (örn. prio=90), interrupt işlenirken uygulamanız preempt edilmez — bu RT tasarımında bilinçli bir karar olmalıdır.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Standart kernel top-half/bottom-half modeli vs PREEMPT_RT threaded IRQ</li>
+      <li>/proc/interrupts ve ps ile IRQ thread'lerini izleme</li>
+      <li>chrt ile IRQ thread önceliği ayarlama</li>
+      <li>IRQF_NO_THREAD ve request_threaded_irq kullanımı</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> CPU isolation ve affinity</h2>
+  <p class="section-lead">RT task'ları belirli CPU çekirdeklerine pinleyip bu çekirdekleri genel scheduler'dan ayırmak, en etkili latency azaltma tekniklerinden biridir.</p>
+
+  <h3>isolcpus kernel boot parametresi</h3>
+
+  <p>En kolay CPU izolasyon yöntemi, kernel komut satırına <code class="inline">isolcpus=</code> parametresi eklemektir. Bu parametre, belirtilen CPU'ları Linux CFS scheduler'ından çıkarır; o CPU'lara yalnızca affinity ile açıkça atanan task'lar yerleştirilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/default/grub</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># CPU 2 ve 3'ü izole et (4 çekirdekli sistemde)</span>
+GRUB_CMDLINE_LINUX_DEFAULT=<span class="str">"quiet isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3"</span>
+
+<span class="cmt"># Değişikliği uygula</span>
+<span class="cmt"># sudo update-grub &amp;&amp; sudo reboot</span></code></pre>
+  </div>
+
+  <p><code class="inline">nohz_full=2,3</code> ile izole CPU'larda timer tick devre dışı bırakılır (tickless mode). <code class="inline">rcu_nocbs=2,3</code> ile RCU callback'leri izole CPU'lardan uzaklaştırılır. Her ikisi de latency'yi önemli ölçüde düşürür.</p>
+
+  <h3>taskset ile affinity</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>terminal</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Uygulamayı CPU 2'de başlat</span>
+<span class="cmd">sudo taskset</span> <span class="flag">-c</span> 2 ./rt_app
+
+<span class="cmt"># Çalışan process'in affinity'sini değiştir</span>
+<span class="cmd">sudo taskset</span> <span class="flag">-c</span> 2,3 <span class="flag">-p</span> $PID
+
+<span class="cmt"># Mevcut affinity'yi oku</span>
+<span class="cmd">taskset</span> <span class="flag">-c</span> <span class="flag">-p</span> $PID</code></pre>
+  </div>
+
+  <h3>cpuset ile gelişmiş izolasyon</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>cpuset-isolation.sh</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># cset kurulumu</span>
+<span class="cmd">sudo apt install</span> cpuset
+
+<span class="cmt"># RT shield oluştur: CPU 2,3 için (kthread'ler dahil)</span>
+<span class="cmd">sudo cset shield</span> <span class="flag">--cpu</span>=2,3 <span class="flag">--kthread</span>=on
+
+<span class="cmt"># RT uygulamayı shield içine al</span>
+<span class="cmd">sudo cset shield</span> <span class="flag">--exec</span> ./rt_app
+
+<span class="cmt"># Shield durumunu göster</span>
+<span class="cmd">sudo cset shield</span> <span class="flag">--shield</span>
+
+<span class="cmt"># Shield'i kaldır</span>
+<span class="cmd">sudo cset shield</span> <span class="flag">--reset</span></code></pre>
+  </div>
+
+  <h3>IRQ affinity: kesmeler RT CPU'lardan uzaklaştır</h3>
+
+  <p>RT CPU'larda interrupt yaşanması latency'yi bozar. IRQ'ları RT olmayan CPU'lara yönlendirmek için <code class="inline">smp_affinity</code> kullanılır. Değer CPU bitmask'tir (hex).</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>irq-affinity.sh</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># IRQ 32'yi CPU 0 ve 1'e yönlendir (bitmask: 0x3 = CPU0+CPU1)</span>
+<span class="cmd">echo</span> 3 | <span class="cmd">sudo tee</span> /proc/irq/32/<span class="field">smp_affinity</span>
+
+<span class="cmt"># Tüm IRQ'ları CPU 0,1'e yönlendirmek için döngü</span>
+<span class="keyword">for</span> irq <span class="keyword">in</span> /proc/irq/[0-9]*/smp_affinity; <span class="keyword">do</span>
+    <span class="cmd">echo</span> 3 | <span class="cmd">sudo tee</span> $irq 2&gt;/dev/null
+<span class="keyword">done</span>
+
+<span class="cmt"># irqbalance servisini durdur (RT sistemde otomatik IRQ taşımasını kapat)</span>
+<span class="cmd">sudo systemctl stop</span> irqbalance
+<span class="cmd">sudo systemctl disable</span> irqbalance</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p><code class="inline">irqbalance</code> servisi çalışıyorsa IRQ affinity ayarlarınızı periyodik olarak sıfırlayabilir. RT sistemlerde bu servisi mutlaka devre dışı bırakın.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>isolcpus + nohz_full + rcu_nocbs: kernel parametreleri ile tam CPU izolasyonu</li>
+      <li>taskset ve cset shield ile çalışma zamanı CPU pinleme</li>
+      <li>/proc/irq/XX/smp_affinity ile IRQ'ları RT CPU'lardan uzaklaştırma</li>
+      <li>irqbalance servisini RT sistemde devre dışı bırakma</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Latency kaynakları ve ftrace</h2>
+  <p class="section-lead">Worst-case latency'nin kökeni genellikle yazılım değil; SMI, BIOS C-state geçişleri ve memory subsystem'daki deterministik olmayan davranışlardır.</p>
+
+  <h3>Latency kaynakları tablosu</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Kaynak</th><th>Tipik Etki</th><th>Tespit Yöntemi</th><th>Çözüm</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>SMI (System Management Interrupt)</td><td>100 µs – 10 ms</td><td>hwlatdetect</td><td>BIOS'ta devre dışı bırak</td></tr>
+      <tr><td>CPU C-state geçişleri</td><td>50 – 500 µs</td><td>cyclictest + powertop</td><td>C1 dışındakileri kapat</td></tr>
+      <tr><td>Turbo Boost / frequency scaling</td><td>10 – 200 µs</td><td>cpufreq-info</td><td>Sabit frekans, performance gov.</td></tr>
+      <tr><td>Page fault</td><td>1 – 50 µs</td><td>perf stat -e page-faults</td><td>mlockall + prefault</td></tr>
+      <tr><td>Lock contention</td><td>1 – 100 µs</td><td>ftrace lockdep</td><td>Lock granülasyonu, lock-free yapı</td></tr>
+      <tr><td>Scheduling overhead</td><td>1 – 20 µs</td><td>sched_switch trace</td><td>CPU affinity, isolcpus</td></tr>
+      <tr><td>Hyperthreading</td><td>10 – 100 µs</td><td>cyclictest with HT on/off</td><td>BIOS'ta kapat veya core izole et</td></tr>
+    </tbody>
+  </table>
+
+  <h3>hwlatdetect ile SMI tespiti</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>terminal</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># rt-tests içinde gelir</span>
+<span class="cmd">sudo hwlatdetect</span> <span class="flag">--duration</span>=60 <span class="flag">--threshold</span>=10
+
+<span class="cmt"># Örnek çıktı — SMI yakalandıysa:</span>
+<span class="cmt"># hwlatdetect:  0 samples &gt; threshold (10 us)</span>
+<span class="cmt"># hwlatdetect:  Maximum latency: 8.12 us</span>
+
+<span class="cmt"># SMI varsa:</span>
+<span class="cmt"># hwlatdetect:  3 samples &gt; threshold (10 us)</span>
+<span class="cmt"># hwlatdetect:  Maximum latency: 47.3 us   ← BIOS SMI</span></code></pre>
+  </div>
+
+  <h3>tracecmd ile scheduling olayları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>ftrace-latency.sh</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># trace-cmd kur</span>
+<span class="cmd">sudo apt install</span> trace-cmd
+
+<span class="cmt"># RT process'in scheduling olaylarını kaydet (5 saniye)</span>
+<span class="cmd">sudo trace-cmd record</span> <span class="flag">-e</span> sched_switch <span class="flag">-P</span> $RT_PID <span class="flag">-s</span> 5000 &amp;
+<span class="cmd">sudo ./rt_app</span> &amp;
+<span class="cmd">wait</span>
+
+<span class="cmt"># Raporu görüntüle</span>
+<span class="cmd">trace-cmd report</span> | head -50</code></pre>
+  </div>
+
+  <h3>ftrace preemptirq tracer</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>ftrace-preemptirq.sh</span><span class="dot">●</span></div>
+    <pre><code><span class="field">TRACING</span>=<span class="str">/sys/kernel/debug/tracing</span>
+
+<span class="cmt"># preemptirq latency tracer'ı etkinleştir</span>
+<span class="cmd">echo</span> preemptirq | <span class="cmd">sudo tee</span> $TRACING/<span class="field">current_tracer</span>
+
+<span class="cmt"># Latency eşiğini 50 µs olarak ayarla</span>
+<span class="cmd">echo</span> 50 | <span class="cmd">sudo tee</span> $TRACING/<span class="field">tracing_thresh</span>
+
+<span class="cmt"># Tracer'ı başlat</span>
+<span class="cmd">echo</span> 1 | <span class="cmd">sudo tee</span> $TRACING/<span class="field">tracing_on</span>
+
+<span class="cmt"># ... RT uygulamayı çalıştır ...</span>
+
+<span class="cmt"># Worst-case latency değerini oku</span>
+<span class="cmd">cat</span> $TRACING/<span class="field">tracing_max_latency</span>
+
+<span class="cmt"># Trace verisini al (worst-case olayı içerir)</span>
+<span class="cmd">cat</span> $TRACING/<span class="field">trace</span> | head -100
+
+<span class="cmt"># Tracer'ı sıfırla</span>
+<span class="cmd">echo</span> nop | <span class="cmd">sudo tee</span> $TRACING/<span class="field">current_tracer</span></code></pre>
+  </div>
+
+  <h3>BIOS ayarları: RT için gerekli değişiklikler</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>BIOS Ayarı</th><th>RT Öneri</th><th>Nedeni</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>C-States</td><td>C1 dışındakileri kapat</td><td>C3/C6 geçişi yüzlerce µs sürer</td></tr>
+      <tr><td>Turbo Boost</td><td>Kapat</td><td>Frekans değişimi latency jitter yaratır</td></tr>
+      <tr><td>Hyperthreading</td><td>Kapat veya izole et</td><td>Shared execution unit contention</td></tr>
+      <tr><td>SMI</td><td>Mümkünse kapat (donanıma bağlı)</td><td>BIOS kaynaklı non-maskable interrupt</td></tr>
+      <tr><td>NUMA Interleaving</td><td>Kapat (NUMA sistemlerde)</td><td>Uzak NUMA node erişimi yüksek latency</td></tr>
+    </tbody>
+  </table>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Latency kaynakları: SMI, C-state, page fault, lock contention, hyperthreading</li>
+      <li>hwlatdetect ile hardware/SMI kaynaklı latency tespiti</li>
+      <li>trace-cmd ve ftrace preemptirq tracer ile scheduling analizi</li>
+      <li>BIOS optimizasyon listesi: RT sistem için kapatılması gerekenler</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: motor kontrolcü örneği</h2>
+  <p class="section-lead">1 kHz periyodik kontrol döngüsü, worst-case 100 µs latency hedefi: RT kernel, CPU izolasyonu ve jitter monitörü bir araya getirilir.</p>
+
+  <h3>Sistem konfigürasyonu</h3>
+
+  <p>Test sistemi: 4 çekirdekli x86_64, PREEMPT_RT kernel 6.6-rt. CPU 2 izole edilir, RT task bu CPU'ya pinlenir. IRQ'lar CPU 0,1'e yönlendirilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>boot parametreleri</span><span class="dot">●</span></div>
+    <pre><code>GRUB_CMDLINE_LINUX_DEFAULT=<span class="str">"quiet isolcpus=2 nohz_full=2 rcu_nocbs=2 \
+  processor.max_cstate=1 intel_idle.max_cstate=0 \
+  intel_pstate=disable cpufreq.default_governor=performance"</span></code></pre>
+  </div>
+
+  <h3>Motor kontrolcü RT task</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>motor_control.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#define</span> _GNU_SOURCE
+<span class="keyword">#include</span> <span class="str">&lt;pthread.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;sched.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;sys/mman.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;time.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdio.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;string.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdint.h&gt;</span>
+
+<span class="keyword">#define</span> <span class="flag">PERIOD_NS</span>      1000000LL    <span class="cmt">/* 1 ms = 1 kHz */</span>
+<span class="keyword">#define</span> <span class="flag">RT_CPU</span>         2
+<span class="keyword">#define</span> <span class="flag">RT_PRIO</span>        90
+<span class="keyword">#define</span> <span class="flag">JITTER_LIMIT</span>   100000LL     <span class="cmt">/* 100 µs worst-case hedef */</span>
+<span class="keyword">#define</span> <span class="flag">LOG_SIZE</span>       10000
+
+<span class="keyword">static</span> <span class="keyword">long long</span> jitter_log[<span class="flag">LOG_SIZE</span>];
+<span class="keyword">static</span> <span class="keyword">int</span>       jitter_idx = 0;
+<span class="keyword">static</span> <span class="keyword">long long</span> max_jitter = 0;
+
+<span class="keyword">static</span> <span class="keyword">inline</span> <span class="keyword">long long</span> <span class="cmd">ts_to_ns</span>(<span class="keyword">const struct</span> <span class="field">timespec</span> *ts) {
+    <span class="keyword">return</span> (<span class="keyword">long long</span>)ts-&gt;<span class="field">tv_sec</span> * 1000000000LL + ts-&gt;<span class="field">tv_nsec</span>;
+}
+
+<span class="keyword">void</span> *<span class="cmd">motor_ctrl_thread</span>(<span class="keyword">void</span> *arg) {
+    <span class="keyword">struct</span> <span class="field">timespec</span> now, next;
+    <span class="keyword">unsigned char</span> prefault_buf[1024 * 1024];
+
+    <span class="cmt">/* Stack prefault */</span>
+    <span class="cmd">memset</span>(prefault_buf, 0, <span class="keyword">sizeof</span>(prefault_buf));
+
+    <span class="cmt">/* SCHED_FIFO priority */</span>
+    <span class="keyword">struct</span> <span class="field">sched_param</span> sp = { .<span class="field">sched_priority</span> = <span class="flag">RT_PRIO</span> };
+    <span class="cmd">pthread_setschedparam</span>(<span class="cmd">pthread_self</span>(), <span class="flag">SCHED_FIFO</span>, &amp;sp);
+
+    <span class="cmt">/* CPU affinity: sadece RT_CPU */</span>
+    <span class="field">cpu_set_t</span> cpuset;
+    <span class="cmd">CPU_ZERO</span>(&amp;cpuset);
+    <span class="cmd">CPU_SET</span>(<span class="flag">RT_CPU</span>, &amp;cpuset);
+    <span class="cmd">pthread_setaffinity_np</span>(<span class="cmd">pthread_self</span>(), <span class="keyword">sizeof</span>(cpuset), &amp;cpuset);
+
+    <span class="cmt">/* Başlangıç zamanı */</span>
+    <span class="cmd">clock_gettime</span>(<span class="flag">CLOCK_MONOTONIC</span>, &amp;next);
+
+    <span class="keyword">while</span> (1) {
+        <span class="cmt">/* Bir sonraki wake-up zamanı */</span>
+        <span class="keyword">long long</span> target_ns = <span class="cmd">ts_to_ns</span>(&amp;next) + <span class="flag">PERIOD_NS</span>;
+        next.<span class="field">tv_sec</span>  = target_ns / 1000000000LL;
+        next.<span class="field">tv_nsec</span> = target_ns % 1000000000LL;
+
+        <span class="cmd">clock_nanosleep</span>(<span class="flag">CLOCK_MONOTONIC</span>, <span class="flag">TIMER_ABSTIME</span>, &amp;next, NULL);
+
+        <span class="cmt">/* Gerçek wake-up zamanını ölç */</span>
+        <span class="cmd">clock_gettime</span>(<span class="flag">CLOCK_MONOTONIC</span>, &amp;now);
+        <span class="keyword">long long</span> actual_ns  = <span class="cmd">ts_to_ns</span>(&amp;now);
+        <span class="keyword">long long</span> jitter     = actual_ns - target_ns;
+        <span class="keyword">if</span> (jitter &lt; 0) jitter = -jitter;
+
+        <span class="cmt">/* Jitter log */</span>
+        <span class="keyword">if</span> (jitter_idx &lt; <span class="flag">LOG_SIZE</span>)
+            jitter_log[jitter_idx++] = jitter;
+        <span class="keyword">if</span> (jitter &gt; max_jitter) {
+            max_jitter = jitter;
+            <span class="keyword">if</span> (jitter &gt; <span class="flag">JITTER_LIMIT</span>)
+                <span class="cmd">fprintf</span>(stderr,
+                    <span class="str">"[WARN] jitter = %lld ns (limit: %lld ns)\n"</span>,
+                    jitter, <span class="flag">JITTER_LIMIT</span>);
+        }
+
+        <span class="cmt">/* ── Motor control loop ── */</span>
+        <span class="cmd">read_encoder</span>();
+        <span class="cmd">compute_pid</span>();
+        <span class="cmd">write_pwm</span>();
+    }
+    <span class="keyword">return</span> NULL;
+}
+
+<span class="keyword">int</span> <span class="cmd">main</span>(<span class="keyword">void</span>) {
+    <span class="keyword">if</span> (<span class="cmd">mlockall</span>(<span class="flag">MCL_CURRENT</span> | <span class="flag">MCL_FUTURE</span>)) {
+        <span class="cmd">perror</span>(<span class="str">"mlockall"</span>); <span class="keyword">return</span> 1;
+    }
+
+    <span class="field">pthread_t</span> tid;
+    <span class="cmd">pthread_create</span>(&amp;tid, NULL, motor_ctrl_thread, NULL);
+    <span class="cmd">pthread_join</span>(tid, NULL);
+
+    <span class="cmd">printf</span>(<span class="str">"Max jitter observed: %lld ns\n"</span>, max_jitter);
+    <span class="cmd">munlockall</span>();
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <h3>Yük altında test</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>stress-test.sh</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># CPU, bellek ve I/O yükü oluştur</span>
+<span class="cmd">stress-ng</span> <span class="flag">--cpu</span> 4 <span class="flag">--io</span> 2 <span class="flag">--vm</span> 1 <span class="flag">--vm-bytes</span> 256M &amp;
+<span class="field">STRESS_PID</span>=$!
+
+<span class="cmt"># RT uygulamayı çalıştır</span>
+<span class="cmd">sudo ./motor_control</span> &amp;
+<span class="field">RT_PID</span>=$!
+
+<span class="cmt"># Aynı anda cyclictest ile bağımsız doğrulama</span>
+<span class="cmd">sudo cyclictest</span> <span class="flag">-p</span> 85 <span class="flag">-t</span> 1 <span class="flag">-a</span> 2 <span class="flag">-n</span> <span class="flag">-i</span> 1000 <span class="flag">-l</span> 60000 <span class="flag">-q</span>
+
+<span class="cmt"># Yükü durdur</span>
+<span class="cmd">kill</span> $STRESS_PID</code></pre>
+  </div>
+
+  <h3>Sonuç metrikleri</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Ölçüm</th><th>Standart Kernel</th><th>PREEMPT_RT + Optimizasyon</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Min latency</td><td>12 µs</td><td>3 µs</td></tr>
+      <tr><td>Avg latency</td><td>95 µs</td><td>8 µs</td></tr>
+      <tr><td>Max latency (yük altında)</td><td class="warn">6.340 µs</td><td class="ok">47 µs</td></tr>
+      <tr><td>100 µs hedef tutuldu mu?</td><td class="secret">Hayır</td><td class="public">Evet</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Bu değerler test donanımına özgüdür. BIOS SMI aktifse, PREEMPT_RT kernel ile bile max latency 100 µs'yi aşabilir. Her üretim sistemi için <code class="inline">hwlatdetect</code> ile SMI taraması yapın ve sonuçları belgeleyin.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Boot parametreleri: isolcpus + nohz_full + C-state devre dışı bırakma</li>
+      <li>Motor kontrol RT task: SCHED_FIFO, CPU affinity, jitter log, TIMER_ABSTIME döngü</li>
+      <li>stress-ng ile yük altında doğrulama testi</li>
+      <li>Standart kernel vs RT kernel: min/avg/max latency karşılaştırması</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

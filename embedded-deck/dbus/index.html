@@ -1,0 +1,1332 @@
+---
+layout: tutorial
+title: "D-Bus — Süreçlerarası İletişim Protokolü"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>D-BUS</span>
+    <span>2026</span>
+  </div>
+  <h1>D-Bus<br><em>Süreçlerarası İletişim</em></h1>
+  <p class="subtitle">systemd, BlueZ ve NetworkManager'ın ortak dili — object model, sd-bus C API, Python bağlaması ve güvenlik politikaları.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">D-Bus nedir</a></li>
+    <li><a href="#s1">Temel kavramlar</a></li>
+    <li><a href="#s2">Introspection ve gdbus</a></li>
+    <li><a href="#s3">Python GDBus bağlaması</a></li>
+    <li><a href="#s4">C ile dbus-1 API</a></li>
+    <li><a href="#s5">sd-bus (libsystemd)</a></li>
+    <li><a href="#s6">Servis yazmak: method ve signal</a></li>
+    <li><a href="#s7">Güvenlik: policy dosyaları</a></li>
+    <li><a href="#s8">Embedded'da D-Bus alternatifleri</a></li>
+    <li><a href="#s9">Pratik: BlueZ D-Bus API</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> D-Bus nedir</h2>
+  <p class="section-lead">D-Bus, Linux'ta süreçler arası iletişim için standart haline gelmiş mesaj yönlendirme protokolüdür; gömülü sistemlerde kaçınılmaz çünkü systemd, BlueZ ve NetworkManager'ın tamamı D-Bus üzerinden konuşur.</p>
+
+  <p>D-Bus (Desktop Bus), 2002 yılında freedesktop.org bünyesinde Red Hat ve GNOME geliştiricileri tarafından standartlaştırıldı. Başlangıçta masaüstü uygulamaları arasında servis keşfi ve olay bildirimi sağlamak için tasarlandı; ancak zamanla Linux sisteminin omurgasına dönüştü. Bugün systemd, servis yönetimini tamamen D-Bus üzerinden yürütür.</p>
+
+  <p>Gömülü Linux'ta D-Bus'tan kaçınmak neredeyse imkânsızdır. BlueZ Bluetooth yığını, NetworkManager ağ konfigürasyonu, udisks2 depolama yönetimi ve PulseAudio ses altyapısı — hepsi D-Bus arayüzü açar. Bu daemon'larla etkileşime girmek için D-Bus protokolünü anlamak zorunludur.</p>
+
+  <h3>IPC mekanizmaları karşılaştırması</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Mekanizma</th><th>Kapsam</th><th>Servis keşfi</th><th>Async event</th><th>Overhead</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Unix pipe</td><td>Parent-child</td><td>Yok</td><td>Yok</td><td>Çok düşük</td></tr>
+        <tr><td>Unix socket</td><td>Tek makine</td><td>Manuel (path)</td><td>epoll/select</td><td>Düşük</td></tr>
+        <tr><td>Shared memory</td><td>Tek makine</td><td>Yok</td><td>Yok (poll gerekli)</td><td>Çok düşük</td></tr>
+        <tr><td>D-Bus</td><td>Tek makine</td><td>Otomatik (bus adı)</td><td>Signal mekanizması</td><td>Orta (daemon)</td></tr>
+        <tr><td>gRPC</td><td>Ağ</td><td>Manuel (host:port)</td><td>Server streaming</td><td>Düşük (binary)</td></tr>
+        <tr><td>MQTT</td><td>Ağ</td><td>Topic tabanlı</td><td>Subscribe</td><td>Düşük</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>D-Bus daemon mimarisi</h3>
+
+  <p>D-Bus, hub-and-spoke modelinde çalışır. Merkezdeki <code class="inline">dbus-daemon</code> süreci tüm mesajları yönlendirir. Hiçbir süreç doğrudan başka bir sürece bağlanmaz; her mesaj önce daemon'a gider, daemon hedef süreci bulur ve iletir.</p>
+
+  <div class="flow">
+    <pre>
+  Süreç A                  dbus-daemon                  Süreç B
+     │                          │                           │
+     │── connect ──────────────▶│                           │
+     │◀─ unique name (:1.47) ───│                           │
+     │                          │◀── connect ───────────────│
+     │                          │─── unique name (:1.91) ──▶│
+     │                          │                           │
+     │── method_call ──────────▶│                           │
+     │   dest: org.example.Svc  │── route ─────────────────▶│
+     │                          │                           │── dispatch
+     │                          │◀── method_return ─────────│
+     │◀── method_return ────────│                           │</pre>
+  </div>
+
+  <h3>Session bus ve system bus</h3>
+
+  <p><strong>System bus</strong> tüm kullanıcıların paylaştığı veriyoludur. Root olarak çalışan daemon'lar burada bulunur. Soket: <span class="path">/run/dbus/system_bus_socket</span>. Gömülü sistemlerde birincil bus budur.</p>
+
+  <p><strong>Session bus</strong> her kullanıcı oturumuna özeldir. Masaüstü uygulamaları bu bus'ı kullanır. <code class="inline">$DBUS_SESSION_BUS_ADDRESS</code> ortam değişkeniyle adreslenir. Gömülü headless sistemlerde genellikle yoktur.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kurulum</span>
+<span class="cmd">apt</span> install dbus libdbus-1-dev
+
+<span class="cmt"># D-Bus daemon durumu</span>
+<span class="cmd">systemctl</span> status dbus
+
+<span class="cmt"># System bus socket</span>
+<span class="cmd">ls</span> <span class="flag">-la</span> /run/dbus/system_bus_socket
+<span class="cmt"># srw-rw-rw- 1 root messagebus 0 ... /run/dbus/system_bus_socket</span>
+
+<span class="cmt"># Session bus adresi (desktop ortamında)</span>
+echo $DBUS_SESSION_BUS_ADDRESS
+<span class="cmt"># unix:path=/run/user/1000/bus</span></code></pre>
+  </div>
+
+  <h3>Embedded Linux'ta hafif alternatifler</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">dbus-broker</span><span class="desc">Sadece routing mantığı, policy yönetimi ayrı süreçte. Daha az bellek, daha iyi performans. Modern dağıtımlarda dbus-daemon'ın yerini alıyor.</span></div>
+    <div class="param"><span class="name">kdbus</span><span class="desc">Kernel-space mesaj yönlendirme; context switch maliyetini ortadan kaldırır. Şu an mainline Linux'ta yok; D-Bus protocol düzeyinde uyumlu.</span></div>
+    <div class="param"><span class="name">sd-bus</span><span class="desc">libsystemd içindeki D-Bus implementasyonu. Doğrudan socket'e yazabilir, daemon bypass mümkün (kdbus/AF_UNIX). En sade ve hızlı C API.</span></div>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Modern systemd tabanlı sistemlerde <code class="inline">dbus.service</code>, <code class="inline">dbus-daemon</code> yerine <code class="inline">dbus-broker</code> çalıştırabilir. API tamamen uyumludur; socket yolu değişmez. <code class="inline">systemctl status dbus.service</code> ile hangi implementasyonun çalıştığını görebilirsiniz.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>D-Bus'ın kökeni ve gömülü Linux'taki rolü</li>
+      <li>Pipe, socket, shared memory ve D-Bus karşılaştırması</li>
+      <li>Hub-and-spoke daemon mimarisi: mesaj yönlendirme akışı</li>
+      <li>System bus ve session bus ayrımı</li>
+      <li>dbus-broker ve sd-bus: hafif embedded alternatifleri</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Temel kavramlar</h2>
+  <p class="section-lead">D-Bus'ın dört temel kavramı — bus name, object path, interface ve member — birlikte bir servis API'sini benzersiz şekilde adresler.</p>
+
+  <h3>Bus name</h3>
+
+  <p>Bus name, bir sürecin D-Bus üzerindeki kimliğidir. İki türü vardır:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Well-known name</span><span class="desc">İnsan tarafından okunabilir, kalıcı isim. Örn: <code class="inline">org.freedesktop.NetworkManager</code>. Servis başladığında talep eder; kapatıldığında serbest kalır.</span></div>
+    <div class="param"><span class="name">Unique name</span><span class="desc">Daemon tarafından bağlantı anında atanan geçici isim. Format: <code class="inline">:1.42</code>. Her bağlantı için tekil, değiştirilemez.</span></div>
+  </div>
+
+  <h3>Object path</h3>
+
+  <p>Bir servis içindeki nesne hiyerarşisini belirtir. Unix dosya yoluna benzer sözdizimi kullanır:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>object paths</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># systemd — root manager nesnesi</span>
+/org/freedesktop/systemd1
+
+<span class="cmt"># Belirli bir unit nesnesi</span>
+/org/freedesktop/systemd1/unit/ssh_2eservice
+
+<span class="cmt"># NetworkManager — aktif bağlantı</span>
+/org/freedesktop/NetworkManager/ActiveConnection/1
+
+<span class="cmt"># BlueZ — Bluetooth adapter</span>
+/org/bluez/hci0
+
+<span class="cmt"># BlueZ — bağlı cihaz</span>
+/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF</code></pre>
+  </div>
+
+  <h3>Interface</h3>
+
+  <p>Bir nesnenin sunduğu API grubuna verilen isim. Bir nesne birden fazla interface implemente edebilir. Her D-Bus nesnesinin implemente etmesi beklenen standart interface'ler vardır:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">org.freedesktop.DBus.Introspectable</span><span class="desc"><code class="inline">Introspect()</code> metodu — nesnenin XML tanımını döner.</span></div>
+    <div class="param"><span class="name">org.freedesktop.DBus.Properties</span><span class="desc"><code class="inline">Get()</code>, <code class="inline">Set()</code>, <code class="inline">GetAll()</code> — property erişimi.</span></div>
+    <div class="param"><span class="name">org.freedesktop.DBus.ObjectManager</span><span class="desc"><code class="inline">GetManagedObjects()</code> — alt nesne hiyerarşisini döner (BlueZ kullanır).</span></div>
+  </div>
+
+  <h3>Method, Signal, Property</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Tür</th><th>Yön</th><th>Yanıt</th><th>Kullanım</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Method</td><td>Client → Service → Client</td><td>Var (method_return veya error)</td><td>İstek-yanıt, RPC çağrısı</td></tr>
+        <tr><td>Signal</td><td>Service → (tüm subscriber'lar)</td><td>Yok</td><td>Asenkron olay bildirimi, broadcast</td></tr>
+        <tr><td>Property</td><td>Get/Set via DBus.Properties</td><td>Var</td><td>Servis durum değişkenleri</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Tür sistemi (type signatures)</h3>
+
+  <p>D-Bus mesajları self-describing'dir: her parametre bir type signature ile tanımlanır. Bu signature introspection XML'inde ve API dokümantasyonunda görünür.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Type code</th><th>C karşılığı</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code class="inline">y</code></td><td>uint8_t</td><td>Byte</td></tr>
+        <tr><td><code class="inline">b</code></td><td>int (0/1)</td><td>Boolean</td></tr>
+        <tr><td><code class="inline">i</code></td><td>int32_t</td><td>32-bit signed integer</td></tr>
+        <tr><td><code class="inline">u</code></td><td>uint32_t</td><td>32-bit unsigned integer</td></tr>
+        <tr><td><code class="inline">t</code></td><td>uint64_t</td><td>64-bit unsigned integer</td></tr>
+        <tr><td><code class="inline">d</code></td><td>double</td><td>IEEE 754 double</td></tr>
+        <tr><td><code class="inline">s</code></td><td>char*</td><td>UTF-8 string (null-terminated)</td></tr>
+        <tr><td><code class="inline">o</code></td><td>char*</td><td>Object path</td></tr>
+        <tr><td><code class="inline">v</code></td><td>variant</td><td>Dinamik tür — içinde başka bir tür</td></tr>
+        <tr><td><code class="inline">a{sv}</code></td><td>GHashTable*</td><td>String-variant sözlük (en yaygın dict)</td></tr>
+        <tr><td><code class="inline">as</code></td><td>char**</td><td>String dizisi</td></tr>
+        <tr><td><code class="inline">(iu)</code></td><td>struct</td><td>int32 + uint32 tuple</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Bus name: well-known (<code class="inline">org.freedesktop.NetworkManager</code>) ve unique (<code class="inline">:1.42</code>) farkı</li>
+      <li>Object path: nesne hiyerarşisini adresleyen Unix-path benzeri sözdizimi</li>
+      <li>Interface: metod ve sinyal koleksiyonu; standart interface'ler</li>
+      <li>Method, signal ve property: üç etkileşim türü ve farkları</li>
+      <li>D-Bus type signatures: <code class="inline">s</code>, <code class="inline">i</code>, <code class="inline">v</code>, <code class="inline">a{sv}</code> gibi temel kodlar</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Introspection ve gdbus</h2>
+  <p class="section-lead">gdbus ve busctl araçlarıyla D-Bus servislerini canlı keşfedebilir, introspection XML'ini okuyabilir ve komut satırından method çağrısı yapabilirsiniz.</p>
+
+  <h3>busctl ile servis listesi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># System bus üzerindeki tüm servisler</span>
+<span class="cmd">busctl</span> list
+
+<span class="cmt"># Çıktı (kısaltılmış):
+# NAME                              PID PROCESS         USER
+# :1.1                                1 systemd         root
+# :1.2                              423 NetworkManager  root
+# org.freedesktop.NetworkManager   423 NetworkManager  root
+# org.freedesktop.systemd1           1 systemd         root
+# org.bluez                        512 bluetoothd      root</span>
+
+<span class="cmt"># Servis ağaç yapısı</span>
+<span class="cmd">busctl</span> tree org.freedesktop.systemd1
+
+<span class="cmt"># Belirli nesnenin introspection</span>
+<span class="cmd">busctl</span> introspect org.freedesktop.systemd1 /org/freedesktop/systemd1</code></pre>
+  </div>
+
+  <h3>gdbus ile introspection</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># NetworkManager root nesnesini incele</span>
+<span class="cmd">gdbus</span> introspect <span class="flag">--system</span> \
+  <span class="flag">--dest</span> org.freedesktop.NetworkManager \
+  <span class="flag">--object-path</span> /
+
+<span class="cmt"># Çıktı (XML fragment):
+# &lt;node&gt;
+#   &lt;interface name="org.freedesktop.NetworkManager"&gt;
+#     &lt;method name="GetDevices"&gt;
+#       &lt;arg type="ao" name="devices" direction="out"/&gt;
+#     &lt;/method&gt;
+#     &lt;signal name="StateChanged"&gt;
+#       &lt;arg type="u" name="state"/&gt;
+#     &lt;/signal&gt;
+#     &lt;property name="State" type="u" access="read"/&gt;
+#   &lt;/interface&gt;
+# &lt;/node&gt;</span>
+
+<span class="cmt"># Tüm nesneleri recursive listele</span>
+<span class="cmd">gdbus</span> introspect <span class="flag">--system</span> \
+  <span class="flag">--dest</span> org.freedesktop.NetworkManager \
+  <span class="flag">--object-path</span> / \
+  <span class="flag">--recurse</span></code></pre>
+  </div>
+
+  <h3>gdbus call ile method çağırma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># NetworkManager sürümünü sorgula</span>
+<span class="cmd">gdbus</span> call <span class="flag">--system</span> \
+  <span class="flag">--dest</span> org.freedesktop.NetworkManager \
+  <span class="flag">--object-path</span> /org/freedesktop/NetworkManager \
+  <span class="flag">--method</span> org.freedesktop.DBus.Properties.Get \
+  <span class="str">"org.freedesktop.NetworkManager"</span> <span class="str">"Version"</span>
+<span class="cmt"># (&lt;'1.44.2'&gt;,)</span>
+
+<span class="cmt"># systemd ListUnits çağrısı</span>
+<span class="cmd">gdbus</span> call <span class="flag">--system</span> \
+  <span class="flag">--dest</span> org.freedesktop.systemd1 \
+  <span class="flag">--object-path</span> /org/freedesktop/systemd1 \
+  <span class="flag">--method</span> org.freedesktop.systemd1.Manager.ListUnits</code></pre>
+  </div>
+
+  <h3>gdbus monitor ile signal izleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># NetworkManager'dan tüm sinyalleri izle</span>
+<span class="cmd">gdbus</span> monitor <span class="flag">--system</span> \
+  <span class="flag">--dest</span> org.freedesktop.NetworkManager
+
+<span class="cmt"># Çıktı:
+# /org/freedesktop/NetworkManager: org.freedesktop.NetworkManager.StateChanged (uint32 70,)
+# /org/freedesktop/NetworkManager/ActiveConnection/1: \
+#   org.freedesktop.DBus.Properties.PropertiesChanged ...</span>
+
+<span class="cmt"># Tüm system bus sinyalleri (çok verbose)</span>
+<span class="cmd">gdbus</span> monitor <span class="flag">--system</span></code></pre>
+  </div>
+
+  <h3>busctl call ve monitor</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># busctl call: tür signature sonra argümanlar</span>
+<span class="cmd">busctl</span> call org.freedesktop.hostname1 \
+  /org/freedesktop/hostname1 \
+  org.freedesktop.hostname1 \
+  GetHostname
+
+<span class="cmt"># Property okuma</span>
+<span class="cmd">busctl</span> get-property org.freedesktop.hostname1 \
+  /org/freedesktop/hostname1 \
+  org.freedesktop.hostname1 \
+  Hostname
+
+<span class="cmt"># Gerçek zamanlı signal izleme</span>
+<span class="cmd">busctl</span> monitor org.freedesktop.NetworkManager
+
+<span class="cmt"># JSON formatında çıktı (scripting için kullanışlı)</span>
+<span class="cmd">busctl</span> <span class="flag">--json=short</span> get-property \
+  org.freedesktop.systemd1 \
+  /org/freedesktop/systemd1 \
+  org.freedesktop.systemd1.Manager \
+  Version</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p><code class="inline">dbus-send</code> eski araçtır; bugün <code class="inline">busctl</code> tercih edilmelidir. <code class="inline">busctl</code> systemd ile birlikte gelir, JSON çıktı desteği sunar ve type signature sözdizimi daha okunaklıdır. <code class="inline">dbus-send</code> hâlâ bazı eski betiklerde görülebilir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code class="inline">busctl list</code>, <code class="inline">busctl tree</code>, <code class="inline">busctl introspect</code> — servis keşfi</li>
+      <li><code class="inline">gdbus introspect</code> — XML introspection okuma</li>
+      <li><code class="inline">gdbus call</code> — komut satırından method çağrısı</li>
+      <li><code class="inline">gdbus monitor</code> / <code class="inline">busctl monitor</code> — gerçek zamanlı signal izleme</li>
+      <li>busctl JSON çıktısı — scripting entegrasyonu</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Python GDBus bağlaması</h2>
+  <p class="section-lead">PyGObject kütüphanesi aracılığıyla GDBus Python API'si, D-Bus servislerine proxy nesneleri üzerinden tip-güvenli erişim sunar.</p>
+
+  <h3>Bağlantı kurma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dbus_connect.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">from</span> gi.repository <span class="keyword">import</span> Gio, GLib
+
+<span class="cmt"># System bus bağlantısı (senkron)</span>
+bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, <span class="keyword">None</span>)
+print(<span class="str">f"Bağlantı UUID: {bus.get_guid()}"</span>)
+
+<span class="cmt"># Session bus bağlantısı</span>
+session_bus = Gio.bus_get_sync(Gio.BusType.SESSION, <span class="keyword">None</span>)</code></pre>
+  </div>
+
+  <h3>Proxy oluşturma ve method çağırma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>nm_version.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">from</span> gi.repository <span class="keyword">import</span> Gio, GLib
+
+bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, <span class="keyword">None</span>)
+
+<span class="cmt"># NetworkManager proxy'si oluştur</span>
+proxy = Gio.DBusProxy.new_sync(
+    bus,
+    Gio.DBusProxyFlags.NONE,
+    <span class="keyword">None</span>,                                          <span class="cmt"># interface info</span>
+    <span class="str">"org.freedesktop.NetworkManager"</span>,              <span class="cmt"># bus name</span>
+    <span class="str">"/org/freedesktop/NetworkManager"</span>,             <span class="cmt"># object path</span>
+    <span class="str">"org.freedesktop.NetworkManager"</span>,              <span class="cmt"># interface</span>
+    <span class="keyword">None</span>
+)
+
+<span class="cmt"># Property okuma (DBus.Properties.Get)</span>
+version = proxy.get_cached_property(<span class="str">"Version"</span>)
+print(<span class="str">f"NetworkManager sürümü: {version.get_string()}"</span>)
+
+<span class="cmt"># GetDevices method çağrısı</span>
+devices = proxy.call_sync(
+    <span class="str">"GetDevices"</span>,
+    <span class="keyword">None</span>,
+    Gio.DBusCallFlags.NONE,
+    <span class="flag">-1</span>,
+    <span class="keyword">None</span>
+)
+<span class="cmt"># devices: GLib.Variant("(ao)", ...) — object path dizisi</span>
+device_paths = devices.unpack()[0]
+<span class="keyword">for</span> path <span class="keyword">in</span> device_paths:
+    print(<span class="str">f"  Aygıt: {path}"</span>)</code></pre>
+  </div>
+
+  <h3>Signal bağlama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>nm_signal.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">from</span> gi.repository <span class="keyword">import</span> Gio, GLib
+
+<span class="keyword">def</span> on_state_changed(proxy, sender, signal_name, params):
+    <span class="keyword">if</span> signal_name == <span class="str">"StateChanged"</span>:
+        state = params.unpack()[0]
+        states = {
+            20: <span class="str">"asleep"</span>, 30: <span class="str">"disconnected"</span>,
+            40: <span class="str">"disconnecting"</span>, 50: <span class="str">"connecting"</span>,
+            60: <span class="str">"connected_local"</span>, 70: <span class="str">"connected_site"</span>,
+            80: <span class="str">"connected_global"</span>
+        }
+        print(<span class="str">f"NM durum: {states.get(state, state)}"</span>)
+
+bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, <span class="keyword">None</span>)
+
+proxy = Gio.DBusProxy.new_sync(
+    bus, Gio.DBusProxyFlags.NONE, <span class="keyword">None</span>,
+    <span class="str">"org.freedesktop.NetworkManager"</span>,
+    <span class="str">"/org/freedesktop/NetworkManager"</span>,
+    <span class="str">"org.freedesktop.NetworkManager"</span>,
+    <span class="keyword">None</span>
+)
+
+<span class="cmt"># g-signal: tüm sinyaller bu callback'e düşer</span>
+proxy.connect(<span class="str">"g-signal"</span>, on_state_changed)
+
+loop = GLib.MainLoop()
+loop.run()  <span class="cmt"># Ctrl+C ile durdur</span></code></pre>
+  </div>
+
+  <h3>Aktif bağlantı bilgisi alma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>active_connection.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">from</span> gi.repository <span class="keyword">import</span> Gio, GLib
+
+<span class="keyword">def</span> get_active_connections():
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, <span class="keyword">None</span>)
+
+    nm = Gio.DBusProxy.new_sync(
+        bus, Gio.DBusProxyFlags.NONE, <span class="keyword">None</span>,
+        <span class="str">"org.freedesktop.NetworkManager"</span>,
+        <span class="str">"/org/freedesktop/NetworkManager"</span>,
+        <span class="str">"org.freedesktop.NetworkManager"</span>,
+        <span class="keyword">None</span>
+    )
+
+    <span class="cmt"># ActiveConnections property: object path dizisi</span>
+    active = nm.get_cached_property(<span class="str">"ActiveConnections"</span>)
+    <span class="keyword">if not</span> active:
+        print(<span class="str">"Aktif bağlantı yok"</span>)
+        <span class="keyword">return</span>
+
+    <span class="keyword">for</span> path <span class="keyword">in</span> active.unpack():
+        conn_proxy = Gio.DBusProxy.new_sync(
+            bus, Gio.DBusProxyFlags.NONE, <span class="keyword">None</span>,
+            <span class="str">"org.freedesktop.NetworkManager"</span>,
+            path,
+            <span class="str">"org.freedesktop.NetworkManager.Connection.Active"</span>,
+            <span class="keyword">None</span>
+        )
+        iface  = conn_proxy.get_cached_property(<span class="str">"Id"</span>)
+        state  = conn_proxy.get_cached_property(<span class="str">"State"</span>)
+        iptype = conn_proxy.get_cached_property(<span class="str">"Type"</span>)
+        print(<span class="str">f"  [{iptype.get_string()}] {iface.get_string()} — durum: {state.get_uint32()}"</span>)
+
+get_active_connections()</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Python'da D-Bus için iki ana kütüphane vardır: <code class="inline">dbus-python</code> (eski, GLib event loop gerektirir) ve PyGObject üzerinden <code class="inline">gi.repository.Gio</code> (modern, GDBus kullanır). Yeni projelerde <code class="inline">gi.repository.Gio</code> tercih edin. Kurulum: <code class="inline">apt install python3-gi</code>.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code class="inline">Gio.bus_get_sync()</code> ile system/session bus bağlantısı</li>
+      <li><code class="inline">Gio.DBusProxy.new_sync()</code> ile proxy oluşturma</li>
+      <li><code class="inline">proxy.call_sync()</code> ile senkron method çağrısı</li>
+      <li><code class="inline">proxy.connect('g-signal', callback)</code> ile signal bağlama</li>
+      <li>NetworkManager aktif bağlantı bilgisi alma — gerçek kullanım örneği</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> C ile dbus-1 API</h2>
+  <p class="section-lead">libdbus (dbus-1) low-level C API'si, D-Bus protokolüne doğrudan erişim sağlar; verbose olmakla birlikte daemon bağımlılığı olmadan kullanılabilir.</p>
+
+  <h3>Bağlantı ve method çağrısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dbus1_call.c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;dbus/dbus.h&gt;
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>)
+{
+    DBusError   err;
+    DBusConnection *conn;
+    DBusMessage    *msg, *reply;
+    <span class="keyword">char</span>           *version = <span class="keyword">NULL</span>;
+
+    dbus_error_init(&amp;err);
+
+    <span class="cmt">/* System bus'a bağlan */</span>
+    conn = <span class="cmd">dbus_bus_get</span>(DBUS_BUS_SYSTEM, &amp;err);
+    <span class="keyword">if</span> (dbus_error_is_set(&amp;err)) {
+        fprintf(stderr, <span class="str">"Bağlantı hatası: %s\n"</span>, err.message);
+        dbus_error_free(&amp;err);
+        <span class="keyword">return</span> <span class="str">1</span>;
+    }
+
+    <span class="cmt">/* Method call mesajı oluştur */</span>
+    msg = <span class="cmd">dbus_message_new_method_call</span>(
+        <span class="str">"org.freedesktop.NetworkManager"</span>,    <span class="cmt">/* destination */</span>
+        <span class="str">"/org/freedesktop/NetworkManager"</span>,    <span class="cmt">/* object path */</span>
+        <span class="str">"org.freedesktop.DBus.Properties"</span>,   <span class="cmt">/* interface */</span>
+        <span class="str">"Get"</span>                                 <span class="cmt">/* method */</span>
+    );
+
+    <span class="cmt">/* Argümanları ekle: interface adı + property adı */</span>
+    <span class="keyword">const char</span> *iface = <span class="str">"org.freedesktop.NetworkManager"</span>;
+    <span class="keyword">const char</span> *prop  = <span class="str">"Version"</span>;
+    <span class="cmd">dbus_message_append_args</span>(
+        msg,
+        DBUS_TYPE_STRING, &amp;iface,
+        DBUS_TYPE_STRING, &amp;prop,
+        DBUS_TYPE_INVALID
+    );
+
+    <span class="cmt">/* Senkron çağrı (5 saniye timeout) */</span>
+    reply = <span class="cmd">dbus_connection_send_with_reply_and_block</span>(
+        conn, msg, 5000, &amp;err
+    );
+    <span class="keyword">if</span> (!reply) {
+        fprintf(stderr, <span class="str">"Yanıt hatası: %s\n"</span>, err.message);
+        dbus_error_free(&amp;err);
+        <span class="keyword">goto</span> cleanup;
+    }
+
+    <span class="cmt">/* Yanıttan variant içindeki string'i oku */</span>
+    DBusMessageIter iter, sub;
+    dbus_message_iter_init(reply, &amp;iter);
+    <span class="keyword">if</span> (dbus_message_iter_get_arg_type(&amp;iter) == DBUS_TYPE_VARIANT) {
+        dbus_message_iter_recurse(&amp;iter, &amp;sub);
+        <span class="keyword">if</span> (dbus_message_iter_get_arg_type(&amp;sub) == DBUS_TYPE_STRING) {
+            dbus_message_iter_get_basic(&amp;sub, &amp;version);
+            printf(<span class="str">"NM Sürümü: %s\n"</span>, version);
+        }
+    }
+
+cleanup:
+    <span class="keyword">if</span> (reply) <span class="cmd">dbus_message_unref</span>(reply);
+    <span class="cmd">dbus_message_unref</span>(msg);
+    <span class="cmt">/* dbus_connection_unref(conn) — paylaşılan bağlantı, unref etme */</span>
+    <span class="keyword">return</span> <span class="str">0</span>;
+}</code></pre>
+  </div>
+
+  <h3>Derleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">gcc</span> dbus1_call.c <span class="flag">-o</span> dbus1_call \
+    $(pkg-config <span class="flag">--cflags</span> <span class="flag">--libs</span> dbus-1)
+
+<span class="cmt"># Cross-compile (ARM)</span>
+<span class="cmd">arm-linux-gnueabihf-gcc</span> dbus1_call.c <span class="flag">-o</span> dbus1_call \
+    $(pkg-config <span class="flag">--cflags</span> <span class="flag">--libs</span> dbus-1)</code></pre>
+  </div>
+
+  <h3>Argüman tipleri ve DBusMessageIter</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">DBUS_TYPE_STRING</span><span class="desc">C: <code class="inline">const char*</code>. <code class="inline">dbus_message_iter_get_basic()</code> ile <code class="inline">const char*</code> alınır.</span></div>
+    <div class="param"><span class="name">DBUS_TYPE_INT32</span><span class="desc">C: <code class="inline">dbus_int32_t</code>. Signed 32-bit integer.</span></div>
+    <div class="param"><span class="name">DBUS_TYPE_UINT32</span><span class="desc">C: <code class="inline">dbus_uint32_t</code>. Unsigned 32-bit integer.</span></div>
+    <div class="param"><span class="name">DBUS_TYPE_BOOLEAN</span><span class="desc">C: <code class="inline">dbus_bool_t</code>. 0 veya 1.</span></div>
+    <div class="param"><span class="name">DBUS_TYPE_VARIANT</span><span class="desc">İçine <code class="inline">dbus_message_iter_recurse()</code> ile girilir.</span></div>
+    <div class="param"><span class="name">DBUS_TYPE_ARRAY</span><span class="desc">İçine <code class="inline">dbus_message_iter_recurse()</code> + <code class="inline">dbus_message_iter_next()</code> döngüsü ile girilir.</span></div>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">UYARI</div>
+    <p><code class="inline">dbus_bus_get()</code> paylaşılan bir bağlantı döndürür. Bu bağlantıyı <code class="inline">dbus_connection_unref()</code> ile kapatmayın — referans sayısı sıfıra düştüğünde bağlantı kapatılır ve aynı süreçteki diğer D-Bus kullanıcıları etkilenir. Özel bağlantı için <code class="inline">dbus_bus_get_private()</code> kullanın.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code class="inline">dbus_bus_get(DBUS_BUS_SYSTEM)</code> ile bağlantı kurma</li>
+      <li><code class="inline">dbus_message_new_method_call()</code> ve argüman ekleme</li>
+      <li><code class="inline">dbus_connection_send_with_reply_and_block()</code> — senkron çağrı</li>
+      <li><code class="inline">DBusMessageIter</code> ile yanıt ayrıştırma</li>
+      <li>Bellek yönetimi: <code class="inline">dbus_message_unref()</code></li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> sd-bus (libsystemd)</h2>
+  <p class="section-lead">sd-bus, libsystemd içinde gelen modern D-Bus implementasyonudur; dbus-1'e göre çok daha sade API sunar ve gömülü sistemlerde tercih edilen çözümdür.</p>
+
+  <h3>sd-bus vs dbus-1 karşılaştırması</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Özellik</th><th>dbus-1 (libdbus)</th><th>sd-bus (libsystemd)</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>API karmaşıklığı</td><td>Yüksek (verbose iterator)</td><td>Düşük (tek satır call)</td></tr>
+        <tr><td>Performans</td><td>Orta</td><td>Daha iyi (direkt socket)</td></tr>
+        <tr><td>Bağımlılık</td><td>libdbus-1</td><td>libsystemd (zaten var)</td></tr>
+        <tr><td>Async event loop</td><td>Manuel</td><td>sd-event entegrasyonu</td></tr>
+        <tr><td>Vtable API</td><td>Yok</td><td>Var (servis yazımı kolay)</td></tr>
+        <tr><td>Kdbus/AF_UNIX</td><td>Hayır</td><td>Evet (otomatik seçim)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>sd-bus ile method çağrısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>sdbus_call.c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;stdio.h&gt;
+#include &lt;systemd/sd-bus.h&gt;
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>)
+{
+    sd_bus *bus  = <span class="keyword">NULL</span>;
+    sd_bus_error error = SD_BUS_ERROR_NULL;
+    sd_bus_message *reply = <span class="keyword">NULL</span>;
+    <span class="keyword">const char</span> *version;
+    <span class="keyword">int</span> rc;
+
+    <span class="cmt">/* System bus'a bağlan */</span>
+    rc = <span class="cmd">sd_bus_open_system</span>(&amp;bus);
+    <span class="keyword">if</span> (rc &lt; 0) {
+        fprintf(stderr, <span class="str">"Bağlantı hatası: %s\n"</span>, strerror(-rc));
+        <span class="keyword">return</span> <span class="str">1</span>;
+    }
+
+    <span class="cmt">/* Property oku — tek satırda! */</span>
+    rc = <span class="cmd">sd_bus_get_property</span>(
+        bus,
+        <span class="str">"org.freedesktop.NetworkManager"</span>,    <span class="cmt">/* destination  */</span>
+        <span class="str">"/org/freedesktop/NetworkManager"</span>,    <span class="cmt">/* object path  */</span>
+        <span class="str">"org.freedesktop.NetworkManager"</span>,    <span class="cmt">/* interface    */</span>
+        <span class="str">"Version"</span>,                            <span class="cmt">/* property     */</span>
+        &amp;error,
+        &amp;reply,
+        <span class="str">"s"</span>                                   <span class="cmt">/* type sig     */</span>
+    );
+    <span class="keyword">if</span> (rc &lt; 0) {
+        fprintf(stderr, <span class="str">"Property hatası: %s\n"</span>, error.message);
+        <span class="keyword">goto</span> out;
+    }
+
+    <span class="cmd">sd_bus_message_read</span>(reply, <span class="str">"s"</span>, &amp;version);
+    printf(<span class="str">"NM sürümü: %s\n"</span>, version);
+
+out:
+    <span class="cmd">sd_bus_error_free</span>(&amp;error);
+    <span class="cmd">sd_bus_message_unref</span>(reply);
+    <span class="cmd">sd_bus_unref</span>(bus);
+    <span class="keyword">return</span> rc &lt; 0 ? <span class="str">1</span> : <span class="str">0</span>;
+}</code></pre>
+  </div>
+
+  <h3>sd_bus_call_method ile method çağrısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>sdbus_method.c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* systemd servisini yeniden başlat */</span>
+<span class="keyword">int</span> restart_service(sd_bus *bus, <span class="keyword">const char</span> *unit)
+{
+    sd_bus_error error  = SD_BUS_ERROR_NULL;
+    sd_bus_message *reply = <span class="keyword">NULL</span>;
+    <span class="keyword">int</span> rc;
+
+    rc = <span class="cmd">sd_bus_call_method</span>(
+        bus,
+        <span class="str">"org.freedesktop.systemd1"</span>,
+        <span class="str">"/org/freedesktop/systemd1"</span>,
+        <span class="str">"org.freedesktop.systemd1.Manager"</span>,
+        <span class="str">"RestartUnit"</span>,
+        &amp;error,
+        &amp;reply,
+        <span class="str">"ss"</span>,          <span class="cmt">/* iki string argüman */</span>
+        unit,           <span class="cmt">/* "ssh.service" gibi */</span>
+        <span class="str">"replace"</span>      <span class="cmt">/* mode */</span>
+    );
+
+    <span class="keyword">if</span> (rc &lt; 0)
+        fprintf(stderr, <span class="str">"Hata: %s — %s\n"</span>,
+                error.name, error.message);
+    <span class="keyword">else</span> {
+        <span class="keyword">const char</span> *job_path;
+        <span class="cmd">sd_bus_message_read</span>(reply, <span class="str">"o"</span>, &amp;job_path);
+        printf(<span class="str">"Job: %s\n"</span>, job_path);
+    }
+
+    <span class="cmd">sd_bus_error_free</span>(&amp;error);
+    <span class="cmd">sd_bus_message_unref</span>(reply);
+    <span class="keyword">return</span> rc;
+}</code></pre>
+  </div>
+
+  <h3>Signal subscribe</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>sdbus_signal.c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Signal callback */</span>
+<span class="keyword">static int</span> on_unit_new(sd_bus_message *m, <span class="keyword">void</span> *userdata,
+                       sd_bus_error *ret_err)
+{
+    <span class="keyword">const char</span> *id, *path;
+    <span class="cmd">sd_bus_message_read</span>(m, <span class="str">"so"</span>, &amp;id, &amp;path);
+    printf(<span class="str">"Yeni unit: %s — %s\n"</span>, id, path);
+    <span class="keyword">return</span> <span class="str">0</span>;
+}
+
+<span class="cmt">/* Subscribe */</span>
+sd_bus_slot *slot = <span class="keyword">NULL</span>;
+rc = <span class="cmd">sd_bus_match_signal</span>(
+    bus,
+    &amp;slot,
+    <span class="str">"org.freedesktop.systemd1"</span>,           <span class="cmt">/* sender */</span>
+    <span class="str">"/org/freedesktop/systemd1"</span>,           <span class="cmt">/* path */</span>
+    <span class="str">"org.freedesktop.systemd1.Manager"</span>,   <span class="cmt">/* interface */</span>
+    <span class="str">"UnitNew"</span>,                             <span class="cmt">/* member */</span>
+    on_unit_new,
+    <span class="keyword">NULL</span>
+);
+
+<span class="cmt">/* Event loop */</span>
+<span class="keyword">while</span> (<span class="str">1</span>) {
+    rc = <span class="cmd">sd_bus_process</span>(bus, <span class="keyword">NULL</span>);
+    <span class="keyword">if</span> (rc &lt; 0) <span class="keyword">break</span>;
+    <span class="keyword">if</span> (rc &gt; 0) <span class="keyword">continue</span>; <span class="cmt">/* daha işlenecek mesaj var */</span>
+    <span class="cmd">sd_bus_wait</span>(bus, UINT64_MAX); <span class="cmt">/* yeni mesaj bekle */</span>
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>Makefile</span><span class="dot">●</span></div>
+    <pre><code>CFLAGS  := $(shell pkg-config <span class="flag">--cflags</span> libsystemd)
+LDFLAGS := $(shell pkg-config <span class="flag">--libs</span>   libsystemd)
+
+sdbus_call: sdbus_call.c
+	$(CC) $(CFLAGS) $&lt; -o $@ $(LDFLAGS)</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code class="inline">sd_bus_open_system()</code> / <code class="inline">sd_bus_open_user()</code> ile bağlantı</li>
+      <li><code class="inline">sd_bus_call_method()</code> — tek satır method call, type-safe</li>
+      <li><code class="inline">sd_bus_get_property()</code> — property okuma</li>
+      <li><code class="inline">sd_bus_match_signal()</code> — signal subscribe</li>
+      <li><code class="inline">sd_bus_process()</code> + <code class="inline">sd_bus_wait()</code> — basit event loop</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Servis yazmak: method ve signal</h2>
+  <p class="section-lead">sd-bus vtable API'si ile D-Bus üzerinden method, property ve signal sunan tam bir C servisi oluşturabilirsiniz.</p>
+
+  <h3>Vtable tanımı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>temp_sensor_service.c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;time.h&gt;
+#include &lt;systemd/sd-bus.h&gt;
+
+#define SERVICE  <span class="str">"com.example.TempSensor"</span>
+#define PATH     <span class="str">"/com/example/TempSensor"</span>
+#define IFACE    <span class="str">"com.example.TempSensor"</span>
+
+<span class="keyword">static</span> int32_t g_temperature = 230; <span class="cmt">/* °C × 10 */</span>
+<span class="keyword">static</span> sd_bus *g_bus = <span class="keyword">NULL</span>;
+
+<span class="cmt">/* GetTemperature method handler */</span>
+<span class="keyword">static int</span> method_get_temperature(sd_bus_message *m, <span class="keyword">void</span> *ud,
+                                   sd_bus_error *err)
+{
+    printf(<span class="str">"GetTemperature çağrıldı\n"</span>);
+    <span class="keyword">return</span> <span class="cmd">sd_bus_reply_method_return</span>(m, <span class="str">"i"</span>, g_temperature);
+}
+
+<span class="cmt">/* SetTemperature method handler */</span>
+<span class="keyword">static int</span> method_set_temperature(sd_bus_message *m, <span class="keyword">void</span> *ud,
+                                   sd_bus_error *err)
+{
+    int32_t new_temp;
+    <span class="keyword">int</span> rc = <span class="cmd">sd_bus_message_read</span>(m, <span class="str">"i"</span>, &amp;new_temp);
+    <span class="keyword">if</span> (rc &lt; 0)
+        <span class="keyword">return</span> rc;
+
+    <span class="keyword">if</span> (new_temp &lt; <span class="str">-400</span> || new_temp &gt; 1500) {
+        <span class="keyword">return</span> <span class="cmd">sd_bus_error_setf</span>(err,
+            SD_BUS_ERROR_INVALID_ARGS,
+            <span class="str">"Sıcaklık aralık dışı: %d"</span>, new_temp);
+    }
+
+    g_temperature = new_temp;
+
+    <span class="cmt">/* TemperatureChanged sinyali yayınla */</span>
+    <span class="cmd">sd_bus_emit_signal</span>(g_bus, PATH, IFACE,
+                       <span class="str">"TemperatureChanged"</span>, <span class="str">"i"</span>, g_temperature);
+
+    <span class="keyword">return</span> <span class="cmd">sd_bus_reply_method_return</span>(m, <span class="str">""</span>);
+}
+
+<span class="cmt">/* Property getter */</span>
+<span class="keyword">static int</span> prop_get_temperature(sd_bus *bus, <span class="keyword">const char</span> *path,
+    <span class="keyword">const char</span> *interface, <span class="keyword">const char</span> *property,
+    sd_bus_message *reply, <span class="keyword">void</span> *ud, sd_bus_error *err)
+{
+    <span class="keyword">return</span> <span class="cmd">sd_bus_message_append</span>(reply, <span class="str">"i"</span>, g_temperature);
+}
+
+<span class="cmt">/* Vtable — servisin tüm API tanımı */</span>
+<span class="keyword">static const</span> sd_bus_vtable sensor_vtable[] = {
+    SD_BUS_VTABLE_START(<span class="str">0</span>),
+
+    SD_BUS_METHOD(<span class="str">"GetTemperature"</span>, <span class="str">""</span>, <span class="str">"i"</span>,
+                  method_get_temperature, SD_BUS_VTABLE_UNPRIVILEGED),
+
+    SD_BUS_METHOD(<span class="str">"SetTemperature"</span>, <span class="str">"i"</span>, <span class="str">""</span>,
+                  method_set_temperature, SD_BUS_VTABLE_UNPRIVILEGED),
+
+    SD_BUS_PROPERTY(<span class="str">"Temperature"</span>, <span class="str">"i"</span>, prop_get_temperature,
+                    <span class="str">0</span>, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+
+    SD_BUS_SIGNAL(<span class="str">"TemperatureChanged"</span>, <span class="str">"i"</span>, <span class="str">0</span>),
+
+    SD_BUS_VTABLE_END
+};
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>)
+{
+    sd_bus_slot *slot = <span class="keyword">NULL</span>;
+    <span class="keyword">int</span> rc;
+
+    rc = <span class="cmd">sd_bus_open_system</span>(&amp;g_bus);
+    <span class="keyword">if</span> (rc &lt; 0) { fprintf(stderr, <span class="str">"Bus: %s\n"</span>, strerror(-rc)); <span class="keyword">return</span> <span class="str">1</span>; }
+
+    <span class="cmt">/* Nesneyi vtable ile yayınla */</span>
+    rc = <span class="cmd">sd_bus_add_object_vtable</span>(g_bus, &amp;slot, PATH, IFACE,
+                                   sensor_vtable, <span class="keyword">NULL</span>);
+    <span class="keyword">if</span> (rc &lt; 0) { fprintf(stderr, <span class="str">"Vtable: %s\n"</span>, strerror(-rc)); <span class="keyword">goto</span> out; }
+
+    <span class="cmt">/* Well-known isim talep et */</span>
+    rc = <span class="cmd">sd_bus_request_name</span>(g_bus, SERVICE, <span class="str">0</span>);
+    <span class="keyword">if</span> (rc &lt; 0) { fprintf(stderr, <span class="str">"Name: %s\n"</span>, strerror(-rc)); <span class="keyword">goto</span> out; }
+
+    printf(<span class="str">"Servis hazır: %s\n"</span>, SERVICE);
+
+    <span class="cmt">/* Event loop */</span>
+    <span class="keyword">while</span> (<span class="str">1</span>) {
+        rc = <span class="cmd">sd_bus_process</span>(g_bus, <span class="keyword">NULL</span>);
+        <span class="keyword">if</span> (rc &lt; 0) <span class="keyword">break</span>;
+        <span class="keyword">if</span> (rc &gt; 0) <span class="keyword">continue</span>;
+        <span class="cmd">sd_bus_wait</span>(g_bus, UINT64_MAX);
+    }
+
+out:
+    <span class="cmd">sd_bus_slot_unref</span>(slot);
+    <span class="cmd">sd_bus_unref</span>(g_bus);
+    <span class="keyword">return</span> rc &lt; 0 ? <span class="str">1</span> : <span class="str">0</span>;
+}</code></pre>
+  </div>
+
+  <h3>Test</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Servisi arka planda başlat (policy dosyası gerekli, bkz. bölüm 07)</span>
+<span class="cmd">sudo</span> ./temp_sensor_service &amp;
+
+<span class="cmt"># GetTemperature çağrısı</span>
+<span class="cmd">busctl</span> call com.example.TempSensor \
+  /com/example/TempSensor \
+  com.example.TempSensor \
+  GetTemperature
+<span class="cmt"># i 230</span>
+
+<span class="cmt"># SetTemperature çağrısı</span>
+<span class="cmd">busctl</span> call com.example.TempSensor \
+  /com/example/TempSensor \
+  com.example.TempSensor \
+  SetTemperature i 280
+
+<span class="cmt"># Property okuma</span>
+<span class="cmd">busctl</span> get-property com.example.TempSensor \
+  /com/example/TempSensor \
+  com.example.TempSensor \
+  Temperature
+<span class="cmt"># i 280</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p><code class="inline">SD_BUS_METHOD()</code> makrosunun ikinci parametresi giriş tip imzası, üçüncüsü çıkış tip imzasıdır. <code class="inline">""</code> boş anlamına gelir. <code class="inline">SD_BUS_VTABLE_UNPRIVILEGED</code> flag'ı, root olmayan kullanıcıların bu metodu çağırmasına izin verir. Ayrıcalıklı işlemler için bu flag çıkarılır ve polkit entegrasyonu yapılır.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code class="inline">SD_BUS_VTABLE_START</code> / <code class="inline">SD_BUS_VTABLE_END</code> ile vtable yapısı</li>
+      <li><code class="inline">SD_BUS_METHOD</code>, <code class="inline">SD_BUS_PROPERTY</code>, <code class="inline">SD_BUS_SIGNAL</code> makroları</li>
+      <li><code class="inline">sd_bus_reply_method_return()</code> ile yanıt gönderme</li>
+      <li><code class="inline">sd_bus_request_name()</code> ile well-known isim kaydı</li>
+      <li><code class="inline">sd_bus_emit_signal()</code> ile sinyal yayınlama</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Güvenlik: policy dosyaları</h2>
+  <p class="section-lead">D-Bus güvenliği XML policy dosyalarıyla yönetilir; sistem bus'ta servis açmak veya mesaj göndermek için bu dosyaların doğru yapılandırılması zorunludur.</p>
+
+  <h3>Policy dosyası konumu ve yapısı</h3>
+
+  <p>System bus policy dosyaları <span class="path">/etc/dbus-1/system.d/</span> dizinine yerleştirilir. Dosya adı genellikle bus adıyla eşleşir: <span class="path">com.example.TempSensor.conf</span>.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/dbus-1/system.d/com.example.TempSensor.conf</span><span class="dot">●</span></div>
+    <pre><code>&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;!DOCTYPE busconfig PUBLIC
+ "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd"&gt;
+
+&lt;busconfig&gt;
+  <span class="cmt">&lt;!-- Servis sahibi: yalnızca root çalıştırabilir --&gt;</span>
+  &lt;policy user="root"&gt;
+    &lt;allow own="com.example.TempSensor"/&gt;
+    &lt;allow send_destination="com.example.TempSensor"/&gt;
+    &lt;allow receive_sender="com.example.TempSensor"/&gt;
+  &lt;/policy&gt;
+
+  <span class="cmt">&lt;!-- Varsayılan: tüm kullanıcılar GetTemperature çağırabilir --&gt;</span>
+  &lt;policy context="default"&gt;
+    &lt;allow send_destination="com.example.TempSensor"
+           send_interface="com.example.TempSensor"
+           send_member="GetTemperature"/&gt;
+    &lt;allow receive_sender="com.example.TempSensor"/&gt;
+  &lt;/policy&gt;
+
+  <span class="cmt">&lt;!-- operator grubu: SetTemperature de çağırabilir --&gt;</span>
+  &lt;policy group="operator"&gt;
+    &lt;allow send_destination="com.example.TempSensor"
+           send_interface="com.example.TempSensor"
+           send_member="SetTemperature"/&gt;
+  &lt;/policy&gt;
+&lt;/busconfig&gt;</code></pre>
+  </div>
+
+  <h3>İzin türleri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">own</span><span class="desc">Well-known bus adını talep etme izni. <code class="inline">&lt;allow own="com.example.Foo"/&gt;</code></span></div>
+    <div class="param"><span class="name">send_destination</span><span class="desc">Hedefe mesaj gönderme izni. Bus adı veya <code class="inline">*</code> wildcard.</span></div>
+    <div class="param"><span class="name">send_interface</span><span class="desc">Belirli bir interface'e mesaj gönderme kısıtlaması.</span></div>
+    <div class="param"><span class="name">send_member</span><span class="desc">Belirli bir method veya signal adına kısıtlama.</span></div>
+    <div class="param"><span class="name">receive_sender</span><span class="desc">Belirli bir kaynaktan sinyal alma izni.</span></div>
+    <div class="param"><span class="name">context="default"</span><span class="desc">Başka policy eşleşmezse uygulanır. Genellikle kısıtlayıcı.</span></div>
+  </div>
+
+  <h3>Policy yeniden yükleme ve systemd activation</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Policy dosyasını kopyala</span>
+<span class="cmd">sudo</span> cp com.example.TempSensor.conf /etc/dbus-1/system.d/
+<span class="cmd">sudo</span> chmod 644 /etc/dbus-1/system.d/com.example.TempSensor.conf
+
+<span class="cmt"># dbus-daemon'ı yeniden yükle (servis yeniden başlatılmaz)</span>
+<span class="cmd">sudo</span> systemctl reload dbus
+
+<span class="cmt"># Policy hata logları</span>
+<span class="cmd">journalctl</span> <span class="flag">-u</span> dbus <span class="flag">--since</span> <span class="str">"1 min ago"</span></code></pre>
+  </div>
+
+  <h3>systemd D-Bus activation</h3>
+
+  <p>Bir D-Bus servisini, istemci mesaj gönderdiğinde otomatik başlatmak için systemd activation kullanılır:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>/usr/share/dbus-1/system-services/com.example.TempSensor.service</span><span class="dot">●</span></div>
+    <pre><code>[D-BUS Service]
+Name=com.example.TempSensor
+Exec=/usr/bin/temp-sensor-service
+User=root
+SystemdService=com.example.TempSensor.service</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/systemd/system/com.example.TempSensor.service</span><span class="dot">●</span></div>
+    <pre><code>[Unit]
+Description=Temperature Sensor D-Bus Service
+After=dbus.service
+
+[Service]
+Type=dbus
+BusName=com.example.TempSensor
+ExecStart=/usr/bin/temp-sensor-service
+User=root
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">UYARI</div>
+    <p>Policy dosyasında <code class="inline">&lt;allow send_destination="*"/&gt;</code> veya <code class="inline">&lt;allow own="*"/&gt;</code> gibi wildcard izinler asla kullanmayın. Bu, herhangi bir sürecin herhangi bir servise mesaj göndermesine ya da var olan bir servis adını ele geçirmesine olanak tanır. Her zaman servis adlarını ve interface'leri açıkça belirtin.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Policy XML formatı: <code class="inline">own</code>, <code class="inline">send_destination</code>, <code class="inline">send_interface</code>, <code class="inline">receive_sender</code></li>
+      <li>Kullanıcı, grup ve <code class="inline">context="default"</code> bazlı izin katmanları</li>
+      <li>Policy yeniden yükleme: <code class="inline">systemctl reload dbus</code></li>
+      <li>systemd D-Bus activation: <code class="inline">[D-BUS Service]</code> dosyası + systemd unit</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Embedded'da D-Bus alternatifleri</h2>
+  <p class="section-lead">dbus-daemon'ın performans maliyeti gömülü kaynak kısıtlı sistemlerde sorun yaratabilir; dbus-broker, kdbus ve domain-specific alternatiflerin doğru seçimi için karşılaştırmalı bir değerlendirme gereklidir.</p>
+
+  <h3>dbus-daemon sorunları</h3>
+
+  <p>Geleneksel <code class="inline">dbus-daemon</code> her mesaj için iki context switch gerektirir: gönderen → daemon → alıcı. Yüksek frekanslı mesajlaşmada (saniyede yüzlerce mesaj) bu gecikme birikir. Ayrıca daemon'ın fork-exec modeli başlangıç gecikmesi ekler.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Çözüm</th><th>Latency</th><th>Bellek</th><th>Durum</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>dbus-daemon</td><td>~100 µs</td><td>~3 MB</td><td>Yaygın, stabil</td></tr>
+        <tr><td>dbus-broker</td><td>~50 µs</td><td>~1.5 MB</td><td>Fedora/RHEL varsayılanı</td></tr>
+        <tr><td>kdbus (kernel)</td><td>~5 µs</td><td>Çok az</td><td>Mainline'da yok</td></tr>
+        <tr><td>sd-bus (direkt)</td><td>~10 µs</td><td>~0.5 MB</td><td>Daemon bypass mümkün</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>dbus-broker</h3>
+
+  <p><code class="inline">dbus-broker</code>, routing mantığını basitleştirmek amacıyla sıfırdan yazılmıştır. Güvenlik policy'si ayrı bir süreç (<code class="inline">dbus-broker-launch</code>) tarafından yönetilir. API tamamen uyumludur — mevcut kod değiştirilmeden çalışır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># dbus-broker kurulumu (Debian/Ubuntu)</span>
+<span class="cmd">apt</span> install dbus-broker
+
+<span class="cmt"># dbus.service'i dbus-broker ile değiştir</span>
+<span class="cmd">systemctl</span> enable <span class="flag">--now</span> dbus-broker.service
+<span class="cmd">systemctl</span> disable dbus.service
+
+<span class="cmt"># Çalışma kontrolü</span>
+<span class="cmd">systemctl</span> status dbus-broker.service
+<span class="cmd">busctl</span> list <span class="cmt"># Hâlâ aynı çıktı</span></code></pre>
+  </div>
+
+  <h3>Domain-specific alternatifler</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">nanomsg / NNG</span><span class="desc">High-performance message passing library. TCP/IPC transport, pattern tabanlı (REQ/REP, PUB/SUB). D-Bus servis keşfi yok ama çok düşük latency.</span></div>
+    <div class="param"><span class="name">ZeroMQ</span><span class="desc">Asenkron mesajlaşma kütüphanesi. Çok güçlü pattern desteği. D-Bus'tan farklı kullanım senaryosu — genellikle distributed sistemler için.</span></div>
+    <div class="param"><span class="name">MQTT (lokal)</span><span class="desc">Mosquitto lokal broker ile process-arası pub/sub. IoT protokolü olduğundan ağ köprüsü de kolaydır. D-Bus introspection yok.</span></div>
+    <div class="param"><span class="name">Unix socket (custom)</span><span class="desc">En düşük overhead. Kendi protokolünü (protobuf, msgpack) üstüne kurar. Servis keşfi manuel yapılır.</span></div>
+  </div>
+
+  <h3>Ne zaman D-Bus kullanmalı</h3>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>D-Bus'ı tercih edin: systemd zaten hedef sistemde varsa; BlueZ, NetworkManager veya udisks2 ile entegrasyon gerekiyorsa; servis keşfi ve introspection değerliyse; varolan D-Bus API'lerine bağlanılıyorsa. Yalnızca iki uygulama arasında yüksek frekanslı veri aktarımı için Unix socket veya shared memory daha uygun olabilir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>dbus-daemon latency sorunu ve context switch maliyeti</li>
+      <li>dbus-broker: daha hızlı routing, tam API uyumluluğu</li>
+      <li>kdbus: kernel-space routing (mainline'da henüz yok)</li>
+      <li>nanomsg, ZeroMQ, MQTT, Unix socket alternatifleri</li>
+      <li>D-Bus seçim kriterleri: systemd bağımlılığı ve servis entegrasyonu</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 09 ═══════════════════ -->
+<section id="s9">
+  <h2><span class="num">09</span> Pratik: BlueZ D-Bus API</h2>
+  <p class="section-lead">BlueZ, Bluetooth yığınının tamamını D-Bus üzerinden açar; Python ile adapter yönetimi, cihaz tarama ve GATT characteristic okuma yapılabilir.</p>
+
+  <h3>BlueZ nesne hiyerarşisi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># BlueZ nesne ağacını gör</span>
+<span class="cmd">busctl</span> tree org.bluez
+
+<span class="cmt"># Çıktı:
+# └─ /org/bluez
+#    └─ /org/bluez/hci0
+#       ├─ /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF
+#       │  ├─ /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/service0001
+#       │  │  ├─ /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/service0001/char0002
+#       │  │  └─ /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/service0001/char0004</span>
+
+<span class="cmt"># Adapter interface'ini incele</span>
+<span class="cmd">busctl</span> introspect org.bluez /org/bluez/hci0 \
+  org.bluez.Adapter1</code></pre>
+  </div>
+
+  <h3>Python ile Bluetooth cihaz tarama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bluez_scan.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> time
+<span class="keyword">from</span> gi.repository <span class="keyword">import</span> Gio, GLib
+
+BLUEZ_SERVICE   = <span class="str">"org.bluez"</span>
+ADAPTER_PATH    = <span class="str">"/org/bluez/hci0"</span>
+ADAPTER_IFACE   = <span class="str">"org.bluez.Adapter1"</span>
+OBJ_MGR_IFACE   = <span class="str">"org.freedesktop.DBus.ObjectManager"</span>
+
+<span class="keyword">def</span> get_adapter(bus):
+    <span class="keyword">return</span> Gio.DBusProxy.new_sync(
+        bus, Gio.DBusProxyFlags.NONE, <span class="keyword">None</span>,
+        BLUEZ_SERVICE, ADAPTER_PATH, ADAPTER_IFACE, <span class="keyword">None</span>
+    )
+
+<span class="keyword">def</span> on_interfaces_added(conn, sender, path, iface, signal, params, userdata):
+    obj_path, ifaces = params.unpack()
+    <span class="keyword">if</span> <span class="str">"org.bluez.Device1"</span> <span class="keyword">in</span> ifaces:
+        dev = ifaces[<span class="str">"org.bluez.Device1"</span>]
+        name    = dev.get(<span class="str">"Name"</span>, <span class="str">"?"</span>)
+        addr    = dev.get(<span class="str">"Address"</span>, <span class="str">"?"</span>)
+        rssi    = dev.get(<span class="str">"RSSI"</span>, <span class="str">"?"</span>)
+        print(<span class="str">f"  Yeni cihaz: {name} [{addr}] RSSI={rssi}"</span>)
+
+<span class="keyword">def</span> scan_bluetooth(duration_sec=10):
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, <span class="keyword">None</span>)
+    adapter = get_adapter(bus)
+
+    <span class="cmt"># InterfacesAdded sinyaline subscribe ol</span>
+    bus.signal_subscribe(
+        BLUEZ_SERVICE,
+        OBJ_MGR_IFACE,
+        <span class="str">"InterfacesAdded"</span>,
+        <span class="keyword">None</span>,
+        <span class="keyword">None</span>,
+        Gio.DBusSignalFlags.NONE,
+        on_interfaces_added,
+        <span class="keyword">None</span>
+    )
+
+    <span class="cmt"># Taramayı başlat</span>
+    adapter.call_sync(<span class="str">"StartDiscovery"</span>, <span class="keyword">None</span>,
+                      Gio.DBusCallFlags.NONE, <span class="flag">-1</span>, <span class="keyword">None</span>)
+    print(<span class="str">f"Tarama başladı ({duration_sec}s)..."</span>)
+
+    loop = GLib.MainLoop()
+    GLib.timeout_add_seconds(duration_sec, loop.quit)
+    loop.run()
+
+    <span class="cmt"># Taramayı durdur</span>
+    adapter.call_sync(<span class="str">"StopDiscovery"</span>, <span class="keyword">None</span>,
+                      Gio.DBusCallFlags.NONE, <span class="flag">-1</span>, <span class="keyword">None</span>)
+    print(<span class="str">"Tarama tamamlandı."</span>)
+
+<span class="keyword">if</span> __name__ == <span class="str">"__main__"</span>:
+    scan_bluetooth()</code></pre>
+  </div>
+
+  <h3>GATT characteristic okuma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>gatt_read.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">from</span> gi.repository <span class="keyword">import</span> Gio, GLib
+
+BLUEZ_SERVICE  = <span class="str">"org.bluez"</span>
+GATT_CHAR_IFACE = <span class="str">"org.bluez.GattCharacteristic1"</span>
+
+<span class="keyword">def</span> read_characteristic(char_path):
+    <span class="str">"""GATT characteristic değerini oku (Raw bytes döner)."""</span>
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, <span class="keyword">None</span>)
+    char_proxy = Gio.DBusProxy.new_sync(
+        bus, Gio.DBusProxyFlags.NONE, <span class="keyword">None</span>,
+        BLUEZ_SERVICE, char_path, GATT_CHAR_IFACE, <span class="keyword">None</span>
+    )
+
+    <span class="cmt"># ReadValue metodunu çağır (options: boş dict)</span>
+    result = char_proxy.call_sync(
+        <span class="str">"ReadValue"</span>,
+        GLib.Variant(<span class="str">"(a{sv})"</span>, [{}]),
+        Gio.DBusCallFlags.NONE,
+        <span class="flag">-1</span>,
+        <span class="keyword">None</span>
+    )
+    raw_bytes = bytes(result.unpack()[0])
+    print(<span class="str">f"Raw: {raw_bytes.hex()}"</span>)
+    <span class="keyword">return</span> raw_bytes
+
+<span class="keyword">def</span> notify_characteristic(char_path):
+    <span class="str">"""GATT notification'ları dinle."""</span>
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, <span class="keyword">None</span>)
+    char_proxy = Gio.DBusProxy.new_sync(
+        bus, Gio.DBusProxyFlags.NONE, <span class="keyword">None</span>,
+        BLUEZ_SERVICE, char_path, GATT_CHAR_IFACE, <span class="keyword">None</span>
+    )
+
+    <span class="keyword">def</span> on_prop_changed(proxy, changed_props, invalidated):
+        props = changed_props.unpack()
+        <span class="keyword">if</span> <span class="str">"Value"</span> <span class="keyword">in</span> props:
+            val = bytes(props[<span class="str">"Value"</span>])
+            print(<span class="str">f"Notification: {val.hex()}"</span>)
+
+    char_proxy.connect(<span class="str">"g-properties-changed"</span>, on_prop_changed)
+    char_proxy.call_sync(<span class="str">"StartNotify"</span>, <span class="keyword">None</span>,
+                         Gio.DBusCallFlags.NONE, <span class="flag">-1</span>, <span class="keyword">None</span>)
+
+    loop = GLib.MainLoop()
+    loop.run()
+
+<span class="cmt"># Kullanım örneği — BLE sıcaklık sensörü (UUID 2A6E)</span>
+<span class="cmt"># char_path = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/service0001/char0002"</span>
+<span class="cmt"># read_characteristic(char_path)</span></code></pre>
+  </div>
+
+  <h3>GetManagedObjects ile tüm BlueZ nesnelerini listeleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bluez_objects.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">from</span> gi.repository <span class="keyword">import</span> Gio
+
+<span class="keyword">def</span> list_bluez_objects():
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, <span class="keyword">None</span>)
+    obj_mgr = Gio.DBusProxy.new_sync(
+        bus, Gio.DBusProxyFlags.NONE, <span class="keyword">None</span>,
+        <span class="str">"org.bluez"</span>, <span class="str">"/"</span>,
+        <span class="str">"org.freedesktop.DBus.ObjectManager"</span>, <span class="keyword">None</span>
+    )
+
+    result = obj_mgr.call_sync(<span class="str">"GetManagedObjects"</span>, <span class="keyword">None</span>,
+                                Gio.DBusCallFlags.NONE, <span class="flag">-1</span>, <span class="keyword">None</span>)
+    objects = result.unpack()[0]
+
+    <span class="keyword">for</span> path, ifaces <span class="keyword">in</span> objects.items():
+        <span class="keyword">if</span> <span class="str">"org.bluez.Device1"</span> <span class="keyword">in</span> ifaces:
+            dev = ifaces[<span class="str">"org.bluez.Device1"</span>]
+            print(<span class="str">f"{path}"</span>)
+            print(<span class="str">f"  Name:    {dev.get('Name', 'N/A')}"</span>)
+            print(<span class="str">f"  Address: {dev.get('Address', 'N/A')}"</span>)
+            print(<span class="str">f"  Paired:  {dev.get('Paired', False)}"</span>)
+            print(<span class="str">f"  Connected: {dev.get('Connected', False)}"</span>)
+
+list_bluez_objects()</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>BlueZ'i programatik kullanmak için <code class="inline">bluetoothd</code>'nin çalışması ve hedef adaptörün <code class="inline">Powered: yes</code> durumunda olması gerekir. <code class="inline">busctl set-property org.bluez /org/bluez/hci0 org.bluez.Adapter1 Powered b true</code> komutuyla adaptörü açabilirsiniz.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>BlueZ nesne hiyerarşisi: <code class="inline">Adapter1</code>, <code class="inline">Device1</code>, <code class="inline">GattCharacteristic1</code></li>
+      <li><code class="inline">InterfacesAdded</code> sinyali ile yeni cihaz tespiti</li>
+      <li><code class="inline">StartDiscovery</code> / <code class="inline">StopDiscovery</code> ile tarama yönetimi</li>
+      <li><code class="inline">GattCharacteristic1.ReadValue()</code> ile GATT okuma</li>
+      <li><code class="inline">StartNotify</code> + <code class="inline">g-properties-changed</code> ile GATT notification</li>
+      <li><code class="inline">GetManagedObjects</code> ile tüm BlueZ nesne ağacını alma</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>
