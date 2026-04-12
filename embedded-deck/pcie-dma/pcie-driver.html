@@ -1,0 +1,1008 @@
+---
+layout: tutorial
+title: "PCIe Sürücü Yazma — BAR · MSI-X · DMA"
+back_url: "../index.html"
+back_label: "PCIe & DMA"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>PCIe &amp; DMA</span>
+    <span>SÜRÜCÜ</span>
+    <span>2026</span>
+  </div>
+  <h1>PCIe Sürücü Yazma<br><em>BAR · MSI-X · DMA</em></h1>
+  <p class="subtitle">Linux PCIe sürücü modelini sıfırdan öğren — pci_driver probe/remove'dan BAR mapping'e, MSI-X interrupt'tan DMA ring buffer'a kadar eksiksiz uygulama.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Linux PCIe sürücü modeli — pci_driver yapısı</a></li>
+    <li><a href="#s1">pci_enable_device ve kaynak yönetimi</a></li>
+    <li><a href="#s2">BAR mapping — pci_iomap, ioremap, readl/writel</a></li>
+    <li><a href="#s3">Interrupt yönetimi — INTx, MSI, MSI-X</a></li>
+    <li><a href="#s4">DMA işlemleri — coherent ve streaming</a></li>
+    <li><a href="#s5">MMIO register erişimi — barrier ve relaxed accessor</a></li>
+    <li><a href="#s6">Sürücü örneği — basit PCIe NIC</a></li>
+    <li><a href="#s7">Hotplug ve power management — ASPM, D0/D3</a></li>
+    <li><a href="#s8">Pratik: PCIe loopback test cihazı sürücüsü</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Linux PCIe sürücü modeli — pci_driver yapısı</h2>
+  <p class="section-lead">Linux PCIe sürücüsü, <code>struct pci_driver</code> üzerine inşa edilir. Kernel, id_table ile eşleşen bir cihaz bulduğunda <code>probe()</code> çağırır; cihaz kaldırıldığında <code>remove()</code> çağırır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — minimal PCIe sürücü iskeleti</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/module.h&gt;
+#include &lt;linux/pci.h&gt;
+#include &lt;linux/interrupt.h&gt;
+
+#define MY_VENDOR_ID  0x1234
+#define MY_DEVICE_ID  0xABCD
+
+/* Cihaz başına özel durum yapısı */
+struct mydev {
+    struct pci_dev  *pdev;
+    void __iomem    *bar0;        /* BAR0 MMIO pointer */
+    int              irq;
+    /* rx/tx ring, DMA buffer'lar... */
+};
+
+/* id_table: hangi cihazları iddia ettiğimiz */
+static const struct pci_device_id mydrv_ids[] = {
+    { PCI_DEVICE(MY_VENDOR_ID, MY_DEVICE_ID) },
+    { PCI_DEVICE(MY_VENDOR_ID, 0xABCE) },     /* başka bir varyant */
+    { 0, }  /* sentinel */
+};
+MODULE_DEVICE_TABLE(pci, mydrv_ids);
+
+static int mydrv_probe(struct pci_dev *pdev,
+                       const struct pci_device_id *id)
+{
+    struct mydev *dev;
+    int ret;
+
+    dev_info(&pdev->dev, "probe: %04x:%04x\n",
+             pdev->vendor, pdev->device);
+
+    /* Private veri tahsis et ve pdev'e bağla */
+    dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
+    if (!dev) return -ENOMEM;
+    dev->pdev = pdev;
+    pci_set_drvdata(pdev, dev);
+
+    /* ... kaynak etkinleştirme, BAR, IRQ, DMA ... */
+
+    return 0;
+}
+
+static void mydrv_remove(struct pci_dev *pdev)
+{
+    struct mydev *dev = pci_get_drvdata(pdev);
+    dev_info(&pdev->dev, "remove\n");
+    /* devm_ kaynakları otomatik serbest bırakılır */
+    (void)dev;
+}
+
+static struct pci_driver mydrv_driver = {
+    .name     = "mydrv",
+    .id_table = mydrv_ids,
+    .probe    = mydrv_probe,
+    .remove   = mydrv_remove,
+};
+
+module_pci_driver(mydrv_driver);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Emirhan Pehlevan");
+MODULE_DESCRIPTION("Minimal PCIe sürücü örneği");</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>pci_driver: name, id_table, probe, remove — minimum gereksinim</li>
+      <li>id_table: PCI_DEVICE(vendor, device) makrosu; MODULE_DEVICE_TABLE ile sysfs/modprobe entegrasyonu</li>
+      <li>probe(): devm_kzalloc ile private veri; pci_set_drvdata ile pdev'e bağla</li>
+      <li>module_pci_driver(): module_init/exit çiftini otomatik oluşturur</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> pci_enable_device ve kaynak yönetimi</h2>
+  <p class="section-lead">probe() içinde cihazı etkinleştirmek, bus mastering açmak ve kaynakları talep etmek gerekir. Managed versiyonlar (pcim_, devm_) cleanup'ı otomatikleştirir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — probe() içinde kaynak etkinleştirme</span><span class="dot">●</span></div>
+    <pre><code>static int mydrv_probe(struct pci_dev *pdev,
+                       const struct pci_device_id *id)
+{
+    struct mydev *dev;
+    int ret;
+
+    dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
+    if (!dev) return -ENOMEM;
+    dev->pdev = pdev;
+    pci_set_drvdata(pdev, dev);
+
+    /* 1. Managed PCIe etkinleştirme — pcim_ sürümü tercih edilir */
+    ret = pcim_enable_device(pdev);
+    if (ret) {
+        dev_err(&pdev->dev, "pcim_enable_device: %d\n", ret);
+        return ret;
+    }
+
+    /* 2. Bus mastering: cihazın DMA başlatabilmesi için zorunlu */
+    pci_set_master(pdev);
+
+    /* 3. BAR'ları talep et (request_region / request_mem_region) */
+    ret = pcim_iomap_regions(pdev,
+                              BIT(0) | BIT(2),  /* BAR0 ve BAR2 */
+                              "mydrv");
+    if (ret) {
+        dev_err(&pdev->dev, "iomap_regions: %d\n", ret);
+        return ret;
+    }
+
+    /* 4. MMIO pointer al */
+    dev->bar0 = pcim_iomap_table(pdev)[0]; /* BAR0 */
+
+    dev_info(&pdev->dev, "BAR0: %p (size %llu)\n",
+             dev->bar0,
+             (unsigned long long)pci_resource_len(pdev, 0));
+
+    return 0;
+}
+
+/* Manuel (non-pcim_) yol — kıyaslama için */
+static int mydrv_probe_manual(struct pci_dev *pdev,
+                               const struct pci_device_id *id)
+{
+    int ret;
+
+    ret = pci_enable_device(pdev);
+    if (ret) return ret;
+
+    pci_set_master(pdev);
+
+    ret = pci_request_regions(pdev, "mydrv");
+    if (ret) goto err_disable;
+
+    void __iomem *bar0 = pci_iomap(pdev, 0, 0);
+    if (!bar0) { ret = -ENOMEM; goto err_release; }
+
+    return 0;
+
+err_release:
+    pci_release_regions(pdev);
+err_disable:
+    pci_disable_device(pdev);
+    return ret;
+}</code></pre>
+  </div>
+
+  <h3>pci_resource_ yardımcıları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Fonksiyon</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td>pci_resource_start(pdev, bar)</td><td>BAR fiziksel başlangıç adresi</td></tr>
+        <tr><td>pci_resource_end(pdev, bar)</td><td>BAR fiziksel bitiş adresi</td></tr>
+        <tr><td>pci_resource_len(pdev, bar)</td><td>BAR boyutu (bayt)</td></tr>
+        <tr><td>pci_resource_flags(pdev, bar)</td><td>IORESOURCE_MEM / IORESOURCE_IO / IORESOURCE_PREFETCH</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>pcim_enable_device(): managed; probe başarısız olursa veya remove çağrılırsa otomatik disable</li>
+      <li>pci_set_master(): BusMaster bit'ini set eder; DMA işlemleri için zorunlu</li>
+      <li>pcim_iomap_regions(): BAR request + iomap tek adımda; pcim_iomap_table() ile pointer al</li>
+      <li>devm_ / pcim_ tercih et — manual cleanup kodunda hata riski azalır</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> BAR mapping — pci_iomap, ioremap, readl/writel</h2>
+  <p class="section-lead">BAR (Base Address Register), cihazın MMIO bölgesini tanımlar. Bu bölgeye CPU erişimi için virtual adres eşlemesi (ioremap) ve doğru accessor fonksiyonları kullanılmalıdır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — BAR mapping ve register erişimi</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/pci.h&gt;
+#include &lt;linux/io.h&gt;
+
+/* Register offset'leri — cihaz datasheet'ten */
+#define REG_CTRL        0x00
+#define REG_STATUS      0x04
+#define REG_DMA_ADDR_LO 0x10
+#define REG_DMA_ADDR_HI 0x14
+#define REG_DMA_LEN     0x18
+#define REG_DMA_CMD     0x1C
+
+#define CTRL_ENABLE     BIT(0)
+#define CTRL_RESET      BIT(1)
+#define STATUS_READY    BIT(0)
+#define STATUS_ERROR    BIT(1)
+
+struct mydev {
+    struct pci_dev  *pdev;
+    void __iomem    *bar0;
+};
+
+/* --- Register okuma/yazma yardımcıları --- */
+static inline u32 mydev_read32(struct mydev *dev, u32 offset)
+{
+    return readl(dev->bar0 + offset);
+}
+
+static inline void mydev_write32(struct mydev *dev, u32 offset, u32 val)
+{
+    writel(val, dev->bar0 + offset);
+}
+
+/* --- Cihaz başlatma --- */
+static int mydev_hw_init(struct mydev *dev)
+{
+    u32 status;
+    int retries = 100;
+
+    /* Reset */
+    mydev_write32(dev, REG_CTRL, CTRL_RESET);
+    udelay(10);
+
+    /* Reset bitini temizle, enable et */
+    mydev_write32(dev, REG_CTRL, CTRL_ENABLE);
+
+    /* Hazır olmasını bekle */
+    do {
+        status = mydev_read32(dev, REG_STATUS);
+        if (status & STATUS_READY) break;
+        if (status & STATUS_ERROR) {
+            dev_err(&dev->pdev->dev, "HW error: status=0x%08x\n", status);
+            return -EIO;
+        }
+        udelay(10);
+    } while (--retries);
+
+    if (!retries) {
+        dev_err(&dev->pdev->dev, "HW init timeout\n");
+        return -ETIMEDOUT;
+    }
+
+    dev_info(&dev->pdev->dev, "HW init OK, status=0x%08x\n", status);
+    return 0;
+}
+
+/* --- 64-bit DMA adresi yaz --- */
+static void mydev_set_dma_addr(struct mydev *dev, dma_addr_t addr)
+{
+    mydev_write32(dev, REG_DMA_ADDR_LO, (u32)(addr & 0xFFFFFFFF));
+    mydev_write32(dev, REG_DMA_ADDR_HI, (u32)(addr >> 32));
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>pci_iomap(pdev, bar, maxlen): BAR'ı virtual adrese eşle; 0=tam boyut</li>
+      <li>readl/writel: 32-bit MMIO erişim; implicit memory barrier içerir</li>
+      <li>void __iomem *: MMIO pointer türü; derleyici yanlışlıkla önbelleğe almaz</li>
+      <li>BIT(n): bit mask makrosu; register flag tanımları için standart</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Interrupt yönetimi — INTx, MSI, MSI-X</h2>
+  <p class="section-lead">PCIe üç interrupt mekanizması destekler: eski INTx (PCI uyumlu), MSI (Message Signaled Interrupt) ve MSI-X (genişletilmiş). Modern sürücüler MSI-X tercih eder.</p>
+
+  <h3>INTx, MSI ve MSI-X karşılaştırması</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Tür</th><th>Vektör Sayısı</th><th>Paylaşım</th><th>Avantaj</th></tr></thead>
+      <tbody>
+        <tr><td>INTx (legacy)</td><td>1 (INTA-INTD)</td><td>Birden fazla cihaz paylaşır</td><td>Eski sistem uyumluluğu</td></tr>
+        <tr><td>MSI</td><td>1–32</td><td>Hayır</td><td>Paylaşım yok, daha az gecikme</td></tr>
+        <tr><td>MSI-X</td><td>1–2048</td><td>Hayır</td><td>En fazla vektör, NUMA'ya yönlendirilebilir</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — MSI-X interrupt kurulumu</span><span class="dot">●</span></div>
+    <pre><code>#define MYDRV_MAX_VECTORS  4
+
+struct mydev {
+    struct pci_dev  *pdev;
+    void __iomem    *bar0;
+    int              num_vectors;
+};
+
+/* MSI-X handler */
+static irqreturn_t mydrv_msix_handler(int irq, void *data)
+{
+    struct mydev *dev = data;
+    u32 status = mydev_read32(dev, REG_STATUS);
+
+    if (!(status &amp; STATUS_READY))
+        return IRQ_NONE;
+
+    /* Interrupt kaynağını temizle */
+    mydev_write32(dev, REG_STATUS, status);
+
+    /* İş yapma: tasklet veya NAPI schedule */
+    /* tasklet_schedule(&dev->rx_tasklet); */
+
+    return IRQ_HANDLED;
+}
+
+static int mydrv_setup_irq(struct mydev *dev)
+{
+    struct pci_dev *pdev = dev->pdev;
+    int i, ret;
+
+    /* MSI-X talep et; başarısız olursa MSI dene */
+    dev->num_vectors = pci_alloc_irq_vectors(pdev,
+        1,                   /* minimum */
+        MYDRV_MAX_VECTORS,   /* istenen maksimum */
+        PCI_IRQ_MSIX | PCI_IRQ_MSI | PCI_IRQ_LEGACY);
+
+    if (dev->num_vectors &lt; 0) {
+        dev_err(&pdev->dev, "irq_vectors: %d\n", dev->num_vectors);
+        return dev->num_vectors;
+    }
+
+    dev_info(&pdev->dev, "irq vectors: %d (%s)\n",
+             dev->num_vectors,
+             pdev->msix_enabled ? "MSI-X" :
+             pdev->msi_enabled  ? "MSI"   : "INTx");
+
+    /* Her vektör için handler kaydet */
+    for (i = 0; i &lt; dev->num_vectors; i++) {
+        int irq = pci_irq_vector(pdev, i);
+        ret = devm_request_irq(&pdev->dev, irq,
+                                mydrv_msix_handler,
+                                0,       /* flags */
+                                "mydrv", dev);
+        if (ret) {
+            dev_err(&pdev->dev, "request_irq[%d]: %d\n", i, ret);
+            /* devm_ önceki request'leri otomatik temizler */
+            pci_free_irq_vectors(pdev);
+            return ret;
+        }
+    }
+
+    return 0;
+}
+
+static void mydrv_free_irq(struct mydev *dev)
+{
+    /* devm_request_irq kullandıysak remove'da otomatik serbest bırakılır */
+    /* Ama vektörleri açıkça serbest bırak */
+    pci_free_irq_vectors(dev->pdev);
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>pci_alloc_irq_vectors(): MSI-X → MSI → legacy sırasıyla dener; flag kombinasyonu ile</li>
+      <li>pci_irq_vector(pdev, i): i. vektörün IRQ numarasını döner</li>
+      <li>MSI-X: her vektör farklı CPU'ya yönlendirilebilir; RX/TX kuyrukları için idealdir</li>
+      <li>devm_request_irq(): remove veya probe hatasında otomatik free_irq</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> DMA işlemleri — coherent ve streaming</h2>
+  <p class="section-lead">PCIe cihazı, DMA ile sistem belleğine doğrudan erişir. Linux DMA API, cihaza görünür fiziksel adresleri yönetir ve cache tutarlılığını sağlar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — DMA mask ayarı ve coherent buffer</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/dma-mapping.h&gt;
+
+#define DMA_BUF_SIZE   (4 * 1024)  /* 4 KB descriptor ring */
+
+struct mydev {
+    struct pci_dev  *pdev;
+    void __iomem    *bar0;
+    /* Coherent DMA buffer */
+    void            *dma_buf;      /* sanal adres */
+    dma_addr_t       dma_handle;   /* cihazın göreceği fiziksel adres */
+};
+
+static int mydrv_dma_init(struct mydev *dev)
+{
+    struct pci_dev *pdev = dev->pdev;
+    int ret;
+
+    /* 1. DMA mask ayarı: 64-bit DMA adresleme */
+    ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+    if (ret) {
+        dev_warn(&pdev->dev, "64-bit DMA yok, 32-bit deneniyor\n");
+        ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+        if (ret) {
+            dev_err(&pdev->dev, "DMA mask ayarlanamadı\n");
+            return ret;
+        }
+    }
+
+    /* 2. Coherent DMA buffer — CPU ve cihaz her zaman tutarlı görür */
+    dev->dma_buf = dma_alloc_coherent(&pdev->dev,
+                                       DMA_BUF_SIZE,
+                                       &dev->dma_handle,
+                                       GFP_KERNEL);
+    if (!dev->dma_buf) {
+        dev_err(&pdev->dev, "dma_alloc_coherent başarısız\n");
+        return -ENOMEM;
+    }
+
+    dev_info(&pdev->dev,
+             "DMA buf: virt=%p, phys=0x%llx, size=%u\n",
+             dev->dma_buf,
+             (unsigned long long)dev->dma_handle,
+             DMA_BUF_SIZE);
+
+    /* Cihaza DMA adresini yaz */
+    mydev_set_dma_addr(dev, dev->dma_handle);
+
+    return 0;
+}
+
+static void mydrv_dma_cleanup(struct mydev *dev)
+{
+    if (dev->dma_buf) {
+        dma_free_coherent(&dev->pdev->dev,
+                          DMA_BUF_SIZE,
+                          dev->dma_buf,
+                          dev->dma_handle);
+        dev->dma_buf    = NULL;
+        dev->dma_handle = 0;
+    }
+}
+
+/* --- Streaming DMA (tek paket için) --- */
+static int mydrv_dma_send(struct mydev *dev, void *data, size_t len)
+{
+    dma_addr_t dma_addr;
+
+    /* Buffer'ı DMA için eşle */
+    dma_addr = dma_map_single(&dev->pdev->dev, data, len,
+                               DMA_TO_DEVICE);
+    if (dma_mapping_error(&dev->pdev->dev, dma_addr)) {
+        dev_err(&dev->pdev->dev, "dma_map_single hata\n");
+        return -ENOMEM;
+    }
+
+    /* Cihaza DMA adresi ve uzunluğunu ver */
+    mydev_write32(dev, REG_DMA_ADDR_LO, (u32)(dma_addr & 0xFFFFFFFF));
+    mydev_write32(dev, REG_DMA_ADDR_HI, (u32)(dma_addr >> 32));
+    mydev_write32(dev, REG_DMA_LEN,     (u32)len);
+    mydev_write32(dev, REG_DMA_CMD,     0x01); /* START */
+
+    /* İşlem tamamlandıktan sonra unmap (genellikle completion IRQ'da) */
+    dma_unmap_single(&dev->pdev->dev, dma_addr, len, DMA_TO_DEVICE);
+
+    return 0;
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>dma_set_mask_and_coherent(): DMA adres aralığını belirt; 64-bit önce dene</li>
+      <li>dma_alloc_coherent(): CPU+cihaz tutarlı bellek; cache flush gerekmez</li>
+      <li>dma_map_single(): streaming DMA; DMA_TO_DEVICE / FROM_DEVICE / BIDIRECTIONAL</li>
+      <li>dma_mapping_error(): harita hatası mutlaka kontrol edilmeli; IOMMU veya bellek doluysa başarısız</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> MMIO register erişimi — barrier ve relaxed accessor</h2>
+  <p class="section-lead">MMIO register'larına erişimde memory ordering kritik öneme sahiptir. readl/writel implicit barrier içerirken readl_relaxed/writel_relaxed daha yüksek performans sağlar.</p>
+
+  <h3>Memory ordering gereksinimleri</h3>
+  <p>MMIO yazma işlemlerinin sırası korunmalıdır; aksi hâlde cihaz yanlış komut sırasına maruz kalabilir. Ayrıca bir MMIO yazmasının donanıma ulaştığından emin olmak için bazen okuma yaparak "flush" gerekir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — accessor pattern ve barrier kullanımı</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/io.h&gt;
+
+/* ── Standart accessor'lar (implicit barrier) ──────────────── */
+
+/* readl/writel: çoğu mimaride mfence veya dsb benzeri işlem içerir */
+static inline void mydev_reg_write(struct mydev *dev, u32 off, u32 val)
+{
+    writel(val, dev->bar0 + off);
+}
+
+static inline u32 mydev_reg_read(struct mydev *dev, u32 off)
+{
+    return readl(dev->bar0 + off);
+}
+
+/* ── Relaxed accessor'lar (barrier YOK — yüksek hızlı döngüler) ── */
+static inline void mydev_reg_write_relaxed(struct mydev *dev,
+                                            u32 off, u32 val)
+{
+    writel_relaxed(val, dev->bar0 + off);
+}
+
+static inline u32 mydev_reg_read_relaxed(struct mydev *dev, u32 off)
+{
+    return readl_relaxed(dev->bar0 + off);
+}
+
+/* ── Kullanım örneği: descriptor ring doldurma ─────────────── */
+static void mydev_fill_tx_ring(struct mydev *dev,
+                                struct tx_desc *ring, int n)
+{
+    int i;
+
+    /* Descriptor'ları relaxed ile yaz — sıra korunur (compiler barrier) */
+    for (i = 0; i &lt; n; i++) {
+        writel_relaxed(ring[i].addr_lo, dev->bar0 + TX_DESC(i, ADDR_LO));
+        writel_relaxed(ring[i].addr_hi, dev->bar0 + TX_DESC(i, ADDR_HI));
+        writel_relaxed(ring[i].length,  dev->bar0 + TX_DESC(i, LEN));
+        /* Son descriptor flag: barrier SONRASI yaz */
+        wmb(); /* write memory barrier */
+        writel_relaxed(ring[i].flags | DESC_VALID,
+                       dev->bar0 + TX_DESC(i, FLAGS));
+    }
+
+    /* Doorbell: cihaza "yeni descriptor var" bildir */
+    /* Bu yazma önceki tüm yazmaların tamamlanmasını gerektirir */
+    wmb();
+    writel(n, dev->bar0 + REG_TX_DOORBELL);
+}
+
+/* ── Yazma flush (MMIO write posting) ─────────────────────── */
+static void mydev_flush_write(struct mydev *dev)
+{
+    /* Yazma flush: bir okuma yaparak posted write'ların bitmesini garantile */
+    (void)readl(dev->bar0 + REG_STATUS);
+}</code></pre>
+  </div>
+
+  <h3>Barrier seçim rehberi</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Durum</th><th>Kullanılacak</th></tr></thead>
+      <tbody>
+        <tr><td>Normal register okuma/yazma</td><td>readl / writel</td></tr>
+        <tr><td>Yüksek frekanslı döngü (descriptor doldurma)</td><td>readl_relaxed / writel_relaxed</td></tr>
+        <tr><td>Sonraki yazma önceki tüm yazmalar tamamlandıktan sonra</td><td>wmb() + writel</td></tr>
+        <tr><td>MMIO write'ın cihaza ulaştığını garanti etme</td><td>Ardından readl() ile flush</td></tr>
+        <tr><td>ARM64: relaxed okuma güvenli mi?</td><td>Evet; implicit ordering vardır (LD-LD sırası)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>readl/writel: x86'da mfence, ARM64'te dmb(osh) içerir — genel kullanım için güvenli</li>
+      <li>readl_relaxed/writel_relaxed: barrier yok; döngü içinde performans kritikse kullan</li>
+      <li>wmb(): write memory barrier; descriptor valid flag'i en son yaz</li>
+      <li>MMIO flush: bir sonraki readl() çağrısına kadar önceki writel()lar queued kalabilir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Sürücü örneği — basit PCIe NIC</h2>
+  <p class="section-lead">RX/TX descriptor ring, DMA ve NAPI kullanan minimal bir PCIe ağ kartı sürücüsünün iskelet implementasyonu.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — PCIe NIC sürücü iskeleti (RX ring + NAPI)</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/netdevice.h&gt;
+#include &lt;linux/etherdevice.h&gt;
+#include &lt;linux/pci.h&gt;
+
+#define RX_RING_SIZE  256
+#define TX_RING_SIZE  256
+#define BUF_SIZE      2048
+
+struct rx_desc {
+    __le64 buf_addr;   /* DMA adresi */
+    __le16 length;
+    __le16 status;
+    __le32 reserved;
+} __packed;
+
+struct nic_priv {
+    struct pci_dev      *pdev;
+    struct net_device   *netdev;
+    void __iomem        *bar0;
+
+    struct napi_struct   napi;
+
+    /* RX ring */
+    struct rx_desc      *rx_ring;     /* descriptor ring (coherent DMA) */
+    dma_addr_t           rx_ring_dma;
+    struct sk_buff      *rx_skbs[RX_RING_SIZE];
+    dma_addr_t           rx_dma[RX_RING_SIZE];
+    int                  rx_head;
+};
+
+/* NAPI poll: IRQ yerine NAPI ile paket al */
+static int nic_napi_poll(struct napi_struct *napi, int budget)
+{
+    struct nic_priv *priv = container_of(napi, struct nic_priv, napi);
+    int received = 0;
+
+    while (received &lt; budget) {
+        struct rx_desc *desc = &priv->rx_ring[priv->rx_head];
+        struct sk_buff *skb;
+        u16 status, length;
+
+        /* Descriptor hazır değilse dur */
+        status = le16_to_cpu(desc->status);
+        if (!(status &amp; 0x01))  /* DD (Descriptor Done) bit */
+            break;
+
+        length = le16_to_cpu(desc->length);
+        skb    = priv->rx_skbs[priv->rx_head];
+
+        /* DMA unmap */
+        dma_unmap_single(&priv->pdev->dev,
+                          priv->rx_dma[priv->rx_head],
+                          BUF_SIZE, DMA_FROM_DEVICE);
+
+        /* skb hazırla ve protokol stack'e ver */
+        skb_put(skb, length);
+        skb->protocol = eth_type_trans(skb, priv->netdev);
+        napi_gro_receive(napi, skb);
+
+        priv->netdev->stats.rx_packets++;
+        priv->netdev->stats.rx_bytes += length;
+
+        /* Descriptor yenile */
+        /* ... yeni skb + DMA map ... */
+        priv->rx_head = (priv->rx_head + 1) % RX_RING_SIZE;
+        received++;
+    }
+
+    if (received &lt; budget) {
+        napi_complete_done(napi, received);
+        /* Interrupt'ı yeniden etkinleştir */
+        writel(0x01, priv->bar0 + 0x100); /* RX IRQ enable */
+    }
+
+    return received;
+}
+
+/* MSI-X handler: NAPI schedule et */
+static irqreturn_t nic_rx_irq(int irq, void *data)
+{
+    struct nic_priv *priv = data;
+    /* Interrupt'ı devre dışı bırak; NAPI devralır */
+    writel(0x00, priv->bar0 + 0x100);
+    napi_schedule(&priv->napi);
+    return IRQ_HANDLED;
+}
+
+static int nic_open(struct net_device *netdev)
+{
+    struct nic_priv *priv = netdev_priv(netdev);
+    napi_enable(&priv->napi);
+    netif_start_queue(netdev);
+    return 0;
+}
+
+static int nic_stop(struct net_device *netdev)
+{
+    struct nic_priv *priv = netdev_priv(netdev);
+    netif_stop_queue(netdev);
+    napi_disable(&priv->napi);
+    return 0;
+}
+
+static const struct net_device_ops nic_ops = {
+    .ndo_open       = nic_open,
+    .ndo_stop       = nic_stop,
+    /* .ndo_start_xmit = nic_xmit, */
+};
+
+static int nic_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+{
+    struct net_device *netdev;
+    struct nic_priv *priv;
+    int ret;
+
+    netdev = alloc_etherdev(sizeof(*priv));
+    if (!netdev) return -ENOMEM;
+
+    priv = netdev_priv(netdev);
+    priv->pdev   = pdev;
+    priv->netdev = netdev;
+    pci_set_drvdata(pdev, priv);
+    SET_NETDEV_DEV(netdev, &pdev->dev);
+
+    ret = pcim_enable_device(pdev);
+    if (ret) goto err_free;
+
+    pci_set_master(pdev);
+
+    ret = pcim_iomap_regions(pdev, BIT(0), "nic");
+    if (ret) goto err_free;
+    priv->bar0 = pcim_iomap_table(pdev)[0];
+
+    /* NAPI kurulumu */
+    netif_napi_add(netdev, &priv->napi, nic_napi_poll, 64);
+
+    netdev->netdev_ops = &nic_ops;
+    eth_hw_addr_random(netdev);  /* gerçekte HW'den oku */
+
+    ret = register_netdev(netdev);
+    if (ret) goto err_napi;
+
+    return 0;
+
+err_napi:
+    netif_napi_del(&priv->napi);
+err_free:
+    free_netdev(netdev);
+    return ret;
+}
+
+static void nic_remove(struct pci_dev *pdev)
+{
+    struct nic_priv *priv = pci_get_drvdata(pdev);
+    unregister_netdev(priv->netdev);
+    netif_napi_del(&priv->napi);
+    free_netdev(priv->netdev);
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>RX ring: coherent DMA'da descriptor dizisi; her slot için skb + DMA adres kaydı</li>
+      <li>NAPI: MSI-X handler RX IRQ'yu kapatır, napi_schedule() çağırır; poll budget ile işlem</li>
+      <li>napi_gro_receive(): GRO (Generic Receive Offload) ile paketleri birleştir</li>
+      <li>alloc_etherdev(): net_device + private veri tek alloc; SET_NETDEV_DEV ile sysfs bağlantısı</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Hotplug ve power management — ASPM, D0/D3</h2>
+  <p class="section-lead">PCIe hotplug ve ASPM (Active State Power Management), gömülü sistemlerde enerji tasarrufu ve dinamik cihaz yönetimi için kritiktir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — pci_driver power management callback'leri</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/pm.h&gt;
+#include &lt;linux/pm_runtime.h&gt;
+
+static int mydrv_suspend(struct device *dev)
+{
+    struct pci_dev  *pdev = to_pci_dev(dev);
+    struct mydev    *mydev = pci_get_drvdata(pdev);
+
+    dev_info(dev, "suspend: D0 → D3\n");
+
+    netif_stop_queue(mydev->netdev);    /* varsa */
+    napi_disable(&mydev->napi);         /* varsa */
+
+    /* HW'i durdur */
+    mydev_write32(mydev, REG_CTRL, 0);
+
+    /* PCIe state: D3hot */
+    pci_save_state(pdev);
+    pci_disable_device(pdev);
+    pci_set_power_state(pdev, PCI_D3hot);
+
+    return 0;
+}
+
+static int mydrv_resume(struct device *dev)
+{
+    struct pci_dev  *pdev = to_pci_dev(dev);
+    struct mydev    *mydev = pci_get_drvdata(pdev);
+    int ret;
+
+    dev_info(dev, "resume: D3 → D0\n");
+
+    pci_set_power_state(pdev, PCI_D0);
+    pci_restore_state(pdev);
+
+    ret = pci_enable_device(pdev);
+    if (ret) return ret;
+
+    pci_set_master(pdev);
+    mydev_hw_init(mydev);
+
+    napi_enable(&mydev->napi);
+    netif_start_queue(mydev->netdev);
+
+    return 0;
+}
+
+static const struct dev_pm_ops mydrv_pm_ops = {
+    SET_SYSTEM_SLEEP_PM_OPS(mydrv_suspend, mydrv_resume)
+    /* Runtime PM: */
+    /* SET_RUNTIME_PM_OPS(mydrv_runtime_suspend,
+                          mydrv_runtime_resume, NULL) */
+};
+
+static struct pci_driver mydrv_driver = {
+    .name     = "mydrv",
+    .id_table = mydrv_ids,
+    .probe    = mydrv_probe,
+    .remove   = mydrv_remove,
+    .driver.pm = &mydrv_pm_ops,
+};</code></pre>
+  </div>
+
+  <h3>ASPM yönetimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — ASPM kontrolü</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ASPM durumunu sorgula</span>
+<span class="cmd">sudo</span> lspci <span class="flag">-vvv</span> <span class="flag">-s</span> 01:00.0 | grep -i "aspm\|l0s\|l1"
+<span class="cmt"># LnkCtl: ASPM L0s L1 Enabled; RCB 64 bytes, ...</span>
+
+<span class="cmt"># Tüm cihazlar için ASPM devre dışı bırak (gecikme kritik):</span>
+<span class="cmd">echo</span> 0 | sudo tee /sys/module/pcie_aspm/parameters/policy
+<span class="cmt"># veya: pcie_aspm=off kernel parametresi</span>
+
+<span class="cmt"># En agresif güç tasarrufu:</span>
+<span class="cmd">echo</span> powersupersave | sudo tee /sys/module/pcie_aspm/parameters/policy</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>dev_pm_ops: suspend/resume sistem uyku döngüsü; SET_SYSTEM_SLEEP_PM_OPS makrosu</li>
+      <li>pci_save_state / pci_restore_state: config space yedekle/geri yükle</li>
+      <li>Runtime PM: cihaz boştayken D3'e geç; pm_runtime_enable/get/put ile yönetim</li>
+      <li>ASPM L1: PLL kapatılır, ~mW tasarruf; L0s: hızlı çıkış, daha az tasarruf</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: PCIe loopback test cihazı sürücüsü</h2>
+  <p class="section-lead">Basit bir PCIe loopback test cihazı için /dev arayüzü sağlayan minimal sürücü — write ile cihaza veri gönder, read ile geri al.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — /dev/myloopback arayüzlü PCIe sürücü</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/cdev.h&gt;
+#include &lt;linux/uaccess.h&gt;
+
+#define BUF_SIZE  4096
+
+struct loopdev {
+    struct pci_dev  *pdev;
+    void __iomem    *bar0;
+    struct cdev      cdev;
+    dev_t            devno;
+    void            *dma_buf;
+    dma_addr_t       dma_handle;
+    struct mutex     lock;
+};
+
+static ssize_t loopdev_write(struct file *f, const char __user *buf,
+                              size_t len, loff_t *off)
+{
+    struct loopdev *dev = f->private_data;
+    ssize_t ret;
+
+    if (len > BUF_SIZE) len = BUF_SIZE;
+
+    mutex_lock(&dev->lock);
+
+    if (copy_from_user(dev->dma_buf, buf, len)) {
+        ret = -EFAULT;
+        goto out;
+    }
+
+    /* Cihaza DMA transfer başlat */
+    mydev_write32((struct mydev *)dev, REG_DMA_LEN, (u32)len);
+    mydev_write32((struct mydev *)dev, REG_DMA_CMD, 0x01); /* TX start */
+
+    /* Basit polling tamamlanma bekleme (IRQ yerine) */
+    int timeout = 1000;
+    while (timeout--) {
+        u32 status = mydev_read32((struct mydev *)dev, REG_STATUS);
+        if (status &amp; STATUS_READY) break;
+        udelay(10);
+    }
+
+    ret = (timeout >= 0) ? (ssize_t)len : -ETIMEDOUT;
+
+out:
+    mutex_unlock(&dev->lock);
+    return ret;
+}
+
+static ssize_t loopdev_read(struct file *f, char __user *buf,
+                             size_t len, loff_t *off)
+{
+    struct loopdev *dev = f->private_data;
+    u32 avail;
+
+    mutex_lock(&dev->lock);
+    avail = mydev_read32((struct mydev *)dev, 0x20); /* RX length reg */
+    if (len > avail) len = avail;
+
+    if (copy_to_user(buf, dev->dma_buf, len)) {
+        mutex_unlock(&dev->lock);
+        return -EFAULT;
+    }
+
+    mutex_unlock(&dev->lock);
+    return len;
+}
+
+static int loopdev_open(struct inode *inode, struct file *f)
+{
+    struct loopdev *dev = container_of(inode->i_cdev,
+                                       struct loopdev, cdev);
+    f->private_data = dev;
+    return 0;
+}
+
+static const struct file_operations loopdev_fops = {
+    .owner   = THIS_MODULE,
+    .open    = loopdev_open,
+    .read    = loopdev_read,
+    .write   = loopdev_write,
+};</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — kullanıcı alanı test</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Modülü yükle</span>
+<span class="cmd">sudo</span> insmod myloopback.ko
+
+<span class="cmt"># /dev cihazı oluşturuldu mu?</span>
+<span class="cmd">ls</span> <span class="flag">-la</span> /dev/myloopback0
+
+<span class="cmt"># Loopback testi: write → cihaz → read</span>
+<span class="cmd">echo</span> "PCIe test verisi" | sudo tee /dev/myloopback0
+<span class="cmd">sudo</span> cat /dev/myloopback0
+<span class="cmt"># PCIe test verisi</span>
+
+<span class="cmt"># Performans testi (dd ile bant genişliği)</span>
+<span class="cmd">dd</span> if=/dev/urandom bs=4K count=1000 | \
+   sudo tee /dev/myloopback0 > /dev/null
+<span class="cmt"># 4096000 bytes (4.1 MB) copied, 0.021 s, 195 MB/s</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>cdev + file_operations: PCIe cihazına /dev arayüzü; standart read/write semantiği</li>
+      <li>copy_from_user / copy_to_user: kullanıcı ↔ kernel bellek kopyası; hata dönüşü zorunlu</li>
+      <li>mutex_lock: DMA transfer sırasında aynı anda iki işlem olmasını önler</li>
+      <li>Polling vs IRQ: test sürücüsünde basit polling yeterli; üretimde IRQ + completion kullan</li>
+    </ul>
+  </div>
+</section>
+
+</main>

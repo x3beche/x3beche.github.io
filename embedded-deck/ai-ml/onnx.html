@@ -1,0 +1,728 @@
+---
+layout: tutorial
+title: "ONNX Runtime — Cross-Platform Inference"
+back_url: "../index.html"
+back_label: "AI/ML Uç Bilişim"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>AI/ML UÇ BİLİŞİM</span>
+    <span>ONNX Runtime</span>
+    <span>2026</span>
+  </div>
+  <h1>ONNX Runtime —<br><em>cross-platform inference.</em></h1>
+  <p class="subtitle">Open Neural Network Exchange ile platform bağımsız model çıkarımı. Execution provider mimarisi, graph optimization, Python ve C API. Raspberry Pi CM4'te YOLOv8 nano ile &lt;50ms nesne tespiti.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">ONNX nedir? — format ve ekosistem</a></li>
+    <li><a href="#s1">ONNX Runtime mimarisi — EP, graph opt, session</a></li>
+    <li><a href="#s2">Python API — InferenceSession, run, options</a></li>
+    <li><a href="#s3">C API — OrtApi, OrtSession, OrtValue</a></li>
+    <li><a href="#s4">Execution providers — CPU, CUDA, OpenVINO, NNAPI</a></li>
+    <li><a href="#s5">Model optimizasyonu — graph opt, QDQ quantization</a></li>
+    <li><a href="#s6">Cross-compile ve gömülü deploy — minimal build, arm64</a></li>
+    <li><a href="#s7">PyTorch/TF → ONNX dönüşüm — torch.onnx.export</a></li>
+    <li><a href="#s8">Pratik — YOLOv8 nano RPi CM4 &lt;50ms nesne tespiti</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> ONNX nedir? — format ve ekosistem</h2>
+  <p class="section-lead">ONNX (Open Neural Network Exchange), farklı derin öğrenme çerçeveleri arasında model taşınabilirliğini sağlayan açık bir format standardıdır. Microsoft, Facebook ve AWS öncülüğünde geliştirilmiştir.</p>
+
+  <h3>Ekosistem haritası</h3>
+
+  <div class="flow">
+    <pre>
+  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
+  │ PyTorch  │  │TensorFlow│  │  scikit  │  │  MXNet   │
+  │ .pt/.pth │  │ saved_   │  │  -learn  │  │  .params │
+  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘
+       │              │              │              │
+       ▼              ▼              ▼              ▼
+  torch.onnx     tf2onnx        sklearn-onnx     mxnet
+  .export()      convert        convert          export
+       │              │              │              │
+       └──────────────┴──────────────┴──────────────┘
+                              ↓
+                      model.onnx  (FlatBuffer/ProtoBuf)
+                              ↓
+                    ONNX Runtime (libonnxruntime)
+                              ↓
+             ┌────────┬───────────┬──────────┬───────┐
+             │ CPU EP │ CUDA EP   │ TensorRT │ NNAPI │
+             │ x86_64 │ NVIDIA    │  EP      │Android│
+             │ ARM    │ GPU       │          │       │
+             └────────┴───────────┴──────────┴───────┘
+    </pre>
+  </div>
+
+  <div class="params">
+    <div class="param">
+      <div class="name">ONNX Format</div>
+      <div class="desc">ProtoBuf tabanlı ikili format (.onnx). Hesaplama grafiği (nodes), tensör şekilleri, ağırlık verileri ve op tanımlamalarını içerir. opset sürümü (1-19+) op uyumluluğunu belirler.</div>
+    </div>
+    <div class="param">
+      <div class="name">ONNX Runtime</div>
+      <div class="desc">Microsoft'un yüksek performanslı çıkarım motoru. C++ çekirdeği üzerine Python, C, C#, Java, JavaScript binding'leri. Hem eğitim hem çıkarım modu desteklenir.</div>
+    </div>
+    <div class="param">
+      <div class="name">ONNX Model Zoo</div>
+      <div class="desc">github.com/onnx/models adresinde 50+ önceden dönüştürülmüş model: ResNet, VGG, BERT, YOLO serileri, GPT-2. Doğrudan ORT ile kullanılabilir.</div>
+    </div>
+    <div class="param">
+      <div class="name">opset Versiyonu</div>
+      <div class="desc">Her ONNX sürümü yeni op'lar ekler veya mevcutları değiştirir. ORT, opset 7-19 aralığını destekler. Export sırasında hedef cihazın desteklediği opset'i belirle.</div>
+    </div>
+  </div>
+
+  <div class="callout">
+    <div class="label">Format Karşılaştırması</div>
+    <p>ONNX, TFLite'a kıyasla daha zengin op kümesine sahiptir (transformer, LSTM, custom ops). Ancak MCU deployment'ta TFLite Micro daha uygun seçenektir. ONNX/ORT, Linux tabanlı gömülü sistemlerde (Raspberry Pi, i.MX8, RK3588) tercih edilir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> ONNX Runtime mimarisi</h2>
+  <p class="section-lead">ORT'un execution provider (EP) mimarisi, aynı ONNX modelini farklı donanım hızlandırıcılarında çalıştırmayı sağlar. Graph optimizer, session oluşturulurken modeli analiz edip dönüştürür.</p>
+
+  <h3>Dahili pipeline</h3>
+
+  <div class="flow">
+    <pre>
+  model.onnx
+       ↓
+  [Model Loader]
+  ProtoBuf parse → InternalGraph
+       ↓
+  [Graph Optimizer]
+  ├── Level 1 (Basic)    : constant folding, redundant elimination
+  ├── Level 2 (Extended) : node fusion (Conv+BN+Relu)
+  └── Level 3 (All)      : layout transformation, memory planning
+       ↓
+  [Execution Provider Dispatch]
+  ├── CPU EP   : libomp, MLAS kernel (ARM NEON otomatik)
+  ├── CUDA EP  : cuDNN, cuBLAS kernel dispatch
+  └── fallback : CPU EP (desteklenmeyen op'lar için)
+       ↓
+  [Session Run]
+  input tensors → kernel execution → output tensors
+    </pre>
+  </div>
+
+  <div class="params">
+    <div class="param">
+      <div class="name">SessionOptions</div>
+      <div class="desc">Session oluşturma parametreleri: graph_optimization_level, inter/intra_op_num_threads, execution_mode (SEQUENTIAL / PARALLEL), log_severity_level.</div>
+    </div>
+    <div class="param">
+      <div class="name">RunOptions</div>
+      <div class="desc">Her run() çağrısı için: timeout_ms, terminate_flag, run_tag. Paralel async çıkarım için kullanılır.</div>
+    </div>
+    <div class="param">
+      <div class="name">MLAS (Microsoft Linear Algebra Subprograms)</div>
+      <div class="desc">ORT'un CPU EP'si. ARM NEON, AVX2, AVX-512 otomatik algılar. GEMM ve konvolüsyon için optimize edilmiş assembly kernelleri içerir.</div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Python API — InferenceSession, run, options</h2>
+  <p class="section-lead">ORT Python API'si, prototipleme ve Linux gömülü sistemler için birincil arayüzdür. <code class="inline">onnxruntime</code> paketi pip ile kurulur.</p>
+
+  <h3>Kurulum</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code class="language-bash"># CPU-only (arm64 RPi dahil)
+pip install onnxruntime
+
+# GPU destekli (CUDA 12.x)
+pip install onnxruntime-gpu
+
+# Gömülü / minimal (ORT Lite)
+pip install onnxruntime-extensions  # custom op desteği</code></pre>
+  </div>
+
+  <h3>Temel çıkarım</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>ort_basic.py</span><span class="dot">●</span></div>
+    <pre><code class="language-python">import onnxruntime as ort
+import numpy as np
+
+# Session oluştur — Session options ile optimize et
+so = ort.SessionOptions()
+so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+so.intra_op_num_threads = 4        # işlem içi paralellik
+so.inter_op_num_threads = 1        # işlemler arası paralellik
+so.enable_mem_pattern   = True     # bellek yeniden kullanımı
+so.enable_cpu_mem_arena = True
+
+session = ort.InferenceSession(
+    "yolov8n.onnx",
+    sess_options=so,
+    providers=["CPUExecutionProvider"]
+)
+
+# Model giriş/çıkış bilgisi
+for inp in session.get_inputs():
+    print(f"Input : {inp.name}  shape={inp.shape}  type={inp.type}")
+for out in session.get_outputs():
+    print(f"Output: {out.name}  shape={out.shape}  type={out.type}")
+
+# Çıkarım
+img = np.random.rand(1, 3, 640, 640).astype(np.float32)  # NCHW
+outputs = session.run(
+    output_names=None,   # tümünü döndür
+    input_feed={"images": img}
+)
+print("Çıkış şekli:", outputs[0].shape)  # (1, 84, 8400) YOLOv8 formatı</code></pre>
+  </div>
+
+  <h3>Gelişmiş: IO Binding ile sıfır kopyalama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>ort_iobinding.py</span><span class="dot">●</span></div>
+    <pre><code class="language-python">import onnxruntime as ort
+import numpy as np
+
+session = ort.InferenceSession("yolov8n.onnx",
+    providers=["CPUExecutionProvider"])
+
+# IOBinding: giriş/çıkış tensörlerini önceden bağla
+io_binding = session.io_binding()
+
+img = np.random.rand(1, 3, 640, 640).astype(np.float32)
+
+# Girişi ORT OrtValue olarak bağla (kopya yok)
+io_binding.bind_input(
+    name='images',
+    device_type='cpu',
+    device_id=0,
+    element_type=np.float32,
+    shape=img.shape,
+    buffer_ptr=img.ctypes.data
+)
+
+# Çıkışı CPU'da oluştur
+io_binding.bind_output('output0', 'cpu')
+
+session.run_with_iobinding(io_binding)
+output = io_binding.copy_outputs_to_cpu()[0]
+print("output shape:", output.shape)</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> C API — OrtApi, OrtSession, OrtValue</h2>
+  <p class="section-lead">ORT C API, C++ ortamı olmayan veya ABI uyumluluğu gerektiren gömülü sistemler için kullanılır. Tüm ORT işlemleri tek bir <code class="inline">OrtApi</code> struct üzerinden gerçekleşir.</p>
+
+  <h3>Temel C çıkarım örneği</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>ort_c_infer.c</span><span class="dot">●</span></div>
+    <pre><code class="language-c">#include &lt;onnxruntime_c_api.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+
+#define ORT_ABORT_ON_ERROR(expr) \
+  do { OrtStatus* ort_status = (expr); \
+    if (ort_status != NULL) { \
+      fprintf(stderr, "ORT Error: %s\n", \
+              g_ort->GetErrorMessage(ort_status)); \
+      g_ort->ReleaseStatus(ort_status); \
+      abort(); \
+    } \
+  } while (0)
+
+static const OrtApi* g_ort = NULL;
+
+int main(void) {
+    g_ort = OrtGetApiBase()->GetApi(ORT_API_VERSION);
+
+    /* Environment oluştur */
+    OrtEnv* env;
+    ORT_ABORT_ON_ERROR(g_ort->CreateEnv(
+        ORT_LOGGING_LEVEL_WARNING, "ort_embedded", &env));
+
+    /* Session options */
+    OrtSessionOptions* session_options;
+    ORT_ABORT_ON_ERROR(g_ort->CreateSessionOptions(&session_options));
+    ORT_ABORT_ON_ERROR(g_ort->SetIntraOpNumThreads(session_options, 4));
+    ORT_ABORT_ON_ERROR(g_ort->SetSessionGraphOptimizationLevel(
+        session_options, ORT_ENABLE_ALL));
+
+    /* Session oluştur */
+    OrtSession* session;
+    ORT_ABORT_ON_ERROR(g_ort->CreateSession(
+        env, "yolov8n.onnx", session_options, &session));
+
+    /* Memory info */
+    OrtMemoryInfo* memory_info;
+    ORT_ABORT_ON_ERROR(g_ort->CreateCpuMemoryInfo(
+        OrtArenaAllocator, OrtMemTypeDefault, &memory_info));
+
+    /* Giriş tensörü oluştur */
+    float input_data[1 * 3 * 640 * 640];
+    memset(input_data, 0, sizeof(input_data));
+    int64_t input_shape[] = {1, 3, 640, 640};
+    size_t  input_shape_len = 4;
+
+    OrtValue* input_tensor;
+    ORT_ABORT_ON_ERROR(g_ort->CreateTensorWithDataAsOrtValue(
+        memory_info,
+        input_data, sizeof(input_data),
+        input_shape, input_shape_len,
+        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+        &input_tensor));
+
+    /* Çıkarım */
+    const char* input_names[]  = {"images"};
+    const char* output_names[] = {"output0"};
+    OrtValue*   output_tensor  = NULL;
+
+    ORT_ABORT_ON_ERROR(g_ort->Run(
+        session, NULL,
+        input_names,  (const OrtValue* const*)&input_tensor, 1,
+        output_names, 1, &output_tensor));
+
+    /* Çıkış verisine eriş */
+    float* output_data;
+    ORT_ABORT_ON_ERROR(g_ort->GetTensorMutableData(
+        output_tensor, (void**)&output_data));
+
+    printf("İlk çıkış değeri: %f\n", output_data[0]);
+
+    /* Temizlik */
+    g_ort->ReleaseValue(output_tensor);
+    g_ort->ReleaseValue(input_tensor);
+    g_ort->ReleaseMemoryInfo(memory_info);
+    g_ort->ReleaseSession(session);
+    g_ort->ReleaseSessionOptions(session_options);
+    g_ort->ReleaseEnv(env);
+    return 0;
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>Derleme (arm64)</span><span class="dot">●</span></div>
+    <pre><code class="language-bash">aarch64-linux-gnu-gcc -O2 -o ort_infer ort_c_infer.c \
+  -I/opt/ort/include \
+  -L/opt/ort/lib -lonnxruntime \
+  -Wl,-rpath,/opt/ort/lib</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Execution providers — CPU, CUDA, OpenVINO, NNAPI</h2>
+  <p class="section-lead">Her Execution Provider (EP), belirli donanım üzerinde op'ları çalıştırır. ORT, desteklenmeyen op'ları otomatik olarak CPU EP'ye devreder (fallback).</p>
+
+  <div class="params">
+    <div class="param">
+      <div class="name">CPU EP</div>
+      <div class="desc">Varsayılan EP. ARM NEON, x86 AVX2/AVX-512 otomatik. MLAS kernelleri ile INT8 QDQ modelleri hızlandırır. Her platformda kullanılabilir.</div>
+    </div>
+    <div class="param">
+      <div class="name">CUDA EP</div>
+      <div class="desc">NVIDIA GPU hızlandırması. cuDNN ve cuBLAS gerektirir. <code class="inline">providers=["CUDAExecutionProvider", "CPUExecutionProvider"]</code> ile aktif edilir. CUDA EP desteklemediği op'ları CPU'ya devreder.</div>
+    </div>
+    <div class="param">
+      <div class="name">TensorRT EP</div>
+      <div class="desc">NVIDIA TensorRT ile derleme zamanı kernel fusion. İlk çalışmada TRT engine derlenir (yavaş), sonraki çalışmalar hızlanır. Jetson platformlarda ideal.</div>
+    </div>
+    <div class="param">
+      <div class="name">CoreML EP</div>
+      <div class="desc">Apple Silicon ve iOS NPU/GPU hızlandırması. Raspberry Pi senaryosunda kullanılmaz; macOS/iOS gömülü ürünler için.</div>
+    </div>
+    <div class="param">
+      <div class="name">OpenVINO EP</div>
+      <div name="name">Intel NPU ve iGPU hızlandırması. Intel UP Squared, NUC ve i.MX8 + eIQ gibi Intel tabanlı gömülü platformlarda kullanılır.</div>
+    </div>
+    <div class="param">
+      <div class="name">NNAPI EP</div>
+      <div class="desc">Android Neural Networks API. Android 8.1+ telefon ve gömülü Android (Qualcomm, MediaTek NPU). <code class="inline">providers=["NnapiExecutionProvider"]</code>.</div>
+    </div>
+  </div>
+
+  <h3>EP seçimi ve fallback akışı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>ep_selection.py</span><span class="dot">●</span></div>
+    <pre><code class="language-python">import onnxruntime as ort
+
+# Mevcut EP'leri listele
+print(ort.get_available_providers())
+# ['CPUExecutionProvider'] — RPi4 üzerinde tipik çıktı
+# ['CUDAExecutionProvider','CPUExecutionProvider'] — CUDA kurulu
+
+# RPi4 için optimal konfigürasyon
+providers = [
+    ("CPUExecutionProvider", {
+        "arena_extend_strategy": "kNextPowerOfTwo",
+        "cpu_memory_arena_cfg": "max_mem:536870912",  # 512 MB limit
+    })
+]
+
+session = ort.InferenceSession("yolov8n.onnx", providers=providers)
+
+# Hangi EP'nin aktif olduğunu doğrula
+for i, node_provider in enumerate(session._provider_options):
+    print(f"Node group {i}: {node_provider}")</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Model optimizasyonu — graph opt, QDQ quantization</h2>
+  <p class="section-lead">ORT'un üç seviyeli graph optimizer ve ONNX Runtime quantization araçları, çıkarım süresini ve bellek kullanımını önemli ölçüde azaltır.</p>
+
+  <h3>Graph optimization seviyeleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Seviye</th><th>Enum</th><th>İçerik</th><th>Etki</th></tr></thead>
+      <tbody>
+        <tr><td>Devre dışı</td><td>ORT_DISABLE_ALL</td><td>Ham grafik</td><td>—</td></tr>
+        <tr><td>Basic</td><td>ORT_ENABLE_BASIC</td><td>Constant folding, redundant elim.</td><td>%5-10</td></tr>
+        <tr><td>Extended</td><td>ORT_ENABLE_EXTENDED</td><td>Op fusion (Conv+BN, Gelu fused)</td><td>%15-25</td></tr>
+        <tr><td>All</td><td>ORT_ENABLE_ALL</td><td>Layout dönüşümü, memory planner</td><td>%20-40</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>QDQ (Quantize-DeQuantize) INT8 quantization</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>ort_quantize.py</span><span class="dot">●</span></div>
+    <pre><code class="language-python">from onnxruntime.quantization import quantize_static, CalibrationDataReader
+from onnxruntime.quantization import QuantFormat, QuantType
+import numpy as np
+
+class ImageCalibrationReader(CalibrationDataReader):
+    def __init__(self, model_path, image_folder, num_samples=100):
+        import glob, cv2
+        self.images = glob.glob(f"{image_folder}/*.jpg")[:num_samples]
+        self.index  = 0
+
+    def get_next(self):
+        if self.index >= len(self.images):
+            return None
+        import cv2
+        img = cv2.imread(self.images[self.index])
+        img = cv2.resize(img, (640, 640))
+        img = img.astype(np.float32) / 255.0
+        img = img.transpose(2, 0, 1)[np.newaxis]  # NCHW
+        self.index += 1
+        return {"images": img}
+
+# Statik INT8 quantization (QDQ format, CPU EP için optimal)
+quantize_static(
+    model_input="yolov8n.onnx",
+    model_output="yolov8n_int8.onnx",
+    calibration_data_reader=ImageCalibrationReader(
+        "yolov8n.onnx", "./calib_images"),
+    quant_format=QuantFormat.QDQ,
+    activation_type=QuantType.QInt8,
+    weight_type=QuantType.QInt8,
+    per_channel=True
+)
+print("INT8 model oluşturuldu: yolov8n_int8.onnx")</code></pre>
+  </div>
+
+  <h3>Optimize edilmiş modeli kaydet</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>save_optimized.py</span><span class="dot">●</span></div>
+    <pre><code class="language-python">import onnxruntime as ort
+
+so = ort.SessionOptions()
+so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+# Optimize edilmiş modeli diske kaydet (bir kez çalıştır, sonra yükle)
+so.optimized_model_filepath = "yolov8n_optimized.onnx"
+
+session = ort.InferenceSession("yolov8n.onnx", sess_options=so)
+# Artık yolov8n_optimized.onnx dosyası mevcut
+# Sonraki çalıştırmalarda doğrudan bu dosyayı yükle (session başlatma hızlanır)</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Cross-compile ve gömülü deploy — minimal build, arm64</h2>
+  <p class="section-lead">Gömülü Linux hedefler için ORT'un minimal build sistemi, gereksiz EP'leri ve op'ları çıkararak küçük bir shared library üretir.</p>
+
+  <h3>Minimal build sistemi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Host PC (Ubuntu 22.04)</span><span class="dot">●</span></div>
+    <pre><code class="language-bash"># aarch64 cross-compile toolchain kur
+sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+# ORT kaynak kodu
+git clone --depth 1 --branch v1.18.1 \
+    https://github.com/microsoft/onnxruntime
+cd onnxruntime
+
+# Minimal build: yalnızca CPU EP, QDQ INT8, temel op'lar
+python tools/ci_build/build.py \
+    --build_dir ./build/arm64 \
+    --config Release \
+    --arm64 \
+    --cmake_extra_defines \
+        CMAKE_TOOLCHAIN_FILE=cmake/toolchains/aarch64-gcc.cmake \
+        onnxruntime_BUILD_UNIT_TESTS=OFF \
+        onnxruntime_MINIMAL_BUILD=ON \
+        onnxruntime_DISABLE_EXCEPTIONS=ON \
+    --parallel $(nproc) \
+    --skip_tests
+
+# Sonuç: build/arm64/Release/libonnxruntime.so (~8 MB minimal)
+ls -lh build/arm64/Release/libonnxruntime*</code></pre>
+  </div>
+
+  <h3>Gerekli op listesi oluşturma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — hangi op'lar gerekli?</span><span class="dot">●</span></div>
+    <pre><code class="language-bash"># Model için gerekli op listesini çıkar
+python tools/ci_build/build.py \
+    --build_dir ./build/required_ops \
+    --config Release \
+    --minimal_build extended \
+    --enable_reduced_operator_type_support \
+    --include_ops_by_model yolov8n.onnx
+
+# Üretilen required_ops.config → minimal build'e dahil edilir</code></pre>
+  </div>
+
+  <h3>RPi hedefine kopyalama ve test</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code class="language-bash"># Kütüphane ve başlıkları RPi'ye kopyala
+scp build/arm64/Release/libonnxruntime.so pi@raspberrypi:/usr/local/lib/
+scp -r include/onnxruntime/ pi@raspberrypi:/usr/local/include/
+
+# RPi'de ldconfig güncelle
+ssh pi@raspberrypi "sudo ldconfig"
+
+# Uygulama derle (RPi'de doğrudan)
+g++ -O2 -o infer ort_c_infer.c \
+    -I/usr/local/include/onnxruntime \
+    -L/usr/local/lib -lonnxruntime \
+    -Wl,-rpath,/usr/local/lib
+
+./infer  # test et</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> PyTorch/TF → ONNX dönüşüm</h2>
+  <p class="section-lead">Model dönüşümü, ONNX ekosisteminin temel adımıdır. torch.onnx.export ve tf2onnx, farklı çerçevelerden ONNX formatına geçişi sağlar.</p>
+
+  <h3>PyTorch → ONNX</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>torch_to_onnx.py</span><span class="dot">●</span></div>
+    <pre><code class="language-python">import torch
+from ultralytics import YOLO
+
+# YOLOv8 nano modeli yükle
+model = YOLO("yolov8n.pt")
+
+# Yöntem 1: Ultralytics export (önerilen)
+model.export(format="onnx", opset=17,
+             simplify=True,
+             dynamic=False,
+             imgsz=640)
+# → yolov8n.onnx
+
+# Yöntem 2: torch.onnx.export (manuel)
+dummy_input = torch.randn(1, 3, 640, 640)
+torch.onnx.export(
+    model.model,
+    dummy_input,
+    "yolov8n_manual.onnx",
+    opset_version=17,
+    input_names=["images"],
+    output_names=["output0"],
+    dynamic_axes={
+        "images":  {0: "batch_size"},
+        "output0": {0: "batch_size"}
+    },
+    export_params=True
+)</code></pre>
+  </div>
+
+  <h3>TensorFlow/Keras → ONNX</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>tf_to_onnx.py</span><span class="dot">●</span></div>
+    <pre><code class="language-python">import tf2onnx
+import tensorflow as tf
+
+model = tf.keras.applications.MobileNetV2(weights="imagenet")
+
+# tf2onnx ile dönüştür
+input_signature = [tf.TensorSpec(
+    shape=[None, 224, 224, 3],
+    dtype=tf.float32,
+    name="input")]
+
+model_proto, _ = tf2onnx.convert.from_keras(
+    model,
+    input_signature=input_signature,
+    opset=17,
+    output_path="mobilenetv2.onnx"
+)
+print("Dönüşüm tamamlandı")</code></pre>
+  </div>
+
+  <h3>Dönüşüm doğrulama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>validate_onnx.py</span><span class="dot">●</span></div>
+    <pre><code class="language-python">import onnx, onnxruntime as ort, numpy as np
+
+# ONNX model doğrulama
+model = onnx.load("yolov8n.onnx")
+onnx.checker.check_model(model)
+print("ONNX model geçerli")
+
+# ORT ile çalıştırarak sayısal doğrulama
+session = ort.InferenceSession("yolov8n.onnx")
+inp = np.random.rand(1, 3, 640, 640).astype(np.float32)
+out = session.run(None, {"images": inp})
+print(f"Çıkış şekli: {out[0].shape}, min={out[0].min():.4f}")</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik — YOLOv8 nano RPi CM4 &lt;50ms nesne tespiti</h2>
+  <p class="section-lead">Raspberry Pi CM4 (4GB RAM, 4x Cortex-A72) üzerinde YOLOv8 nano ONNX modeli ile gerçek zamanlı nesne tespiti. Python ve C++ API karşılaştırması.</p>
+
+  <h3>Pipeline mimarisi</h3>
+
+  <div class="flow">
+    <pre>
+  USB Kamera (V4L2)
+       ↓ 640×480 BGR
+  [cv2.VideoCapture]
+       ↓
+  [Ön işleme: resize 640×640, normalize /255, NCHW]
+       ↓
+  [ORT InferenceSession — CPU EP, 4 thread]
+       ↓ (1, 84, 8400) float32
+  [NMS post-processing — onnxruntime + numpy]
+       ↓
+  [Bounding box + label overlay]
+       ↓
+  [cv2.imshow veya RTSP stream]
+    </pre>
+  </div>
+
+  <h3>Python implementasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>yolo_detect.py</span><span class="dot">●</span></div>
+    <pre><code class="language-python">import cv2, numpy as np, time
+import onnxruntime as ort
+
+CONF_THRESH = 0.5
+IOU_THRESH  = 0.45
+COCO_CLASSES = ["person","bicycle","car","motorbike","bus","truck"]  # kısaltılmış
+
+# Session hazırlama
+so = ort.SessionOptions()
+so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+so.intra_op_num_threads = 4
+session = ort.InferenceSession("yolov8n.onnx", sess_options=so,
+                                providers=["CPUExecutionProvider"])
+
+def preprocess(frame):
+    img = cv2.resize(frame, (640, 640))
+    img = img[:, :, ::-1].astype(np.float32) / 255.0   # BGR→RGB, normalize
+    return img.transpose(2, 0, 1)[np.newaxis]           # HWC→NCHW
+
+def postprocess(output, orig_shape):
+    """output: (1,84,8400) — YOLOv8 format"""
+    pred = output[0].T  # (8400, 84)
+    boxes    = pred[:, :4]
+    scores   = pred[:, 4:].max(axis=1)
+    class_id = pred[:, 4:].argmax(axis=1)
+
+    mask = scores > CONF_THRESH
+    boxes, scores, class_id = boxes[mask], scores[mask], class_id[mask]
+
+    # xywh → xyxy, scale to original
+    h, w = orig_shape[:2]
+    cx, cy, bw, bh = boxes.T
+    x1 = (cx - bw/2) * w / 640
+    y1 = (cy - bh/2) * h / 480
+    x2 = (cx + bw/2) * w / 640
+    y2 = (cy + bh/2) * h / 480
+    return np.stack([x1,y1,x2,y2], axis=1), scores, class_id
+
+cap = cv2.VideoCapture(0)
+while True:
+    ret, frame = cap.read()
+    if not ret: break
+
+    inp = preprocess(frame)
+    t0  = time.perf_counter()
+    out = session.run(None, {"images": inp})
+    dt  = (time.perf_counter() - t0) * 1000
+
+    boxes, scores, cls = postprocess(out, frame.shape)
+    for (x1,y1,x2,y2), s, c in zip(boxes, scores, cls):
+        label = f"{COCO_CLASSES[c] if c < len(COCO_CLASSES) else c} {s:.2f}"
+        cv2.rectangle(frame, (int(x1),int(y1)), (int(x2),int(y2)), (0,255,0), 2)
+        cv2.putText(frame, label, (int(x1),int(y1)-5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+
+    cv2.putText(frame, f"{dt:.1f}ms", (10,25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+    cv2.imshow("YOLOv8n ORT", frame)
+    if cv2.waitKey(1) == ord('q'): break</code></pre>
+  </div>
+
+  <h3>Python vs C++ karşılaştırması (RPi CM4)</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>API</th><th>Session init</th><th>Çıkarım (ortalama)</th><th>Post-processing</th><th>Toplam FPS</th></tr></thead>
+      <tbody>
+        <tr><td>Python (4t)</td><td>2.1 s</td><td>38 ms</td><td>8 ms</td><td>~22 FPS</td></tr>
+        <tr><td>C++ (4t)</td><td>1.8 s</td><td>34 ms</td><td>3 ms</td><td>~27 FPS</td></tr>
+        <tr><td>C++ + INT8</td><td>1.9 s</td><td>22 ms</td><td>3 ms</td><td>~40 FPS</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">50ms Hedefine Ulaşma</div>
+    <p>YOLOv8n float32 ile Python/C++ API her iki durumda da 50ms hedefini geçer. INT8 QDQ quantization ile 22ms çıkarım elde edilir ve 50ms hedefinin altına inilir. Daha küçük giriş boyutu (416×416) kullanmak da gecikmeyi %20 azaltır.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

@@ -1,0 +1,708 @@
+---
+layout: tutorial
+title: "WireGuard — Modern VPN"
+back_url: "../index.html"
+back_label: "embedded-deck"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>LİNUX GÜVENLİK / WIREGUARD</span>
+    <span>MODERN VPN</span>
+    <span>2026</span>
+  </div>
+  <h1>WireGuard<br><em>Modern, hızlı, sade VPN.</em></h1>
+  <p class="subtitle">Kernel-native VPN protokolü — ChaCha20/Poly1305, Curve25519, BLAKE2s ile modern kriptografi, minimal kod tabanı ve sıfır konfigürasyon felsefesi. IoT fleet'ten hub-and-spoke topolojisine kadar pratik rehber.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">WireGuard nedir?</a></li>
+    <li><a href="#s1">Kurulum ve anahtar üretimi</a></li>
+    <li><a href="#s2">Peer yapılandırması</a></li>
+    <li><a href="#s3">wg-quick ile bağlantı yönetimi</a></li>
+    <li><a href="#s4">NAT traversal</a></li>
+    <li><a href="#s5">Hub-and-spoke IoT topolojisi</a></li>
+    <li><a href="#s6">systemd entegrasyonu</a></li>
+    <li><a href="#s7">Pratik: 10 gömülü cihaz fleet VPN</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> WireGuard nedir?</h2>
+  <p class="section-lead">WireGuard, Jason Donenfeld tarafından tasarlanan ve Linux 5.6 kernel'ine dahil edilen modern bir VPN protokolüdür. OpenVPN ve IPsec'e kıyasla 4000 satır altında C koduyla yazılmış olması, güvenlik analizini ve denetimini radikal biçimde kolaylaştırır.</p>
+
+  <h3>Kriptografi seçimleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Amaç</th><th>Algoritma</th><th>Neden?</th></tr></thead>
+      <tbody>
+        <tr><td>Anahtar değişimi</td><td>Curve25519 (ECDH)</td><td>Hız, küçük anahtar boyu, side-channel direnci</td></tr>
+        <tr><td>Simetrik şifreleme</td><td>ChaCha20-Poly1305</td><td>AES donanım hızlandırması olmayan ARM/MIPS için ideal</td></tr>
+        <tr><td>Hash / MAC</td><td>BLAKE2s</td><td>SHA-256'dan daha hızlı, sabit zamanlı uygulama</td></tr>
+        <tr><td>Anahtar türetme</td><td>HKDF</td><td>ChaCha20 oturum anahtarlarını Curve25519 çıktısından türetir</td></tr>
+        <tr><td>Kimlik doğrulama</td><td>Noise Protocol (IKpsk2)</td><td>Formal doğrulanmış el sıkışma çerçevesi</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Geleneksel VPN ile karşılaştırma</h3>
+
+  <div class="flow">
+    <pre>
+  OpenVPN:  TLS handshake → RSA/DH → sertifika doğrulama → şifrelenmiş tünel
+            ~600 KB kod, TLS stack, PKI altyapısı gerekli
+
+  IPsec:    IKEv2 → çok sayıda cipher suite → SA müzakeresi → ESP/AH
+            Karmaşık yapılandırma, firewall bypass sorunları
+
+  WireGuard: Noise_IKpsk2 → Curve25519 → ChaCha20-Poly1305 → UDP tüneli
+             ~4000 satır kod, yapılandırma = public key + AllowedIPs
+    </pre>
+  </div>
+
+  <h3>Roaming ve kimlik</h3>
+  <p>WireGuard'da her peer, <strong>public key</strong> ile tanımlanır — IP adresi değil. Bu, IP değişikliklerinde (mobil ağ geçişi, DHCP yenileme) tunnel'ın kesintisiz devam etmesini sağlar. Paket geldiğinde WireGuard geçerli kaynak IP'yi peer ile ilişkilendirir ve <code>AllowedIPs</code> tablosuna göre yönlendirir.</p>
+
+  <div class="callout">
+    <div class="label">KERNEL DESTEĞI</div>
+    <p>Linux 5.6+ kernel'de WireGuard modülü (<code>wireguard.ko</code>) doğrudan dahildir. Daha eski kerneller için <code>wireguard-dkms</code> veya backport paketi gereklidir. Embedded sistemlerde Buildroot/Yocto ile kernel konfigürasyonuna <code>CONFIG_WIREGUARD=y</code> eklenmesi yeterlidir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>WireGuard = ~4000 satır C; kernel 5.6'dan itibaren built-in</li>
+      <li>Peer kimliği = public key; IP değişikliklerinde roaming sorunsuz</li>
+      <li>ChaCha20/Poly1305: donanım AES yoksa OpenVPN'den 3-5x hızlı</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Kurulum ve anahtar üretimi</h2>
+  <p class="section-lead">WireGuard'ın çekirdek araçları <code>wg</code> ve <code>wg-quick</code>'tir. Anahtar çifti üretimi, preshared key oluşturma ve temel doğrulama adımları.</p>
+
+  <h3>Kurulum</h3>
+
+  <pre><code><span class="cmt"># Debian / Ubuntu</span>
+apt install wireguard wireguard-tools
+
+<span class="cmt"># Arch Linux</span>
+pacman -S wireguard-tools
+
+<span class="cmt"># Alpine (gömülü sistemler için yaygın)</span>
+apk add wireguard-tools
+
+<span class="cmt"># Buildroot (defconfig veya menuconfig)</span>
+<span class="cmt"># BR2_PACKAGE_WIREGUARD_TOOLS=y</span>
+<span class="cmt"># CONFIG_WIREGUARD=y  (kernel config)</span>
+
+<span class="cmt"># Kernel modülünü yükle (5.6 öncesi veya modüler build)</span>
+modprobe wireguard
+lsmod | grep wireguard
+</code></pre>
+
+  <h3>Anahtar çifti üretimi</h3>
+
+  <pre><code><span class="cmt"># Özel anahtar üret (256-bit rastgele, base64)</span>
+wg genkey | tee privatekey | wg pubkey > publickey
+
+cat privatekey   <span class="cmt"># → base64 private key (ASLA paylaşma)</span>
+cat publickey    <span class="cmt"># → base64 public key (peer'lara ver)</span>
+
+<span class="cmt"># Preshared key (PSK) — ek simetrik güvenlik katmanı</span>
+<span class="cmt"># Quantum-safe ek koruma; isteğe bağlı ama önerilir</span>
+wg genpsk > presharedkey
+
+<span class="cmt"># Güvenli izinler</span>
+chmod 600 privatekey presharedkey
+chmod 644 publickey
+
+<span class="cmt"># Sunucu için toplu anahtar üretimi:</span>
+SERVER_PRIVKEY=$(wg genkey)
+SERVER_PUBKEY=$(echo "$SERVER_PRIVKEY" | wg pubkey)
+echo "Server private: $SERVER_PRIVKEY"
+echo "Server public:  $SERVER_PUBKEY"
+</code></pre>
+
+  <h3>wg komutu ile interface yönetimi</h3>
+
+  <pre><code><span class="cmt"># Manuel interface oluşturma (wg-quick olmadan)</span>
+ip link add wg0 type wireguard
+ip address add 10.0.0.1/24 dev wg0
+wg set wg0 listen-port 51820 private-key /etc/wireguard/server_private.key
+ip link set wg0 up
+
+<span class="cmt"># Peer ekleme</span>
+wg set wg0 peer &lt;CLIENT_PUBLIC_KEY&gt; \
+    preshared-key /etc/wireguard/preshared.key \
+    allowed-ips 10.0.0.2/32
+
+<span class="cmt"># Mevcut durumu göster</span>
+wg show wg0
+wg showconf wg0  <span class="cmt"># mevcut config dosyası formatında göster</span>
+</code></pre>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>wg genkey | wg pubkey → private/public key çifti üretimi</li>
+      <li>wg genpsk → preshared key; quantum-resistant ek katman</li>
+      <li>wg set ile dinamik peer ekleme/çıkarma; wg show ile durum</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Peer yapılandırması</h2>
+  <p class="section-lead"><code>/etc/wireguard/wg0.conf</code> dosyası, WireGuard interface ve peer'larını tanımlar. Sözdizimi INI formatına benzer; [Interface] ve [Peer] bölümlerinden oluşur.</p>
+
+  <h3>Sunucu yapılandırması</h3>
+
+  <pre><code><span class="cmt"># /etc/wireguard/wg0.conf — Sunucu</span>
+
+[Interface]
+<span class="cmt"># Sunucunun VPN IP adresi</span>
+Address    = 10.10.0.1/24
+
+<span class="cmt"># Dinlenecek UDP portu</span>
+ListenPort = 51820
+
+<span class="cmt"># Özel anahtar (doğrudan veya dosya yolu)</span>
+PrivateKey = &lt;SERVER_PRIVATE_KEY&gt;
+
+<span class="cmt"># Bağlantı geldiğinde IP forwarding + NAT aç</span>
+PostUp   = iptables -A FORWARD -i %i -j ACCEPT; \
+           iptables -A FORWARD -o %i -j ACCEPT; \
+           iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; \
+           iptables -D FORWARD -o %i -j ACCEPT; \
+           iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+<span class="cmt"># İstemci 1</span>
+[Peer]
+PublicKey    = &lt;CLIENT1_PUBLIC_KEY&gt;
+PresharedKey = &lt;PRESHARED_KEY&gt;
+AllowedIPs   = 10.10.0.2/32   <span class="cmt"># Bu istemciden yalnızca bu IP kabul et</span>
+
+<span class="cmt"># İstemci 2</span>
+[Peer]
+PublicKey    = &lt;CLIENT2_PUBLIC_KEY&gt;
+PresharedKey = &lt;PRESHARED_KEY_2&gt;
+AllowedIPs   = 10.10.0.3/32
+</code></pre>
+
+  <h3>İstemci yapılandırması</h3>
+
+  <pre><code><span class="cmt"># /etc/wireguard/wg0.conf — İstemci (gömülü cihaz)</span>
+
+[Interface]
+Address    = 10.10.0.2/32
+PrivateKey = &lt;CLIENT_PRIVATE_KEY&gt;
+
+<span class="cmt"># DNS (isteğe bağlı — systemd-resolved veya resolvconf ile)</span>
+DNS = 10.10.0.1
+
+[Peer]
+PublicKey    = &lt;SERVER_PUBLIC_KEY&gt;
+PresharedKey = &lt;PRESHARED_KEY&gt;
+
+<span class="cmt"># Sunucunun gerçek IP ve portu</span>
+Endpoint = vpn.example.com:51820
+
+<span class="cmt"># 0.0.0.0/0 → tüm trafiği VPN'den geçir (full tunnel)</span>
+<span class="cmt"># Sadece VPN ağı için: 10.10.0.0/24</span>
+AllowedIPs = 0.0.0.0/0, ::/0
+
+<span class="cmt"># NAT arkasındaysa keepalive açık tut</span>
+PersistentKeepalive = 25
+</code></pre>
+
+  <h3>AllowedIPs mantığı</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">AllowedIPs — giden yön</span><span class="desc">Bu IP aralığına giden paketler şifrelenerek bu peer'a gönderilir — routing tablosu gibi davranır</span></div>
+    <div class="param"><span class="name">AllowedIPs — gelen yön</span><span class="desc">Bu peer'dan gelen şifreli paketlerin kaynak IP'si yalnızca bu aralıkta olabilir — kaynak doğrulama</span></div>
+    <div class="param"><span class="name">0.0.0.0/0</span><span class="desc">Full tunnel: tüm trafik VPN'den geçer. Split tunnel için yalnızca gerekli subnet'ler yazılır</span></div>
+    <div class="param"><span class="name">Çakışma kuralı</span><span class="desc">Birden fazla peer aynı IP aralığını paylaşamaz — WireGuard en spesifik prefix'i kullanır</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>[Interface] = yerel ayarlar; [Peer] = karşı taraf tanımı</li>
+      <li>AllowedIPs çift yönlü çalışır: hem routing hem kaynak doğrulama</li>
+      <li>PostUp/PostDown: iptables NAT kuralları wg-quick ile otomatik yönetilir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> wg-quick ile bağlantı yönetimi</h2>
+  <p class="section-lead"><code>wg-quick</code>, WireGuard interface'ini yapılandırma dosyasından otomatik olarak oluşturan, routing tablolarını güncelleyen ve PostUp/PostDown hook'larını çalıştıran yardımcı araçtır.</p>
+
+  <h3>Temel komutlar</h3>
+
+  <pre><code><span class="cmt"># Interface'i başlat (/etc/wireguard/wg0.conf kullanılır)</span>
+wg-quick up wg0
+
+<span class="cmt"># Interface'i durdur</span>
+wg-quick down wg0
+
+<span class="cmt"># Yapılandırmayı yeniden uygula (down + up)</span>
+wg-quick strip wg0  <span class="cmt"># wg-quick ek direktifleri çıkarıp saf wg config göster</span>
+
+<span class="cmt"># Belirli bir conf dosyası ile</span>
+wg-quick up /etc/wireguard/wg0.conf
+
+<span class="cmt"># Mevcut durum</span>
+wg show
+wg show wg0
+wg show wg0 peers
+wg show wg0 latest-handshakes
+</code></pre>
+
+  <h3>wg-quick ek direktifleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Direktif</th><th>Yer</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td><code>Address</code></td><td>[Interface]</td><td>Interface'e atanacak IP/prefix; birden fazla yazılabilir</td></tr>
+        <tr><td><code>DNS</code></td><td>[Interface]</td><td>resolvconf veya systemd-resolved üzerinden DNS ayarla</td></tr>
+        <tr><td><code>MTU</code></td><td>[Interface]</td><td>Varsayılan 1420; bazı ISP'lerde azaltılması gerekebilir</td></tr>
+        <tr><td><code>Table</code></td><td>[Interface]</td><td>Routing tablosu numarası; <code>off</code> = otomatik routing eklenmesin</td></tr>
+        <tr><td><code>PreUp/PostUp</code></td><td>[Interface]</td><td>Interface açılmadan önce/sonra çalıştırılacak komut</td></tr>
+        <tr><td><code>PreDown/PostDown</code></td><td>[Interface]</td><td>Interface kapatılmadan önce/sonra çalıştırılacak komut</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>nftables ile PostUp</h3>
+
+  <pre><code><span class="cmt"># nftables kullanan sistemlerde PostUp (iptables yerine)</span>
+[Interface]
+Address    = 10.10.0.1/24
+PrivateKey = &lt;SERVER_PRIVATE_KEY&gt;
+ListenPort = 51820
+PostUp   = nft add rule inet filter forward iifname %i accept; \
+           nft add rule inet filter forward oifname %i accept; \
+           nft add rule ip nat postrouting oifname eth0 masquerade
+PostDown = nft flush table inet filter; \
+           nft flush table ip nat
+</code></pre>
+
+  <h3>systemd-networkd entegrasyonu</h3>
+
+  <pre><code><span class="cmt"># /etc/systemd/network/wg0.netdev — WireGuard netdev</span>
+[NetDev]
+Name = wg0
+Kind = wireguard
+
+[WireGuard]
+PrivateKey = &lt;PRIVATE_KEY&gt;
+ListenPort = 51820
+
+[WireGuardPeer]
+PublicKey    = &lt;CLIENT1_PUBLIC_KEY&gt;
+PresharedKey = &lt;PSK&gt;
+AllowedIPs   = 10.10.0.2/32
+
+<span class="cmt">---</span>
+<span class="cmt"># /etc/systemd/network/wg0.network — IP ve routing</span>
+[Match]
+Name = wg0
+
+[Network]
+Address = 10.10.0.1/24
+
+[Route]
+Destination = 10.10.0.0/24
+</code></pre>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>wg-quick up/down: routing + PostUp/PostDown otomatik yönetimi</li>
+      <li>systemd-networkd: .netdev + .network dosyaları ile kalıcı yapılandırma</li>
+      <li>wg show latest-handshakes: peer bağlantı durumunu izle</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> NAT traversal</h2>
+  <p class="section-lead">Gömülü IoT cihazları genellikle NAT arkasında bulunur — sabit IP'leri yoktur, doğrudan ulaşılamazlar. WireGuard, UDP hole punching ve PersistentKeepalive mekanizmasıyla bu sorunu çözer.</p>
+
+  <h3>UDP hole punching nasıl çalışır?</h3>
+
+  <div class="flow">
+    <pre>
+  [Cihaz A]     [NAT-A]          [Sunucu]        [NAT-B]     [Cihaz B]
+      │               │                │               │            │
+      │──── UDP ─────►│                │               │            │
+      │       NAT-A açık: A:port1 ─────►               │            │
+      │                │◄──── UDP ─────│               │            │
+      │                │               │◄──── UDP ──────────────────│
+      │                │               │       NAT-B açık: B:port2  │
+      │                │               │                            │
+      │  Handshake:  WireGuard Noise IKpsk2   (encrypted)           │
+      │◄═══════════════════════════════════════════════════════════►│
+    </pre>
+  </div>
+
+  <h3>PersistentKeepalive</h3>
+
+  <p>NAT tabloları belirli süre sonra UDP akışlarını siler. <code>PersistentKeepalive</code> bu süreyi doldurmadan düzenli aralıklarla boş paket göndererek NAT oturumunu canlı tutar.</p>
+
+  <pre><code><span class="cmt"># İstemci peer tanımında</span>
+[Peer]
+PublicKey           = &lt;SERVER_PUBLIC_KEY&gt;
+Endpoint            = vpn.example.com:51820
+AllowedIPs          = 10.10.0.0/24
+PersistentKeepalive = 25   <span class="cmt"># 25 saniyede bir boş paket gönder</span>
+                            <span class="cmt"># 25s: çoğu NAT için yeterli</span>
+                            <span class="cmt"># Aggressive NAT: 15s önerilir</span>
+</code></pre>
+
+  <h3>Symmetric NAT kısıtlamaları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Full-cone NAT</span><span class="desc">Her dış kaynak IP/port'tan istek kabul edilir — hole punching kolay</span></div>
+    <div class="param"><span class="name">Address-restricted NAT</span><span class="desc">Yalnızca daha önce paket gönderilen IP'den gelen trafiğe izin verir</span></div>
+    <div class="param"><span class="name">Port-restricted NAT</span><span class="desc">Daha önce paket gönderilen IP:port çiftinden gelen trafik kabul edilir</span></div>
+    <div class="param"><span class="name">Symmetric NAT</span><span class="desc">Her hedef için farklı kaynak port kullanılır — hole punching başarısız olabilir. Çözüm: relay sunucu (TURN benzeri) veya sunucuyu sabit IP'li yapmak</span></div>
+  </div>
+
+  <pre><code><span class="cmt"># NAT tipini tespit et (stun-client veya nmap ile)</span>
+apt install stun-client
+stun stun.l.google.com 19302 -v 2&gt;&amp;1 | grep "Mapped Address"
+
+<span class="cmt"># Bağlantı sorunlarını debug et</span>
+wg show wg0 latest-handshakes  <span class="cmt"># son handshake zamanı</span>
+tcpdump -i eth0 udp port 51820 -n
+
+<span class="cmt"># Firewall'da UDP portunu açmayı unutma (sunucu tarafı)</span>
+ufw allow 51820/udp
+<span class="cmt"># veya nftables:</span>
+nft add rule inet filter input udp dport 51820 accept
+</code></pre>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>WireGuard UDP üzerinde çalışır — hole punching ile NAT'ı aşar</li>
+      <li>PersistentKeepalive = 25: NAT oturumunu canlı tutar</li>
+      <li>Symmetric NAT durumunda relay/sunucu tarafı sabit IP gerekebilir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Hub-and-spoke IoT topolojisi</h2>
+  <p class="section-lead">N adet gömülü cihazın merkezi bir sunucu üzerinden birbirine bağlandığı hub-and-spoke modeli, IoT fleet yönetiminde en yaygın WireGuard topolojisidir.</p>
+
+  <h3>Topoloji diyagramı</h3>
+
+  <div class="flow">
+    <pre>
+                ┌─────────────────────┐
+                │   VPN Sunucu        │
+                │   10.10.0.1/24      │
+                │   eth0: 203.0.113.5 │
+                └──────┬──────────────┘
+                       │ wg0 (51820/UDP)
+          ┌────────────┼────────────┐
+          │            │            │
+     ┌────▼───┐  ┌─────▼──┐  ┌─────▼──┐
+     │ Cihaz1 │  │ Cihaz2 │  │Cihaz10 │
+     │10.10.0.2│  │10.10.0.3│  │10.10.0.11│
+     │ (NAT)  │  │ (NAT)  │  │ (NAT)  │
+     └────────┘  └────────┘  └────────┘
+    </pre>
+  </div>
+
+  <h3>Sunucu yapılandırması — IP forwarding</h3>
+
+  <pre><code><span class="cmt"># /etc/sysctl.d/99-wireguard.conf</span>
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+sysctl -p /etc/sysctl.d/99-wireguard.conf
+
+<span class="cmt"># /etc/wireguard/wg0.conf — Sunucu (10 cihaz için)</span>
+[Interface]
+Address    = 10.10.0.1/24
+ListenPort = 51820
+PrivateKey = &lt;SERVER_PRIVATE_KEY&gt;
+PostUp   = iptables -A FORWARD -i wg0 -j ACCEPT; \
+           iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; \
+           iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+[Peer]  <span class="cmt"># Cihaz 1</span>
+PublicKey  = &lt;DEVICE1_PUBKEY&gt;
+AllowedIPs = 10.10.0.2/32
+
+[Peer]  <span class="cmt"># Cihaz 2</span>
+PublicKey  = &lt;DEVICE2_PUBKEY&gt;
+AllowedIPs = 10.10.0.3/32
+
+<span class="cmt"># ... 10 cihaza kadar devam eder</span>
+</code></pre>
+
+  <h3>Cihazlar arası routing</h3>
+
+  <pre><code><span class="cmt"># Cihaz 1'den Cihaz 2'ye erişim için:</span>
+<span class="cmt"># Cihaz 1 konfig → AllowedIPs = 10.10.0.0/24 (tüm VPN ağı)</span>
+<span class="cmt"># Sunucu FORWARD kuralı ile paketi Cihaz 2'ye yönlendirir</span>
+
+<span class="cmt"># Cihaz 1: /etc/wireguard/wg0.conf</span>
+[Interface]
+Address    = 10.10.0.2/32
+PrivateKey = &lt;DEVICE1_PRIVATE_KEY&gt;
+
+[Peer]
+PublicKey           = &lt;SERVER_PUBLIC_KEY&gt;
+Endpoint            = 203.0.113.5:51820
+AllowedIPs          = 10.10.0.0/24   <span class="cmt"># tüm VPN ağına routing</span>
+PersistentKeepalive = 25
+
+<span class="cmt"># Cihaz 1'den Cihaz 3'e ping testi:</span>
+<span class="cmt"># ping 10.10.0.4  → sunucu üzerinden yönlendirilir</span>
+</code></pre>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Hub-and-spoke: tüm cihazlar sunucuya bağlı; peer-to-peer geçiş sunucu üzerinden</li>
+      <li>ip_forward + MASQUERADE: cihazların internete çıkışı için gerekli</li>
+      <li>Cihazlarda AllowedIPs = 10.10.0.0/24 → VPN ağına doğrudan routing</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> systemd entegrasyonu</h2>
+  <p class="section-lead">WireGuard bağlantısını sistem başlangıcında otomatik kurmak ve yönetmek için <code>wg-quick@.service</code> systemd birimi kullanılır. DNS sızıntısı engellemesi ve NetworkManager entegrasyonu da bu bölümde ele alınıyor.</p>
+
+  <h3>wg-quick systemd servisi</h3>
+
+  <pre><code><span class="cmt"># Servisi etkinleştir ve başlat</span>
+systemctl enable wg-quick@wg0.service
+systemctl start  wg-quick@wg0.service
+systemctl status wg-quick@wg0.service
+
+<span class="cmt"># Yapılandırma değişikliği sonrası yenile</span>
+systemctl restart wg-quick@wg0.service
+
+<span class="cmt"># Logları izle</span>
+journalctl -u wg-quick@wg0 -f
+
+<span class="cmt"># wg-quick@.service unit dosyasını incele</span>
+systemctl cat wg-quick@.service
+</code></pre>
+
+  <h3>systemd-resolved ve DNS sızıntısı</h3>
+
+  <pre><code"><span class="cmt"># /etc/wireguard/wg0.conf — DNS direktifi ile</span>
+[Interface]
+Address    = 10.10.0.2/32
+PrivateKey = &lt;PRIVATE_KEY&gt;
+DNS        = 10.10.0.1   <span class="cmt"># VPN DNS sunucusu</span>
+
+<span class="cmt"># systemd-resolved ile DNS sızıntısı engeli</span>
+<span class="cmt"># wg-quick, DNS ayarını resolvconf veya systemd-resolved üzerinden uygular</span>
+<span class="cmt"># DNS sızıntısını test et:</span>
+curl https://dnsleaktest.com/test  <span class="cmt"># veya</span>
+dig +short myip.opendns.com @resolver1.opendns.com
+nslookup example.com  <span class="cmt"># hangi DNS sunucusu cevap veriyor?</span>
+
+<span class="cmt"># systemd-resolved durumunu kontrol et</span>
+resolvectl status wg0
+resolvectl dns wg0
+</code></pre>
+
+  <h3>NetworkManager entegrasyonu</h3>
+
+  <pre><code"><span class="cmt"># NetworkManager WireGuard bağlantısı oluştur</span>
+nmcli connection add type wireguard \
+    ifname wg0 \
+    con-name "IoT-VPN"
+
+<span class="cmt"># Bağlantı ayarlarını düzenle</span>
+nmcli connection modify "IoT-VPN" \
+    wireguard.private-key "$(cat /etc/wireguard/private.key)" \
+    wireguard.listen-port 51820
+
+<span class="cmt"># Peer ekle (nmcli ile)</span>
+nmcli connection modify "IoT-VPN" \
+    "+wireguard.peers" \
+    "public-key=&lt;SERVER_PUBKEY&gt;,endpoint=vpn.example.com:51820,allowed-ips=10.10.0.0/24,persistent-keepalive=25"
+
+<span class="cmt"># Bağlantıyı aktif et</span>
+nmcli connection up "IoT-VPN"
+</code></pre>
+
+  <div class="callout">
+    <div class="label">DİKKAT</div>
+    <p>Gömülü sistemlerde NetworkManager genellikle kullanılmaz; <code>wg-quick@.service</code> veya doğrudan <code>systemd-networkd</code> tercih edilir. DNS direktifi yalnızca <code>resolvconf</code> veya <code>systemd-resolved</code> yüklüyse çalışır; yoksa görmezden gelinir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>systemctl enable wg-quick@wg0 → boot'ta otomatik bağlantı</li>
+      <li>DNS direktifi + systemd-resolved ile DNS sızıntısı engellenir</li>
+      <li>Gömülü: systemd-networkd .netdev/.network en hafif çözüm</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Pratik: 10 gömülü cihaz için fleet VPN</h2>
+  <p class="section-lead">Fabrikadan çıkan gömülü cihazlara otomatik WireGuard yapılandırması oluşturan provisioning scripti ve fleet izleme araçları.</p>
+
+  <h3>Otomatik provisioning scripti</h3>
+
+  <pre><code>#!/bin/bash
+<span class="cmt"># provision_fleet.sh — 10 cihaz için WireGuard konfig üretici</span>
+
+set -euo pipefail
+
+SERVER_IP="203.0.113.5"
+SERVER_PORT="51820"
+VPN_SUBNET="10.10.0"
+SERVER_VPN_IP="${VPN_SUBNET}.1"
+OUTPUT_DIR="./wg-fleet-configs"
+NUM_DEVICES=10
+
+mkdir -p "$OUTPUT_DIR/server"
+
+<span class="cmt"># Sunucu anahtar çifti</span>
+SERVER_PRIVKEY=$(wg genkey)
+SERVER_PUBKEY=$(echo "$SERVER_PRIVKEY" | wg pubkey)
+
+<span class="cmt"># Sunucu conf başlangıcı</span>
+cat &gt; "$OUTPUT_DIR/server/wg0.conf" &lt;&lt;EOF
+[Interface]
+Address    = ${SERVER_VPN_IP}/24
+ListenPort = ${SERVER_PORT}
+PrivateKey = ${SERVER_PRIVKEY}
+PostUp   = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+EOF
+
+<span class="cmt"># Her cihaz için</span>
+for i in $(seq 1 $NUM_DEVICES); do
+    DEVICE_IP="${VPN_SUBNET}.$((i + 1))"
+    DEVICE_DIR="$OUTPUT_DIR/device_${i}"
+    mkdir -p "$DEVICE_DIR"
+
+    <span class="cmt"># Cihaz anahtar çifti</span>
+    DEV_PRIVKEY=$(wg genkey)
+    DEV_PUBKEY=$(echo "$DEV_PRIVKEY" | wg pubkey)
+    PSK=$(wg genpsk)
+
+    <span class="cmt"># Cihaz conf dosyası</span>
+    cat &gt; "$DEVICE_DIR/wg0.conf" &lt;&lt;EOF
+[Interface]
+Address    = ${DEVICE_IP}/32
+PrivateKey = ${DEV_PRIVKEY}
+
+[Peer]
+PublicKey           = ${SERVER_PUBKEY}
+PresharedKey        = ${PSK}
+Endpoint            = ${SERVER_IP}:${SERVER_PORT}
+AllowedIPs          = ${VPN_SUBNET}.0/24
+PersistentKeepalive = 25
+EOF
+    chmod 600 "$DEVICE_DIR/wg0.conf"
+
+    <span class="cmt"># Sunucu conf'a peer ekle</span>
+    cat &gt;&gt; "$OUTPUT_DIR/server/wg0.conf" &lt;&lt;EOF
+[Peer]  # Device ${i}
+PublicKey    = ${DEV_PUBKEY}
+PresharedKey = ${PSK}
+AllowedIPs   = ${DEVICE_IP}/32
+
+EOF
+
+    echo "Cihaz $i: IP=${DEVICE_IP}, pubkey=${DEV_PUBKEY:0:10}..."
+done
+
+chmod 600 "$OUTPUT_DIR/server/wg0.conf"
+echo "Yapılandırmalar oluşturuldu: $OUTPUT_DIR"
+</code></pre>
+
+  <h3>Fleet izleme scripti</h3>
+
+  <pre><code>#!/bin/bash
+<span class="cmt"># monitor_fleet.sh — WireGuard peer durumunu izle</span>
+
+echo "=== WireGuard Fleet Durumu $(date) ==="
+echo ""
+
+wg show wg0 peers | while read -r PUBKEY; do
+    ENDPOINT=$(wg show wg0 endpoints | grep "^$PUBKEY" | awk '{print $2}')
+    HANDSHAKE=$(wg show wg0 latest-handshakes | grep "^$PUBKEY" | awk '{print $2}')
+    TRANSFER=$(wg show wg0 transfer | grep "^$PUBKEY" | awk '{printf "rx=%s tx=%s", $2, $3}')
+
+    <span class="cmt"># Handshake zamanını değerlendir</span>
+    NOW=$(date +%s)
+    AGE=$(( NOW - HANDSHAKE ))
+    if [ "$AGE" -lt 180 ]; then
+        STATUS="ONLINE"
+    else
+        STATUS="OFFLINE"
+    fi
+
+    printf "%-20s %-10s %-30s %s\n" \
+        "${PUBKEY:0:16}..." "$STATUS" "$ENDPOINT" "$TRANSFER"
+done
+</code></pre>
+
+  <h3>Cihaza konfig gönderme ve uygulama</h3>
+
+  <pre><code"><span class="cmt"># cihaza SSH ile konfig gönder ve uygula</span>
+DEVICE_IP="192.168.1.100"  <span class="cmt"># cihazın fabrika IP'si</span>
+
+scp wg-fleet-configs/device_1/wg0.conf root@${DEVICE_IP}:/etc/wireguard/
+ssh root@${DEVICE_IP} "chmod 600 /etc/wireguard/wg0.conf && \
+    systemctl enable wg-quick@wg0 && \
+    systemctl start  wg-quick@wg0 && \
+    wg show wg0"
+
+<span class="cmt"># Bağlantıyı doğrula (VPN IP üzerinden)</span>
+ping -c3 10.10.0.2   <span class="cmt"># cihaz 1 VPN IP'si</span>
+</code></pre>
+
+  <div class="callout">
+    <div class="label">GÜVENLİK NOTU</div>
+    <p>Üretilen yapılandırma dosyaları özel anahtarlar içerir. <code>chmod 600</code> ile korunmalı, git'e eklenmemeli ve şifreli bir vault (HashiCorp Vault, SOPS) üzerinden yönetilmelidir. Her cihazın benzersiz anahtar çifti olmalı — anahtarlar paylaşılmamalıdır.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>provision_fleet.sh: N cihaz için otomatik anahtar üretimi + conf dosyası</li>
+      <li>monitor_fleet.sh: latest-handshakes ile online/offline tespiti</li>
+      <li>PSK her peer için benzersiz; anahtarlar şifreli vault'ta saklanmalı</li>
+    </ul>
+  </div>
+</section>
+
+</main>

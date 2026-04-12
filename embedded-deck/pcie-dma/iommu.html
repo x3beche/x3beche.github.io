@@ -1,0 +1,709 @@
+---
+layout: tutorial
+title: "IOMMU & SMMU — DMA Koruması"
+back_url: "../index.html"
+back_label: "PCIe & DMA"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>PCIe &amp; DMA</span>
+    <span>DONANIM</span>
+    <span>2026</span>
+  </div>
+  <h1>IOMMU &amp; SMMU<br><em>DMA Koruması</em></h1>
+  <p class="subtitle">DMA saldırılarını anla ve önle. Intel VT-d, AMD-Vi ve ARM SMMU-v3 ile cihaz izolasyonu. Linux IOMMU subsystem, VFIO ve KVM PCIe passthrough.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">IOMMU nedir? — DMA saldırısı ve izolasyon</a></li>
+    <li><a href="#s1">Intel VT-d ve AMD-Vi</a></li>
+    <li><a href="#s2">ARM SMMU-v3 — stream ID ve context bank</a></li>
+    <li><a href="#s3">Linux IOMMU subsystem</a></li>
+    <li><a href="#s4">IOMMU groups ve /sys/kernel/iommu_groups</a></li>
+    <li><a href="#s5">VFIO — userspace device access</a></li>
+    <li><a href="#s6">IOMMU ve KVM/QEMU — PCIe passthrough</a></li>
+    <li><a href="#s7">Pratik: VFIO ile PCIe NIC'i VM'e atama</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> IOMMU nedir? — DMA saldırısı ve izolasyon</h2>
+  <p class="section-lead">IOMMU (Input-Output Memory Management Unit), PCIe ve diğer I/O cihazlarının sistem belleğine erişimini kontrol eden donanım birimidir. CPU'nun MMU'su ne işe yarıyorsa, IOMMU da I/O cihazları için aynı işlevi görür.</p>
+
+  <h3>DMA saldırısı — neden IOMMU gerekli?</h3>
+  <p>IOMMU olmayan bir sistemde, PCIe cihazı herhangi bir fiziksel adrese DMA yapabilir. Bu durum ciddi güvenlik riskleri doğurur:</p>
+
+  <div class="flow">
+    <pre>
+  IOMMU OLMADAN (tehlikeli):
+
+  Kötü niyetli PCIe cihazı (örn. truva atı USB-PCIe dongle):
+  ┌────────────────────────────────────────────────────────┐
+  │  DMA isteği: adres=0x100000, len=4096                  │
+  │  → Kernel kod bölgesini okur/değiştirir!               │
+  │  → SSH anahtarını, bellek içeriğini çalar              │
+  │  → /dev/mem yerine doğrudan DMA ile çekirdek bypass    │
+  └────────────────────────────────────────────────────────┘
+
+  IOMMU İLE (güvenli):
+  ┌────────────────────────────────────────────────────────┐
+  │  Cihaz DMA isteği: adres=0x100000                      │
+  │  IOMMU: bu IOVA için eşleme var mı?                    │
+  │    → Eşleme yok → ATE (Access Translation Error)       │
+  │    → PCIe UR (Unsupported Request) yanıtı              │
+  │    → dmesg: IOMMU fault: device 01:00.0                │
+  └────────────────────────────────────────────────────────┘
+    </pre>
+  </div>
+
+  <h3>IOMMU temel kavramları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">IOVA (I/O Virtual Address)</span><span class="desc">Cihazın kullandığı adres; gerçek fiziksel adres değil; IOMMU çevirir</span></div>
+    <div class="param"><span class="name">IOMMU Domain</span><span class="desc">Bir sayfa tablosu; bir veya daha fazla cihaza atanabilir</span></div>
+    <div class="param"><span class="name">IOMMU Group</span><span class="desc">Aynı trust sınırında olan cihazlar; grup başına bir domain zorunlu</span></div>
+    <div class="param"><span class="name">ACS (Access Control Services)</span><span class="desc">PCIe özelliği: Switch içindeki P2P (peer-to-peer) DMA'yı kontrol eder</span></div>
+    <div class="param"><span class="name">ATS (Address Translation Services)</span><span class="desc">PCIe özelliği: cihaz kendi IOVA→PA çevirisini yapabilir (performans)</span></div>
+  </div>
+
+  <h3>IOMMU olmayan sistem riski</h3>
+  <p>Thunderbolt, PCIe hot-plug, USB4 gibi kullanıcı tarafından takılabilen cihazlara sahip sistemlerde IOMMU kritiktir. "Evil maid" saldırısı: masaüstü bilgisayar kilitliyken takılan bir PCIe cihazı, IOMMU olmadan RAM'i okuyabilir.</p>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>IOMMU: I/O cihazlarının DMA erişimini sayfa tablosu ile denetler</li>
+      <li>IOVA: cihazın gördüğü adres; IOMMU → PA çevirisi; haritasız erişim engellenir</li>
+      <li>DMA saldırısı: IOMMU olmadan herhangi bir PCIe cihazı tüm RAM'e erişebilir</li>
+      <li>IOMMU group: izolasyon birimi; bir grubun tamamı aynı domain'e bağlanmalı</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Intel VT-d ve AMD-Vi</h2>
+  <p class="section-lead">Intel VT-d (Virtualization Technology for Directed I/O) ve AMD-Vi, x86 platformlarındaki IOMMU uygulamalarıdır. ACPI DMAR tablosu üzerinden keşfedilir.</p>
+
+  <h3>Intel VT-d mimarisi</h3>
+
+  <div class="flow">
+    <pre>
+  ┌─────────────────────────────────────────────────────────────┐
+  │                    Intel VT-d                               │
+  │                                                             │
+  │  PCIe Bus  →  [Remapping Hardware Unit]  →  System RAM     │
+  │                        │                                    │
+  │                        ▼                                    │
+  │              Root Entry Table (RET)                         │
+  │              (Bus 0-255 için 256 entry)                     │
+  │                        │                                    │
+  │                    Context Entry                            │
+  │              (Device:Function için)                         │
+  │                        │                                    │
+  │                  IOMMU Page Table                           │
+  │              (IOVA → PA çevirisi, 4/2/1 KB page)           │
+  └─────────────────────────────────────────────────────────────┘
+    </pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Intel VT-d etkinleştirme ve doğrulama</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># BIOS/UEFI'de VT-d etkinleştirdikten sonra:</span>
+
+<span class="cmt"># Kernel parametreleri (/etc/default/grub)</span>
+<span class="cmt"># GRUB_CMDLINE_LINUX="intel_iommu=on iommu=strict"</span>
+<span class="cmt"># iommu=strict: her DMA haritası kaldırıldığında TLB flush (güvenli)</span>
+<span class="cmt"># iommu=pt:    passthrough (güvenlik kapalı, max performans)</span>
+
+<span class="cmd">sudo</span> update-grub
+<span class="cmd">sudo</span> reboot
+
+<span class="cmt"># Doğrulama</span>
+<span class="cmd">dmesg</span> | grep -i iommu | head -10
+<span class="cmt"># DMAR: IOMMU enabled</span>
+<span class="cmt"># DMAR-IR: Enabled IRQ remapping in x2apic mode</span>
+
+<span class="cmd">cat</span> /sys/class/iommu/dmar0/intel-iommu/cap
+<span class="cmt"># Capability flags: SAGAW (address width), SLTS, etc.</span>
+
+<span class="cmt"># DMAR (DMA Remapping) tablosunu oku</span>
+<span class="cmd">sudo</span> acpidump <span class="flag">-n</span> DMAR | acpixtract -l
+<span class="cmd">sudo</span> iasl <span class="flag">-d</span> DMAR.dat</code></pre>
+  </div>
+
+  <h3>AMD-Vi</h3>
+  <p>AMD IOMMU (IVRS tablosu, AMD-Vi), Intel VT-d'ye benzer işlevsellik sunar. Kernel parametresi: <code>amd_iommu=on</code>. AMD platformlarda PCIe cihazları IVHD (I/O Virtualization Hardware Definition) tablosu üzerinden IOMMU'ya bağlanır.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>Intel VT-d</th><th>AMD-Vi</th></tr></thead>
+      <tbody>
+        <tr><td>ACPI tablosu</td><td>DMAR</td><td>IVRS</td></tr>
+        <tr><td>Kernel parametresi</td><td>intel_iommu=on</td><td>amd_iommu=on</td></tr>
+        <tr><td>IRQ remapping</td><td>VT-d IR</td><td>AMD-Vi IR</td></tr>
+        <tr><td>Sayfa boyutları</td><td>4KB, 2MB, 1GB</td><td>4KB, 2MB, 1GB</td></tr>
+        <tr><td>Nested translation</td><td>SLAT (nested)</td><td>PPR (Peripheral Page Request)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>VT-d: DMAR ACPI tablosu → Root Entry → Context Entry → IOMMU page table</li>
+      <li>intel_iommu=on: VT-d etkinleştirir; iommu=strict: her unmap'te TLB flush</li>
+      <li>AMD-Vi: IVRS tablosu; amd_iommu=on; VT-d ile işlevsel eşdeğer</li>
+      <li>Sayfa boyutu: 4KB (minimum), 2MB (büyük sayfa, TLB verimli), 1GB (dev sayfa)</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> ARM SMMU-v3 — stream ID ve context bank</h2>
+  <p class="section-lead">ARM Systems MMU (SMMU), ARM SoC'larındaki IOMMU uygulamasıdır. SMMU-v3, PCIe ve diğer I/O master'lar için iki aşamalı sayfa tablosu çevirisi sağlar.</p>
+
+  <h3>SMMU-v3 mimarisi</h3>
+
+  <div class="flow">
+    <pre>
+  ┌───────────────────────────────────────────────────────────────┐
+  │                      ARM SMMU-v3                              │
+  │                                                               │
+  │  I/O Device  ──(StreamID)──▶  Stream Table  ──▶  Context     │
+  │  (PCIe BDF,                  (STE: Stream    Bank / CD       │
+  │   DMA master ID)              Table Entry)   (sayfa tablosu) │
+  │                                                               │
+  │  Stage 1: VA → IPA (guest OS sayfa tablosu, VMID ile)        │
+  │  Stage 2: IPA → PA  (hypervisor sayfa tablosu, VMID ile)     │
+  │                                                               │
+  │  PCIe BDF → RequestID → StreamID → STE → Stage1 + Stage2    │
+  └───────────────────────────────────────────────────────────────┘
+    </pre>
+  </div>
+
+  <h3>StreamID ve RequestID</h3>
+  <p><strong>RequestID</strong>: PCIe'de BDF (Bus:Device:Function) — TLP header'dan alınır. <strong>StreamID</strong>: SMMU'nun gördüğü ID; RequestID → StreamID dönüşümü platform yapılandırmasına bağlı. Her StreamID için SMMU'da bir Stream Table Entry (STE) bulunur.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — SMMU-v3 Linux ile doğrulama</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ARM64 kernel: SMMU DT node örneği (device tree)</span>
+<span class="cmt"># smmu: iommu@09000000 {</span>
+<span class="cmt">#     compatible = "arm,smmu-v3";</span>
+<span class="cmt">#     reg = &lt;0x0 0x09000000 0x0 0x800000&gt;;</span>
+<span class="cmt">#     interrupts = &lt;...&gt;;</span>
+<span class="cmt">#     #iommu-cells = &lt;1&gt;;</span>
+<span class="cmt"># };</span>
+<span class="cmt">#</span>
+<span class="cmt"># PCIe EP'nin SMMU'ya bağlanması:</span>
+<span class="cmt"># pcie: pcie@... {</span>
+<span class="cmt">#     iommus = &lt;&amp;smmu STREAMID&gt;;</span>
+<span class="cmt"># };</span>
+
+<span class="cmt"># Kernel parametreleri</span>
+<span class="cmt"># arm-smmu-v3.disable_bypass=1  — haritasız DMA'yı engelle</span>
+<span class="cmt"># iommu.strict=1                — strict TLB invalidation</span>
+
+<span class="cmt"># SMMU cihazını gör</span>
+<span class="cmd">dmesg</span> | grep -i smmu
+<span class="cmt"># arm-smmu-v3 9000000.iommu: probing hardware</span>
+<span class="cmt"># arm-smmu-v3 9000000.iommu: SMMU-v3 with 128-bit IDS</span>
+
+<span class="cmt"># Bağlı gruplar</span>
+<span class="cmd">ls</span> /sys/kernel/iommu_groups/
+<span class="cmd">ls</span> /sys/kernel/iommu_groups/0/devices/</code></pre>
+  </div>
+
+  <h3>Stage 1 ve Stage 2 çevirisi</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Aşama</th><th>Girdi</th><th>Çıktı</th><th>Kullanım</th></tr></thead>
+      <tbody>
+        <tr><td>Stage 1 (S1)</td><td>IOVA (cihaz adresi)</td><td>IPA (Intermediate Physical)</td><td>Native Linux DMA API</td></tr>
+        <tr><td>Stage 2 (S2)</td><td>IPA (Guest fiziksel)</td><td>PA (gerçek fiziksel)</td><td>Sanallaştırma (hypervisor)</td></tr>
+        <tr><td>S1 + S2 (nested)</td><td>IOVA → IPA → PA</td><td>PA</td><td>VM içindeki PCIe passthrough</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>SMMU-v3: ARM SoC için IOMMU; PCIe RequestID → StreamID → STE → sayfa tablosu</li>
+      <li>Stage 1: cihaz IOVA → fiziksel adres (native Linux kullanımı)</li>
+      <li>Stage 2: guest fiziksel → gerçek fiziksel (hypervisor, KVM)</li>
+      <li>disable_bypass=1: haritasız DMA isteği faulta düşer — zorunlu güvenlik ayarı</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Linux IOMMU subsystem</h2>
+  <p class="section-lead">Linux IOMMU subsystem, farklı donanım uygulamalarını (VT-d, AMD-Vi, SMMU) tek bir API arkasında soyutlar. Sürücüler iommu_ops üzerinden donanımdan bağımsız çalışır.</p>
+
+  <h3>IOMMU subsystem katmanları</h3>
+
+  <div class="flow">
+    <pre>
+  Kullanıcı alanı (VFIO)
+       │
+  ┌────▼─────────────────────────────────┐
+  │        Linux IOMMU Core API          │
+  │  iommu_domain_alloc()                │
+  │  iommu_attach_device()               │
+  │  iommu_map()  /  iommu_unmap()       │
+  └────┬─────────────────────────────────┘
+       │   iommu_ops (driver-specific)
+  ┌────▼───────────────────────────────────────┐
+  │  intel-iommu.c │ amd-iommu.c │ arm-smmu.c  │
+  └────────────────────────────────────────────┘
+       │
+  Hardware (VT-d / AMD-Vi / SMMU)
+    </pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — Linux IOMMU API (kernel sürücü tarafı)</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/iommu.h&gt;
+
+/* ── IOMMU domain oluşturma ───────────────────────────────── */
+static struct iommu_domain *create_dma_domain(struct device *dev)
+{
+    struct iommu_domain *domain;
+
+    /*
+     * Domain türleri:
+     *   IOMMU_DOMAIN_DMA:      DMA API için genel domain
+     *   IOMMU_DOMAIN_IDENTITY: passthrough (PA==IOVA)
+     *   IOMMU_DOMAIN_UNMANAGED: sürücü elle yönetir (VFIO için)
+     *   IOMMU_DOMAIN_BLOCKED:  tüm DMA engellenir
+     */
+    domain = iommu_domain_alloc(dev->bus);
+    if (!domain) {
+        dev_err(dev, "iommu_domain_alloc başarısız\n");
+        return NULL;
+    }
+
+    return domain;
+}
+
+/* ── Cihazı domain'e bağla ────────────────────────────────── */
+static int attach_to_domain(struct iommu_domain *domain,
+                              struct device *dev)
+{
+    int ret = iommu_attach_device(domain, dev);
+    if (ret)
+        pr_err("iommu_attach_device hata: %d\n", ret);
+    return ret;
+}
+
+/* ── IOVA → PA haritası kur ──────────────────────────────── */
+static int map_iova(struct iommu_domain *domain,
+                    unsigned long iova, phys_addr_t pa,
+                    size_t size)
+{
+    int prot = IOMMU_READ | IOMMU_WRITE;  /* | IOMMU_NOEXEC */
+    int ret = iommu_map(domain, iova, pa, size, prot, GFP_KERNEL);
+    if (ret)
+        pr_err("iommu_map(0x%lx→0x%llx, %zu): %d\n",
+               iova, (u64)pa, size, ret);
+    return ret;
+}
+
+/* ── Haritayı kaldır ─────────────────────────────────────── */
+static void unmap_iova(struct iommu_domain *domain,
+                        unsigned long iova, size_t size)
+{
+    size_t unmapped = iommu_unmap(domain, iova, size);
+    if (unmapped != size)
+        pr_warn("iommu_unmap: beklenen %zu, gerçek %zu\n",
+                size, unmapped);
+}
+
+/* ── IOVA → PA çeviri kontrolü ───────────────────────────── */
+static phys_addr_t translate_iova(struct iommu_domain *domain,
+                                   unsigned long iova)
+{
+    phys_addr_t pa = iommu_iova_to_phys(domain, iova);
+    pr_debug("IOVA 0x%lx → PA 0x%llx\n", iova, (u64)pa);
+    return pa;
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>iommu_domain: sayfa tablosu kapsayıcısı; IOMMU_DOMAIN_DMA genel kullanım için</li>
+      <li>iommu_attach_device(): cihazı domain'e bağlar; tüm DMA bu domain sayfa tablosundan geçer</li>
+      <li>iommu_map(): IOVA → PA eşlemesi kur; prot: READ, WRITE, NOEXEC bayrakları</li>
+      <li>DMA API sürücü çağrıları (dma_map_single vb.) arka planda iommu_map kullanır</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> IOMMU groups ve /sys/kernel/iommu_groups</h2>
+  <p class="section-lead">IOMMU group, PCIe topolojisi veya donanım kısıtları nedeniyle birlikte yönetilmesi zorunlu cihazlar kümesidir. Bir grubu VFIO'ya atamak için gruptaki tüm cihazların VFIO'ya bağlanması gerekir.</p>
+
+  <h3>Grup oluşma nedenleri</h3>
+  <p>PCIe ACS (Access Control Services) yoksa, bir Switch arkasındaki tüm cihazlar birbirinin DMA trafiğine erişebilir — bunlar tek grup oluşturur. ACS etkinse her cihaz kendi grubunu alabilir. Root Port doğrudan bağlı Endpoint genellikle tek başına bir grupta olur.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — IOMMU group analizi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm IOMMU gruplarını ve içindeki cihazları listele</span>
+for d in /sys/kernel/iommu_groups/*/devices/*; do
+    group=$(echo "$d" | cut -d/ -f5)
+    bdf=$(basename "$d")
+    name=$(lspci -s "$bdf" 2&gt;/dev/null | cut -d: -f3-)
+    printf "Group %-4s  %s  %s\n" "$group" "$bdf" "$name"
+done | sort -n
+
+<span class="cmt"># Tipik çıktı:</span>
+<span class="cmt"># Group 0    00:00.0  Host bridge: Intel ...  </span>
+<span class="cmt"># Group 1    00:1d.0  PCI bridge: Intel ...   </span>
+<span class="cmt"># Group 2    01:00.0  Non-Volatile memory: Samsung ...</span>
+<span class="cmt"># Group 3    02:00.0  Ethernet: Realtek ...   </span>
+
+<span class="cmt"># Bir grubun tüm cihazlarını gör</span>
+<span class="cmd">ls</span> /sys/kernel/iommu_groups/2/devices/
+
+<span class="cmt"># ACS desteği kontrolü</span>
+<span class="cmd">sudo</span> lspci <span class="flag">-vvv</span> | grep -A5 "Access Control"
+<span class="cmt"># Access Control Services: ACSCap: SrcValid+ TransBlk+ ReqRedir+ ... </span>
+<span class="cmt"># → ACS mevcut: her downstream port izole edilebilir</span>
+
+<span class="cmt"># Grup-1 cihaz sayısı: birden fazlaysa VFIO passthrough için hepsini bağlamalısın</span>
+<span class="cmd">ls</span> /sys/kernel/iommu_groups/1/devices/ | wc -l</code></pre>
+  </div>
+
+  <h3>IOMMU group ve VM passthrough ilişkisi</h3>
+
+  <div class="flow">
+    <pre>
+  İYİ (single-device group): ACS mevcut
+  ┌──────────────┐    ┌──────────────┐
+  │ Group 5      │    │ Group 6      │
+  │ 02:00.0 NIC  │    │ 03:00.0 NVMe │
+  └──────────────┘    └──────────────┘
+  → Sadece NIC'i VM'e ver; NVMe host'ta kalır
+
+  KÖTÜ (multi-device group): ACS yok, switch arkası
+  ┌─────────────────────────────────────┐
+  │ Group 7                             │
+  │ 04:00.0 NIC                         │
+  │ 04:01.0 Sound card                  │
+  │ 04:02.0 USB controller              │
+  └─────────────────────────────────────┘
+  → VM'e NIC vermek için Sound + USB'yi de VM'e vermek zorunda
+  → Veya: acs_override kernel patch (güvenlik kaybı)
+    </pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>IOMMU group: trust sınırı — gruptaki cihazlar birbirini etkileyebilir</li>
+      <li>ACS olmayan switch: tüm downstream cihazlar tek grup; passthrough sınırlaması</li>
+      <li>/sys/kernel/iommu_groups/N/devices/: grup üyelerini listeler</li>
+      <li>VFIO passthrough için: grup içindeki tüm cihazlar VFIO'ya bağlanmalı</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> VFIO — userspace device access</h2>
+  <p class="section-lead">VFIO (Virtual Function I/O), PCIe cihazlarına kullanıcı alanından güvenli erişim sağlar. IOMMU koruması altında, cihaz doğrudan bir VM'e veya DPDK gibi kullanıcı alanı sürücülerine atanır.</p>
+
+  <h3>VFIO mimarisi</h3>
+
+  <div class="flow">
+    <pre>
+  Kullanıcı Alanı (QEMU, DPDK):
+    /dev/vfio/N  →  ioctl(VFIO_IOMMU_MAP_DMA)  →  DMA harita kur
+    /dev/vfio/N  →  ioctl(VFIO_DEVICE_GET_REGION_INFO) → BAR okuma
+    /dev/vfio/N  →  ioctl(VFIO_DEVICE_GET_IRQ_INFO)    → IRQ yapılandır
+
+  Kernel:
+    vfio.ko  →  vfio_iommu_type1.ko  →  Linux IOMMU API
+                      │
+              IOMMU Domain (UNMANAGED)
+                      │
+              IOMMU hardware (VT-d / SMMU)
+    </pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — VFIO kurulumu ve cihaz bağlama</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1. IOMMU etkin olduğunu doğrula</span>
+<span class="cmd">dmesg</span> | grep -E "IOMMU|DMAR|SMMU"
+
+<span class="cmt"># 2. Hedef cihazı belirle</span>
+<span class="cmd">lspci</span> <span class="flag">-nn</span>
+<span class="cmt"># 02:00.0 Ethernet [0200]: Realtek RTL8111/8168/8411 [10ec:8168]</span>
+
+<span class="cmt"># 3. IOMMU grubunu kontrol et</span>
+<span class="cmd">ls</span> /sys/kernel/iommu_groups/3/devices/
+<span class="cmt"># 0000:02:00.0  ← tek cihaz, iyi</span>
+
+<span class="cmt"># 4. Mevcut sürücüyü ayır</span>
+<span class="cmd">echo</span> 0000:02:00.0 | sudo tee /sys/bus/pci/devices/0000:02:00.0/driver/unbind
+
+<span class="cmt"># 5. VFIO modüllerini yükle</span>
+<span class="cmd">sudo</span> modprobe vfio
+<span class="cmd">sudo</span> modprobe vfio_pci
+
+<span class="cmt"># 6. Cihazı VFIO'ya bağla</span>
+<span class="cmd">echo</span> "10ec 8168" | sudo tee /sys/bus/pci/drivers/vfio-pci/new_id
+
+<span class="cmt"># Alternatif: vfio-pci doğrudan bind</span>
+<span class="cmd">echo</span> 0000:02:00.0 | sudo tee /sys/bus/pci/drivers/vfio-pci/bind
+
+<span class="cmt"># 7. /dev/vfio/ oluşturulduğunu doğrula</span>
+<span class="cmd">ls</span> <span class="flag">-la</span> /dev/vfio/
+<span class="cmt"># crw-rw-rw- 1 root vfio ...  /dev/vfio/3</span>
+<span class="cmt"># crw-rw-rw- 1 root root ...  /dev/vfio/vfio</span></code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — VFIO userspace erişimi (DMA haritası)</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/vfio.h&gt;
+#include &lt;sys/ioctl.h&gt;
+
+int vfio_setup(int group_id)
+{
+    int container, group, device_fd;
+
+    /* VFIO container */
+    container = open("/dev/vfio/vfio", O_RDWR);
+    ioctl(container, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU);
+
+    /* IOMMU group'u aç */
+    char path[64];
+    snprintf(path, sizeof(path), "/dev/vfio/%d", group_id);
+    group = open(path, O_RDWR);
+    ioctl(group, VFIO_GROUP_SET_CONTAINER, &container);
+
+    /* Cihazı aç */
+    device_fd = ioctl(group, VFIO_GROUP_GET_DEVICE_FD, "0000:02:00.0");
+
+    /* BAR bilgisini al */
+    struct vfio_region_info reg = {
+        .argsz = sizeof(reg),
+        .index = VFIO_PCI_BAR0_REGION_INDEX,
+    };
+    ioctl(device_fd, VFIO_DEVICE_GET_REGION_INFO, &reg);
+    printf("BAR0: offset=0x%llx size=0x%llx\n",
+           reg.offset, reg.size);
+
+    /* DMA haritası kur (QEMU bunu yapar) */
+    struct vfio_iommu_type1_dma_map dma = {
+        .argsz = sizeof(dma),
+        .flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
+        .vaddr = (uintptr_t)mmap(NULL, 4096, PROT_READ|PROT_WRITE,
+                                  MAP_PRIVATE|MAP_ANONYMOUS, -1, 0),
+        .iova  = 0x10000,   /* cihaza görünecek adres */
+        .size  = 4096,
+    };
+    ioctl(container, VFIO_IOMMU_MAP_DMA, &dma);
+
+    return device_fd;
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>VFIO: IOMMU korumalı kullanıcı alanı cihaz erişimi; güvenli DMA passthrough</li>
+      <li>Container → Group → Device hiyerarşisi; her grup tek container'a bağlanır</li>
+      <li>VFIO_IOMMU_MAP_DMA: kullanıcı belleği için IOMMU haritası kur → cihaz bu IOVA'ya DMA yapabilir</li>
+      <li>DPDK, QEMU, SPDK: performans kritik userspace sürücüler VFIO kullanır</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> IOMMU ve KVM/QEMU — PCIe passthrough</h2>
+  <p class="section-lead">PCIe passthrough (assigned device), bir PCIe cihazını doğrudan sanal makineye atar. IOMMU, VM'nin cihazın DMA'sından korunmasını sağlar; cihaz sanki fiziksel olarak VM'in kendisindeymiş gibi çalışır.</p>
+
+  <h3>Passthrough mekanizması</h3>
+
+  <div class="flow">
+    <pre>
+  Host Linux (KVM/QEMU)
+  ┌─────────────────────────────────────────────────────────────┐
+  │  QEMU proses                                                │
+  │  ├── vCPU thread'leri                                       │
+  │  └── VFIO device thread                                     │
+  │         │                                                   │
+  │         ▼                                                   │
+  │  /dev/vfio/3  ──▶  vfio_iommu  ──▶  IOMMU (VT-d)          │
+  │                                          │                  │
+  │                                    PCIe 02:00.0 NIC        │
+  └─────────────────────────────────────────────────────────────┘
+
+  Sanal Makine (Guest OS):
+  ├── Guest kernel: NIC'i "gerçek donanım" olarak görür
+  ├── Guest DMA → IOMMU Stage-2 → Host PA → NIC
+  └── IRQ: VFIO interrupt forwarding → kvm_irqfd → Guest IRQ
+    </pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — QEMU PCIe passthrough komutu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># QEMU ile PCIe NIC passthrough (vfio-pci)</span>
+<span class="cmd">qemu-system-x86_64</span> \
+    <span class="flag">-enable-kvm</span> \
+    <span class="flag">-cpu</span> host \
+    <span class="flag">-m</span> 4G \
+    <span class="flag">-drive</span> file=vm.qcow2,format=qcow2 \
+    \
+    <span class="cmt"># IOMMU modeli (Guest'in IOMMU görmesi için)</span>
+    <span class="flag">-machine</span> q35,accel=kvm \
+    <span class="flag">-device</span> intel-iommu,intremap=on,caching-mode=on \
+    \
+    <span class="cmt"># PCIe cihazı passthrough</span>
+    <span class="flag">-device</span> vfio-pci,host=02:00.0,multifunction=on \
+    \
+    <span class="flag">-nographic</span> \
+    <span class="flag">-serial</span> mon:stdio
+
+<span class="cmt"># Guest'te doğrulama</span>
+<span class="cmt"># lspci -k → sürücü: r8169 veya e1000e (gerçek hardware sürücüsü)</span>
+<span class="cmt"># ethtool eth0 → Speed: 1000baseT/Full (gerçek hız)</span>
+<span class="cmt"># iperf3 → host-to-guest: ~940 Mbps (bare metal yakın performans)</span></code></pre>
+  </div>
+
+  <h3>vIOMMU: Guest'e IOMMU sunmak</h3>
+  <p>Guest OS IOMMU kullanmak istiyorsa (örn. VFIO içinde VFIO), QEMU'da vIOMMU emülasyonu etkinleştirilir. <code>-device intel-iommu</code> veya <code>-device virtio-iommu-pci</code> ile guest'e sanal IOMMU sunulur.</p>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>PCIe passthrough: cihaz doğrudan VM'e; bare metal yakın performans</li>
+      <li>IOMMU: VM DMA'sını izole eder; bir VM diğerinin belleğine veya host'a DMA yapamaz</li>
+      <li>q35 + intel-iommu: QEMU'da IOMMU destekli passthrough için gerekli platform</li>
+      <li>vIOMMU: nested VM veya guest DPDK için guest'e sanal IOMMU sunumu</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Pratik: VFIO ile PCIe NIC'i sanal makineye doğrudan atama</h2>
+  <p class="section-lead">Adım adım: Intel VT-d etkin sistemde Realtek NIC'i VFIO ile ayır, QEMU VM'ine ata ve guest Ubuntu'da çalıştır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — tam passthrough kurulum betiği</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">#!/bin/bash</span>
+<span class="cmt"># nic_passthrough_setup.sh — PCIe NIC'i VM'e atama</span>
+set -euo pipefail
+
+NIC_BDF="0000:02:00.0"       # lspci'den al
+NIC_VENDOR_DEV="10ec:8168"   # lspci -nn'den al
+
+echo "=== 1. IOMMU etkin mi? ==="
+if ! dmesg | grep -qi "IOMMU enabled"; then
+    echo "HATA: IOMMU etkin değil!"
+    echo "GRUB: intel_iommu=on veya amd_iommu=on ekle"
+    exit 1
+fi
+echo "OK: IOMMU etkin"
+
+echo "=== 2. IOMMU group ==="
+GROUP=$(readlink /sys/bus/pci/devices/$NIC_BDF/iommu_group | \
+        sed 's|.*/||')
+echo "NIC IOMMU group: $GROUP"
+DEVICES=$(ls /sys/kernel/iommu_groups/$GROUP/devices/)
+echo "Gruptaki cihazlar: $DEVICES"
+COUNT=$(echo "$DEVICES" | wc -w)
+if [ "$COUNT" -gt 1 ]; then
+    echo "UYARI: Grupta $COUNT cihaz var — hepsini VFIO'ya bağlamalısın!"
+fi
+
+echo "=== 3. Mevcut sürücüyü ayır ==="
+DRIVER=$(readlink /sys/bus/pci/devices/$NIC_BDF/driver 2&gt;/dev/null | \
+         sed 's|.*/||' || echo "none")
+echo "Mevcut sürücü: $DRIVER"
+if [ "$DRIVER" != "none" ] &amp;&amp; [ "$DRIVER" != "vfio-pci" ]; then
+    echo "$NIC_BDF" | sudo tee /sys/bus/pci/drivers/$DRIVER/unbind
+    echo "Ayrıldı: $DRIVER"
+fi
+
+echo "=== 4. VFIO modülleri ==="
+sudo modprobe vfio vfio_iommu_type1 vfio_pci
+
+echo "=== 5. VFIO'ya bağla ==="
+echo "$NIC_VENDOR_DEV" | sudo tee /sys/bus/pci/drivers/vfio-pci/new_id \
+    2&gt;/dev/null || true
+
+if [ ! -e /sys/bus/pci/devices/$NIC_BDF/driver ]; then
+    echo "$NIC_BDF" | sudo tee /sys/bus/pci/drivers/vfio-pci/bind
+fi
+
+echo "=== 6. Doğrulama ==="
+readlink /sys/bus/pci/devices/$NIC_BDF/driver
+ls -la /dev/vfio/
+
+echo ""
+echo "=== VM başlatma komutu ==="
+cat &lt;&lt;'EOF'
+qemu-system-x86_64 \
+  -enable-kvm -cpu host -m 2G \
+  -drive file=ubuntu.qcow2,format=qcow2 \
+  -machine q35,accel=kvm \
+  -device intel-iommu \
+  -device vfio-pci,host=02:00.0 \
+  -nographic -serial mon:stdio
+EOF</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div name="code-header"><span>bash — guest doğrulama ve performans testi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Guest OS içinde (Ubuntu)</span>
+
+<span class="cmt"># NIC tanındı mı?</span>
+<span class="cmd">lspci</span> <span class="flag">-k</span>
+<span class="cmt"># 00:03.0 Ethernet: Realtek RTL8111/8168</span>
+<span class="cmt">#         Kernel driver in use: r8169</span>
+
+<span class="cmt"># IP adresi al</span>
+<span class="cmd">sudo</span> dhclient eth0
+
+<span class="cmt"># Performans testi: host ↔ guest iperf3</span>
+<span class="cmt"># Host'ta:</span>
+<span class="cmd">iperf3</span> <span class="flag">-s</span>
+<span class="cmt"># Guest'te:</span>
+<span class="cmd">iperf3</span> <span class="flag">-c</span> 192.168.1.1 <span class="flag">-t</span> 10
+<span class="cmt"># [ ID] Interval      Transfer     Bandwidth</span>
+<span class="cmt"># [  5]  0.00-10.00   1.11 GBytes  953 Mbits/sec</span>
+<span class="cmt"># → 953 Mbps: bare metal yakın (overhead yok)</span>
+
+<span class="cmt"># Karşılaştırma: virtio-net (QEMU emüle)</span>
+<span class="cmt"># [  5]  0.00-10.00   0.91 GBytes  784 Mbits/sec</span>
+<span class="cmt"># → virtio-net 17% daha yavaş — passthrough'un avantajı</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>IOMMU group kontrolü: tek cihazlı group → passthrough için ideal; çok cihazlı → hepsini VFIO'ya bağla</li>
+      <li>vfio-pci modülü: mevcut sürücüyü ayır, cihazı VFIO'ya bağla, /dev/vfio/N oluşur</li>
+      <li>Performans: vfio-pci passthrough, virtio-net'ten %15-20 daha yüksek throughput</li>
+      <li>Güvenlik: IOMMU etkin passthrough — VM host belleğine DMA yapamaz</li>
+    </ul>
+  </div>
+</section>
+
+</main>

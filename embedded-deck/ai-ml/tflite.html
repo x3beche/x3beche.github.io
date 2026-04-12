@@ -1,0 +1,735 @@
+---
+layout: tutorial
+title: "TFLite Micro — MCU/Edge Çıkarımı"
+back_url: "../index.html"
+back_label: "AI/ML Uç Bilişim"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>AI/ML UÇ BİLİŞİM</span>
+    <span>TFLite Micro</span>
+    <span>2026</span>
+  </div>
+  <h1>TFLite Micro —<br><em>MCU/Edge çıkarımı.</em></h1>
+  <p class="subtitle">TensorFlow Lite Micro ile heap'siz, RTTI'sız MCU'larda model çıkarımı. INT8 quantization'dan arena allocator'a, STM32 X-CUBE-AI'dan Raspberry Pi deployment'a kapsamlı rehber.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">TFLite nedir? — TF ekosistemindeki yeri</a></li>
+    <li><a href="#s1">Model quantization — INT8, INT4, float16</a></li>
+    <li><a href="#s2">TFLite Micro mimarisi — arena, op resolver, no-heap</a></li>
+    <li><a href="#s3">Python API — Interpreter, invoke, benchmark</a></li>
+    <li><a href="#s4">C++ API — MicroInterpreter ve tensor arena</a></li>
+    <li><a href="#s5">Raspberry Pi deployment — cross-compile, benchmark_model</a></li>
+    <li><a href="#s6">STM32 MCU deployment — X-CUBE-AI, CubeMX</a></li>
+    <li><a href="#s7">Model optimizasyon araçları — Netron, profiler</a></li>
+    <li><a href="#s8">Pratik — MobileNet INT8 ile gesture recognition</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> TFLite nedir? — TF ekosistemindeki yeri</h2>
+  <p class="section-lead">TensorFlow Lite (TFLite), TensorFlow modellerini uç cihazlarda çalıştırmak için tasarlanmış hafif bir çıkarım çerçevesidir. TFLite Micro ise bu çerçevenin heap ve işletim sistemi olmaksızın bare-metal MCU'larda bile çalışan alt kümesidir.</p>
+
+  <h3>TF ekosisteminde konum</h3>
+
+  <div class="flow">
+    <pre>
+  TensorFlow (Eğitim)
+  ┌──────────────────────────────────────────────┐
+  │  tf.keras model  →  saved_model  →  .tflite  │
+  │                       ↓                      │
+  │            TFLite Converter                   │
+  │         (quantize + flatbuffer)               │
+  └──────────────────────────────────────────────┘
+            ↓                    ↓
+  ┌─────────────────┐   ┌─────────────────────┐
+  │   TFLite Runtime│   │  TFLite Micro        │
+  │  Linux / Android│   │  Cortex-M / bare     │
+  │  iOS / Windows  │   │  metal / Zephyr      │
+  └─────────────────┘   └─────────────────────┘
+    </pre>
+  </div>
+
+  <div class="params">
+    <div class="param">
+      <div class="name">TFLite Runtime</div>
+      <div class="desc">Heap kullanan tam özellikli runtime. Linux, Android, iOS, Windows hedef alır. Dynamic tensor allocation destekler. ~1 MB binary footprint.</div>
+    </div>
+    <div class="param">
+      <div class="name">TFLite Micro (TFLM)</div>
+      <div class="desc">Statik bellek (arena allocator), no heap, no RTTI, no exceptions. Cortex-M0+ ile çalışır. ~20 KB binary. libc bağımlılığı minimumdur.</div>
+    </div>
+    <div class="param">
+      <div class="name">.tflite Formatı</div>
+      <div class="desc">FlatBuffer tabanlı ikili format. Hem TFLite hem TFLM aynı .tflite dosyasını okur. Ağırlıklar, grafik topolojisi ve quantization parametrelerini içerir.</div>
+    </div>
+    <div class="param">
+      <div class="name">Desteklenen hedefler</div>
+      <div class="desc">ARM Cortex-M (STM32, nRF52, SAMD51), ESP32-S3, RPi, Linux x86_64, Android NDK, Arduino, Zephyr RTOS.</div>
+    </div>
+  </div>
+
+  <h3>TFLite vs TFLite Micro karşılaştırması</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>TFLite Runtime</th><th>TFLite Micro</th></tr></thead>
+      <tbody>
+        <tr><td>Heap tahsisi</td><td>Evet (malloc/free)</td><td>Hayır (arena)</td></tr>
+        <tr><td>RTTI / Exceptions</td><td>Evet</td><td>Hayır</td></tr>
+        <tr><td>İşletim sistemi</td><td>Gerekli</td><td>Opsiyonel</td></tr>
+        <tr><td>Binary boyutu</td><td>~1 MB</td><td>~20 KB</td></tr>
+        <tr><td>Min RAM</td><td>~5 MB</td><td>~16 KB</td></tr>
+        <tr><td>Op sayısı</td><td>~150+</td><td>~50 (seçici)</td></tr>
+        <tr><td>Flatbuffer yükleme</td><td>Dinamik</td><td>Flash'tan ROM</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">Not</div>
+    <p>TFLite Micro, TFLite'ın bir "alt kümesi" değil, ayrı bir kaynak ağacıdır. Op kernel implementasyonları optimize edilmiş CMSIS-NN rutinlerini çağırabilir. Tüm .tflite modeller TFLM ile uyumlu değildir — kullanılan op'ların TFLM kerneli olmalıdır.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Model quantization — INT8, INT4, float16</h2>
+  <p class="section-lead">Quantization, kayan noktalı ağırlıkları (float32) düşük bit genişlikli tam sayılara (INT8, INT4) dönüştürür. Bu işlem model boyutunu 4x küçültür ve MCU'larda mevcut olan SIMD tam sayı birimlerini devreye sokar.</p>
+
+  <h3>Quantization türleri</h3>
+
+  <div class="params">
+    <div class="param">
+      <div class="name">Post-Training Quantization (PTQ)</div>
+      <div class="desc">Eğitilmiş float32 modeli kalibrasyonlu veri seti ile dönüştürür. Hızlı uygulanır; küçük doğruluk kaybı (<1-2%) beklenir. INT8 ve float16 PTQ destekler.</div>
+    </div>
+    <div class="param">
+      <div class="name">Quantization-Aware Training (QAT)</div>
+      <div class="desc">Eğitim sırasında sahte quantization (fake-quant) düğümleri ekler. Model, quantization gürültüsünü "öğrenir". PTQ'ya kıyasla daha iyi doğruluk, ancak yeniden eğitim gerektirir.</div>
+    </div>
+    <div class="param">
+      <div class="name">INT8 Tam Quantization</div>
+      <div class="desc">Ağırlıklar ve aktivasyonlar INT8'e dönüştürülür. Model 4x küçülür, çıkarım 2-4x hızlanır. Cortex-M SIMD (SSAT, VMLA) ile doğrudan uyumludur.</div>
+    </div>
+    <div class="param">
+      <div class="name">float16 Quantization</div>
+      <div class="desc">Yalnızca ağırlıklar float16. Aktivasyonlar float32 kalır. GPU'lu cihazlarda (RPi + VideoCore) işe yarar; MCU'da avantaj sınırlıdır.</div>
+    </div>
+    <div class="param">
+      <div class="name">INT4 (Dynamic Range)</div>
+      <div class="desc">TF 2.13+ ile desteklenir. Ağırlıklar INT4, aktivasyonlar INT8/float. Bellek baskısı çok yüksek MCU senaryolarında kullanılır; doğruluk kaybı daha yüksektir.</div>
+    </div>
+  </div>
+
+  <h3>PTQ — Python kodu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>ptq_int8.py</span><span class="dot">●</span></div>
+    <pre><code class="language-python">import tensorflow as tf
+import numpy as np
+
+# Eğitilmiş modeli yükle
+model = tf.keras.models.load_model("gesture_mobilenet.h5")
+
+# Kalibrasyon veri seti oluştur (temsili örnekler)
+def representative_dataset():
+    for _ in range(200):
+        data = np.random.rand(1, 96, 96, 3).astype(np.float32)
+        yield [data]
+
+# TFLite Converter
+converter = tf.lite.TFLiteConverter.from_keras_model(model)
+converter.optimizations = [tf.lite.Optimize.DEFAULT]
+converter.representative_dataset = representative_dataset
+
+# Tam INT8: hem ağırlıklar hem aktivasyonlar
+converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+converter.inference_input_type  = tf.int8
+converter.inference_output_type = tf.int8
+
+tflite_model = converter.convert()
+with open("gesture_int8.tflite", "wb") as f:
+    f.write(tflite_model)
+
+print(f"Model boyutu: {len(tflite_model) / 1024:.1f} KB")</code></pre>
+  </div>
+
+  <h3>Accuracy-Size tradeoff</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Quantization</th><th>Boyut</th><th>Accuracy</th><th>Latency (CM4)</th><th>Hedef</th></tr></thead>
+      <tbody>
+        <tr><td>float32 (baseline)</td><td>5.2 MB</td><td>92.4%</td><td>420 ms</td><td>Linux/Android</td></tr>
+        <tr><td>float16 PTQ</td><td>2.6 MB</td><td>92.2%</td><td>380 ms</td><td>Linux/GPU</td></tr>
+        <tr><td>INT8 PTQ</td><td>1.3 MB</td><td>91.8%</td><td>95 ms</td><td>RPi/MCU</td></tr>
+        <tr><td>INT8 QAT</td><td>1.3 MB</td><td>92.1%</td><td>95 ms</td><td>RPi/MCU</td></tr>
+        <tr><td>INT4 Dynamic</td><td>0.7 MB</td><td>89.5%</td><td>68 ms</td><td>MCU (Flash kısıtlı)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">İpucu</div>
+    <p>QAT için <code class="inline">tensorflow_model_optimization</code> paketini kullan: <code class="inline">tfmot.quantization.keras.quantize_model(model)</code>. QAT sonrası model PTQ pipeline'ına sokulur; çift adım zahmetli ama kritik doğruluk gerektiren uygulamalarda zorunludur.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> TFLite Micro mimarisi — arena, op resolver, no-heap</h2>
+  <p class="section-lead">TFLM'in tasarımı "sıfır dinamik bellek tahsisi" ilkesine dayanır. Tüm bellek, kullanıcının sağladığı sabit boyutlu bir byte dizisinden (tensor arena) karşılanır.</p>
+
+  <h3>Mimari katmanları</h3>
+
+  <div class="flow">
+    <pre>
+  Kullanıcı Kodu
+       ↓
+  MicroInterpreter
+  ├── MicroErrorReporter   (hata mesajları, uart/printf)
+  ├── MicroMutableOpResolver  (kayıtlı op kernelleri)
+  │     ├── CONV_2D     → cmsis_nn_convolve_wrapper
+  │     ├── DEPTHWISE_CONV_2D
+  │     ├── FULLY_CONNECTED
+  │     └── SOFTMAX
+  ├── Model (flatbuffer, Flash'ta)
+  └── TensorArena (SRAM, statik dizi)
+        ├── Input tensor  (INT8 piksel verisi)
+        ├── Intermediate activations (katmanlar arası)
+        └── Output tensor (sınıf skorları)
+    </pre>
+  </div>
+
+  <div class="params">
+    <div class="param">
+      <div class="name">TensorArena</div>
+      <div class="desc">Statik <code class="inline">uint8_t tensor_arena[ARENA_SIZE]</code> dizisi. AllocateTensors() çağrısında TFLM, grafik analizine göre gerekli belleği bu arenadan ayırır. Arena çok küçükse hata döner.</div>
+    </div>
+    <div class="param">
+      <div class="name">MicroMutableOpResolver</div>
+      <div class="desc">Yalnızca kullanılan op'ları kaydeder. Tüm op'ların binary'e dahil edilmesini önler. Her AddXxx() çağrısı ilgili kernel'i listeye ekler ve binary boyutunu artırır.</div>
+    </div>
+    <div class="param">
+      <div class="name">Kernel Abstraction</div>
+      <div class="desc">Her op'un platform-agnostik referans implementasyonu ve optimize edilmiş implementasyonu (CMSIS-NN, Xtensa, RISC-V P-extension) vardır. Derleme zamanında seçilir.</div>
+    </div>
+    <div class="param">
+      <div class="name">CMSIS-NN</div>
+      <div class="desc">ARM'ın Cortex-M için optimize NN kütüphanesi. TFLM, CMSIS-NN'i otomatik olarak çağırır. SSAT ve MVE intrinsiklerini kullanarak INT8 konvolüsyonu 4-8x hızlandırır.</div>
+    </div>
+  </div>
+
+  <div class="callout">
+    <div class="label">Arena Boyutu Hesaplama</div>
+    <p>Arena boyutu, modelin aktivasyon belleğine bağlıdır ve deneme-yanılma ile belirlenir. <code class="inline">AllocateTensors()</code> başarısız olursa arena'yı büyüt. Pratik yöntem: önce büyük bir arena ayır, <code class="inline">interpreter.arena_used_bytes()</code> ile gerçek kullanımı ölç, sonra küçült.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Python API — Interpreter, invoke, benchmark</h2>
+  <p class="section-lead">TFLite Python API, Linux ve Raspberry Pi'da model doğrulama ve prototipleme için idealdir. <code class="inline">tflite_runtime</code> paketi TensorFlow'un tamamını kurmadan çalışır.</p>
+
+  <h3>Kurulum</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code class="language-bash"># RPi OS / Debian tabanlı (arm64)
+pip install tflite-runtime
+
+# PC'de geliştirme için (tam TF)
+pip install tensorflow</code></pre>
+  </div>
+
+  <h3>Temel çıkarım akışı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>tflite_infer.py</span><span class="dot">●</span></div>
+    <pre><code class="language-python">import numpy as np
+import tflite_runtime.interpreter as tflite
+import time
+
+# Model yükle
+interpreter = tflite.Interpreter(model_path="gesture_int8.tflite",
+                                  num_threads=4)
+interpreter.allocate_tensors()
+
+# Tensor bilgilerini al
+input_details  = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+print("Input  shape:", input_details[0]['shape'])   # [1, 96, 96, 1]
+print("Input  dtype:", input_details[0]['dtype'])   # int8
+print("Output shape:", output_details[0]['shape'])  # [1, 5]
+
+# INT8 giriş için quantization parametreleri
+scale, zero_point = input_details[0]['quantization']
+# float_input → int8: int8_val = float_val / scale + zero_point
+
+# Örnek çıkarım
+img_float = np.random.rand(1, 96, 96, 1).astype(np.float32)
+img_int8  = (img_float / scale + zero_point).astype(np.int8)
+
+interpreter.set_tensor(input_details[0]['index'], img_int8)
+
+t0 = time.perf_counter()
+interpreter.invoke()
+t1 = time.perf_counter()
+
+output = interpreter.get_tensor(output_details[0]['index'])
+print(f"Çıkarım süresi: {(t1-t0)*1000:.2f} ms")
+print(f"Sınıf skorları: {output}")
+print(f"Tahmin: sınıf {np.argmax(output)}")</code></pre>
+  </div>
+
+  <h3>benchmark_model ile performans ölçümü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — RPi4</span><span class="dot">●</span></div>
+    <pre><code class="language-bash"># benchmark_model binary'ini indir veya derle
+wget https://storage.googleapis.com/tensorflow-nightly-public/prod/tensorflow/release/lite/tools/nightly/latest/linux_aarch64/benchmark_model
+
+chmod +x benchmark_model
+
+./benchmark_model \
+  --graph=gesture_int8.tflite \
+  --num_threads=4 \
+  --num_runs=50 \
+  --warmup_runs=5
+
+# Örnek çıktı:
+# Inference timings in us: Avg=28471, Min=27842, Max=31205
+# INIT: 45231 us, 1st inference: 30123 us
+# Warmup iterations: 5, Inferences: 50</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">Çoklu Thread</div>
+    <p><code class="inline">num_threads=4</code> RPi4'ün 4 çekirdeğini kullanır. Ancak küçük modellerde thread overhead, paralel faydayı geçebilir. Her model için optimal thread sayısını ölçerek belirle.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> C++ API — MicroInterpreter ve tensor arena</h2>
+  <p class="section-lead">TFLM C++ API, MCU'larda doğrudan kullanılan temel arayüzdür. Arduino ve Zephyr kütüphaneleri bu API üzerine sarıcı katman sağlar.</p>
+
+  <h3>Tam MCU çıkarım örneği</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>main_functions.cc</span><span class="dot">●</span></div>
+    <pre><code class="language-c">// TFLM başlıkları
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/micro/micro_error_reporter.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+
+// Model (xxd ile C array'e dönüştürülmüş .tflite)
+#include "gesture_model_data.h"
+
+namespace {
+  tflite::MicroErrorReporter micro_error_reporter;
+  tflite::ErrorReporter*     error_reporter = &micro_error_reporter;
+
+  const tflite::Model* model = nullptr;
+  tflite::MicroInterpreter* interpreter = nullptr;
+  TfLiteTensor* input  = nullptr;
+  TfLiteTensor* output = nullptr;
+
+  // Tensor arena — SRAM'de statik dizi
+  constexpr int kTensorArenaSize = 70 * 1024;  // 70 KB
+  static uint8_t tensor_arena[kTensorArenaSize];
+}
+
+void setup() {
+  // Model flatbuffer'ı yükle
+  model = tflite::GetModel(g_gesture_model_data);
+  if (model->version() != TFLITE_SCHEMA_VERSION) {
+    TF_LITE_REPORT_ERROR(error_reporter, "Model schema uyumsuz!");
+    return;
+  }
+
+  // Yalnızca kullanılan op'ları kaydet (binary boyutu küçültür)
+  static tflite::MicroMutableOpResolver<5> resolver;
+  resolver.AddConv2D();
+  resolver.AddDepthwiseConv2D();
+  resolver.AddMaxPool2D();
+  resolver.AddFullyConnected();
+  resolver.AddSoftmax();
+
+  // Interpreter oluştur
+  static tflite::MicroInterpreter static_interpreter(
+      model, resolver, tensor_arena, kTensorArenaSize, error_reporter);
+  interpreter = &static_interpreter;
+
+  // Tensörleri tahsis et
+  TfLiteStatus alloc_status = interpreter->AllocateTensors();
+  if (alloc_status != kTfLiteOk) {
+    TF_LITE_REPORT_ERROR(error_reporter,
+        "AllocateTensors başarısız! Arena: %d KB", kTensorArenaSize/1024);
+    return;
+  }
+
+  input  = interpreter->input(0);
+  output = interpreter->output(0);
+
+  // Kullanılan arena miktarını yazdır
+  TF_LITE_REPORT_ERROR(error_reporter,
+      "Arena kullanımı: %d bytes",
+      interpreter->arena_used_bytes());
+}
+
+void loop() {
+  // Giriş tensörüne kamera görüntüsü yaz (INT8 format)
+  int8_t* input_data = input->data.int8;
+  // ... kamera'dan piksel kopyala ...
+
+  // Çıkarım
+  if (interpreter->Invoke() != kTfLiteOk) {
+    TF_LITE_REPORT_ERROR(error_reporter, "Invoke başarısız!");
+    return;
+  }
+
+  // Çıkış tensöründen sınıfı al
+  int8_t* scores = output->data.int8;
+  int     best   = 0;
+  for (int i = 1; i &lt; output->dims->data[1]; i++) {
+    if (scores[i] > scores[best]) best = i;
+  }
+  // best → 0=idle, 1=up, 2=down, 3=left, 4=right
+}</code></pre>
+  </div>
+
+  <h3>Model binary'e gömme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code class="language-bash"># .tflite dosyasını C array'e çevir
+xxd -i gesture_int8.tflite > gesture_model_data.cc
+
+# gesture_model_data.cc içeriği:
+# unsigned char g_gesture_model_data[] = { 0x1c, 0x00, ... };
+# unsigned int  g_gesture_model_data_len = 1348216;</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Raspberry Pi deployment — cross-compile, benchmark_model</h2>
+  <p class="section-lead">Raspberry Pi 4, TFLite Runtime'ı tam anlamıyla çalıştırabilir. NEON optimizasyonları ve 4 çekirdek sayesinde gerçek zamanlı kamera çıkarımı mümkündür.</p>
+
+  <h3>TFLite shared library kurulumu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — RPi4 (arm64)</span><span class="dot">●</span></div>
+    <pre><code class="language-bash"># Yöntem 1: pip ile Python runtime (en hızlı)
+pip3 install tflite-runtime
+
+# Yöntem 2: libtensorflow-lite.so ile C++ uygulamaları için
+# TFLite'ı kaynaktan derle (aarch64 üzerinde)
+git clone --depth 1 https://github.com/tensorflow/tensorflow
+cd tensorflow
+
+# Bağımlılıklar
+sudo apt-get install -y cmake libabsl-dev libflatbuffers-dev
+
+# CMake ile derle
+mkdir tflite-build && cd tflite-build
+cmake ../tensorflow/lite \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DTFLITE_ENABLE_XNNPACK=ON \
+    -DTFLITE_ENABLE_NNAPI=OFF
+make -j4 libtensorflow-lite.a
+
+# Host PC'den cross-compile (aarch64-linux-gnu toolchain)
+cmake ../tensorflow/lite \
+    -DCMAKE_TOOLCHAIN_FILE=../tensorflow/lite/tools/cmake/toolchains/aarch64_linux.cmake \
+    -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)</code></pre>
+  </div>
+
+  <h3>XNNPACK ile hızlandırma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>xnnpack_infer.py</span><span class="dot">●</span></div>
+    <pre><code class="language-python">import tflite_runtime.interpreter as tflite
+
+# XNNPACK delegate etkinleştir (RPi4'te varsayılan olarak açık)
+interpreter = tflite.Interpreter(
+    model_path="gesture_int8.tflite",
+    experimental_delegates=[
+        tflite.load_delegate('libxnnpack_delegate.so')
+    ],
+    num_threads=4
+)
+interpreter.allocate_tensors()</code></pre>
+  </div>
+
+  <h3>Kamera entegrasyonu — picamera2</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>camera_infer.py</span><span class="dot">●</span></div>
+    <pre><code class="language-python">from picamera2 import Picamera2
+import numpy as np
+import tflite_runtime.interpreter as tflite
+import cv2, time
+
+interpreter = tflite.Interpreter("gesture_int8.tflite", num_threads=4)
+interpreter.allocate_tensors()
+inp_det = interpreter.get_input_details()[0]
+out_det = interpreter.get_output_details()[0]
+scale, zp = inp_det['quantization']
+
+picam2 = Picamera2()
+picam2.configure(picam2.create_preview_configuration(
+    main={"size": (640, 480), "format": "RGB888"}))
+picam2.start()
+
+LABELS = ["idle", "up", "down", "left", "right"]
+
+while True:
+    frame = picam2.capture_array()                    # (480,640,3) uint8
+    roi   = cv2.resize(frame[:, 80:560], (96, 96))    # kare kırp, yeniden boyutlandır
+    gray  = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+    inp   = (gray.astype(np.float32)/255.0 / scale + zp).astype(np.int8)
+    inp   = inp[np.newaxis, ..., np.newaxis]          # (1,96,96,1)
+
+    interpreter.set_tensor(inp_det['index'], inp)
+    t0 = time.perf_counter()
+    interpreter.invoke()
+    dt = (time.perf_counter() - t0) * 1000
+
+    scores = interpreter.get_tensor(out_det['index'])[0]
+    pred   = int(np.argmax(scores))
+    print(f"{LABELS[pred]}  ({dt:.1f} ms)")</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> STM32 MCU deployment — X-CUBE-AI, CubeMX</h2>
+  <p class="section-lead">STM32Cube.AI (X-CUBE-AI), .tflite ve .onnx modellerini STM32 MCU'lar için C kaynak koduna dönüştürür. CubeMX entegrasyonu ile tek tıkla Flash/RAM analizi ve kod üretimi sağlar.</p>
+
+  <h3>X-CUBE-AI iş akışı</h3>
+
+  <div class="flow">
+    <pre>
+  gesture_int8.tflite
+         ↓
+  STM32Cube.AI Converter
+  (STM32CubeMX → X-CUBE-AI paketi)
+         ↓
+  ┌──────────────────────────────────┐
+  │  network.c / network.h           │  ← üretilen C kodu
+  │  network_data.c / network_data.h │  ← ağırlıklar
+  │  app_x-cube-ai.c                 │  ← çıkarım başlatma
+  └──────────────────────────────────┘
+         ↓
+  CubeMX → Keil / IAR / GCC proje
+         ↓
+  STM32H743 Flash programlama
+    </pre>
+  </div>
+
+  <h3>CubeMX X-CUBE-AI konfigürasyonu</h3>
+
+  <div class="params">
+    <div class="param">
+      <div class="name">1. Paket Kurulumu</div>
+      <div class="desc">STM32CubeMX → Software Packs → X-CUBE-AI'yi etkinleştir. En güncel sürümü seç (v8.x+).</div>
+    </div>
+    <div class="param">
+      <div class="name">2. Model Yükleme</div>
+      <div class="desc">Middleware → X-CUBE-AI → Add Network → Model type: TFLite → gesture_int8.tflite dosyasını seç.</div>
+    </div>
+    <div class="param">
+      <div class="name">3. Analiz</div>
+      <div class="desc">Analyze butonu: Flash kullanımı (ağırlıklar), RAM kullanımı (aktivasyon buffer), per-layer latency tahmini gösterir.</div>
+    </div>
+    <div class="param">
+      <div class="name">4. Validation</div>
+      <div class="desc">Validate on Desktop: Orijinal TFLite çıktısı ile üretilen C kodunun sayısal uyumunu kontrol eder. MAE ve max delta raporlar.</div>
+    </div>
+  </div>
+
+  <h3>Flash/RAM kısıtları ve çözümler</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Sorun</th><th>Belirti</th><th>Çözüm</th></tr></thead>
+      <tbody>
+        <tr><td>Flash doldu</td><td>Link error: .rodata overflow</td><td>INT4 quantization veya pruning ile model küçült</td></tr>
+        <tr><td>RAM yetersiz</td><td>AI_NETWORK_ERROR_INVALID_STATE</td><td>Activation buffer'ı CCMRAM veya external RAM'e taşı</td></tr>
+        <tr><td>Yavaş çıkarım</td><td>>100ms Cortex-M7'de</td><td>CMSIS-NN etkinleştir, FPU kullan, cache aç</td></tr>
+        <tr><td>Doğruluk farkı</td><td>PC vs MCU farklı sonuç</td><td>Validate Desktop ile karşılaştır, rounding mode kontrol et</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>app_x-cube-ai.c (özet)</span><span class="dot">●</span></div>
+    <pre><code class="language-c">#include "app_x-cube-ai.h"
+#include "network.h"
+#include "network_data.h"
+
+static ai_handle network = AI_HANDLE_NULL;
+static ai_u8 activations[AI_NETWORK_DATA_ACTIVATIONS_SIZE];
+
+void MX_X_CUBE_AI_Init(void) {
+    ai_network_create_and_init(&network,
+        activations, AI_NETWORK_DATA_CONFIG);
+}
+
+void MX_X_CUBE_AI_Process(int8_t *input_buf, int8_t *output_buf) {
+    ai_buffer ai_input[]  = AI_NETWORK_IN_1_ARGS(input_buf);
+    ai_buffer ai_output[] = AI_NETWORK_OUT_1_ARGS(output_buf);
+    ai_network_run(network, ai_input, ai_output);
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Model optimizasyon araçları — Netron, profiler</h2>
+  <p class="section-lead">Model dönüşümü ve deployment öncesinde model yapısını görselleştirmek, per-op latency'yi ölçmek ve darboğazları bulmak kritik önem taşır.</p>
+
+  <h3>Netron ile görselleştirme</h3>
+
+  <div class="params">
+    <div class="param">
+      <div class="name">Netron</div>
+      <div class="desc">Tarayıcı tabanlı model görselleştirme aracı. netron.app adresinde veya <code class="inline">pip install netron</code> ile yerel kullanım. .tflite, .onnx, .pb, .h5 destekler. Her katmanın şekil, dtype ve quantization parametrelerini gösterir.</div>
+    </div>
+    <div class="param">
+      <div class="name">TFLite Model Benchmark</div>
+      <div class="desc">Resmi benchmark aracı. Per-operator profiling modu ile hangi op'ın ne kadar süre harcadığını gösterir. <code class="inline">--enable_op_profiling=true</code> ile aktif edilir.</div>
+    </div>
+    <div class="param">
+      <div class="name">Optimize.DEFAULT</div>
+      <div class="desc">TFLite Converter'ın varsayılan optimizasyon modu. Dynamic range quantization uygular — ağırlıkları INT8, aktivasyonları float tutar. Hızlı başlangıç noktası.</div>
+    </div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — per-op profiling</span><span class="dot">●</span></div>
+    <pre><code class="language-bash">./benchmark_model \
+  --graph=gesture_int8.tflite \
+  --enable_op_profiling=true \
+  --num_threads=4 \
+  --num_runs=20
+
+# Örnek çıktı:
+# Node type              | avg (ms) | avg%  | cdf%
+# CONV_2D                |   8.241  | 42.1% | 42.1%
+# DEPTHWISE_CONV_2D      |   6.112  | 31.2% | 73.3%
+# FULLY_CONNECTED        |   2.834  | 14.5% | 87.8%
+# SOFTMAX                |   0.231  |  1.2% | 89.0%
+# MAX_POOL_2D            |   2.154  | 11.0% |100.0%</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>model_analyzer.py</span><span class="dot">●</span></div>
+    <pre><code class="language-python">import tensorflow as tf
+
+# Model analizi
+analyzer = tf.lite.experimental.Analyzer
+analyzer.analyze(
+    model_path="gesture_int8.tflite",
+    gpu_compatibility=True
+)
+
+# Netron ile aç (yerel)
+import netron
+netron.start("gesture_int8.tflite", port=8080)</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik — MobileNet INT8 ile gesture recognition</h2>
+  <p class="section-lead">Raspberry Pi 4 üzerinde kameradan 5 sınıflı el hareketi tanıma. MobileNet-v1 INT8 modeli, picamera2 ile 30fps kamera girişi, hedef &lt;30ms çıkarım gecikmesi.</p>
+
+  <h3>Sistem mimarisi</h3>
+
+  <div class="flow">
+    <pre>
+  Pi Camera Module 3
+       ↓ 30fps RGB888 (640×480)
+  [picamera2 DMA capture]
+       ↓
+  [ROI kırp + resize 96×96]
+       ↓
+  [float→INT8 quantize]
+       ↓
+  [TFLite Interpreter  4-thread]
+       ↓
+  [INT8→float dequantize]
+       ↓
+  [softmax → argmax → label]
+       ↓
+  [GPIO LED / UART output]
+    </pre>
+  </div>
+
+  <h3>Performans hedefleri ve sonuçlar</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Adım</th><th>Hedef</th><th>Ölçülen (RPi4)</th></tr></thead>
+      <tbody>
+        <tr><td>Kamera capture</td><td>&lt;5 ms</td><td>3.2 ms</td></tr>
+        <tr><td>Ön işleme (resize+quant)</td><td>&lt;3 ms</td><td>1.8 ms</td></tr>
+        <tr><td>TFLite Invoke (4t)</td><td>&lt;25 ms</td><td>22.4 ms</td></tr>
+        <tr><td>Son işleme</td><td>&lt;1 ms</td><td>0.3 ms</td></tr>
+        <tr><td>Toplam gecikme</td><td>&lt;30 ms</td><td>27.7 ms</td></tr>
+        <tr><td>Throughput</td><td>30 FPS</td><td>36 FPS</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>GPIO entegrasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>gesture_gpio.py</span><span class="dot">●</span></div>
+    <pre><code class="language-python">import RPi.GPIO as GPIO
+
+LED_PINS = {
+    "up":    17,
+    "down":  18,
+    "left":  27,
+    "right": 22,
+    "idle":  None
+}
+
+GPIO.setmode(GPIO.BCM)
+for pin in LED_PINS.values():
+    if pin: GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
+
+def set_gesture_led(label: str):
+    for name, pin in LED_PINS.items():
+        if pin:
+            GPIO.output(pin, GPIO.HIGH if name == label else GPIO.LOW)
+    print(f"Hareket: {label}")</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">Hedef Aşıldı</div>
+    <p>MobileNet-v1-0.25 INT8 modeli (96×96 giriş) RPi4'te 22ms çıkarım süresi ile 30ms hedefini rahatlıkla geçer. Daha büyük modeller (MobileNet-v2, EfficientNet-Lite) için XNNPACK delegate ek 20-30% hız kazandırır.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

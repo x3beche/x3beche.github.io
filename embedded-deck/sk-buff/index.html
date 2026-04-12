@@ -1,0 +1,868 @@
+---
+layout: tutorial
+title: "sk_buff — Linux Ağ Yığını Derinlemesi"
+back_url: "../index.html"
+back_label: "embedded-deck"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>LİNUX NETWORK / SK_BUFF</span>
+    <span>AĞ YIĞINI</span>
+    <span>2026</span>
+  </div>
+  <h1>sk_buff<br><em>Linux ağ yığınının kalbi.</em></h1>
+  <p class="subtitle">Socket buffer veri yapısının bellek düzeni, yönetim fonksiyonları, RX/TX yolları, NAPI, GSO/GRO ve sürücü geliştirme perspektifi — Linux ağ kodunun derinliklerine tam dalış.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">sk_buff nedir?</a></li>
+    <li><a href="#s1">sk_buff bellek düzeni</a></li>
+    <li><a href="#s2">sk_buff yönetim fonksiyonları</a></li>
+    <li><a href="#s3">RX yolu</a></li>
+    <li><a href="#s4">TX yolu</a></li>
+    <li><a href="#s5">NAPI — New API</a></li>
+    <li><a href="#s6">GSO/GRO — Offload</a></li>
+    <li><a href="#s7">Sürücü geliştirme perspektifi</a></li>
+    <li><a href="#s8">Pratik: Custom virtual network sürücüsü</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> sk_buff nedir?</h2>
+  <p class="section-lead"><code>struct sk_buff</code> (socket buffer), Linux ağ yığınının merkezi veri yapısıdır. Her ağ paketi, kernel içinde bir sk_buff olarak temsil edilir. L2'den L7'ye kadar tüm protokol katmanları bu yapı üzerinde çalışır.</p>
+
+  <h3>Tasarım felsefesi</h3>
+  <p>sk_buff, 1993'te Alan Cox tarafından tasarlandı ve o tarihten bu yana Linux ağ yığınının omurgası. Temel fikir: <strong>sıfır kopyalama</strong>. Bir paket NIC'ten uygulamaya ulaşana kadar veri baytları mümkün olduğunca taşınmaz; bunun yerine pointer'lar hareket eder. Header ekleme (encapsulation) ve çıkarma (decapsulation) işlemleri pointer aritmetiği ile gerçekleştirilir.</p>
+
+  <div class="flow">
+    <pre>
+  NIC DMA → sk_buff (head/data/tail/end)
+               │
+         Protocol stack:
+         L2 Ethernet │ pull() — header çıkar, data++
+         L3 IP       │ pull() — header çıkar, data++
+         L4 TCP      │ pull() — header çıkar, data++
+               │
+         Uygulama verisi (data..tail arası)
+    </pre>
+  </div>
+
+  <h3>sk_buff'ın kapsamı</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Alan</th><th>Bilgi türü</th></tr></thead>
+      <tbody>
+        <tr><td>Paket verisi</td><td>Bayt tamponu (head/data/tail/end pointer'ları)</td></tr>
+        <tr><td>Aygıt bilgisi</td><td>dev (net_device), skb_iif (giriş arayüzü indeksi)</td></tr>
+        <tr><td>Zaman damgası</td><td>tstamp (ktime_t), hwtstamps (donanım zaman damgası)</td></tr>
+        <tr><td>Protokol bilgisi</td><td>protocol, network_header, transport_header offsets</td></tr>
+        <tr><td>Bağlantı takibi</td><td>_nfct (netfilter conntrack pointer)</td></tr>
+        <tr><td>QoS / sınıflandırma</td><td>priority, mark, queue_mapping</td></tr>
+        <tr><td>Checksum</td><td>ip_summed, csum (checksum offload durumu)</td></tr>
+        <tr><td>GSO/GRO</td><td>gso_size, gso_segs, skb_shinfo() → nr_frags</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">KAYNAK</div>
+    <p><code>struct sk_buff</code> tanımı: <code>include/linux/skbuff.h</code> — Linux kernel kaynak kodunda 500+ satır yorum ile belgelenmiştir. Her alan için <code>grep -n "field_name" include/linux/skbuff.h</code> ile bağlam bulunabilir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>sk_buff = Linux ağ yığınının merkezi veri yapısı — L2'den L7'ye tüm protokoller</li>
+      <li>Sıfır kopyalama: veri yerine pointer'lar hareket eder</li>
+      <li>Header ekle/çıkar = pointer aritmetiği (push/pull)</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> sk_buff bellek düzeni</h2>
+  <p class="section-lead">sk_buff, veri baytlarını değil; baytların tutulduğu tampona işaret eden dört pointer'ı yönetir. Bu düzen, başlık ekleme ve çıkarma işlemlerini sıfır kopyayla gerçekleştirir.</p>
+
+  <h3>Dört temel pointer</h3>
+
+  <div class="flow">
+    <pre>
+  Bellek tamponu:
+  ┌─────────────────────────────────────────────────────┐
+  │ headroom │   veri (payload)   │ tailroom │   end    │
+  └─────────────────────────────────────────────────────┘
+  ^          ^                    ^                     ^
+  head       data                 tail                  end
+
+  head  = tamponun başlangıç adresi (sabit)
+  data  = geçerli verinin başlangıcı (header push ile azalır)
+  tail  = geçerli verinin sonu (put ile artar)
+  end   = tamponun sonu (sabit)
+
+  len   = tail - data  (geçerli veri uzunluğu)
+  headroom = data - head  (başa eklenebilecek header alanı)
+  tailroom = end  - tail  (sona eklenebilecek veri alanı)
+    </pre>
+  </div>
+
+  <h3>TX yönünde header ekleme (encapsulation)</h3>
+
+  <div class="flow">
+    <pre>
+  Uygulama verisi oluşturuldu:
+  head....[TCP data]....tail
+
+  TCP header ekle (skb_push):
+  head..[TCP hdr][TCP data]....tail
+        ^data
+
+  IP header ekle (skb_push):
+  head.[IP hdr][TCP hdr][TCP data]....tail
+       ^data
+
+  Eth header ekle (skb_push):
+  [Eth hdr][IP hdr][TCP hdr][TCP data]....tail
+  ^data (= head alanında artık yer kalmadı)
+    </pre>
+  </div>
+
+  <h3>RX yönünde header çıkarma (decapsulation)</h3>
+
+  <div class="flow">
+    <pre>
+  NIC'ten geldi:
+  [Eth hdr][IP hdr][TCP hdr][TCP data]
+  ^data
+
+  Eth header işle (skb_pull):
+  [Eth hdr][IP hdr][TCP hdr][TCP data]
+            ^data  (data += ETH_HLEN)
+
+  IP header işle (skb_pull):
+  [Eth hdr][IP hdr][TCP hdr][TCP data]
+                    ^data
+
+  TCP header işle (skb_pull):
+  [Eth hdr][IP hdr][TCP hdr][TCP data]
+                              ^data  ← uygulama görmek istediği
+    </pre>
+  </div>
+
+  <h3>shinfo ve frag_list</h3>
+
+  <pre><code"><span class="cmt">// skb_shinfo(): sk_buff'ın END pointer'ının hemen ardında</span>
+<span class="cmt">// skb_shared_info yapısı — çoklu fragment (scatter-gather) için</span>
+
+<span class="keyword">struct</span> skb_shared_info {
+    __u8          nr_frags;          <span class="cmt">// fragment sayısı (max 17)</span>
+    skb_frag_t    frags[MAX_SKB_FRAGS]; <span class="cmt">// sayfa bazlı fragment'lar</span>
+    struct sk_buff *frag_list;       <span class="cmt">// chained sk_buff listesi (GRO)</span>
+    <span class="keyword">struct</span> skb_ufo_frag_list *ufo_frag_list;
+    <span class="keyword">unsigned int</span>  gso_size;          <span class="cmt">// GSO segment boyutu</span>
+    <span class="keyword">unsigned short</span> gso_segs;         <span class="cmt">// GSO toplam segment sayısı</span>
+    <span class="keyword">unsigned short</span> gso_type;         <span class="cmt">// SKB_GSO_TCPV4 vb.</span>
+};
+
+<span class="cmt">// Kullanım:</span>
+<span class="keyword">struct</span> skb_shared_info *shinfo = skb_shinfo(skb);
+printk("nr_frags=%d gso_size=%d\n", shinfo-&gt;nr_frags, shinfo-&gt;gso_size);
+</code></pre>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>head/data/tail/end: dört pointer, len = tail - data</li>
+      <li>headroom: TX'te header eklemek için önceden ayrılmış alan</li>
+      <li>skb_shinfo: scatter-gather fragment'lar ve GSO metadata</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> sk_buff yönetim fonksiyonları</h2>
+  <p class="section-lead">sk_buff yaşam döngüsü: tahsis, pointer yönetimi, klonlama ve serbest bırakma fonksiyonları — kernel sürücüsü ve modülü yazarken sıkça kullanılır.</p>
+
+  <h3>Tahsis ve serbest bırakma</h3>
+
+  <pre><code"><span class="cmt">// Yeni sk_buff tahsis et</span>
+<span class="cmt">// size: veri alanı boyutu, gfp: bellek tahsis bayrağı</span>
+<span class="keyword">struct</span> sk_buff *skb = alloc_skb(size, GFP_ATOMIC);
+<span class="keyword">if</span> (!skb)
+    <span class="keyword">return</span> -ENOMEM;
+
+<span class="cmt">// NIC sürücüsü için optimize edilmiş tahsis</span>
+<span class="cmt">// NET_SKB_PAD kadar headroom otomatik eklenir</span>
+<span class="keyword">struct</span> sk_buff *skb = dev_alloc_skb(size);
+
+<span class="cmt">// Referans sayacını artır (serbest bırakmayı geciktir)</span>
+skb_get(skb);
+
+<span class="cmt">// Referans sayacını azalt; 0 olursa belleği serbest bırak</span>
+kfree_skb(skb);         <span class="cmt">// hata yolunda (drop)</span>
+consume_skb(skb);       <span class="cmt">// başarılı tüketimde (kfree_skb alias)</span>
+dev_kfree_skb(skb);     <span class="cmt">// sürücü TX tamamlandığında</span>
+dev_kfree_skb_irq(skb); <span class="cmt">// IRQ context'te</span>
+</code></pre>
+
+  <h3>Pointer yönetimi</h3>
+
+  <pre><code"><span class="cmt">// skb_reserve: tahsis sonrası headroom ayır (TX hazırlık)</span>
+<span class="cmt">// Ethernet + IP + TCP header için yer aç</span>
+skb_reserve(skb, ETH_HLEN + MAX_HEADER);
+
+<span class="cmt">// skb_put: tail'i artır, sona veri ekle — RX'te kullanılır</span>
+void *data_area = skb_put(skb, payload_len);
+memcpy(data_area, src_buf, payload_len);
+
+<span class="cmt">// skb_push: data'yı azalt, başa header ekle — TX encapsulation</span>
+struct ethhdr *eth = skb_push(skb, ETH_HLEN);
+memcpy(eth-&gt;h_dest, dest_mac, ETH_ALEN);
+
+<span class="cmt">// skb_pull: data'yı artır, baştan header çıkar — RX decapsulation</span>
+skb_pull(skb, ETH_HLEN);  <span class="cmt">// Ethernet header'ı atla</span>
+
+<span class="cmt">// Network/transport header pointer'larını kaydet</span>
+skb_reset_network_header(skb);   <span class="cmt">// network_header = data - head</span>
+struct iphdr *iph = ip_hdr(skb); <span class="cmt">// network_header'dan IP header</span>
+
+skb_set_transport_header(skb, sizeof(struct iphdr));
+struct tcphdr *th = tcp_hdr(skb);
+</code></pre>
+
+  <h3>Klonlama ve kopyalama</h3>
+
+  <pre><code"><span class="cmt">// skb_clone: metadata kopyalanır, veri paylaşılır (COW)
+// Orijinal ve klon aynı veri baytlarına pointer tutar</span>
+<span class="keyword">struct</span> sk_buff *clone = skb_clone(skb, GFP_ATOMIC);
+
+<span class="cmt">// skb_copy: tam kopyalama — bağımsız veri tamponu</span>
+<span class="keyword">struct</span> sk_buff *copy = skb_copy(skb, GFP_ATOMIC);
+
+<span class="cmt">// skb_copy_expand: klon + ek headroom/tailroom</span>
+<span class="keyword">struct</span> sk_buff *exp = skb_copy_expand(skb,
+    new_headroom, new_tailroom, GFP_ATOMIC);
+
+<span class="cmt">// pskb_copy: sadece lineer kısım kopyalanır</span>
+<span class="keyword">struct</span> sk_buff *partial = pskb_copy(skb, GFP_ATOMIC);
+
+<span class="cmt">// Yazma öncesi paylaşım kontrolü (COW semantics)</span>
+<span class="keyword">if</span> (skb_cloned(skb)) {
+    skb = skb_unshare(skb, GFP_ATOMIC);
+    <span class="keyword">if</span> (!skb) <span class="keyword">return</span> -ENOMEM;
+}
+</code></pre>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>alloc_skb + skb_reserve: TX için headroom ayır, sonra push ile header ekle</li>
+      <li>dev_alloc_skb + skb_put: RX için veri alanı oluştur</li>
+      <li>skb_clone: zerocopy çoğaltma; skb_copy: bağımsız kopya</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> RX yolu</h2>
+  <p class="section-lead">NIC'te gelen paketin Linux kernel ağ yığınından geçerek uygulamaya ulaşması — donanım kesmesinden socket buffer'a.</p>
+
+  <h3>RX akış diyagramı</h3>
+
+  <div class="flow">
+    <pre>
+  NIC donanım RX kesmesi
+       │
+  IRQ handler (net driver)
+       │ NAPI schedule (napi_schedule)
+  softirq NET_RX_SOFTIRQ
+       │
+  napi_poll()  ← driver'ın poll() callback'i
+       │
+  netif_receive_skb() / napi_gro_receive()
+       │
+  ptype_all hooks  (AF_PACKET, tcpdump)
+       │
+  ip_rcv() → ip_rcv_finish() → ip_local_deliver()
+       │
+  tcp_v4_rcv() / udp_rcv()
+       │
+  Socket receive queue
+       │
+  Uygulama: recv() / read()
+    </pre>
+  </div>
+
+  <h3>netif_receive_skb ve protokol dispatch</h3>
+
+  <pre><code"><span class="cmt">// net/core/dev.c — protokol dispatch</span>
+<span class="cmt">// skb->protocol'e göre ilgili handler çağrılır</span>
+
+<span class="cmt">// Örn: ETH_P_IP (0x0800) → ip_rcv()</span>
+<span class="cmt">// Önemsiz bir kural: struct packet_type listesi</span>
+<span class="keyword">struct</span> packet_type ip_packet_type = {
+    .type = cpu_to_be16(ETH_P_IP),
+    .func = ip_rcv,
+};
+
+<span class="cmt">// ip_rcv'nin basitleştirilmiş akışı:</span>
+<span class="cmt">// 1. Checksum doğrula (veya NIC'e offload edilmişse skip)</span>
+<span class="cmt">// 2. IP header'ı parse et</span>
+<span class="cmt">// 3. netfilter NF_INET_PRE_ROUTING hook'u çağır (nftables prerouting)</span>
+<span class="cmt">// 4. ip_route_input() → routing kararı (yerel mi, forward mu?)</span>
+<span class="cmt">// 5. Yerel: NF_INET_LOCAL_IN → tcp_v4_rcv() / udp_rcv()</span>
+<span class="cmt">// 6. Forward: NF_INET_FORWARD → ip_forward()</span>
+</code></pre>
+
+  <h3>Socket receive queue</h3>
+
+  <pre><code"><span class="cmt">// Kernel tarafı: sk_buff'ı socket kuyruğuna ekle</span>
+sock_queue_rcv_skb(sk, skb);
+
+<span class="cmt">// Uygulama tarafı (basitleştirilmiş)</span>
+<span class="cmt">// recvmsg() → tcp_recvmsg() → skb_dequeue(&sk->sk_receive_queue)</span>
+<span class="cmt">// Veri: sk_buff'tan kullanıcı tamponuna kopyalanır</span>
+
+<span class="cmt">// sk_buff'ın uygulama tamponu ile ilişkisi:</span>
+<span class="cmt">// skb->data[0..len] → kullanıcı tamponu (copy_to_user)</span>
+<span class="cmt">// Zero-copy receive için MSG_ZEROCOPY veya io_uring kullanılır</span>
+</code></pre>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>NIC IRQ → NAPI poll → netif_receive_skb → protokol handler → socket</li>
+      <li>ETH_P_IP → ip_rcv; netfilter hook'ları her katmanda çağrılır</li>
+      <li>sock_queue_rcv_skb: sk_buff socket kuyruğuna eklenir, recvmsg kopyalar</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> TX yolu</h2>
+  <p class="section-lead">Uygulamanın gönderdiği verinin sk_buff olarak oluşturulup protokol yığınından NIC sürücüsüne ulaşması.</p>
+
+  <h3>TX akış diyagramı</h3>
+
+  <div class="flow">
+    <pre>
+  Uygulama: send() / write()
+       │
+  tcp_sendmsg() / udp_sendmsg()
+       │ sk_buff oluştur, veri kopyala
+  ip_queue_xmit() / ip_send_skb()
+       │ IP header ekle, routing
+  Netfilter NF_INET_LOCAL_OUT (nftables output)
+       │
+  ip_output() → ip_finish_output()
+       │ GSO segmentasyon (büyük paket parçalanır)
+  Netfilter NF_INET_POST_ROUTING (nftables postrouting)
+       │
+  dev_queue_xmit()
+       │
+  Qdisc (Traffic Control — pfifo_fast, fq, tbf...)
+       │
+  netdev_start_xmit() → driver ndo_start_xmit()
+       │
+  NIC TX ring'e koy, DMA tetikle
+    </pre>
+  </div>
+
+  <h3>dev_queue_xmit ve qdisc</h3>
+
+  <pre><code"><span class="cmt">// Qdisc (queuing discipline) = Linux Traffic Control</span>
+<span class="cmt">// sk_buff dev_queue_xmit'ten qdisc'e girer</span>
+<span class="cmt">// Qdisc'ten çıkış → ndo_start_xmit</span>
+
+<span class="cmt">// Mevcut qdisc görüntüleme</span>
+tc qdisc show dev eth0
+<span class="cmt">// → qdisc pfifo_fast 0: root refcnt 2 bands 3 priomap...</span>
+
+<span class="cmt">// FQ (Fair Queuing) qdisc ile paket gönderim düzenleme</span>
+tc qdisc replace dev eth0 root fq
+tc qdisc replace dev eth0 root fq_codel   <span class="cmt"># CoDel algoritması</span>
+
+<span class="cmt">// sk_buff.priority ve queue_mapping</span>
+<span class="cmt">// SO_PRIORITY soket seçeneği → skb->priority</span>
+<span class="cmt">// setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &prio, sizeof(prio));</span>
+</code></pre>
+
+  <h3>ndo_start_xmit — sürücü TX</h3>
+
+  <pre><code"><span class="cmt">// Bir NIC sürücüsünün TX callback'i (sözde kod)</span>
+<span class="keyword">static</span> netdev_tx_t my_nic_start_xmit(<span class="keyword">struct</span> sk_buff *skb,
+                                      <span class="keyword">struct</span> net_device *dev) {
+    <span class="keyword">struct</span> my_nic_priv *priv = netdev_priv(dev);
+    <span class="keyword">struct</span> my_tx_desc *desc;
+    dma_addr_t dma;
+
+    <span class="cmt">// TX ring dolu mu?</span>
+    <span class="keyword">if</span> (my_tx_ring_full(priv)) {
+        netif_stop_queue(dev);   <span class="cmt">// TX queue'yu durdur</span>
+        <span class="keyword">return</span> NETDEV_TX_BUSY;
+    }
+
+    <span class="cmt">// sk_buff verisini DMA'ya hazırla</span>
+    dma = dma_map_single(&amp;priv-&gt;pdev-&gt;dev,
+                         skb-&gt;data, skb-&gt;len,
+                         DMA_TO_DEVICE);
+
+    <span class="cmt">// TX descriptor'a yaz</span>
+    desc = &amp;priv-&gt;tx_ring[priv-&gt;tx_head];
+    desc-&gt;addr   = dma;
+    desc-&gt;length = skb-&gt;len;
+    desc-&gt;flags  = TX_DESC_EOP | TX_DESC_CSUM;
+
+    <span class="cmt">// sk_buff'ı sakla (TX tamamlandığında serbest bırakmak için)</span>
+    priv-&gt;tx_skb[priv-&gt;tx_head] = skb;
+    priv-&gt;tx_head = (priv-&gt;tx_head + 1) % TX_RING_SIZE;
+
+    <span class="cmt">// NIC'e bildir</span>
+    writel(priv-&gt;tx_head, priv-&gt;bar + TX_TAIL_REG);
+
+    <span class="keyword">return</span> NETDEV_TX_OK;
+}
+</code></pre>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>send() → ip_queue_xmit → qdisc → ndo_start_xmit → NIC DMA</li>
+      <li>Qdisc: paket sıralama ve şekillendirme katmanı (fq, fq_codel önerilir)</li>
+      <li>ndo_start_xmit: sk_buff verisi DMA'ya maplenir, TX ring descriptor'a yazılır</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> NAPI — New API</h2>
+  <p class="section-lead">NAPI (New API), yüksek hızlı NIC'lerde interrupt overhead'ini azaltmak için tasarlanmış polling tabanlı RX mekanizmasıdır. Linux 2.5'te tanıtıldı; modern tüm NIC sürücüleri NAPI kullanır.</p>
+
+  <h3>NAPI'nin sorunu çözmesi</h3>
+  <p>Geleneksel interrupt-driven NIC: her paket için bir IRQ. 10 Gbps hatta ~15 milyon paket/saniye = 15 milyon kesme/saniye = CPU üzerinde kabul edilemez interrupt overhead. NAPI: ilk paket interrupt ile bildirilir, ardından softirq context'te polling moduna geçilir.</p>
+
+  <div class="flow">
+    <pre>
+  Paket geldi → IRQ → napi_schedule() → IRQ devre dışı
+                                            │
+                                    NET_RX_SOFTIRQ
+                                            │
+                                    napi_poll() çağrıldı
+                                    ├── skb oku
+                                    ├── netif_receive_skb()
+                                    └── budget bitti veya kuyruk boş
+                                            │
+                                    napi_complete() → IRQ yeniden aç
+    </pre>
+  </div>
+
+  <h3>NAPI implementasyonu</h3>
+
+  <pre><code"><span class="cmt">// 1. NAPI yapısını başlat (driver probe'da)</span>
+<span class="keyword">struct</span> napi_struct napi;
+netif_napi_add(dev, &amp;napi, my_poll_func, NAPI_POLL_WEIGHT);
+<span class="cmt">// NAPI_POLL_WEIGHT = 64 (varsayılan budget)</span>
+
+<span class="cmt">// 2. IRQ handler — sadece NAPI schedule et</span>
+<span class="keyword">static</span> irqreturn_t my_irq_handler(<span class="keyword">int</span> irq, <span class="keyword">void</span> *data) {
+    <span class="keyword">struct</span> my_nic_priv *priv = data;
+
+    <span class="cmt">// IRQ'yu NIC'te maskele</span>
+    my_nic_disable_rx_irq(priv);
+
+    <span class="cmt">// softirq context'te poll çalıştırmayı planla</span>
+    napi_schedule(&amp;priv-&gt;napi);
+
+    <span class="keyword">return</span> IRQ_HANDLED;
+}
+
+<span class="cmt">// 3. Poll callback — softirq context'te çağrılır</span>
+<span class="keyword">static int</span> my_poll_func(<span class="keyword">struct</span> napi_struct *napi, <span class="keyword">int</span> budget) {
+    <span class="keyword">struct</span> my_nic_priv *priv = container_of(napi, ..., napi);
+    <span class="keyword">int</span> work_done = 0;
+
+    <span class="keyword">while</span> (work_done &lt; budget) {
+        <span class="keyword">struct</span> sk_buff *skb = my_nic_rx_one(priv);
+        <span class="keyword">if</span> (!skb) <span class="keyword">break</span>;
+
+        napi_gro_receive(napi, skb);  <span class="cmt">// GRO desteği ile teslim et</span>
+        work_done++;
+    }
+
+    <span class="cmt">// Budget dolmadıysa tüm paketler alındı — polling bitti</span>
+    <span class="keyword">if</span> (work_done &lt; budget) {
+        napi_complete_done(napi, work_done);
+        my_nic_enable_rx_irq(priv);  <span class="cmt">// IRQ'yu yeniden aç</span>
+    }
+
+    <span class="keyword">return</span> work_done;
+}
+</code></pre>
+
+  <h3>GRO ile bütünleşik kullanım</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">napi_gro_receive()</span><span class="desc">GRO (Generic Receive Offload) mantığı ile sk_buff'ı teslim et. Ardışık TCP segmentleri birleştirilerek tek büyük sk_buff oluşturulur — protokol yığınının yükü azalır</span></div>
+    <div class="param"><span class="name">napi_complete_done()</span><span class="desc">Poll bitti bildir, GRO buffer'larını flush et ve IRQ'yu yeniden aktif et</span></div>
+    <div class="param"><span class="name">interrupt throttling</span><span class="desc">NAPI budget (64 paket) aşıldığında softirq tekrar planlanır — interrupt throttling olmadan yüksek yük altında CPU starvation riski</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>NAPI: ilk paket IRQ, ardından softirq polling — interrupt overhead dramatik azalır</li>
+      <li>budget=64: her poll turunda max 64 paket işlenir; budget dolarsa IRQ kapalı kalır</li>
+      <li>napi_gro_receive: GRO birleştirmesi ile protokol stack yükünü azalt</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> GSO/GRO — Offload</h2>
+  <p class="section-lead">Büyük paketleri küçük segmentlere bölme (GSO) ve gelen küçük paketleri birleştirme (GRO) işlemleri — NIC donanımına veya kernel'a offload edilerek CPU yükü azaltılır.</p>
+
+  <h3>GSO — Generic Segmentation Offload</h3>
+  <p>TCP, büyük mesajları MSS (Maximum Segment Size) boyutuna bölerek gönderir. GSO bu segmentasyonu mümkün olduğunca geç yapar — ideal olarak NIC sürücüsünde veya NIC donanımında (TSO).</p>
+
+  <div class="flow">
+    <pre>
+  GSO olmadan:
+  [TCP 64KB] → [1448B seg1][1448B seg2]...[1448B seg45]  (protokol stack'te)
+  Her segment için IP header + checksum = 45x yük
+
+  GSO ile (TSO — TCP Segmentation Offload):
+  [TCP 64KB GSO skb] → NIC sürücüsü → NIC donanımı → [seg1][seg2]...[seg45]
+  Protokol stack'te yalnızca bir büyük sk_buff işlenir
+    </pre>
+  </div>
+
+  <pre><code"><span class="cmt">// sk_buff GSO alanları</span>
+<span class="keyword">struct</span> sk_buff *skb;
+
+<span class="cmt">// GSO paket mi kontrol et</span>
+<span class="keyword">if</span> (skb_is_gso(skb)) {
+    <span class="keyword">struct</span> skb_shared_info *si = skb_shinfo(skb);
+    printk("GSO: size=%u segs=%u type=%u\n",
+           si-&gt;gso_size, si-&gt;gso_segs, si-&gt;gso_type);
+}
+
+<span class="cmt">// Yazılım GSO segmentasyonu (NIC TSO desteklemiyorsa)</span>
+<span class="keyword">struct</span> sk_buff *segs = skb_gso_segment(skb, features);
+<span class="keyword">if</span> (!IS_ERR(segs)) {
+    <span class="keyword">struct</span> sk_buff *seg = segs;
+    <span class="keyword">do</span> {
+        <span class="keyword">struct</span> sk_buff *next = seg-&gt;next;
+        seg-&gt;next = seg-&gt;prev = <span class="keyword">NULL</span>;
+        ndo_start_xmit(seg, dev);
+        seg = next;
+    } <span class="keyword">while</span> (seg);
+}
+</code></pre>
+
+  <h3>GRO — Generic Receive Offload</h3>
+  <p>GSO'nun tersine: gelen ardışık TCP segmentleri birleştirilerek protokol yığınına tek büyük sk_buff olarak teslim edilir. NIC GRO yapmazsa kernel yazılım GRO yapar.</p>
+
+  <pre><code"><span class="cmt">// NIC GRO durumunu kontrol et</span>
+ethtool -k eth0 | grep generic-receive-offload
+<span class="cmt">// generic-receive-offload: on</span>
+
+<span class="cmt">// Tüm offload özelliklerini görüntüle</span>
+ethtool -k eth0
+
+<span class="cmt">// GSO/GRO özelliklerini aç/kapat (test için)</span>
+ethtool -K eth0 gso off     <span class="cmt"># Generic Segmentation Offload</span>
+ethtool -K eth0 gro off     <span class="cmt"># Generic Receive Offload</span>
+ethtool -K eth0 tso off     <span class="cmt"># TCP Segmentation Offload (NIC hw)</span>
+ethtool -K eth0 rx-checksumming off
+</code></pre>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>Yön</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td>TSO</td><td>TX</td><td>TCP Segmentation Offload — NIC donanımı segmentler</td></tr>
+        <tr><td>GSO</td><td>TX</td><td>Yazılım TSO — NIC desteği yoksa kernel segmentler</td></tr>
+        <tr><td>GRO</td><td>RX</td><td>Generic Receive Offload — ardışık segment birleştirme</td></tr>
+        <tr><td>LRO</td><td>RX</td><td>Large Receive Offload — NIC donanımı birleştirir (GSO uyumlu değil)</td></tr>
+        <tr><td>TX checksum</td><td>TX</td><td>Checksum hesaplama NIC'e bırakılır</td></tr>
+        <tr><td>RX checksum</td><td>RX</td><td>Checksum doğrulama NIC'te yapılır</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>GSO: büyük sk_buff oluştur, sürücüde parçala — protokol stack yükü 1/N'e iner</li>
+      <li>GRO: küçük RX paketleri birleştir — protokol stack'e tek büyük sk_buff</li>
+      <li>ethtool -k/-K ile offload özelliklerini görüntüle ve değiştir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Sürücü geliştirme perspektifi</h2>
+  <p class="section-lead">Bir NIC sürücüsü yazarken sk_buff ile etkileşim noktaları: RX descriptor ring'den sk_buff oluşturma, TX tamamlandığında serbest bırakma ve net_device yapısı.</p>
+
+  <h3>net_device ve ndo operasyonları</h3>
+
+  <pre><code"><span class="keyword">static const struct</span> net_device_ops my_netdev_ops = {
+    .ndo_open          = my_open,           <span class="cmt">// ifconfig up</span>
+    .ndo_stop          = my_stop,           <span class="cmt">// ifconfig down</span>
+    .ndo_start_xmit    = my_start_xmit,     <span class="cmt">// TX — sk_buff gönder</span>
+    .ndo_get_stats64   = my_get_stats64,    <span class="cmt">// istatistikler</span>
+    .ndo_set_mac_address = eth_mac_addr,
+    .ndo_validate_addr   = eth_validate_addr,
+    .ndo_change_mtu      = my_change_mtu,
+};
+
+<span class="cmt">// net_device tahsis ve kayıt</span>
+<span class="keyword">static int</span> my_probe(<span class="keyword">struct</span> pci_dev *pdev, ...) {
+    <span class="keyword">struct</span> net_device *dev = alloc_etherdev(sizeof(<span class="keyword">struct</span> my_priv));
+    <span class="keyword">if</span> (!dev) <span class="keyword">return</span> -ENOMEM;
+
+    SET_NETDEV_DEV(dev, &amp;pdev-&gt;dev);
+    dev-&gt;netdev_ops = &amp;my_netdev_ops;
+    dev-&gt;features   = NETIF_F_HW_CSUM | NETIF_F_TSO | NETIF_F_GRO;
+
+    <span class="keyword">return</span> register_netdev(dev);
+}
+</code></pre>
+
+  <h3>RX: sk_buff oluşturma</h3>
+
+  <pre><code"><span class="cmt">// RX tamamlama (NAPI poll context'te)</span>
+<span class="keyword">static void</span> my_rx_complete(<span class="keyword">struct</span> my_nic_priv *priv,
+                           <span class="keyword">struct</span> napi_struct *napi) {
+    <span class="keyword">struct</span> my_rx_desc *desc = &amp;priv-&gt;rx_ring[priv-&gt;rx_tail];
+    <span class="keyword">struct</span> sk_buff *skb;
+    <span class="keyword">unsigned int</span> pkt_len = desc-&gt;length;
+
+    <span class="cmt">// DMA unmap</span>
+    dma_unmap_single(&amp;priv-&gt;pdev-&gt;dev,
+                     desc-&gt;dma_addr, priv-&gt;rx_buf_size,
+                     DMA_FROM_DEVICE);
+
+    <span class="cmt">// sk_buff tahsis et</span>
+    skb = dev_alloc_skb(pkt_len + NET_IP_ALIGN);
+    <span class="keyword">if</span> (!skb) {
+        priv-&gt;dev-&gt;stats.rx_dropped++;
+        <span class="keyword">goto</span> refill;
+    }
+
+    <span class="cmt">// 2-byte align (IP başlığını 4-byte align'a hizalar)</span>
+    skb_reserve(skb, NET_IP_ALIGN);
+
+    <span class="cmt">// Veriyi DMA buffer'dan sk_buff'a kopyala</span>
+    skb_put_data(skb, priv-&gt;rx_buf[priv-&gt;rx_tail], pkt_len);
+
+    <span class="cmt">// Metadata ayarla</span>
+    skb-&gt;dev      = priv-&gt;dev;
+    skb-&gt;protocol = eth_type_trans(skb, priv-&gt;dev);
+    skb-&gt;ip_summed = CHECKSUM_UNNECESSARY;  <span class="cmt">// NIC checksum yaptı</span>
+
+    <span class="cmt">// Protokol yığınına teslim et</span>
+    napi_gro_receive(napi, skb);
+
+    priv-&gt;dev-&gt;stats.rx_packets++;
+    priv-&gt;dev-&gt;stats.rx_bytes += pkt_len;
+
+refill:
+    my_refill_rx_ring(priv, priv-&gt;rx_tail);
+    priv-&gt;rx_tail = (priv-&gt;rx_tail + 1) % RX_RING_SIZE;
+}
+</code></pre>
+
+  <h3>TX tamamlandığında serbest bırakma</h3>
+
+  <pre><code"><span class="cmt">// TX completion IRQ handler veya TX poll</span>
+<span class="keyword">static void</span> my_tx_complete(<span class="keyword">struct</span> my_nic_priv *priv) {
+    <span class="keyword">while</span> (priv-&gt;tx_tail != priv-&gt;tx_head) {
+        <span class="keyword">struct</span> my_tx_desc *desc = &amp;priv-&gt;tx_ring[priv-&gt;tx_tail];
+
+        <span class="cmt">// NIC bu descriptor'ı tamamladı mı?</span>
+        <span class="keyword">if</span> (!(desc-&gt;flags &amp; TX_DESC_DONE))
+            <span class="keyword">break</span>;
+
+        dma_unmap_single(&amp;priv-&gt;pdev-&gt;dev,
+                         desc-&gt;dma_addr, desc-&gt;length,
+                         DMA_TO_DEVICE);
+
+        <span class="cmt">// sk_buff'ı serbest bırak</span>
+        dev_kfree_skb_irq(priv-&gt;tx_skb[priv-&gt;tx_tail]);
+        priv-&gt;tx_skb[priv-&gt;tx_tail] = <span class="keyword">NULL</span>;
+
+        priv-&gt;tx_tail = (priv-&gt;tx_tail + 1) % TX_RING_SIZE;
+        priv-&gt;dev-&gt;stats.tx_packets++;
+    }
+
+    <span class="cmt">// Queue durmuşsa ve ring'de yer açıldıysa yeniden başlat</span>
+    <span class="keyword">if</span> (netif_queue_stopped(priv-&gt;dev) &amp;&amp; my_tx_ring_has_space(priv))
+        netif_wake_queue(priv-&gt;dev);
+}
+</code></pre>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>net_device_ops: ndo_start_xmit, ndo_open, ndo_stop temel callback'ler</li>
+      <li>RX: dev_alloc_skb + skb_reserve + skb_put_data + eth_type_trans</li>
+      <li>TX complete: dma_unmap + dev_kfree_skb_irq + netif_wake_queue</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: Custom virtual network sürücüsü</h2>
+  <p class="section-lead">Kernel modülü olarak çalışan minimal bir sanal ağ cihazı: paketleri loopback'e yönlendiren dummy netdev ve temel performans ölçümü.</p>
+
+  <h3>Minimal sanal netdev modülü</h3>
+
+  <pre><code">#include &lt;linux/module.h&gt;
+#include &lt;linux/netdevice.h&gt;
+#include &lt;linux/etherdevice.h&gt;
+#include &lt;linux/skbuff.h&gt;
+
+<span class="keyword">static struct</span> net_device *vnet_dev;
+
+<span class="keyword">struct</span> vnet_priv {
+    <span class="keyword">struct</span> net_device_stats stats;
+    <span class="keyword">spinlock_t</span> lock;
+};
+
+<span class="cmt">/* TX: paketi al ve kendimize geri gönder (loopback) */</span>
+<span class="keyword">static</span> netdev_tx_t vnet_xmit(<span class="keyword">struct</span> sk_buff *skb,
+                              <span class="keyword">struct</span> net_device *dev) {
+    <span class="keyword">struct</span> vnet_priv *priv = netdev_priv(dev);
+    <span class="keyword">struct</span> sk_buff *rx_skb;
+
+    priv-&gt;stats.tx_packets++;
+    priv-&gt;stats.tx_bytes += skb-&gt;len;
+
+    <span class="cmt">/* Gelen sk_buff'ı klonla (TX yolunda serbest bırakılacak) */</span>
+    rx_skb = skb_clone(skb, GFP_ATOMIC);
+    <span class="keyword">if</span> (rx_skb) {
+        <span class="cmt">/* Aygıt ve protokol ayarla */</span>
+        rx_skb-&gt;dev      = dev;
+        rx_skb-&gt;protocol = eth_type_trans(rx_skb, dev);
+        rx_skb-&gt;ip_summed = CHECKSUM_UNNECESSARY;
+
+        <span class="cmt">/* RX yığınına sun */</span>
+        netif_rx(rx_skb);
+
+        priv-&gt;stats.rx_packets++;
+        priv-&gt;stats.rx_bytes += rx_skb-&gt;len;
+    }
+
+    dev_kfree_skb(skb);
+    <span class="keyword">return</span> NETDEV_TX_OK;
+}
+
+<span class="keyword">static struct</span> net_device_stats *vnet_stats(<span class="keyword">struct</span> net_device *dev) {
+    <span class="keyword">struct</span> vnet_priv *priv = netdev_priv(dev);
+    <span class="keyword">return</span> &amp;priv-&gt;stats;
+}
+
+<span class="keyword">static const struct</span> net_device_ops vnet_ops = {
+    .ndo_start_xmit = vnet_xmit,
+    .ndo_get_stats  = vnet_stats,
+};
+
+<span class="keyword">static void</span> vnet_setup(<span class="keyword">struct</span> net_device *dev) {
+    ether_setup(dev);
+    dev-&gt;netdev_ops = &amp;vnet_ops;
+    dev-&gt;flags     |= IFF_NOARP;
+    dev-&gt;features  |= NETIF_F_HW_CSUM;
+    eth_hw_addr_random(dev);  <span class="cmt">/* Rastgele MAC */</span>
+}
+
+<span class="keyword">static int</span> __init vnet_init(<span class="keyword">void</span>) {
+    <span class="keyword">int</span> err;
+    vnet_dev = alloc_netdev(sizeof(<span class="keyword">struct</span> vnet_priv),
+                             "vnet%d", NET_NAME_UNKNOWN, vnet_setup);
+    <span class="keyword">if</span> (!vnet_dev)
+        <span class="keyword">return</span> -ENOMEM;
+
+    spin_lock_init(&amp;((struct vnet_priv *)netdev_priv(vnet_dev))-&gt;lock);
+
+    err = register_netdev(vnet_dev);
+    <span class="keyword">if</span> (err) {
+        free_netdev(vnet_dev);
+        <span class="keyword">return</span> err;
+    }
+    pr_info("vnet: registered as %s\n", vnet_dev-&gt;name);
+    <span class="keyword">return</span> 0;
+}
+
+<span class="keyword">static void</span> __exit vnet_exit(<span class="keyword">void</span>) {
+    unregister_netdev(vnet_dev);
+    free_netdev(vnet_dev);
+    pr_info("vnet: unregistered\n");
+}
+
+module_init(vnet_init);
+module_exit(vnet_exit);
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Minimal virtual netdev — sk_buff demo");
+</code></pre>
+
+  <h3>Test ve perf ölçümü</h3>
+
+  <pre><code"><span class="cmt"># Modülü derle ve yükle</span>
+make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
+insmod vnet.ko
+ip link set vnet0 up
+ip addr add 192.168.99.1/24 dev vnet0
+
+<span class="cmt"># Loopback gönderim testi</span>
+ping 192.168.99.1 -c5
+
+<span class="cmt"># İstatistikler</span>
+ip -s link show vnet0
+cat /proc/net/dev | grep vnet0
+
+<span class="cmt"># Performans ölçümü — iperf3 ile</span>
+iperf3 -s -B 192.168.99.1 &amp;
+iperf3 -c 192.168.99.1 -t 10
+
+<span class="cmt"># sk_buff tahsis/serbest bırakma izleme (bpftrace)</span>
+bpftrace -e '
+kprobe:alloc_skb { @alloc = count(); }
+kprobe:kfree_skb  { @free  = count(); }
+interval:s:1      { print(@alloc); print(@free); clear(@alloc); clear(@free); }
+'
+
+<span class="cmt"># Netdev istatistikleri izle</span>
+watch -n1 "ip -s link show vnet0"
+</code></pre>
+
+  <div class="callout">
+    <div class="label">ÖNEMLİ</div>
+    <p>Bu sanal sürücü eğitim amaçlıdır. Gerçek bir sürücüde lock contention, DMA eşleştirme, NUMA farkındalığı ve interrupt affinity gibi konular kritik performans faktörleridir. Üretim NIC sürücüsü için <code>drivers/net/ethernet/intel/igb/</code> veya <code>drivers/net/ethernet/mellanox/mlx5/</code> referans alın.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>alloc_netdev + register_netdev: minimal netdev kaydı</li>
+      <li>ndo_start_xmit: skb_clone + netif_rx ile loopback geri besleme</li>
+      <li>bpftrace ile alloc_skb/kfree_skb sayımı — bellek baskısı izleme</li>
+    </ul>
+  </div>
+</section>
+
+</main>

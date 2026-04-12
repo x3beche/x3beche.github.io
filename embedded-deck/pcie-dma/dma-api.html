@@ -1,0 +1,961 @@
+---
+layout: tutorial
+title: "Linux DMA API — Coherent · Streaming · IOVA"
+back_url: "../index.html"
+back_label: "PCIe & DMA"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>PCIe &amp; DMA</span>
+    <span>SÜRÜCÜ</span>
+    <span>2026</span>
+  </div>
+  <h1>Linux DMA API<br><em>Coherent · Streaming · IOVA</em></h1>
+  <p class="subtitle">Üç adres uzayını anla: virtual, physical, IOVA. Coherent ve streaming DMA, scatter-gather ring, DMA pool ve IOMMU etkisiyle cache tutarlılığını yönet.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">DMA API tasarımı — üç adres uzayı</a></li>
+    <li><a href="#s1">Coherent DMA — dma_alloc_coherent</a></li>
+    <li><a href="#s2">Streaming DMA — dma_map_single/page</a></li>
+    <li><a href="#s3">Scatter-gather DMA — struct scatterlist</a></li>
+    <li><a href="#s4">DMA pool — küçük tampon yönetimi</a></li>
+    <li><a href="#s5">DMA mask — 32-bit vs 64-bit</a></li>
+    <li><a href="#s6">DMA sync — cache flush ve invalidate</a></li>
+    <li><a href="#s7">IOMMU etkisi — swiotlb ve bounce buffer</a></li>
+    <li><a href="#s8">Pratik: scatter-gather DMA RX descriptor ring</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> DMA API tasarımı — üç adres uzayı</h2>
+  <p class="section-lead">Linux DMA API, donanım ayrıntılarını soyutlayan taşınabilir bir arayüz sağlar. Temel zorluk: CPU, cihaz ve sanal bellek adresleri birbirinden farklı olabilir.</p>
+
+  <h3>Üç adres uzayı</h3>
+
+  <div class="flow">
+    <pre>
+  ┌─────────────────────────────────────────────────────────────┐
+  │                     Adres Uzayları                          │
+  ├────────────────┬───────────────────────────────────────────┤
+  │ Virtual (VA)   │ CPU'nun gördüğü adres (kernel: kmalloc,    │
+  │                │ vmalloc; kullanıcı: mmap). MMU çevirir.   │
+  ├────────────────┼───────────────────────────────────────────┤
+  │ Physical (PA)  │ RAM chip'teki gerçek adres. CPU → PA:      │
+  │                │ MMU page table'ı kullanır (virt_to_phys)   │
+  ├────────────────┼───────────────────────────────────────────┤
+  │ Bus / DMA (DA) │ Cihazın (PCIe EP, USB HC) gördüğü adres.  │
+  │ = IOVA         │ IOMMU yoksa PA = DA. IOMMU varsa farklı.  │
+  └────────────────┴───────────────────────────────────────────┘
+
+  CPU  ──(MMU)──▶ RAM
+                   ↕
+  PCIe Dev ──(IOMMU)──▶ RAM
+    </pre>
+  </div>
+
+  <h3>Neden DMA API gerekli?</h3>
+  <p><strong>Cache coherency</strong>: Bazı mimarilerde (ARM, MIPS) CPU cache ve cihazın DMA'sı aynı belleği farklı görür. Cihaz yazarken CPU eski cache'li değeri okuyabilir. DMA API, gerektiğinde cache flush/invalidate yapar. <strong>IOMMU</strong>: IOMMU etkinleştirilmişse, cihazın kullandığı adres (IOVA) fiziksel adresten farklıdır. DMA API, IOMMU haritasını kurar ve döner. <strong>Taşınabilirlik</strong>: x86'da cache tutarlıdır, ARM'de değildir. API bu farkı gizler; sürücü kodu mimariye bağımsız kalır.</p>
+
+  <h3>dma_addr_t vs phys_addr_t</h3>
+  <p><code>dma_addr_t</code>: cihazın kullanacağı adres — DMA API'den döner. <code>phys_addr_t</code>: CPU MMU'sunun gördüğü fiziksel adres. IOMMU olmayan sistemlerde eşit; IOMMU varsa farklı. Sürücüde her zaman <code>dma_addr_t</code> kullan; doğrudan <code>virt_to_phys()</code> ile cihaza adres verme.</p>
+
+  <div class="callout warn">
+    <div class="label">KRİTİK</div>
+    <p>Sürücüde hiçbir zaman <code>virt_to_phys(ptr)</code> sonucunu cihaza verme. Bu IOMMU'yu atlar, güvenlik açığı oluşturur ve mimariler arasında çalışmaz. Her zaman DMA API kullan.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>VA: CPU'nun gördüğü; PA: RAM'deki gerçek; IOVA/DA: cihazın gördüğü</li>
+      <li>IOMMU yoksa PA == IOVA; IOMMU varsa farklı — DMA API bu farkı yönetir</li>
+      <li>dma_addr_t: cihaza verilecek adres türü; virt_to_phys() kullanma</li>
+      <li>Cache incoherence: ARM, MIPS gibi mimarilerde zorunlu flush/invalidate</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Coherent DMA — dma_alloc_coherent</h2>
+  <p class="section-lead">Coherent DMA, CPU ve cihazın her zaman aynı güncel veriyi gördüğü özel bir bellek bölgesi tahsis eder. Descriptor ring'ler ve küçük kontrol yapıları için idealdir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — coherent DMA tahsis ve kullanımı</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/dma-mapping.h&gt;
+
+#define DESC_RING_SIZE  (256 * sizeof(struct rx_desc))
+
+struct mydev {
+    struct device    *dev;       /* &pdev->dev */
+    struct rx_desc   *rx_ring;   /* CPU virtual pointer */
+    dma_addr_t        rx_ring_dma; /* cihaz DMA adresi */
+};
+
+/* ── Tahsis ───────────────────────────────────────────────── */
+static int alloc_coherent_ring(struct mydev *priv)
+{
+    /*
+     * dma_alloc_coherent():
+     *  - GFP_KERNEL ile page-aligned bellek tahsis eder
+     *  - IOMMU varsa IOVA alır ve haritalar
+     *  - cache-coherent; CPU yazdığında cihaz görür (flush gerekmez)
+     *  - dönen pointer: CPU sanal adresi
+     *  - dma_handle: cihaza verilecek adres (dma_addr_t)
+     */
+    priv->rx_ring = dma_alloc_coherent(priv->dev,
+                                        DESC_RING_SIZE,
+                                        &priv->rx_ring_dma,
+                                        GFP_KERNEL);
+    if (!priv->rx_ring) {
+        dev_err(priv->dev, "coherent alloc başarısız (%zu bayt)\n",
+                DESC_RING_SIZE);
+        return -ENOMEM;
+    }
+
+    dev_info(priv->dev,
+             "RX ring: va=%p da=0x%llx size=%zu\n",
+             priv->rx_ring,
+             (u64)priv->rx_ring_dma,
+             DESC_RING_SIZE);
+
+    /* Ring'i sıfırla */
+    memset(priv->rx_ring, 0, DESC_RING_SIZE);
+
+    return 0;
+}
+
+/* ── Serbest bırakma ──────────────────────────────────────── */
+static void free_coherent_ring(struct mydev *priv)
+{
+    if (priv->rx_ring) {
+        dma_free_coherent(priv->dev,
+                          DESC_RING_SIZE,
+                          priv->rx_ring,
+                          priv->rx_ring_dma);
+        priv->rx_ring     = NULL;
+        priv->rx_ring_dma = 0;
+    }
+}
+
+/* ── Descriptor güncelleme (CPU tarafı) ───────────────────── */
+static void setup_rx_desc(struct mydev *priv, int idx, dma_addr_t buf_da)
+{
+    struct rx_desc *desc = &priv->rx_ring[idx];
+
+    /* Coherent buffer'da: flush GEREKMEZ */
+    desc->buf_addr = cpu_to_le64(buf_da);
+    desc->length   = cpu_to_le16(RX_BUF_SIZE);
+    desc->status   = 0;
+
+    /* wmb() ile cihazın yeni descriptor'ı görmesi garantilenir */
+    wmb();
+}</code></pre>
+  </div>
+
+  <h3>Coherent DMA özellikleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>Coherent DMA</th></tr></thead>
+      <tbody>
+        <tr><td>Cache tutarlılığı</td><td>Garanti; flush/invalidate gerekmez</td></tr>
+        <tr><td>Performans</td><td>Tahsis pahalı; erişim hızlı</td></tr>
+        <tr><td>Kullanım alanı</td><td>Descriptor ring, status buffer, küçük kontrol yapıları</td></tr>
+        <tr><td>Tahsis boyutu</td><td>Genellikle küçük (4 KB – 1 MB); büyük tahsis başarısız olabilir</td></tr>
+        <tr><td>Alignment</td><td>Page-aligned (4 KB); donanım descriptor gereksinimi karşılar</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>dma_alloc_coherent(): page-aligned, cache-coherent bellek; IOMMU varsa IOVA haritası kurar</li>
+      <li>Dönüş değerleri: sanal adres (CPU erişimi) + dma_handle (cihaza verilecek adres)</li>
+      <li>memset(0) ile ring sıfırla; descriptor'lar coherent olduğu için flush gerekmez</li>
+      <li>dma_free_coherent(): aynı size ve handle ile serbest bırak</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Streaming DMA — dma_map_single/page</h2>
+  <p class="section-lead">Streaming DMA, mevcut bir bellek buffer'ını geçici olarak cihaz erişimine açar. Büyük veri transferleri (ağ paketi, blok I/O) için kullanılır. Her map/unmap çifti arasında cache sync gerekebilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — streaming DMA map/unmap döngüsü</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/dma-mapping.h&gt;
+#include &lt;linux/skbuff.h&gt;
+
+/* ── TX: CPU buffer → cihaz ──────────────────────────────── */
+static int tx_packet(struct mydev *priv, struct sk_buff *skb)
+{
+    dma_addr_t  dma_addr;
+    int         ret = 0;
+
+    /*
+     * dma_map_single():
+     *  DMA_TO_DEVICE   → CPU→cihaz; CPU yazısı cihaza görünür (cache flush)
+     *  DMA_FROM_DEVICE → cihaz→CPU; cihaz yazısı CPU'ya görünür (cache inv.)
+     *  DMA_BIDIRECTIONAL → her iki yön; daha pahalı
+     */
+    dma_addr = dma_map_single(priv->dev,
+                               skb->data,
+                               skb->len,
+                               DMA_TO_DEVICE);
+
+    /* Harita hatası kontrolü: zorunlu! */
+    if (dma_mapping_error(priv->dev, dma_addr)) {
+        dev_err(priv->dev, "TX dma_map_single başarısız\n");
+        return -ENOMEM;
+    }
+
+    /* Cihaza DMA adresi ve uzunluk ver */
+    setup_tx_descriptor(priv, dma_addr, skb->len);
+
+    /*
+     * Transfer tamamlanınca (TX completion IRQ'da) unmap:
+     * unmap sonrası dma_addr geçersizdir
+     */
+    /* ... completion IRQ'da çağrılır: */
+    dma_unmap_single(priv->dev, dma_addr, skb->len, DMA_TO_DEVICE);
+    dev_kfree_skb(skb);
+
+    return ret;
+}
+
+/* ── RX: cihaz buffer → CPU ──────────────────────────────── */
+static struct sk_buff *rx_alloc_buffer(struct mydev *priv,
+                                        dma_addr_t *dma_addr_out)
+{
+    struct sk_buff *skb;
+    dma_addr_t dma_addr;
+
+    skb = netdev_alloc_skb_ip_align(priv->netdev, RX_BUF_SIZE);
+    if (!skb) return NULL;
+
+    dma_addr = dma_map_single(priv->dev,
+                               skb->data,
+                               RX_BUF_SIZE,
+                               DMA_FROM_DEVICE);
+
+    if (dma_mapping_error(priv->dev, dma_addr)) {
+        dev_kfree_skb(skb);
+        return NULL;
+    }
+
+    *dma_addr_out = dma_addr;
+    return skb;
+}
+
+static void rx_complete(struct mydev *priv, int idx, u16 pkt_len)
+{
+    dma_addr_t dma_addr = priv->rx_dma[idx];
+    struct sk_buff *skb = priv->rx_skbs[idx];
+
+    /* Unmap: cihaz yazdı, CPU okuyacak → cache invalidate */
+    dma_unmap_single(priv->dev, dma_addr, RX_BUF_SIZE,
+                     DMA_FROM_DEVICE);
+
+    /* Paket stack'e ver */
+    skb_put(skb, pkt_len);
+    skb->protocol = eth_type_trans(skb, priv->netdev);
+    napi_gro_receive(&priv->napi, skb);
+
+    /* Yeni buffer tahsis et */
+    priv->rx_skbs[idx] = rx_alloc_buffer(priv, &priv->rx_dma[idx]);
+}
+
+/* ── dma_map_page (page-level map) ────────────────────────── */
+static dma_addr_t map_page_for_dma(struct mydev *priv,
+                                    struct page *page,
+                                    size_t offset, size_t size)
+{
+    return dma_map_page(priv->dev, page, offset, size, DMA_FROM_DEVICE);
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>dma_map_single(): mevcut buffer'ı DMA için eşle; dönen dma_addr_t'yi cihaza ver</li>
+      <li>dma_mapping_error(): her map sonrası kontrol et; NULL pointer ile karıştırma</li>
+      <li>DMA_TO_DEVICE: cache flush (CPU yazdı, cihaz okuyacak); DMA_FROM_DEVICE: cache invalidate</li>
+      <li>Transfer tamamlanana kadar buffer'a CPU erişimi tehlikeli — unmap'e kadar dokunma</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Scatter-gather DMA — struct scatterlist</h2>
+  <p class="section-lead">Scatter-gather (SG), birden fazla fiziksel olarak dağınık bellek bölgesini tek DMA transfer olarak sunar. Ağ sürücüsü TX ring'leri ve blok sürücüleri SG kullanır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — scatter-gather DMA kullanımı</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/scatterlist.h&gt;
+
+#define MAX_SG_ENTRIES  16
+
+/* ── Basit SG liste oluşturma ─────────────────────────────── */
+static int sg_dma_example(struct mydev *priv,
+                           void **bufs, size_t *sizes, int nbufs)
+{
+    struct scatterlist sg[MAX_SG_ENTRIES];
+    int i, nents;
+
+    if (nbufs > MAX_SG_ENTRIES) return -EINVAL;
+
+    /* SG listesi başlat */
+    sg_init_table(sg, nbufs);
+
+    for (i = 0; i &lt; nbufs; i++) {
+        /* Her buffer'ı SG entry'ye bağla */
+        sg_set_buf(&sg[i], bufs[i], sizes[i]);
+    }
+
+    /* Tüm SG listesini DMA için eşle */
+    nents = dma_map_sg(priv->dev, sg, nbufs, DMA_TO_DEVICE);
+    if (nents == 0) {
+        dev_err(priv->dev, "dma_map_sg başarısız\n");
+        return -ENOMEM;
+    }
+
+    /* dma_map_sg sonrası entry sayısı değişebilir (IOMMU merge eder) */
+    dev_dbg(priv->dev, "SG: %d giriş → %d DMA entry\n", nbufs, nents);
+
+    /* Her DMA entry'yi cihaz descriptor'ına yaz */
+    struct scatterlist *s;
+    int j = 0;
+    for_each_sg(sg, s, nents, i) {
+        dma_addr_t da  = sg_dma_address(s);
+        unsigned   len = sg_dma_len(s);
+
+        dev_dbg(priv->dev, "  SG[%d]: da=0x%llx len=%u\n",
+                j++, (u64)da, len);
+
+        /* Cihazın descriptor tablosuna yaz */
+        write_tx_descriptor(priv, j-1, da, len);
+    }
+
+    /* Transfer tamamlanınca unmap */
+    dma_unmap_sg(priv->dev, sg, nbufs, DMA_TO_DEVICE);
+
+    return 0;
+}
+
+/* ── SKB fragmanlarıyla SG (gerçek NIC kullanımı) ─────────── */
+static int tx_skb_sg(struct mydev *priv, struct sk_buff *skb)
+{
+    struct scatterlist sg[MAX_SKB_FRAGS + 1];
+    int nents, i;
+
+    sg_init_table(sg, skb_shinfo(skb)->nr_frags + 1);
+
+    /* Linear bölüm */
+    sg_set_buf(&sg[0], skb->data, skb_headlen(skb));
+
+    /* Fragmanlar (sosket tampon parçaları) */
+    for (i = 0; i &lt; skb_shinfo(skb)->nr_frags; i++) {
+        skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+        sg_set_page(&sg[i+1],
+                    skb_frag_page(frag),
+                    skb_frag_size(frag),
+                    skb_frag_off(frag));
+    }
+
+    nents = dma_map_sg(priv->dev, sg,
+                       skb_shinfo(skb)->nr_frags + 1,
+                       DMA_TO_DEVICE);
+    if (!nents) return -ENOMEM;
+
+    /* ... descriptor'lara yaz, transfer başlat ... */
+
+    /* TX completion'da unmap */
+    dma_unmap_sg(priv->dev, sg,
+                 skb_shinfo(skb)->nr_frags + 1,
+                 DMA_TO_DEVICE);
+    return 0;
+}</code></pre>
+  </div>
+
+  <h3>SG yardımcı makrolar</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Makro / Fonksiyon</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td>sg_init_table(sg, n)</td><td>SG dizisini başlat</td></tr>
+        <tr><td>sg_set_buf(sg, buf, len)</td><td>Sanal adresli buffer'ı SG entry'ye bağla</td></tr>
+        <tr><td>sg_set_page(sg, page, len, offset)</td><td>struct page'i SG entry'ye bağla</td></tr>
+        <tr><td>dma_map_sg(dev, sg, n, dir)</td><td>SG listesini DMA için eşle; gerçek entry sayısını döner</td></tr>
+        <tr><td>for_each_sg(sg, s, nents, i)</td><td>Eşlenen SG entry'leri üzerinde döngü</td></tr>
+        <tr><td>sg_dma_address(s)</td><td>Entry'nin DMA adresi (harita sonrası)</td></tr>
+        <tr><td>sg_dma_len(s)</td><td>Entry'nin DMA uzunluğu (birleştirme olabilir)</td></tr>
+        <tr><td>dma_unmap_sg(dev, sg, n, dir)</td><td>Tüm SG listesini unmap et</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>SG: dağınık bellek parçalarını tek DMA transferi — copy olmadan zero-copy TX</li>
+      <li>dma_map_sg(): IOMMU birleştirebilir, entry sayısı azalabilir; nents değişkenini kullan</li>
+      <li>for_each_sg + sg_dma_address/len: eşleme sonrası adres/boyut; mapping öncesindeki değerleri kullanma</li>
+      <li>SKB fragmanları: linear + frags — tümünü SG ile tek seferde transfer et</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> DMA pool — küçük tampon yönetimi</h2>
+  <p class="section-lead">dma_pool, küçük ve sık tahsis edilen DMA buffer'ları için özel bir havuz yöneticisidir. dma_alloc_coherent'in sayfadan küçük tahsislerde yaşattığı israfı önler.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — dma_pool oluşturma ve kullanımı</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/dmapool.h&gt;
+
+#define DESC_SIZE   64      /* tek descriptor boyutu */
+#define DESC_ALIGN  64      /* cihaz gereksinimi: 64-bayt hizalı */
+
+struct mydev {
+    struct device    *dev;
+    struct dma_pool  *desc_pool;
+};
+
+/* ── Pool oluşturma ───────────────────────────────────────── */
+static int create_dma_pool(struct mydev *priv)
+{
+    /*
+     * dma_pool_create(name, dev, size, align, boundary):
+     *   size:     her tahsisin boyutu
+     *   align:    minimum hizalama (power-of-2)
+     *   boundary: 0 = sınır yok; 4096 = 4 KB sınır geçilemez
+     */
+    priv->desc_pool = dma_pool_create("mydrv_desc",
+                                       priv->dev,
+                                       DESC_SIZE,
+                                       DESC_ALIGN,
+                                       0);
+    if (!priv->desc_pool) {
+        dev_err(priv->dev, "dma_pool_create başarısız\n");
+        return -ENOMEM;
+    }
+
+    dev_info(priv->dev, "DMA pool: %u bayt × N, %u hizalı\n",
+             DESC_SIZE, DESC_ALIGN);
+    return 0;
+}
+
+/* ── Pool'dan tahsis ──────────────────────────────────────── */
+static struct tx_desc *alloc_tx_desc(struct mydev *priv,
+                                      dma_addr_t *da_out)
+{
+    struct tx_desc *desc;
+
+    /*
+     * dma_pool_alloc(pool, flags, handle):
+     *   GFP_ATOMIC: interrupt context'te güvenli
+     *   GFP_KERNEL: uyuyabilir context (probe, thread)
+     *   handle: dma_addr_t çıkışı
+     */
+    desc = dma_pool_alloc(priv->desc_pool, GFP_ATOMIC, da_out);
+    if (!desc) {
+        dev_err(priv->dev, "dma_pool_alloc başarısız\n");
+        return NULL;
+    }
+
+    memset(desc, 0, DESC_SIZE);
+    return desc;
+}
+
+/* ── Pool'a iade ──────────────────────────────────────────── */
+static void free_tx_desc(struct mydev *priv,
+                          struct tx_desc *desc,
+                          dma_addr_t da)
+{
+    dma_pool_free(priv->desc_pool, desc, da);
+}
+
+/* ── Pool yok etme (remove veya hata yolunda) ─────────────── */
+static void destroy_dma_pool(struct mydev *priv)
+{
+    if (priv->desc_pool) {
+        dma_pool_destroy(priv->desc_pool);
+        priv->desc_pool = NULL;
+    }
+}
+
+/* ── Kullanım örneği: TX descriptor gönderme döngüsü ──────── */
+static int send_frame(struct mydev *priv, void *data, size_t len)
+{
+    struct tx_desc *desc;
+    dma_addr_t      desc_da, data_da;
+
+    /* Pool'dan descriptor al */
+    desc = alloc_tx_desc(priv, &desc_da);
+    if (!desc) return -ENOMEM;
+
+    /* Veri buffer'ını streaming DMA ile eşle */
+    data_da = dma_map_single(priv->dev, data, len, DMA_TO_DEVICE);
+    if (dma_mapping_error(priv->dev, data_da)) {
+        free_tx_desc(priv, desc, desc_da);
+        return -ENOMEM;
+    }
+
+    /* Descriptor doldur */
+    desc->data_addr = cpu_to_le64(data_da);
+    desc->length    = cpu_to_le32(len);
+    desc->flags     = cpu_to_le32(TX_FLAG_SOF | TX_FLAG_EOF | TX_FLAG_IRQ);
+
+    /* Cihada descriptor adresini ver */
+    writel((u32)(desc_da & 0xFFFFFFFF), priv->bar0 + TX_DESC_ADDR_LO);
+    writel((u32)(desc_da >> 32),        priv->bar0 + TX_DESC_ADDR_HI);
+    writel(0x01,                         priv->bar0 + TX_KICK);
+
+    return 0;
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>dma_pool: küçük (&lt;page) DMA buffer'lar için özel havuz; tahsis/iade O(1)</li>
+      <li>align parametresi: cihazın descriptor hizalama gereksinimini karşılar</li>
+      <li>GFP_ATOMIC: interrupt context'te zorunlu; GFP_KERNEL: uyku izinli context'te</li>
+      <li>dma_pool_destroy(): yok etmeden önce tüm tahsisler iade edilmeli</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> DMA mask — 32-bit vs 64-bit</h2>
+  <p class="section-lead">DMA mask, cihazın erişebileceği fiziksel adres aralığını tanımlar. Eski donanımlar yalnızca 32-bit adres kullanabilir; modern donanımlar 64-bit DMA destekler.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — DMA mask yapılandırması</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/dma-mapping.h&gt;
+
+static int setup_dma_mask(struct pci_dev *pdev)
+{
+    int ret;
+
+    /*
+     * dma_set_mask_and_coherent():
+     *   DMA_BIT_MASK(64): 64-bit adres; 0x0 – 0xFFFFFFFFFFFFFFFF
+     *   DMA_BIT_MASK(32): 32-bit; yalnızca ilk 4 GB RAM erişilebilir
+     *   DMA_BIT_MASK(40): 40-bit; embedded sistemlerde yaygın
+     */
+
+    /* Tercih: 64-bit */
+    ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+    if (ret == 0) {
+        dev_info(&pdev->dev, "64-bit DMA etkin\n");
+        return 0;
+    }
+
+    /* Geri dönüş: 32-bit */
+    ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+    if (ret == 0) {
+        dev_warn(&pdev->dev,
+                 "64-bit DMA yok, 32-bit kullanılıyor\n");
+        return 0;
+    }
+
+    dev_err(&pdev->dev, "DMA mask ayarlanamadı: %d\n", ret);
+    return ret;
+}
+
+/* ── 32-bit DMA ile yüksek bellek sorunu ─────────────────── */
+/*
+ * Sistem 4 GB'tan fazla RAM içeriyorsa ve cihaz 32-bit DMA kullanıyorsa:
+ * - dma_alloc_coherent(): kernel otomatik olarak 4 GB altından tahsis eder
+ * - Streaming DMA: buffer 4 GB üzerindeyse swiotlb (bounce buffer) devreye girer
+ * - swiotlb: düşük bellekte geçici buffer → kopyala → cihaza ver → kopyala geri
+ * - performans kaybı! 64-bit DMA kullanmak her zaman daha iyidir
+ */
+
+/* ── dma_mask vs coherent_dma_mask ────────────────────────── */
+/*
+ * pdev->dma_mask:         streaming DMA için
+ * pdev->dev.coherent_dma_mask: dma_alloc_coherent için
+ * dma_set_mask_and_coherent(): ikisini birden ayarlar
+ *
+ * Ayrı ayarlama gerekirse:
+ */
+static int setup_dma_mask_split(struct pci_dev *pdev)
+{
+    int ret;
+    ret = dma_set_mask(&pdev->dev, DMA_BIT_MASK(64));
+    if (ret) return ret;
+    ret = dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(32));
+    /* coherent: 32-bit, streaming: 64-bit — nadir senaryo */
+    return ret;
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>DMA_BIT_MASK(64): her zaman önce dene; 64-bit DMA swiotlb overhead'ini önler</li>
+      <li>DMA_BIT_MASK(32): 4 GB üzeri RAM varsa swiotlb bounce buffer devreye girer</li>
+      <li>dma_set_mask_and_coherent(): streaming ve coherent maskelerini tek seferde ayarlar</li>
+      <li>IOMMU etkinse 32-bit cihaz bile 64-bit adres uzayına erişebilir (IOVA → PA çevirisi ile)</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> DMA sync — cache flush ve invalidate</h2>
+  <p class="section-lead">Streaming DMA'da, CPU ile cihaz aynı buffer'ı sırayla kullanır. Her kullanım değişikliğinde cache'i senkronize etmek gerekir — özellikle cache-incoherent mimarilerde (ARM, MIPS).</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — DMA sync API</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/dma-mapping.h&gt;
+
+/*
+ * CPU ↔ Cihaz ownership geçişi ve sync gereksinimleri:
+ *
+ *  Senaryo             | Fonksiyon                       | Etki
+ *  ─────────────────────────────────────────────────────────────
+ *  CPU yazdı → Cihaz   | dma_sync_single_for_device()    | cache flush
+ *  Cihaz yazdı → CPU   | dma_sync_single_for_cpu()       | cache invalidate
+ *  CPU okuyacak (FROM) | dma_sync_single_for_cpu()       | cache invalidate
+ *  CPU yazacak (TO)    | dma_sync_single_for_device()    | cache flush
+ */
+
+struct ring_buf {
+    void       *vaddr;
+    dma_addr_t  daddr;
+    size_t      size;
+};
+
+/* ── CPU buffer'ı güncelleyip cihaza hazır hale getir ──────── */
+static void cpu_to_device_sync(struct device *dev,
+                                struct ring_buf *buf)
+{
+    /* CPU buffer'ı güncelledi */
+    memcpy(buf->vaddr, some_data, buf->size);
+
+    /* Cache flush: CPU yazdığı veriyi RAM'e boşalt */
+    dma_sync_single_for_device(dev, buf->daddr, buf->size,
+                                DMA_TO_DEVICE);
+    /* Artık cihaz DMA ile okuyabilir */
+}
+
+/* ── Cihaz transfer etti, CPU okuyacak ────────────────────── */
+static void device_to_cpu_sync(struct device *dev,
+                                struct ring_buf *buf)
+{
+    /* Cihad DMA ile buffer'a yazdı */
+    dma_sync_single_for_cpu(dev, buf->daddr, buf->size,
+                             DMA_FROM_DEVICE);
+    /* Cache invalidate: eski CPU cache değerlerini at, RAM'den oku */
+
+    /* Şimdi CPU buf->vaddr'daki güncel veriyi okuyabilir */
+    process_data(buf->vaddr, buf->size);
+}
+
+/* ── Ping-pong buffer: cihaz→CPU→cihaz döngüsü ────────────── */
+static void pingpong_cycle(struct device *dev,
+                            struct ring_buf *buf)
+{
+    /* 1. Cihaz DMA ile doldurdu */
+    dma_sync_single_for_cpu(dev, buf->daddr, buf->size,
+                             DMA_BIDIRECTIONAL);
+
+    /* 2. CPU işle ve değiştir */
+    transform_data(buf->vaddr, buf->size);
+
+    /* 3. CPU işlemi bitti, cihaza geri ver */
+    dma_sync_single_for_device(dev, buf->daddr, buf->size,
+                                DMA_BIDIRECTIONAL);
+}
+
+/* ── Scatter-gather sync ─────────────────────────────────── */
+static void sg_sync_for_cpu(struct device *dev,
+                              struct scatterlist *sg, int nents)
+{
+    dma_sync_sg_for_cpu(dev, sg, nents, DMA_FROM_DEVICE);
+    /* Tüm SG entry'leri cache invalidate */
+}
+
+static void sg_sync_for_device(struct device *dev,
+                                struct scatterlist *sg, int nents)
+{
+    dma_sync_sg_for_device(dev, sg, nents, DMA_TO_DEVICE);
+    /* Tüm SG entry'leri cache flush */
+}</code></pre>
+  </div>
+
+  <h3>x86 vs ARM davranışı</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Mimari</th><th>Cache Coherent?</th><th>sync Etkisi</th></tr></thead>
+      <tbody>
+        <tr><td>x86/x86-64</td><td>Evet (HW garantisi)</td><td>sync → no-op (yalnızca barrier)</td></tr>
+        <tr><td>ARM Cortex-A (non-CCI)</td><td>Hayır</td><td>sync → gerçek cache flush/inv</td></tr>
+        <tr><td>ARM Cortex-A (CCI/CCN)</td><td>Evet (hardware coherency)</td><td>sync → no-op</td></tr>
+        <tr><td>MIPS</td><td>Hayır</td><td>sync → cache flush/invalidate</td></tr>
+        <tr><td>RISC-V</td><td>Platform bağımlı</td><td>IOMMU varsa no-op</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>dma_sync_single_for_cpu(): cihad yazdı, CPU okuyacak → cache invalidate</li>
+      <li>dma_sync_single_for_device(): CPU yazdı, cihaz okuyacak → cache flush</li>
+      <li>x86'da no-op; ARM'de gerçek cache operasyonu — API her ikisini de kapsar</li>
+      <li>BIDIRECTIONAL: her iki yönde flush+invalidate; en güvenli ama en pahalı</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> IOMMU etkisi — swiotlb ve bounce buffer</h2>
+  <p class="section-lead">IOMMU, DMA adres çevirisi yaparak cihazı sistem belleğinden izole eder. swiotlb, IOMMU olmayan veya 32-bit DMA kısıtlı sistemler için yazılım bounce buffer sağlar.</p>
+
+  <h3>IOMMU aktifken DMA akışı</h3>
+
+  <div class="flow">
+    <pre>
+  IOMMU ETKİN:
+
+  Sürücü                IOMMU                 RAM
+  ──────                ─────                 ───
+  dma_map_single()  →  IOVA tahsis et     →  PA → IOVA eşlemesi kur
+  (döner: IOVA)         (örn. 0x10000000)
+
+  Cihaz DMA yapar:
+  IOVA 0x10000000   →  IOMMU page table  →  gerçek PA (örn. 0x800000000)
+
+  dma_unmap_single():
+  IOVA serbest bırak → IOMMU eşlemesini kaldır
+
+  ─────────────────────────────────────────────────────────────────
+  IOMMU KAPALI (veya 64-bit DMA, büyük RAM):
+
+  Sürücü                                       RAM
+  ──────                                       ───
+  dma_map_single() → virt_to_phys() →        PA doğrudan kullan
+  (döner: PA)
+
+  ─────────────────────────────────────────────────────────────────
+  32-bit DMA CİHAZ, 8 GB RAM, IOMMU YOK:
+
+  dma_map_single() → buffer > 4 GB?
+                     ├─ Hayır: PA doğrudan kullan
+                     └─ Evet: swiotlb bounce buffer devreye girer
+                              ├─ 4 GB altında geçici buf tahsis
+                              ├─ veri kopyala
+                              └─ geçici buf adresini cihaza ver
+    </pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — IOMMU ve swiotlb durum kontrolü</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># IOMMU gruplamaları listele</span>
+<span class="cmd">ls</span> /sys/kernel/iommu_groups/
+<span class="cmt"># 0  1  2  3  4  5  ...  — her grup ayrı izolasyon birimi</span>
+
+<span class="cmt"># Belirli bir grupta hangi cihazlar var?</span>
+<span class="cmd">ls</span> /sys/kernel/iommu_groups/1/devices/
+
+<span class="cmt"># swiotlb tampon durumu</span>
+<span class="cmd">cat</span> /sys/kernel/debug/swiotlb/io_tlb_nslabs
+<span class="cmt"># 32768  — varsayılan: 32768 slot × 2048 bayt = 64 MB</span>
+
+<span class="cmd">dmesg</span> | grep -i swiotlb
+<span class="cmt"># swiotlb: mapped [mem 0xf...] of size 64M</span>
+<span class="cmt"># eğer doluysa: "swiotlb buffer is full" uyarısı</span>
+
+<span class="cmt"># Kernel parametreleri:</span>
+<span class="cmt"># intel_iommu=on    — Intel VT-d etkinleştir</span>
+<span class="cmt"># iommu=pt           — passthrough (güvenlik kapatılır, performans artar)</span>
+<span class="cmt"># swiotlb=262144    — daha büyük bounce buffer (256K slot)</span></code></pre>
+  </div>
+
+  <h3>IOMMU map/unmap overhead</h3>
+  <p>IOMMU etkinken her dma_map_single() çağrısı bir IOVA tahsisi ve TLB haritası ekler. Yüksek paket oranlı ağ sürücülerinde bu overhead önemli olabilir. Çözümler: <strong>IOMMU domain cache</strong> (IOVA'ları tekrar kullan), <strong>DMA pool</strong> (çok sayıda küçük alloc yerine havuz), <strong>IOMMU passthrough</strong> (güvenilir donanım için).</p>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>IOMMU etkinken: dma_map_single() IOVA tahsis eder + page table kurar; unmap'te temizler</li>
+      <li>swiotlb: IOMMU yok + 32-bit cihaz + yüksek bellek → software bounce buffer</li>
+      <li>swiotlb dolu uyarısı: slot sayısını artır (swiotlb=N) veya 64-bit DMA kullan</li>
+      <li>iommu=pt (passthrough): TLB haritası yok, PA==IOVA; güvenlik kaybı ama overhead yok</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: scatter-gather DMA RX descriptor ring</h2>
+  <p class="section-lead">Gerçek bir ağ sürücüsünde SG DMA ile RX descriptor ring implementasyonu — buffer tahsis, ring doldurma, completion işleme ve yenileme döngüsü.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — tam RX descriptor ring (SG + DMA)</span><span class="dot">●</span></div>
+    <pre><code>#define RX_RING_SIZE   256
+#define RX_BUF_SIZE    2048   /* MTU + header */
+
+struct rx_slot {
+    struct sk_buff *skb;
+    dma_addr_t      dma;
+};
+
+struct rx_ring {
+    struct rx_desc  *descs;         /* coherent DMA descriptor array */
+    dma_addr_t       descs_dma;
+    struct rx_slot   slots[RX_RING_SIZE];
+    int              prod;          /* producer index (SW günceller) */
+    int              cons;          /* consumer index (HW günceller) */
+};
+
+/* ── Ring başlatma ────────────────────────────────────────── */
+static int rx_ring_init(struct mydev *priv)
+{
+    struct rx_ring *ring;
+    int i, ret;
+
+    ring = kzalloc(sizeof(*ring), GFP_KERNEL);
+    if (!ring) return -ENOMEM;
+    priv->rx_ring = ring;
+
+    /* Coherent descriptor buffer */
+    ring->descs = dma_alloc_coherent(priv->dev,
+        RX_RING_SIZE * sizeof(struct rx_desc),
+        &ring->descs_dma,
+        GFP_KERNEL);
+    if (!ring->descs) { ret = -ENOMEM; goto err_ring; }
+
+    /* Her slot için SKB tahsis et ve DMA'ya eşle */
+    for (i = 0; i &lt; RX_RING_SIZE; i++) {
+        struct sk_buff *skb = netdev_alloc_skb_ip_align(
+                                  priv->netdev, RX_BUF_SIZE);
+        if (!skb) { ret = -ENOMEM; goto err_slots; }
+
+        dma_addr_t da = dma_map_single(priv->dev,
+                                        skb->data, RX_BUF_SIZE,
+                                        DMA_FROM_DEVICE);
+        if (dma_mapping_error(priv->dev, da)) {
+            dev_kfree_skb(skb);
+            ret = -ENOMEM;
+            goto err_slots;
+        }
+
+        ring->slots[i].skb = skb;
+        ring->slots[i].dma = da;
+
+        /* Descriptor doldur */
+        ring->descs[i].buf_addr = cpu_to_le64(da);
+        ring->descs[i].buf_size = cpu_to_le16(RX_BUF_SIZE);
+        ring->descs[i].status   = 0;
+    }
+
+    /* HW'ye ring adresini ver */
+    writel(lower_32_bits(ring->descs_dma), priv->bar0 + RX_RING_BASE_LO);
+    writel(upper_32_bits(ring->descs_dma), priv->bar0 + RX_RING_BASE_HI);
+    writel(RX_RING_SIZE,                   priv->bar0 + RX_RING_SIZE_REG);
+    writel(1,                              priv->bar0 + RX_ENABLE);
+
+    return 0;
+
+err_slots:
+    for (i--; i >= 0; i--) {
+        dma_unmap_single(priv->dev, ring->slots[i].dma,
+                         RX_BUF_SIZE, DMA_FROM_DEVICE);
+        dev_kfree_skb(ring->slots[i].skb);
+    }
+    dma_free_coherent(priv->dev,
+                      RX_RING_SIZE * sizeof(struct rx_desc),
+                      ring->descs, ring->descs_dma);
+err_ring:
+    kfree(ring);
+    return ret;
+}
+
+/* ── RX completion işleme (NAPI poll içinden) ─────────────── */
+static int rx_ring_process(struct mydev *priv, int budget)
+{
+    struct rx_ring *ring = priv->rx_ring;
+    int processed = 0;
+
+    while (processed &lt; budget) {
+        struct rx_desc *desc = &ring->descs[ring->cons];
+        u16 status = le16_to_cpu(desc->status);
+
+        if (!(status &amp; RX_DESC_DONE)) break;
+
+        u16 pkt_len = le16_to_cpu(desc->pkt_length);
+        struct rx_slot *slot = &ring->slots[ring->cons];
+
+        /* Unmap ve stack'e ver */
+        dma_unmap_single(priv->dev, slot->dma,
+                         RX_BUF_SIZE, DMA_FROM_DEVICE);
+        skb_put(slot->skb, pkt_len);
+        slot->skb->protocol = eth_type_trans(slot->skb, priv->netdev);
+        napi_gro_receive(&priv->napi, slot->skb);
+        priv->netdev->stats.rx_packets++;
+        priv->netdev->stats.rx_bytes += pkt_len;
+
+        /* Yeni buffer ver */
+        struct sk_buff *new_skb = netdev_alloc_skb_ip_align(
+                                      priv->netdev, RX_BUF_SIZE);
+        dma_addr_t new_da = 0;
+        if (new_skb) {
+            new_da = dma_map_single(priv->dev, new_skb->data,
+                                    RX_BUF_SIZE, DMA_FROM_DEVICE);
+            if (dma_mapping_error(priv->dev, new_da)) {
+                dev_kfree_skb(new_skb);
+                new_skb = NULL;
+            }
+        }
+
+        slot->skb = new_skb;
+        slot->dma = new_da;
+
+        /* Descriptor yenile */
+        desc->buf_addr = cpu_to_le64(new_da);
+        desc->status   = 0;
+        wmb();
+
+        ring->cons = (ring->cons + 1) % RX_RING_SIZE;
+        processed++;
+    }
+
+    /* Tail pointer güncelle (HW'ye "yeni descriptor var" bildir) */
+    writel(ring->cons, priv->bar0 + RX_TAIL);
+
+    return processed;
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Coherent descriptor ring + streaming slot buffer: standart ağ sürücüsü deseni</li>
+      <li>Başlatmada hata yolunda partial cleanup zorunlu: unmap edilmiş slotları geri sar</li>
+      <li>RX completion: unmap → skb_put → eth_type_trans → napi_gro_receive → yeni slot</li>
+      <li>wmb() + tail pointer: yeni descriptor'ı cihaza duyur; sıra korunmalı</li>
+    </ul>
+  </div>
+</section>
+
+</main>

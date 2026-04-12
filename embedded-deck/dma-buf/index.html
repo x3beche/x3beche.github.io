@@ -1,0 +1,885 @@
+---
+layout: tutorial
+title: "DMA-BUF & CMA — Sıfır Kopyalı Bellek Paylaşımı"
+back_url: "../index.html"
+back_label: "embedded-deck"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>DMA-BUF</span>
+    <span>2026</span>
+  </div>
+  <h1>DMA-BUF &amp; CMA<br><em>Sıfır Kopyalı Bellek Paylaşımı</em></h1>
+  <p class="subtitle">Çekirdek altsistemleri arasında kamera, GPU ve encoder pipeline'larını kopyasız bellek paylaşımıyla birleştirin.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Bellek paylaşım problemi</a></li>
+    <li><a href="#s1">DMA-BUF mimarisi</a></li>
+    <li><a href="#s2">Exporter implementasyonu</a></li>
+    <li><a href="#s3">Importer kullanımı</a></li>
+    <li><a href="#s4">CMA — Contiguous Memory Allocator</a></li>
+    <li><a href="#s5">Sürücüler arası paylaşım</a></li>
+    <li><a href="#s6">Userspace erişimi</a></li>
+    <li><a href="#s7">Pratik: Kamera → GPU sıfır kopya pipeline</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> Bellek Paylaşım Problemi</h2>
+  <p class="section-lead">Modern SoC'larda kamera, GPU, video encoder ve display birbirinden farklı DMA master'larıdır. Geleneksel yöntemde her aktarım gereksiz bellek kopyaları üretir ve gecikme ile güç tüketimini artırır.</p>
+
+  <h3>Geleneksel pipeline — sorunlu yaklaşım</h3>
+
+  <div class="flow">
+    <pre>Kamera DMA → [Çekirdek tamponu A] → mmap → [Userspace tamponu]
+      → write() → [Çekirdek tamponu B] → GPU DMA
+      → write() → [Çekirdek tamponu C] → Encoder DMA
+      → write() → [Çekirdek tamponu D] → Display DMA
+
+Toplam kopya: 3–4x (4K@30fps için ~3.5 GB/s gereksiz bant genişliği)</pre>
+  </div>
+
+  <h3>Neden bu kadar kopyalama?</h3>
+  <p>Linux'ta her alt sistem (V4L2, DRM, V4L2M2M, ALSA) kendi bellek yönetim modeliyle çalışır. Aralarında doğrudan fiziksel adres paylaşımı yoktur; veri aktarımı ancak userspace tampon aracılığıyla gerçekleşir.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Gecikme</span><span class="desc">Her kopya CPU cache flush + bus transfer süresi ekler — video işlemede kritik</span></div>
+    <div class="param"><span class="name">Güç tüketimi</span><span class="desc">DRAM okuma/yazma işlemleri mobil SoC'larda güç bütçesinin %20-30'unu tüketebilir</span></div>
+    <div class="param"><span class="name">Bant genişliği</span><span class="desc">4K@60fps RGBA = 3.98 GB/s; her ekstra kopya bant genişliğini katlar</span></div>
+    <div class="param"><span class="name">CPU yükü</span><span class="desc">memcpy ile kopya CPU çekirdeğini yüklü tutar; donanım pipeline'ı boşta bekler</span></div>
+  </div>
+
+  <h3>DMA-BUF çözümü</h3>
+
+  <div class="flow">
+    <pre>Kamera DMA → [Fiziksel bellek — tek tampon]
+                    ↓ dma_buf fd (file descriptor)
+             GPU DMA ─────────────┤
+             Encoder DMA ─────────┤
+             Display DMA ─────────┘
+
+Toplam kopya: 0 (zero-copy) — aynı fiziksel sayfa tüm aygıtlar tarafından paylaşılır</pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Geleneksel pipeline'da 3–4 gereksiz bellek kopyası oluşur</li>
+      <li>DMA-BUF: fiziksel tampon bir kez tahsis edilir, tüm donanım birimleri aynı tampona erişir</li>
+      <li>4K@60fps için sıfır kopya, bant genişliği ve güç tüketimini dramatik azaltır</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> DMA-BUF Mimarisi</h2>
+  <p class="section-lead">DMA-BUF, Linux çekirdeğinde alt sistemler arasında bellek paylaşımı için standart bir çerçevedir. Temel mekanizma: fiziksel bellek sahibi <em>exporter</em>, kullanan <em>importer</em> ve aralarında geçen <em>file descriptor</em>.</p>
+
+  <h3>Temel kavramlar</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">dma_buf</span><span class="desc">Paylaşılan tampon nesnesi — fiziksel belleği temsil eder, struct dma_buf olarak çekirdekte yaşar</span></div>
+    <div class="param"><span class="name">Exporter</span><span class="desc">Tamponu tahsis eden ve ops tablosunu uygulayan sürücü (kamera, GPU, özel tahsisçi)</span></div>
+    <div class="param"><span class="name">Importer</span><span class="desc">dma_buf fd'sini alıp kendi DMA işlemleri için kullanan sürücü (encoder, display, compute)</span></div>
+    <div class="param"><span class="name">attachment</span><span class="desc">Bir importer'ın dma_buf'a eklenmesi — struct dma_buf_attachment ile temsil edilir</span></div>
+    <div class="param"><span class="name">sg_table</span><span class="desc">Scatter-gather tablosu — fiziksel bellek parçalarının listesi (CMA ile genelde tek parça)</span></div>
+    <div class="param"><span class="name">file descriptor</span><span class="desc">Userspace'e sunulan handle — ioctl veya mmap için kullanılır, fork/sendmsg ile geçirilebilir</span></div>
+  </div>
+
+  <h3>DMA-BUF yaşam döngüsü</h3>
+
+  <div class="flow">
+    <pre>1. dma_buf_export()        — exporter fiziksel belleği sarmaladı, struct dma_buf oluştu
+2. dma_buf_fd()            — çekirdek nesnesini file descriptor'a dönüştür
+3. fd → userspace (ioctl)  — V4L2 VIDIOC_QUERYBUF veya özel ioctl ile userspace'e gönder
+4. fd → başka sürücü       — userspace fd'yi DRM/encoder sürücüsüne iletir
+5. dma_buf_get(fd)         — importer fd'den struct dma_buf* alır
+6. dma_buf_attach()        — importer, dma_buf'a eklenir
+7. dma_buf_map_attachment() — sg_table alınır, DMA mapping yapılır
+8. DMA işlemi              — donanım tampona doğrudan erişir
+9. dma_buf_unmap_attachment() — mapping serbest bırakılır
+10. dma_buf_detach()       — importer ayrılır
+11. dma_buf_put()          — referans sayacı düşer, sıfırda bellek serbest</pre>
+  </div>
+
+  <h3>Kernel header'ları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — include</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/dma-buf.h&gt;       /* dma_buf, dma_buf_ops, dma_buf_export_info */
+#include &lt;linux/dma-mapping.h&gt;   /* DMA direction flags, dma_map_sg */
+#include &lt;linux/scatterlist.h&gt;   /* sg_table, sg_alloc_table */
+#include &lt;linux/module.h&gt;</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>DMA-BUF üç taraflı: exporter (sahip), importer (kullanıcı), fd (köprü)</li>
+      <li>sg_table fiziksel bellek parçalarını tanımlar; CMA ile genelde tek contiguous parça</li>
+      <li>File descriptor userspace üzerinden sürücüler arasında güvenli geçiş sağlar</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> Exporter Implementasyonu</h2>
+  <p class="section-lead">Exporter, fiziksel belleği tahsis eden ve <code>dma_buf_ops</code> tablosunu uygulayan sürücüdür. Kamera sürücüsü tipik exporter örneğidir.</p>
+
+  <h3>dma_buf_ops tablosu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — camera_dmabuf_exporter.c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/dma-buf.h&gt;
+#include &lt;linux/slab.h&gt;
+#include &lt;linux/module.h&gt;
+
+struct camera_buffer {
+    struct dma_buf      *dmabuf;
+    struct sg_table     *sgt;
+    void                *vaddr;      /* sanal adres (vmap için) */
+    dma_addr_t           dma_addr;   /* fiziksel DMA adresi */
+    size_t               size;
+    struct device       *dev;
+};
+
+/* map_dma_buf: importer DMA mapping talep ettiğinde çağrılır */
+static struct sg_table *
+camera_dmabuf_map(struct dma_buf_attachment *attach,
+                  enum dma_data_direction dir)
+{
+    struct camera_buffer *cbuf = attach->dmabuf->priv;
+    struct sg_table *sgt;
+    int ret;
+
+    sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
+    if (!sgt)
+        return ERR_PTR(-ENOMEM);
+
+    /* Tek contiguous parça — CMA belleği için tipik */
+    ret = sg_alloc_table(sgt, 1, GFP_KERNEL);
+    if (ret) {
+        kfree(sgt);
+        return ERR_PTR(ret);
+    }
+
+    sg_set_page(sgt->sgl,
+                pfn_to_page(PFN_DOWN(cbuf->dma_addr)),
+                cbuf->size, 0);
+
+    ret = dma_map_sg(attach->dev, sgt->sgl, sgt->nents, dir);
+    if (!ret) {
+        sg_free_table(sgt);
+        kfree(sgt);
+        return ERR_PTR(-ENOMEM);
+    }
+
+    return sgt;
+}
+
+static void camera_dmabuf_unmap(struct dma_buf_attachment *attach,
+                                struct sg_table *sgt,
+                                enum dma_data_direction dir)
+{
+    dma_unmap_sg(attach->dev, sgt->sgl, sgt->nents, dir);
+    sg_free_table(sgt);
+    kfree(sgt);
+}
+
+/* mmap: userspace CPU erişimi için */
+static int camera_dmabuf_mmap(struct dma_buf *dmabuf,
+                               struct vm_area_struct *vma)
+{
+    struct camera_buffer *cbuf = dmabuf->priv;
+    unsigned long size = vma->vm_end - vma->vm_start;
+
+    if (size > cbuf->size)
+        return -EINVAL;
+
+    vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+    return remap_pfn_range(vma, vma->vm_start,
+                           PFN_DOWN(cbuf->dma_addr),
+                           size, vma->vm_page_prot);
+}
+
+/* vmap: çekirdek içi sanal adres eşlemesi */
+static int camera_dmabuf_vmap(struct dma_buf *dmabuf,
+                               struct iosys_map *map)
+{
+    struct camera_buffer *cbuf = dmabuf->priv;
+    iosys_map_set_vaddr(map, cbuf->vaddr);
+    return 0;
+}
+
+static void camera_dmabuf_release(struct dma_buf *dmabuf)
+{
+    struct camera_buffer *cbuf = dmabuf->priv;
+    /* Fiziksel belleği serbest bırak (CMA veya DMA coherent) */
+    dma_free_coherent(cbuf->dev, cbuf->size, cbuf->vaddr, cbuf->dma_addr);
+    kfree(cbuf);
+}
+
+static const struct dma_buf_ops camera_dmabuf_ops = {
+    .map_dma_buf    = camera_dmabuf_map,
+    .unmap_dma_buf  = camera_dmabuf_unmap,
+    .mmap           = camera_dmabuf_mmap,
+    .vmap           = camera_dmabuf_vmap,
+    .release        = camera_dmabuf_release,
+};
+
+/* Tampon oluşturma ve dışa aktarma */
+int camera_alloc_and_export(struct device *dev, size_t size, int *out_fd)
+{
+    struct camera_buffer *cbuf;
+    DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
+    struct dma_buf *dmabuf;
+    int fd;
+
+    cbuf = kzalloc(sizeof(*cbuf), GFP_KERNEL);
+    if (!cbuf)
+        return -ENOMEM;
+
+    cbuf->size = size;
+    cbuf->dev  = dev;
+
+    /* DMA coherent bellek tahsis et */
+    cbuf->vaddr = dma_alloc_coherent(dev, size,
+                                     &cbuf->dma_addr, GFP_KERNEL);
+    if (!cbuf->vaddr) {
+        kfree(cbuf);
+        return -ENOMEM;
+    }
+
+    exp_info.ops   = &camera_dmabuf_ops;
+    exp_info.size  = size;
+    exp_info.flags = O_CLOEXEC | O_RDWR;
+    exp_info.priv  = cbuf;
+
+    dmabuf = dma_buf_export(&exp_info);
+    if (IS_ERR(dmabuf)) {
+        dma_free_coherent(dev, size, cbuf->vaddr, cbuf->dma_addr);
+        kfree(cbuf);
+        return PTR_ERR(dmabuf);
+    }
+
+    cbuf->dmabuf = dmabuf;
+
+    fd = dma_buf_fd(dmabuf, O_CLOEXEC);
+    if (fd < 0) {
+        dma_buf_put(dmabuf);
+        return fd;
+    }
+
+    *out_fd = fd;
+    return 0;
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>dma_buf_ops</code>: map/unmap/mmap/vmap/release callback'leri zorunlu veya isteğe bağlı</li>
+      <li><code>dma_buf_export()</code> + <code>dma_buf_fd()</code> ile çekirdek nesnesi userspace fd'ye dönüştürülür</li>
+      <li><code>dma_alloc_coherent()</code> fiziksel ve sanal adresi birlikte tahsis eder</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> Importer Kullanımı</h2>
+  <p class="section-lead">Importer, başka bir sürücünün dışa aktardığı DMA-BUF tampona DMA erişimi gerçekleştiren sürücüdür. GPU veya video encoder tipik importer örnekleridir.</p>
+
+  <h3>Importer sürücü kodu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — encoder_dmabuf_importer.c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/dma-buf.h&gt;
+
+struct encoder_job {
+    struct dma_buf            *input_buf;
+    struct dma_buf_attachment *attachment;
+    struct sg_table           *sgt;
+    struct device             *dev;
+};
+
+int encoder_import_dmabuf(struct device *dev, int fd,
+                          struct encoder_job **out_job)
+{
+    struct encoder_job *job;
+    struct dma_buf *dmabuf;
+    int ret;
+
+    job = kzalloc(sizeof(*job), GFP_KERNEL);
+    if (!job)
+        return -ENOMEM;
+
+    /* fd'den struct dma_buf* al — referans sayacını artırır */
+    dmabuf = dma_buf_get(fd);
+    if (IS_ERR(dmabuf)) {
+        kfree(job);
+        return PTR_ERR(dmabuf);
+    }
+
+    job->input_buf = dmabuf;
+    job->dev       = dev;
+
+    /* Encoder cihazını tampona ekle */
+    job->attachment = dma_buf_attach(dmabuf, dev);
+    if (IS_ERR(job->attachment)) {
+        ret = PTR_ERR(job->attachment);
+        goto err_put;
+    }
+
+    /* DMA mapping al — encoder cihazı için scatter-gather tablosu */
+    job->sgt = dma_buf_map_attachment(job->attachment,
+                                      DMA_TO_DEVICE);
+    if (IS_ERR(job->sgt)) {
+        ret = PTR_ERR(job->sgt);
+        goto err_detach;
+    }
+
+    /* İlk sg entry'den DMA adresini al (CMA = tek parça) */
+    dma_addr_t input_addr = sg_dma_address(job->sgt->sgl);
+    dev_dbg(dev, "imported DMA-BUF: dma_addr=0x%llx size=%zu\n",
+            (u64)input_addr, dmabuf->size);
+
+    /* Encoder donanım register'ına yaz */
+    encoder_set_input_addr(dev, input_addr, dmabuf->size);
+
+    *out_job = job;
+    return 0;
+
+err_detach:
+    dma_buf_detach(dmabuf, job->attachment);
+err_put:
+    dma_buf_put(dmabuf);
+    kfree(job);
+    return ret;
+}
+
+void encoder_release_job(struct encoder_job *job)
+{
+    dma_buf_unmap_attachment(job->attachment, job->sgt, DMA_TO_DEVICE);
+    dma_buf_detach(job->input_buf, job->attachment);
+    dma_buf_put(job->input_buf);
+    kfree(job);
+}</code></pre>
+  </div>
+
+  <h3>DMA yön bayrakları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Bayrak</th><th>Anlam</th><th>Kullanım</th></tr></thead>
+      <tbody>
+        <tr><td><code>DMA_TO_DEVICE</code></td><td>CPU → Cihaz</td><td>Encoder giriş tamponu (CPU yazdı, encoder okuyacak)</td></tr>
+        <tr><td><code>DMA_FROM_DEVICE</code></td><td>Cihaz → CPU</td><td>Kamera çıkış tamponu (kamera yazdı, CPU okuyacak)</td></tr>
+        <tr><td><code>DMA_BIDIRECTIONAL</code></td><td>Her iki yön</td><td>Hem CPU hem cihaz okuyup yazacak</td></tr>
+        <tr><td><code>DMA_NONE</code></td><td>Veri yönü bilinmiyor</td><td>Debug/test; mümkünse kullanmayın</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">CACHE KOHERANSİ</div>
+    <p>CPU ve DMA aynı belleğe eriştiğinde cache senkronizasyonu kritiktir. <code>DMA_TO_DEVICE</code> mapping sırasında çekirdek otomatik <strong>cache flush</strong> yapar; <code>DMA_FROM_DEVICE</code> sırasında <strong>cache invalidate</strong> yapar. <code>dma_alloc_coherent()</code> ile tahsis edilen bellek hardware coherent olduğundan bu işlemler atlanabilir — ancak yavaş olabilir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>dma_buf_get() → attach() → map_attachment()</code> standart importer üçlüsü</li>
+      <li><code>sg_dma_address(sgt->sgl)</code> ile ilk parçanın DMA adresi alınır</li>
+      <li>Kullanım sonrası ters sırayla serbest bırakma: unmap → detach → put</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> CMA — Contiguous Memory Allocator</h2>
+  <p class="section-lead">CMA, büyük contiguous fiziksel bellek bloklarını garantili tahsis etmek için tasarlanmış bir Linux alt sistemidir. DMA-BUF exporters için en yaygın fiziksel bellek kaynağıdır.</p>
+
+  <h3>CMA neden gereklidir?</h3>
+  <p>Sistem ayaklandıktan sonra DRAM parçalanır. Normal <code>alloc_pages()</code> çağrıları 10–100 MB büyüklüğünde contiguous bellek bulamaz. CMA bu bölgeyi sistemin başından rezerve ederek kamera/GPU/codec için her zaman contiguous bellek garantisi verir.</p>
+
+  <h3>Device Tree konfigürasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts — reserved-memory</span><span class="dot">●</span></div>
+    <pre><code">/ {
+    reserved-memory {
+        #address-cells = &lt;2&gt;;
+        #size-cells    = &lt;2&gt;;
+        ranges;
+
+        /* Kamera + video codec için 128 MB CMA bölgesi */
+        linux,cma {
+            compatible = "shared-dma-pool";
+            reusable;               /* CMA: sistem tarafından geri kullanılabilir */
+            size = &lt;0x0 0x8000000&gt;; /* 128 MB */
+            alignment = &lt;0x0 0x400000&gt;; /* 4 MB hizalama */
+            linux,cma-default;      /* varsayılan CMA havuzu */
+        };
+
+        /* ISP için özel 64 MB sabit CMA */
+        isp_reserved: isp-memory@80000000 {
+            compatible = "shared-dma-pool";
+            reusable;
+            reg = &lt;0x0 0x80000000 0x0 0x4000000&gt;; /* 0x80000000..0x84000000 */
+        };
+    };
+
+    /* ISP sürücüsü bu özel havuzu kullanır */
+    isp@fe800000 {
+        compatible = "vendor,isp-v2";
+        memory-region = &lt;&amp;isp_reserved&gt;;
+        /* ... */
+    };
+};</code></pre>
+  </div>
+
+  <h3>Kernel konfigürasyon seçenekleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — kernel config</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># CMA için zorunlu kernel seçenekleri</span>
+CONFIG_CMA=y
+CONFIG_DMA_CMA=y
+CONFIG_CMA_SIZE_MBYTES=128      # Varsayılan CMA boyutu (MB)
+CONFIG_CMA_AREAS=7              # Maksimum CMA bölge sayısı
+
+<span class="cmt"># Kernel boot parametresiyle de ayarlanabilir</span>
+<span class="cmt"># /boot/cmdline.txt veya u-boot bootargs:</span>
+<span class="cmt"># cma=256M@0x40000000  — 256 MB, 1 GB offset'te</span>
+
+<span class="cmt"># DMA-BUF framework</span>
+CONFIG_DMABUF_HEAPS=y
+CONFIG_DMABUF_HEAPS_SYSTEM=y    # Sistem belleği heap
+CONFIG_DMABUF_HEAPS_CMA=y       # /dev/dma_heap/linux,cma</code></pre>
+  </div>
+
+  <h3>Kernel sürücüsünde CMA kullanımı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — cma_alloc.c</span><span class="dot">●</span></div>
+    <pre><code">#include &lt;linux/cma.h&gt;
+#include &lt;linux/dma-contiguous.h&gt;
+#include &lt;linux/of_reserved_mem.h&gt;
+
+static int mydev_probe(struct platform_device *pdev)
+{
+    struct device *dev = &pdev->dev;
+
+    /* Device Tree memory-region bağlaması (isp_reserved gibi özel bölge) */
+    int ret = of_reserved_mem_device_init(dev);
+    if (ret)
+        dev_warn(dev, "DT reserved-memory init failed: %d\n", ret);
+
+    /* CMA'dan contiguous fiziksel sayfa tahsis et */
+    size_t npages = (FRAME_SIZE + PAGE_SIZE - 1) >> PAGE_SHIFT;
+    struct page *pages = dma_alloc_from_contiguous(dev, npages, 0, GFP_KERNEL);
+    if (!pages)
+        return -ENOMEM;
+
+    phys_addr_t phys = page_to_phys(pages);
+    void *vaddr = page_address(pages);
+
+    dev_info(dev, "CMA allocated: phys=0x%llx virt=%p size=%zu\n",
+             (u64)phys, vaddr, FRAME_SIZE);
+
+    /* Kullanım sonrası serbest bırak */
+    dma_release_from_contiguous(dev, pages, npages);
+    return 0;
+}</code></pre>
+  </div>
+
+  <h3>Userspace DMA-BUF heap API — /dev/dma_heap</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — userspace_heap.c</span><span class="dot">●</span></div>
+    <pre><code">#include &lt;fcntl.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;linux/dma-heap.h&gt;
+
+int alloc_cma_dmabuf(size_t size)
+{
+    /* CMA heap cihaz dosyasını aç */
+    int heap_fd = open("/dev/dma_heap/linux,cma", O_RDONLY | O_CLOEXEC);
+    if (heap_fd &lt; 0) {
+        /* Sistem heap fallback */
+        heap_fd = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
+        if (heap_fd &lt; 0)
+            return -1;
+    }
+
+    struct dma_heap_allocation_data alloc = {
+        .len        = size,
+        .fd_flags   = O_RDWR | O_CLOEXEC,
+        .heap_flags = 0,
+    };
+
+    if (ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &alloc) &lt; 0) {
+        close(heap_fd);
+        return -1;
+    }
+
+    close(heap_fd);
+    return alloc.fd;   /* DMA-BUF file descriptor */
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>CMA, sistem başlangıcında büyük contiguous fiziksel bellek bloğunu rezerve eder</li>
+      <li>DT <code>reserved-memory</code> + <code>shared-dma-pool</code> ile sürücüye özel bölge tanımlanır</li>
+      <li><code>CONFIG_DMABUF_HEAPS_CMA=y</code> ile userspace <code>/dev/dma_heap/linux,cma</code> üzerinden erişebilir</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> Sürücüler Arası Paylaşım</h2>
+  <p class="section-lead">V4L2 kamera sürücüsünden DRM display sürücüsüne kadar uzanan sıfır kopyalı pipeline, DMA-BUF'un en güçlü kullanım senaryosudur.</p>
+
+  <h3>V4L2 DMABUF modu</h3>
+  <p>V4L2 sürücüleri üç tampon modu destekler: <code>MMAP</code>, <code>USERPTR</code> ve <code>DMABUF</code>. DMABUF modunda kernel tamponları doğrudan dışa aktarılır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — v4l2_dmabuf_export.c (userspace)</span><span class="dot">●</span></div>
+    <pre><code">#include &lt;linux/videodev2.h&gt;
+#include &lt;sys/ioctl.h&gt;
+
+/* V4L2 DMABUF tampon isteği */
+struct v4l2_requestbuffers req = {
+    .count  = 4,
+    .type   = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+    .memory = V4L2_MEMORY_DMABUF,
+};
+ioctl(v4l2_fd, VIDIOC_REQBUFS, &req);
+
+/* Her tampon için DMA-BUF fd al — VIDIOC_EXPBUF */
+for (int i = 0; i &lt; req.count; i++) {
+    struct v4l2_exportbuffer expbuf = {
+        .type  = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        .index = i,
+        .flags = O_CLOEXEC | O_RDWR,
+    };
+    ioctl(v4l2_fd, VIDIOC_EXPBUF, &expbuf);
+    dmabuf_fds[i] = expbuf.fd;
+    /* dmabuf_fds[i] artık DRM/encoder'a iletilebilir */
+}
+
+/* Tamponu kuyruğa ekle */
+struct v4l2_buffer buf = {
+    .type   = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+    .memory = V4L2_MEMORY_DMABUF,
+    .index  = 0,
+    .m.fd   = dmabuf_fds[0],
+};
+ioctl(v4l2_fd, VIDIOC_QBUF, &buf);</code></pre>
+  </div>
+
+  <h3>DRM — DMA-BUF importer (display)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — drm_dmabuf_import.c (userspace)</span><span class="dot">●</span></div>
+    <pre><code">#include &lt;xf86drm.h&gt;
+#include &lt;xf86drmMode.h&gt;
+#include &lt;drm/drm_fourcc.h&gt;
+
+/* V4L2'den alınan DMA-BUF fd'yi DRM'e aktar */
+uint32_t gem_handle;
+drmPrimeFDToHandle(drm_fd, dmabuf_fd, &gem_handle);
+
+/* GEM handle'dan framebuffer oluştur */
+uint32_t fb_id;
+uint32_t pitches[4]  = { width * 4 };
+uint32_t offsets[4]  = { 0 };
+uint64_t modifiers[4]= { DRM_FORMAT_MOD_LINEAR };
+uint32_t handles[4]  = { gem_handle };
+
+drmModeAddFB2WithModifiers(drm_fd, width, height,
+                           DRM_FORMAT_ARGB8888,
+                           handles, pitches, offsets,
+                           modifiers, &fb_id,
+                           DRM_MODE_FB_MODIFIERS);
+
+/* Framebuffer'ı doğrudan display plane'e ata */
+drmModeSetPlane(drm_fd, plane_id, crtc_id, fb_id, 0,
+                0, 0, width, height,
+                0, 0, width &lt;&lt; 16, height &lt;&lt; 16);</code></pre>
+  </div>
+
+  <h3>Kamera → Display pipeline özeti</h3>
+
+  <div class="flow">
+    <pre>V4L2 kamera sürücüsü
+  │ VIDIOC_EXPBUF → dmabuf_fd
+  │
+  ▼ userspace (fd geçişi — kopya YOK)
+  │
+DRM display sürücüsü
+  │ drmPrimeFDToHandle → gem_handle
+  │ drmModeAddFB2 → fb_id
+  │ drmModeSetPlane → direkt display
+
+Kamera DMA → Fiziksel tampon → Display DMA
+             (tek fiziksel adres, sıfır kopya)</pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>V4L2 DMABUF modu: <code>VIDIOC_REQBUFS(DMABUF)</code> + <code>VIDIOC_EXPBUF</code> ile fd alınır</li>
+      <li>DRM import: <code>drmPrimeFDToHandle()</code> fd → GEM handle dönüşümü</li>
+      <li>Userspace sadece fd iletir — gerçek veri kopyası hiç gerçekleşmez</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> Userspace Erişimi</h2>
+  <p class="section-lead">Userspace, DMA-BUF tamponlarına hem CPU erişimi (mmap) hem de senkronizasyon mekanizması (DMA_BUF_IOCTL_SYNC) aracılığıyla ulaşabilir.</p>
+
+  <h3>mmap ile CPU erişimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — userspace_mmap.c</span><span class="dot">●</span></div>
+    <pre><code">#include &lt;sys/mman.h&gt;
+#include &lt;linux/dma-buf.h&gt;
+
+/* DMA-BUF'u CPU'dan okumak için mmap */
+void *cpu_access_dmabuf(int dmabuf_fd, size_t size)
+{
+    /* DMA_BUF_IOCTL_SYNC: CPU erişimi öncesi cache flush */
+    struct dma_buf_sync sync_start = {
+        .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ,
+    };
+    ioctl(dmabuf_fd, DMA_BUF_IOCTL_SYNC, &sync_start);
+
+    void *ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                     MAP_SHARED, dmabuf_fd, 0);
+    if (ptr == MAP_FAILED)
+        return NULL;
+
+    /* Tampon içeriğini CPU'dan oku */
+    uint8_t first_pixel[4];
+    memcpy(first_pixel, ptr, 4);
+    printf("R=%u G=%u B=%u A=%u\n",
+           first_pixel[0], first_pixel[1],
+           first_pixel[2], first_pixel[3]);
+
+    /* CPU erişimi bitti — cache sync */
+    struct dma_buf_sync sync_end = {
+        .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ,
+    };
+    ioctl(dmabuf_fd, DMA_BUF_IOCTL_SYNC, &sync_end);
+
+    munmap(ptr, size);
+    return ptr;  /* gerçekte munmap sonrası geçersiz */
+}</code></pre>
+  </div>
+
+  <h3>DMA_BUF_IOCTL_SYNC bayrakları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Bayrak kombinasyonu</th><th>Anlam</th></tr></thead>
+      <tbody>
+        <tr><td><code>SYNC_START | SYNC_READ</code></td><td>CPU okuyacak — DMA→CPU cache invalidate</td></tr>
+        <tr><td><code>SYNC_START | SYNC_WRITE</code></td><td>CPU yazacak — DMA→CPU cache invalidate</td></tr>
+        <tr><td><code>SYNC_START | SYNC_RW</code></td><td>CPU hem okuyup hem yazacak</td></tr>
+        <tr><td><code>SYNC_END | SYNC_WRITE</code></td><td>CPU yazmayı bitirdi — CPU→DMA cache flush</td></tr>
+        <tr><td><code>SYNC_END | SYNC_READ</code></td><td>CPU okumayı bitirdi</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">ÖNEMLI</div>
+    <p>DMA_BUF_IOCTL_SYNC'i atlamak <strong>cache inkoherens</strong> sorunlarına yol açar: GPU'nun yazdığı veri CPU'ya görünmez veya CPU'nun yazdığı veri DMA cihazına ulaşmaz. ARM big.LITTLE SoC'larda bu hata aralıklı, tekrarlanamaz hatalara neden olur.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>mmap(dmabuf_fd, ...)</code> ile CPU'dan doğrudan DMA tamponuna erişim sağlanır</li>
+      <li><code>DMA_BUF_IOCTL_SYNC</code> SYNC_START ve SYNC_END etrafında zorunludur</li>
+      <li>Cache inkoherens sorunlarını önlemek için erişim yönü (READ/WRITE) doğru belirtilmeli</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> Pratik: Kamera → GPU Sıfır Kopya Pipeline</h2>
+  <p class="section-lead">V4L2 kamera yakalama → DMA-BUF fd → OpenGL ES texture yükleme. Fiziksel tampon boyunca tek kopya gerçekleşmez.</p>
+
+  <h3>Sistem konfigürasyonu</h3>
+
+  <div class="flow">
+    <pre>Raspberry Pi 5 — kamera modülü + OpenGL ES (Mesa V3D)
+
+[libcamera/V4L2] → DMA-BUF fd → [EGL/OpenGL ES]
+     │                                   │
+     └── aynı fiziksel tampon ───────────┘
+           (DRAM üzerinde tek kopya)</pre>
+  </div>
+
+  <h3>Adım 1 — V4L2 DMABUF tamponu kur</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — camera_pipeline.c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/videodev2.h&gt;
+#include &lt;EGL/egl.h&gt;
+#include &lt;EGL/eglext.h&gt;
+#include &lt;GLES2/gl2.h&gt;
+#include &lt;GLES2/gl2ext.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;sys/ioctl.h&gt;
+
+#define WIDTH  1920
+#define HEIGHT 1080
+#define NUM_BUFS 4
+
+int dmabuf_fds[NUM_BUFS];
+int v4l2_fd;
+
+void setup_camera_dmabuf(void)
+{
+    v4l2_fd = open("/dev/video0", O_RDWR | O_NONBLOCK);
+
+    struct v4l2_format fmt = {
+        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        .fmt.pix = {
+            .width       = WIDTH,
+            .height      = HEIGHT,
+            .pixelformat = V4L2_PIX_FMT_NV12,
+            .field       = V4L2_FIELD_NONE,
+        },
+    };
+    ioctl(v4l2_fd, VIDIOC_S_FMT, &fmt);
+
+    struct v4l2_requestbuffers req = {
+        .count  = NUM_BUFS,
+        .type   = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        .memory = V4L2_MEMORY_MMAP,
+    };
+    ioctl(v4l2_fd, VIDIOC_REQBUFS, &req);
+
+    for (int i = 0; i &lt; NUM_BUFS; i++) {
+        struct v4l2_exportbuffer expbuf = {
+            .type  = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+            .index = i,
+            .flags = O_CLOEXEC | O_RDONLY,
+        };
+        ioctl(v4l2_fd, VIDIOC_EXPBUF, &expbuf);
+        dmabuf_fds[i] = expbuf.fd;
+
+        struct v4l2_buffer buf = {
+            .type   = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+            .memory = V4L2_MEMORY_MMAP,
+            .index  = i,
+        };
+        ioctl(v4l2_fd, VIDIOC_QBUF, &buf);
+    }
+
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    ioctl(v4l2_fd, VIDIOC_STREAMON, &type);
+}</code></pre>
+  </div>
+
+  <h3>Adım 2 — EGL DMA-BUF texture import</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — egl_dmabuf_texture.c</span><span class="dot">●</span></div>
+    <pre><code>PFNEGLCREATEIMAGEKHRPROC      eglCreateImageKHR;
+PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES;
+
+GLuint import_dmabuf_as_texture(EGLDisplay dpy, int dmabuf_fd,
+                                 int width, int height)
+{
+    EGLint attribs[] = {
+        EGL_WIDTH,                      width,
+        EGL_HEIGHT,                     height,
+        EGL_LINUX_DRM_FOURCC_EXT,       DRM_FORMAT_NV12,
+        EGL_DMA_BUF_PLANE0_FD_EXT,      dmabuf_fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT,  0,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT,   width,
+        EGL_DMA_BUF_PLANE1_FD_EXT,      dmabuf_fd,
+        EGL_DMA_BUF_PLANE1_OFFSET_EXT,  width * height,
+        EGL_DMA_BUF_PLANE1_PITCH_EXT,   width,
+        EGL_NONE
+    };
+
+    EGLImage image = eglCreateImageKHR(dpy, EGL_NO_CONTEXT,
+                                       EGL_LINUX_DMA_BUF_EXT,
+                                       NULL, attribs);
+
+    GLuint texture;
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, texture);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    /* DMA-BUF fiziksel bellek GPU texture'ına bağlandı — sıfır kopya */
+    glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, image);
+
+    eglDestroyImageKHR(dpy, image);
+    return texture;
+}</code></pre>
+  </div>
+
+  <h3>Adım 3 — Render döngüsü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — render_loop.c</span><span class="dot">●</span></div>
+    <pre><code>void render_loop(EGLDisplay dpy)
+{
+    GLuint textures[NUM_BUFS] = {0};
+
+    while (1) {
+        struct v4l2_buffer buf = {
+            .type   = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+            .memory = V4L2_MEMORY_MMAP,
+        };
+        ioctl(v4l2_fd, VIDIOC_DQBUF, &buf);
+
+        if (!textures[buf.index])
+            textures[buf.index] = import_dmabuf_as_texture(
+                dpy, dmabuf_fds[buf.index], WIDTH, HEIGHT);
+
+        /* Render — kamera verisi doğrudan GPU'da, kopya yok */
+        draw_fullscreen_quad(textures[buf.index]);
+        eglSwapBuffers(dpy, egl_surface);
+
+        ioctl(v4l2_fd, VIDIOC_QBUF, &buf);
+    }
+}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">SONUÇ</div>
+    <p>1920x1080 NV12 frame = 3.1 MB. 60fps'de geleneksel kopya yaklaşımı <strong>186 MB/s</strong> gereksiz bant genişliği tüketir. DMA-BUF pipeline'da kamera → GPU veri hareketi <strong>sıfırdır</strong>; aynı fiziksel sayfa her iki donanım biriminden erişilir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>V4L2 <code>VIDIOC_EXPBUF</code> ile kamera tampon fd'si alınır</li>
+      <li><code>EGL_LINUX_DMA_BUF_EXT</code> ile DMA-BUF doğrudan GPU texture'ına import edilir</li>
+      <li><code>glEGLImageTargetTexture2DOES</code> sıfır kopyalı bağlamayı tamamlar</li>
+      <li>60fps@1080p için 186 MB/s bant genişliği tasarrufu sağlanır</li>
+    </ul>
+  </div>
+</section>
+
+</main>

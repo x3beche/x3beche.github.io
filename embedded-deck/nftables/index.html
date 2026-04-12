@@ -1,0 +1,855 @@
+---
+layout: tutorial
+title: "nftables — Linux Güvenlik Duvarı"
+back_url: "../index.html"
+back_label: "embedded-deck"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>LİNUX NETWORK / NFTABLES</span>
+    <span>GÜVENLİK DUVARI</span>
+    <span>2026</span>
+  </div>
+  <h1>nftables<br><em>Linux'un modern güvenlik duvarı.</em></h1>
+  <p class="subtitle">iptables'ın halefi, birleşik netfilter ön yüzü — tek syntax ile IPv4/IPv6/ARP/bridge filtreleme, NAT, sets ve maps. IoT gateway'den edge sunucuya kadar tam rehber.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">nftables nedir?</a></li>
+    <li><a href="#s1">Temel kavramlar</a></li>
+    <li><a href="#s2">nft syntax</a></li>
+    <li><a href="#s3">Temel kural yazımı</a></li>
+    <li><a href="#s4">NAT</a></li>
+    <li><a href="#s5">Sets ve maps</a></li>
+    <li><a href="#s6">Gömülü güvenlik politikası</a></li>
+    <li><a href="#s7">Pratik: IoT gateway güvenlik duvarı</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> nftables nedir?</h2>
+  <p class="section-lead">nftables, Linux kernel 3.13'te tanıtılan ve iptables, ip6tables, arptables ile ebtables'ın yerini alan modern netfilter ön yüzüdür. Tekil bir araç (<code>nft</code>) ile tüm protokol ailelerini yönetebilir, daha güçlü eşleştirme mekanizmaları ve JIT derlemeli kural işleme sunar.</p>
+
+  <h3>iptables vs nftables</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>iptables</th><th>nftables</th></tr></thead>
+      <tbody>
+        <tr><td>Kernel versiyonu</td><td>2.4+</td><td>3.13+</td></tr>
+        <tr><td>Araç</td><td>iptables, ip6tables, arptables, ebtables</td><td>nft (tek araç)</td></tr>
+        <tr><td>IPv4/IPv6</td><td>Ayrı tablolar</td><td>Tek tabloda <code>inet</code> ailesi</td></tr>
+        <tr><td>Kural değerlendirme</td><td>Linear tarama</td><td>Sets/maps ile O(1) lookup</td></tr>
+        <tr><td>Atomik güncelleme</td><td>Kısıtlı</td><td>Transaction tabanlı — tüm set tek işlem</td></tr>
+        <tr><td>Durum</td><td>Legacy (maintenance mode)</td><td>Aktif geliştirme, önerilen</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Mimari</h3>
+
+  <div class="flow">
+    <pre>
+  Kullanıcı alanı:   nft CLI
+                          │
+  Kernel alanı:     netlink socket
+                          │
+                    nf_tables subsystem
+                          │
+           ┌──────────────┼──────────────────┐
+           │              │                  │
+       ip table       ip6 table          inet table
+      (IPv4 only)   (IPv6 only)       (IPv4 + IPv6)
+           │
+    ┌──────┼──────┐
+    │      │      │
+ input  forward output  (+ prerouting, postrouting)
+    </pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">GEÇİŞ NOTU</div>
+    <p>Debian 10+, Ubuntu 20.04+, Fedora 18+ ve RHEL 8+ sistemlerde nftables varsayılan güvenlik duvarı altyapısı haline geldi. <code>iptables-nft</code> wrapper'ı sayesinde eski iptables komutları nftables backend üzerinde çalışır. Yeni projeler için doğrudan nft syntax kullanın.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>nftables = iptables + ip6tables + arptables + ebtables yerini alıyor</li>
+      <li>Tek nft CLI, tüm protokol aileleri, inet = IPv4+IPv6 ortak tablo</li>
+      <li>Sets/maps ile O(1) kural araması; atomik ruleset güncellemeleri</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Temel kavramlar</h2>
+  <p class="section-lead">nftables'ın veri modeli: table → chain → rule hiyerarşisi ve her katmanın rolü. Hook noktaları paketin kernel içindeki yolculuğunu belirler.</p>
+
+  <h3>Nesne hiyerarşisi</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Table</span><span class="desc">En üst düzey kapsayıcı. Protokol ailesi (ip, ip6, inet, arp, bridge) ve isme göre tanımlanır. Örn: <code>table inet filter</code></span></div>
+    <div class="param"><span class="name">Chain</span><span class="desc">Kuralların sıralı listesi. Base chain (hook'a bağlı) veya regular chain (goto/jump hedefi) olabilir. Priority ile değerlendirme sırası belirlenir.</span></div>
+    <div class="param"><span class="name">Rule</span><span class="desc">Eşleştirme ifadeleri + eylem. Örn: <code>ip saddr 192.168.1.1 drop</code></span></div>
+    <div class="param"><span class="name">Set</span><span class="desc">IP adresi, port veya başka değerler kümesi. Named set ile kural içinden referans alınır. Dinamik güncelleme destekli.</span></div>
+    <div class="param"><span class="name">Map</span><span class="desc">Anahtar-değer çifti. Lookup ile aksiyon seçimi veya değer dönüşümü — DNAT hedef mapping için ideal.</span></div>
+  </div>
+
+  <h3>Netfilter hook noktaları</h3>
+
+  <div class="flow">
+    <pre>
+  Gelen paket
+       │
+  [prerouting]   ← DNAT burada yapılır
+       │
+  Routing kararı
+       ├──── Yerel süreç için ──────► [input] ──► Uygulama
+       │
+       └──── Forward ────────────► [forward] ──► [postrouting] ──► Çıkış
+                                                      ↑
+                                              [output] (yerel çıkan)
+    </pre>
+  </div>
+
+  <h3>Chain türleri ve priority</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Hook</th><th>Yön</th><th>Tipik priority</th><th>Kullanım</th></tr></thead>
+      <tbody>
+        <tr><td>prerouting</td><td>Gelen, routing öncesi</td><td>-100 (raw), 0 (filter), 100 (mangle)</td><td>DNAT, connection tracking</td></tr>
+        <tr><td>input</td><td>Gelen, yerel</td><td>0 (filter)</td><td>Gelen bağlantı filtreleme</td></tr>
+        <tr><td>forward</td><td>Transit</td><td>0 (filter)</td><td>Router/gateway kural</td></tr>
+        <tr><td>output</td><td>Çıkan, yerel</td><td>0 (filter)</td><td>Çıkan trafik kısıtlama</td></tr>
+        <tr><td>postrouting</td><td>Çıkan, routing sonrası</td><td>100 (nat)</td><td>SNAT, MASQUERADE</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>table → chain → rule hiyerarşisi; her katman bağımsız isimlendirme</li>
+      <li>Base chain hook'a bağlı; priority = değerlendirme sırası (küçük = önce)</li>
+      <li>Set ve map: O(1) lookup ile büyük IP/port listelerini verimli yönet</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> nft syntax</h2>
+  <p class="section-lead"><code>nft</code> komutunun genel sözdizimi ve temel işlemler: table/chain/rule ekleme, silme, listeleme ve yapılandırma dosyasından yükleme.</p>
+
+  <h3>Temel nft komutları</h3>
+
+  <pre><code><span class="cmt"># Tüm ruleset'i göster</span>
+nft list ruleset
+
+<span class="cmt"># Belirli bir tabloyu göster</span>
+nft list table inet filter
+
+<span class="cmt"># Table oluştur</span>
+nft add table inet filter
+
+<span class="cmt"># Chain oluştur (base chain — hook'a bağlı)</span>
+nft add chain inet filter input \
+    '{ type filter hook input priority 0; policy drop; }'
+
+<span class="cmt"># Chain oluştur (regular chain)</span>
+nft add chain inet filter check_ssh
+
+<span class="cmt"># Kural ekle (chain'in sonuna)</span>
+nft add rule inet filter input \
+    ct state established,related accept
+
+<span class="cmt"># Kural ekle (chain'in başına)</span>
+nft insert rule inet filter input \
+    iif lo accept
+
+<span class="cmt"># Tüm kuralları sil</span>
+nft flush ruleset
+
+<span class="cmt"># Tabloyu sil (içindeki tüm chain+rule ile)</span>
+nft delete table inet filter
+</code></pre>
+
+  <h3>Yapılandırma dosyası kullanımı</h3>
+
+  <pre><code><span class="cmt"># /etc/nftables.conf — systemd tarafından yüklenir</span>
+<span class="cmt"># Dosyadan yükle</span>
+nft -f /etc/nftables.conf
+
+<span class="cmt"># Sözdizimi kontrolü (uygulamadan)</span>
+nft -c -f /etc/nftables.conf
+
+<span class="cmt"># Mevcut ruleset'i dosyaya kaydet</span>
+nft list ruleset &gt; /etc/nftables.conf
+
+<span class="cmt"># systemd ile başlangıçta yükle</span>
+systemctl enable nftables
+systemctl start  nftables
+</code></pre>
+
+  <h3>nftables.conf yapısı</h3>
+
+  <pre><code>#!/usr/sbin/nft -f
+<span class="cmt"># /etc/nftables.conf</span>
+
+<span class="cmt"># Önceki kuralları temizle</span>
+flush ruleset
+
+table inet filter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+
+        <span class="cmt"># Loopback</span>
+        iif "lo" accept
+
+        <span class="cmt"># Kurulu bağlantılar</span>
+        ct state { established, related } accept
+
+        <span class="cmt"># Geçersiz paketleri düşür</span>
+        ct state invalid drop
+
+        <span class="cmt"># SSH</span>
+        tcp dport 22 accept
+
+        <span class="cmt"># ICMP (ping)</span>
+        ip protocol icmp accept
+        ip6 nexthdr icmpv6 accept
+    }
+
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority 0; policy accept;
+    }
+}
+</code></pre>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>nft list ruleset: mevcut tüm kuralları görüntüle</li>
+      <li>nft -f dosya: atomik olarak tüm ruleset'i uygula</li>
+      <li>policy drop: default reddet — yalnızca açıkça izin verilenler geçer</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Temel kural yazımı</h2>
+  <p class="section-lead">IP adresi, port ve bağlantı durumu eşleştirme ifadeleri — nftables kural sözdiziminin yapı taşları.</p>
+
+  <h3>IP adresi eşleştirme</h3>
+
+  <pre><code><span class="cmt"># Kaynak IP'ye göre drop</span>
+nft add rule inet filter input ip saddr 10.0.0.5 drop
+
+<span class="cmt"># Hedef IP'ye göre kabul</span>
+nft add rule inet filter input ip daddr 192.168.1.1 accept
+
+<span class="cmt"># Subnet eşleştirme</span>
+nft add rule inet filter input ip saddr 192.168.0.0/16 accept
+
+<span class="cmt"># IPv6 eşleştirme</span>
+nft add rule inet filter input ip6 saddr 2001:db8::/32 drop
+
+<span class="cmt"># inet: hem IPv4 hem IPv6</span>
+nft add rule inet filter input ip saddr 10.0.0.0/8 log prefix "RFC1918: " drop
+</code></pre>
+
+  <h3>Port ve protokol eşleştirme</h3>
+
+  <pre><code><span class="cmt"># TCP port</span>
+nft add rule inet filter input tcp dport 80 accept
+nft add rule inet filter input tcp dport 443 accept
+
+<span class="cmt"># Port aralığı</span>
+nft add rule inet filter input tcp dport 8000-8080 accept
+
+<span class="cmt"># Port listesi (küme)</span>
+nft add rule inet filter input tcp dport { 22, 80, 443, 8443 } accept
+
+<span class="cmt"># UDP</span>
+nft add rule inet filter input udp dport 51820 accept   <span class="cmt"># WireGuard</span>
+nft add rule inet filter input udp dport 53 accept      <span class="cmt"># DNS</span>
+
+<span class="cmt"># Kaynak + hedef port kombinasyonu</span>
+nft add rule inet filter input \
+    ip saddr 192.168.1.0/24 tcp dport { 22, 443 } accept
+</code></pre>
+
+  <h3>Bağlantı durumu (ct state)</h3>
+
+  <pre><code"><span class="cmt"># Stateful firewall — temel şablon</span>
+table inet filter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+
+        <span class="cmt"># Kurulu ve ilişkili bağlantılar her zaman geçer</span>
+        ct state { established, related } accept
+
+        <span class="cmt"># Geçersiz paket (bozuk durum tablosu)</span>
+        ct state invalid counter drop
+
+        <span class="cmt"># Yeni bağlantı — port bazlı izin</span>
+        ct state new tcp dport 22 accept
+        ct state new tcp dport { 80, 443 } accept
+        ct state new udp dport 51820 accept
+
+        <span class="cmt"># ICMP: rate limit ile flood koruması</span>
+        ip protocol icmp limit rate 10/second accept
+        ip6 nexthdr icmpv6 limit rate 10/second accept
+
+        <span class="cmt"># Gerisi: log ve drop</span>
+        counter log prefix "INPUT DROP: " drop
+    }
+}
+</code></pre>
+
+  <h3>Eylemler</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Eylem</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td><code>accept</code></td><td>Paketi kabul et, chain değerlendirmesini durdur</td></tr>
+        <tr><td><code>drop</code></td><td>Paketi sessizce düşür — gönderene bildirim yok</td></tr>
+        <tr><td><code>reject</code></td><td>Paketi reddet + ICMP unreachable/TCP reset gönder</td></tr>
+        <tr><td><code>reject with icmp type port-unreachable</code></td><td>ICMP port unreachable ile reddet</td></tr>
+        <tr><td><code>log prefix "TEXT " level info</code></td><td>Kernel log'a yaz (dmesg/journalctl)</td></tr>
+        <tr><td><code>counter</code></td><td>Eşleşen paket/byte sayacı — sonraki eylemle birleşir</td></tr>
+        <tr><td><code>goto chain_name</code></td><td>Başka chain'e git — geri dönüş yok</td></tr>
+        <tr><td><code>jump chain_name</code></td><td>Başka chain'e dal — zincir bitince geri döner</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>ct state established,related: stateful firewall temeli — her zaman ilk kurala koy</li>
+      <li>Küme sözdizimi { 80, 443 }: birden fazla değeri tek kuralla eşleştir</li>
+      <li>counter + log: izleme ve hata ayıklama için birlikte kullan</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> NAT</h2>
+  <p class="section-lead">nftables NAT kuralları, <code>ip nat</code> tablosu (veya <code>inet nat</code>) altında prerouting ve postrouting chain'lerinde tanımlanır. MASQUERADE, SNAT, DNAT ve port forwarding örnekleri.</p>
+
+  <h3>MASQUERADE — dinamik SNAT</h3>
+
+  <pre><code">flush ruleset
+
+table ip nat {
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+
+        <span class="cmt"># eth0 üzerinden çıkan tüm trafiği masquerade et</span>
+        <span class="cmt"># (dinamik IP için SNAT alternatifi)</span>
+        oifname "eth0" masquerade
+    }
+}
+
+table inet filter {
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+
+        <span class="cmt"># LAN'dan WAN'a forward</span>
+        iifname "eth1" oifname "eth0" ct state new,established,related accept
+        iifname "eth0" oifname "eth1" ct state established,related accept
+    }
+}
+</code></pre>
+
+  <h3>SNAT — sabit kaynak IP</h3>
+
+  <pre><code"><span class="cmt"># Sabit IP'li SNAT (MASQUERADE yerine — performans daha iyi)</span>
+table ip nat {
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+        oifname "eth0" snat to 203.0.113.5
+    }
+}
+</code></pre>
+
+  <h3>DNAT — port forwarding</h3>
+
+  <pre><code">table ip nat {
+    chain prerouting {
+        type nat hook prerouting priority -100; policy accept;
+
+        <span class="cmt"># Dış port 2222 → iç sunucu SSH (22)</span>
+        iifname "eth0" tcp dport 2222 dnat to 192.168.1.10:22
+
+        <span class="cmt"># HTTP forward — iç web sunucusuna</span>
+        iifname "eth0" tcp dport 80 dnat to 192.168.1.20:80
+
+        <span class="cmt"># UDP port forward (örn. TFTP)</span>
+        iifname "eth0" udp dport 69 dnat to 192.168.1.30:69
+    }
+}
+</code></pre>
+
+  <h3>WireGuard ile NAT — tam örnek</h3>
+
+  <pre><code">flush ruleset
+
+table inet filter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iif "lo" accept
+        ct state { established, related } accept
+        ct state invalid drop
+        tcp dport 22 accept
+        udp dport 51820 accept           <span class="cmt"># WireGuard</span>
+        ip protocol icmp accept
+    }
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+        iifname "wg0" accept             <span class="cmt"># VPN'den gelen forward</span>
+        oifname "wg0" ct state established,related accept
+    }
+}
+
+table ip nat {
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+        oifname "eth0" masquerade        <span class="cmt"># VPN istemcileri internete çıkar</span>
+    }
+}
+</code></pre>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>MASQUERADE: dinamik IP (DHCP) için; SNAT: sabit IP için daha verimli</li>
+      <li>DNAT prerouting'de yapılır; forward chain'de izin kuralı da gereklidir</li>
+      <li>WireGuard + NAT: wg0 forward + eth0 MASQUERADE kombinasyonu</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Sets ve maps</h2>
+  <p class="section-lead">nftables set'leri, IP adresleri veya portların gruplandırılmasını sağlar. Map'ler ise anahtar-değer eşleştirmesi yaparak DNAT hedeflerini veya counter gruplarını dinamik yönetmeye olanak tanır.</p>
+
+  <h3>Named set — IP whitelist</h3>
+
+  <pre><code">table inet filter {
+    <span class="cmt"># Tanımlı IP seti</span>
+    set admin_hosts {
+        type ipv4_addr
+        flags constant
+        elements = {
+            192.168.1.10,
+            192.168.1.11,
+            10.10.0.1
+        }
+    }
+
+    <span class="cmt"># Dinamik engel listesi (çalışma zamanında güncellenebilir)</span>
+    set blocklist {
+        type ipv4_addr
+        flags dynamic, timeout
+        timeout 1h              <span class="cmt"># 1 saat sonra otomatik temizlenir</span>
+        gc-interval 5m
+    }
+
+    chain input {
+        type filter hook input priority 0; policy drop;
+
+        <span class="cmt"># Whitelist'ten gelen SSH kabul</span>
+        ip saddr @admin_hosts tcp dport 22 accept
+
+        <span class="cmt"># Blocklist'ten gelen her şeyi düşür</span>
+        ip saddr @blocklist drop
+    }
+}
+
+<span class="cmt"># Çalışma zamanında set güncellemesi</span>
+nft add element inet filter blocklist { 1.2.3.4, 5.6.7.8 }
+nft delete element inet filter blocklist { 1.2.3.4 }
+nft list set inet filter blocklist
+</code></pre>
+
+  <h3>Interval set — subnet kümesi</h3>
+
+  <pre><code">table inet filter {
+    set rfc1918 {
+        type ipv4_addr
+        flags interval
+        elements = {
+            10.0.0.0/8,
+            172.16.0.0/12,
+            192.168.0.0/16
+        }
+    }
+
+    chain input {
+        type filter hook input priority 0; policy drop;
+        <span class="cmt"># RFC1918 adresleri sadece iç arayüzden kabul</span>
+        ip saddr @rfc1918 iifname "eth1" accept
+        ip saddr @rfc1918 iifname "eth0" drop
+    }
+}
+</code></pre>
+
+  <h3>Map — DNAT hedef mapping</h3>
+
+  <pre><code">table ip nat {
+    <span class="cmt"># Port → iç sunucu IP:port eşleştirmesi</span>
+    map port_forward {
+        type inet_service : ipv4_addr . inet_service
+        elements = {
+            2222 : 192.168.1.10 . 22,   <span class="cmt"># SSH</span>
+            8080 : 192.168.1.20 . 80,   <span class="cmt"># Web</span>
+            8443 : 192.168.1.20 . 443,  <span class="cmt"># HTTPS</span>
+        }
+    }
+
+    chain prerouting {
+        type nat hook prerouting priority -100; policy accept;
+        <span class="cmt"># Map'ten DNAT hedefini al</span>
+        iifname "eth0" tcp dport map @port_forward dnat to
+    }
+}
+</code></pre>
+
+  <h3>Port knocking — state machine</h3>
+
+  <pre><code">table inet filter {
+    <span class="cmt"># Port knocking için durum takibi</span>
+    set knock1 {
+        type ipv4_addr; flags dynamic, timeout; timeout 10s;
+    }
+    set knock2 {
+        type ipv4_addr; flags dynamic, timeout; timeout 10s;
+    }
+    set allowed_ssh {
+        type ipv4_addr; flags dynamic, timeout; timeout 60s;
+    }
+
+    chain input {
+        type filter hook input priority 0; policy drop;
+
+        <span class="cmt"># Açık olan SSH erişimine izin ver</span>
+        ip saddr @allowed_ssh tcp dport 22 accept
+
+        <span class="cmt"># Port knock sekansı: 7000 → 8000 → SSH açık</span>
+        tcp dport 7000 add @knock1 { ip saddr }
+        ip saddr @knock1 tcp dport 8000 add @allowed_ssh { ip saddr }
+
+        ct state { established, related } accept
+    }
+}
+</code></pre>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Named set: IP listesi tek yerde tanımla, birden fazla kuralta kullan</li>
+      <li>flags dynamic + timeout: çalışma zamanında eklenip otomatik silinen set</li>
+      <li>Map ile DNAT: port → hedef eşleştirmesi, kural sayısını dramatik azaltır</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Gömülü güvenlik politikası</h2>
+  <p class="section-lead">Kaynak kısıtlı gömülü sistemler için minimal ama güçlü güvenlik duvarı politikası: default drop, stateful firewall, rate limiting ve flood koruması.</p>
+
+  <h3>Default drop politikası</h3>
+
+  <pre><code">flush ruleset
+
+table inet filter {
+    chain input {
+        type filter hook input priority 0;
+        <span class="cmt"># Default: DROP — yalnızca açıkça izin verilenler geçer</span>
+        policy drop;
+
+        <span class="cmt"># 1. Loopback — hiçbir zaman engelleme</span>
+        iif lo accept
+
+        <span class="cmt"># 2. Kurulu bağlantılar — performans için en başta</span>
+        ct state established,related accept
+
+        <span class="cmt"># 3. Geçersiz — hemen düşür</span>
+        ct state invalid drop
+
+        <span class="cmt"># 4. Servis kuralları (platforma göre özelleştir)</span>
+        tcp dport 22 accept          <span class="cmt"># SSH yönetim</span>
+        udp dport 51820 accept       <span class="cmt"># WireGuard VPN</span>
+
+        <span class="cmt"># 5. ICMP — rate limit ile</span>
+        ip  protocol   icmp   icmp type echo-request limit rate 5/second accept
+        ip6 nexthdr    icmpv6 icmpv6 type echo-request limit rate 5/second accept
+        <span class="cmt"># ICMPv6 ND gerekli (Neighbor Discovery)</span>
+        ip6 nexthdr icmpv6 icmpv6 type {
+            nd-neighbor-solicit, nd-neighbor-advert,
+            nd-router-solicit,   nd-router-advert
+        } accept
+    }
+
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority 0; policy accept;
+    }
+}
+</code></pre>
+
+  <h3>Rate limiting — brute force koruması</h3>
+
+  <pre><code">table inet filter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iif lo accept
+        ct state established,related accept
+        ct state invalid drop
+
+        <span class="cmt"># SSH brute force koruması</span>
+        <span class="cmt"># Dakikada 3'ten fazla yeni SSH bağlantısı: log ve drop</span>
+        tcp dport 22 ct state new \
+            limit rate over 3/minute burst 5 packets \
+            log prefix "SSH BRUTE: " level warn drop
+
+        tcp dport 22 ct state new accept
+
+        <span class="cmt"># HTTP flood koruması</span>
+        tcp dport { 80, 443 } ct state new \
+            limit rate over 100/second burst 200 packets drop
+
+        tcp dport { 80, 443 } accept
+
+        <span class="cmt"># ICMP flood (ping flood)</span>
+        ip protocol icmp \
+            limit rate over 10/second burst 20 packets drop
+        ip protocol icmp accept
+    }
+}
+</code></pre>
+
+  <h3>SYN flood koruması</h3>
+
+  <pre><code">table inet filter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iif lo accept
+        ct state established,related accept
+
+        <span class="cmt"># SYN flood — TCP SYN paketleri için rate limit</span>
+        tcp flags syn tcp dport { 80, 443 } \
+            limit rate over 200/second burst 500 packets \
+            log prefix "SYN FLOOD: " drop
+
+        <span class="cmt"># Geçersiz TCP bayrakları</span>
+        tcp flags &amp; (fin|syn|rst|psh|ack|urg) == 0x0 drop  <span class="cmt"># NULL scan</span>
+        tcp flags &amp; (fin|syn) == (fin|syn) drop             <span class="cmt"># XMAS scan</span>
+
+        ct state new tcp dport { 22, 80, 443 } accept
+        ip protocol icmp accept
+    }
+}
+</code></pre>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>policy drop = whitelist modeli; tüm bilinmeyenler bloke edilir</li>
+      <li>limit rate over: eşiği aşan trafiği drop et; burst ile kısa spike'lara tolerans</li>
+      <li>TCP bayrak kontrolü: NULL ve XMAS scan gibi port tarama tekniklerini engelle</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Pratik: IoT gateway güvenlik duvarı</h2>
+  <p class="section-lead">WAN (eth0), LAN (eth1) ve WireGuard VPN (wg0) arayüzleri olan bir IoT gateway için tam nftables yapılandırması: NAT, rate limit, port forward ve WireGuard entegrasyonu.</p>
+
+  <h3>Ağ topolojisi</h3>
+
+  <div class="flow">
+    <pre>
+  İnternet
+     │
+  eth0 (WAN — DHCP, dinamik IP)
+     │
+  ┌──┴──────────────────────────────────┐
+  │  IoT Gateway                         │
+  │  nftables güvenlik duvarı             │
+  └──┬──────────────────┬────────────────┘
+     │                  │
+  eth1 (LAN)         wg0 (VPN)
+  192.168.2.0/24    10.10.0.0/24
+  IoT cihazları     Uzak yönetim
+    </pre>
+  </div>
+
+  <h3>Tam gateway nftables.conf</h3>
+
+  <pre><code">#!/usr/sbin/nft -f
+<span class="cmt"># /etc/nftables.conf — IoT Gateway güvenlik duvarı</span>
+
+flush ruleset
+
+<span class="cmt"># ─── Değişkenler ─────────────────────────────────────</span>
+define WAN    = "eth0"
+define LAN    = "eth1"
+define VPN    = "wg0"
+define LAN_NET = 192.168.2.0/24
+define VPN_NET = 10.10.0.0/24
+
+<span class="cmt"># ─── Engel listesi ───────────────────────────────────</span>
+table inet raw {
+    set blocklist {
+        type ipv4_addr
+        flags dynamic, timeout
+        timeout 1h
+        gc-interval 10m
+    }
+    chain prerouting {
+        type filter hook prerouting priority -300; policy accept;
+        ip saddr @blocklist counter drop
+    }
+}
+
+<span class="cmt"># ─── NAT ─────────────────────────────────────────────</span>
+table ip nat {
+    map port_forward {
+        type inet_service : ipv4_addr . inet_service
+        elements = {
+            8022 : 192.168.2.10 . 22,   <span class="cmt"># IoT cihaz 1 SSH</span>
+            8080 : 192.168.2.20 . 80,   <span class="cmt"># IoT cihaz 2 HTTP</span>
+        }
+    }
+
+    chain prerouting {
+        type nat hook prerouting priority -100; policy accept;
+        iifname $WAN tcp dport map @port_forward dnat to
+    }
+
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+        oifname $WAN masquerade
+    }
+}
+
+<span class="cmt"># ─── Filtre ──────────────────────────────────────────</span>
+table inet filter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+
+        iif lo accept
+        ct state established,related accept
+        ct state invalid counter drop
+
+        <span class="cmt"># WAN: yalnızca VPN ve ICMP</span>
+        iifname $WAN udp dport 51820 accept          <span class="cmt"># WireGuard</span>
+        iifname $WAN ip protocol icmp                \
+            limit rate 5/second accept
+        iifname $WAN drop                            <span class="cmt"># diğer WAN girişi yok</span>
+
+        <span class="cmt"># LAN: güvenilir ağ</span>
+        iifname $LAN ip saddr $LAN_NET accept
+
+        <span class="cmt"># VPN: yönetim arayüzü</span>
+        iifname $VPN ip saddr $VPN_NET tcp dport 22 \
+            limit rate 3/minute burst 5 packets accept
+        iifname $VPN ip saddr $VPN_NET accept
+    }
+
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+
+        ct state established,related accept
+        ct state invalid drop
+
+        <span class="cmt"># LAN → WAN: internete çıkış</span>
+        iifname $LAN oifname $WAN \
+            ip saddr $LAN_NET ct state new accept
+
+        <span class="cmt"># LAN → VPN: VPN ağına ulaşım</span>
+        iifname $LAN oifname $VPN accept
+
+        <span class="cmt"># VPN → LAN: uzak yönetim</span>
+        iifname $VPN oifname $LAN ip saddr $VPN_NET accept
+
+        <span class="cmt"># WAN → LAN: yalnızca port forward ile</span>
+        iifname $WAN oifname $LAN ct state dnat accept
+
+        <span class="cmt"># IoT cihazları arası izolasyon (isteğe bağlı)</span>
+        <span class="cmt"># iifname $LAN oifname $LAN drop</span>
+    }
+
+    chain output {
+        type filter hook output priority 0; policy accept;
+    }
+}
+</code></pre>
+
+  <h3>Yapılandırmayı uygula ve test et</h3>
+
+  <pre><code"><span class="cmt"># Sözdizimi kontrolü</span>
+nft -c -f /etc/nftables.conf &amp;&amp; echo "Syntax OK"
+
+<span class="cmt"># Uygula</span>
+nft -f /etc/nftables.conf
+
+<span class="cmt"># Doğrulama</span>
+nft list ruleset
+nft list counters              <span class="cmt"># counter değerlerini izle</span>
+
+<span class="cmt"># Bağlantı testleri</span>
+ping -c3 8.8.8.8               <span class="cmt"># WAN çıkışı</span>
+ssh -p 8022 192.168.2.10       <span class="cmt"># DNAT port forward test</span>
+ping -c3 10.10.0.2             <span class="cmt"># VPN bağlantısı</span>
+
+<span class="cmt"># Rate limit testleri</span>
+hping3 -S --flood -p 22 &lt;gateway_ip&gt;  <span class="cmt"># SYN flood simülasyonu</span>
+nft list set inet raw blocklist          <span class="cmt"># dinamik engel listesini izle</span>
+
+<span class="cmt"># systemd ile kalıcı hale getir</span>
+systemctl enable nftables
+systemctl start  nftables
+</code></pre>
+
+  <div class="callout">
+    <div class="label">İPUCU</div>
+    <p>IoT cihazları genellikle birbirinden izole edilmesi gereken düşük güvenlik profilli cihazlardır. <code>iifname $LAN oifname $LAN drop</code> kuralı etkinleştirilerek LAN izolasyonu sağlanabilir; böylece ele geçirilen bir cihaz diğer LAN cihazlarına saldıramaz. Bu özellikle endüstriyel IoT ve medikal cihazlar için önemlidir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>WAN/LAN/VPN arayüz ayrımı: her yönün ayrı güvenlik politikası</li>
+      <li>Map ile DNAT port forward: port_forward map tüm yönlendirmeyi tek tanımda toplar</li>
+      <li>inet raw + blocklist set: tüm trafikten önce (-300 priority) engel listesi</li>
+    </ul>
+  </div>
+</section>
+
+</main>
