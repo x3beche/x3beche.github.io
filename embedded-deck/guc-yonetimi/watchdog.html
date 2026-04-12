@@ -1,0 +1,850 @@
+---
+layout: tutorial
+title: "Watchdog Timer — Güç Yönetimi"
+back_url: "../index.html"
+back_label: "Güç Yönetimi & Thermal"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÜÇ YÖNETİMİ</span>
+    <span>WATCHDOG</span>
+    <span>2026</span>
+  </div>
+  <h1>Watchdog Timer —<br><em>/dev/watchdog.</em></h1>
+  <p class="subtitle">/dev/watchdog API'si, systemd WatchdogSec entegrasyonu, pretimeout handler ve BCM2835/i.MX/STM32 IWDG platform detayları — sistemi kilitmeden kurtar.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Watchdog nedir — hardware vs software WDT</a></li>
+    <li><a href="#s1">/dev/watchdog API — open, write, ioctl</a></li>
+    <li><a href="#s2">Kernel watchdog driver — struct watchdog_device</a></li>
+    <li><a href="#s3">systemd watchdog entegrasyonu</a></li>
+    <li><a href="#s4">Pretimeout — önceden uyarı ve panic</a></li>
+    <li><a href="#s5">watchdog-d daemon — /etc/watchdog.conf</a></li>
+    <li><a href="#s6">Platform WDT: BCM2835, i.MX WDOG, STM32 IWDG</a></li>
+    <li><a href="#s7">Yocto/Buildroot — WDT enablement</a></li>
+    <li><a href="#s8">Pratik: Python watchdog daemon ve kill testi</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Watchdog nedir — hardware vs software WDT</h2>
+  <p class="section-lead">Watchdog timer, yazılımın kendisini periyodik olarak "ben hâlâ çalışıyorum" diye onaylamasını gerektirir. Onay gelmezse donanım sistemi sıfırlar.</p>
+
+  <h3>Neden gerekli?</h3>
+
+  <p>Gömülü sistemlerde yazılım birçok nedenden dolayı kilitlenebilir: sonsuz döngü, deadlock, bellek bozulması, kernel panik. İnsan müdahalesi mümkün olmayan uzak veya güvenlik-kritik sistemlerde watchdog, son savunma hattıdır.</p>
+
+  <div class="params">
+    <div class="param"><div class="name">Hardware WDT</div><div class="desc">CPU dışı bağımsız bir sayaç. CPU tamamen kilitlense bile çalışır. En güvenilir yöntem. Her SoC'da genellikle mevcuttur (WDOG, IWDG, vb.).</div></div>
+    <div class="param"><div class="name">Software WDT (softdog)</div><div class="desc">Kernel timer tabanlı watchdog. Donanım WDT yoksa kullanılır. Kernel donduğunda çalışmaz — güvenilirlik sınırlı.</div></div>
+    <div class="param"><div class="name">External WDT</div><div class="desc">Ayrı bir mikrodenetleyici (STM8, PIC) GPIO sinyal bekler. En yüksek güvenilirlik — ana işlemci tamamen ölse de reset atar.</div></div>
+  </div>
+
+  <h3>Temel çalışma prensibi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>WDT akış diyagramı</span><span class="dot">●</span></div>
+    <pre><code>Uygulama başlar
+    │
+    ├─ /dev/watchdog açılır  → WDT başlar (örn. 30sn)
+    │
+    ├─ Döngü: iş yap → watchdog besle (her ~10sn)
+    │              │
+    │              └─ WDT sayacı sıfırlanır
+    │
+    ├─ Kilitlenme!
+    │              │
+    │              └─ watchdog beslenmez
+    │                         │
+    │              timeout (30sn) dolunca
+    │                         │
+    └──────────────────── HARDWARE RESET</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">KRİTİK</div>
+    <p>/dev/watchdog'u açtıktan sonra beslemezseniz sistem resetlenir. Test ortamında her zaman "magic close" mekanizmasını doğru kullanın: dosyayı kapatmadan önce <code class="inline">'V'</code> karakteri yazın.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> /dev/watchdog API — open, write, ioctl</h2>
+  <p class="section-lead">Linux watchdog UAPI basittir: aç, besle, kapat. Tüm kontrol /dev/watchdog üzerinden ioctl ile yapılır.</p>
+
+  <h3>Temel C API</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — watchdog temel kullanım</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;linux/watchdog.h&gt;
+
+int main(void) {
+    int fd, timeout = 30;
+
+    /* WDT aç — bu noktadan itibaren beslenmezse reset gelir */
+    fd = open("/dev/watchdog", O_RDWR);
+    if (fd &lt; 0) { perror("open /dev/watchdog"); return 1; }
+
+    /* Zaman aşımını ayarla (saniye) */
+    if (ioctl(fd, WDIOC_SETTIMEOUT, &amp;timeout) &lt; 0) {
+        perror("WDIOC_SETTIMEOUT");
+    }
+
+    /* Gerçek timeout'u oku (donanım en yakın desteklenen değere yuvarlar) */
+    ioctl(fd, WDIOC_GETTIMEOUT, &amp;timeout);
+    printf("WDT timeout: %d saniye\n", timeout);
+
+    /* Keepalive döngüsü */
+    for (int i = 0; i &lt; 10; i++) {
+        sleep(10);
+
+        /* Yöntem 1: write() ile besle */
+        write(fd, "1", 1);
+
+        /* Yöntem 2: ioctl ile besle */
+        /* ioctl(fd, WDIOC_KEEPALIVE, 0); */
+
+        printf("WDT beslendi (%d/10)\n", i + 1);
+    }
+
+    /* Magic close: 'V' yazarak güvenli kapat */
+    write(fd, "V", 1);
+    close(fd);
+    printf("WDT durduruldu (magic close)\n");
+
+    return 0;
+}</code></pre>
+  </div>
+
+  <h3>IOCTL komutları</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">WDIOC_GETSUPPORT</div><div class="desc">struct watchdog_info ile WDT özelliklerini oku: firma adı, sürüm, desteklenen WDIOF_ flagler.</div></div>
+    <div class="param"><div class="name">WDIOC_GETSTATUS / WDIOC_GETBOOTSTATUS</div><div class="desc">WDT durum flagleri. WDIOF_CARDRESET: son önyükleme WDT resetinden mi oldu?</div></div>
+    <div class="param"><div class="name">WDIOC_SETTIMEOUT / WDIOC_GETTIMEOUT</div><div class="desc">Timeout süresini ayarla/oku (saniye). Donanım en yakın değere yuvarlar.</div></div>
+    <div class="param"><div class="name">WDIOC_KEEPALIVE</div><div class="desc">WDT sayacını sıfırla (besle). write() ile eşdeğer.</div></div>
+    <div class="param"><div class="name">WDIOC_SETOPTIONS</div><div class="desc">WDIOS_DISABLECARD: WDT durdur. WDIOS_ENABLECARD: WDT başlat.</div></div>
+    <div class="param"><div class="name">WDIOC_SETPRETIMEOUT / WDIOC_GETPRETIMEOUT</div><div class="desc">Pre-timeout süresini ayarla: gerçek timeout'tan bu kadar saniye önce uyarı verilir.</div></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — WDT destek sorgulama</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/watchdog.h&gt;
+
+struct watchdog_info info;
+ioctl(fd, WDIOC_GETSUPPORT, &amp;info);
+
+printf("Identity: %s\n",    info.identity);
+printf("Firmware: %u\n",    info.firmware_version);
+printf("Options:  0x%08x\n", info.options);
+
+/* WDIOF flag'leri kontrol et */
+if (info.options &amp; WDIOF_SETTIMEOUT)
+    printf("  - Timeout ayarlanabilir\n");
+if (info.options &amp; WDIOF_KEEPALIVEPING)
+    printf("  - Keepalive destekleniyor\n");
+if (info.options &amp; WDIOF_MAGICCLOSE)
+    printf("  - Magic close destekleniyor\n");
+if (info.options &amp; WDIOF_PRETIMEOUT)
+    printf("  - Pre-timeout destekleniyor\n");
+
+/* Son reset WDT'den mi? */
+int boot_status;
+ioctl(fd, WDIOC_GETBOOTSTATUS, &amp;boot_status);
+if (boot_status &amp; WDIOF_CARDRESET)
+    printf("Son reset: WDT reset!\n");</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Kernel watchdog driver — struct watchdog_device</h2>
+  <p class="section-lead">Linux watchdog core, platform-specific WDT donanımını soyutlayan birleşik bir altyapı sağlar. Yeni bir WDT driver yazmak için watchdog_device struct'ını ve ops'larını doldurmak yeterlidir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — minimal watchdog driver</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/watchdog.h&gt;
+#include &lt;linux/platform_device.h&gt;
+
+struct mywdt_priv {
+    void __iomem       *base;
+    struct watchdog_device wdd;
+};
+
+static int mywdt_start(struct watchdog_device *wdd)
+{
+    struct mywdt_priv *priv = watchdog_get_drvdata(wdd);
+    /* Donanımı başlat */
+    writel(WDT_ENABLE | WDT_RESET_ON_TIMEOUT,
+           priv-&gt;base + WDT_CTRL_REG);
+    return 0;
+}
+
+static int mywdt_stop(struct watchdog_device *wdd)
+{
+    struct mywdt_priv *priv = watchdog_get_drvdata(wdd);
+    writel(0, priv-&gt;base + WDT_CTRL_REG);
+    return 0;
+}
+
+static int mywdt_ping(struct watchdog_device *wdd)
+{
+    struct mywdt_priv *priv = watchdog_get_drvdata(wdd);
+    /* Sayacı sıfırla */
+    writel(WDT_KICK_VALUE, priv-&gt;base + WDT_KICK_REG);
+    return 0;
+}
+
+static int mywdt_set_timeout(struct watchdog_device *wdd,
+                              unsigned int timeout)
+{
+    struct mywdt_priv *priv = watchdog_get_drvdata(wdd);
+    u32 count = timeout * WDT_CLK_FREQ;
+    writel(count, priv-&gt;base + WDT_LOAD_REG);
+    wdd-&gt;timeout = timeout;
+    return 0;
+}
+
+static const struct watchdog_ops mywdt_ops = {
+    .owner       = THIS_MODULE,
+    .start       = mywdt_start,
+    .stop        = mywdt_stop,
+    .ping        = mywdt_ping,
+    .set_timeout = mywdt_set_timeout,
+};
+
+static const struct watchdog_info mywdt_info = {
+    .options  = WDIOF_SETTIMEOUT | WDIOF_KEEPALIVEPING | WDIOF_MAGICCLOSE,
+    .identity = "MyPlatform WDT",
+};
+
+static int mywdt_probe(struct platform_device *pdev)
+{
+    struct mywdt_priv *priv;
+    struct resource *res;
+
+    priv = devm_kzalloc(&amp;pdev-&gt;dev, sizeof(*priv), GFP_KERNEL);
+    if (!priv) return -ENOMEM;
+
+    res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+    priv-&gt;base = devm_ioremap_resource(&amp;pdev-&gt;dev, res);
+    if (IS_ERR(priv-&gt;base)) return PTR_ERR(priv-&gt;base);
+
+    priv-&gt;wdd.info       = &amp;mywdt_info;
+    priv-&gt;wdd.ops        = &amp;mywdt_ops;
+    priv-&gt;wdd.timeout    = 30;   /* default 30s */
+    priv-&gt;wdd.min_timeout = 1;
+    priv-&gt;wdd.max_timeout = 128;
+    priv-&gt;wdd.parent     = &amp;pdev-&gt;dev;
+
+    watchdog_set_drvdata(&amp;priv-&gt;wdd, priv);
+    watchdog_set_nowayout(&amp;priv-&gt;wdd, nowayout);
+
+    return devm_watchdog_register_device(&amp;pdev-&gt;dev, &amp;priv-&gt;wdd);
+}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">nowayout parametresi</div>
+    <p><code class="inline">nowayout=1</code> modülü yüklendiğinde magic close çalışmaz — WDT bir kez açıldıktan sonra kapatılamaz. Üretim sistemleri için önerilir; test sırasında false resetleri önlemek için 0 kullanın.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> systemd watchdog entegrasyonu</h2>
+  <p class="section-lead">systemd, watchdog'u kendi servis izleme sistemiyle entegre eder. Servis belirli aralıklarla "ben sağlıklıyım" bildirimi göndermezse systemd servisi yeniden başlatır; daha uzun sürede yanıt gelmezse sistem resetlenir.</p>
+
+  <h3>systemd watchdog yapılandırması</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/systemd/system.conf — sistem geneli WDT</span><span class="dot">●</span></div>
+    <pre><code>[Manager]
+RuntimeWatchdogSec=30s   # sistemin WDT timeout'u
+RebootWatchdogSec=10min  # reboot sırasında WDT timeout
+KExecWatchdogSec=10min   # kexec sırasında WDT timeout</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>servis dosyası — WatchdogSec</span><span class="dot">●</span></div>
+    <pre><code>[Unit]
+Description=Kritik Sensör Daemon
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/sensor-daemon
+
+# Servis 20 saniyede bir sd_notify(WATCHDOG=1) çağırmalı
+WatchdogSec=20s
+
+# WDT timeout'u aşılırsa ne yap?
+Restart=on-watchdog        # servisi yeniden başlat
+RestartSec=5s
+
+# veya sistem reset için:
+# WatchdogSignal=SIGABRT   # önce ABRT, sonra reset
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+  </div>
+
+  <h3>sd_notify API ile servis içi watchdog</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — sd_notify ile watchdog</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;systemd/sd-daemon.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;time.h&gt;
+
+int main(void) {
+    uint64_t watchdog_usec = 0;
+    struct timespec ts;
+
+    /* systemd watchdog interval'ını öğren */
+    sd_watchdog_enabled(0, &amp;watchdog_usec);
+    uint64_t interval_usec = watchdog_usec / 2;  /* interval/2 sıklıkla besle */
+
+    /* Hazır olduğunu bildir */
+    sd_notify(0, "READY=1\nSTATUS=Sensör daemon başladı");
+
+    while (1) {
+        /* ... iş yap ... */
+        do_sensor_reading();
+
+        /* WDT besle */
+        sd_notify(0, "WATCHDOG=1");
+
+        /* İsteğe bağlı: durum güncelle */
+        sd_notifyf(0, "WATCHDOG=1\nSTATUS=Ölçüm #%d tamamlandı",
+                   reading_count++);
+
+        /* Hesaplanan interval kadar bekle */
+        usleep(interval_usec);
+    }
+    return 0;
+}
+/* Derleme: gcc ... -lsystemd */</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>python3 — sd_notify Python</span><span class="dot">●</span></div>
+    <pre><code>#!/usr/bin/env python3
+import os, time, socket
+
+def sd_notify(msg):
+    """systemd sd_notify() Python uygulaması"""
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr: return
+    if addr.startswith('@'):
+        addr = '\0' + addr[1:]
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    sock.sendto(msg.encode(), addr)
+    sock.close()
+
+# Başlangıç
+sd_notify("READY=1\nSTATUS=başlatıldı")
+
+count = 0
+while True:
+    time.sleep(5)
+    count += 1
+    # Watchdog besle
+    sd_notify(f"WATCHDOG=1\nSTATUS=döngü {count}")
+    print(f"WDT beslendi (döngü {count})")</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — systemd WDT durumunu kontrol et</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Sistemin WDT kullandığını doğrula</span>
+systemctl show | grep -i watchdog
+<span class="cmt"># RuntimeWatchdogUSec=30s
+# RuntimeWatchdogPreUSec=0</span>
+
+<span class="cmt"># servis watchdog durumu</span>
+systemctl status sensor-daemon.service | grep -i watchdog</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Pretimeout — önceden uyarı ve panic</h2>
+  <p class="section-lead">Pretimeout, gerçek WDT resetinden önce belirli bir süre içinde kernel'a veya kullanıcı alanına uyarı verir. Bu sürede teşhis bilgisi toplanabilir veya kontrollü kapatma yapılabilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — pretimeout ayarı</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/watchdog.h&gt;
+
+int fd = open("/dev/watchdog", O_RDWR);
+
+int timeout = 30;
+int pretimeout = 5;   /* resetden 5 saniye önce uyar */
+
+ioctl(fd, WDIOC_SETTIMEOUT,    &amp;timeout);
+ioctl(fd, WDIOC_SETPRETIMEOUT, &amp;pretimeout);
+
+int actual_pre;
+ioctl(fd, WDIOC_GETPRETIMEOUT, &amp;actual_pre);
+printf("Pretimeout: %d saniye resetden önce\n", actual_pre);</code></pre>
+  </div>
+
+  <h3>watchdog_pretimeout_governor</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">noop</div><div class="desc">Hiçbir şey yapma. Sadece pretimeout event üretilir (logging için kullanışlı).</div></div>
+    <div class="param"><div class="name">panic</div><div class="desc">Kernel panic tetikler. kdump ile panic dump alınabilir — teşhis için en yararlı seçenek.</div></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — pretimeout governor</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># mevcut pretimeout governor'ları</span>
+ls /sys/bus/platform/drivers/ | grep pretimeout
+cat /sys/kernel/debug/watchdog0/pretimeout_governor
+<span class="cmt"># noop</span>
+
+<span class="cmt"># panic governor'a geç (kernel panic + kdump)</span>
+echo panic > /sys/kernel/debug/watchdog0/pretimeout_governor
+
+<span class="cmt"># systemd ile pretimeout</span>
+<span class="cmt"># /etc/systemd/system.conf içine:</span>
+<span class="cmt"># RuntimeWatchdogPreUSec=5s</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">KDump İLE BİRLİKTE</div>
+    <p>Pretimeout + panic + kdump kombinasyonu, production sistemlerde "neden kilitlendi?" sorusunu yanıtlamak için en güçlü araçtır. Pretimeout'ta kernel panic tetiklenince kdump crash dump kaydeder, sonra asıl WDT reset atar ve sistem yeniden başlar.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> watchdog-d daemon — /etc/watchdog.conf</h2>
+  <p class="section-lead">watchdog-d (veya watchdog paketi), /dev/watchdog'u yöneten, çeşitli sistem sağlık testlerini yapan hazır bir daemon'dur.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — kurulum</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Debian/Ubuntu</span>
+apt install watchdog
+
+<span class="cmt"># servis başlat</span>
+systemctl enable --now watchdog</code></pre>
+  </div>
+
+  <h3>/etc/watchdog.conf açıklamalı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/watchdog.conf</span><span class="dot">●</span></div>
+    <pre><code># WDT cihaz dosyası
+watchdog-device = /dev/watchdog
+
+# WDT timeout (saniye)
+watchdog-timeout = 30
+
+# Kaç saniyede bir besle
+interval = 10
+
+# Sıcaklık eşiği (°C) — /sys/class/thermal/ veya hwmon
+#temperature-device = /dev/cpu_temp0
+#max-temperature = 90
+
+# CPU yük ortalaması testi
+max-load-1  = 24    # 1dk load average > 24 ise hata
+max-load-5  = 18    # 5dk load average
+max-load-15 = 12    # 15dk load average
+
+# Bellek testi
+min-memory = 1      # MB cinsinden minimum free bellek
+#allocatable-memory = 1
+
+# Dosya değişiklik testi (dosya güncellenmezse hata)
+#file = /var/run/heartbeat.pid
+#change = 60        # 60 saniyede değişmeli
+
+# Dosya erişilebilirlik testi
+#file = /var/run/myapp.pid
+
+# PID dosyası — process çalışıyor mu?
+#pidfile = /var/run/sshd.pid
+
+# Özel test scripti
+#test-binary = /usr/local/bin/wdt-health-check.sh
+#test-timeout = 5   # script 5 saniyede bitirmeli
+
+# Hata durumunda ne yap
+repair-binary = /usr/local/bin/wdt-repair.sh
+
+# Log
+log-dir = /var/log/watchdog
+verbose = 0</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — custom health check scripti</span><span class="dot">●</span></div>
+    <pre><code>#!/bin/bash
+# /usr/local/bin/wdt-health-check.sh
+# watchdog test-binary olarak çağrılır
+# Başarı: exit 0, Hata: exit 1
+
+# I2C sensör erişilebilir mi?
+if ! i2cdetect -y 1 2&gt;/dev/null | grep -q "^20:"; then
+    logger -p daemon.error "WDT: I2C sensor kayboldu!"
+    exit 1
+fi
+
+# Kritik servis çalışıyor mu?
+if ! systemctl is-active --quiet mqtt-bridge.service; then
+    logger -p daemon.error "WDT: mqtt-bridge durdu!"
+    exit 1
+fi
+
+# Disk yazılabilir mi?
+if ! touch /tmp/wdt_test 2&gt;/dev/null; then
+    logger -p daemon.error "WDT: disk yazılamıyor!"
+    exit 1
+fi
+rm -f /tmp/wdt_test
+
+exit 0</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Platform WDT: BCM2835, i.MX WDOG, STM32 IWDG</h2>
+  <p class="section-lead">Her SoC'un kendi WDT donanımı ve driver'ı vardır. Üç yaygın platform için notlar.</p>
+
+  <h3>Raspberry Pi — BCM2835/BCM2711 WDT</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts / bash — BCM2835 WDT</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># BCM2835 WDT device tree node (Pi 4)</span>
+<span class="cmt"># bcm2835-wdt otomatik yüklenir — kernel config: CONFIG_BCM2835_WDT=y</span>
+
+<span class="cmt"># Driver yüklü mü?</span>
+dmesg | grep bcm2835_wdt
+<span class="cmt"># bcm2835-wdt: Broadcom BCM2835 watchdog timer</span>
+
+cat /sys/devices/platform/soc/1c000000.watchdog/identity 2&gt;/dev/null ||
+cat /sys/class/watchdog/watchdog0/identity
+<span class="cmt"># Broadcom BCM2835 Watchdog timer</span>
+
+<span class="cmt"># Maksimum timeout: ~15 saniye (BCM2835 sınırlaması)</span>
+cat /sys/class/watchdog/watchdog0/max_timeout
+<span class="cmt"># 15</span>
+
+<span class="cmt"># BCM2711 (Pi 4): daha uzun timeout destekler</span>
+<span class="cmt"># PM kütüphanesi üzerinden de kontrol edilebilir</span></code></pre>
+  </div>
+
+  <h3>i.MX WDOG (NXP i.MX6/7/8)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts — i.MX6 WDOG</span><span class="dot">●</span></div>
+    <pre><code>wdog1: watchdog@20bc000 {
+    compatible = "fsl,imx6q-wdt", "fsl,imx21-wdt";
+    reg = &lt;0x020bc000 0x4000&gt;;
+    interrupts = &lt;GIC_SPI 80 IRQ_TYPE_LEVEL_HIGH&gt;;
+    clocks = &lt;&amp;clks IMX6QDL_CLK_IPG&gt;;
+};</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — i.MX WDOG kullanım</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># i.MX WDOG kernel config: CONFIG_IMX2_WDT=y</span>
+dmesg | grep imx2_wdt
+<span class="cmt"># imx2-wdt 20bc000.watchdog: Initial timeout: 60s</span>
+
+<span class="cmt"># i.MX WDOG maksimum timeout: ~128 saniye</span>
+cat /sys/class/watchdog/watchdog0/max_timeout
+<span class="cmt"># 128</span>
+
+<span class="cmt"># i.MX WDOG reset kaynağını kontrol et</span>
+<span class="cmt"># SRC (System Reset Controller) registerı</span>
+devmem2 0x020D8008 w  <span class="cmt"># SRC_SRSR: reset status register</span>
+<span class="cmt"># bit[4]: WDOG reset bit</span></code></pre>
+  </div>
+
+  <h3>STM32 IWDG ve WWDG</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts — STM32 IWDG</span><span class="dot">●</span></div>
+    <pre><code>/* STM32MP157 IWDG (Independent Watchdog) */
+iwdg2: watchdog@5a002000 {
+    compatible = "st,stm32mp1-iwdg";
+    reg = &lt;0x5a002000 0x400&gt;;
+    clocks = &lt;&amp;rcc IWDG2&gt;, &lt;&amp;rcc CK_LSI&gt;;
+    clock-names = "pclk", "lsi";
+    timeout-sec = &lt;32&gt;;
+    status = "okay";
+};
+
+/* WWDG (Window Watchdog) — pencereli WDT */
+wwdg: watchdog@40002c00 {
+    compatible = "st,stm32-wwdg";
+    reg = &lt;0x40002c00 0x400&gt;;
+    clocks = &lt;&amp;rcc WWDG1K&gt;;
+    /* min ve max arasında beslenmeli! */
+};</code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><div class="name">IWDG (Independent WDT)</div><div class="desc">LSI osilatörüne bağlı, CPU clock'undan bağımsız. Çok derin uyku dahil her durumda çalışır. STM32 gömülü için tercih edilir.</div></div>
+    <div class="param"><div class="name">WWDG (Window WDT)</div><div class="desc">Pencereli: belirli bir zaman penceresinin dışında besleme yapmak reset atar. "Çok erken besleme" de hata sayılır — yazılım donduğunda değil, anormal davrandığında da müdahale eder.</div></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Yocto/Buildroot — WDT enablement</h2>
+  <p class="section-lead">Gömülü Linux dağıtımlarında WDT genellikle varsayılan olarak devre dışıdır. Yocto ve Buildroot'ta etkinleştirme adımları.</p>
+
+  <h3>Yocto</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>yocto — layer.conf ve recipe</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># local.conf veya distro.conf</span>
+DISTRO_FEATURES:append = " watchdog"
+
+<span class="cmt"># kernel konfigürasyonu (meta-layer/recipes-kernel/linux/linux-yocto.bbappend)</span>
+KERNEL_EXTRA_FEATURES:append = " watchdog.scc"
+
+<span class="cmt"># watchdog paketi ekle</span>
+IMAGE_INSTALL:append = " watchdog"
+
+<span class="cmt"># systemd entegrasyonu için (meta-systemd)</span>
+IMAGE_INSTALL:append = " systemd-conf"</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>yocto — watchdog recipe bbappend</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># meta-myboard/recipes-support/watchdog/watchdog_%.bbappend</span>
+FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
+
+SRC_URI:append = " file://watchdog.conf"
+
+do_install:append() {
+    install -d ${D}${sysconfdir}
+    install -m 0644 ${WORKDIR}/watchdog.conf ${D}${sysconfdir}/watchdog.conf
+}</code></pre>
+  </div>
+
+  <h3>Buildroot</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>buildroot — menuconfig seçenekleri</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># make menuconfig içinde:</span>
+<span class="cmt"># Target packages → System tools → watchdog utilities</span>
+BR2_PACKAGE_WATCHDOG=y
+
+<span class="cmt"># Kernel config fragment (board/myboard/linux.config)</span>
+CONFIG_WATCHDOG=y
+CONFIG_WATCHDOG_CORE=y
+CONFIG_BCM2835_WDT=y   <span class="cmt"># ya da platform-specific</span>
+CONFIG_SOFT_WATCHDOG=y  <span class="cmt"># yedek olarak softdog</span></code></pre>
+  </div>
+
+  <h3>Systemd servis — önyükleme sırasında WDT başlatma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/systemd/system/watchdog-start.service</span><span class="dot">●</span></div>
+    <pre><code>[Unit]
+Description=Start Hardware Watchdog
+DefaultDependencies=no
+Before=sysinit.target
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# WDT modülünü yükle (gerekirse)
+ExecStartPre=-/sbin/modprobe bcm2835_wdt
+# watchdog daemon başlat
+ExecStart=/sbin/watchdogd -F -c /etc/watchdog.conf
+
+[Install]
+WantedBy=sysinit.target</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: Python watchdog daemon ve kill testi</h2>
+  <p class="section-lead">Python ile tam watchdog keepalive daemon, ardından kill testi ile hardware reset'i gözlemleme.</p>
+
+  <h3>Python watchdog daemon</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>python3 — watchdog_daemon.py</span><span class="dot">●</span></div>
+    <pre><code>#!/usr/bin/env python3
+"""
+Watchdog keepalive daemon.
+- /dev/watchdog'u açar, timeout ayarlar
+- Her FEED_INTERVAL saniyede bir besler
+- Sağlık kontrolü başarısız olursa beslemeyi durdurur → reset
+"""
+import os, fcntl, struct, time, signal, logging, subprocess
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s',
+    datefmt='%H:%M:%S'
+)
+log = logging.getLogger("wdt")
+
+# /usr/include/linux/watchdog.h değerleri
+WDIOC_SETTIMEOUT  = 0xC0045706
+WDIOC_GETTIMEOUT  = 0x80045707
+WDIOC_KEEPALIVE   = 0x80002705
+WDIOC_GETBOOTSTATUS = 0x80045702
+WDIOF_CARDRESET   = 0x0020
+
+WDT_DEVICE    = "/dev/watchdog"
+WDT_TIMEOUT   = 30      # saniye
+FEED_INTERVAL = 10      # saniye — timeout/3
+MAGIC_CLOSE   = b'V'
+
+class WatchdogDaemon:
+    def __init__(self):
+        self.fd = None
+        self.running = True
+        signal.signal(signal.SIGTERM, self._shutdown)
+        signal.signal(signal.SIGINT,  self._shutdown)
+
+    def _shutdown(self, *args):
+        log.info("Kapatma sinyali alındı")
+        self.running = False
+
+    def open(self):
+        self.fd = os.open(WDT_DEVICE, os.O_RDWR)
+
+        # Boot status kontrol
+        buf = struct.pack('I', 0)
+        res = fcntl.ioctl(self.fd, WDIOC_GETBOOTSTATUS, buf)
+        boot_status = struct.unpack('I', res)[0]
+        if boot_status &amp; WDIOF_CARDRESET:
+            log.warning("Son reboot WDT resetinden! Sistem kilitlenmesi oldu.")
+
+        # Timeout ayarla
+        buf = struct.pack('I', WDT_TIMEOUT)
+        res = fcntl.ioctl(self.fd, WDIOC_SETTIMEOUT, buf)
+        actual = struct.unpack('I', res)[0]
+        log.info(f"WDT açıldı, timeout={actual}s, besle={FEED_INTERVAL}s")
+
+    def feed(self):
+        """WDT besle"""
+        os.write(self.fd, b'1')
+
+    def close_safe(self):
+        """Magic close — WDT'yi güvenli durdur"""
+        if self.fd is not None:
+            os.write(self.fd, MAGIC_CLOSE)
+            os.close(self.fd)
+            self.fd = None
+            log.info("WDT magic close ile durduruldu")
+
+    def health_check(self):
+        """Sistem sağlık kontrolü — False döndürürse besleme durur"""
+        # Kritik servis çalışıyor mu?
+        ret = subprocess.run(
+            ["systemctl", "is-active", "--quiet", "sshd"],
+            capture_output=True
+        )
+        if ret.returncode != 0:
+            log.error("sshd çalışmıyor!")
+            return False
+
+        # Disk alanı kontrolü (minimum 10MB)
+        stat = os.statvfs("/")
+        free_mb = (stat.f_bavail * stat.f_frsize) / (1024 * 1024)
+        if free_mb &lt; 10:
+            log.error(f"Disk doldu: {free_mb:.1f}MB kaldı!")
+            return False
+
+        return True
+
+    def run(self):
+        self.open()
+        try:
+            while self.running:
+                if self.health_check():
+                    self.feed()
+                    log.debug("WDT beslendi, sistem sağlıklı")
+                else:
+                    log.critical("SAĞLIK KONTROLÜ BAŞARISIZ — WDT beslenmeyecek!")
+                    # Beslemeyi durdur, reset bekle
+                    while True:
+                        time.sleep(1)
+
+                time.sleep(FEED_INTERVAL)
+        finally:
+            self.close_safe()
+
+if __name__ == "__main__":
+    daemon = WatchdogDaemon()
+    daemon.run()</code></pre>
+  </div>
+
+  <h3>Kill testi — hardware reset gözlemleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — WDT kill testi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1. Daemon'ı başlat</span>
+python3 watchdog_daemon.py &amp;
+WDT_PID=$!
+echo "WDT daemon PID: $WDT_PID"
+
+<span class="cmt"># 2. Normal çalıştığını doğrula (30 saniye izle)</span>
+sleep 30
+echo "Sistem hâlâ çalışıyor — WDT düzgün besleniyor"
+
+<span class="cmt"># 3. Daemon'ı kill et (SIGKILL — magic close yapamaz)</span>
+echo "WDT daemon'ını öldürüyoruz..."
+kill -9 $WDT_PID
+
+<span class="cmt"># 4. WDT_TIMEOUT saniye bekle → sistem resetlenecek
+# Bu noktadan sonra terminal oturumu kapanır!</span>
+echo "WDT beslenmeyecek, $WDT_TIMEOUT saniye içinde reset bekleniyor..."
+
+<span class="cmt"># 5. Reboot sonrası — WDT resetinden mi önyüklendi?</span>
+dmesg | grep -i "watchdog\|wdt\|reset"
+<span class="cmt"># bcm2835-wdt: Watchdog reset triggered</span>
+
+<span class="cmt"># 6. Boot status kontrolü</span>
+python3 -c "
+import os, fcntl, struct
+WDIOC_GETBOOTSTATUS = 0x80045702
+WDIOF_CARDRESET     = 0x0020
+fd = os.open('/dev/watchdog', os.O_RDWR)
+buf = struct.pack('I', 0)
+res = fcntl.ioctl(fd, WDIOC_GETBOOTSTATUS, buf)
+status = struct.unpack('I', res)[0]
+print('WDT reset:', bool(status &amp; WDIOF_CARDRESET))
+os.write(fd, b'V')
+os.close(fd)
+"</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">BEKLENEN SONUÇ</div>
+    <p>kill -9 ile daemon öldürüldükten WDT_TIMEOUT (30) saniye sonra sistem resetlenir. Reboot sonrası <code class="inline">WDIOC_GETBOOTSTATUS</code> <code class="inline">WDIOF_CARDRESET</code> bitini set gösterir. dmesg'de "Watchdog reset triggered" veya benzeri mesaj görülür. Bu, hardware WDT'nin yazılımdan bağımsız olarak düzgün çalıştığını doğrular.</p>
+  </div>
+
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

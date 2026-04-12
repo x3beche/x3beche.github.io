@@ -1,0 +1,670 @@
+---
+layout: tutorial
+title: "ALSA &amp; Ses — Linux Audio Alt Sistemi"
+back_url: "../index.html"
+back_label: "embedded-deck"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>ALSA</span>
+    <span>2026</span>
+  </div>
+  <h1>ALSA &amp; Ses<br><em>Linux Audio Alt Sistemi.</em></h1>
+  <p class="subtitle">ALSA kernel mimarisinden .asoundrc yapılandırmasına, ASoC machine driver tasarımından DAPM güç yönetimine ve Device Tree binding'den Raspberry Pi I2S DAC uygulamasına kadar eksiksiz Linux ses alt sistemi rehberi.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Linux ses mimarisi</a></li>
+    <li><a href="#s1">ALSA card/device/subdevice modeli</a></li>
+    <li><a href="#s2">aplay / arecord</a></li>
+    <li><a href="#s3">.asoundrc konfigürasyonu</a></li>
+    <li><a href="#s4">amixer ve alsamixer</a></li>
+    <li><a href="#s5">ASoC mimarisi</a></li>
+    <li><a href="#s6">DAPM — Dynamic Audio Power Management</a></li>
+    <li><a href="#s7">Device Tree binding</a></li>
+    <li><a href="#s8">Pratik: Raspberry Pi + I2S DAC (PCM5102)</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Linux ses mimarisi</h2>
+  <p class="section-lead">Linux ses yığını, kernel ALSA katmanından kullanıcı alanı ses sunucularına kadar birden fazla katmandan oluşur. Her katman belirli bir soyutlama sağlar.</p>
+
+  <h3>Katmanlı mimari</h3>
+  <div class="flow">
+    <pre>
+Uygulama (GStreamer, SDL, openal, mpv)
+        |
+    PipeWire / PulseAudio / JACK
+    (userspace ses sunucusu)
+        |
+   libasound (alsa-lib)
+   .asoundrc PCM plug katmanı
+        |
+  ┌─────────────────────────────┐
+  │   ALSA Kernel Alt Sistemi   │
+  │  ┌─────────────────────┐   │
+  │  │  ASoC Framework     │   │
+  │  │  (gömülü ses)       │   │
+  │  └──────┬──────────────┘   │
+  │         │                   │
+  │  Machine│  Codec   Platform │
+  │  Driver │  Driver  Driver   │
+  └─────────┼───────────────────┘
+            │
+     Donanım (I2S, SPI, I2C DAC/ADC)
+    </pre>
+  </div>
+
+  <h3>Ses sunucusu karşılaştırması</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Katman</th><th>Görev</th><th>Gömülü Kullanımı</th><th>Gecikme</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>ALSA (kernel)</td><td>Donanım sürücüsü, PCM buffer yönetimi</td><td>Her zaman temel</td><td>&lt;1 ms</td></tr>
+        <tr><td>ALSA (alsa-lib)</td><td>PCM plug, dmix, softvol, rate dönüşüm</td><td>Sunucusuz kullanım</td><td>1–5 ms</td></tr>
+        <tr><td>PulseAudio</td><td>Çoklu uygulama mix, Bluetooth, network</td><td>Desktop odaklı</td><td>20–80 ms</td></tr>
+        <tr><td>PipeWire</td><td>PA + JACK yerine geçer, pro audio + multimedia</td><td>Modern tercih</td><td>1–10 ms</td></tr>
+        <tr><td>JACK</td><td>Düşük gecikme pro audio, graph routing</td><td>Müzik ekipmanları</td><td>&lt;5 ms</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Gömülü sistemlerde PulseAudio ve PipeWire genellikle gereksizdir. <code>aplay</code> doğrudan ALSA PCM cihazına yazarak ek gecikme katmanı olmadan ses çalar. Sadece birden fazla uygulamanın aynı anda ses çalması gerekiyorsa dmix veya PipeWire kullanılır.</p>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Raspberry Pi OS (Bookworm) artık varsayılan olarak PipeWire kullanır. Eski PulseAudio servisi <code>pipewire-pulse</code> ile emüle edilir. Gömülü uygulamalar için <code>alsa-utils</code> kurarak doğrudan ALSA'ya erişmek daha kontrollü ve öngörülebilirdir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> ALSA card/device/subdevice modeli</h2>
+  <p class="section-lead">ALSA, her ses donanımını kart → cihaz → alt cihaz hiyerarşisiyle modeller. Bu hiyerarşiyi anlamak doğru PCM cihazını seçmek için gereklidir.</p>
+
+  <h3>Hiyerarşi</h3>
+  <div class="params">
+    <div class="param"><span class="name">Card (kart)</span><span class="desc">Bir ses kontrolcüsü — hw:0, hw:1. Birden fazla kart birden fazla ses donanımını temsil eder</span></div>
+    <div class="param"><span class="name">Device (cihaz)</span><span class="desc">Kart içinde bir PCM stream — hw:0,0 hw:0,1. Çoğu kartta 0 = oynatma, 1 = kayıt</span></div>
+    <div class="param"><span class="name">Subdevice (alt cihaz)</span><span class="desc">Aynı PCM üzerinde paralel stream — hw:0,0,0 hw:0,0,1</span></div>
+  </div>
+
+  <h3>/proc/asound ile inceleme</h3>
+  <pre><code class="language-bash"># Tüm kartları listele
+cat /proc/asound/cards
+#  0 [bcm2835ALSA  ]: bcm2835 ALSA - bcm2835 ALSA
+#  1 [sndrpiiqaudio]: snd_rpi_iqaudio_dac - ...
+
+# Cihazları incele
+cat /proc/asound/card0/pcm0p/info
+# card: 0, device: 0, subdevices: 8
+# id: bcm2835 ALSA, name: bcm2835 ALSA
+
+# PCM stream durumu
+cat /proc/asound/card1/pcm0p/sub0/status
+
+# Mixer kontrolleri
+cat /proc/asound/card0/id</code></pre>
+
+  <h3>aplay -l ile kart listesi</h3>
+  <pre><code class="language-bash">aplay -l
+# **** List of PLAYBACK Hardware Devices ****
+# card 0: bcm2835ALSA [bcm2835 ALSA], device 0: bcm2835 ALSA [bcm2835 ALSA]
+#   Subdevices: 7/8
+# card 1: sndrpiiqaudio [IQaudIO DAC+], device 0: IQAudio DAC HiFi ...
+#   Subdevices: 1/1
+
+# Kayıt cihazları
+arecord -l
+
+# PCM cihaz formatı:
+# hw:CARD,DEV,SUBDEV  — doğrudan erişim, kernel buffer
+# plughw:0,0          — otomatik format dönüşüm</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> aplay / arecord</h2>
+  <p class="section-lead"><code>aplay</code> ve <code>arecord</code>, ALSA'nın temel komut satırı oynatma ve kayıt araçlarıdır. Test, debug ve basit ses pipeline'ları için vazgeçilmezdir.</p>
+
+  <h3>aplay temel kullanım</h3>
+  <pre><code class="language-bash"># Basit WAV oynatma
+aplay /usr/share/sounds/alsa/Front_Left.wav
+
+# Belirli kart ve cihaz seç
+aplay -D hw:1,0 test.wav
+
+# Format belirterek raw PCM oynat
+aplay -D hw:0,0 \
+    --format=S16_LE \
+    --rate=48000 \
+    --channels=2 \
+    audio.raw
+
+# Buffer ve period boyutu ayarla (gecikme tuning)
+aplay -D plughw:0,0 \
+    --buffer-size=4096 \
+    --period-size=1024 \
+    test.wav
+
+# Ses seviyesini vol ile normalize et
+aplay -D "plug:softvol" test.wav</code></pre>
+
+  <h3>arecord ile ses yakalama</h3>
+  <pre><code class="language-bash"># 10 saniye kayıt — WAV formatı
+arecord -D hw:0,0 \
+    -f S16_LE -r 44100 -c 2 \
+    -d 10 output.wav
+
+# Sürekli kayıt (Ctrl+C ile dur)
+arecord -D hw:1,0 -f S32_LE -r 96000 -c 2 capture.wav
+
+# Loopback test: kayıt edip aynı anda çal
+arecord -D hw:0,0 -f S16_LE -r 44100 -c 2 - | \
+    aplay -D hw:0,0 -f S16_LE -r 44100 -c 2 -</code></pre>
+
+  <h3>Desteklenen formatlar</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Format</th><th>Açıklama</th><th>Kullanım</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>S16_LE</td><td>16-bit signed little-endian</td><td>Standart CD kalitesi</td></tr>
+        <tr><td>S24_LE</td><td>24-bit signed (3-byte)</td><td>Pro audio</td></tr>
+        <tr><td>S32_LE</td><td>32-bit signed (4-byte)</td><td>Yüksek çözünürlük DAC</td></tr>
+        <tr><td>FLOAT_LE</td><td>32-bit IEEE 754 float</td><td>DSP işleme</td></tr>
+        <tr><td>MU_LAW</td><td>8-bit µ-law</td><td>Telefon/VoIP</td></tr>
+        <tr><td>IEC958_SUBFRAME_LE</td><td>S/PDIF subframe</td><td>Dijital çıkış</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> .asoundrc konfigürasyonu</h2>
+  <p class="section-lead"><code>~/.asoundrc</code> veya <code>/etc/asound.conf</code> ile ALSA PCM cihazlarını, mix, yazılım ses seviyesi ve örnekleme hızı dönüşümü yapılandırabilirsiniz.</p>
+
+  <h3>Varsayılan cihaz ayarlama</h3>
+  <pre><code class="language-bash"># ~/.asoundrc veya /etc/asound.conf
+
+# Varsayılan PCM cihazını kart 1, cihaz 0 olarak ayarla
+pcm.!default {
+    type hw
+    card 1
+    device 0
+}
+
+ctl.!default {
+    type hw
+    card 1
+}</code></pre>
+
+  <h3>dmix ile çoklu uygulama karıştırma</h3>
+  <p>dmix, birden fazla uygulamanın aynı ses kartına aynı anda yazmasına izin veren bir ALSA plug'dır. Donanım mixing desteklemeyen kartlar için zorunludur.</p>
+  <pre><code class="language-bash">pcm.dmixed {
+    type dmix
+    ipc_key 1024
+    ipc_key_add_uid true
+    slave {
+        pcm "hw:0,0"
+        rate 48000
+        channels 2
+        period_time 0
+        period_size 1024
+        buffer_size 4096
+    }
+    bindings {
+        0 0
+        1 1
+    }
+}
+
+pcm.!default {
+    type plug
+    slave.pcm "dmixed"
+}</code></pre>
+
+  <h3>softvol — yazılım ses seviyesi</h3>
+  <pre><code class="language-bash">pcm.softvol {
+    type softvol
+    slave {
+        pcm "hw:0,0"
+    }
+    control {
+        name "Master"
+        card 0
+    }
+    min_dB -51.0
+    max_dB 0.0
+    resolution 256
+}
+
+pcm.!default {
+    type plug
+    slave.pcm "softvol"
+}</code></pre>
+
+  <h3>Örnekleme hızı dönüşümü (rate plugin)</h3>
+  <pre><code class="language-bash">pcm.rate_convert {
+    type plug
+    slave {
+        pcm "hw:1,0"
+        rate 48000    # DAC'ın desteklediği oran
+        channels 2
+        format S32_LE
+    }
+}
+
+# Artık 44100 Hz ses de 48000 Hz çıkışa otomatik dönüşür
+# aplay -D rate_convert -r 44100 -f S16_LE test.wav</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> amixer ve alsamixer</h2>
+  <p class="section-lead"><code>amixer</code> komut satırı mixer kontrolcüsü, <code>alsamixer</code> ise terminal tabanlı görsel mixer arayüzüdür. Her ikisi de ALSA Simple Mixer Interface (SMI) üzerinden çalışır.</p>
+
+  <h3>amixer temel kullanım</h3>
+  <pre><code class="language-bash"># Kart 0'daki tüm kontrolleri listele
+amixer -c 0 scontrols
+
+# Belirli kontrolü incele
+amixer -c 0 sget Master
+# Simple mixer control 'Master',0
+#   Capabilities: pvolume pswitch
+#   Playback channels: Front Left - Front Right
+#   Limits: Playback 0 - 65536
+#   Front Left: Playback 48000 [73%] [on]
+#   Front Right: Playback 48000 [73%] [on]
+
+# Ses seviyesini yüzde ile ayarla
+amixer -c 0 sset Master 80%
+
+# Mutele al
+amixer -c 0 sset Master mute
+
+# Mutele geri al
+amixer -c 0 sset Master unmute
+
+# Toggle
+amixer -c 0 sset Master toggle</code></pre>
+
+  <h3>numid ile doğrudan kontrol erişimi</h3>
+  <pre><code class="language-bash"># Tüm kontrolleri numid ile listele
+amixer -c 0 controls
+
+# Numid üzerinden sorgula ve ayarla
+amixer -c 0 cget numid=3
+amixer -c 0 cset numid=3 80%
+
+# Raw değer ayarla (0–65536 arası)
+amixer -c 0 cset numid=3 52000</code></pre>
+
+  <h3>alsamixer kullanımı</h3>
+  <pre><code class="language-bash"># Varsayılan kart
+alsamixer
+
+# Belirli kart
+alsamixer -c 1
+
+# Sadece capture kontrolleri
+alsamixer -V capture
+
+# Klavye kısayolları:
+# F6 = kart seç
+# F3 = playback  F4 = capture  F5 = tümü
+# M  = mute/unmute
+# Yukarı/Aşağı ok = ses seviyesi
+# Tab = sol/sağ kanal kilidi açma</code></pre>
+
+  <h3>alsactl ile ayarları kaydet/yükle</h3>
+  <pre><code class="language-bash"># Mevcut mixer ayarlarını kaydet
+alsactl store -f /etc/asound.state
+
+# Ayarları geri yükle (boot'ta)
+alsactl restore -f /etc/asound.state
+
+# Systemd ile otomatik yükleme
+# /etc/systemd/system/alsa-restore.service
+# ExecStart=alsactl restore</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> ASoC mimarisi</h2>
+  <p class="section-lead">ASoC (ALSA System on Chip) framework, gömülü SoC ses sistemlerini modüler bir şekilde modellemek için geliştirilmiştir. Üç sürücü türünden oluşur.</p>
+
+  <h3>ASoC bileşenleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">Machine Driver</span><span class="desc">Board'a özgü glue kodu — codec ve platform'u birbirine bağlar, DAPM route'ları tanımlar, clock yapılandırması yapar</span></div>
+    <div class="param"><span class="name">Codec Driver</span><span class="desc">DAC/ADC çipi sürücüsü (PCM5102, ES8388, WM8960...) — mixer kontrolleri, DAPM widget'ları, codec register map</span></div>
+    <div class="param"><span class="name">Platform Driver</span><span class="desc">SoC I2S/PCM kontrolcüsü (bcm2835-i2s, imx-ssi, rockchip-i2s) — DMA transfer, clock üretimi</span></div>
+  </div>
+
+  <div class="flow">
+    <pre>
+Machine Driver (board/sound/snd-myboard.c)
+      |           |
+  Platform     Codec
+  Driver       Driver
+  (bcm2835-   (pcm5102a.c)
+   i2s.c)          |
+      |           I2C (register access)
+     DMA
+      |
+  I2S Bus ————————————————— PCM5102 DAC Chip
+  (BCLK, LRCLK, DATA)
+    </pre>
+  </div>
+
+  <h3>Machine driver skeleton (C)</h3>
+  <pre><code class="language-bash">// sound/soc/bcm/rpi-pcm5102.c (örnek)
+#include &lt;linux/module.h&gt;
+#include &lt;sound/soc.h&gt;
+
+static struct snd_soc_dai_link rpi_pcm5102_dai = {
+    .name           = "PCM5102",
+    .stream_name    = "PCM5102 HiFi",
+    .cpu_dai_name   = "bcm2835-i2s.0",
+    .codec_dai_name = "pcm5102a-hifi",
+    .platform_name  = "bcm2835-i2s.0",
+    .codec_name     = "pcm5102a",
+    .dai_fmt        = SND_SOC_DAIFMT_I2S |
+                      SND_SOC_DAIFMT_NB_NF |
+                      SND_SOC_DAIFMT_CBS_CFS,
+};
+
+static struct snd_soc_card rpi_pcm5102 = {
+    .name      = "rpi-pcm5102",
+    .owner     = THIS_MODULE,
+    .dai_link  = &amp;rpi_pcm5102_dai,
+    .num_links = 1,
+};</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> DAPM — Dynamic Audio Power Management</h2>
+  <p class="section-lead">DAPM, ses kartındaki her bileşenin (amplifier, mixer, ADC, DAC, PGA...) gerçek kullanım durumuna göre otomatik olarak güç verilip kaldırılmasını sağlayan ASoC'un güç yönetim çerçevesidir.</p>
+
+  <h3>DAPM widget türleri</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Widget Türü</th><th>Macro</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Mixer</td><td>SND_SOC_DAPM_MIXER</td><td>Birden fazla sinyali birleştirir</td></tr>
+        <tr><td>MUX</td><td>SND_SOC_DAPM_MUX</td><td>Bir girişi seçer</td></tr>
+        <tr><td>PGA</td><td>SND_SOC_DAPM_PGA</td><td>Programlanabilir kazanç amplifikatörü</td></tr>
+        <tr><td>DAC</td><td>SND_SOC_DAPM_DAC</td><td>Dijital-analog dönüştürücü</td></tr>
+        <tr><td>ADC</td><td>SND_SOC_DAPM_ADC</td><td>Analog-dijital dönüştürücü</td></tr>
+        <tr><td>Output</td><td>SND_SOC_DAPM_OUTPUT</td><td>Fiziksel çıkış pini</td></tr>
+        <tr><td>Input</td><td>SND_SOC_DAPM_INPUT</td><td>Fiziksel giriş pini</td></tr>
+        <tr><td>Supply</td><td>SND_SOC_DAPM_SUPPLY</td><td>Güç kaynağı (AVDD, DVDD)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>DAPM route tanımlama</h3>
+  <pre><code class="language-bash">// codec driver içinde route tablosu:
+static const struct snd_soc_dapm_route wm8960_routes[] = {
+    /* Playback path */
+    { "Left Output Mixer", "PCM Playback Switch", "Left DAC" },
+    { "Right Output Mixer", "PCM Playback Switch", "Right DAC" },
+    { "HP_L", NULL, "Left Output Mixer" },
+    { "HP_R", NULL, "Right Output Mixer" },
+
+    /* Capture path */
+    { "Left ADC", NULL, "Left Input PGA" },
+    { "Left Input PGA", NULL, "LINPUT1" },
+};
+// Format: { sink, control, source }
+// control NULL ise her zaman bağlı (unconditional route)</code></pre>
+
+  <h3>Bias level geçişleri</h3>
+  <p>DAPM, codec'in güç durumunu dört seviyede yönetir:</p>
+  <div class="params">
+    <div class="param"><span class="name">SND_SOC_BIAS_OFF</span><span class="desc">Tüm güç kapalı — deep sleep, hiçbir ses işlemi yok</span></div>
+    <div class="param"><span class="name">SND_SOC_BIAS_STANDBY</span><span class="desc">Referans voltajı aktif — ses yok ama hızlı geçiş hazır</span></div>
+    <div class="param"><span class="name">SND_SOC_BIAS_PREPARE</span><span class="desc">Ses açılmadan önce hazırlık aşaması</span></div>
+    <div class="param"><span class="name">SND_SOC_BIAS_ON</span><span class="desc">Tam güç — aktif ses oynatma veya kayıt</span></div>
+  </div>
+
+  <pre><code class="language-bash"># DAPM route durumunu /proc'tan incele
+cat /proc/asound/card1/dapm_widgets
+
+# DAPM güç tüketimi özeti
+cat /sys/kernel/debug/asoc/*/dapm_pop_time 2>/dev/null</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Device Tree binding</h2>
+  <p class="section-lead">ASoC ses kartları Device Tree üzerinden yapılandırılır. <code>simple-audio-card</code> binding, machine driver yazmadan temel I2S kurulumu sağlar.</p>
+
+  <h3>simple-audio-card binding</h3>
+  <pre><code class="language-bash">/* arch/arm/boot/dts/myboard.dts */
+
+/* I2C bus üzerindeki codec */
+&amp;i2c1 {
+    status = "okay";
+    clock-frequency = &lt;100000&gt;;
+
+    wm8960: wm8960@1a {
+        compatible = "wlf,wm8960";
+        reg = &lt;0x1a&gt;;
+        #sound-dai-cells = &lt;0&gt;;
+        clocks = &lt;&amp;mclk&gt;;
+        clock-names = "mclk";
+        wlf,shared-lrclk;
+    };
+};
+
+/* I2S kontrolcüsü */
+&amp;i2s0 {
+    status = "okay";
+    #sound-dai-cells = &lt;0&gt;;
+};
+
+/* Ses kartı */
+sound {
+    compatible = "simple-audio-card";
+    simple-audio-card,name = "MyBoard Audio";
+    simple-audio-card,format = "i2s";
+    simple-audio-card,bitclock-master = &lt;&amp;cpu_dai&gt;;
+    simple-audio-card,frame-master = &lt;&amp;cpu_dai&gt;;
+
+    simple-audio-card,routing =
+        "Headphone Jack", "HP_L",
+        "Headphone Jack", "HP_R",
+        "LINPUT1", "Microphone Jack";
+
+    cpu_dai: simple-audio-card,cpu {
+        sound-dai = &lt;&amp;i2s0&gt;;
+        dai-tdm-slot-num = &lt;2&gt;;
+        dai-tdm-slot-width = &lt;32&gt;;
+    };
+
+    simple-audio-card,codec {
+        sound-dai = &lt;&amp;wm8960&gt;;
+        clocks = &lt;&amp;mclk&gt;;
+        clock-names = "mclk";
+    };
+};</code></pre>
+
+  <h3>PCM5102 (DAC-only, register-less) binding</h3>
+  <pre><code class="language-bash">/* PCM5102 I2C gerektirmez — sadece I2S */
+pcm5102a: pcm5102a {
+    compatible = "ti,pcm5102a";
+    #sound-dai-cells = &lt;0&gt;;
+};
+
+sound {
+    compatible = "simple-audio-card";
+    simple-audio-card,name = "RPi-PCM5102";
+    simple-audio-card,format = "i2s";
+    simple-audio-card,bitclock-master = &lt;&amp;cpu_dai&gt;;
+    simple-audio-card,frame-master = &lt;&amp;cpu_dai&gt;;
+
+    cpu_dai: simple-audio-card,cpu {
+        sound-dai = &lt;&amp;i2s&gt;;
+    };
+
+    simple-audio-card,codec {
+        sound-dai = &lt;&amp;pcm5102a&gt;;
+    };
+};</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: Raspberry Pi + I2S DAC (PCM5102)</h2>
+  <p class="section-lead">PCM5102A I2S DAC modülü ile Raspberry Pi 4 arasında tam ses kurulumu — Device Tree overlay, ALSA yapılandırması ve ses testi.</p>
+
+  <h3>Donanım bağlantıları</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>PCM5102 Pin</th><th>Raspberry Pi GPIO</th><th>İşlev</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>BCK</td><td>GPIO 18 (PCM CLK)</td><td>Bit Clock</td></tr>
+        <tr><td>LRCK</td><td>GPIO 19 (PCM FS)</td><td>Left/Right Clock (Word Select)</td></tr>
+        <tr><td>DIN</td><td>GPIO 21 (PCM DOUT)</td><td>Veri girişi (Pi→DAC)</td></tr>
+        <tr><td>SCK</td><td>GND (slave mode)</td><td>System Clock (Master Mode'da bağlı)</td></tr>
+        <tr><td>VCC</td><td>3.3V veya 5V</td><td>Güç</td></tr>
+        <tr><td>GND</td><td>GND</td><td>Toprak</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Adım 1: Device Tree Overlay etkinleştirme</h3>
+  <pre><code class="language-bash"># /boot/config.txt (Raspberry Pi OS) veya /boot/firmware/config.txt
+# Varsayılan ses kartını devre dışı bırak
+dtparam=audio=off
+
+# PCM5102 overlay'i etkinleştir
+dtoverlay=hifiberry-dac
+
+# Alternatif: özel overlay
+dtoverlay=i2s-mmap</code></pre>
+
+  <h3>Adım 2: hifiberry-dac overlay içeriği (referans)</h3>
+  <pre><code class="language-bash"># Raspberry Pi overlay kaynak kodu şu şekilde görünür:
+# overlays/hifiberry-dac-overlay.dts (çekirdek kaynak)
+
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2835";
+
+    fragment@0 {
+        target = &lt;&amp;i2s&gt;;
+        __overlay__ { status = "okay"; };
+    };
+
+    fragment@1 {
+        target-path = "/";
+        __overlay__ {
+            pcm5102a: pcm5102a {
+                compatible = "ti,pcm5102a";
+                #sound-dai-cells = &lt;0&gt;;
+                status = "okay";
+            };
+        };
+    };
+
+    fragment@2 {
+        target = &lt;&amp;sound&gt;;
+        hifiberry_dac: __overlay__ {
+            compatible = "hifiberry,hifiberry-dac";
+            i2s-controller = &lt;&amp;i2s&gt;;
+            status = "okay";
+        };
+    };
+};</code></pre>
+
+  <h3>Adım 3: ALSA yapılandırması</h3>
+  <pre><code class="language-bash"># /etc/asound.conf — PCM5102'yi varsayılan yap
+pcm.!default {
+    type hw
+    card sndrpihifiberry   # veya card 0 (tek kart ise)
+    device 0
+}
+
+ctl.!default {
+    type hw
+    card sndrpihifiberry
+}
+
+# Yazılım ses kontrolü (PCM5102'nin hardware mixer yok)
+pcm.softvol {
+    type softvol
+    slave.pcm "hw:sndrpihifiberry"
+    control {
+        name "Master"
+        card sndrpihifiberry
+    }
+}</code></pre>
+
+  <h3>Adım 4: Test ve doğrulama</h3>
+  <pre><code class="language-bash"># Kart tanındı mı?
+aplay -l
+# card 0: sndrpihifiberry [snd_rpi_hifiberry_dac], device 0: HifiBerry DAC HiFi pcm5102a-hifi-0
+
+# Ses testi
+speaker-test -D hw:0 -c 2 -t sine -f 1000
+
+# WAV dosyası çal
+aplay -D hw:0,0 -f S32_LE -r 48000 -c 2 test48k.wav
+
+# Mixer kontrolleri
+amixer -c sndrpihifiberry scontrols
+# (PCM5102 hardware mixer yok — sadece digital volume varsa)
+
+# I2S parametrelerini doğrula
+cat /proc/asound/card0/pcm0p/sub0/hw_params
+# format: S32_LE
+# subformat: STD
+# channels: 2
+# rate: 48000 (48000/1)
+# period_size: 1024
+# buffer_size: 8192</code></pre>
+
+  <h3>Adım 5: Sorun giderme</h3>
+  <pre><code class="language-bash"># Kart bulunamıyorsa:
+dmesg | grep -i "i2s\|pcm5102\|hifiberry"
+
+# I2S clock sorunu:
+# Pi'de I2S master mode için doğru MCLK frekansı gerekir
+# 48kHz → BCLK = 48000 * 64 = 3.072 MHz
+# Overlay config.txt'de: dtparam=i2s=on
+
+# ALSA buffer hatası:
+aplay -D hw:0,0 --buffer-time=100000 --period-time=25000 test.wav
+
+# PipeWire çakışması çözme:
+systemctl --user stop pipewire pipewire-pulse
+aplay -D hw:0,0 test.wav</code></pre>
+
+  <div class="callout">
+    <div class="label">ÖZET</div>
+    <p>Linux ses mimarisi ALSA çekirdeğinden ASoC framework'ına, DAPM güç yönetiminden Device Tree binding'e kadar katmanlı bir yapıya sahiptir. Gömülü sistemlerde PulseAudio veya PipeWire olmadan doğrudan <code>hw:</code> cihazına erişmek, gecikme ve öngörülebilirlik açısından idealdir. PCM5102 gibi register-less DAC'lar için <code>simple-audio-card</code> binding ile makine sürücüsü yazmaya gerek kalmaz.</p>
+  </div>
+</section>
+
+</main>

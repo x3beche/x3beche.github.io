@@ -1,0 +1,576 @@
+---
+layout: tutorial
+title: "eMMC Yönetimi — Gömülü Depolama"
+back_url: "../index.html"
+back_label: "embedded-deck"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ</span>
+    <span>eMMC</span>
+    <span>2026</span>
+  </div>
+  <h1>eMMC Yönetimi<br><em>Gömülü Depolama.</em></h1>
+  <p class="subtitle">JEDEC JESD84 standardından bölümleme stratejilerine, RPMB güvenliğinden sağlık izlemeye ve üretim hattı provisioning scriptlerine kadar eksiksiz eMMC yönetimi rehberi.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">eMMC nedir?</a></li>
+    <li><a href="#s1">Fiziksel yapı ve registerlar</a></li>
+    <li><a href="#s2">GPT bölümleme</a></li>
+    <li><a href="#s3">Boot partitions</a></li>
+    <li><a href="#s4">RPMB — Replay Protected Memory Block</a></li>
+    <li><a href="#s5">mmc-utils araçları</a></li>
+    <li><a href="#s6">Sağlık izleme</a></li>
+    <li><a href="#s7">Wear leveling ve tuning</a></li>
+    <li><a href="#s8">Pratik: Üretim eMMC provision scripti</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> eMMC nedir?</h2>
+  <p class="section-lead">eMMC (embedded MultiMediaCard), NAND flash bellek ve kontrolcüsünü tek bir BGA paketinde birleştiren, JEDEC JESD84 standardıyla tanımlanmış yönetilen depolama birimidir.</p>
+
+  <h3>NAND flash ve yönetilen depolama</h3>
+  <p>Ham NAND flash ile çalışmak son derece karmaşıktır: bozuk blok yönetimi, wear leveling, ECC (Error Correction Code) ve write endurance tümü yazılım katmanında çözülmelidir. eMMC, tüm bu düşük seviyeli sorumluluğu iç kontrolcüde gizleyerek sisteme standart bir MMC/SD arayüzü sunar. Geliştirici dosya sistemi yazma/okuma işlemleri yaparken; sayfa programlama, blok silme, ECC ve wear leveling eMMC içinde otomatik yürütülür.</p>
+
+  <h3>Depolama teknolojisi karşılaştırması</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Özellik</th><th>Ham NAND</th><th>eMMC</th><th>SD Kart</th><th>NVMe SSD</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Arayüz</td><td>Paralel/SPI</td><td>MMC (HS400)</td><td>SD/SPI</td><td>PCIe/NVMe</td></tr>
+        <tr><td>Hız (seq r)</td><td>~100 MB/s</td><td>250–300 MB/s</td><td>10–100 MB/s</td><td>2–7 GB/s</td></tr>
+        <tr><td>Entegrasyon</td><td>MTD/UBIFS gerekir</td><td>Block device doğrudan</td><td>Block device</td><td>Block device</td></tr>
+        <tr><td>Boot desteği</td><td>Manuel</td><td>Boot0/Boot1 hardwired</td><td>Card detect gerekir</td><td>NVMe boot</td></tr>
+        <tr><td>RPMB</td><td>Yok</td><td>Standart</td><td>Yok</td><td>Yok (genelde)</td></tr>
+        <tr><td>Endurance</td><td>pSLC: 100K cycle</td><td>MLC: 3K–10K cycle</td><td>Düşük</td><td>TLC: 3K cycle</td></tr>
+        <tr><td>Maliyet</td><td>Düşük</td><td>Orta</td><td>Düşük</td><td>Yüksek</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>JEDEC JESD84 standardı</h3>
+  <p>JESD84-B51 (eMMC 5.1) standardı; HS400 (400 MB/s), enhanced strobe modu, packed commands, command queuing ve gelişmiş sağlık registerları gibi özellikleri tanımlar. Çoğu modern SoC (i.MX8, RK3568, AM625) HS400 destekler.</p>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Fiziksel yapı ve registerlar</h2>
+  <p class="section-lead">eMMC'nin iç yapısını anlamak; boot partition seçimi, write protection ve kapasite hesaplama için gereklidir.</p>
+
+  <h3>Mantıksal bölge yapısı</h3>
+  <div class="flow">
+    <pre>
+eMMC Fiziksel Yapısı
+┌────────────────────────────────────────┐
+│           User Data Area               │  ← normal disk bölümler
+│  (mmcblk0 — GPT/MBR bölümleme)        │
+├──────────────┬─────────────────────────┤
+│  Boot Area 1 │  Boot Area 2            │  ← mmcblk0boot0 / mmcblk0boot1
+│  (mmcblk0boot0)  (mmcblk0boot1)        │  U-Boot buraya yazılır
+├──────────────┴─────────────────────────┤
+│  RPMB (Replay Protected Memory Block)  │  ← mmcblk0rpmb
+│  (TEE / güvenli depolama)              │
+└────────────────────────────────────────┘
+    </pre>
+  </div>
+
+  <h3>Önemli registerlar</h3>
+  <div class="params">
+    <div class="param"><span class="name">CID (Card Identification)</span><span class="desc">128-bit — üretici, model, seri numarası, üretim tarihi. Değiştirilemez, fabrikada yazılır</span></div>
+    <div class="param"><span class="name">CSD (Card Specific Data)</span><span class="desc">128-bit — eMMC sürümü, kapasite, blok boyutu, zaman sabitleri</span></div>
+    <div class="param"><span class="name">EXT_CSD</span><span class="desc">512-byte genişletilmiş register — boot partition boyutu, RPMB boyutu, timing modu, sağlık bitleri, WP grupları</span></div>
+  </div>
+
+  <h3>EXT_CSD register haritası (önemli ofsetler)</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Ofset</th><th>Alan</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>196</td><td>BOOT_PARTITION_ENABLE</td><td>Hangi boot alanından önyükleneceği (boot0/boot1/user)</td></tr>
+        <tr><td>179</td><td>PARTITION_CONFIG</td><td>Boot partition access ve bus seçimi</td></tr>
+        <tr><td>241</td><td>BOOT_SIZE_MULTI</td><td>Boot partition boyutu = değer × 128 KB</td></tr>
+        <tr><td>267</td><td>PRE_EOL_INFO</td><td>Ömür sonu uyarısı (0x01=normal, 0x02=warning, 0x03=urgent)</td></tr>
+        <tr><td>268</td><td>DEVICE_LIFE_TIME_EST_A</td><td>Type A (SLC) yıpranma tahmini — %10 adımlarla 0–100%</td></tr>
+        <tr><td>269</td><td>DEVICE_LIFE_TIME_EST_B</td><td>Type B (MLC) yıpranma tahmini — %10 adımlarla 0–100%</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre><code class="language-bash"># EXT_CSD registerını oku ve parse et
+mmc extcsd read /dev/mmcblk0 | grep -E "BOOT|LIFE|EOL"
+
+# Çıktı örneği:
+# Boot Partition Size [BOOT_SIZE_MULTI]: 0x10
+# Boot configuration bytes [PARTITION_CONFIG]: 0x48
+# pre-EOL information [PRE_EOL_INFO]: 0x01
+# Device life time estimation type A [DEVICE_LIFE_TIME_EST_TYP_A]: 0x01</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> GPT bölümleme</h2>
+  <p class="section-lead">eMMC user data alanı, tıpkı bir SATA disk gibi GPT veya MBR bölüm tablosuyla yönetilir. Gömülü sistemlerde GPT tercih edilir.</p>
+
+  <h3>Neden GPT?</h3>
+  <p>MBR 4 birincil bölümle sınırlıdır ve 2 TB üstü diskleri desteklemez. GPT 128 bölüme kadar destek sunar, birincil ve yedek bölüm tablosu içerir ve her bölüme GUID ile benzersiz kimlik verir.</p>
+
+  <h3>sgdisk ile bölümleme</h3>
+  <pre><code class="language-bash">#!/bin/bash
+# Üretim bölümleme scripti
+DEVICE=/dev/mmcblk0
+
+# Mevcut bölüm tablosunu sil
+sgdisk --zap-all $DEVICE
+
+# Bölümleri oluştur
+# U-Boot env (2 MB, offset 1 MB'dan başla — bootloader raw için yer)
+sgdisk --new=1:2048:6143   --typecode=1:8300 --change-name=1:"uboot-env"  $DEVICE
+
+# Boot: kernel + DTB + initramfs (64 MB)
+sgdisk --new=2:6144:137215 --typecode=2:0700 --change-name=2:"boot"       $DEVICE
+
+# RootFS A (512 MB — squashfs)
+sgdisk --new=3:137216:1185791 --typecode=3:8300 --change-name=3:"rootfs-a" $DEVICE
+
+# RootFS B (512 MB — A/B güncelleme)
+sgdisk --new=4:1185792:2234367 --typecode=4:8300 --change-name=4:"rootfs-b" $DEVICE
+
+# Data (kalan alan)
+sgdisk --new=5:2234368:0 --typecode=5:8300 --change-name=5:"data" $DEVICE
+
+# Bölüm tablosunu yazdır
+sgdisk --print $DEVICE
+
+# Kernel bölüm tablosunu güncelle
+partprobe $DEVICE || partx -u $DEVICE</code></pre>
+
+  <h3>Bölüm düzeni</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Bölüm</th><th>Başlangıç</th><th>Boyut</th><th>İçerik</th><th>FS</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>mmcblk0p1</td><td>2048 (1 MB)</td><td>2 MB</td><td>U-Boot env</td><td>Raw</td></tr>
+        <tr><td>mmcblk0p2</td><td>6144 (3 MB)</td><td>64 MB</td><td>Kernel, DTB, initrd</td><td>FAT32</td></tr>
+        <tr><td>mmcblk0p3</td><td>137216</td><td>512 MB</td><td>RootFS A (squashfs)</td><td>SquashFS</td></tr>
+        <tr><td>mmcblk0p4</td><td>1185792</td><td>512 MB</td><td>RootFS B (squashfs)</td><td>SquashFS</td></tr>
+        <tr><td>mmcblk0p5</td><td>2234368</td><td>Kalan</td><td>Kalıcı data + overlay</td><td>ext4</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>eMMC'de ilk 1 MB (LBA 0–2047) bootloader için ayrılır ve bölüm tablosuna dahil edilmez. U-Boot çoğunlukla <code>mmcblk0boot0</code>'a yazılır; ancak bazı SoC tasarımları U-Boot'u user data alanının başına ham olarak yazar. Hedef boardunuzun boot flow diyagramını inceleyin.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Boot partitions</h2>
+  <p class="section-lead">eMMC'nin iki adet 128 KB'nın katları şeklinde boyutlandırılmış özel boot alanı (boot0 / boot1) mevcuttur. SoC ROM kodu doğrudan bu alanlardan önyükleme yapabilir.</p>
+
+  <h3>Boot partition erişimini etkinleştirme</h3>
+  <pre><code class="language-bash"># Boot0'ı erişilebilir yap
+echo 0 > /sys/class/block/mmcblk0boot0/force_ro
+
+# Boot1'i erişilebilir yap
+echo 0 > /sys/class/block/mmcblk0boot1/force_ro</code></pre>
+
+  <h3>U-Boot'u boot0'a yazma</h3>
+  <pre><code class="language-bash">#!/bin/bash
+# U-Boot'u eMMC boot0 partition'a yaz
+UBOOT_BIN=/tmp/u-boot.imx    # i.MX8 formatı
+BOOT0=/dev/mmcblk0boot0
+
+# Write protect'i kaldır
+echo 0 > /sys/class/block/mmcblk0boot0/force_ro
+
+# Yazma (i.MX8 için offset 0, bazı SoC'lar 512 byte offset ister)
+dd if=$UBOOT_BIN of=$BOOT0 bs=512 seek=0 conv=fsync status=progress
+
+# Write protect'i geri aç
+echo 1 > /sys/class/block/mmcblk0boot0/force_ro
+
+echo "U-Boot yazıldı: $(stat -c %s $UBOOT_BIN) byte"</code></pre>
+
+  <h3>BOOT_PARTITION_ENABLE ayarlama</h3>
+  <pre><code class="language-bash"># mmc-utils ile boot0'dan önyüklemeyi etkinleştir
+# PARTITION_CONFIG[5:3] = 001 = boot0
+mmc bootpart enable 1 1 /dev/mmcblk0
+# Argümanlar: boot_partition(1=boot0) boot_ack(1=etkin) device
+
+# Mevcut ayarı doğrula
+mmc extcsd read /dev/mmcblk0 | grep "Boot configuration"
+# Boot configuration bytes [PARTITION_CONFIG]: 0x48
+# 0x48 = 0100 1000: boot0 enabled, boot ACK enabled</code></pre>
+
+  <h3>Boot partition boyutu</h3>
+  <pre><code class="language-bash"># Boot partition boyutunu hesapla
+mmc extcsd read /dev/mmcblk0 | grep "BOOT_SIZE_MULTI"
+# Boot Partition Size [BOOT_SIZE_MULTI]: 0x10
+# Boyut = 0x10 * 128KB = 16 * 128KB = 2MB
+
+# Doğrula
+blockdev --getsize64 /dev/mmcblk0boot0
+# 4194304 = 4 MB (bazı cihazlarda 2× BOOT_SIZE_MULTI)</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> RPMB — Replay Protected Memory Block</h2>
+  <p class="section-lead">RPMB, eMMC içinde kriptografik kimlik doğrulama kullanan özel bir bellek bölgesidir. Güvenli sayaç, cihaz kimliği ve güvenli boot durumu saklamak için kullanılır.</p>
+
+  <h3>RPMB güvenlik modeli</h3>
+  <div class="flow">
+    <pre>
+TEE (Güvenli Dünya)        Normal Dünya
+       |                        |
+   HMAC-SHA256              mmc ioctl
+   anahtarı bilir          (sadece RPMB erişimi)
+       |                        |
+       +------- eMMC RPMB ------+
+                   |
+           256-byte veri bloğu
+           + write counter
+           + MAC doğrulama
+    </pre>
+  </div>
+
+  <h3>RPMB anahtar provisioning</h3>
+  <pre><code class="language-bash">#!/bin/bash
+# RPMB anahtarını ilk kez yaz (bir kez yapılır — geri alınamaz!)
+# Anahtar 32 byte HMAC-SHA256 anahtarı
+
+# Donanımdan türetilmiş anahtar (örnek — gerçekte TEE/HSM'den gelir)
+KEY_HEX="0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+
+# rpmb-tool veya mmc rpmb write-key kullan
+mmc rpmb write-key /dev/mmcblk0rpmb /dev/mmcblk0 <<< "$KEY_HEX"
+
+# Ya da rpmb-tool (daha güvenilir TEE entegrasyonu)
+# rpmb_tool --key $KEY_HEX program /dev/mmcblk0</code></pre>
+
+  <h3>RPMB okuma/yazma (mmc-utils)</h3>
+  <pre><code class="language-bash"># RPMB'ye 256-byte veri yaz (blok 0)
+echo -n "secure_data_here_padded_to_256b" | \
+    mmc rpmb write-block /dev/mmcblk0rpmb /dev/mmcblk0 0x00 -
+
+# RPMB'den veri oku
+mmc rpmb read-block /dev/mmcblk0rpmb /dev/mmcblk0 0x00 1 -</code></pre>
+
+  <div class="callout">
+    <div class="label">GÜVENLİK</div>
+    <p>RPMB anahtarı eMMC'ye bir kez yazılır ve değiştirilemez. Aynı anahtar yedek olarak güvenli depolamada (HSM, TEE persistent storage) tutulmalıdır. RPMB'nin asıl amacı yüksek kapasiteli veri depolama değil; write counter ile replay saldırısına karşı dayanıklı küçük güvenli değer saklamaktır (örn: rollback counter, device binding key).</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> mmc-utils araçları</h2>
+  <p class="section-lead"><code>mmc-utils</code> paketi, EXT_CSD okuma, boot partition yönetimi, sağlık sorgulama ve düşük seviyeli eMMC yapılandırması için temel CLI araçlarını sunar.</p>
+
+  <h3>Temel komutlar</h3>
+  <pre><code class="language-bash"># EXT_CSD tüm alanları oku
+mmc extcsd read /dev/mmcblk0
+
+# eMMC durumu sorgula
+mmc status get /dev/mmcblk0
+# Çıktı: READY_FOR_DATA=1, CURRENT_STATE=Transfer, ...
+
+# Cihaz bilgisi (CID, CSD)
+mmc info /dev/mmcblk0
+
+# Boot bus ayarlarını göster
+mmc bootbus get /dev/mmcblk0
+
+# Boot bus genişliği ayarla (x8, SDR, DDR)
+mmc bootbus set /dev/mmcblk0 x8 sdr normal</code></pre>
+
+  <h3>Güvenli silme işlemleri</h3>
+  <pre><code class="language-bash"># Belirli LBA aralığını sil (DISCARD — hızlı, veri geri alınabilir)
+mmc erase /dev/mmcblk0 0 8192
+
+# Güvenli silme (SECURE ERASE — yavaş, NAND hücrelerini fiziksel sıfırlar)
+mmc erase --secure /dev/mmcblk0 0 8192
+
+# Tüm cihazı güvenli sil (üretim sonrası temizleme)
+mmc sanitize /dev/mmcblk0</code></pre>
+
+  <h3>Write Protect (WP) yönetimi</h3>
+  <pre><code class="language-bash"># WP grup boyutunu öğren
+mmc extcsd read /dev/mmcblk0 | grep "Write protect group size"
+
+# Boot partition kalıcı write protect
+mmc writeprotect boot set /dev/mmcblk0
+
+# User area belirli bölge WP
+mmc writeprotect user set pwron /dev/mmcblk0 0 8192
+# pwron = power-on WP (her açılışta aktif)
+# perm  = kalıcı WP (değiştirilemez)
+# temp  = geçici WP</code></pre>
+
+  <div class="params">
+    <div class="param"><span class="name">mmc extcsd read</span><span class="desc">512-byte EXT_CSD registerını insan okunabilir formatta gösterir</span></div>
+    <div class="param"><span class="name">mmc status get</span><span class="desc">Anlık eMMC durum registerını sorgular — hata bayrakları dahil</span></div>
+    <div class="param"><span class="name">mmc bootpart enable</span><span class="desc">Boot0/boot1 seçimi ve boot ACK yapılandırması</span></div>
+    <div class="param"><span class="name">mmc sanitize</span><span class="desc">Silinen blokları fiziksel olarak temizler (NAND cell erase)</span></div>
+    <div class="param"><span class="name">mmc rpmb</span><span class="desc">RPMB anahtar programlama, blok okuma/yazma</span></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Sağlık izleme</h2>
+  <p class="section-lead">eMMC JESD84-B51 standardı, cihaz ömrü ve wear durumunu izlemek için EXT_CSD içinde birkaç sağlık alanı tanımlar.</p>
+
+  <h3>Temel sağlık alanları</h3>
+  <pre><code class="language-bash">#!/bin/bash
+# eMMC sağlık raporu scripti
+DEVICE=${1:-/dev/mmcblk0}
+
+echo "=== eMMC Sağlık Raporu: $DEVICE ==="
+
+EXTCSD=$(mmc extcsd read $DEVICE 2>/dev/null)
+
+# PRE_EOL_INFO
+EOL=$(echo "$EXTCSD" | grep "PRE_EOL_INFO" | grep -oP '0x[0-9a-fA-F]+' | tail -1)
+case $EOL in
+    0x00) EOL_STATUS="Undefined" ;;
+    0x01) EOL_STATUS="Normal — kullanım %0-80" ;;
+    0x02) EOL_STATUS="WARNING — kullanım %80-90" ;;
+    0x03) EOL_STATUS="URGENT — kullanım >%90, değiştirin!" ;;
+    *)    EOL_STATUS="Bilinmiyor: $EOL" ;;
+esac
+echo "Pre-EOL Info: $EOL_STATUS"
+
+# LIFE TIME EST A/B
+LIFE_A=$(echo "$EXTCSD" | grep "DEVICE_LIFE_TIME_EST_TYP_A" | grep -oP '0x[0-9a-fA-F]+' | tail -1)
+LIFE_B=$(echo "$EXTCSD" | grep "DEVICE_LIFE_TIME_EST_TYP_B" | grep -oP '0x[0-9a-fA-F]+' | tail -1)
+
+echo "Life Time Est Type A (SLC): $((16#${LIFE_A#0x} * 10))% tüketildi"
+echo "Life Time Est Type B (MLC): $((16#${LIFE_B#0x} * 10))% tüketildi"</code></pre>
+
+  <h3>Sağlık alanı yorumlama tablosu</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Değer</th><th>PRE_EOL_INFO</th><th>LIFE_TIME_EST</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>0x00</td><td>Tanımsız</td><td>Tanımsız</td></tr>
+        <tr><td>0x01</td><td>Normal</td><td>%0–10 kullanıldı</td></tr>
+        <tr><td>0x02</td><td>Uyarı (SLC kopyaları tükeniyor)</td><td>%10–20 kullanıldı</td></tr>
+        <tr><td>0x03</td><td>Acil (cihazı değiştirin)</td><td>%20–30 kullanıldı</td></tr>
+        <tr><td>0x0A</td><td>—</td><td>%90–100 kullanıldı</td></tr>
+        <tr><td>0x0B</td><td>—</td><td>&gt;%100 (aşılmış!)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Sistemd sağlık izleme servisi</h3>
+  <pre><code class="language-bash"># /etc/systemd/system/emmc-health-check.service
+[Unit]
+Description=eMMC Health Monitor
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/emmc-health-report.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+
+---
+# /etc/systemd/system/emmc-health-check.timer
+[Unit]
+Description=eMMC Health Check — günlük
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Wear leveling ve tuning</h2>
+  <p class="section-lead">eMMC iç wear leveling algoritması otomatik çalışır; ancak host tarafında scheduler, fstrim ve ext4 seçenekleri ek optimizasyon sağlar.</p>
+
+  <h3>I/O Scheduler seçimi</h3>
+  <p>eMMC managed storage olduğundan, iç kontrolcü komut sıralamasını kendisi yapar. Host scheduler'ın ek maliyet getirmemesi için <code>mq-deadline</code> veya <code>none</code> tercih edilir.</p>
+  <pre><code class="language-bash"># Mevcut scheduler'ı gör
+cat /sys/block/mmcblk0/queue/scheduler
+# [mq-deadline] none kyber bfq
+
+# mq-deadline olarak ayarla
+echo mq-deadline > /sys/block/mmcblk0/queue/scheduler
+
+# Udev kuralı ile kalıcı yap:
+# /etc/udev/rules.d/60-mmc-scheduler.rules
+ACTION=="add|change", KERNEL=="mmcblk[0-9]", \
+    ATTR{queue/rotational}=="0", \
+    ATTR{queue/scheduler}="mq-deadline"</code></pre>
+
+  <h3>ext4 tuning</h3>
+  <pre><code class="language-bash"># ext4 data bölümünü flash için optimize et
+# Zaten oluşturulmuş bölümde:
+tune2fs -o journal_data_writeback /dev/mmcblk0p5
+tune2fs -O ^has_journal /dev/mmcblk0p5   # journal'ı kapat (kritik veri yoksa)
+tune2fs -E discard /dev/mmcblk0p5        # TRIM/DISCARD etkinleştir
+
+# fstab mount seçenekleri:
+# /dev/mmcblk0p5 /data ext4 noatime,nodiratime,discard,data=writeback 0 2</code></pre>
+
+  <h3>fstrim ile düzenli TRIM</h3>
+  <pre><code class="language-bash"># Manuel trim
+fstrim -v /data
+# /data: 256 MiB (268435456 bytes) trimmed
+
+# Systemd timer ile haftalık trim
+systemctl enable fstrim.timer
+systemctl start fstrim.timer
+
+# fstrim.timer ne kadar sıklıkla çalışıyor?
+systemctl cat fstrim.timer | grep OnCalendar
+# OnCalendar=weekly</code></pre>
+
+  <div class="callout">
+    <div class="label">İPUCU</div>
+    <p>eMMC'de <code>discard</code> mount seçeneği her silme işleminde eMMC'ye DISCARD komutu gönderir. Bu, sık yazma/silme işlemlerinde performans düşüşüne neden olabilir. Bunun yerine periyodik <code>fstrim</code> (ör: gece yarısı) daha dengeli bir yaklaşımdır.</p>
+  </div>
+
+  <h3>Yazma I/O'yu azaltma stratejileri</h3>
+  <div class="params">
+    <div class="param"><span class="name">tmpfs log</span><span class="desc">/var/log'u tmpfs'e taşı — syslog flash'a yazma yükü ortadan kalkar</span></div>
+    <div class="param"><span class="name">journal kompres</span><span class="desc">systemd-journald Storage=volatile veya log_level azaltma</span></div>
+    <div class="param"><span class="name">noatime</span><span class="desc">Her dosya erişiminde atime güncellemesini kapat — %20–30 yazma azalması</span></div>
+    <div class="param"><span class="name">ro rootfs</span><span class="desc">Rootfs bölümüne sıfır yazma — en büyük kazanım</span></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: Üretim eMMC provision scripti</h2>
+  <p class="section-lead">Üretim hattında her cihaza uygulanacak eksiksiz provision scripti: bölümleme, imaj yazma, boot partition yapılandırması ve RPMB anahtar programlama.</p>
+
+  <h3>Tam provision scripti</h3>
+  <pre><code class="language-bash">#!/bin/bash
+# production-provision.sh — Üretim eMMC Provision
+# Kullanım: ./production-provision.sh /dev/mmcblk0 images/
+set -euo pipefail
+
+DEVICE=${1:?Cihaz gerekli: /dev/mmcblk0}
+IMG_DIR=${2:?İmaj dizini gerekli}
+LOG=/var/log/provision-$(date +%Y%m%d-%H%M%S).log
+
+log() { echo "[$(date '+%T')] $*" | tee -a $LOG; }
+
+log "=== Üretim Provision Başlıyor: $DEVICE ==="
+
+# 1. Eski bölüm tablosunu temizle
+log "Bölüm tablosu temizleniyor..."
+sgdisk --zap-all $DEVICE
+
+# 2. GPT bölümleme
+log "GPT bölümleri oluşturuluyor..."
+sgdisk \
+    --new=1:2048:6143    --change-name=1:"uboot-env" \
+    --new=2:6144:137215  --change-name=2:"boot"      \
+    --new=3:137216:1185791 --change-name=3:"rootfs-a" \
+    --new=4:1185792:2234367 --change-name=4:"rootfs-b" \
+    --new=5:2234368:0    --change-name=5:"data"       \
+    $DEVICE
+
+partprobe $DEVICE
+sleep 1
+
+# 3. Boot filesystem
+log "Boot bölümü formatlanıyor..."
+mkfs.vfat -F 32 -n "BOOT" ${DEVICE}p2
+
+# 4. Data bölümü
+log "Data bölümü formatlanıyor..."
+mkfs.ext4 -L data -O ^has_journal -E discard ${DEVICE}p5
+
+# 5. Boot partitionları aç, U-Boot yaz
+log "U-Boot boot0'a yazılıyor..."
+echo 0 > /sys/class/block/$(basename ${DEVICE})boot0/force_ro
+dd if=$IMG_DIR/u-boot.imx of=${DEVICE}boot0 bs=512 seek=0 conv=fsync
+echo 1 > /sys/class/block/$(basename ${DEVICE})boot0/force_ro
+
+# 6. Boot partition etkinleştir
+log "Boot partition etkinleştiriliyor..."
+mmc bootpart enable 1 1 $DEVICE
+
+# 7. Kernel + DTB boot bölümüne kopyala
+log "Kernel ve DTB kopyalanıyor..."
+MNT=$(mktemp -d)
+mount ${DEVICE}p2 $MNT
+cp $IMG_DIR/Image       $MNT/
+cp $IMG_DIR/*.dtb        $MNT/
+cp $IMG_DIR/initramfs.cpio.gz $MNT/ 2>/dev/null || true
+umount $MNT
+
+# 8. RootFS A'ya squashfs yaz
+log "RootFS A yazılıyor..."
+dd if=$IMG_DIR/rootfs.squashfs of=${DEVICE}p3 bs=4M conv=fsync status=progress
+
+# 9. RootFS B'ye aynısını yaz (başlangıç senkron)
+log "RootFS B (kopya) yazılıyor..."
+dd if=$IMG_DIR/rootfs.squashfs of=${DEVICE}p4 bs=4M conv=fsync status=progress
+
+# 10. RPMB anahtar provision (varsa)
+if [ -f "$IMG_DIR/rpmb.key" ]; then
+    log "RPMB anahtarı programlanıyor..."
+    mmc rpmb write-key ${DEVICE}rpmb $DEVICE < $IMG_DIR/rpmb.key
+fi
+
+# 11. Doğrulama
+log "=== Provision Doğrulama ==="
+sgdisk --print $DEVICE | tee -a $LOG
+mmc extcsd read $DEVICE | grep -E "Boot|PARTITION_CONFIG" | tee -a $LOG
+
+log "=== PROVISION TAMAMLANDI ==="
+echo "Log: $LOG"</code></pre>
+
+  <h3>Provision sonrası sağlık kontrolü</h3>
+  <pre><code class="language-bash">#!/bin/bash
+# post-provision-check.sh
+DEVICE=${1:-/dev/mmcblk0}
+
+echo "Bölüm düzeni:"
+lsblk $DEVICE -o NAME,SIZE,FSTYPE,LABEL,MOUNTPOINT
+
+echo ""
+echo "eMMC sağlık:"
+mmc extcsd read $DEVICE | grep -E "PRE_EOL|LIFE_TIME|BOOT_SIZE"
+
+echo ""
+echo "Boot partition:"
+mmc bootpart get $DEVICE</code></pre>
+
+  <div class="callout">
+    <div class="label">ÖZET</div>
+    <p>eMMC, ham NAND'ın tüm düşük seviyeli karmaşıklığını soyutlayan yönetilen bir depolama standardıdır. Üretim kaliteli sistemlerde; GPT bölümleme, boot0 kullanımı, RPMB key provisioning ve düzenli sağlık izleme birlikte ele alınmalıdır. <code>mmc-utils</code> bu işlemlerin tamamını komut satırından gerçekleştirmenizi sağlar.</p>
+  </div>
+</section>
+
+</main>

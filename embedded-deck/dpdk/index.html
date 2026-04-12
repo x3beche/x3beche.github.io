@@ -1,0 +1,614 @@
+---
+layout: tutorial
+title: "DPDK — Yüksek Performanslı Paket İşleme"
+back_url: "../index.html"
+back_label: "embedded-deck"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>LİNUX PERFORMANS NETWORK</span>
+    <span>DPDK</span>
+    <span>2026</span>
+  </div>
+  <h1>DPDK<br><em>Wire-speed paket işleme, kernel olmadan.</em></h1>
+  <p class="subtitle">Data Plane Development Kit ile Linux network stack'ini atlayın, milyon paket/saniye hızlarında L2/L3 işleme yapın — NFV, telecom ve edge uygulamaları için temel altyapı.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">DPDK nedir?</a></li>
+    <li><a href="#s1">Mimari: EAL, lcore, hugepage, PMD</a></li>
+    <li><a href="#s2">Hugepage kurulumu</a></li>
+    <li><a href="#s3">PMD sürücüler</a></li>
+    <li><a href="#s4">rte_mbuf — paket tamponu</a></li>
+    <li><a href="#s5">rte_ring — kilitsiz kuyruk</a></li>
+    <li><a href="#s6">Temel DPDK uygulaması</a></li>
+    <li><a href="#s7">Pipeline modeli</a></li>
+    <li><a href="#s8">Pratik: L2 forwarding uygulaması</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> DPDK nedir?</h2>
+  <p class="section-lead">Data Plane Development Kit (DPDK), Intel tarafından 2010'da başlatılmış ve 2017'de Linux Foundation'a devredilmiş açık kaynak bir kütüphane ve sürücü koleksiyonudur. Temel amacı, ağ paketlerini Linux kernel network stack'ini tamamen atlayarak (kernel bypass) doğrudan kullanıcı alanından işlemektir.</p>
+
+  <h3>Neden kernel bypass?</h3>
+  <p>Geleneksel Linux network stack'inde bir paketin serüveni şöyledir: NIC kesmesi → kernel IRQ handler → socket buffer kopyalama → sistem çağrısı geçişi → kullanıcı alanı. Bu yol her paket için yüzlerce CPU döngüsü tüketir, context switch ve bellek kopyalama ek yük getirir. 10GbE hattında ~14.8 milyon paket/saniye hedeflendiğinde bu yük kabul edilemez hale gelir.</p>
+
+  <div class="flow">
+    <pre>
+  Geleneksel Linux:
+  NIC → Kernel Driver → SKB Alloc → TCP/IP Stack → Socket → Memcpy → Uygulama
+       [kesme]        [kopyalama]  [işleme]       [syscall] [kopyalama]
+
+  DPDK:
+  NIC → PMD (user-space poll) → rte_mbuf → Uygulama
+       [polling, sıfır kopya]   [DMA, zero-copy]
+    </pre>
+  </div>
+
+  <h3>Kullanım alanları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">NFV (Network Function Virtualization)</span><span class="desc">vRouter, vFirewall, vLoadBalancer — telecom operatörleri için sanal ağ fonksiyonları</span></div>
+    <div class="param"><span class="name">Telecom / 5G</span><span class="desc">gNodeB baseband işleme, fronthaul/midhaul paket yönetimi, O-RAN DU/CU</span></div>
+    <div class="param"><span class="name">Edge Computing</span><span class="desc">MEC (Multi-access Edge Computing) uygulamaları, düşük gecikmeli paket yönlendirme</span></div>
+    <div class="param"><span class="name">DPI (Deep Packet Inspection)</span><span class="desc">İçerik tabanlı filtreleme, güvenlik duvarı, IDS/IPS sistemleri</span></div>
+    <div class="param"><span class="name">Yük Dengeleme</span><span class="desc">L4/L7 yük dengeleme — nginx/HAProxy'ye göre 10-100x daha yüksek PPS</span></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Mimari: EAL, lcore, hugepage, PMD</h2>
+  <p class="section-lead">DPDK'nın temel mimarisi birkaç temel bileşenden oluşur. Her bileşen belirli bir sorunu çözmek için tasarlanmıştır.</p>
+
+  <h3>EAL — Environment Abstraction Layer</h3>
+  <p>EAL, DPDK uygulamalarının çalıştığı temel çerçevedir. CPU affinity, bellek yönetimi, PCI cihaz erişimi ve loglama gibi işletim sistemi bağımlı işlemleri soyutlar. Her DPDK uygulaması <code>rte_eal_init()</code> çağrısıyla EAL'ı başlatmak zorundadır.</p>
+
+  <div class="flow">
+    <pre>
+  ┌────────────────────────────────────────────────────┐
+  │                DPDK Uygulama                        │
+  ├────────────────────────────────────────────────────┤
+  │  rte_ethdev  rte_mbuf  rte_ring  rte_mempool       │
+  │  (Ethernet)  (buffer)  (queue)   (memory)           │
+  ├────────────────────────────────────────────────────┤
+  │         EAL — Environment Abstraction Layer         │
+  │   lcore mgmt │ hugepage alloc │ PCI probe           │
+  ├───────────────┬──────────────────────────────────-──┤
+  │  PMD (igb)    │  PMD (mlx5)   │  PMD (virtio)       │
+  │  user-space   │  user-space   │  user-space          │
+  │  NIC driver   │  NIC driver   │  NIC driver          │
+  └───────────────┴───────────────┴────────────────────-┘
+    </pre>
+  </div>
+
+  <h3>lcore — Logical Core</h3>
+  <p>DPDK, ağ işleme iş yükünü belirli CPU çekirdeklerine (lcore) sabitler. Bu çekirdekler polling modunda çalışır; kesme bekleme yerine sürekli RX kuyruğunu kontrol eder. <code>taskset</code> veya EAL parametreleriyle belirlenen bu çekirdekler <strong>hiçbir zaman</strong> OS scheduler'a geri verilmemelidir.</p>
+
+  <pre><code class="language-bash"># lcore 1 ve 2'yi DPDK'ya tahsis et, lcore 0'ı master olarak kullan:
+./dpdk-app -l 0-2 -n 4
+
+# CPU izolasyonu — kernel cmdline:
+isolcpus=1,2 nohz_full=1,2 rcu_nocbs=1,2</code></pre>
+
+  <h3>Memory model ve hugepage</h3>
+  <p>DPDK, 4KB standart sayfa boyutu yerine 2MB veya 1GB hugepage kullanır. Bu sayede TLB miss sayısı dramatik biçimde azalır. Büyük paket tamponları için TLB thrashing kritik bir darboğaz olabilir.</p>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Hugepage kurulumu</h2>
+  <p class="section-lead">DPDK çalışmaya başlamadan önce hugepage'ler tahsis edilmelidir. Bu tahsis sistem başlangıcında veya çalışma zamanında yapılabilir.</p>
+
+  <h3>Çalışma zamanı hugepage tahsisi</h3>
+
+  <pre><code class="language-bash"># 2MB hugepage — mevcut durumu kontrol et
+cat /proc/meminfo | grep -i huge
+# HugePages_Total: 0
+# HugePages_Free:  0
+# Hugepagesize:    2048 kB
+
+# 1024 adet 2MB hugepage tahsis et (= 2GB)
+echo 1024 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+
+# NUMA sistemlerde node bazında tahsis:
+echo 512 | sudo tee /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
+echo 512 | sudo tee /sys/devices/system/node/node1/hugepages/hugepages-2048kB/nr_hugepages
+
+# 1GB hugepage (destekleniyorsa):
+echo 4 | sudo tee /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages</code></pre>
+
+  <h3>Kalıcı hugepage (kernel cmdline)</h3>
+
+  <pre><code class="language-bash"># /etc/default/grub içinde GRUB_CMDLINE_LINUX'a ekle:
+GRUB_CMDLINE_LINUX="default_hugepagesz=2M hugepagesz=2M hugepages=2048 \
+                    hugepagesz=1G hugepages=4 \
+                    isolcpus=1-7 nohz_full=1-7"
+
+sudo update-grub
+sudo reboot</code></pre>
+
+  <h3>Hugepage dosya sistemi mount</h3>
+
+  <pre><code class="language-bash"># hugetlbfs mount — DPDK bunu otomatik yapar ama elle de yapılabilir:
+sudo mkdir -p /dev/hugepages
+sudo mount -t hugetlbfs hugetlbfs /dev/hugepages
+
+# 1GB hugepage için ayrı mount point:
+sudo mkdir -p /dev/hugepages1G
+sudo mount -t hugetlbfs -o pagesize=1G hugetlbfs /dev/hugepages1G
+
+# /etc/fstab'a ekle:
+echo "hugetlbfs /dev/hugepages hugetlbfs defaults 0 0" | sudo tee -a /etc/fstab</code></pre>
+
+  <h3>dpdk-hugepages.py yardımcı scripti</h3>
+
+  <pre><code class="language-bash"># DPDK kurulumunda gelir:
+sudo dpdk-hugepages.py --setup 2G         # 2GB 2M hugepage
+sudo dpdk-hugepages.py --show             # mevcut durumu göster
+sudo dpdk-hugepages.py --reserve 1G --pagesize 1G  # 1G hugepage</code></pre>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Hugepage tahsisi sistem çalışırken yapıldığında bellek fragmantasyonu nedeniyle başarısız olabilir. Kritik prodüksiyon sistemleri için hugepage tahsisini boot time'da <code>hugepages=</code> kernel parametresiyle yapın. NUMA sistemlerde her node'a eşit dağıtım yapın.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> PMD sürücüler</h2>
+  <p class="section-lead">Poll Mode Driver (PMD), donanıma özgü NIC erişimini sağlayan kullanıcı alanı sürücüsüdür. Kernel sürücüsü devre dışı bırakılır, NIC doğrudan kullanıcı alanına bağlanır.</p>
+
+  <h3>Temel PMD'ler ve özellikleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>PMD</th><th>NIC</th><th>Mekanizma</th><th>Özellik</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>igb / e1000</code></td><td>Intel 1GbE</td><td>UIO/VFIO</td><td>Geliştirme ve test</td></tr>
+        <tr><td><code>ixgbe</code></td><td>Intel 10GbE X540/X550</td><td>UIO/VFIO</td><td>Prodüksiyon, SR-IOV</td></tr>
+        <tr><td><code>i40e</code></td><td>Intel XL710/X710 40GbE</td><td>VFIO</td><td>PF/VF, Flow Director</td></tr>
+        <tr><td><code>ice</code></td><td>Intel E810 100GbE</td><td>VFIO</td><td>En yeni Intel NIC</td></tr>
+        <tr><td><code>mlx5</code></td><td>Mellanox/NVIDIA 25/100GbE</td><td>Verbs (libibverbs)</td><td>Kernel sürücü ile birlikte çalışır</td></tr>
+        <tr><td><code>virtio</code></td><td>KVM virtio-net</td><td>Virtio spec</td><td>Sanallaştırma, QEMU/KVM</td></tr>
+        <tr><td><code>vfio-pci</code></td><td>Tüm VFIO uyumlu</td><td>VFIO-PCI</td><td>IOMMU koruması, önerilen</td></tr>
+        <tr><td><code>af_xdp</code></td><td>Kernel AF_XDP socket</td><td>AF_XDP</td><td>Kernel sürücü tutulur, kısmi bypass</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>vfio-pci ile NIC bağlama</h3>
+
+  <pre><code class="language-bash"># 1. Mevcut NIC'i tespit et
+lspci | grep Ethernet
+# 0000:03:00.0 Ethernet controller: Intel Corporation 82599ES 10-Gigabit
+
+# 2. Kernel sürücüyü kaldır
+sudo modprobe vfio-pci
+PCI_ADDR="0000:03:00.0"
+sudo dpdk-devbind.py --status
+sudo dpdk-devbind.py --bind=vfio-pci $PCI_ADDR
+
+# 3. IOMMU etkinleştirme (kernel cmdline):
+# Intel: intel_iommu=on iommu=pt
+# AMD:   amd_iommu=on iommu=pt
+
+# 4. Bağlamayı doğrula
+sudo dpdk-devbind.py --status | grep vfio</code></pre>
+
+  <h3>mlx5 özel durum</h3>
+
+  <pre><code class="language-bash"># Mellanox mlx5 için özel durum: kernel sürücü kalmaya devam eder
+# OFED veya inbox mlx5_core sürücüsü gerekir
+sudo apt install rdma-core libibverbs-dev libmlx5-dev
+
+# Bağlama GEREKMEZ — mlx5 PMD kernel sürücüyle konuşur:
+sudo dpdk-devbind.py --status
+# şu şekilde görünür: drv=mlx5_core (kullanılabilir: mlx5)</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> rte_mbuf — paket tamponu</h2>
+  <p class="section-lead">rte_mbuf, DPDK'nın temel paket tamponu yapısıdır. Her ağ paketi bir rte_mbuf'ta saklanır. Sıfır kopya (zero-copy) tasarımı ile donanım DMA'sından doğrudan kullanıcı alanı işlemine gider.</p>
+
+  <h3>rte_mbuf yapısı</h3>
+
+  <div class="flow">
+    <pre>
+  ┌─────────────────────────────────────────────────────────┐
+  │                  rte_mbuf metadata                       │
+  │  next│pool│buf_addr│data_off│pkt_len│data_len│ol_flags  │
+  ├─────────────────────────────────────────────────────────┤
+  │  headroom (RTE_PKTMBUF_HEADROOM = 128B)                 │
+  ├─────────────────────────────────────────────────────────┤
+  │  data_off                                               │
+  │  ┌───────────────────────────────────────────────┐      │
+  │  │  Ethernet Header │ IP Header │ TCP │ Payload  │      │
+  │  └───────────────────────────────────────────────┘      │
+  │  ← data_len →                                           │
+  ├─────────────────────────────────────────────────────────┤
+  │  tailroom                                               │
+  └─────────────────────────────────────────────────────────┘
+  Total buf_len = RTE_MBUF_DEFAULT_BUF_SIZE (2048B)
+    </pre>
+  </div>
+
+  <h3>mempool oluşturma</h3>
+
+  <pre><code class="language-c">#include &lt;rte_mbuf.h&gt;
+#include &lt;rte_mempool.h&gt;
+
+#define NUM_MBUFS        8191       /* 2^13 - 1, Mersenne sayısı önerilir */
+#define MBUF_CACHE_SIZE  250
+#define MBUF_DATA_SIZE   RTE_MBUF_DEFAULT_BUF_SIZE  /* 2048 */
+
+struct rte_mempool *mbuf_pool;
+
+mbuf_pool = rte_pktmbuf_pool_create(
+    "MBUF_POOL",          /* isim */
+    NUM_MBUFS,            /* eleman sayısı */
+    MBUF_CACHE_SIZE,      /* per-lcore cache */
+    0,                    /* private data boyutu */
+    MBUF_DATA_SIZE,       /* veri alan boyutu */
+    rte_socket_id()       /* NUMA node */
+);
+if (mbuf_pool == NULL)
+    rte_exit(EXIT_FAILURE, "mempool oluşturulamadı\n");</code></pre>
+
+  <h3>mbuf erişim makroları</h3>
+
+  <pre><code class="language-c">struct rte_mbuf *m;
+
+/* Veri pointer'ı */
+void *data = rte_pktmbuf_mtod(m, void *);
+
+/* Belirli offset'ten cast */
+struct rte_ether_hdr *eth =
+    rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+struct rte_ipv4_hdr *ip =
+    rte_pktmbuf_mtod_offset(m, struct rte_ipv4_hdr *,
+                             sizeof(struct rte_ether_hdr));
+
+/* Paket uzunluğu */
+uint16_t pkt_len = rte_pktmbuf_pkt_len(m);
+
+/* Offload flag'leri (checksum, VLAN, tunnel) */
+uint64_t flags = m->ol_flags;
+if (flags & RTE_MBUF_F_RX_IP_CKSUM_BAD)
+    /* IP checksum hatalı */;
+
+/* scatter-gather: zincirleme mbuf'lar */
+struct rte_mbuf *seg = m;
+while (seg != NULL) {
+    /* her segmenti işle */
+    seg = seg->next;
+}
+
+/* Serbest bırakma */
+rte_pktmbuf_free(m);</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> rte_ring — kilitsiz kuyruk</h2>
+  <p class="section-lead">rte_ring, DPDK'nın lock-free (kilitsiz) FIFO kuyruk implementasyonudur. lcore'lar arası mbuf pointer aktarımında kullanılır. CAS (Compare-and-Swap) atomic operasyonlarıyla thread-safe çalışır.</p>
+
+  <h3>Ring türleri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">SPSC</span><span class="desc">Single Producer Single Consumer — en yüksek performans, tek üretici tek tüketici</span></div>
+    <div class="param"><span class="name">SPMC</span><span class="desc">Single Producer Multi Consumer — bir üretici, çoklu tüketici (work dispatch)</span></div>
+    <div class="param"><span class="name">MPSC</span><span class="desc">Multi Producer Single Consumer — çoklu üretici, tek tüketici (aggregation)</span></div>
+    <div class="param"><span class="name">MPMC</span><span class="desc">Multi Producer Multi Consumer — varsayılan, en genel durum</span></div>
+  </div>
+
+  <pre><code class="language-c">#include &lt;rte_ring.h&gt;
+
+/* Ring oluşturma */
+struct rte_ring *ring;
+ring = rte_ring_create(
+    "PKT_RING",           /* isim */
+    1024,                 /* boyut — 2^N olmalı */
+    rte_socket_id(),      /* NUMA socket */
+    RING_F_SP_ENQ |       /* Single Producer */
+    RING_F_SC_DEQ         /* Single Consumer */
+);
+
+/* Enqueue (paket gönder) */
+struct rte_mbuf *m;
+int ret = rte_ring_enqueue(ring, (void *)m);
+if (ret == -ENOBUFS)
+    /* ring dolu — paketi at */
+    rte_pktmbuf_free(m);
+
+/* Bulk enqueue — daha verimli */
+struct rte_mbuf *burst[32];
+unsigned int sent = rte_ring_enqueue_burst(ring,
+    (void **)burst, 32, NULL);
+
+/* Dequeue */
+struct rte_mbuf *rx_mbuf;
+ret = rte_ring_dequeue(ring, (void **)&rx_mbuf);
+
+/* Bulk dequeue */
+unsigned int rcvd = rte_ring_dequeue_burst(ring,
+    (void **)burst, 32, NULL);
+
+/* Doluluk kontrolü */
+unsigned count = rte_ring_count(ring);
+unsigned free  = rte_ring_free_count(ring);</code></pre>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Ring boyutu her zaman 2'nin kuvveti olmalıdır. Modulo operasyonu yerine bitmask kullanımı (<code>count & (size-1)</code>) performansı artırır. NUMA sistemlerde ring ve onu kullanan lcore'lar aynı NUMA node'unda olmalıdır; aksi takdirde remote memory access gecikmesi oluşur.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Temel DPDK uygulaması</h2>
+  <p class="section-lead">Minimal bir DPDK uygulamasının iskelet kodu üç aşamadan oluşur: EAL başlatma, port kurulumu ve ana paket döngüsü.</p>
+
+  <h3>EAL başlatma ve port kurulumu</h3>
+
+  <pre><code class="language-c">#include &lt;rte_eal.h&gt;
+#include &lt;rte_ethdev.h&gt;
+#include &lt;rte_mbuf.h&gt;
+
+#define RX_RING_SIZE  1024
+#define TX_RING_SIZE  1024
+#define BURST_SIZE    32
+
+static const struct rte_eth_conf port_conf = {
+    .rxmode = {
+        .mq_mode = RTE_ETH_MQ_RX_RSS,  /* RSS ile çoklu kuyruk */
+    },
+    .txmode = {
+        .mq_mode = RTE_ETH_MQ_TX_NONE,
+    },
+    .rx_adv_conf.rss_conf = {
+        .rss_key = NULL,
+        .rss_hf = RTE_ETH_RSS_IP | RTE_ETH_RSS_TCP | RTE_ETH_RSS_UDP,
+    },
+};
+
+int port_init(uint16_t port, struct rte_mempool *mbuf_pool) {
+    struct rte_eth_dev_info dev_info;
+    int ret;
+
+    if (!rte_eth_dev_is_valid_port(port))
+        return -1;
+
+    rte_eth_dev_info_get(port, &dev_info);
+
+    /* Port yapılandırması */
+    ret = rte_eth_dev_configure(port, 1, 1, &port_conf);
+    if (ret != 0) return ret;
+
+    /* MTU ayarla */
+    rte_eth_dev_set_mtu(port, 9000);  /* Jumbo frame */
+
+    /* RX queue kur */
+    ret = rte_eth_rx_queue_setup(port, 0, RX_RING_SIZE,
+        rte_eth_dev_socket_id(port), NULL, mbuf_pool);
+    if (ret < 0) return ret;
+
+    /* TX queue kur */
+    ret = rte_eth_tx_queue_setup(port, 0, TX_RING_SIZE,
+        rte_eth_dev_socket_id(port), NULL);
+    if (ret < 0) return ret;
+
+    /* Port başlat */
+    ret = rte_eth_dev_start(port);
+    if (ret < 0) return ret;
+
+    /* Promiscuous mode */
+    rte_eth_promiscuous_enable(port);
+    return 0;
+}</code></pre>
+
+  <h3>Ana paket döngüsü (polling loop)</h3>
+
+  <pre><code class="language-c">static int lcore_main(void *arg) {
+    uint16_t port;
+    struct rte_mbuf *bufs[BURST_SIZE];
+    uint16_t nb_rx, nb_tx;
+
+    printf("lcore %u başlıyor\n", rte_lcore_id());
+
+    RTE_ETH_FOREACH_DEV(port) {
+        if (rte_eth_dev_socket_id(port) >= 0 &&
+            rte_eth_dev_socket_id(port) != (int)rte_socket_id())
+            printf("UYARI: port %u uzak NUMA node'unda\n", port);
+    }
+
+    /* Sonsuz polling döngüsü */
+    for (;;) {
+        RTE_ETH_FOREACH_DEV(port) {
+            /* RX burst — BURST_SIZE'a kadar paket al */
+            nb_rx = rte_eth_rx_burst(port, 0, bufs, BURST_SIZE);
+            if (nb_rx == 0) continue;
+
+            /* Paketleri işle (bu örnekte basitçe ilet) */
+            uint16_t out_port = port ^ 1;  /* 0→1, 1→0 */
+
+            /* TX burst */
+            nb_tx = rte_eth_tx_burst(out_port, 0, bufs, nb_rx);
+
+            /* İletilemeyen paketleri serbest bırak */
+            if (unlikely(nb_tx < nb_rx)) {
+                for (uint16_t i = nb_tx; i < nb_rx; i++)
+                    rte_pktmbuf_free(bufs[i]);
+            }
+        }
+    }
+    return 0;
+}
+
+int main(int argc, char *argv[]) {
+    struct rte_mempool *mbuf_pool;
+    uint16_t nb_ports, portid;
+
+    /* EAL başlat */
+    int ret = rte_eal_init(argc, argv);
+    if (ret < 0) rte_exit(EXIT_FAILURE, "EAL başlatılamadı\n");
+
+    nb_ports = rte_eth_dev_count_avail();
+    if (nb_ports < 2 || (nb_ports & 1))
+        rte_exit(EXIT_FAILURE, "Çift sayıda port gerekli\n");
+
+    mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL",
+        NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE, 0,
+        RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+
+    /* Her port için başlatma */
+    RTE_ETH_FOREACH_DEV(portid)
+        port_init(portid, mbuf_pool);
+
+    /* lcore'lara görev dağıt */
+    rte_eal_mp_remote_launch(lcore_main, NULL, CALL_MAIN);
+    rte_eal_mp_wait_lcore();
+
+    rte_eal_cleanup();
+    return 0;
+}</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Pipeline modeli</h2>
+  <p class="section-lead">Basit burst modeline ek olarak DPDK, P4 benzeri bir pipeline modeli sunar. Bu modelde paket işleme adımları (port → table → action) birer pipeline bileşenine dönüştürülür.</p>
+
+  <h3>Pipeline bileşenleri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Port</span><span class="desc">Pipeline'ın giriş/çıkış noktaları — ethdev, ring, source/sink</span></div>
+    <div class="param"><span class="name">Table</span><span class="desc">Eşleşme tablosu — exact match, LPM (IPv4 yönlendirme), ACL, hash</span></div>
+    <div class="param"><span class="name">Action</span><span class="desc">Eşleşme sonrası yapılacak işlem — forward, drop, counter, meter</span></div>
+    <div class="param"><span class="name">SWX Pipeline</span><span class="desc">DPDK 20.11+ softswitch pipeline — P4 programlanabilir veri düzlemi</span></div>
+  </div>
+
+  <h3>Basit LPM tablosu örneği</h3>
+
+  <pre><code class="language-c">#include &lt;rte_lpm.h&gt;
+
+struct rte_lpm *lpm;
+struct rte_lpm_config config = {
+    .max_rules = 1 &lt;&lt; 16,      /* 65536 kural */
+    .number_tbl8s = 1 &lt;&lt; 8,
+    .flags = 0,
+};
+
+lpm = rte_lpm_create("IPV4_LPM", rte_socket_id(), &config);
+
+/* Kural ekle: 10.0.0.0/8 → next_hop 1 */
+uint32_t ip = RTE_IPV4(10, 0, 0, 0);
+rte_lpm_add(lpm, ip, 8, 1);
+
+/* 192.168.1.0/24 → next_hop 2 */
+ip = RTE_IPV4(192, 168, 1, 0);
+rte_lpm_add(lpm, ip, 24, 2);
+
+/* Lookup */
+uint32_t next_hop;
+struct rte_ipv4_hdr *ipv4_hdr = /* ... */;
+int rc = rte_lpm_lookup(lpm, rte_be_to_cpu_32(ipv4_hdr->dst_addr),
+                         &next_hop);
+if (rc == 0)
+    /* next_hop port'una ilet */
+else
+    /* drop */;</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: L2 forwarding uygulaması</h2>
+  <p class="section-lead">Bu bölümde iki NIC portu arasında wire-speed L2 forwarding yapan tam bir DPDK uygulaması geliştirilecektir. QEMU virtio portlarıyla test edilebilir.</p>
+
+  <h3>Makefile</h3>
+
+  <pre><code class="language-bash">APP = l2fwd
+
+# DPDK kurulum yolu
+RTE_SDK ?= /usr/local/share/dpdk
+RTE_TARGET ?= x86_64-native-linux-gcc
+
+CFLAGS += -O3 -march=native
+LDFLAGS += -lrte_eal -lrte_mbuf -lrte_ethdev -lrte_mempool \
+           -lrte_ring -lrte_kvargs -lrte_pci -lrte_bus_pci
+
+# pkg-config kullanımı (DPDK 20.11+)
+CFLAGS  += $(shell pkg-config --cflags libdpdk)
+LDFLAGS += $(shell pkg-config --libs libdpdk)
+
+$(APP): l2fwd.c
+	gcc $(CFLAGS) -o $@ $< $(LDFLAGS)</code></pre>
+
+  <h3>QEMU ile test ortamı kurma</h3>
+
+  <pre><code class="language-bash"># iki virtio-net interface ile QEMU başlatma:
+sudo qemu-system-x86_64 \
+  -enable-kvm \
+  -m 4G \
+  -cpu host \
+  -smp 4 \
+  -mem-path /dev/hugepages \
+  -mem-prealloc \
+  -netdev tap,id=net0,ifname=tap0,script=no,downscript=no \
+  -device virtio-net-pci,netdev=net0,id=nic0 \
+  -netdev tap,id=net1,ifname=tap1,script=no,downscript=no \
+  -device virtio-net-pci,netdev=net1,id=nic1 \
+  -drive file=ubuntu.img,format=qcow2 \
+  -nographic</code></pre>
+
+  <h3>L2 forwarding çalıştırma ve performans ölçümü</h3>
+
+  <pre><code class="language-bash"># Hugepage tahsis et
+echo 1024 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+
+# NIC'leri DPDK'ya bağla
+sudo modprobe vfio-pci
+sudo dpdk-devbind.py --bind=vfio-pci 0000:00:03.0 0000:00:04.0
+
+# L2 forwarding başlat (lcore 0: master, lcore 1-2: packet processing)
+sudo ./l2fwd -l 0-2 -n 4 -- -p 0x3 -T 1
+
+# Çıktı:
+# Port statistics ====================================
+# Statistics for port 0 ------------------------------
+# Packets sent:                        10000000
+# Packets received:                    10000000
+# Packets dropped:                            0
+# Port statistics ====================================
+# Aggregate statistics ==============================
+# Total packets sent:                  20000000
+# Total packets received:              20000000
+# Total packets dropped:                       0</code></pre>
+
+  <h3>Performans tuning ipuçları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">CPU izolasyonu</span><span class="desc"><code>isolcpus=</code> + <code>nohz_full=</code> — timer interrupt'larını uzaklaştır, %100 polling yaptır</span></div>
+    <div class="param"><span class="name">NUMA affinity</span><span class="desc">NIC ve lcore aynı NUMA node'unda olmalı — <code>numactl --cpubind=0 --membind=0</code></span></div>
+    <div class="param"><span class="name">Burst size</span><span class="desc">BURST_SIZE=32 genellikle optimal — düşük gecikme için 16, yüksek throughput için 64</span></div>
+    <div class="param"><span class="name">TX offloading</span><span class="desc">checksum offload aktifleştir — <code>RTE_ETH_TX_OFFLOAD_IPV4_CKSUM</code> CPU yükünü azaltır</span></div>
+    <div class="param"><span class="name">Flow Director</span><span class="desc">Intel NIC'lerde RSS + Flow Director ile paketleri doğru lcore'a yönlendir</span></div>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>DPDK uygulamaları root ayrıcalığı gerektirdiğinden prodüksiyon ortamlarında dikkatli olun. <code>--user</code> flag'i ile non-root kullanım mümkündür ancak VFIO-noIOMMU veya özel grup/capability ayarları gerektirir. Container ortamlarında <code>--privileged</code> yerine minimum gerekli capability'leri (<code>CAP_SYS_ADMIN</code>, <code>CAP_NET_ADMIN</code>) tercih edin.</p>
+  </div>
+</section>
+
+</main>

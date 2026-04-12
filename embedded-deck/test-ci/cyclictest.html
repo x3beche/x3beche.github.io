@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>cyclictest — RT Latency Ölçümü · Test &amp; CI</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Fraunces:ital,wght@0,300;0,400;0,600;0,800;1,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/tutorial.css">
+</head>
+<body>
+
+<a href="index.html" class="nav-link">Test &amp; CI</a>
+
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>TEST &amp; CI</span>
+    <span>RT TEST</span>
+    <span>2026</span>
+  </div>
+  <h1>cyclictest<br><em>RT latency ölçümü.</em></h1>
+  <p class="subtitle">PREEMPT_RT Linux sistemlerde gerçek zamanlı gecikme analizi. Histogram oluşturmadan IRQ affinity ayarlamaya, stress-ng yük testinden latency bütçesi belirlemeye kapsamlı rehber.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">RT latency nedir?</a></li>
+    <li><a href="#s1">rt-tests paketi</a></li>
+    <li><a href="#s2">cyclictest parametreleri ve kullanım</a></li>
+    <li><a href="#s3">Latency histogramı ve görselleştirme</a></li>
+    <li><a href="#s4">/proc/sys/kernel tunables</a></li>
+    <li><a href="#s5">IRQ affinity ve CPU isolation</a></li>
+    <li><a href="#s6">stress-ng ile yük altında test</a></li>
+    <li><a href="#s7">Pratik: Industrial Linux'ta latency bütçesi</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> RT Latency Nedir?</h2>
+  <p class="section-lead">Gerçek zamanlı sistemlerde en kritik metrik, bir olayın gerçekleşmesinden uygulamanın tepki vermesine kadar geçen maksimum süredir.</p>
+
+  <p>Genel amaçlı Linux çekirdeği (mainline), throughput (iş hacmi) optimizasyonu için tasarlanmıştır. Scheduler, uzun dönemde adil CPU dağıtımı yapmaya çalışır; bu süreçte anlık gecikmeler (latency) ikincil plana atılır. Sonuç: bir RT thread teorik olarak yüzlerce milisaniye bekleyebilir.</p>
+
+  <p>PREEMPT_RT yaması, çekirdeğin büyük bölümünü preemptible (kesilebilir) hale getirir. Kritik bölgeler spinlock yerine mutex kullanır, interrupt handler'lar threaded hale gelir. Hedef: <strong>worst-case latency'yi öngörülebilir ve düşük</strong> tutmak.</p>
+
+  <h3>Temel kavramlar</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">Latency</div><div class="desc">Bir timer tetiklendiğinden, ilgili RT thread'in uyanıp çalışmaya başlamasına kadar geçen süre. Mikrosaniye (µs) cinsinden ölçülür.</div></div>
+    <div class="param"><div class="name">Jitter</div><div class="desc">Ard arda gelen latency ölçümleri arasındaki değişkenlik. Düşük ortalama latency'ye rağmen yüksek jitter, RT sistemler için kabul edilemez.</div></div>
+    <div class="param"><div class="name">Worst-case latency</div><div class="desc">Tüm test süresi boyunca gözlemlenen maksimum gecikme. RT sistemlerde bu değer <em>hiçbir zaman</em> belirli bir eşiği geçmemeli.</div></div>
+    <div class="param"><div class="name">Latency bütçesi</div><div class="desc">Uygulama katmanının kabul edebileceği maksimum gecikme. Motor kontrolü: ~50µs, ses işleme: ~1ms, sanayi PLC: ~250µs.</div></div>
+    <div class="param"><div class="name">WCET</div><div class="desc">Worst-Case Execution Time — bir görevin tamamlanması için gereken maksimum CPU süresi. Latency bütçesinin bir parçası.</div></div>
+  </div>
+
+  <div class="callout">
+    <div class="label">NEDEN WORST-CASE?</div>
+    <p>Ortalama latency 10µs olsa bile, günde bir kez 500µs'lik bir spike tüm sistemi bozabilir. Güvenlik-kritik sistemlerde (tıbbi cihaz, araç kontrolü) worst-case latency yasal bir gereksinim olabilir. cyclictest, saatlerce çalışarak bu nadiren gerçekleşen spike'ları yakalar.</p>
+  </div>
+
+  <h3>PREEMPT_RT kernel derleme kontrolü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — RT kernel kontrolü</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># PREEMPT_RT aktif mi?</span>
+<span class="cmd">uname</span> -v | <span class="cmd">grep</span> -i preempt
+<span class="cmt"># Örnek çıktı: #1 SMP PREEMPT_RT Thu Apr  3 14:20:11 UTC 2026</span>
+
+<span class="cmt"># Kernel config kontrolü</span>
+<span class="cmd">zcat</span> /proc/config.gz | <span class="cmd">grep</span> PREEMPT
+<span class="cmt"># CONFIG_PREEMPT_RT=y olmalı</span>
+
+<span class="cmt"># Yocto ile RT kernel aktifleştirme:</span>
+<span class="cmt"># local.conf veya machine.conf'a ekle:</span>
+<span class="cmt"># KERNEL_FEATURES:append = " features/preempt-rt/preempt-rt.scc"</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> rt-tests Paketi</h2>
+  <p class="section-lead">rt-tests, Linux RT performansını ölçmek için geliştirilmiş araçlar koleksiyonudur. Linaro ve kernel topluluğu tarafından aktif olarak geliştirilmektedir.</div>
+
+  <h3>Kurulum</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — rt-tests kurulumu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Debian / Ubuntu</span>
+<span class="cmd">apt</span> install -y rt-tests
+
+<span class="cmt"># Yocto recipe ekle (layer'a)</span>
+<span class="cmt"># IMAGE_INSTALL:append = " rt-tests"</span>
+
+<span class="cmt"># Kaynak koddan derleme</span>
+<span class="cmd">git</span> clone https://git.kernel.org/pub/scm/linux/kernel/git/clrkwllms/rt-tests.git
+<span class="cmd">cd</span> rt-tests && <span class="cmd">make</span> -j$(nproc)
+<span class="cmd">make</span> install PREFIX=/usr/local</code></pre>
+  </div>
+
+  <h3>Paketteki araçlar</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Araç</th><th>Ne ölçer?</th><th>Ne zaman kullanılır?</th></tr></thead>
+      <tbody>
+        <tr><td>cyclictest</td><td>Timer wakeup latency</td><td>Ana RT latency ölçümü</td></tr>
+        <tr><td>hackbench</td><td>Scheduler throughput</td><td>Scheduler stres testi olarak yük oluşturma</td></tr>
+        <tr><td>pi_stress</td><td>Priority inheritance</td><td>Mutex ve PI-futex doğrulama</td></tr>
+        <tr><td>hwlatdetect</td><td>Hardware SMI latency</td><td>BIOS/firmware kaynaklı gizli gecikmeleri tespit</td></tr>
+        <tr><td>oslat</td><td>OS-level latency</td><td>cyclictest'e alternatif, CPU-bound ölçüm</td></tr>
+        <tr><td>pmqtest</td><td>POSIX MQ latency</td><td>IPC latency analizi</td></tr>
+        <tr><td>signaltest</td><td>Signal delivery latency</td><td>RT signal işleme zamanlaması</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>hwlatdetect — gizli donanım gecikmelerini bul</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — hwlatdetect kullanımı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># SMI (System Management Interrupt) ve diğer HW gecikmeleri tara</span>
+<span class="cmt"># BIOS/UEFI SMI, birkaç milisaniye sürebilir ve cyclictest'i bozar</span>
+<span class="cmd">hwlatdetect</span> --duration=60 --threshold=10
+
+<span class="cmt"># Çıktı (sorunlu sistem):</span>
+<span class="cmt"># hwlatdetect: sample window size is 1000000 us</span>
+<span class="cmt"># hwlatdetect: sample width is 500000 us</span>
+<span class="cmt"># NMI: 0  (what you'd expect for a BIOS NMI);</span>
+<span class="cmt"># SMIs: 12  ← PROBLEM! BIOS 60 saniyede 12 SMI üretti</span>
+<span class="cmt"># 1 samples exceeding threshold: max = 18us</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> cyclictest Parametreleri</h2>
+  <p class="section-lead">cyclictest, POSIX timer kullanarak RT thread'lerin wakeup gecikmesini ölçer. Doğru parametreler çok önemlidir.</p>
+
+  <h3>Temel sözdizimi ve parametreler</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">-t N / --threads=N</div><div class="desc">Oluşturulacak thread sayısı. <code class="inline">-t 4</code> = 4 thread, varsayılan 1. Her thread ayrı bir timer kullanır.</div></div>
+    <div class="param"><div class="name">-p P / --priority=P</div><div class="desc">RT thread önceliği (1-99). <code class="inline">-p 98</code> önerilir; 99 watchdog için saklanmalı.</div></div>
+    <div class="param"><div class="name">-i I / --interval=I</div><div class="desc">Timer periyodu mikrosaniye cinsinden. <code class="inline">-i 1000</code> = 1ms periyot. Daha kısa periyot → daha fazla ölçüm.</div></div>
+    <div class="param"><div class="name">-d D / --distance=D</div><div class="desc">Multi-thread modda thread'ler arası başlangıç ofseti (µs). <code class="inline">-d 0</code> tüm thread'leri aynı anda tetikler.</div></div>
+    <div class="param"><div class="name">-h BUCKETS / --histogram</div><div class="desc">Histogram modu. <code class="inline">-h 400</code> = 400µs'ye kadar bucket, sonrasını overflow sayar.</div></div>
+    <div class="param"><div class="name">-l N / --loops=N</div><div class="desc">Toplam ölçüm sayısı. <code class="inline">-l 1000000</code>. <code class="inline">-D DURATION</code> ile süre sınırı da konabilir.</div></div>
+    <div class="param"><div class="name">-D DURATION</div><div class="desc">Çalışma süresi: <code class="inline">30m</code>, <code class="inline">2h</code>, <code class="inline">overnight</code> formatında. Uzun testler için -l yerine tercih edilir.</div></div>
+    <div class="param"><div class="name">--json</div><div class="desc">Makine tarafından okunabilir JSON çıktısı. CI entegrasyonunda parse için kullanılır.</div></div>
+    <div class="param"><div class="name">-a CPU / --affinity</div><div class="desc">Thread'leri belirli CPU'lara bağla. <code class="inline">-a 2,3</code> = thread'ler sadece CPU 2 ve 3'te çalışır.</div></div>
+    <div class="param"><div class="name">--mlockall</div><div class="desc">Tüm belleği RAM'e kilitle. Page fault'ların latency spike'ına neden olmasını önler.</div></div>
+  </div>
+
+  <h3>Tipik kullanım örnekleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — cyclictest komutları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Hızlı smoke testi — 30 saniye, tek thread</span>
+<span class="cmd">cyclictest</span> <span class="flag">-t1 -p98 -i1000 -D 30s --mlockall</span>
+
+<span class="cmt"># Üretim testi — tüm CPU'lar, 2 saat, histogram çıktısı</span>
+<span class="cmd">cyclictest</span> <span class="flag">-t$(nproc) -p98 -i1000 -D 2h -h 400 --mlockall --json</span> \
+  > latency.json
+
+<span class="cmt"># CPU 2-3'ü RT'ye ayır, diğer CPU'larda yük oluştur</span>
+<span class="cmd">cyclictest</span> <span class="flag">-t2 -p98 -i1000 -a 2,3 -D 30m -h 400 --mlockall</span>
+
+<span class="cmt"># Tipik çıktı:</span>
+<span class="cmt"># T: 0 (  1234) P:98 I:1000 C:1800000 Min:    3 Act:    5 Avg:    6 Max:   42</span>
+<span class="cmt"># T: 1 (  1235) P:98 I:1000 C:1800000 Min:    3 Act:    6 Avg:    6 Max:   51</span>
+<span class="cmt"># Sütunlar: Thread ID, PID, Öncelik, İnterval, Count, Min, Aktif, Ortalama, Maks</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">ROOT GEREKSİNİMİ</div>
+    <p>cyclictest'in RT öncelik ayarlaması için root veya <code class="inline">CAP_SYS_NICE</code> yetkisi gerekir. Embedded sistemlerde genellikle root olarak çalıştırılır. Container içinde çalıştırıyorsanız: <code class="inline">--cap-add=SYS_NICE --cap-add=SYS_ADMIN</code></p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Latency Histogramı ve Görselleştirme</h2>
+  <p class="section-lead">Histogram modu, latency dağılımını bucketlara bölerek olası spike'ları ve tail latency'yi net biçimde gösterir.</p>
+
+  <h3>Histogram verisi üretme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — histogram oluşturma</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Histogram verisi üret (-h 400 = 0-400µs aralığında bucket)</span>
+<span class="cmd">cyclictest</span> <span class="flag">-t4 -p98 -i1000 -D 1h -h 400 --mlockall</span> > /tmp/cyclictest-hist.txt
+
+<span class="cmt"># Çıktı formatı:</span>
+<span class="cmt"># # Histogram</span>
+<span class="cmt"># 000000 0   0   0   0</span>
+<span class="cmt"># 000001 0   0   0   0</span>
+<span class="cmt"># 000002 1234 2341 1122 987</span>
+<span class="cmt"># ...her satır: µs_değeri t0_count t1_count t2_count t3_count</span>
+
+<span class="cmt"># Ayrı thread çıktıları için --histfile kullan</span>
+<span class="cmd">cyclictest</span> <span class="flag">-t4 -p98 -i1000 -D 1h -h 400 --mlockall</span> \
+  <span class="flag">--histfile=/tmp/histogram.txt</span></code></pre>
+  </div>
+
+  <h3>gnuplot ile görselleştirme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — gnuplot histogram scripti</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Histogram verisini gnuplot formatına dönüştür</span>
+<span class="keyword">cat</span> << <span class="str">'EOF'</span> > /tmp/plot-hist.gnuplot
+set terminal png size 1200,600
+set output "/tmp/latency-histogram.png"
+set title "RT Latency Histogram — cyclictest"
+set xlabel "Latency (µs)"
+set ylabel "Örneklem Sayısı"
+set logscale y
+set grid
+set key top right
+
+plot \
+  "/tmp/cyclictest-hist.txt" using 1:2 with lines lw 2 title "CPU 0", \
+  "/tmp/cyclictest-hist.txt" using 1:3 with lines lw 2 title "CPU 1", \
+  "/tmp/cyclictest-hist.txt" using 1:4 with lines lw 2 title "CPU 2", \
+  "/tmp/cyclictest-hist.txt" using 1:5 with lines lw 2 title "CPU 3"
+EOF</span>
+<span class="cmd">gnuplot</span> /tmp/plot-hist.gnuplot
+<span class="cmd">scp</span> /tmp/latency-histogram.png dev@workstation:~/</code></pre>
+  </div>
+
+  <h3>JSON çıktısını parse etme (CI için)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>python3 — JSON sonuç parse</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> json, sys
+
+<span class="keyword">with</span> open(<span class="str">'latency.json'</span>) <span class="keyword">as</span> f:
+    data = json.load(f)
+
+MAX_ALLOWED_US = <span class="str">50</span>   <span class="cmt"># latency bütçesi</span>
+failed = <span class="keyword">False</span>
+
+<span class="keyword">for</span> thread <span class="keyword">in</span> data[<span class="str">'thread'</span>].values():
+    max_lat = thread[<span class="str">'max'</span>]
+    avg_lat = thread[<span class="str">'avg'</span>]
+    <span class="field">print</span>(<span class="str">f"Thread {thread['id']}: min={thread['min']}µs avg={avg_lat}µs max={max_lat}µs"</span>)
+    <span class="keyword">if</span> max_lat > MAX_ALLOWED_US:
+        <span class="field">print</span>(<span class="str">f"  HATA: max latency {max_lat}µs > bütçe {MAX_ALLOWED_US}µs"</span>, file=sys.stderr)
+        failed = <span class="keyword">True</span>
+
+sys.exit(<span class="str">1</span> <span class="keyword">if</span> failed <span class="keyword">else</span> <span class="str">0</span>)</code></pre>
+  </div>
+
+  <h3>Sonuç yorumlama tablosu</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Max Latency</th><th>Değerlendirme</th><th>Tipik neden</th></tr></thead>
+      <tbody>
+        <tr><td>&lt; 20µs</td><td>Mükemmel RT</td><td>İyi ayarlanmış, izole CPU</td></tr>
+        <tr><td>20–50µs</td><td>İyi RT</td><td>Bazı kesinti kaynakları mevcut</td></tr>
+        <tr><td>50–200µs</td><td>Kabul edilebilir</td><td>IRQ affinity veya tunables eksik</td></tr>
+        <tr><td>200µs–1ms</td><td>Zayıf RT</td><td>PREEMPT_RT yok veya yük yönetimi eksik</td></tr>
+        <tr><td>&gt; 1ms</td><td>RT değil</td><td>Genel amaçlı kernel veya SMI sorunu</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> /proc/sys/kernel Tunables</h2>
+  <p class="section-lead">Linux kernel parametreleri, RT performansını doğrudan etkileyen scheduler davranışını ayarlar.</p>
+
+  <h3>Kritik RT tunables</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — RT tuning parametreleri</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ─── RT throttling — KAPATILMALI ────────────────────────────</span>
+<span class="cmt"># Varsayılan: RT thread'ler 1 saniyede en fazla 950ms çalışabilir</span>
+<span class="cmt"># Bu, RT thread'leri zorla kesilebilir kılar → spike oluşturur</span>
+<span class="cmd">echo</span> -1 > /proc/sys/kernel/sched_rt_runtime_us   <span class="cmt"># limitsiz</span>
+<span class="cmd">echo</span> 1000000 > /proc/sys/kernel/sched_rt_period_us
+
+<span class="cmt"># ─── NUMA balancing — KAPATILMALI ───────────────────────────</span>
+<span class="cmt"># NUMA balancer bellek sayfalarını taşır → latency spike</span>
+<span class="cmd">echo</span> 0 > /proc/sys/kernel/numa_balancing
+
+<span class="cmt"># ─── Transparent HugePages — KAPATILMALI ────────────────────</span>
+<span class="cmt"># THP compaction background işlemi RT thread'leri engeller</span>
+<span class="cmd">echo</span> never > /sys/kernel/mm/transparent_hugepage/enabled
+<span class="cmd">echo</span> never > /sys/kernel/mm/transparent_hugepage/defrag
+
+<span class="cmt"># ─── Watchdog — KAPATILMALI (isteğe bağlı) ──────────────────</span>
+<span class="cmd">echo</span> 0 > /proc/sys/kernel/watchdog
+<span class="cmd">echo</span> 0 > /proc/sys/kernel/nmi_watchdog
+
+<span class="cmt"># ─── Sched features ─────────────────────────────────────────</span>
+<span class="cmd">echo</span> NO_GENTLE_FAIR_SLEEPERS > /sys/kernel/debug/sched/features
+<span class="cmd">echo</span> NO_WAKEUP_PREEMPTION   > /sys/kernel/debug/sched/features
+
+<span class="cmt"># ─── CPU frekansı — sabit tut ───────────────────────────────</span>
+<span class="keyword">for</span> cpu <span class="keyword">in</span> /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; <span class="keyword">do</span>
+  <span class="cmd">echo</span> performance > $cpu
+<span class="keyword">done</span></code></pre>
+  </div>
+
+  <h3>Kalıcı ayarlar — sysctl.conf</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/sysctl.d/99-rt-tuning.conf</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># RT thread throttling kapat</span>
+kernel.sched_rt_runtime_us = -1
+kernel.sched_rt_period_us  = 1000000
+
+<span class="cmt"># NUMA dengeleme kapat</span>
+kernel.numa_balancing = 0
+
+<span class="cmt"># vm.swappiness — RT sistemde swap istemiyoruz</span>
+vm.swappiness = 0
+
+<span class="cmt"># Uygula: sysctl --system</span></code></pre>
+  </div>
+
+  <h3>Kernel komut satırı parametreleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>U-Boot / GRUB — kernel cmdline</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># /boot/cmdline.txt (Raspberry Pi) veya GRUB_CMDLINE_LINUX</span>
+<span class="str">console=ttyAMA0,115200 root=/dev/mmcblk0p2 rw</span>
+<span class="str">isolcpus=2,3</span>          <span class="cmt"># CPU 2,3'ü scheduler'dan izole et</span>
+<span class="str">nohz_full=2,3</span>         <span class="cmt"># tickless mode — timer interrupt azalt</span>
+<span class="str">rcu_nocbs=2,3</span>         <span class="cmt"># RCU callback CPU 2,3'te çalışmasın</span>
+<span class="str">irqaffinity=0,1</span>       <span class="cmt"># IRQ'lar CPU 0,1'de işlensin</span>
+<span class="str">nosoftlockup</span>          <span class="cmt"># soft lockup detector kapat</span>
+<span class="str">skew_tick=1</span>           <span class="cmt"># timer tick'leri dağıt</span>
+<span class="str">transparent_hugepage=never</span></code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">UYARI: sched_rt_runtime_us = -1</div>
+    <p>RT throttling kapatılırsa, hatalı bir RT thread tüm sistemi dondurabilir. Bu ayar sadece test edilmiş, güvenilir RT uygulamalarınız varsa kullanılmalıdır. Geliştirme ortamında dikkatli olun — serial konsol üzerinden sistemi kurtaramayabilirsiniz.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> IRQ Affinity ve CPU İzolasyonu</h2>
+  <p class="section-lead">RT thread'lerin çalıştığı CPU'lara IRQ kesintilerinin yönlendirilmemesi, latency spike'larının en büyük kaynağını ortadan kaldırır.</p>
+
+  <h3>IRQ listesi ve affinity görüntüleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — IRQ affinity inceleme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm IRQ'ları ve CPU affinity'sini göster</span>
+<span class="cmd">cat</span> /proc/interrupts
+
+<span class="cmt"># Belirli bir IRQ'nun affinity maskesi (hex bitmask)</span>
+<span class="cmd">cat</span> /proc/irq/18/smp_affinity        <span class="cmt"># CPU bitmask</span>
+<span class="cmd">cat</span> /proc/irq/18/smp_affinity_list   <span class="cmt"># daha okunaklı</span>
+
+<span class="cmt"># Örnek: 0x3 = binary 0011 = CPU 0 ve 1</span>
+<span class="cmt"># Tüm IRQ'ları CPU 0,1'e yönlendir</span>
+<span class="keyword">for</span> irq <span class="keyword">in</span> /proc/irq/*/smp_affinity; <span class="keyword">do</span>
+  <span class="cmd">echo</span> 3 > $irq 2>/dev/null  <span class="cmt"># 0x3 = CPU 0,1</span>
+<span class="keyword">done</span></code></pre>
+  </div>
+
+  <h3>irqbalance durdurma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — irqbalance yönetimi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># irqbalance manuel IRQ affinity ayarlarını bozar — durdur</span>
+<span class="cmd">systemctl</span> stop irqbalance
+<span class="cmd">systemctl</span> disable irqbalance
+
+<span class="cmt"># Alternatif: irqbalance'ı çalıştır ama RT CPU'lardan hariç tut</span>
+<span class="cmd">cat</span> /etc/default/irqbalance
+<span class="cmt"># IRQBALANCE_BANNED_CPUS="0c"  ← hex: CPU 2 ve CPU 3 bitmask</span>
+
+<span class="cmt"># IRQBALANCE_BANNED_CPUS hesaplama:
+# CPU 0 = 0x01, CPU 1 = 0x02, CPU 2 = 0x04, CPU 3 = 0x08
+# CPU 2 + CPU 3 = 0x04 + 0x08 = 0x0C</span></code></pre>
+  </div>
+
+  <h3>CPU izolasyonu — isolcpus</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — isolcpus doğrulama</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># isolcpus aktif mi?</span>
+<span class="cmd">cat</span> /sys/devices/system/cpu/isolated
+<span class="cmt"># Çıktı: 2-3  (CPU 2 ve 3 izole)</span>
+
+<span class="cmt"># İzole CPU'da RT thread çalıştır</span>
+<span class="cmd">taskset</span> <span class="flag">-c 2</span> cyclictest <span class="flag">-t1 -p98 -i1000 -D 30m -h 400</span>
+
+<span class="cmt"># numactl ile birlikte</span>
+<span class="cmd">numactl</span> <span class="flag">--cpunodebind=0 --membind=0</span> \
+  <span class="cmd">taskset</span> <span class="flag">-c 2</span> cyclictest <span class="flag">-t1 -p99 -i1000 -D 30m</span>
+
+<span class="cmt"># Kernel thread'lerini izole CPU'dan kaldır</span>
+<span class="cmd">tuna</span> <span class="flag">--cpus=2,3 --isolate</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">CPU TOPOLOJISI</div>
+    <p>Hyperthreading aktifse, bir fiziksel çekirdeğin iki sanal CPU'su (sibling) birbirini etkiler. RT thread'ler için tam izolasyon sağlamak adına sibling CPU'nun da izole edilmesi veya hyperthreading'in kapatılması gerekir: <code class="inline">echo off > /sys/devices/system/cpu/smt/control</code></p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> stress-ng ile Yük Altında Test</h2>
+  <p class="section-lead">RT latency, sistem boştayken düşük olabilir ama gerçek üretim yükü altında dramatik biçimde artabilir. stress-ng, gerçekçi yük senaryoları oluşturur.</p>
+
+  <h3>stress-ng kurulumu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — stress-ng kurulumu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">apt</span> install -y stress-ng
+<span class="cmt"># veya Yocto: IMAGE_INSTALL:append = " stress-ng"</span>
+
+<span class="cmt"># Temel stres test (tüm CPU'lar, 30 saniye)</span>
+<span class="cmd">stress-ng</span> <span class="flag">--cpu 4 --timeout 30s</span></code></pre>
+  </div>
+
+  <h3>Yük senaryoları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — stress-ng yük senaryoları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ─── CPU stres — FPU yoğun hesaplama ───────────────────────</span>
+<span class="cmd">stress-ng</span> <span class="flag">--cpu 2 --cpu-method matrixprod --timeout 1h</span>
+
+<span class="cmt"># ─── IO stres — disk I/O yoğun ─────────────────────────────</span>
+<span class="cmd">stress-ng</span> <span class="flag">--io 4 --timeout 1h</span>
+
+<span class="cmt"># ─── Bellek stres — cache thrashing ────────────────────────</span>
+<span class="cmd">stress-ng</span> <span class="flag">--vm 2 --vm-bytes 512M --vm-method rowhammer --timeout 1h</span>
+
+<span class="cmt"># ─── Matris hesaplama — SIMD / NEON stres ──────────────────</span>
+<span class="cmd">stress-ng</span> <span class="flag">--matrix 4 --matrix-size 256 --timeout 1h</span>
+
+<span class="cmt"># ─── Network stres — TCP/UDP yoğun ─────────────────────────</span>
+<span class="cmd">stress-ng</span> <span class="flag">--sock 4 --timeout 1h</span>
+
+<span class="cmt"># ─── Kombine senaryo — gerçekçi production yükü ────────────</span>
+<span class="cmd">stress-ng</span> \
+  <span class="flag">--cpu 2</span>           <span class="cmt"># non-RT CPU'larda CPU stres</span>
+  <span class="flag">--io 2</span>            <span class="cmt"># IO stres</span>
+  <span class="flag">--vm 1 --vm-bytes 256M</span>  <span class="cmt"># bellek stres</span>
+  <span class="flag">--sock 2</span>          <span class="cmt"># network stres</span>
+  <span class="flag">--taskset 0,1</span>     <span class="cmt">← sadece non-RT CPU'larda çalış</span>
+  <span class="flag">--timeout 2h</span> &</span>
+
+<span class="cmt"># Arka planda stress-ng çalışırken cyclictest başlat</span>
+<span class="cmd">cyclictest</span> <span class="flag">-t2 -p98 -i1000 -a 2,3 -D 2h -h 400 --mlockall</span> > latency-under-load.txt</code></pre>
+  </div>
+
+  <h3>hackbench ile scheduler stres</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — hackbench kombinasyonu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># hackbench = yoğun thread/process oluşturma ve haberleşme</span>
+<span class="cmt"># Scheduler'ı aşırı yüklemenin klasik yöntemi</span>
+<span class="cmd">hackbench</span> <span class="flag">-l 1000 -g 20</span> &
+<span class="cmd">cyclictest</span> <span class="flag">-t4 -p98 -i1000 -D 30m -h 400 --mlockall</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Pratik: Industrial Linux'ta Latency Bütçesi</h2>
+  <p class="section-lead">Hedef: i.MX8MP tabanlı industrial Linux sistemde &lt;50µs worst-case latency garantisi. Adım adım tuning süreci.</p>
+
+  <h3>Başlangıç durumu ölçümü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — baseline ölçüm</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Hiçbir tuning yapılmadan baseline ölç</span>
+<span class="cmd">cyclictest</span> <span class="flag">-t4 -p98 -i1000 -D 30m --mlockall</span> > baseline.txt
+
+<span class="cmt"># Baseline sonuç (kötü):</span>
+<span class="cmt"># T:0 Min:    4 Avg:   12 Max: 1832 ← 1.8ms! kabul edilemez</span>
+<span class="cmt"># T:1 Min:    5 Avg:   13 Max: 2145 ← 2.1ms!</span></code></pre>
+  </div>
+
+  <h3>Tuning adımları ve etkisi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — adım adım tuning</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ── Adım 1: SMI kontrolü ────────────────────────────────────</span>
+<span class="cmd">hwlatdetect</span> <span class="flag">--duration=60</span>
+<span class="cmt"># SMIs: 0 → SMI sorun değil, devam et</span>
+
+<span class="cmt"># ── Adım 2: RT throttling kapat ─────────────────────────────</span>
+<span class="cmd">echo</span> -1 > /proc/sys/kernel/sched_rt_runtime_us
+<span class="cmd">cyclictest</span> <span class="flag">-t4 -p98 -i1000 -D 10m --mlockall</span>
+<span class="cmt"># Max: 892µs → hâlâ yüksek ama iyileşme var</span>
+
+<span class="cmt"># ── Adım 3: THP kapat ───────────────────────────────────────</span>
+<span class="cmd">echo</span> never > /sys/kernel/mm/transparent_hugepage/enabled
+<span class="cmd">cyclictest</span> <span class="flag">-t4 -p98 -i1000 -D 10m --mlockall</span>
+<span class="cmt"># Max: 234µs → iyileşme devam ediyor</span>
+
+<span class="cmt"># ── Adım 4: CPU isolation + IRQ affinity ────────────────────</span>
+<span class="cmt"># Kernel cmdline'a ekle ve yeniden boot: isolcpus=2,3 nohz_full=2,3</span>
+<span class="keyword">for</span> irq <span class="keyword">in</span> /proc/irq/*/smp_affinity; <span class="keyword">do</span>
+  <span class="cmd">echo</span> 3 > $irq 2>/dev/null
+<span class="keyword">done</span>
+<span class="cmd">systemctl</span> stop irqbalance
+<span class="cmd">cyclictest</span> <span class="flag">-t2 -p98 -i1000 -a 2,3 -D 10m --mlockall</span>
+<span class="cmt"># Max: 48µs → HEDEF TUTTURULDU! (&lt;50µs)</span>
+
+<span class="cmt"># ── Adım 5: Yük altında doğrulama ───────────────────────────</span>
+<span class="cmd">stress-ng</span> <span class="flag">--cpu 2 --io 2 --vm 1 --vm-bytes 256M --taskset 0,1 --timeout 2h</span> &
+<span class="cmd">cyclictest</span> <span class="flag">-t2 -p98 -i1000 -a 2,3 -D 2h -h 400 --mlockall</span> > final.txt
+
+<span class="cmt"># Final sonuç (hedef karşılandı):</span>
+<span class="cmt"># T:0 Min:    4 Avg:    9 Max:   47 ← &lt;50µs!</span>
+<span class="cmt"># T:1 Min:    4 Avg:    9 Max:   44 ← &lt;50µs!</span></code></pre>
+  </div>
+
+  <h3>CI pipeline — otomatik latency testi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>.gitlab-ci.yml — RT latency job</span><span class="dot">●</span></div>
+    <pre><code><span class="field">rt-latency-test:</span>
+  <span class="field">stage:</span> <span class="str">board-test</span>
+  <span class="field">script:</span>
+    <span class="cmt"># Tuning uygula</span>
+    - <span class="str">ssh root@board "echo -1 > /proc/sys/kernel/sched_rt_runtime_us"</span>
+    - <span class="str">ssh root@board "echo never > /sys/kernel/mm/transparent_hugepage/enabled"</span>
+    <span class="cmt"># cyclictest çalıştır (5 dakika, yük altında)</span>
+    - <span class="str">ssh root@board "stress-ng --cpu 2 --timeout 5m &"</span>
+    - <span class="str">ssh root@board "cyclictest -t2 -p98 -i1000 -a 2,3 -D 5m --json > /tmp/lat.json"</span>
+    - <span class="str">scp root@board:/tmp/lat.json ./latency-results.json</span>
+    <span class="cmt"># Latency bütçesi kontrolü (max 50µs)</span>
+    - <span class="str">python3 ci/check-latency.py --threshold 50 latency-results.json</span>
+  <span class="field">artifacts:</span>
+    <span class="field">paths:</span>
+      - <span class="str">latency-results.json</span></code></pre>
+  </div>
+
+  <h3>Tuning sonuç özeti</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Adım</th><th>Max Latency</th><th>Değişiklik</th></tr></thead>
+      <tbody>
+        <tr><td>Baseline</td><td>2145µs</td><td>—</td></tr>
+        <tr><td>RT throttling kapatıldı</td><td>892µs</td><td>-58%</td></tr>
+        <tr><td>THP kapatıldı</td><td>234µs</td><td>-74%</td></tr>
+        <tr><td>CPU izolasyon + IRQ affinity</td><td>47µs</td><td>-80%</td></tr>
+        <tr><td>Yük altında final test</td><td>47µs</td><td>Stabil</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+</main>
+
+</body>
+</html>

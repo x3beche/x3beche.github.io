@@ -1,0 +1,655 @@
+---
+layout: tutorial
+title: "Suspend & Resume — Güç Yönetimi"
+back_url: "../index.html"
+back_label: "Güç Yönetimi & Thermal"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÜÇ YÖNETİMİ</span>
+    <span>SUSPEND/RESUME</span>
+    <span>2026</span>
+  </div>
+  <h1>Suspend &amp; Resume —<br><em>Linux PM states.</em></h1>
+  <p class="subtitle">freeze'den S4 hibernation'a tüm Linux uyku geçişleri: wakeup source yönetimi, driver hook'ları, hata ayıklama ve Raspberry Pi'de RTC ile uyandırma pratiği.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Linux PM states — S0'dan S5'e</a></li>
+    <li><a href="#s1">/sys/power/state — geçiş mekanizması</a></li>
+    <li><a href="#s2">Wakeup sources — kayıt ve yönetim</a></li>
+    <li><a href="#s3">pm_test — suspend adımlarını test et</a></li>
+    <li><a href="#s4">Driver suspend/resume hook'ları</a></li>
+    <li><a href="#s5">Freezer — process dondurma</a></li>
+    <li><a href="#s6">Platform-specific: i.MX6, RPi, ACPI S3</a></li>
+    <li><a href="#s7">Hata ayıklama — suspend başarısız olunca</a></li>
+    <li><a href="#s8">Pratik: RTC DS3231 ve GPIO button wakeup</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Linux PM states — S0'dan S5'e</h2>
+  <p class="section-lead">Linux, ACPI standardından esinlenen bir güç durum modeli kullanır. Her state farklı bir enerji/uyanma gecikmesi tradeoff'u sunar.</p>
+
+  <div class="params">
+    <div class="param"><div class="name">S0 — Running</div><div class="desc">Normal çalışma durumu. CPU ve tüm çevreler aktif. Runtime PM (RPM) bu state içinde çalışır: kullanılmayan donanım blokları bireysel olarak kapatılır.</div></div>
+    <div class="param"><div class="name">S0ix — Connected Standby</div><div class="desc">Modern Intel/AMD dizüstü bilgisayarlar ve bazı ARM SoC'lar. Sistem uyurken ağ/Bluetooth aktif kalabilir. Linux'ta "s2idle" (freeze) olarak uygulanır.</div></div>
+    <div class="param"><div class="name">S2RAM — Suspend-to-RAM</div><div class="desc">RAM güçlü kalır, içerik korunur. CPU ve çevre birimleri kapatılır. Uyanma ~100ms. En yaygın mobil/gömülü uyku modu. Linux'ta "mem" state.</div></div>
+    <div class="param"><div class="name">S3 — Standby</div><div class="desc">ACPI S3, S2RAM ile eşdeğerdir — bazı BIOS'larda ayrı gösterilir. Linux "standby" state'i biraz daha sığdır (standby = hafif uyku, mem = tam S2RAM).</div></div>
+    <div class="param"><div class="name">S4 — Hibernate</div><div class="desc">RAM içeriği swap/disk'e yazılır, sistem tamamen kapatılır. Uyanma ~10-30s (swap'tan okuma süresi). Linux'ta "disk" state. Pil tamamen bitecekse veri kaybı olmaz.</div></div>
+    <div class="param"><div class="name">S5 — Soft Off</div><div class="desc">Sistem tamamen kapalı ama güç kaynağı bağlı. Soğuk önyükleme gerekir. Wakeup on LAN (WoL) bazı sistemlerde bu state'te çalışabilir.</div></div>
+  </div>
+
+  <h3>mem state'inin gerçek davranışı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># mem state hangi derinliği kullanıyor?</span>
+cat /sys/power/mem_sleep
+<span class="cmt"># s2idle [deep]   → köşeli parantez içindeki aktif
+# ya da:
+# [s2idle] deep</span>
+
+<span class="cmt"># deep (S2RAM) yerine s2idle (Connected Standby) seç</span>
+echo s2idle > /sys/power/mem_sleep
+
+<span class="cmt"># gerçek S2RAM için</span>
+echo deep > /sys/power/mem_sleep</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> /sys/power/state — geçiş mekanizması</h2>
+  <p class="section-lead">/sys/power/state dosyasına uyku modu adı yazmak, o moda geçişi başlatır. Komut döndüğünde sistem zaten uyanmış demektir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># desteklenen state'leri görüntüle</span>
+cat /sys/power/state
+<span class="cmt"># freeze mem disk</span>
+
+<span class="cmt"># freeze (s2idle / connected standby)</span>
+echo freeze > /sys/power/state
+
+<span class="cmt"># suspend-to-RAM (S2RAM)</span>
+echo mem > /sys/power/state
+
+<span class="cmt"># standby (hafif uyku, bazı platformlarda)</span>
+echo standby > /sys/power/state
+
+<span class="cmt"># hibernation (swap'a yaz)</span>
+echo disk > /sys/power/state</code></pre>
+  </div>
+
+  <h3>Sistem uyku döngüsü (internal)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Suspend sırası (Linux kernel)</span><span class="dot">●</span></div>
+    <pre><code>echo mem > /sys/power/state
+    │
+    ├─ 1. senkronize_filesystems()   — FS flush
+    ├─ 2. freeze_processes()         — kullanıcı proc'ları dondur
+    ├─ 3. freeze_kernel_threads()    — kernel thread'leri dondur
+    ├─ 4. dpm_suspend_start()        — driver .prepare() hook'ları
+    ├─ 5. dpm_suspend()              — driver .suspend() hook'ları
+    ├─ 6. dpm_suspend_late()         — driver .suspend_late()
+    ├─ 7. dpm_suspend_noirq()        — driver .suspend_noirq()
+    ├─ 8. disable_nonboot_cpus()     — CPU hotplug off
+    ├─ 9. syscore_suspend()          — son sistem çekirdek uyku
+    └─10. arch_suspend()             — donanım uyku (PSCI/WFI)
+         ...  DONANIM UYKU  ...
+    └─10. arch_resume()
+    ├─ 9. syscore_resume()
+    ├─ 8. enable_nonboot_cpus()
+    ├─ 7. dpm_resume_noirq()
+    ├─ 6. dpm_resume_early()
+    ├─ 5. dpm_resume()
+    ├─ 4. dpm_resume_end()
+    ├─ 3. thaw_kernel_threads()
+    └─ 2. thaw_processes()</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p><code class="inline">echo mem > /sys/power/state</code> komutu başarıyla döndüğünde sistem artık uyanmış demektir — komut bloke olur, uyanınca devam eder. Hata olursa negatif errno döner ve <code class="inline">dmesg</code>'de hangi driver'ın başarısız olduğu görülür.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Wakeup sources — kayıt ve yönetim</h2>
+  <p class="section-lead">Sistem suspend halindeyken onu uyandırabilecek kaynaklar "wakeup source" olarak kayıt edilmelidir. Kayıtsız bir interrupt sistemi uyandıramaz.</p>
+
+  <h3>Kernel API</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — driver içinde wakeup source</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/pm_wakeup.h&gt;
+
+/* Cihazı wakeup özellikli yap */
+device_init_wakeup(&amp;pdev-&gt;dev, true);
+
+/* Wakeup event bildirimi (interrupt handler içinde) */
+pm_wakeup_event(&amp;pdev-&gt;dev, 500);   /* 500ms wakeup lock */
+
+/* Manuel wakeup source oluştur */
+struct wakeup_source *ws;
+ws = wakeup_source_register(NULL, "my-wakeup-source");
+__pm_stay_awake(ws);   /* wakeup işlemi devam ederken */
+__pm_relax(ws);        /* wakeup tamamlandığında */
+wakeup_source_unregister(ws);</code></pre>
+  </div>
+
+  <h3>sysfs wakeup source yönetimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># tüm wakeup source'ları listele</span>
+cat /sys/kernel/debug/wakeup_sources
+<span class="cmt"># name            active_count  event_count  wakeup_count  expire_count
+# rtc0                    1           42           42             0
+# gpio-keys               0            5            5             0</span>
+
+<span class="cmt"># bir cihazın wakeup'ını etkinleştir</span>
+cat /sys/bus/platform/devices/rtc0/power/wakeup
+<span class="cmt"># enabled</span>
+
+echo enabled  > /sys/bus/platform/devices/soc:gpio-wakeup/power/wakeup
+echo disabled > /sys/bus/platform/devices/soc:gpio-wakeup/power/wakeup
+
+<span class="cmt"># wakeup count — suspend öncesi ve sonrası karşılaştır (race condition önleme)</span>
+cat /sys/power/wakeup_count
+<span class="cmt"># 7</span>
+
+<span class="cmt"># wakeup_count ile yarış koşulsuz suspend</span>
+WC=$(cat /sys/power/wakeup_count)
+echo "$WC" > /sys/power/wakeup_count &amp;&amp; echo mem > /sys/power/state</code></pre>
+  </div>
+
+  <h3>RTC alarm wakeup</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — 60 saniye sonra uyan</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># rtcwake ile belirli süre sonra uyanma</span>
+rtcwake -m mem -s 60
+<span class="cmt"># Sistem 60 saniye sonra otomatik uyanacak</span>
+
+<span class="cmt"># belirli bir saat için</span>
+rtcwake -m mem -t $(date +%s -d "tomorrow 07:00")
+
+<span class="cmt"># test: sistemi uyutmadan sadece RTC alarm kur</span>
+rtcwake -m no -s 30   <span class="cmt"># alarm kur, uyutma</span>
+cat /proc/driver/rtc  <span class="cmt"># alarm time'ı kontrol et</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> pm_test — suspend adımlarını test et</h2>
+  <p class="section-lead">pm_test, gerçekten uyumadan suspend/resume sırasını kısmen ya da tamamen simüle etmeni sağlar. Hangi sürücünün başarısız olduğunu bulmak için temel araçtır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># mevcut pm_test seçenekleri</span>
+cat /sys/power/pm_test
+<span class="cmt"># [none] core processors platform devices freezer</span>
+
+<span class="cmt"># pm_test seviyeleri (her biri öncekini içerir):
+# none      - normal suspend (test yok)
+# core      - syscore suspend'e kadar git, geri dön
+# processors- CPU suspend dahil
+# platform  - platform firmware suspend dahil
+# devices   - tüm cihaz driver'larını test et
+# freezer   - process freeze'i test et</span>
+
+<span class="cmt"># devices seviyesinde test: driver'ları suspend et, uyanma olmadan dön</span>
+echo devices > /sys/power/pm_test
+echo mem > /sys/power/state
+<span class="cmt"># Sistem 5 saniye bekler, otomatik geri döner</span>
+<span class="cmt"># Başarısız driver dmesg'e yazılır</span>
+
+<span class="cmt"># testi bitir, normal moda dön</span>
+echo none > /sys/power/pm_test
+
+<span class="cmt"># dmesg'de hata ara</span>
+dmesg | grep -E "(suspend|resume|PM:|failed)" | tail -30</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">KULLANIM SENARYOSU</div>
+    <p>Gerçek <code class="inline">echo mem</code> başarısız oluyorsa önce <code class="inline">pm_test=freezer</code> dene, sorun yoksa <code class="inline">devices</code>'a yükselt. Bu şekilde sorunlu katmanı izole edersin. Çoğu zaman bir USB host controller veya ağ sürücüsünün eksik <code class="inline">.suspend()</code> callback'i suçludur.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Driver suspend/resume hook'ları</h2>
+  <p class="section-lead">Her platform driver, struct dev_pm_ops yapısı üzerinden suspend/resume callback'lerini kaydeder. Bu callback'lerin doğru sırayla çalışması tüm suspend/resume süreci için kritiktir.</p>
+
+  <h3>dev_pm_ops callback'leri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — platform driver pm ops</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/platform_device.h&gt;
+#include &lt;linux/pm.h&gt;
+
+static int mydev_suspend(struct device *dev)
+{
+    struct mydev_priv *priv = dev_get_drvdata(dev);
+
+    /* donanımı uyku moduna al */
+    mydev_hw_suspend(priv);
+
+    /* wakeup etkin ise interrupt kaynağını koru */
+    if (device_may_wakeup(dev))
+        enable_irq_wake(priv-&gt;irq);
+
+    dev_dbg(dev, "suspended\n");
+    return 0;
+}
+
+static int mydev_resume(struct device *dev)
+{
+    struct mydev_priv *priv = dev_get_drvdata(dev);
+
+    if (device_may_wakeup(dev))
+        disable_irq_wake(priv-&gt;irq);
+
+    /* donanımı yeniden başlat */
+    mydev_hw_resume(priv);
+
+    dev_dbg(dev, "resumed\n");
+    return 0;
+}
+
+/* noirq hook: interrupt'lar devre dışıyken çalışır */
+static int mydev_suspend_noirq(struct device *dev)
+{
+    /* interrupt gerektirmeyen son temizlik işlemleri */
+    return 0;
+}
+
+static const struct dev_pm_ops mydev_pm_ops = {
+    .suspend         = mydev_suspend,
+    .resume          = mydev_resume,
+    .suspend_noirq   = mydev_suspend_noirq,
+    .resume_noirq    = mydev_resume_noirq,
+    /* Runtime PM için */
+    .runtime_suspend = mydev_runtime_suspend,
+    .runtime_resume  = mydev_runtime_resume,
+};
+
+static struct platform_driver mydev_driver = {
+    .driver = {
+        .name = "mydev",
+        .pm   = &amp;mydev_pm_ops,
+    },
+    .probe  = mydev_probe,
+    .remove = mydev_remove,
+};</code></pre>
+  </div>
+
+  <h3>Power domain</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts — power domain kullanımı</span><span class="dot">●</span></div>
+    <pre><code>/* Power domain tanımı */
+pd_vpu: power-domain@0 {
+    compatible = "fsl,imx8m-blk-ctrl";
+    #power-domain-cells = &lt;1&gt;;
+};
+
+/* Cihaz, power domain'e bağlı */
+vpu: vpu@38300000 {
+    compatible = "nxp,imx8mq-vpu";
+    power-domains = &lt;&amp;pd_vpu 0&gt;;
+    /* Suspend sırasında PM core bu domain'i otomatik kapatır */
+};</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">SIMPLE_PM_BUS</div>
+    <p>Birçok gömülü SoC'ta <code class="inline">simple-pm-bus</code> driver'ı, clock ve power domain yönetimini otomatik yapar. Driver yazarken bu mekanizmayı kullanmak, manuel suspend/resume yerine daha az hata içerir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Freezer — process dondurma</h2>
+  <p class="section-lead">Suspend öncesinde tüm kullanıcı alanı süreçleri ve çoğu kernel thread dondurulur. Bu adım, suspend sırasında I/O'ları yarım bırakmaktan kaynaklanan tutarsızlıkları önler.</p>
+
+  <h3>Freeze mekanizması</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — dondurulabilir kernel thread</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/freezer.h&gt;
+#include &lt;linux/kthread.h&gt;
+
+static int my_worker_thread(void *data)
+{
+    /* Thread'i dondurulabilir yap */
+    set_freezable();
+
+    while (!kthread_should_stop()) {
+        /* Freeze isteği gelirse burada donur */
+        try_to_freeze();
+
+        /* ... asıl iş ... */
+
+        msleep_interruptible(100);
+    }
+    return 0;
+}</code></pre>
+  </div>
+
+  <h3>Freeze sorunlarını tespit et</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># hangi süreçler dondurulamıyor? (suspend başarısız mesajı)</span>
+dmesg | grep -i "freezing of tasks"
+<span class="cmt"># PM: Freezing user space processes
+# PM: Freezing of user space processes failed (elapsed 20.003 seconds)</span>
+
+<span class="cmt"># dondurulamamış süreçleri bul</span>
+dmesg | grep "Task refused to freeze"
+<span class="cmt"># Task refused to freeze (pid:1234, name:myapp)</span>
+
+<span class="cmt"># process'in freeze durumunu kontrol et (/proc/PID/status)</span>
+grep "^Flags" /proc/1234/status
+<span class="cmt"># Flags: 00400002  (PF_NOFREEZE bayrağı set ise dondurulamaz)</span>
+
+<span class="cmt"># dynamic debug ile freeze istatistiklerini izle</span>
+echo "file kernel/freezer.c +p" > /sys/kernel/debug/dynamic_debug/control</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>Kullanıcı alanı süreci freeze sinyaline 20 saniye içinde yanıt vermezse suspend iptal edilir. Uzun süre bloklanan sistem çağrılarında olan D-state (uninterruptible sleep) süreçler bu duruma yol açabilir. Uygulamada <code class="inline">SA_RESTART</code> olmayan signal handler'lar veya yanlış konfigüre edilmiş NFS mount'ları yaygın sebeplerdir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Platform-specific: i.MX6, RPi, ACPI S3</h2>
+  <p class="section-lead">Her platform suspend/resume için farklı firmware/hardware desteği gerektirir. Üç yaygın platform için özel notlar.</p>
+
+  <h3>i.MX6 — SNVS ile RTC wakeup</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts — i.MX6 SNVS</span><span class="dot">●</span></div>
+    <pre><code>/* i.MX6 Secure Non-Volatile Storage — RTC ve wakeup kontrolü */
+snvs: snvs@020cc000 {
+    compatible = "fsl,sec-v4.0-mon", "syscon", "simple-mfd";
+
+    snvs_rtc: snvs-rtc-lp {
+        compatible = "fsl,sec-v4.0-mon-rtc-lp";
+        regmap = &lt;&amp;snvs&gt;;
+        offset = &lt;0x34&gt;;
+        clocks = &lt;&amp;clks IMX6QDL_CLK_SNVS_LP&gt;;
+        clock-names = "snvs-rtc";
+        interrupts = &lt;GIC_SPI 19 IRQ_TYPE_LEVEL_HIGH&gt;;
+    };
+
+    snvs_poweroff: snvs-poweroff {
+        compatible = "fsl,sec-v4.0-poweroff";
+        regmap = &lt;&amp;snvs&gt;;
+    };
+};</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — i.MX6 suspend testi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># i.MX6'da S2RAM için "mem" = "deep"</span>
+echo deep > /sys/power/mem_sleep
+
+<span class="cmt"># RTC alarm 30 saniye sonraya ayarla</span>
+rtcwake -d rtc0 -m mem -s 30
+
+<span class="cmt"># Wakeup kaynağını kontrol et</span>
+dmesg | grep -i "wakeup\|snvs"</code></pre>
+  </div>
+
+  <h3>Raspberry Pi — PMIC wakeup</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Raspberry Pi suspend</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># RPi 4/5'te suspend desteği (kernel 6.1+)</span>
+cat /sys/power/state
+<span class="cmt"># freeze mem</span>
+
+<span class="cmt"># GPIO wakeup etkinleştir (örn. GPIO3 = pin 5)</span>
+echo enabled > /sys/class/gpio/gpio3/power/wakeup
+
+<span class="cmt"># ya da /boot/config.txt ile:</span>
+<span class="cmt"># dtparam=wakeup-gpio=3</span>
+
+<span class="cmt"># suspend</span>
+echo mem > /sys/power/state
+<span class="cmt"># GPIO3'ü GND'ye çekmek sistemi uyandırır</span>
+
+<span class="cmt"># RPi 5'te suspend LED göstergesi</span>
+echo heartbeat > /sys/class/leds/PWR/trigger  <span class="cmt"># uyku sırasında yanıp söner</span></code></pre>
+  </div>
+
+  <h3>ACPI S3 (x86/x86-64)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — ACPI S3</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ACPI S3 desteğini kontrol et</span>
+cat /sys/power/state
+<span class="cmt"># freeze mem disk  (mem = S3)</span>
+
+<span class="cmt"># S3 destekleniyor mu? (ACPI tablo)</span>
+dmesg | grep -i "ACPI.*S3\|suspend.*s3"
+
+<span class="cmt"># USB wakeup'ı yönet</span>
+for usb in /sys/bus/usb/devices/*/power/wakeup; do
+    echo disabled > "$usb"  <span class="cmt"># USB wakeup'ı devre dışı bırak</span>
+done
+
+<span class="cmt"># ağ kartının wakeup'ını aç (Wake-on-LAN)</span>
+ethtool -s eth0 wol g
+echo enabled > /sys/class/net/eth0/device/power/wakeup</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Hata ayıklama — suspend başarısız olunca</h2>
+  <p class="section-lead">Suspend başarısız olduğunda sistematik bir yaklaşım gerekir. En yaygın sebep: eksik/hatalı driver suspend callback'i veya dondurulamamış bir süreç.</p>
+
+  <h3>Adım adım hata ayıklama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — sistematik debug</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1. dmesg'de suspend hatası ara</span>
+dmesg | grep -E "(PM:|suspend|resume|failed|error)" | tail -50
+
+<span class="cmt"># Örnek hata çıktısı:</span>
+<span class="cmt"># PM: Suspending system (mem)</span>
+<span class="cmt"># PM: suspend of devices failed</span>
+<span class="cmt"># PM: Some devices failed to suspend, or early wake event detected</span>
+<span class="cmt"># e1000e 0000:00:19.0: Device driver failed to support suspend</span>
+
+<span class="cmt"># 2. pm_test ile driver isolation</span>
+echo devices > /sys/power/pm_test
+echo mem > /sys/power/state
+dmesg | grep -E "(PM:|failed)" | tail -20
+echo none > /sys/power/pm_test
+
+<span class="cmt"># 3. dynamic_debug ile suspend callback izle</span>
+echo "file drivers/base/power/main.c +p" \
+  > /sys/kernel/debug/dynamic_debug/control
+echo "file drivers/base/power/wakeup.c +p" \
+  >> /sys/kernel/debug/dynamic_debug/control
+
+<span class="cmt"># 4. Belirli bir cihazı debug et</span>
+echo "module e1000e +p" > /sys/kernel/debug/dynamic_debug/control
+
+<span class="cmt"># 5. suspend_stats — suspend istatistikleri</span>
+cat /sys/kernel/debug/suspend_stats
+<span class="cmt"># success: 15
+# fail: 3
+# failed_freeze: 0
+# failed_prepare: 0
+# failed_suspend: 3
+# failed_suspend_noirq: 0
+# failed_resume: 0
+# last_failed_dev: e1000e</span></code></pre>
+  </div>
+
+  <h3>Wakeup kaynaklarını izole et</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Sistem anında uyanıyorsa (spurious wakeup)</span>
+<span class="cmt"># wakeup_count yöntemini kullan</span>
+cat /sys/power/wakeup_count
+<span class="cmt"># 42</span>
+
+echo 42 > /sys/power/wakeup_count
+echo $?
+<span class="cmt"># 0: başarılı (wakeup event yok, devam et)
+# yazma hatası: yeni wakeup event geldi, suspend iptal</span>
+
+<span class="cmt"># tüm wakeup source'ları debug</span>
+cat /sys/kernel/debug/wakeup_sources | sort -k3 -rn | head -10</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: RTC DS3231 ve GPIO button wakeup</h2>
+  <p class="section-lead">Raspberry Pi üzerinde iki wakeup senaryosu: DS3231 RTC modülü ile zamanlı uyanma ve GPIO button ile manuel uyanma.</p>
+
+  <h3>1 — DS3231 RTC ile Wakeup</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts — DS3231 I2C RTC overlay</span><span class="dot">●</span></div>
+    <pre><code>/* /boot/overlays/i2c-rtc.dts benzeri */
+&amp;i2c1 {
+    status = "okay";
+
+    rtc: ds3231@68 {
+        compatible = "maxim,ds3231";
+        reg = &lt;0x68&gt;;
+        /* SQW/INT pinini GPIO wakeup olarak kullan */
+        interrupt-parent = &lt;&amp;gpio&gt;;
+        interrupts = &lt;17 IRQ_TYPE_EDGE_FALLING&gt;;
+    };
+};</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — DS3231 ile suspend/wakeup</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># DS3231 /dev/rtc1 olarak görünür (RPi'nin kendi RTC'si rtc0)</span>
+ls -la /dev/rtc*
+<span class="cmt"># crw------- 1 root root 253, 0 /dev/rtc0
+# crw------- 1 root root 253, 1 /dev/rtc1</span>
+
+<span class="cmt"># DS3231'i sistem RTC'si yap</span>
+hwclock --hctosys --rtc=/dev/rtc1
+
+<span class="cmt"># 2 dakika sonra uyan (mem = S2RAM)</span>
+rtcwake -d /dev/rtc1 -m mem -s 120
+
+<span class="cmt"># uyanma sonrası log</span>
+dmesg | tail -20
+<span class="cmt"># PM: resume of devices complete after 423.127 msecs
+# rtc-ds3231 1-0068: setting system clock to 2026-04-12T09:30:05</span>
+
+<span class="cmt"># periyodik wakeup scripti (her 5 dakikada bir)</span>
+cat &lt;&lt;'EOF' &gt; /usr/local/bin/periodic_wake.sh
+#!/bin/bash
+INTERVAL=300  # saniye
+while true; do
+    # iş yap
+    /usr/local/bin/collect_sensor_data.sh
+    # uyku
+    rtcwake -d /dev/rtc1 -m mem -s $INTERVAL
+done
+EOF
+chmod +x /usr/local/bin/periodic_wake.sh</code></pre>
+  </div>
+
+  <h3>2 — GPIO Button ile Wakeup</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts — gpio-keys wakeup</span><span class="dot">●</span></div>
+    <pre><code>/* /boot/overlays/ altında gpio-wakeup.dts */
+/ {
+    gpio_wakeup: gpio-keys-wakeup {
+        compatible = "gpio-keys";
+
+        wakeup-button {
+            label = "Wakeup Button";
+            gpios = &lt;&amp;gpio 3 GPIO_ACTIVE_LOW&gt;;  /* GPIO3 = Pin 5 */
+            linux,code = &lt;KEY_WAKEUP&gt;;
+            wakeup-source;   /* bu butonu wakeup source yap */
+            debounce-interval = &lt;50&gt;;
+        };
+    };
+};</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — GPIO button wakeup testi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># gpio-keys cihazının wakeup etkin olduğunu kontrol et</span>
+cat /sys/devices/platform/gpio-keys-wakeup/power/wakeup
+<span class="cmt"># enabled</span>
+
+<span class="cmt"># suspend'e gir (GPIO3'e GND bağlamak sistemi uyandırır)</span>
+echo mem > /sys/power/state
+
+<span class="cmt"># uyanma kaynağını öğren</span>
+dmesg | grep -i "wakeup\|gpio"
+<span class="cmt"># gpio-keys: wakeup key event (KEY_WAKEUP)</span></code></pre>
+  </div>
+
+  <h3>3 — Suspend sonrası periferal yeniden başlatma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — resume hook scripti</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># /lib/systemd/system-sleep/ altına script koy</span>
+cat &lt;&lt;'EOF' &gt; /lib/systemd/system-sleep/reinit-peripherals.sh
+#!/bin/bash
+case "$1" in
+  pre)
+    echo "Suspend öncesi: sensörleri durdur"
+    systemctl stop sensor-daemon.service
+    ;;
+  post)
+    echo "Resume sonrası: sensörleri yeniden başlat"
+    # I2C sensör yeniden başlat
+    i2cset -y 1 0x76 0xF3 0xFE  # BME280 reset
+    sleep 0.1
+    systemctl start sensor-daemon.service
+    # GPS seri portu yeniden aç
+    systemctl restart gpsd.service
+    ;;
+esac
+EOF
+chmod +x /lib/systemd/system-sleep/reinit-peripherals.sh</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">SONUÇ</div>
+    <p>RTC tabanlı periyodik wakeup, pil ömrü kritik IoT sensör düğümlerinde en yaygın kullanılan senaryodur. Raspberry Pi + DS3231 kombinasyonunda uyku sırasında tüketim ~2 mA seviyesine inerken, aktif ölçüm anında ~500 mA'ye çıkabilir. %5 aktif süre hedeflendiğinde ortalama tüketim ~27 mA olur.</p>
+  </div>
+
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

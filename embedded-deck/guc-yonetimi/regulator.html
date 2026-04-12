@@ -1,0 +1,749 @@
+---
+layout: tutorial
+title: "Regulator Framework — Güç Yönetimi"
+back_url: "../index.html"
+back_label: "Güç Yönetimi & Thermal"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÜÇ YÖNETİMİ</span>
+    <span>REGULATOR</span>
+    <span>2026</span>
+  </div>
+  <h1>Regulator Framework —<br><em>PMIC &amp; DVFS.</em></h1>
+  <p class="subtitle">Linux regulator consumer API ile voltaj yönetimi: LDO/buck/boost türleri, AXP803·TPS65217·BD71837·RK817 PMIC'leri, DVFS entegrasyonu ve güç bütçesi optimizasyonu.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Linux regulator framework mimarisi</a></li>
+    <li><a href="#s1">DT regulator binding</a></li>
+    <li><a href="#s2">Consumer API — get, enable, set_voltage</a></li>
+    <li><a href="#s3">Regulator türleri — LDO, buck, boost, fixed</a></li>
+    <li><a href="#s4">Yaygın PMIC'ler: AXP803, TPS65217, BD71837, RK817</a></li>
+    <li><a href="#s5">Voltage scaling — DVFS ile regulator</a></li>
+    <li><a href="#s6">sysfs ve debugfs arayüzü</a></li>
+    <li><a href="#s7">Yeni regulator driver yazımı</a></li>
+    <li><a href="#s8">Pratik: TPS65217 CPU VDD düşürme ve i.MX8 güç bütçesi</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Linux regulator framework mimarisi</h2>
+  <p class="section-lead">Linux regulator framework, güç kaynağı donanımını (PMIC, LDO, buck converter) ve bu kaynakları kullanan tüketicileri (SoC, DDR, peripheral) soyutlayan kernel alt sistemidir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>Mimari katmanları</span><span class="dot">●</span></div>
+    <pre><code>┌──────────────────────────────────────────────────────┐
+│            Consumer (tüketen driver)                 │
+│   regulator_get() → regulator_enable() → set_v()    │
+├──────────────────────────────────────────────────────┤
+│              Regulator Core                          │
+│   regulator_dev + regulator_desc + ops               │
+├──────────────────────────────────────────────────────┤
+│           Regulator Driver (Provider)                │
+│   AXP20x / TPS65217 / BD71837 / fixed-regulator      │
+├──────────────────────────────────────────────────────┤
+│         Hardware (I2C/SPI PMIC, Discrete)            │
+└──────────────────────────────────────────────────────┘</code></pre>
+  </div>
+
+  <h3>Temel veri yapıları</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">struct regulator_desc</div><div class="desc">Regulator'ın statik tanımı: isim, tip, voltaj tablosu, ops, sahip modül. Driver tarafından doldurulur.</div></div>
+    <div class="param"><div class="name">struct regulator_dev (rdev)</div><div class="desc">Kaydedilmiş bir regulator örneği. Core tarafından yönetilir. Supply chain bilgisini içerir.</div></div>
+    <div class="param"><div class="name">struct regulator</div><div class="desc">Consumer handle: tüketici driver'ın elindeki referans. regulator_get() ile alınır.</div></div>
+    <div class="param"><div class="name">Supply chain</div><div class="desc">Regulator'ların birbirine bağlandığı hiyerarşi. Buck → LDO → SoC gibi. Üst katman kapanınca alt katmanlar da kapanır.</div></div>
+  </div>
+
+  <h3>PMIC mimarisi örneği</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Tipik PMIC supply zinciri</span><span class="dot">●</span></div>
+    <pre><code>Battery / VIN
+    │
+    ├── DCDC1 (Buck 3.3V)  ─── VCC_3V3_SYS
+    │       │                    ├── DDR (LDO1 1.35V)
+    │       │                    └── USB PHY
+    │
+    ├── DCDC2 (Buck, variable) ─── VDD_CPU  (cpufreq kontrollü)
+    │
+    ├── DCDC3 (Buck, variable) ─── VDD_GPU
+    │
+    ├── LDO1  (1.8V)  ─── VCCIO_SD
+    ├── LDO2  (3.0V)  ─── VCCIO_WIFI
+    └── LDO3  (1.8V)  ─── VCC_SENSOR</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> DT regulator binding</h2>
+  <p class="section-lead">PMIC regulator'ları Device Tree'de iki katmanda tanımlanır: PMIC'in kendisi (I2C/SPI client) ve PMIC içindeki her regulator bloğu.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts — AXP209 PMIC regulator binding</span><span class="dot">●</span></div>
+    <pre><code>&amp;i2c0 {
+    axp209: pmic@34 {
+        compatible = "x-powers,axp209";
+        reg = &lt;0x34&gt;;
+        interrupts = &lt;0 62 4&gt;;
+        interrupt-controller;
+        #interrupt-cells = &lt;1&gt;;
+
+        regulators {
+            /* DC-DC1 — VCC 3.3V, her zaman açık */
+            reg_dcdc1: dcdc1 {
+                regulator-name        = "vcc-3v3";
+                regulator-min-microvolt = &lt;3300000&gt;;
+                regulator-max-microvolt = &lt;3300000&gt;;
+                regulator-always-on;  /* system rail, kapatılmaz */
+            };
+
+            /* DC-DC2 — VDD CPU, değiştirilebilir */
+            reg_dcdc2: dcdc2 {
+                regulator-name        = "vdd-cpu";
+                regulator-min-microvolt = &lt;700000&gt;;   /* 0.7V */
+                regulator-max-microvolt = &lt;1300000&gt;;  /* 1.3V */
+                regulator-always-on;
+                /* cpufreq driver bu regulator'ı kullanır */
+            };
+
+            /* LDO3 — USB PHY 3.3V */
+            reg_ldo3: ldo3 {
+                regulator-name        = "vcc-usb";
+                regulator-min-microvolt = &lt;3300000&gt;;
+                regulator-max-microvolt = &lt;3300000&gt;;
+                regulator-boot-on;    /* önyükleme sırasında aç */
+            };
+
+            /* LDO4 — sensör 2.8V (isteğe bağlı açık/kapalı) */
+            reg_ldo4: ldo4 {
+                regulator-name        = "vcc-sensor";
+                regulator-min-microvolt = &lt;1800000&gt;;
+                regulator-max-microvolt = &lt;3300000&gt;;
+                /* regulator-always-on YOK: consumer açıp kapayabilir */
+            };
+        };
+    };
+};</code></pre>
+  </div>
+
+  <h3>Önemli DT özellikleri</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">regulator-name</div><div class="desc">Consumer'ın regulator_get() içinde kullandığı isim veya supply alias. Zorunlu değil ama önerilir.</div></div>
+    <div class="param"><div class="name">regulator-min/max-microvolt</div><div class="desc">Güvenli voltaj aralığı. Bu aralık dışında regulator_set_voltage() başarısız olur.</div></div>
+    <div class="param"><div class="name">regulator-always-on</div><div class="desc">Bu regulator hiç kapatılmaz. Sistem rail'leri için kullanılır.</div></div>
+    <div class="param"><div class="name">regulator-boot-on</div><div class="desc">Önyükleme sırasında açık olmalı, ama ilgili consumer kapatabilir.</div></div>
+    <div class="param"><div class="name">regulator-over-current-protection</div><div class="desc">Aşırı akım korumasını etkinleştir (destekleyen donanımlar için).</div></div>
+    <div class="param"><div class="name">vin-supply</div><div class="desc">Bu regulator'ı besleyen üst seviye regulator (supply chain).</div></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Consumer API — get, enable, set_voltage</h2>
+  <p class="section-lead">Consumer driver'ları regulator'lara standart bir API ile erişir. Bu API, donanım farklılıklarını soyutlar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — consumer driver örneği</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/regulator/consumer.h&gt;
+
+struct mydev_priv {
+    struct device    *dev;
+    struct regulator *vdd;     /* güç kaynağı */
+    struct regulator *vio;     /* I/O voltajı */
+};
+
+static int mydev_probe(struct platform_device *pdev)
+{
+    struct mydev_priv *priv;
+
+    priv = devm_kzalloc(&amp;pdev-&gt;dev, sizeof(*priv), GFP_KERNEL);
+
+    /* Regulator'ı al — DT'de "vdd-supply" property'si ile eşleşir */
+    priv-&gt;vdd = devm_regulator_get(&amp;pdev-&gt;dev, "vdd");
+    if (IS_ERR(priv-&gt;vdd)) {
+        dev_err(&amp;pdev-&gt;dev, "vdd regulator alınamadı\n");
+        return PTR_ERR(priv-&gt;vdd);
+    }
+
+    priv-&gt;vio = devm_regulator_get_optional(&amp;pdev-&gt;dev, "vio");
+    /* get_optional: regulator yoksa hata değil, NULL döner */
+
+    /* Voltaj ayarla */
+    int ret = regulator_set_voltage(priv-&gt;vdd, 1800000, 1800000);
+    /* min_uV ve max_uV eşit = sabit voltaj iste */
+    if (ret) {
+        dev_err(&amp;pdev-&gt;dev, "voltaj ayarlanamadı\n");
+        return ret;
+    }
+
+    /* Regulator'ı aç */
+    ret = regulator_enable(priv-&gt;vdd);
+    if (ret) {
+        dev_err(&amp;pdev-&gt;dev, "regulator açılamadı\n");
+        return ret;
+    }
+
+    /* Açılma süresi — bazı regulator'lar stabil olmak için zaman ister */
+    usleep_range(1000, 2000);   /* 1-2ms */
+
+    /* ... donanım başlatma ... */
+
+    return 0;
+}
+
+static void mydev_remove(struct platform_device *pdev)
+{
+    struct mydev_priv *priv = platform_get_drvdata(pdev);
+    regulator_disable(priv-&gt;vdd);
+    /* devm_regulator_get ile alındıysa regulator_put otomatik */
+}</code></pre>
+  </div>
+
+  <h3>Ek API fonksiyonları</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">regulator_get_voltage()</div><div class="desc">Mevcut çıkış voltajını mikrovolt cinsinden oku.</div></div>
+    <div class="param"><div class="name">regulator_is_enabled()</div><div class="desc">Regulator'ın açık olup olmadığını kontrol et (1=açık, 0=kapalı).</div></div>
+    <div class="param"><div class="name">regulator_get_current_limit()</div><div class="desc">Maksimum akım sınırını mikroamper cinsinden oku.</div></div>
+    <div class="param"><div class="name">regulator_set_load()</div><div class="desc">Beklenen yükü bildir — regulator modu optimizasyonu için (normal vs low-power mode).</div></div>
+    <div class="param"><div class="name">devm_regulator_bulk_get()</div><div class="desc">Birden fazla regulator'ı aynı anda al. regulator_bulk_enable/disable ile toplu kontrol.</div></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — bulk regulator kullanımı</span><span class="dot">●</span></div>
+    <pre><code>static const char * const supply_names[] = {
+    "vdd", "vio", "vana"
+};
+struct regulator_bulk_data supplies[ARRAY_SIZE(supply_names)];
+
+/* İsimleri ata */
+for (int i = 0; i &lt; ARRAY_SIZE(supply_names); i++)
+    supplies[i].supply = supply_names[i];
+
+/* Tümünü al */
+ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(supplies), supplies);
+
+/* Tümünü aç */
+ret = regulator_bulk_enable(ARRAY_SIZE(supplies), supplies);
+
+/* Tümünü kapat */
+regulator_bulk_disable(ARRAY_SIZE(supplies), supplies);</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Regulator türleri — LDO, buck, boost, fixed</h2>
+  <p class="section-lead">Her regulator tipi farklı elektriksel özelliklere sahiptir. Doğru tip seçimi hem verimlilik hem de düzenleme kalitesi için önemlidir.</p>
+
+  <div class="params">
+    <div class="param"><div class="name">LDO (Low Dropout)</div><div class="desc">Basit ve düşük gürültülü. Giriş voltajından biraz düşük çıkış üretir. Fazla enerji ısıya dönüşür. RF/analog devreler, gürültüye duyarlı I/O için ideal. Verimlilik: ~(Vout/Vin) × 100%.</div></div>
+    <div class="param"><div class="name">Buck (Step-down)</div><div class="desc">Anahtarlamalı, yüksek verimli (%85-95). Giriş voltajından düşük çıkış. CPU/GPU/DDR gibi yüksek akım tüketiciler için. EMI üretir — ek filtreleme gerekebilir.</div></div>
+    <div class="param"><div class="name">Boost (Step-up)</div><div class="desc">Anahtarlamalı. Giriş voltajından yüksek çıkış üretir. USB 5V üretimi, LED sürücüleri, pil şarj sistemleri.</div></div>
+    <div class="param"><div class="name">Buck-Boost</div><div class="desc">Giriş voltajından hem yüksek hem düşük çıkış üretebilir. Pil sistemlerinde (3.7V LiPo → sabit 3.3V veya 5V) kullanışlı.</div></div>
+    <div class="param"><div class="name">Charge pump</div><div class="desc">Kondansatör anahtarlamalı, bobinsiz boost. Küçük güçler için (LCD vias, flash bellek programlama).</div></div>
+    <div class="param"><div class="name">Fixed regulator</div><parameter name="desc">Voltaj ayarlanamaz, sadece enable/disable. DT'de <code class="inline">compatible = "regulator-fixed"</code>.</div></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts — fixed regulator</span><span class="dot">●</span></div>
+    <pre><code>/* Sabit 5V güç kaynağı (örn. USB VBUS) */
+reg_usb_vbus: regulator-usb-vbus {
+    compatible = "regulator-fixed";
+    regulator-name = "usb-vbus";
+    regulator-min-microvolt = &lt;5000000&gt;;
+    regulator-max-microvolt = &lt;5000000&gt;;
+    gpio = &lt;&amp;gpio1 13 GPIO_ACTIVE_HIGH&gt;;  /* enable GPIO */
+    enable-active-high;
+    regulator-boot-on;
+};</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Yaygın PMIC'ler: AXP803, TPS65217, BD71837, RK817</h2>
+  <p class="section-lead">Gömülü Linux dünyasında en sık karşılaşılan PMIC'ler ve platform bağlantıları.</p>
+
+  <h3>X-Powers AXP209/AXP803 (Allwinner SoC)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>AXP803 özet (A64/H6 SoC)</span><span class="dot">●</span></div>
+    <pre><code>AXP803:
+  DC-DC1: 1.6–3.4V (sys, sd)
+  DC-DC2: 0.5–1.3V (CPU VDD — DVFS)
+  DC-DC3: 0.5–1.3V (GPU VDD)
+  DC-DC4: 0.5–1.3V (DRAM)
+  DC-DC5: 0.8–1.84V
+  DC-DC6: 0.6–1.52V
+  LDO1..14: çeşitli sabit/değişken
+  ALDO/DLDO/ELDO: Audio/SD/EFUSE LDO
+  Batarya şarj kontrolcüsü dahil</code></pre>
+  </div>
+
+  <h3>Texas Instruments TPS65217 (BeagleBone Black)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts — TPS65217 (AM335x)</span><span class="dot">●</span></div>
+    <pre><code>&amp;i2c0 {
+    tps: tps@24 {
+        compatible = "ti,tps65217";
+        reg = &lt;0x24&gt;;
+        interrupts = &lt;7&gt;;  /* GPIO 7 */
+
+        regulators {
+            dcdc1_reg: regulator@0 {
+                regulator-name = "vdd_1_8v";
+                regulator-min-microvolt = &lt;900000&gt;;
+                regulator-max-microvolt = &lt;1800000&gt;;
+                regulator-boot-on;
+                regulator-always-on;
+            };
+            dcdc2_reg: regulator@1 {
+                regulator-name = "vdd_core";   /* AM335x çekirdek */
+                regulator-min-microvolt = &lt;925000&gt;;
+                regulator-max-microvolt = &lt;1325000&gt;;
+                regulator-always-on;
+            };
+            dcdc3_reg: regulator@2 {
+                regulator-name = "vdd_mpu";    /* ARM Cortex-A8 */
+                regulator-min-microvolt = &lt;925000&gt;;
+                regulator-max-microvolt = &lt;1325000&gt;;
+                regulator-always-on;
+                /* cpufreq bu regulator'ı DVFS için kullanır */
+            };
+        };
+    };
+};</code></pre>
+  </div>
+
+  <h3>ROHM BD71837 (i.MX8M)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>BD71837 özet (i.MX8MQ/Mini)</span><span class="dot">●</span></div>
+    <pre><code>BD71837:
+  BUCK1: VDD_SOC (NXP i.MX8M SOC rail, DVFS)
+  BUCK2: VDD_ARM (ARM A53 cluster, DVFS)
+  BUCK3: VDD_0V9_DRAM (DDR4 rail)
+  BUCK4: VDD_0V9_SD
+  BUCK5: 3V3 (system)
+  BUCK6: 1V1 (HDMI)
+  BUCK7: 1V8 (IO)
+  BUCK8: variable (eMMC)
+  LDO1..7: çeşitli</code></pre>
+  </div>
+
+  <h3>Rockchip RK817 (RK3568/RK3399)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts — RK817 (RK3568)</span><span class="dot">●</span></div>
+    <pre><code>&amp;i2c0 {
+    rk817: pmic@20 {
+        compatible = "rockchip,rk817";
+        reg = &lt;0x20&gt;;
+        interrupt-parent = &lt;&amp;gpio0&gt;;
+        interrupts = &lt;RK_PA3 IRQ_TYPE_LEVEL_LOW&gt;;
+
+        regulators {
+            vdd_logic: DCDC_REG1 {
+                regulator-name = "vdd_logic";
+                regulator-min-microvolt = &lt;500000&gt;;
+                regulator-max-microvolt = &lt;1350000&gt;;
+                regulator-always-on;
+            };
+            vdd_arm: DCDC_REG2 {
+                regulator-name = "vdd_arm";
+                regulator-min-microvolt = &lt;500000&gt;;
+                regulator-max-microvolt = &lt;1350000&gt;;
+                regulator-always-on;
+                /* cpufreq ile DVFS */
+            };
+        };
+    };
+};</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Voltage scaling — DVFS ile regulator</h2>
+  <p class="section-lead">DVFS (Dynamic Voltage &amp; Frequency Scaling) çalışırken cpufreq driver, OPP tablosundaki voltaj değerlerini regulator_set_voltage() ile uygular.</p>
+
+  <h3>DVFS akışı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>DVFS geçiş sırası</span><span class="dot">●</span></div>
+    <pre><code>Frekans artırılacak (600 MHz → 1200 MHz):
+  1. regulator_set_voltage(vdd_cpu, 1100mV, 1100mV)  ← önce voltaj artır
+  2. clk_set_rate(cpu_clk, 1200MHz)                  ← sonra frekans artır
+  3. regulator_set_load(vdd_cpu, new_load)
+
+Frekans düşürülecek (1200 MHz → 600 MHz):
+  1. clk_set_rate(cpu_clk, 600MHz)                   ← önce frekans düşür
+  2. regulator_set_voltage(vdd_cpu, 950mV, 950mV)    ← sonra voltaj düşür</code></pre>
+  </div>
+
+  <h3>Regulator notifier chain</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — regulator event notifier</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/regulator/consumer.h&gt;
+
+static int my_regulator_notifier(struct notifier_block *nb,
+                                  unsigned long event, void *data)
+{
+    switch (event) {
+    case REGULATOR_EVENT_VOLTAGE_CHANGE:
+        pr_info("Voltaj değişti: %luuV\n",
+                (unsigned long)data);
+        break;
+    case REGULATOR_EVENT_OVER_CURRENT:
+        pr_warn("Aşırı akım algılandı!\n");
+        break;
+    case REGULATOR_EVENT_UNDER_VOLTAGE:
+        pr_warn("Düşük voltaj!\n");
+        break;
+    case REGULATOR_EVENT_DISABLE:
+        pr_info("Regulator kapandı\n");
+        break;
+    }
+    return NOTIFY_OK;
+}
+
+static struct notifier_block regulator_nb = {
+    .notifier_call = my_regulator_notifier,
+};
+
+/* Notifier'ı kaydet */
+regulator_register_notifier(reg, &amp;regulator_nb);</code></pre>
+  </div>
+
+  <h3>Güç tüketimi tahmini</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash / python3 — voltaj × akım = güç</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># debugfs'ten regulator bilgisi</span>
+cat /sys/kernel/debug/regulator/vdd-cpu/microvolts
+<span class="cmt"># 1100000  (1.1V)</span>
+
+cat /sys/kernel/debug/regulator/vdd-cpu/microamps
+<span class="cmt"># 500000   (500mA)</span>
+
+cat /sys/kernel/debug/regulator/vdd-cpu/min_microvolts
+cat /sys/kernel/debug/regulator/vdd-cpu/max_microvolts
+
+<span class="cmt"># Güç hesabı: P = V × I</span>
+python3 -c "
+v_uv = 1100000   # 1.1V
+i_ua = 500000    # 500mA
+p_uw = v_uv * i_ua // 1000000   # mikrowatt'a çevir bölme
+print(f'Güç: {p_uw/1000:.0f} mW ({p_uw} uW)')
+"
+<span class="cmt"># Güç: 550 mW</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> sysfs ve debugfs arayüzü</h2>
+  <p class="section-lead">/sys/kernel/debug/regulator/ altında her regulator hakkında detaylı bilgi mevcuttur. Güç bütçesi analizi ve hata ayıklama için temel araçtır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># tüm regulator'ları listele</span>
+ls /sys/kernel/debug/regulator/
+<span class="cmt"># vdd-cpu  vdd-gpu  vcc-3v3  vcc-1v8  vcc-usb  ...</span>
+
+<span class="cmt"># regulator detayları</span>
+cat /sys/kernel/debug/regulator/vdd-cpu/name
+<span class="cmt"># dcdc2</span>
+
+cat /sys/kernel/debug/regulator/vdd-cpu/microvolts
+<span class="cmt"># 1100000</span>
+
+cat /sys/kernel/debug/regulator/vdd-cpu/enable_count
+<span class="cmt"># 2  (2 consumer bu regulator'ı açık tutuyor)</span>
+
+cat /sys/kernel/debug/regulator/vdd-cpu/use_count
+<span class="cmt"># 2</span>
+
+<span class="cmt"># Tüm regulator özeti (tek seferlik)</span>
+for r in /sys/kernel/debug/regulator/*/; do
+    name=$(basename "$r")
+    uv=$(cat "${r}microvolts" 2&gt;/dev/null || echo "N/A")
+    ena=$(cat "${r}enable_count" 2&gt;/dev/null || echo "?")
+    printf "%-20s  %8s uV  enabled=%s\n" "$name" "$uv" "$ena"
+done</code></pre>
+  </div>
+
+  <h3>regulator_summary debugfs</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm regulator'ların hiyerarşik özeti</span>
+cat /sys/kernel/debug/regulator/regulator_summary
+<span class="cmt"># regulator                      use open bypass  min(uV)   max(uV)    load(uA) consumers
+# ---------------------------------------------------------------------------------------------------
+# vdd-cpu dcdc2                    1    1    0  1100000   1100000       0
+#   cpufreq                                                              0
+# vcc-3v3 dcdc1                    2    2    0  3300000   3300000       0
+#   dwmmc                                                                0
+#   usb-phy                                                              0
+</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Yeni regulator driver yazımı</h2>
+  <p class="section-lead">Desteklenmeyen bir PMIC için regulator driver yazmak, regulator_desc ve ops yapılarını doldurmak ve regulator_register() çağırmaktan ibarettir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — minimal I2C regulator driver</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/i2c.h&gt;
+#include &lt;linux/regulator/driver.h&gt;
+#include &lt;linux/regulator/of_regulator.h&gt;
+
+/* Desteklenen voltaj tablosu (uV cinsinden) */
+static const unsigned int myreg_voltages[] = {
+    800000, 900000, 1000000, 1100000,
+    1200000, 1300000, 1800000, 3300000,
+};
+
+static int myreg_get_voltage_sel(struct regulator_dev *rdev)
+{
+    struct i2c_client *i2c = rdev_get_drvdata(rdev);
+    int val = i2c_smbus_read_byte_data(i2c, REG_VSEL);
+    if (val &lt; 0) return val;
+    return val &amp; 0x07;  /* alt 3 bit = selector */
+}
+
+static int myreg_set_voltage_sel(struct regulator_dev *rdev,
+                                   unsigned int selector)
+{
+    struct i2c_client *i2c = rdev_get_drvdata(rdev);
+    int cur = i2c_smbus_read_byte_data(i2c, REG_VSEL);
+    if (cur &lt; 0) return cur;
+
+    cur = (cur &amp; ~0x07) | (selector &amp; 0x07);
+    return i2c_smbus_write_byte_data(i2c, REG_VSEL, cur);
+}
+
+static int myreg_enable(struct regulator_dev *rdev)
+{
+    struct i2c_client *i2c = rdev_get_drvdata(rdev);
+    return i2c_smbus_write_byte_data(i2c, REG_CTRL, 0x01);
+}
+
+static int myreg_disable(struct regulator_dev *rdev)
+{
+    struct i2c_client *i2c = rdev_get_drvdata(rdev);
+    return i2c_smbus_write_byte_data(i2c, REG_CTRL, 0x00);
+}
+
+static int myreg_is_enabled(struct regulator_dev *rdev)
+{
+    struct i2c_client *i2c = rdev_get_drvdata(rdev);
+    return i2c_smbus_read_byte_data(i2c, REG_CTRL) &amp; 0x01;
+}
+
+static const struct regulator_ops myreg_ops = {
+    .get_voltage_sel   = myreg_get_voltage_sel,
+    .set_voltage_sel   = myreg_set_voltage_sel,
+    .list_voltage      = regulator_list_voltage_table,
+    .map_voltage       = regulator_map_voltage_ascend,
+    .enable            = myreg_enable,
+    .disable           = myreg_disable,
+    .is_enabled        = myreg_is_enabled,
+};
+
+static const struct regulator_desc myreg_desc = {
+    .name          = "myreg-dcdc1",
+    .of_match      = "myreg-dcdc1",
+    .type          = REGULATOR_VOLTAGE,
+    .ops           = &amp;myreg_ops,
+    .volt_table    = myreg_voltages,
+    .n_voltages    = ARRAY_SIZE(myreg_voltages),
+    .owner         = THIS_MODULE,
+};
+
+static int myreg_i2c_probe(struct i2c_client *client)
+{
+    struct regulator_config config = {};
+    struct regulator_dev *rdev;
+
+    config.dev     = &amp;client-&gt;dev;
+    config.of_node = client-&gt;dev.of_node;
+    config.driver_data = client;
+
+    /* regulator_init_data DT'den otomatik okunur */
+    config.init_data = of_get_regulator_init_data(
+        &amp;client-&gt;dev, client-&gt;dev.of_node, &amp;myreg_desc);
+
+    rdev = devm_regulator_register(&amp;client-&gt;dev, &amp;myreg_desc, &amp;config);
+    return PTR_ERR_OR_ZERO(rdev);
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: TPS65217 CPU VDD düşürme ve i.MX8 güç bütçesi</h2>
+  <p class="section-lead">İki pratik senaryo: BeagleBone Black'te TPS65217 üzerinden CPU VDD voltajını düşürerek güç tasarrufu ve i.MX8 sistemde güç bütçesi optimizasyonu.</p>
+
+  <h3>1 — BeagleBone Black TPS65217 CPU VDD Düşürme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — BBB TPS65217 regulator kontrolü</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># BeagleBone Black'te regulator'ları listele</span>
+cat /sys/kernel/debug/regulator/regulator_summary
+<span class="cmt"># vdd_mpu dcdc3        1  1  0   925000  1325000    0  cpufreq
+# vdd_core dcdc2       1  1  0   925000  1325000    0  opp</span>
+
+<span class="cmt"># Mevcut CPU voltajı</span>
+cat /sys/kernel/debug/regulator/vdd_mpu/microvolts
+<span class="cmt"># 1275000  (1.275V @ 1GHz)</span>
+
+<span class="cmt"># OPP tablosunu görüntüle</span>
+cat /sys/kernel/debug/opp/cpu0/opp_summary
+<span class="cmt"># OPP: 300000000 Hz, 950000 uV  (300MHz, 0.95V)
+# OPP: 600000000 Hz, 1100000 uV  (600MHz, 1.1V)
+# OPP: 720000000 Hz, 1200000 uV  (720MHz, 1.2V)
+# OPP: 800000000 Hz, 1275000 uV  (800MHz, 1.275V)
+# OPP: 1000000000 Hz, 1325000 uV (1GHz,  1.325V)</span>
+
+<span class="cmt"># Frekansı 600MHz'e sabitle — voltaj otomatik 1.1V'a düşer</span>
+cpupower frequency-set -u 600MHz
+cat /sys/kernel/debug/regulator/vdd_mpu/microvolts
+<span class="cmt"># 1100000  (1.1V)</span>
+
+<span class="cmt"># Güç farkı hesabı:
+# 1GHz:  P ~ V² × f = 1.325² × 1.0  = 1.756 (normalize)
+# 600MHz: P ~ 1.1² × 0.6 = 0.726 (normalize)
+# Tasarruf: ~58%!</span>
+
+<span class="cmt"># INA219 ile gerçek ölçüm (eğer donanım varsa)</span>
+python3 -c "
+from ina219 import INA219
+ina = INA219(0.1, address=0x40)
+ina.configure()
+print(f'Voltaj: {ina.voltage():.3f}V')
+print(f'Akım:   {ina.current():.1f}mA')
+print(f'Güç:    {ina.power():.1f}mW')
+"</code></pre>
+  </div>
+
+  <h3>2 — i.MX8 PMIC ile Güç Bütçesi Optimizasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>python3 — i.MX8 güç bütçesi scripti</span><span class="dot">●</span></div>
+    <pre><code>#!/usr/bin/env python3
+"""
+i.MX8 sistemi için regulator debugfs üzerinden güç bütçesi analizi.
+Her regulator'ın voltaj × enable durumunu raporlar.
+"""
+import os, pathlib
+
+REGULATOR_BASE = pathlib.Path("/sys/kernel/debug/regulator")
+
+def read_file(path):
+    try:
+        return path.read_text().strip()
+    except Exception:
+        return None
+
+def analyze_regulators():
+    regs = []
+    for reg_dir in sorted(REGULATOR_BASE.iterdir()):
+        if not reg_dir.is_dir():
+            continue
+        name    = reg_dir.name
+        uv      = read_file(reg_dir / "microvolts")
+        enable  = read_file(reg_dir / "enable_count")
+        use     = read_file(reg_dir / "use_count")
+        min_uv  = read_file(reg_dir / "min_microvolts")
+        max_uv  = read_file(reg_dir / "max_microvolts")
+
+        if uv is None:
+            continue
+
+        regs.append({
+            "name":    name,
+            "uv":      int(uv),
+            "enabled": int(enable or 0) > 0,
+            "use":     int(use or 0),
+            "min_uv":  int(min_uv or 0),
+            "max_uv":  int(max_uv or 0),
+        })
+    return regs
+
+def print_budget(regs):
+    print(f"{'Regulator':<25} {'Voltaj':>10} {'Etkin':>6} {'Kullanıcı':>10}")
+    print("-" * 60)
+    active = [r for r in regs if r["enabled"]]
+    for r in active:
+        v_str = f"{r['uv']/1000000:.3f}V"
+        print(f"{r['name']:<25} {v_str:>10} {'Evet':>6} {r['use']:>10}")
+
+    print(f"\nToplam etkin regulator: {len(active)}/{len(regs)}")
+    print("\nOptimizasyon önerileri:")
+    for r in regs:
+        if not r["enabled"] and r["use"] == 0:
+            print(f"  {r['name']}: kapalı (tasarruf sağlıyor)")
+        if r["enabled"] and r["uv"] == r["max_uv"] and r["max_uv"] > 1800000:
+            print(f"  {r['name']}: {r['uv']/1e6:.2f}V (maksimumda, düşürülebilir?)")
+
+if __name__ == "__main__":
+    regs = analyze_regulators()
+    print_budget(regs)</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — i.MX8 güç optimizasyon adımları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1. Kullanılmayan peripheral'ları kapat (runtime PM)</span>
+echo auto > /sys/bus/platform/devices/30a30000.ethernet/power/control
+echo auto > /sys/bus/platform/devices/30900000.usb/power/control
+
+<span class="cmt"># 2. cpufreq schedutil + düşük max frekans</span>
+cpupower frequency-set -g schedutil
+cpupower frequency-set -u 1200MHz   <span class="cmt"># turbo OPP'yi kapat</span>
+
+<span class="cmt"># 3. Boşta regulator voltajını izle</span>
+watch -n2 'for r in vdd_arm vdd_soc; do
+    v=$(cat /sys/kernel/debug/regulator/${r}/microvolts 2>/dev/null)
+    echo "$r: $((v/1000))mV"
+done'
+
+<span class="cmt"># 4. GPU devfreq powersave</span>
+echo powersave > /sys/class/devfreq/*/governor 2>/dev/null
+
+<span class="cmt"># 5. Sonuç: yüksüz i.MX8 sistemde tipik tüketim
+# - Tam performans (1.8GHz): ~3.5W
+# - schedutil + 1.2GHz:      ~2.1W
+# - powersave + 600MHz:       ~1.2W
+# - Suspend-to-RAM:           ~0.5W</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">ÖZET</div>
+    <p>Regulator framework ile güç optimizasyonu üç katmanda yapılır: (1) kullanılmayan blokları tamamen kapat (regulator_disable), (2) çalışan bloklar için voltajı minimize et (OPP/DVFS), (3) yük tahminini doğru bildir (regulator_set_load) — böylece PMIC düşük güç moduna geçebilir. Bu üç adımı birlikte uygulayan bir i.MX8 sistemde %40-60 güç tasarrufu mümkündür.</p>
+  </div>
+
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

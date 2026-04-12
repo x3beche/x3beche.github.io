@@ -1,0 +1,687 @@
+---
+layout: tutorial
+title: "cpufreq — Güç Yönetimi"
+back_url: "../index.html"
+back_label: "Güç Yönetimi & Thermal"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÜÇ YÖNETİMİ</span>
+    <span>CPUFREQ</span>
+    <span>2026</span>
+  </div>
+  <h1>cpufreq —<br><em>CPU frekans ölçekleme.</em></h1>
+  <p class="subtitle">DVFS ile dinamik voltaj-frekans yönetimi: governor seçiminden OPP tablosuna, schedutil'den cpupower araçlarına — pilli sistemlerde güç tüketimini yarıya indir.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">cpufreq nedir — DVFS ve kernel subsystem</a></li>
+    <li><a href="#s1">Governor'lar — performance'dan schedutil'e</a></li>
+    <li><a href="#s2">OPP — Operating Performance Points</a></li>
+    <li><a href="#s3">sysfs ile manuel kontrol</a></li>
+    <li><a href="#s4">Energy-Aware Scheduling (EAS)</a></li>
+    <li><a href="#s5">Boost ve turbo frekans</a></li>
+    <li><a href="#s6">cpupower araçları</a></li>
+    <li><a href="#s7">Kernel config ve Device Tree</a></li>
+    <li><a href="#s8">Pratik: RPi4 throttling · BeagleBone schedutil · INA219</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> cpufreq nedir — DVFS ve kernel subsystem</h2>
+  <p class="section-lead">cpufreq, Linux kernel'ın CPU voltaj ve frekansını çalışma zamanında dinamik olarak yöneten alt sistemidir. Temel fikir: düşük yük altında frekansı (ve voltajı) düşürerek güç tüketimini kare-küp ilişkisiyle azaltmak.</p>
+
+  <p>Güç tüketimi dinamik bileşeni şu formülle özetlenir: <strong>P = C × V² × f</strong>. Frekansı yarıya indirmek voltajı da düşürmeye olanak tanır; voltajdaki küçük bir düşüş güçte dramatik azalma sağlar. Bu ilkeye <strong>DVFS (Dynamic Voltage &amp; Frequency Scaling)</strong> denir.</p>
+
+  <h3>Kernel subsystem mimarisi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Mimari Katmanları</span><span class="dot">●</span></div>
+    <pre><code>┌─────────────────────────────────────────────┐
+│           userspace / sysfs                 │
+│  /sys/devices/system/cpu/cpu0/cpufreq/      │
+├─────────────────────────────────────────────┤
+│           cpufreq core (kernel)             │
+│   governor → policy → driver               │
+├──────────────┬──────────────────────────────┤
+│  cpufreq     │  cpufreq driver              │
+│  governor    │  (platform-specific)         │
+│  (schedutil) │  intel_pstate / acpi-cpufreq │
+│              │  cpufreq-dt / arm_big_little  │
+├──────────────┴──────────────────────────────┤
+│    clock subsystem (clk_set_rate)           │
+│    regulator subsystem (regulator_set_v)    │
+└─────────────────────────────────────────────┘</code></pre>
+  </div>
+
+  <h3>sysfs arayüzü — temel dosyalar</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># CPU0 cpufreq dizini</span>
+ls /sys/devices/system/cpu/cpu0/cpufreq/
+<span class="cmt"># affected_cpus  cpuinfo_cur_freq  cpuinfo_max_freq  cpuinfo_min_freq
+# cpuinfo_transition_latency  related_cpus  scaling_available_governors
+# scaling_available_frequencies  scaling_cur_freq  scaling_driver
+# scaling_governor  scaling_max_freq  scaling_min_freq  scaling_setspeed</span>
+
+<span class="cmt"># mevcut frekans (kHz)</span>
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq
+<span class="cmt"># 1500000</span>
+
+<span class="cmt"># aktif governor</span>
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+<span class="cmt"># schedutil</span>
+
+<span class="cmt"># donanımın desteklediği frekanslar</span>
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies
+<span class="cmt"># 600000 900000 1200000 1500000 1800000</span></code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><div class="name">cpuinfo_cur_freq</div><div class="desc">Donanımdan okunan gerçek frekans (kHz). scaling_cur_freq'ten farklı olabilir.</div></div>
+    <div class="param"><div class="name">scaling_driver</div><div class="desc">Aktif cpufreq driver adı (örn: <code class="inline">cpufreq-dt</code>, <code class="inline">intel_pstate</code>).</div></div>
+    <div class="param"><div class="name">cpuinfo_transition_latency</div><div class="desc">Frekans değişimi için gereken süre (ns). Governor kararlarını etkiler.</div></div>
+    <div class="param"><div class="name">scaling_available_governors</div><div class="desc">Kernel'da derlenmiş governor listesi.</div></div>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Intel Turbo Boost veya AMD Precision Boost aktifken <code class="inline">cpuinfo_cur_freq</code>, <code class="inline">cpuinfo_max_freq</code>'i aşabilir. Bu normal bir davranıştır — turbo aralığı sysfs üzerinden ayrıca yönetilir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Governor'lar — performance'dan schedutil'e</h2>
+  <p class="section-lead">Governor, anlık CPU yüküne bakarak hangi frekansın seçileceğine karar veren politika motorudur. Doğru governor seçimi güç/performans dengesini doğrudan belirler.</p>
+
+  <div class="params">
+    <div class="param"><div class="name">performance</div><div class="desc">Her zaman maksimum frekans. Gecikme kritik uygulamalar ve kıyaslama testleri için. Güç tasarrufu yok.</div></div>
+    <div class="param"><div class="name">powersave</div><div class="desc">Her zaman minimum frekans. Maksimum güç tasarrufu. İşlem kapasitesi çok düşük, sadece boşta sistemler için.</div></div>
+    <div class="param"><div class="name">ondemand</div><div class="desc">CPU kullanımını her örnekleme aralığında ölçer; eşiği (varsayılan %80) geçince maksimuma atlar, aksi halde düşürür. Eski çekirdeklerde yaygın.</div></div>
+    <div class="param"><div class="name">conservative</div><div class="desc">ondemand gibi ama frekansı kademeli olarak yükseltir/düşürür. Daha az agresif voltaj değişimi — bazı SoC'larda stabil.</div></div>
+    <div class="param"><div class="name">schedutil</div><div class="desc">Linux 4.7+. Scheduler'ın PELT (Per-Entity Load Tracking) verilerini kullanır. EAS ile uyumlu. Önerilen modern governor.</div></div>
+    <div class="param"><div class="name">userspace</div><div class="desc">Frekans kararını tamamen kullanıcı alanına bırakır. <code class="inline">scaling_setspeed</code> dosyasına yaz. Test ve özel politikalar için.</div></div>
+  </div>
+
+  <h3>Governor değiştirme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># tüm CPU'larda schedutil'e geç</span>
+for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    echo schedutil > "$cpu"
+done
+
+<span class="cmt"># ya da cpupower ile</span>
+cpupower frequency-set -g schedutil
+
+<span class="cmt"># ondemand parametrelerini ayarla</span>
+ls /sys/devices/system/cpu/cpufreq/ondemand/
+<span class="cmt"># ignore_nice_load  powersave_bias  sampling_down_factor
+# sampling_rate  sampling_rate_min  up_threshold</span>
+
+<span class="cmt"># örnekleme hızını artır (ms cinsinden, mikrosaniye değil)</span>
+echo 50000 > /sys/devices/system/cpu/cpufreq/ondemand/sampling_rate
+
+<span class="cmt"># schedutil için rate_limit_us ayarı</span>
+cat /sys/devices/system/cpu/cpufreq/schedutil/rate_limit_us
+<span class="cmt"># 1000  (1ms — frekans değişim hızı sınırı)</span></code></pre>
+  </div>
+
+  <h3>Governor seçim rehberi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Senaryo → Governor</span><span class="dot">●</span></div>
+    <pre><code>Gerçek zamanlı / düşük gecikme   → performance
+Pil ömrü öncelikli (IoT, sensor) → powersave veya schedutil
+Genel amaçlı masaüstü/sunucu    → schedutil (Linux 4.7+)
+big.LITTLE / EAS etkin sistem    → schedutil (zorunlu)
+Eski çekirdek (< 4.7)            → ondemand
+Enerji profili / test            → userspace</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p><code class="inline">ondemand</code> ve <code class="inline">conservative</code> governor'ları tickless (NO_HZ_IDLE) kernel ile birlikte kullanıldığında, CPU boşta iken timer tick'i azaldığından örnekleme gecikmesi artabilir. schedutil bu sorunu yaşamaz çünkü scheduler event'lerine doğrudan bağlıdır.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> OPP — Operating Performance Points</h2>
+  <p class="section-lead">OPP tablosu, CPU'nun çalışabileceği voltaj-frekans çiftlerini tanımlar. Device Tree'de tanımlanan bu tablo, cpufreq driver'ının hangi adımları kullanabileceğini belirler.</p>
+
+  <h3>Device Tree OPP tanımı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts</span><span class="dot">●</span></div>
+    <pre><code>/ {
+    cpu0_opp_table: opp-table-0 {
+        compatible = "operating-points-v2";
+        opp-shared;   /* tüm CPU'lar aynı tabloyu paylaşır */
+
+        opp-600000000 {
+            opp-hz = /bits/ 64 &lt;600000000&gt;;    /* 600 MHz */
+            opp-microvolt = &lt;950000&gt;;            /* 0.95 V */
+            clock-latency-ns = &lt;300000&gt;;
+        };
+        opp-900000000 {
+            opp-hz = /bits/ 64 &lt;900000000&gt;;    /* 900 MHz */
+            opp-microvolt = &lt;1025000&gt;;           /* 1.025 V */
+        };
+        opp-1200000000 {
+            opp-hz = /bits/ 64 &lt;1200000000&gt;;   /* 1.2 GHz */
+            opp-microvolt = &lt;1100000&gt;;           /* 1.1 V */
+        };
+        opp-1500000000 {
+            opp-hz = /bits/ 64 &lt;1500000000&gt;;   /* 1.5 GHz */
+            opp-microvolt = &lt;1200000&gt;;           /* 1.2 V */
+            turbo-mode;                          /* turbo OPP */
+        };
+    };
+
+    cpus {
+        cpu@0 {
+            compatible = "arm,cortex-a53";
+            operating-points-v2 = &lt;&amp;cpu0_opp_table&gt;;
+            clocks = &lt;&amp;ccu CLK_CPU&gt;;
+            clock-names = "cpu";
+            cpu-supply = &lt;&amp;reg_vdd_cpu&gt;;  /* regulator bağlantısı */
+        };
+    };
+};</code></pre>
+  </div>
+
+  <h3>OPP ile ilgili sysfs/debugfs</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># OPP tablosunu debugfs'ten oku</span>
+cat /sys/kernel/debug/opp/cpu0/opp_summary
+<span class="cmt"># OPP: 600000000 Hz, 950000 uV</span>
+<span class="cmt"># OPP: 900000000 Hz, 1025000 uV</span>
+<span class="cmt"># OPP: 1200000000 Hz, 1100000 uV</span>
+<span class="cmt"># OPP: 1500000000 Hz, 1200000 uV  [turbo]</span>
+
+<span class="cmt"># scaling_available_frequencies ile kontrol et</span>
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies
+<span class="cmt"># 600000 900000 1200000 1500000</span></code></pre>
+  </div>
+
+  <h3>devfreq ile fark</h3>
+
+  <p><strong>cpufreq</strong> yalnızca CPU'lar içindir. <strong>devfreq</strong>, GPU, DDR bellek, görüntü işleme birimi (ISP) gibi diğer donanım blokları için benzer bir DVFS altyapısı sağlar. Her ikisi de OPP tablosunu kullanır; ancak devfreq kendi governor'larına (simple_ondemand, powersave, performance, userspace) sahiptir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># devfreq cihazlarını listele (GPU, DDR vb.)</span>
+ls /sys/class/devfreq/
+<span class="cmt"># ff400000.gpu  ff610000.dmc</span>
+
+cat /sys/class/devfreq/ff400000.gpu/cur_freq
+<span class="cmt"># 400000000</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> sysfs ile manuel kontrol</h2>
+  <p class="section-lead">Governor'ı userspace olarak ayarlayıp scaling_setspeed'e yazmak, tam manuel kontrol sağlar. Test, profil alma ve özel enerji politikaları için kullanışlıdır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># CPU0'ı manuel moda al</span>
+echo userspace > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+
+<span class="cmt"># frekansı 900 MHz'e sabitle (kHz cinsinden)</span>
+echo 900000 > /sys/devices/system/cpu/cpu0/cpufreq/scaling_setspeed
+
+<span class="cmt"># doğrula</span>
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq
+<span class="cmt"># 900000</span>
+
+<span class="cmt"># frekans aralığını kısıtla (governor hâlâ aktifken)</span>
+echo 600000  > /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq
+echo 1200000 > /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq
+
+<span class="cmt"># tüm CPU'larda aynı anda uygula</span>
+for i in $(seq 0 3); do
+    echo 1200000 > /sys/devices/system/cpu/cpu$i/cpufreq/scaling_max_freq
+done</code></pre>
+  </div>
+
+  <h3>cpufreq-set (cpufrequtils paketi)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># cpufreq-set ile governor değiştir</span>
+cpufreq-set -c 0 -g schedutil         <span class="cmt"># CPU0</span>
+cpufreq-set -g ondemand               <span class="cmt"># tüm CPU'lar</span>
+
+<span class="cmt"># frekans aralığını ayarla</span>
+cpufreq-set -c 0 -d 600MHz -u 1.2GHz
+
+<span class="cmt"># sabit frekans (userspace governor otomatik seçilir)</span>
+cpufreq-set -c 0 -f 900MHz
+
+<span class="cmt"># mevcut ayarları göster</span>
+cpufreq-info -c 0</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">İPUCU</div>
+    <p>Gömülü sistemlerde önyükleme sırasında governor ayarlamak için <code class="inline">/etc/default/cpufrequtils</code> dosyasına <code class="inline">GOVERNOR="schedutil"</code> yazabilir veya systemd service dosyasından <code class="inline">cpupower frequency-set -g schedutil</code> çalıştırabilirsin.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Energy-Aware Scheduling (EAS)</h2>
+  <p class="section-lead">Linux 5.0 ile kararlı hale gelen EAS, görevleri yalnızca boş CPU'ya değil, enerji maliyeti en düşük CPU'ya atayan bir scheduler özelliğidir. big.LITTLE mimarisinin gücünü tam olarak açığa çıkarır.</p>
+
+  <h3>EAS gereksinimleri</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">schedutil governor</div><div class="desc">EAS yalnızca schedutil ile çalışır. Başka bir governor seçilirse EAS devre dışı kalır.</div></div>
+    <div class="param"><div class="name">Energy Model (EM)</div><div class="desc">Her CPU kapasitesi için güç tüketimi bilgisi gerekir. DT veya driver üzerinden sağlanır.</div></div>
+    <div class="param"><div class="name">Capacity Awareness</div><div class="desc">Küçük (LITTLE) ve büyük (big) çekirdeklerin kapasitesi farklıdır. <code class="inline">cpu-capacity</code> DT özelliği veya cpufreq ile belirlenir.</div></div>
+    <div class="param"><div class="name">CONFIG_ENERGY_MODEL=y</div><div class="desc">Kernel config'de Energy Model subsystem etkin olmalı.</div></div>
+  </div>
+
+  <h3>Energy Model DT tanımı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts — Cortex-A55 + A76 (big.LITTLE)</span><span class="dot">●</span></div>
+    <pre><code>/* Cortex-A55 (LITTLE cluster) */
+cpu@0 {
+    compatible = "arm,cortex-a55";
+    capacity-dmips-mhz = &lt;406&gt;;    /* normalize kapasite */
+    dynamic-power-coefficient = &lt;100&gt;;
+};
+
+/* Cortex-A76 (big cluster) */
+cpu@4 {
+    compatible = "arm,cortex-a76";
+    capacity-dmips-mhz = &lt;1024&gt;;
+    dynamic-power-coefficient = &lt;530&gt;;
+};</code></pre>
+  </div>
+
+  <h3>EAS aktif mi kontrol et</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># EAS durumunu göster</span>
+cat /proc/sys/kernel/sched_energy_aware
+<span class="cmt"># 1 = aktif</span>
+
+<span class="cmt"># Energy Model var mı?</span>
+ls /sys/kernel/debug/energy_model/
+<span class="cmt"># cpu0  cpu4</span>
+
+cat /sys/kernel/debug/energy_model/cpu0/table
+<span class="cmt"># cap    freq     power</span>
+<span class="cmt">#  73   500000     50</span>
+<span class="cmt"># 146  1000000     90</span>
+<span class="cmt"># 219  1500000    145</span>
+
+<span class="cmt"># EAS'ı geçici olarak kapat</span>
+echo 0 > /proc/sys/kernel/sched_energy_aware</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">SONUÇ</div>
+    <p>EAS etkin bir big.LITTLE sistemde, hafif görevler LITTLE çekirdeklere atanır; ağır anlık görevler big çekirdeklere geçer. Bu mekanizma, aynı işi yaparken %20-40 daha az enerji tüketebilir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Boost ve turbo frekans</h2>
+  <p class="section-lead">Turbo/boost, kısa süreli anlık yükler için OPP tablosundaki maksimum frekansın üzerine çıkma yeteneğidir. Platform bağımlıdır; her mimaride farklı uygulanır.</p>
+
+  <h3>Generic boost (ARM / cpufreq-dt)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># boost durumunu göster</span>
+cat /sys/devices/system/cpu/cpufreq/boost
+<span class="cmt"># 1 = etkin</span>
+
+<span class="cmt"># boost'u devre dışı bırak</span>
+echo 0 > /sys/devices/system/cpu/cpufreq/boost
+
+<span class="cmt"># tekrar etkinleştir</span>
+echo 1 > /sys/devices/system/cpu/cpufreq/boost</code></pre>
+  </div>
+
+  <h3>Intel P-state</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Intel P-state sürücüsü ile turbo kontrolü</span>
+cat /sys/devices/system/cpu/intel_pstate/no_turbo
+<span class="cmt"># 0 = turbo etkin, 1 = kapalı</span>
+
+echo 1 > /sys/devices/system/cpu/intel_pstate/no_turbo
+
+<span class="cmt"># enerji/performans tercihi (EPP)</span>
+cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference
+<span class="cmt"># balance_performance</span>
+
+<span class="cmt"># mevcut seçenekler</span>
+cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_available_preferences
+<span class="cmt"># default performance balance_performance balance_power power</span>
+
+echo power > /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference</code></pre>
+  </div>
+
+  <h3>AMD P-state</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># AMD P-state modu (Linux 5.17+)</span>
+cat /sys/devices/system/cpu/amd_pstate/status
+<span class="cmt"># active  (passive veya guided olabilir)</span>
+
+<span class="cmt"># AMD P-state EPP (Linux 6.3+)</span>
+cat /sys/devices/system/cpu/cpu0/cpufreq/amd_pstate_epp
+<span class="cmt"># balance_performance</span></code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">GÖMÜLÜ SİSTEM NOTU</div>
+    <p>ARM tabanlı gömülü sistemlerde (Raspberry Pi, i.MX, RK3568 vb.) "turbo" kavramı OPP tablosundaki en yüksek OPP'yi ifade eder; ayrı bir turbo mekanizması yoktur. Termal throttling aktif olduğunda bu OPP otomatik olarak devre dışı kalır.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> cpupower araçları</h2>
+  <p class="section-lead">cpupower, cpufreq sysfs arayüzü için kapsamlı bir komut satırı aracıdır. Hem frekans yönetimi hem de güç tüketimi izleme özellikleri sunar.</p>
+
+  <h3>Kurulum ve temel kullanım</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Ubuntu/Debian</span>
+apt install linux-tools-$(uname -r) cpufrequtils
+
+<span class="cmt"># Fedora/RHEL</span>
+dnf install kernel-tools
+
+<span class="cmt"># tüm CPU'ların frekans bilgisi</span>
+cpupower frequency-info
+<span class="cmt"># analyzing CPU 0:
+#   driver: cpufreq-dt
+#   CPUs which run at the same hardware frequency: 0
+#   hardware limits: 600 MHz - 1.50 GHz
+#   available frequency steps:  600 MHz, 900 MHz, 1.20 GHz, 1.50 GHz
+#   available cpufreq governors: conservative ondemand userspace
+#                                powersave performance schedutil
+#   current policy: frequency should be within 600 MHz and 1.50 GHz.
+#                   The governor "schedutil" may decide which speed to use
+#   current CPU frequency: 900 MHz (asserted by call to hardware)</span></code></pre>
+  </div>
+
+  <h3>Frekans ayarlama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># governor değiştir (tüm CPU'lar)</span>
+cpupower frequency-set -g performance
+
+<span class="cmt"># maksimum frekansı sınırla</span>
+cpupower frequency-set -u 1.2GHz
+
+<span class="cmt"># minimum frekansı ayarla</span>
+cpupower frequency-set -d 900MHz
+
+<span class="cmt"># belirli CPU için</span>
+cpupower -c 2 frequency-set -g powersave</code></pre>
+  </div>
+
+  <h3>cpupower monitor — güç monitörleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># mevcut monitor'leri listele</span>
+cpupower monitor -l
+<span class="cmt"># Monitor "Mperf" (3 states) - Might overflow after 922000000 s
+# Monitor "Idle_Stats" (4 states)</span>
+
+<span class="cmt"># 5 saniye boyunca C-state ve frekans istatistiklerini göster</span>
+cpupower monitor -m Mperf,Idle_Stats sleep 5
+<span class="cmt">#               || Mperf                   || Idle_Stats
+# PKG |CORE|CPU || C0   | Cx   | Freq  ||POLL | C1   | C2
+#   0 |  0 |  0 ||  2.3 | 97.7 |  1024 ||   0 |  1.2 | 96.5</span>
+
+<span class="cmt"># powertop entegrasyonu</span>
+powertop --auto-tune   <span class="cmt"># mevcut tüm güç tasarruf özelliklerini etkinleştir</span>
+powertop --csv=report.csv --time=60  <span class="cmt"># 60s raporla</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">İPUCU</div>
+    <p><code class="inline">cpupower monitor</code> çıktısında <strong>C0</strong> CPU'nun aktif olduğu zaman yüzdesi, <strong>Cx</strong> ise uyku halinde geçirdiği süredir. İyi optimize edilmiş gömülü bir sistemde boşta C0 &lt; %5 olmalıdır.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Kernel config ve Device Tree</h2>
+  <p class="section-lead">cpufreq için doğru kernel konfigürasyonu platform bağımlıdır. Genellikle bir cpufreq driver, bir veya birden fazla governor ve clock/regulator bağlantıları gerekir.</p>
+
+  <h3>Temel kernel config seçenekleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig</span><span class="dot">●</span></div>
+    <pre><code>CONFIG_CPU_FREQ=y
+CONFIG_CPU_FREQ_STAT=y             <span class="cmt"># sysfs istatistik dosyaları</span>
+CONFIG_CPU_FREQ_GOV_PERFORMANCE=y
+CONFIG_CPU_FREQ_GOV_POWERSAVE=y
+CONFIG_CPU_FREQ_GOV_ONDEMAND=y
+CONFIG_CPU_FREQ_GOV_CONSERVATIVE=y
+CONFIG_CPU_FREQ_GOV_USERSPACE=y
+CONFIG_CPU_FREQ_GOV_SCHEDUTIL=y    <span class="cmt"># önerilir</span>
+CONFIG_CPU_FREQ_DEFAULT_GOV_SCHEDUTIL=y
+
+<span class="cmt"># Platform driver (ARM/DT tabanlı)</span>
+CONFIG_CPUFREQ_DT=y                <span class="cmt"># generic DT-based driver</span>
+CONFIG_CPUFREQ_DT_PLATDEV=y
+
+<span class="cmt"># ARM big.LITTLE</span>
+CONFIG_ARM_BIG_LITTLE_CPUFREQ=y
+
+<span class="cmt"># Energy Model</span>
+CONFIG_ENERGY_MODEL=y</code></pre>
+  </div>
+
+  <h3>Platform driver ile clock ve regulator bağlantısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts — tam CPU node örneği</span><span class="dot">●</span></div>
+    <pre><code>cpus {
+    #address-cells = &lt;1&gt;;
+    #size-cells = &lt;0&gt;;
+
+    cpu0: cpu@0 {
+        device_type = "cpu";
+        compatible = "arm,cortex-a53";
+        reg = &lt;0&gt;;
+        enable-method = "psci";
+        operating-points-v2 = &lt;&amp;cpu_opp_table&gt;;
+        clocks = &lt;&amp;ccu CLK_CPU&gt;;       /* clock provider */
+        clock-names = "cpu";
+        cpu-supply = &lt;&amp;reg_vdd_cpu&gt;;   /* regulator consumer */
+        #cooling-cells = &lt;2&gt;;           /* thermal cooling */
+    };
+};
+
+/* PMIC regulator tanımı */
+&amp;axp209 {
+    regulators {
+        reg_vdd_cpu: dcdc2 {
+            regulator-name = "vdd-cpu";
+            regulator-min-microvolt = &lt;700000&gt;;
+            regulator-max-microvolt = &lt;1300000&gt;;
+            regulator-always-on;
+        };
+    };
+};</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">PLATFORM DRIVER SEÇİMİ</div>
+    <p>DT tabanlı ARM SoC'lar için <code class="inline">cpufreq-dt</code> driver çoğunlukla yeterlidir. SoC'a özgü özellikler (örn. Rockchip pvtm, i.MX8 scaling) için platform-specific driver'lar gerekebilir — BSP kaynaklarını kontrol et.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: RPi4 thermal throttling · BeagleBone schedutil · INA219</h2>
+  <p class="section-lead">Üç gerçek senaryo: Raspberry Pi 4'te termal kaynaklı throttling'i analiz etmek, BeagleBone Black'te schedutil governor ayarı yapmak ve INA219 ile gerçek güç tüketimini ölçmek.</p>
+
+  <h3>1 — Raspberry Pi 4 Thermal Throttling İnceleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Raspberry Pi 4</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># throttling durumunu oku (vcgencmd)</span>
+vcgencmd get_throttled
+<span class="cmt"># throttled=0x0        → normal
+# throttled=0x50000   → throttling oluştu (geçmişte)
+# throttled=0x50005   → şu an throttling aktif!</span>
+
+<span class="cmt"># bit maskeleri:
+# bit 0: under-voltage
+# bit 1: arm freq capped
+# bit 2: currently throttled
+# bit 16-18: yukarıdakilerin geçmişte oluşup oluşmadığı</span>
+
+<span class="cmt"># sıcaklık ve frekansı aynı anda izle</span>
+while true; do
+    temp=$(vcgencmd measure_temp | cut -d= -f2)
+    freq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq)
+    throttle=$(vcgencmd get_throttled)
+    echo "$(date +%T) | $temp | ${freq}kHz | $throttle"
+    sleep 1
+done
+
+<span class="cmt"># CPU'yu yükle ve throttling'i tetikle</span>
+stress-ng --cpu 4 --timeout 60s &amp;
+
+<span class="cmt"># throttling eşiği: RPi4 85°C üzerinde frekansı 1500→600 MHz'e düşürür</span>
+<span class="cmt"># soğutucu takarak veya frekansı sınırlayarak önle</span>
+echo 1200000 > /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq</code></pre>
+  </div>
+
+  <h3>2 — BeagleBone Black schedutil ayarı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — BeagleBone Black (AM335x)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># mevcut governor ve OPP'leri gör</span>
+cpufreq-info
+<span class="cmt"># available frequency steps: 300 MHz, 600 MHz, 720 MHz, 800 MHz, 1000 MHz</span>
+
+<span class="cmt"># schedutil'e geç (TPS65217 regulator otomatik voltaj ayarı yapar)</span>
+cpupower frequency-set -g schedutil
+
+<span class="cmt"># schedutil rate_limit_us ayarı (gömülü için 4ms önerilir)</span>
+echo 4000 > /sys/devices/system/cpu/cpufreq/schedutil/rate_limit_us
+
+<span class="cmt"># boşta ve yük altındaki frekansı karşılaştır</span>
+watch -n0.5 'cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq'
+
+<span class="cmt"># systemd service ile kalıcı hale getir</span>
+cat /etc/systemd/system/cpufreq.service</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>systemd — cpufreq.service</span><span class="dot">●</span></div>
+    <pre><code>[Unit]
+Description=Set cpufreq governor
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/cpupower frequency-set -g schedutil
+ExecStart=/bin/sh -c 'echo 4000 > /sys/devices/system/cpu/cpufreq/schedutil/rate_limit_us'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+  </div>
+
+  <h3>3 — INA219 ile Gerçek Güç Tüketimi Ölçümü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>python3 — INA219 güç ölçümü</span><span class="dot">●</span></div>
+    <pre><code>#!/usr/bin/env python3
+"""
+INA219 I2C güç sensörü ile CPU governor karşılaştırması.
+Devre: INA219 0.1Ω shunt, 0x40 adresi, I2C bus 1
+Pip: pip3 install pi-ina219
+"""
+import time, subprocess
+from ina219 import INA219, DeviceRangeError
+
+SHUNT_OHMS = 0.1
+ina = INA219(SHUNT_OHMS, address=0x40)
+ina.configure()
+
+def set_governor(gov):
+    subprocess.run(["cpupower", "frequency-set", "-g", gov],
+                   capture_output=True)
+    time.sleep(0.5)
+
+def measure(duration=10, label=""):
+    samples = []
+    t_end = time.time() + duration
+    while time.time() &lt; t_end:
+        try:
+            power_mw = ina.power()
+            voltage  = ina.voltage()
+            samples.append(power_mw)
+        except DeviceRangeError:
+            pass
+        time.sleep(0.1)
+    avg = sum(samples) / len(samples) if samples else 0
+    print(f"[{label:15s}] Ortalama güç: {avg:6.1f} mW  "
+          f"(n={len(samples)})")
+    return avg
+
+print("=== Governor Güç Karşılaştırması ===")
+for gov in ["powersave", "schedutil", "ondemand", "performance"]:
+    set_governor(gov)
+    # boşta ölç
+    idle  = measure(10, f"{gov}/idle")
+    # yük altında ölç
+    load  = subprocess.Popen(["stress-ng", "--cpu", "1"])
+    time.sleep(1)
+    under = measure(10, f"{gov}/load")
+    load.terminate()
+    print(f"  Tasarruf vs performance: {(1 - idle/under)*100:.1f}%")
+    print()</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">BEKLENEN SONUÇLAR</div>
+    <p>Tipik BeagleBone Black üzerinde: <strong>powersave</strong> boşta ~180 mW, <strong>performance</strong> yük altında ~750 mW. schedutil bu iki uç arasında dinamik kalır ve gereksiz yükte bile performans governor'ından ~%25 daha az güç tüketir.</p>
+  </div>
+
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

@@ -1,0 +1,574 @@
+---
+layout: tutorial
+title: "OverlayFS &amp; SquashFS — Üretim Rootfs Tasarımı"
+back_url: "../index.html"
+back_label: "embedded-deck"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>OVERLAYFS</span>
+    <span>2026</span>
+  </div>
+  <h1>OverlayFS &amp; SquashFS<br><em>Üretim Rootfs Tasarımı.</em></h1>
+  <p class="subtitle">Read-only SquashFS tabanlı rootfs üzerine OverlayFS katmanı kurarak fabrika sıfırlama, flash ömrü uzatma ve atom güncelleme desteği sağlayan üretim kalitesi gömülü Linux dosya sistemi mimarisi.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Neden read-only rootfs?</a></li>
+    <li><a href="#s1">SquashFS oluşturma</a></li>
+    <li><a href="#s2">OverlayFS mimarisi</a></li>
+    <li><a href="#s3">Katmanlı rootfs tasarımı</a></li>
+    <li><a href="#s4">Factory reset implementasyonu</a></li>
+    <li><a href="#s5">OverlayFS + Buildroot</a></li>
+    <li><a href="#s6">OverlayFS + Yocto</a></li>
+    <li><a href="#s7">Persistent partition stratejisi</a></li>
+    <li><a href="#s8">Pratik: Raspberry Pi ro-rootfs + overlay + factory reset</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Neden read-only rootfs?</h2>
+  <p class="section-lead">Güç kaybı, medya bozulması ve olası güvenlik açıklarına karşı en etkili savunma, kök dosya sistemini salt okunur (read-only) olarak bağlamaktır.</p>
+
+  <h3>Üretim cihazlarında karşılaşılan sorunlar</h3>
+  <p>Saha koşullarında çalışan gömülü cihazların karşılaştığı en yaygın arıza senaryosu güç kesilmesidir. NAND flash veya eMMC üzerinde anlık güç kesilmesi, bağlı bir ext4 veya JFFS2 dosya sisteminde yarım kalmış yazma işlemlerinin yarattığı tutarsız bloklar nedeniyle sistemin bir daha açılmamasına yol açar. Bu durumda saha teknisyeninin cihazı geri getirmesi ya da fabrikaya iade maliyeti çıkar.</p>
+  <p>Rootfs'i read-only tutmanın ikinci büyük faydası flash ömrüdür. NAND flash hücrelerinin sınırlı sayıda yazma/silme döngüsü vardır; rootfs read-only olduğunda bu hücreler ömür boyunca hiç yıpranmaz. Tüm runtime yazmaları tmpfs veya ayrı bir data bölümüne yönlenir.</p>
+
+  <h3>Sağladığı üretim gereksinimleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">Güç kesilmesi dayanıklılığı</span><span class="desc">SquashFS salt okunur — yarım yazma olmaz, fsck gerekmez, sistem her zaman tutarlı önyüklenir</span></div>
+    <div class="param"><span class="name">Fabrika sıfırlama</span><span class="desc">Kullanıcı verisi yalnızca upperdir'de; silmek = fabrika durumuna dönmek</span></div>
+    <div class="param"><span class="name">Güvenlik</span><span class="desc">Saldırgan rootfs'e yazamaz — zararlı yazılım kalıcı olamaz, read-only remount koruması</span></div>
+    <div class="param"><span class="name">Flash ömrü</span><span class="desc">Rootfs bölümüne sıfır yazma — wear leveling yükü yalnızca data bölümünde</span></div>
+    <div class="param"><span class="name">Atomik güncelleme</span><span class="desc">A/B bölüm düzeninde yeni squashfs imajı yazar, pointer değiştir — rollback trivial</span></div>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Read-only rootfs yaklaşımı Android'in system partition tasarımıyla aynı prensipleri paylaşır. Android 10'dan itibaren <code>/system</code> ve <code>/vendor</code> bölümleri SquashFS üzerinde salt okunur bağlanır; çalışma zamanı değişiklikleri overlay veya tmpfs katmanına yazılır.</p>
+  </div>
+
+  <h3>Mimari karar ağacı</h3>
+  <div class="flow">
+    <pre>
+Cihazda flash ömrü kritik mi?
+        |
+       EVET
+        |
+   ro-rootfs kullan
+        |
+   +----+-----+
+   |          |
+tmpfs upper  ext4/f2fs data bölümü
+(reboot'ta   (persist edilmesi
+ sıfırlanır)  gereken veriler)
+    </pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> SquashFS oluşturma</h2>
+  <p class="section-lead">SquashFS; sıkıştırılmış, salt okunur, yüksek sıkıştırma oranlı bir Linux dosya sistemidir. Rootfs imajı bir kez oluşturulur, hiçbir zaman değiştirilmez.</p>
+
+  <h3>mksquashfs temel kullanımı</h3>
+  <pre><code class="language-bash"># Bir dizinden squashfs imajı oluştur
+mksquashfs rootfs_dir/ rootfs.squashfs \
+    -comp zstd \
+    -Xcompression-level 15 \
+    -noappend \
+    -no-progress \
+    -e proc sys dev run tmp
+
+# Oluşturulan imajı incele
+unsquashfs -s rootfs.squashfs
+# Çıktı: block_size 131072, inodes 1234, ...
+
+# İmajı geçici olarak bağla (loop device)
+mkdir -p /mnt/squash
+mount -t squashfs -o loop rootfs.squashfs /mnt/squash</code></pre>
+
+  <h3>Sıkıştırma algoritması seçimi</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Algoritma</th><th>Sıkıştırma Hızı</th><th>Açma Hızı</th><th>Oran</th><th>Kullanım Senaryosu</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>lz4</td><td>Çok hızlı</td><td>En hızlı</td><td>Düşük</td><td>RAM kısıtlı, hızlı boot</td></tr>
+        <tr><td>lzo</td><td>Hızlı</td><td>Hızlı</td><td>Orta</td><td>Dengeli gömülü sistemler</td></tr>
+        <tr><td>zstd</td><td>Orta</td><td>Hızlı</td><td>İyi</td><td>Modern önerilen seçim</td></tr>
+        <tr><td>gzip</td><td>Yavaş</td><td>Orta</td><td>İyi</td><td>Eski sistemler, uyumluluk</td></tr>
+        <tr><td>xz</td><td>Çok yavaş</td><td>Yavaş</td><td>En iyi</td><td>Depolama kritik, NOR flash</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Blok boyutu ve performans</h3>
+  <p>SquashFS varsayılan blok boyutu 128 KB'dir. Küçük blok boyutu (4 KB, 8 KB) rastgele erişim performansını artırır ancak sıkıştırma oranını düşürür. Büyük blok boyutu (256 KB, 1 MB) daha iyi sıkıştırma sağlar ancak tek bir küçük dosyaya erişmek için daha fazla veri sıkıştırması çözülür.</p>
+
+  <pre><code class="language-bash"># Blok boyutu karşılaştırma
+mksquashfs rootfs/ out-4k.squashfs   -comp zstd -b 4096
+mksquashfs rootfs/ out-128k.squashfs -comp zstd -b 131072
+mksquashfs rootfs/ out-1m.squashfs   -comp zstd -b 1048576
+
+ls -lh out-*.squashfs
+# out-4k.squashfs:   45M
+# out-128k.squashfs: 32M
+# out-1m.squashfs:   29M</code></pre>
+
+  <div class="callout">
+    <div class="label">İPUCU</div>
+    <p>Gömülü sistemlerde <code>zstd -Xcompression-level 3</code> ile hızlı build ve iyi oran dengesi kurulur. Nihai üretim imajı için seviye 15-19 kullanarak maksimum küçültme elde edilir; build süresi uzasa da bu işlem CI'da yapılır.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> OverlayFS mimarisi</h2>
+  <p class="section-lead">OverlayFS, Linux çekirdeğine 3.18 sürümünde dahil olan ve birden fazla dizini tek bir birleşik görünüme bindiren katmanlı bir dosya sistemidir.</p>
+
+  <h3>Temel kavramlar</h3>
+  <div class="params">
+    <div class="param"><span class="name">lowerdir</span><span class="desc">Salt okunur alt katman — squashfs veya herhangi bir ro dosya sistemi. Değiştirilemez</span></div>
+    <div class="param"><span class="name">upperdir</span><span class="desc">Yazılabilir üst katman — tmpfs veya ext4. Tüm yazma işlemleri buraya gider</span></div>
+    <div class="param"><span class="name">workdir</span><span class="desc">OverlayFS'in iç kullanımı için boş çalışma dizini — upperdir ile aynı dosya sistemi üzerinde olmalı</span></div>
+    <div class="param"><span class="name">merged</span><span class="desc">Kullanıcıya sunulan birleşik görünüm — upper + lower'ın üst üste bindirilmiş hali</span></div>
+  </div>
+
+  <div class="flow">
+    <pre>
+┌─────────────────────────────┐
+│        merged (görünen)     │  ← kullanıcı bu katmanı görür
+│  /etc/passwd  /bin/bash     │
+│  /etc/hosts   /usr/lib/...  │
+└─────────┬───────────────────┘
+          │ overlay birleştirme
+    ┌─────┴─────┐
+    │           │
+┌───▼───┐   ┌──▼────┐
+│ upper │   │ lower │
+│(tmpfs)│   │(sqsh) │
+│/etc/  │   │/etc/  │
+│ hosts │   │ hosts │← upper'da varsa o gösterilir
+│       │   │passwd │← sadece lower'da varsa lower gösterilir
+└───────┘   └───────┘
+    </pre>
+  </div>
+
+  <h3>Kernel mount komutu</h3>
+  <pre><code class="language-bash">mount -t overlay overlay \
+    -o lowerdir=/mnt/lower,\
+       upperdir=/mnt/upper,\
+       workdir=/mnt/work \
+    /mnt/merged</code></pre>
+
+  <h3>Whiteout ve opaque</h3>
+  <p>Bir dosya lower katmanda var olup upper katmanda silindiğinde, OverlayFS upper'a o dosyanın adında bir <em>whiteout</em> dosyası (karakter cihazı 0:0) oluşturur. Bir dizin lower'dan gelen dizinin yerine tamamen yenisiyle değiştirildiğinde ise upper'a <em>opaque</em> xattr (<code>trusted.overlay.opaque=y</code>) yazılır.</p>
+
+  <pre><code class="language-bash"># Whiteout dosyasını incele
+ls -la /mnt/upper/etc/
+# c---------. 1 root root 0, 0 silinen_dosya  ← whiteout
+
+# Opaque dizin xattr'ı
+getfattr -n trusted.overlay.opaque /mnt/upper/etc/replaced_dir/
+# trusted.overlay.opaque="y"</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Katmanlı rootfs tasarımı</h2>
+  <p class="section-lead">Üretim kalitesi bir ro-rootfs tasarımında squashfs alt katman, tmpfs veya kalıcı bölüm üst katman olarak birleştirilir.</p>
+
+  <h3>Senaryo 1: tmpfs upper (volatile)</h3>
+  <p>Reboot sonrası tüm değişiklikler kaybolur. Kiosk, endüstriyel kontrol, güvenlik kamerası gibi cihazlar için idealdir.</p>
+  <pre><code class="language-bash">#!/bin/sh
+# /etc/init.d/overlay-mount veya initramfs init
+
+SQUASHFS=/dev/mmcblk0p2
+LOWER=/mnt/lower
+UPPER=/mnt/upper
+WORK=/mnt/work
+MERGED=/
+
+# squashfs'i bağla
+mkdir -p $LOWER
+mount -t squashfs -o ro $SQUASHFS $LOWER
+
+# tmpfs upper/work hazırla
+mount -t tmpfs tmpfs /mnt/rw
+mkdir -p /mnt/rw/upper /mnt/rw/work
+
+# overlay bağla
+mount -t overlay overlay \
+    -o lowerdir=$LOWER,upperdir=/mnt/rw/upper,workdir=/mnt/rw/work \
+    $MERGED</code></pre>
+
+  <h3>Senaryo 2: ext4 upper (persistent)</h3>
+  <p>Değişiklikler yeniden başlatma sonrası korunur. Yapılandırma dosyaları, log, veritabanı gibi kalıcı veriler için gereklidir. Factory reset, ext4 bölümünü formatlamak kadar basittir.</p>
+  <pre><code class="language-bash">DATA_PART=/dev/mmcblk0p3
+DATA_MNT=/mnt/data
+
+# Veri bölümünü bağla
+mount -t ext4 -o noatime,nodiratime $DATA_PART $DATA_MNT
+
+# upper ve work dizinleri veri bölümü altında
+UPPER=$DATA_MNT/overlay/upper
+WORK=$DATA_MNT/overlay/work
+mkdir -p $UPPER $WORK
+
+mount -t overlay overlay \
+    -o lowerdir=$LOWER,upperdir=$UPPER,workdir=$WORK \
+    /</code></pre>
+
+  <div class="callout">
+    <div class="label">DİKKAT</div>
+    <p><code>workdir</code> ve <code>upperdir</code> kesinlikle aynı dosya sistemi üzerinde olmalıdır. Farklı bölümlere yerleştirilirse <code>mount: invalid argument</code> hatasıyla karşılaşılır. Her ikisi de aynı ext4 veya tmpfs bölümü altındaki alt dizinler olmalıdır.</p>
+  </div>
+
+  <h3>Çoklu lowerdir (birden fazla katman)</h3>
+  <p>OverlayFS, Linux 4.0'dan itibaren birden fazla salt okunur alt katmanı destekler. Bu özellik OTA güncellemelerinde delta katmanı eklemek için kullanılır:</p>
+  <pre><code class="language-bash"># lower1 = base rootfs, lower2 = uygulama katmanı
+mount -t overlay overlay \
+    -o lowerdir=/mnt/app:/mnt/base,\
+       upperdir=/mnt/rw/upper,\
+       workdir=/mnt/rw/work \
+    /mnt/merged
+# Öncelik: /mnt/app > /mnt/base (soldan sağa)</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Factory reset implementasyonu</h2>
+  <p class="section-lead">Factory reset, upperdir'in tüm içeriğini silmek ve cihazı yeniden başlatmaktan ibarettir. Donanım reset butonu veya yazılım tetikleyicisiyle entegre edilir.</p>
+
+  <h3>systemd reset service</h3>
+  <pre><code class="language-bash"># /usr/lib/systemd/system/factory-reset.service
+[Unit]
+Description=Factory Reset Service
+After=umount.target
+DefaultDependencies=no
+Before=shutdown.target reboot.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/do-factory-reset.sh
+StandardOutput=journal
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+
+  <pre><code class="language-bash">#!/bin/bash
+# /usr/sbin/do-factory-reset.sh
+set -e
+
+DATA_PART=/dev/mmcblk0p3
+DATA_MNT=/mnt/data_reset
+
+echo "Factory reset başlatılıyor..."
+
+# Geçici bağlama noktası
+mkdir -p $DATA_MNT
+mount -t ext4 $DATA_PART $DATA_MNT
+
+# Overlay dizinini sil
+rm -rf $DATA_MNT/overlay/upper
+rm -rf $DATA_MNT/overlay/work
+
+# Temiz dizinleri yeniden oluştur
+mkdir -p $DATA_MNT/overlay/upper $DATA_MNT/overlay/work
+
+umount $DATA_MNT
+echo "Factory reset tamamlandı. Yeniden başlatılıyor..."
+
+# Yeniden başlat
+systemctl reboot</code></pre>
+
+  <h3>Donanım reset butonu (GPIO)</h3>
+  <pre><code class="language-bash">#!/bin/bash
+# /usr/sbin/reset-button-monitor.sh
+# GPIO 17 = reset butonu (active-low)
+
+GPIO_NUM=17
+HOLD_SECONDS=5
+
+echo $GPIO_NUM > /sys/class/gpio/export
+echo "in" > /sys/class/gpio/gpio${GPIO_NUM}/direction
+
+while true; do
+    STATE=$(cat /sys/class/gpio/gpio${GPIO_NUM}/value)
+    if [ "$STATE" = "0" ]; then
+        # Buton basılı — sayaç başlat
+        COUNT=0
+        while [ "$STATE" = "0" ] && [ $COUNT -lt $HOLD_SECONDS ]; do
+            sleep 1
+            COUNT=$((COUNT + 1))
+            STATE=$(cat /sys/class/gpio/gpio${GPIO_NUM}/value)
+        done
+        if [ $COUNT -ge $HOLD_SECONDS ]; then
+            systemctl start factory-reset.service
+        fi
+    fi
+    sleep 0.2
+done</code></pre>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Üretim sistemlerinde GPIO izleme için <code>gpiod</code> (libgpiod) kullanımı önerilir. Eski <code>sysfs</code> GPIO arayüzü çekirdek 5.x'te deprecated sayılmaktadır. <code>gpioget</code> ve <code>gpiomon</code> araçları daha güvenilir edge detection sağlar.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> OverlayFS + Buildroot</h2>
+  <p class="section-lead">Buildroot ile squashfs + overlay rootfs imajı oluşturmak için birkaç yapılandırma değişikliği ve board özelleştirme scripti yeterlidir.</p>
+
+  <h3>Buildroot menuconfig ayarları</h3>
+  <pre><code class="language-bash"># make menuconfig ile aşağıdaki seçenekleri etkinleştir:
+
+# Filesystem Images:
+BR2_TARGET_ROOTFS_SQUASHFS=y
+BR2_TARGET_ROOTFS_SQUASHFS_LZMA=n
+BR2_TARGET_ROOTFS_SQUASHFS_LZ4=n
+BR2_TARGET_ROOTFS_SQUASHFS_ZSTD=y
+
+# Overlay filesystem support (package):
+BR2_PACKAGE_UTIL_LINUX=y          # mount komutu için
+BR2_LINUX_KERNEL_NEEDS_HOST_LIBELF=y</code></pre>
+
+  <h3>Kernel konfigürasyonu</h3>
+  <pre><code class="language-bash"># Linux kernel .config içinde gerekli seçenekler:
+CONFIG_OVERLAY_FS=y               # ya da =m (modül olarak)
+CONFIG_SQUASHFS=y
+CONFIG_SQUASHFS_ZSTD=y
+CONFIG_SQUASHFS_XZ=y
+CONFIG_TMPFS=y
+CONFIG_TMPFS_POSIX_ACL=y</code></pre>
+
+  <h3>post-build.sh ile init script ekleme</h3>
+  <pre><code class="language-bash">#!/bin/bash
+# board/myboard/post-build.sh
+# Buildroot bu scripti rootfs finalize'dan önce çalıştırır
+
+TARGET_DIR=$1
+
+# Overlay mount init scriptini kopyala
+install -m 755 board/myboard/overlay/etc/init.d/S01overlay \
+    $TARGET_DIR/etc/init.d/S01overlay
+
+# Readonly fstab oluştur
+cat > $TARGET_DIR/etc/fstab << 'EOF'
+/dev/mmcblk0p2  /mnt/lower  squashfs  ro,noatime           0 0
+tmpfs           /mnt/rw     tmpfs     size=64m,mode=755    0 0
+overlay         /           overlay   lowerdir=/mnt/lower,upperdir=/mnt/rw/upper,workdir=/mnt/rw/work  0 0
+EOF</code></pre>
+
+  <h3>Buildroot imaj düzeni</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Bölüm</th><th>İçerik</th><th>Dosya Sistemi</th><th>Erişim</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>mmcblk0p1</td><td>Bootloader (U-Boot), DTB, kernel</td><td>FAT32/raw</td><td>R/W (boot)</td></tr>
+        <tr><td>mmcblk0p2</td><td>rootfs.squashfs</td><td>SquashFS</td><td>Read-only</td></tr>
+        <tr><td>mmcblk0p3</td><td>overlay upper/work + user data</td><td>ext4</td><td>R/W</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> OverlayFS + Yocto</h2>
+  <p class="section-lead">Yocto, <code>overlayfs-etc.bbclass</code> ve <code>IMAGE_FSTYPES</code> mekanizmalarıyla squashfs + overlay kurulumunu resmi olarak destekler.</p>
+
+  <h3>local.conf / image recipe ayarları</h3>
+  <pre><code class="language-bash"># conf/local.conf veya image recipe'si içinde:
+IMAGE_FSTYPES += "squashfs"
+IMAGE_FSTYPES:append = " squashfs-zst"
+
+# squashfs sıkıştırma seçenekleri
+EXTRA_IMAGECMD:squashfs = "-comp zstd -Xcompression-level 15 -b 131072"</code></pre>
+
+  <h3>overlayfs-etc.bbclass kullanımı</h3>
+  <pre><code class="language-bash"># image recipe'sine inherit et:
+# recipes-core/images/my-image.bb
+inherit overlayfs-etc
+
+# /etc dizinini overlay ile yönet:
+OVERLAYFS_ETC_MOUNT_POINT = "/data"
+OVERLAYFS_ETC_DEVICE       = "/dev/mmcblk0p3"
+OVERLAYFS_ETC_FSTYPE        = "ext4"
+OVERLAYFS_ETC_MOUNT_OPTIONS = "defaults,noatime"</code></pre>
+
+  <p>Bu bbclass, <code>/etc</code> dizinini alt katman ve <code>/data/overlay-etc</code> üst katman olarak otomatik olarak yönetir. Systemd mount unit'leri ve mount-overlay.service dosyaları otomatik üretilir.</p>
+
+  <h3>Kalıcılık (persistency) stratejisi</h3>
+  <pre><code class="language-bash"># recipes-core/images/my-image.bb
+# Hangi dizinlerin kalıcı olduğunu belirt:
+OVERLAYFS_MOUNT_POINT[data] = "/data"
+OVERLAYFS_WRITABLE_PATHS[data] = " \
+    /etc/network/interfaces \
+    /var/lib/dhcp \
+    /home \
+"</code></pre>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Yocto Kirkstone (4.0) ve sonrasında <code>overlayfs.bbclass</code> geliştirilmiş ve <code>OVERLAYFS_QA_SKIP</code> değişkeni ile lint kontrolleri atlanabilir hale getirilmiştir. Dunfell (3.1) kullanıyorsanız bbclass'ı meta-layer'ınıza elle kopyalamanız gerekebilir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Persistent partition stratejisi</h2>
+  <p class="section-lead">Kalıcı veri bölümü tasarımı, hangi dizinlerin reboot'a karşı dayanıklı olması gerektiğine dair bilinçli kararlar gerektirir.</p>
+
+  <h3>Dizin kategorileri</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Dizin</th><th>İçerik</th><th>Strateji</th><th>Neden</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>/etc</td><td>Sistem yapılandırması</td><td>Overlay upper</td><td>Fabrika reset'te sıfırlanabilmeli</td></tr>
+        <tr><td>/var/log</td><td>Sistem logları</td><td>tmpfs veya ayrı bölüm</td><td>Flash yıpranmasını önle</td></tr>
+        <tr><td>/var/lib</td><td>Uygulama durumu</td><td>Bind mount — data bölümü</td><td>Reboot'ta korunmalı</td></tr>
+        <tr><td>/home</td><td>Kullanıcı verileri</td><td>Bind mount — data bölümü</td><td>Reboot'ta korunmalı</td></tr>
+        <tr><td>/tmp</td><td>Geçici dosyalar</td><td>tmpfs</td><td>RAM'da, flash'a yazma yok</td></tr>
+        <tr><td>/run</td><td>Runtime PID, socket</td><td>tmpfs (otomatik)</td><td>systemd tarafından yönetilir</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>fstab ile bind mount kurulumu</h3>
+  <pre><code class="language-bash"># /etc/fstab — persistent bölüm bind mount'ları
+/dev/mmcblk0p3  /data          ext4    defaults,noatime  0 2
+
+# data bölümü altındaki dizinleri bind mount et
+/data/var/lib   /var/lib       none    bind              0 0
+/data/home      /home          none    bind              0 0
+
+# Log'ları tmpfs'e yönlendir (flash ömrü)
+tmpfs           /var/log       tmpfs   size=32m,nosuid,nodev  0 0
+tmpfs           /tmp           tmpfs   size=64m,nosuid,nodev  0 0</code></pre>
+
+  <h3>İlk açılışta data bölümü init</h3>
+  <pre><code class="language-bash">#!/bin/sh
+# /etc/init.d/S02data-init
+
+DATA=/data
+DIRS="var/lib var/lib/dhcp home"
+
+# İlk boot: dizinleri oluştur
+for dir in $DIRS; do
+    if [ ! -d "$DATA/$dir" ]; then
+        mkdir -p "$DATA/$dir"
+        # Squashfs'teki varsayılan içeriği kopyala
+        if [ -d "/mnt/lower/$dir" ]; then
+            cp -a "/mnt/lower/$dir/." "$DATA/$dir/"
+        fi
+    fi
+done</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: Raspberry Pi'da ro-rootfs + overlay + factory reset</h2>
+  <p class="section-lead">Raspberry Pi 4 üzerinde squashfs tabanlı read-only rootfs, tmpfs overlay ve GPIO reset butonu ile eksiksiz bir uygulama.</p>
+
+  <h3>Adım 1: Mevcut rootfs'ten squashfs oluşturma</h3>
+  <pre><code class="language-bash"># Pi üzerinde veya SD kart PC'ye takılıyken:
+# /proc /sys /dev /run /tmp dışarıda bırak
+mksquashfs /mnt/pi_root rootfs.squashfs \
+    -comp zstd \
+    -Xcompression-level 10 \
+    -noappend \
+    -e proc -e sys -e dev -e run -e tmp \
+    -e mnt -e media
+
+# SD karta yaz (mmcblk0p2 = rootfs bölümü)
+dd if=rootfs.squashfs of=/dev/mmcblk0p2 bs=4M status=progress</code></pre>
+
+  <h3>Adım 2: initramfs ile overlay kurulumu</h3>
+  <pre><code class="language-bash">#!/bin/sh
+# /etc/initramfs-tools/scripts/overlay (Raspberry Pi OS)
+# veya /init (özel initramfs)
+
+prereqs() { echo ""; }
+case $1 in prereqs) prereqs; exit 0 ;; esac
+
+. /scripts/functions
+
+LOWER=/mnt/lower
+RW=/mnt/rw
+
+# squashfs bölümünü bağla
+mkdir -p $LOWER
+mount -t squashfs -o ro ${ROOT} $LOWER
+
+# tmpfs üst katmanı hazırla
+mount -t tmpfs -o size=128m tmpfs $RW
+mkdir -p $RW/upper $RW/work
+
+# overlay'i gerçek rootfs'e bağla
+mount -t overlay overlay \
+    -o lowerdir=$LOWER,upperdir=$RW/upper,workdir=$RW/work \
+    ${rootmnt}
+
+# Çalışma anı pseudo-fs bağlama noktaları oluştur
+mkdir -p ${rootmnt}/mnt/lower ${rootmnt}/mnt/rw
+mount --move $LOWER ${rootmnt}/mnt/lower
+mount --move $RW    ${rootmnt}/mnt/rw</code></pre>
+
+  <h3>Adım 3: cmdline.txt güncellemesi</h3>
+  <pre><code class="language-bash"># /boot/cmdline.txt
+console=serial0,115200 console=tty1 \
+root=/dev/mmcblk0p2 rootfstype=squashfs \
+ro quiet init=/sbin/overlay-init</code></pre>
+
+  <h3>Adım 4: Factory reset servisi kurulumu</h3>
+  <pre><code class="language-bash">cat > /etc/systemd/system/factory-reset.service << 'EOF'
+[Unit]
+Description=Factory Reset — tüm overlay değişikliklerini sil
+DefaultDependencies=no
+After=umount.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'rm -rf /mnt/rw/upper/* /mnt/rw/upper/.[^.]*'
+ExecStartPost=/bin/systemctl reboot
+EOF
+
+systemctl daemon-reload</code></pre>
+
+  <h3>Adım 5: Doğrulama</h3>
+  <pre><code class="language-bash"># Rootfs'in read-only bağlandığını doğrula
+mount | grep " / "
+# overlay on / type overlay (rw,lowerdir=/mnt/lower,upperdir=...)
+
+# Değişiklik yap ve reboot sonrası kaybolduğunu gör
+echo "test" > /tmp/kalici_mi
+cat /tmp/kalici_mi  # "test" gösterir
+reboot
+cat /tmp/kalici_mi  # Dosya yok — overlay temizlendi
+
+# squashfs boyutu ve içeriği
+df -h /mnt/lower
+ls /mnt/lower/etc/</code></pre>
+
+  <div class="callout">
+    <div class="label">ÖZET</div>
+    <p>Read-only squashfs + OverlayFS kombinasyonu, gömülü Linux üretim cihazlarında güç kesilmesi dayanıklılığı, fabrika sıfırlama ve flash ömrü optimizasyonu için olgunlaşmış bir standarttır. Buildroot ve Yocto her ikisi de bu mimariyi birinci sınıf olarak destekler.</p>
+  </div>
+</section>
+
+</main>

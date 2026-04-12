@@ -1,0 +1,769 @@
+---
+layout: tutorial
+title: "Linux Framebuffer (fbdev) — Grafik & Görüntü"
+back_url: "../index.html"
+back_label: "Grafik & Görüntü"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GRAFİK &amp; GÖRÜNTÜ</span>
+    <span>FRAMEBUFFER / FBDEV</span>
+    <span>2026</span>
+  </div>
+  <h1>Linux Framebuffer —<br><em>/dev/fb0.</em></h1>
+  <p class="subtitle">Doğrudan piksel yazımından boot splash screen'e, Python ile video playback'ten DRM/KMS migration yoluna kadar Linux framebuffer alt sisteminin eksiksiz rehberi.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">fbdev nedir — /dev/fb0, modern DRM ile ilişki</a></li>
+    <li><a href="#s1">ioctl API — fb_var_screeninfo, fb_fix_screeninfo</a></li>
+    <li><a href="#s2">mmap ile piksel yazma — offset hesabı, RGB565/ARGB8888</a></li>
+    <li><a href="#s3">Double buffering — FBIOPAN_DISPLAY, vsync</a></li>
+    <li><a href="#s4">fbset — timing değiştirme, custom modeline</a></li>
+    <li><a href="#s5">Splash screen — Plymouth, psplash, BMP decode</a></li>
+    <li><a href="#s6">Python ile framebuffer — Pillow, numpy, video playback</a></li>
+    <li><a href="#s7">fbdev → DRM migration — simpledrm, fbcon, DRM_FBDEV_EMULATION</a></li>
+    <li><a href="#s8">Pratik — pixel art, boot splash (C+BMP), console font</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> fbdev nedir</h2>
+  <p class="section-lead">Linux framebuffer (fbdev), kullanıcı alanının doğrudan ekran belleğine yazmasına olanak tanıyan eski bir kernel sürücüsüdür. GPU hızlandırması olmadan, CPU piksel verisini doğrudan gönderir.</p>
+
+  <h3>Tarihsel bağlam</h3>
+
+  <div class="params">
+    <div class="param">
+      <div class="name">fbdev (1995+)</div>
+      <div class="desc">Kernel'ın ilk birleşik display API'si. X11 sunucuları, konsol ve oyun motorları tarafından kullanıldı. <code class="inline">/dev/fb0</code> karakter cihazı üzerinden erişilir.</div>
+    </div>
+    <div class="param">
+      <div class="name">DRM/KMS (2008+)</div>
+      <div class="desc">Modern GPU yönetimi: mode setting, buffer yönetimi, GPU render. Fbdev'in yerini almaktadır. Ancak basit embedded ekranlar için fbdev hala kullanılır.</div>
+    </div>
+    <div class="param">
+      <div class="name">simpledrm (2021+)</div>
+      <div class="desc">Linux 5.14+ ile fbdev sürücülerinin yerini alan DRM sürücüsü. Aynı donanımda modern API sunar. <code class="inline">DRM_FBDEV_EMULATION</code> ile geriye uyumluluk sağlar.</div>
+    </div>
+  </div>
+
+  <h3>Hangi durumlarda fbdev?</h3>
+
+  <div class="flow">
+    <pre>
+  Basit, statik display (logo, status bar)?
+       ├─ Evet  → fbdev yeterli
+       └─ Hayır
+            ↓
+  GPU hızlandırma gerekli?
+       ├─ Evet  → DRM/KMS + libdrm veya Qt/LVGL
+       └─ Hayır → fbdev veya simpledrm
+    </pre>
+  </div>
+
+  <h3>Kernel konfigürasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig</span><span class="dot">●</span></div>
+    <pre><code">CONFIG_FB=y
+CONFIG_FB_VESA=y              <span class="cmt"># x86 VESA framebuffer</span>
+CONFIG_FB_EFI=y               <span class="cmt"># UEFI GOP framebuffer</span>
+CONFIG_FB_BCM2708=y           <span class="cmt"># Raspberry Pi legacy fbdev</span>
+CONFIG_FRAMEBUFFER_CONSOLE=y  <span class="cmt"># fbcon: kernel konsolu</span>
+CONFIG_LOGO=y                 <span class="cmt"># boot logo (penguen)</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> ioctl API — fb_var_screeninfo, fb_fix_screeninfo</h2>
+  <p class="section-lead"><code class="inline">/dev/fb0</code> açıldıktan sonra ioctl çağrıları ile ekranın özelliklerini sorgulayabilir ve bazılarını değiştirebilirsin.</p>
+
+  <h3>fb_var_screeninfo — değiştirilebilir özellikler</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">xres / yres</div><div class="desc">Aktif çözünürlük (piksel). <code class="inline">xres_virtual/yres_virtual</code> double buffering için sanal çözünürlük.</div></div>
+    <div class="param"><div class="name">bits_per_pixel</div><div class="desc">Piksel başına bit: 16 (RGB565), 24 (RGB888), 32 (ARGB8888).</div></div>
+    <div class="param"><div class="name">xoffset / yoffset</div><div class="desc">Sanal ekranda görüntüleme ofseti. Double buffering için yoffset değiştirilir.</div></div>
+    <div class="param"><div class="name">red/green/blue/transp</div><div class="desc">Her renk kanalının bit ofseti ve uzunluğu. Piksel formatını tanımlar.</div></div>
+  </div>
+
+  <h3>fb_fix_screeninfo — sabit özellikler</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">smem_start</div><div class="desc">Framebuffer fiziksel adresi (belgeleme amaçlı; mmap için kullanma).</div></div>
+    <div class="param"><div class="name">smem_len</div><div class="desc">Toplam framebuffer bellek boyutu (byte).</div></div>
+    <div class="param"><div class="name">line_length</div><div class="desc">Bir satırın byte cinsinden uzunluğu (stride/pitch). Her zaman <code class="inline">xres * bytes_per_pixel</code>'e eşit değildir; hizalama padding olabilir.</div></div>
+  </div>
+
+  <h3>ioctl örneği</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — fb bilgisi okuma</span><span class="dot">●</span></div>
+    <pre><code">#include &lt;stdio.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;linux/fb.h&gt;
+#include &lt;sys/ioctl.h&gt;
+
+int main(void)
+{
+    int fd = open("/dev/fb0", O_RDWR);
+    if (fd &lt; 0) { perror("/dev/fb0"); return 1; }
+
+    struct fb_var_screeninfo vinfo;
+    struct fb_fix_screeninfo finfo;
+
+    ioctl(fd, FBIOGET_VSCREENINFO, &amp;vinfo);
+    ioctl(fd, FBIOGET_FSCREENINFO, &amp;finfo);
+
+    printf("Çözünürlük   : %dx%d\n",
+        vinfo.xres, vinfo.yres);
+    printf("Bit/piksel   : %d bpp\n",
+        vinfo.bits_per_pixel);
+    printf("Satır uzunluğu: %d byte\n",
+        finfo.line_length);
+    printf("FB bellek    : %d KB\n",
+        finfo.smem_len / 1024);
+    printf("Kırmızı      : ofset=%d, uzunluk=%d\n",
+        vinfo.red.offset, vinfo.red.length);
+    printf("Yeşil        : ofset=%d, uzunluk=%d\n",
+        vinfo.green.offset, vinfo.green.length);
+    printf("Mavi         : ofset=%d, uzunluk=%d\n",
+        vinfo.blue.offset, vinfo.blue.length);
+
+    close(fd);
+    return 0;
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> mmap ile piksel yazma</h2>
+  <p class="section-lead">Framebuffer'a en verimli erişim <code class="inline">mmap()</code> ile sağlanır. Kernel belleğini kullanıcı alanına eşler; memcpy gibi standart bellek işlemleri ile piksel yazılır.</p>
+
+  <h3>Piksel adresi hesabı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Formül</span><span class="dot">●</span></div>
+    <pre><code">offset = y * line_length + x * bytes_per_pixel
+
+/* bytes_per_pixel = bits_per_pixel / 8 */
+/* line_length ≥ xres * bytes_per_pixel  (padding olabilir!) */</code></pre>
+  </div>
+
+  <h3>RGB565 piksel yazma — tam örnek</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — RGB565 framebuffer</span><span class="dot">●</span></div>
+    <pre><code">#include &lt;stdio.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;linux/fb.h&gt;
+#include &lt;stdint.h&gt;
+
+/* RGB888 → RGB565 dönüşümü */
+static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
+    return ((r &amp; 0xF8) &lt;&lt; 8) |
+           ((g &amp; 0xFC) &lt;&lt; 3) |
+           ((b &amp; 0xF8) &gt;&gt; 3);
+}
+
+int main(void)
+{
+    int fd = open("/dev/fb0", O_RDWR);
+
+    struct fb_var_screeninfo vinfo;
+    struct fb_fix_screeninfo finfo;
+    ioctl(fd, FBIOGET_VSCREENINFO, &amp;vinfo);
+    ioctl(fd, FBIOGET_FSCREENINFO, &amp;finfo);
+
+    int width  = vinfo.xres;
+    int height = vinfo.yres;
+    int bpp    = vinfo.bits_per_pixel / 8;  /* byte/piksel */
+    long fb_size = finfo.line_length * height;
+
+    uint8_t *fb = mmap(NULL, fb_size,
+        PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+
+    /* Gradyan çiz */
+    for (int y = 0; y &lt; height; y++) {
+        for (int x = 0; x &lt; width; x++) {
+            uint16_t color = rgb565(
+                x * 255 / width,           /* kırmızı: soldan sağa */
+                y * 255 / height,          /* yeşil: yukarıdan aşağı */
+                128                         /* mavi: sabit */
+            );
+            /* piksel adresine yaz */
+            long offset = y * finfo.line_length + x * bpp;
+            *(uint16_t *)(fb + offset) = color;
+        }
+    }
+
+    sleep(3);
+    munmap(fb, fb_size);
+    close(fd);
+    return 0;
+}</code></pre>
+  </div>
+
+  <h3>ARGB8888 — 32-bit piksel</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — ARGB8888</span><span class="dot">●</span></div>
+    <pre><code">/* 32-bit piksel: A=31:24, R=23:16, G=15:8, B=7:0 */
+uint32_t *pixels32 = (uint32_t *)fb;
+
+for (int y = 0; y &lt; height; y++) {
+    for (int x = 0; x &lt; width; x++) {
+        /* line_length/4 kullan (uint32 adreslemesi) */
+        pixels32[y * (finfo.line_length / 4) + x] =
+            0xFF000000 |           /* A = opak */
+            ((x * 255 / width)  &lt;&lt; 16) |  /* R */
+            ((y * 255 / height) &lt;&lt; 8)  |  /* G */
+            0x80;                          /* B */
+    }
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Double buffering — FBIOPAN_DISPLAY, vsync</h2>
+  <p class="section-lead">Tek buffer'a yazıp göstermek tearing'e yol açar. Double buffering ile bir buffer görüntülenirken diğerine yazılır; VBlank anında tamponlar değiştirilir.</p>
+
+  <h3>Sanal çözünürlük ile double buffer</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — double buffering</span><span class="dot">●</span></div>
+    <pre><code">#include &lt;linux/fb.h&gt;
+
+struct fb_var_screeninfo vinfo;
+ioctl(fb_fd, FBIOGET_VSCREENINFO, &amp;vinfo);
+
+/* Dikey sanal çözünürlüğü 2x yap */
+vinfo.yres_virtual = vinfo.yres * 2;
+ioctl(fb_fd, FBIOPUT_VSCREENINFO, &amp;vinfo);
+
+long fb_size = finfo.line_length * vinfo.yres_virtual;
+uint8_t *fb = mmap(NULL, fb_size,
+    PROT_READ | PROT_WRITE, MAP_SHARED, fb_fd, 0);
+
+/* Buffer 0: fb[0 ... line_length*yres-1]          */
+/* Buffer 1: fb[line_length*yres ... fb_size-1]     */
+
+int current_buf = 0;
+
+while (rendering) {
+    int next_buf = 1 - current_buf;
+    uint8_t *draw_fb = fb + next_buf * finfo.line_length * vinfo.yres;
+
+    /* next_buf'a çiz */
+    render_frame(draw_fb);
+
+    /* VBlank'i bekle ve tamponları değiştir */
+    vinfo.yoffset = next_buf * vinfo.yres;
+    ioctl(fb_fd, FBIOPAN_DISPLAY, &amp;vinfo);
+
+    /* Opsiyonel: FBIO_WAITFORVSYNC ile VBlank senkronizasyonu */
+    int zero = 0;
+    ioctl(fb_fd, FBIO_WAITFORVSYNC, &amp;zero);
+
+    current_buf = next_buf;
+}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">FBIO_WAITFORVSYNC</div>
+    <p><code class="inline">FBIO_WAITFORVSYNC</code> ioctl'i tüm sürücülerde desteklenmeyebilir. Raspberry Pi'nin legacy fbdev sürücüsünde çalışır. Desteklenmiyorsa <code class="inline">EINVAL</code> veya <code class="inline">ENOIOCTLCMD</code> döner. Modern sistemlerde DRM/KMS atomic commit ile page flip eventi tercih edilir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> fbset — timing değiştirme, custom modeline</h2>
+  <p class="section-lead"><code class="inline">fbset</code> aracı, framebuffer sürücüsünün timing parametrelerini kullanıcı alanından değiştirmek için kullanılır.</p>
+
+  <h3>fbset kullanımı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"># Mevcut mod bilgisi
+fbset -i
+
+# Belirli bir çözünürlük ayarla
+fbset -xres 1280 -yres 720 -depth 32
+
+# Refresh rate değiştir
+fbset -a 1024x768-75   <span class="cmt"># /etc/fb.modes'dan</span>
+
+# Özel modeline
+fbset \
+    -xres 800 -yres 480 \
+    -vxres 800 -vyres 960 \
+    -depth 16 \
+    -left 40 -right 40 -upper 29 -lower 13 \
+    -hslen 48 -vslen 3 \
+    -pixclock 33333 \
+    -sync 0 -vmode 0
+
+# Desteklenen tüm modları listele
+cat /etc/fb.modes</code></pre>
+  </div>
+
+  <h3>/etc/fb.modes — mod veritabanı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/fb.modes — custom mod</span><span class="dot">●</span></div>
+    <pre><code">mode "800x480-60"
+    geometry 800 480 800 960 16
+    timings 33333 40 40 29 13 48 3
+    rgba 5/11,6/5,5/0,0/0
+endmode
+
+mode "1024x600-60"
+    geometry 1024 600 1024 1200 16
+    timings 15385 140 160 20 12 20 3
+    rgba 5/11,6/5,5/0,0/0
+endmode</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">pixel clock hesabı</div>
+    <p>Timings değerindeki ilk sayı piksel saati periyodu (pikosaniye). Hesap: <code class="inline">pixclock = 1e12 / (Hz * htotal * vtotal)</code>. 800x480@60Hz için htotal≈888, vtotal≈525: <code class="inline">pixclock = 1e12 / (60 * 888 * 525) ≈ 35818</code>.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Splash screen — Plymouth, psplash, BMP decode</h2>
+  <p class="section-lead">Boot splash screen, kullanıcıya sistem hazırlanırken görsel geri bildirim sağlar. Systemd öncesinde fbdev üzerinden gösterilir.</p>
+
+  <h3>Plymouth — systemd entegreli splash</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Plymouth kurulumu</span><span class="dot">●</span></div>
+    <pre><code"># Yocto'da plymouth
+IMAGE_INSTALL:append = " plymouth plymouth-script"
+
+# Tema seçimi
+plymouth-set-default-theme -R bgrt  # ya da "spinner", "solar"
+
+# Özel tema
+mkdir -p /usr/share/plymouth/themes/my-brand/
+cat > /usr/share/plymouth/themes/my-brand/my-brand.plymouth << 'EOF'
+[Plymouth Theme]
+Name=My Brand
+Description=Custom splash
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/my-brand
+ScriptFile=/usr/share/plymouth/themes/my-brand/my-brand.script
+EOF</code></pre>
+  </div>
+
+  <h3>psplash — Yocto için minimal splash</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — psplash Yocto</span><span class="dot">●</span></div>
+    <pre><code"># local.conf
+IMAGE_INSTALL:append = " psplash"
+
+# Özel logo: 40x40 piksel PNG, RGBA
+# psplash-poky-img.h formatına dönüştür
+gdk-pixbuf-csource --name=psplash_poky_img \
+    my_logo.png > psplash-poky-img.h
+
+# psplash kernel cmdline parametresi
+# APPEND += " psplash=true"
+
+# İlerleme çubuğu rengi (yüzde 0-100)
+psplash-write "PROGRESS 50"
+psplash-write "MSG Sistem başlatılıyor..."</code></pre>
+  </div>
+
+  <h3>C ile BMP decode → framebuffer</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — BMP yükle ve fb'ye yaz</span><span class="dot">●</span></div>
+    <pre><code">#include &lt;stdio.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;string.h&gt;
+
+#pragma pack(1)
+typedef struct {
+    uint16_t type;        /* "BM" = 0x4D42 */
+    uint32_t size;
+    uint16_t reserved1, reserved2;
+    uint32_t offset;      /* piksel verisi başlangıcı */
+    uint32_t hdr_size;
+    int32_t  width, height;
+    uint16_t planes, bpp; /* 24 veya 32 */
+    uint32_t compression;
+    uint32_t img_size;
+    int32_t  xppm, yppm;
+    uint32_t clr_used, clr_important;
+} BmpHeader;
+#pragma pack()
+
+void bmp_to_fb(const char *bmp_path, uint8_t *fb,
+               int fb_width, int line_length, int fb_bpp)
+{
+    FILE *f = fopen(bmp_path, "rb");
+    BmpHeader hdr;
+    fread(&amp;hdr, sizeof(hdr), 1, f);
+
+    /* BMP'de satırlar alt-üst sırada, hizalama 4-byte */
+    int bmp_bpp  = hdr.bpp / 8;
+    int row_size = ((hdr.width * bmp_bpp + 3) / 4) * 4;
+    uint8_t *row = malloc(row_size);
+
+    for (int y = 0; y &lt; hdr.height; y++) {
+        /* BMP: en alt satır önce */
+        int fb_y = hdr.height - 1 - y;
+        fseek(f, hdr.offset + y * row_size, SEEK_SET);
+        fread(row, 1, row_size, f);
+
+        for (int x = 0; x &lt; hdr.width &amp;&amp; x &lt; fb_width; x++) {
+            /* BMP: BGR sırası */
+            uint8_t b = row[x * bmp_bpp + 0];
+            uint8_t g = row[x * bmp_bpp + 1];
+            uint8_t r = row[x * bmp_bpp + 2];
+
+            if (fb_bpp == 2) {
+                /* RGB565 */
+                uint16_t px = ((r &amp; 0xF8) &lt;&lt; 8) |
+                              ((g &amp; 0xFC) &lt;&lt; 3) |
+                              ((b) &gt;&gt; 3);
+                *(uint16_t *)(fb + fb_y * line_length + x * 2) = px;
+            } else {
+                /* ARGB8888 */
+                uint32_t px = 0xFF000000 | (r &lt;&lt; 16) | (g &lt;&lt; 8) | b;
+                *(uint32_t *)(fb + fb_y * line_length + x * 4) = px;
+            }
+        }
+    }
+    free(row);
+    fclose(f);
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Python ile framebuffer — Pillow, numpy, video playback</h2>
+  <p class="section-lead">Python'dan framebuffer erişimi hızlı prototipleme için kullanışlıdır. Pillow ile resim yükle, numpy ile piksel manipülasyonu yap, mmap ile direkt yaz.</p>
+
+  <h3>Temel Python framebuffer yazımı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Python — /dev/fb0 yazma</span><span class="dot">●</span></div>
+    <pre><code">import mmap
+import struct
+import fcntl
+import ctypes
+
+# fb_var_screeninfo ioctl yapısı (kısaltılmış)
+FBIOGET_VSCREENINFO = 0x4600
+FBIOGET_FSCREENINFO = 0x4602
+
+with open('/dev/fb0', 'r+b') as fb:
+    # Ekran bilgisini al (ilk 8 uint32: xres, yres, xvres, yvres,
+    #                     xoffset, yoffset, bpp, grayscale)
+    vinfo_buf = bytearray(160)
+    fcntl.ioctl(fb, FBIOGET_VSCREENINFO, vinfo_buf)
+    xres, yres, _, _, _, _, bpp = struct.unpack_from('7I', vinfo_buf)
+
+    finfo_buf = bytearray(68)
+    fcntl.ioctl(fb, FBIOGET_FSCREENINFO, finfo_buf)
+    line_length = struct.unpack_from('I', finfo_buf, 16)[0]
+
+    fb_size = line_length * yres
+    fb_mem  = mmap.mmap(fb.fileno(), fb_size,
+                        mmap.MAP_SHARED,
+                        mmap.PROT_READ | mmap.PROT_WRITE)
+
+    # Kırmızı ekran (RGB565: R=0b11111, G=0, B=0 → 0xF800)
+    fb_mem.seek(0)
+    fb_mem.write(b'\x00\xF8' * (fb_size // 2))</code></pre>
+  </div>
+
+  <h3>Pillow + numpy ile resim gösterme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Python — Pillow → fb0</span><span class="dot">●</span></div>
+    <pre><code">from PIL import Image
+import numpy as np
+import mmap, fcntl, struct
+
+def show_image(img_path, fb_path='/dev/fb0'):
+    with open(fb_path, 'r+b') as fb:
+        # Ekran bilgisi (xres, yres, bpp al)
+        vinfo = bytearray(160)
+        fcntl.ioctl(fb, 0x4600, vinfo)
+        xres, yres, _, _, _, _, bpp = struct.unpack_from('7I', vinfo)
+
+        finfo = bytearray(68)
+        fcntl.ioctl(fb, 0x4602, finfo)
+        line_length = struct.unpack_from('I', finfo, 16)[0]
+
+        img = Image.open(img_path).convert('RGB')
+        img = img.resize((xres, yres), Image.LANCZOS)
+        arr = np.array(img, dtype=np.uint8)
+
+        if bpp == 16:
+            # RGB888 → RGB565
+            r = (arr[:, :, 0] >> 3).astype(np.uint16)
+            g = (arr[:, :, 1] >> 2).astype(np.uint16)
+            b = (arr[:, :, 2] >> 3).astype(np.uint16)
+            pixels = ((r &lt;&lt; 11) | (g &lt;&lt; 5) | b).astype(np.uint16)
+        else:
+            # ARGB8888
+            a = np.full((yres, xres), 255, dtype=np.uint8)
+            pixels = np.stack([arr[:,:,2], arr[:,:,1],
+                                arr[:,:,0], a], axis=2)
+
+        fb_mem = mmap.mmap(fb.fileno(), line_length * yres)
+        fb_mem.seek(0)
+        fb_mem.write(pixels.tobytes()[:line_length * yres])
+
+show_image('/tmp/splash.png')</code></pre>
+  </div>
+
+  <h3>Video playback (frame by frame)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Python — OpenCV + framebuffer video</span><span class="dot">●</span></div>
+    <pre><code">import cv2
+import numpy as np
+import mmap, fcntl, struct, time
+
+def fb_video(video_path, fb_path='/dev/fb0'):
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25
+
+    with open(fb_path, 'r+b') as fb:
+        vinfo = bytearray(160)
+        fcntl.ioctl(fb, 0x4600, vinfo)
+        xres, yres, _, _, _, _, bpp = struct.unpack_from('7I', vinfo)
+        finfo = bytearray(68)
+        fcntl.ioctl(fb, 0x4602, finfo)
+        line_length = struct.unpack_from('I', finfo, 16)[0]
+
+        fb_mem = mmap.mmap(fb.fileno(), line_length * yres)
+
+        frame_time = 1.0 / fps
+        while cap.isOpened():
+            t0 = time.monotonic()
+            ret, frame = cap.read()
+            if not ret:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # döngü
+                continue
+
+            frame = cv2.resize(frame, (xres, yres))
+            # BGR → RGB565
+            r = (frame[:,:,2] >> 3).astype(np.uint16)
+            g = (frame[:,:,1] >> 2).astype(np.uint16)
+            b = (frame[:,:,0] >> 3).astype(np.uint16)
+            px = ((r &lt;&lt; 11) | (g &lt;&lt; 5) | b).astype(np.uint16)
+
+            fb_mem.seek(0)
+            fb_mem.write(px.tobytes()[:line_length * yres])
+
+            # FPS sınırla
+            elapsed = time.monotonic() - t0
+            if elapsed &lt; frame_time:
+                time.sleep(frame_time - elapsed)
+
+    cap.release()</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> fbdev → DRM migration</h2>
+  <p class="section-lead">Kernel 5.14+ ile birçok eski fbdev sürücüsünün yerini simpledrm aldı. <code class="inline">DRM_FBDEV_EMULATION</code> ise DRM sürücüsü üzerinden /dev/fb0 arayüzü sunar.</p>
+
+  <h3>simpledrm</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig — simpledrm</span><span class="dot">●</span></div>
+    <pre><code">CONFIG_DRM_SIMPLEDRM=y
+<span class="cmt"># EFI framebuffer, VESA, platform framebuffer gibi</span>
+<span class="cmt"># basit donanımlar için DRM sürücüsü</span>
+<span class="cmt"># Eski vesafb, efifb'nin yerine geçer</span></code></pre>
+  </div>
+
+  <h3>DRM_FBDEV_EMULATION — geriye uyumluluk</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig + bash</span><span class="dot">●</span></div>
+    <pre><code">CONFIG_DRM_FBDEV_EMULATION=y
+<span class="cmt"># DRM sürücüsü /dev/fb0 arayüzü sağlar</span>
+<span class="cmt"># fbdev uygulamaları kod değişikliği olmadan çalışmaya devam eder</span>
+
+# Kontrol: hangi driver /dev/fb0'ı sunuyor?
+cat /sys/class/graphics/fb0/device/uevent
+<span class="cmt"># DRIVER=simpledrm  veya  DRIVER=vc4 gibi</span>
+
+# DRM cihazı
+ls /dev/dri/
+<span class="cmt"># card0  renderD128</span>
+
+# fbdev emulation debug
+dmesg | grep "fbdev"</code></pre>
+  </div>
+
+  <h3>Migration kontrol listesi</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">1. mmap erişimi</div><div class="desc">DRM FBDEV_EMULATION üzerinden mmap hala çalışır. Test: mevcut fbdev uygulamanı değiştirmeden çalıştır.</div></div>
+    <div class="param"><div class="name">2. ioctl uyumluluğu</div><div class="desc"><code class="inline">FBIOGET_VSCREENINFO</code>, <code class="inline">FBIOPAN_DISPLAY</code> emulasyon katmanında desteklenir.</div></div>
+    <div class="param"><div class="name">3. Performans</div><div class="desc">DRM sürücüsüne geçildiğinde libdrm ile doğrudan KMS kullanmak daha performanslıdır.</div></div>
+    <div class="param"><div class="name">4. fbcon</div><div class="desc">Kernel console (text mode) <code class="inline">CONFIG_FRAMEBUFFER_CONSOLE</code> ile DRM üzerinden çalışmaya devam eder.</div></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik</h2>
+  <p class="section-lead">Üç gerçek senaryo: Raspberry Pi /dev/fb0 ile pixel art çizimi, C + BMP parser ile boot splash screen ve framebuffer console font değiştirme.</p>
+
+  <h3>Raspberry Pi — /dev/fb0 ile pixel art</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — sprite çizici</span><span class="dot">●</span></div>
+    <pre><code">#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;linux/fb.h&gt;
+#include &lt;stdint.h&gt;
+
+/* 8x8 pixel art sprite (RGB565) */
+static const uint16_t smile[8][8] = {
+    {0,0,0xF800,0xF800,0xF800,0xF800,0,0},
+    {0,0xF800,0,0,0,0,0xF800,0},
+    {0xF800,0,0x001F,0,0,0x001F,0,0xF800},
+    {0xF800,0,0,0,0,0,0,0xF800},
+    {0xF800,0,0x001F,0,0,0x001F,0,0xF800},
+    {0xF800,0,0,0x07E0,0x07E0,0,0,0xF800},
+    {0,0xF800,0,0,0,0,0xF800,0},
+    {0,0,0xF800,0xF800,0xF800,0xF800,0,0},
+};
+
+void draw_sprite(uint8_t *fb, int line_length,
+                 int sx, int sy, int scale)
+{
+    for (int y = 0; y &lt; 8; y++) {
+        for (int x = 0; x &lt; 8; x++) {
+            uint16_t color = smile[y][x];
+            /* Ölçeklenmiş piksel bloğu çiz */
+            for (int dy = 0; dy &lt; scale; dy++) {
+                for (int dx = 0; dx &lt; scale; dx++) {
+                    long off = (sy + y*scale + dy) * line_length
+                             + (sx + x*scale + dx) * 2;
+                    *(uint16_t *)(fb + off) = color;
+                }
+            }
+        }
+    }
+}</code></pre>
+  </div>
+
+  <h3>Boot splash screen — C + BMP parser</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — splash uygulama servisi</span><span class="dot">●</span></div>
+    <pre><code"># /etc/systemd/system/splash.service
+[Unit]
+Description=Boot Splash Screen
+DefaultDependencies=no
+After=sysinit.target
+Before=basic.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/fb-splash /usr/share/splash.bmp
+RemainAfterExit=yes
+
+[Install]
+WantedBy=basic.target</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — fb-splash main</span><span class="dot">●</span></div>
+    <pre><code">#include &lt;sys/mman.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;linux/fb.h&gt;
+
+int main(int argc, char *argv[])
+{
+    if (argc &lt; 2) {
+        fprintf(stderr, "Kullanım: fb-splash &lt;dosya.bmp&gt;\n");
+        return 1;
+    }
+
+    int fd = open("/dev/fb0", O_RDWR);
+    struct fb_var_screeninfo vinfo;
+    struct fb_fix_screeninfo finfo;
+    ioctl(fd, FBIOGET_VSCREENINFO, &amp;vinfo);
+    ioctl(fd, FBIOGET_FSCREENINFO, &amp;finfo);
+
+    long fb_size = finfo.line_length * vinfo.yres;
+    uint8_t *fb = mmap(NULL, fb_size,
+        PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+
+    int bpp = vinfo.bits_per_pixel / 8;
+    bmp_to_fb(argv[1], fb, vinfo.xres,
+              finfo.line_length, bpp);
+
+    munmap(fb, fb_size);
+    close(fd);
+    return 0;
+}</code></pre>
+  </div>
+
+  <h3>Framebuffer console font değiştirme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — fbcon font</span><span class="dot">●</span></div>
+    <pre><code"># Mevcut font listesi
+ls /usr/share/consolefonts/*.psf*
+
+# Font değiştir (setfont)
+setfont /usr/share/consolefonts/Lat2-Terminus16.psf
+
+# Büyük font (HiDPI ekran)
+setfont /usr/share/consolefonts/Uni3-Terminus32x16.psf
+
+# Kernel parametresi ile kalıcı (cmdline)
+# fbcon=font:VGA8x16
+
+# Yüksek çözünürlüklü ekranda okunabilir font
+# Grub GRUB_CMDLINE_LINUX içine ekle:
+# "fbcon=font:TER16x32"
+
+# Ekran döndürme (90 derece)
+echo 1 > /sys/class/graphics/fbcon/rotate_all
+<span class="cmt"># 0=normal, 1=CCW90, 2=180, 3=CW90</span></code></pre>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

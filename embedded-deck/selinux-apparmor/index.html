@@ -1,0 +1,726 @@
+---
+layout: tutorial
+title: "SELinux & AppArmor — Zorunlu Erişim Kontrolü"
+back_url: "../index.html"
+back_label: "embedded-deck"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ GÜVENLİK LİNUX</span>
+    <span>SELinux/AppArmor</span>
+    <span>2026</span>
+  </div>
+  <h1>SELinux &amp; AppArmor<br><em>Zorunlu erişim, sıfır güven.</em></h1>
+  <p class="subtitle">DAC'ın yetersiz kaldığı noktada MAC devreye girer — süreç izolasyonu, dosya etiketleme ve politika tabanlı erişim kontrolü ile gömülü sistem güvenliğini üst düzeye taşıyın.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">DAC vs MAC</a></li>
+    <li><a href="#s1">LSM framework</a></li>
+    <li><a href="#s2">SELinux temelleri</a></li>
+    <li><a href="#s3">SELinux policy yönetimi</a></li>
+    <li><a href="#s4">SELinux gömülü kullanımı</a></li>
+    <li><a href="#s5">AppArmor temelleri</a></li>
+    <li><a href="#s6">aa-genprof ile profil oluşturma</a></li>
+    <li><a href="#s7">AppArmor gömülü kullanımı</a></li>
+    <li><a href="#s8">Pratik: Web server için AppArmor profili</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> DAC vs MAC</h2>
+  <p class="section-lead">Linux'ta geleneksel erişim kontrolü Discretionary Access Control (DAC) üzerine kurulmuştur. DAC yeterli değildir: root hesabı ele geçirildiğinde veya setuid ikili dosyaları kötüye kullanıldığında tüm sistem risk altına girer. Mandatory Access Control (MAC) bu açığı sistemin özünde kapatır.</p>
+
+  <h3>DAC (Discretionary Access Control)</h3>
+  <p>DAC'ta dosya sahibi erişim kurallarını <em>kendisi</em> belirler. <code>chmod 777</code> komutu çalıştırabilen bir kullanıcı dosyayı herkese açabilir. Kernel bunu sorunsuz kabul eder — politika sahibin takdirine (discretion) bırakılmıştır.</p>
+
+  <pre><code class="language-bash"># DAC örnek: kullanıcı kendi dosyasında tam kontrol sahibi
+ls -la /etc/passwd
+-rw-r--r-- 1 root root 1234 Apr 12 2026 /etc/passwd
+# root okuyabilir/yazabilir, diğerleri sadece okuyabilir
+# Ancak root yetkisiyle her şeyi yapabilirsiniz
+
+# setuid binary riski:
+ls -la /usr/bin/passwd
+-rwsr-xr-x 1 root root 59976 /usr/bin/passwd
+# s biti: çalıştıran ne olursa olsun root yetkileriyle çalışır
+# Bu binary'de buffer overflow varsa → root shell</code></pre>
+
+  <h3>MAC (Mandatory Access Control)</h3>
+  <p>MAC'ta erişim kuralları sistem yöneticisi tarafından merkezi olarak tanımlanır ve kullanıcılar bu kuralları değiştiremez. root bile MAC politikasına tabidir — bir process sadece politikasının izin verdiği işlemleri yapabilir.</p>
+
+  <h3>Gerçek CVE örnekleri — MAC olsaydı</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>CVE</th><th>Zafiyet</th><th>DAC'ta etki</th><th>MAC ile etki</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>CVE-2021-4034 (PwnKit)</td><td>pkexec privilege escalation</td><td>Local root</td><td>SELinux: pkexec domain kısıtlı, privilege yok</td></tr>
+        <tr><td>CVE-2022-0847 (Dirty Pipe)</td><td>Pipe buffer write — root dosya yazma</td><td>/etc/passwd değiştirilir</td><td>SELinux: passwd_t dosyasına yazma engellenir</td></tr>
+        <tr><td>CVE-2016-5195 (Dirty COW)</td><td>Race condition, root write</td><td>Sistem dosyaları değişir</td><td>AppArmor: korunan profil dosyaları değiştirilemez</td></tr>
+        <tr><td>Log4Shell benzeri</td><td>RCE via web app</td><td>Web server yetkisiyle OS erişimi</td><td>AppArmor: httpd profili /tmp ve /etc'ye erişemez</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>MAC bir "sihirli çözüm" değildir — yanlış yapılandırılmış politikalar güvenlik yanılsaması yaratır. "Permissive mode"da log üretilir ama engelleme olmaz. Prodüksiyon sistemleri her zaman "enforcing mode"da çalışmalıdır.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> LSM framework</h2>
+  <p class="section-lead">Linux Security Module (LSM), çekirdek içinde güvenlik politikalarını uygulayan bir kanca (hook) mekanizmasıdır. Tüm MAC implementasyonları LSM üzerinden çalışır ve çekirdek içindeki kritik sistem çağrılarına müdahale ederler.</p>
+
+  <h3>Mevcut LSM implementasyonları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>LSM</th><th>Köken</th><th>Model</th><th>Kullanım alanı</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>SELinux</td><td>NSA / Red Hat</td><td>Label tabanlı (Type Enforcement)</td><td>Android, RHEL/Fedora, CentOS</td></tr>
+        <tr><td>AppArmor</td><td>Immunix/Canonical</td><td>Path tabanlı profil</td><td>Ubuntu, openSUSE, Debian, snaps</td></tr>
+        <tr><td>Smack</td><td>Casey Schaufler</td><td>Basit label tabanlı</td><td>Tizen OS, gömülü (Automotive)</td></tr>
+        <tr><td>Tomoyo</td><td>NTT Data</td><td>Path tabanlı öğrenen</td><td>Japonya kaynaklı, az yaygın</td></tr>
+        <tr><td>Yama</td><td>Kees Cook</td><td>ptrace kısıtlama</td><td>Desktop güvenliği — diğerleriyle birlikte</td></tr>
+        <tr><td>Landlock</td><td>Mickaël Salaün</td><td>Kullanıcı alanı tanımlı</td><td>Sandbox — root olmadan MAC, kernel 5.13+</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Hangi LSM'i seçmeli?</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Android gömülü</span><span class="desc">SELinux — Android 5.0'dan beri enforcing, geniş politika kütüphanesi mevcut</span></div>
+    <div class="param"><span class="name">Yocto / Embedded Linux</span><span class="desc">AppArmor daha kolay başlangıç; SELinux meta-selinux layer ile de desteklenir</span></div>
+    <div class="param"><span class="name">Automotive (GENIVI/AGL)</span><span class="desc">Smack — basit model, düşük overhead, AGL resmi desteği</span></div>
+    <div class="param"><span class="name">Ubuntu tabanlı sistemler</span><span class="desc">AppArmor — Ubuntu'da varsayılan, hazır profil geniş</span></div>
+    <div class="param"><span class="name">RHEL/CentOS/Fedora</span><span class="desc">SELinux — targeted policy ile hazır gelen, araç desteği güçlü</span></div>
+  </div>
+
+  <pre><code class="language-bash"># Aktif LSM'leri kontrol et:
+cat /sys/kernel/security/lsm
+# Örnek çıktı: lockdown,capability,yama,selinux
+# veya: lockdown,capability,yama,apparmor
+
+# Kernel derleme zamanı LSM listesi:
+grep CONFIG_LSM /boot/config-$(uname -r)</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> SELinux temelleri</h2>
+  <p class="section-lead">SELinux (Security-Enhanced Linux), NSA tarafından geliştirilen ve 2003'te mainline kernel'e dahil edilen en kapsamlı LSM implementasyonudur. Temel modeli, her process ve dosyaya bir güvenlik bağlamı (security context) atamak üzerine kurulmuştur.</p>
+
+  <h3>Subject / Object / Permission modeli</h3>
+
+  <div class="flow">
+    <pre>
+  Subject (process)          Object (dosya, soket, port)
+  ┌─────────────────┐        ┌──────────────────────────┐
+  │ httpd_t         │ ──?──► │ httpd_sys_content_t       │
+  │ (domain)        │        │ /var/www/html/index.html  │
+  └─────────────────┘        └──────────────────────────┘
+          │
+          └── SELinux Policy sorar:
+              "httpd_t" domain'i "httpd_sys_content_t"
+              tipi üzerinde "read" yapabilir mi?
+              → ALLOW httpd_t httpd_sys_content_t:file { read getattr open }
+    </pre>
+  </div>
+
+  <h3>Security context formatı</h3>
+
+  <pre><code class="language-bash"># user:role:type:level (MLS için level eklenir)
+# Örnek context'leri göster:
+
+# Process context:
+ps axZ | grep httpd
+# system_u:system_r:httpd_t:s0     12345 ? Ss httpd
+
+# Dosya context'leri:
+ls -Z /var/www/html/
+# system_u:object_r:httpd_sys_content_t:s0 index.html
+
+ls -Z /etc/passwd
+# system_u:object_r:passwd_file_t:s0 /etc/passwd
+
+ls -Z /etc/shadow
+# system_u:object_r:shadow_t:s0 /etc/shadow
+
+# Kendi process'iniz:
+id -Z
+# unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023</code></pre>
+
+  <h3>SELinux mod kontrolü</h3>
+
+  <pre><code class="language-bash"># Mevcut modu göster:
+getenforce
+# Enforcing | Permissive | Disabled
+
+# Geçici mod değişimi (reboot'a kadar):
+setenforce 0   # Permissive
+setenforce 1   # Enforcing
+
+# Kalıcı mod (/etc/selinux/config):
+SELINUX=enforcing    # enforcing / permissive / disabled
+SELINUXTYPE=targeted # targeted / minimum / mls
+
+# SELinux durumu:
+sestatus
+# SELinux status:                 enabled
+# SELinuxfs mount:                /sys/fs/selinux
+# SELinux mount point:            /sys/fs/selinux
+# Loaded policy name:             targeted
+# Current mode:                   enforcing
+# Policy version:                 33</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> SELinux policy yönetimi</h2>
+  <p class="section-lead">SELinux politikası, izin verilen erişimlerin tanımlandığı kurallar bütünüdür. Targeted policy, sistem servislerini kısıtlarken kullanıcı süreçlerini serbest bırakır — bu denge gömülü sistemler için pratik bir başlangıç noktasıdır.</p>
+
+  <h3>audit2allow — reddeden kuraldan izin kuralı üretme</h3>
+
+  <pre><code class="language-bash"># SELinux reddetme logları /var/log/audit/audit.log'a düşer
+# Örnek ret mesajı:
+# type=AVC msg=audit(1714567890.123:456): avc: denied { read }
+#   for pid=1234 comm="myapp" name="config.txt"
+#   scontext=system_u:system_r:myapp_t:s0
+#   tcontext=system_u:object_r:etc_t:s0
+#   tclass=file permissive=0
+
+# Ret mesajlarını incele:
+ausearch -m avc -ts recent
+audit2why -a
+
+# İzin kuralı üret:
+ausearch -m avc -ts recent | audit2allow
+
+# Yeni modül olarak derle ve yükle:
+ausearch -m avc -ts recent | audit2allow -M myapp_policy
+semodule -i myapp_policy.pp
+
+# Modülleri listele:
+semodule -l | grep myapp</code></pre>
+
+  <h3>Boolean'lar — politikayı esnetme</h3>
+
+  <pre><code class="language-bash"># SELinux Boolean'ları: politikayı yeniden derlemeden ayarla
+
+# Mevcut boolean'ları listele:
+getsebool -a | grep httpd
+
+# Örnekler:
+getsebool httpd_can_network_connect
+# httpd_can_network_connect --> off
+
+# httpd'nin ağa bağlanmasına izin ver (proxy backend için):
+setsebool -P httpd_can_network_connect on
+# -P: kalıcı (reboot sonrası geçerli)
+
+# Başka yararlı boolean'lar:
+setsebool -P httpd_read_user_content on     # ~/public_html
+setsebool -P ftp_home_dir on               # FTP ev dizini erişimi
+setsebool -P ssh_sysadm_login on           # sysadm_r SSH girişi</code></pre>
+
+  <h3>restorecon ve chcon</h3>
+
+  <pre><code class="language-bash"># Dosya context'ini varsayılana döndür (policy'de tanımlı değer):
+restorecon /var/www/html/index.html
+restorecon -Rv /var/www/html/    # Recursive, verbose
+
+# Geçici context değiştirme (reboot'ta sıfırlanır):
+chcon -t httpd_sys_content_t /var/www/html/myfile.html
+
+# Kalıcı context tanımlama (policy'e ekler):
+semanage fcontext -a -t httpd_sys_content_t "/mywebroot(/.*)?"
+restorecon -Rv /mywebroot
+
+# Port context:
+semanage port -l | grep http
+# http_port_t   tcp   80, 443, 488, 8008, 8009, 8443
+
+# Özel port ekle:
+semanage port -a -t http_port_t -p tcp 8080</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> SELinux gömülü kullanımı</h2>
+  <p class="section-lead">SELinux, gömülü Linux ekosisteminde özellikle Android ve Yocto aracılığıyla kullanılmaktadır. Android 5.0'dan itibaren tüm Android cihazları SELinux enforcing modunda çalışmaktadır.</p>
+
+  <h3>Android SELinux mimarisi</h3>
+
+  <div class="flow">
+    <pre>
+  Android SELinux Politika Katmanları:
+  ┌──────────────────────────────────────────────────┐
+  │  Vendor Policy (OEM özelleştirmeleri)             │
+  │  /vendor/etc/selinux/                            │
+  ├──────────────────────────────────────────────────┤
+  │  Platform Policy (AOSP politikası)                │
+  │  /system/etc/selinux/                            │
+  ├──────────────────────────────────────────────────┤
+  │  Public Platform Policy (API sözleşmesi)          │
+  │  OEM'ler bu API'yi genişletebilir                │
+  └──────────────────────────────────────────────────┘
+    </pre>
+  </div>
+
+  <pre><code class="language-bash"># Android SELinux kontrol:
+adb shell getenforce       # Enforcing
+adb shell ls -Z /data/     # Dosya context'leri
+
+# Yeni Android uygulaması için context:
+# AOSP: system/sepolicy/private/app.te
+# Vendor: device/vendor/board/sepolicy/</code></pre>
+
+  <h3>Yocto meta-selinux layer</h3>
+
+  <pre><code class="language-bash"># meta-selinux layer ekle:
+git clone https://github.com/SELinuxProject/meta-selinux.git
+# meta-openembedded de gereklidir:
+git clone https://github.com/openembedded/meta-openembedded.git
+
+# conf/bblayers.conf:
+BBLAYERS += " \
+  /path/to/meta-openembedded/meta-oe \
+  /path/to/meta-openembedded/meta-networking \
+  /path/to/meta-selinux \
+"
+
+# conf/local.conf:
+DISTRO_FEATURES:append = " selinux"
+DEFAULT_ENFORCING = "enforcing"   # veya "permissive"
+
+# SELinux araçları için:
+IMAGE_INSTALL:append = " \
+  packagegroup-core-selinux \
+  selinux-python \
+  setools \
+"
+
+# Build:
+bitbake core-image-selinux-minimal</code></pre>
+
+  <h3>Özel SELinux politikası yazma (Yocto)</h3>
+
+  <pre><code class="language-bash"># meta-myboard/recipes-security/myapp-selinux/myapp.te
+policy_module(myapp, 1.0.0)
+
+# Tip tanımlamaları
+type myapp_t;
+type myapp_exec_t;
+type myapp_var_t;
+type myapp_log_t;
+
+# Domain geçişi: myapp_exec_t çalıştırıldığında myapp_t domain'ine gir
+domain_type(myapp_t)
+domain_entry_file(myapp_t, myapp_exec_t)
+
+# Temel izinler
+files_read_etc_files(myapp_t)
+logging_send_syslog_msg(myapp_t)
+miscfiles_read_localization(myapp_t)
+
+# Özel izinler
+allow myapp_t myapp_var_t:dir { read write add_name remove_name };
+allow myapp_t myapp_var_t:file { create read write unlink getattr setattr };
+allow myapp_t myapp_log_t:file { create append read getattr };</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> AppArmor temelleri</h2>
+  <p class="section-lead">AppArmor, path (dosya yolu) tabanlı bir MAC sistemidir. SELinux'un dosya etiketleme yaklaşımının aksine AppArmor, profilde belirtilen yol kalıplarıyla erişimi kısıtlar. Öğrenmesi ve uygulaması daha kolaydır.</p>
+
+  <h3>Profil yapısı</h3>
+
+  <pre><code class="language-bash"># /etc/apparmor.d/usr.sbin.nginx — nginx AppArmor profili
+#include &lt;tunables/global&gt;
+
+/usr/sbin/nginx {
+  #include &lt;abstractions/base&gt;
+  #include &lt;abstractions/nameservice&gt;
+
+  # Capability'ler
+  capability net_bind_service,   # 1024 altı port bind
+  capability setgid,
+  capability setuid,
+  capability dac_override,
+
+  # Binary
+  /usr/sbin/nginx mr,            # m=mmap, r=read
+
+  # Konfigürasyon dosyaları
+  /etc/nginx/             r,
+  /etc/nginx/**           r,
+
+  # Web içeriği
+  /var/www/               r,
+  /var/www/**             r,
+
+  # Log dosyaları
+  /var/log/nginx/         rw,
+  /var/log/nginx/**       rw,
+
+  # PID ve socket dosyaları
+  /run/nginx.pid          rw,
+  /run/nginx/             rw,
+  /run/nginx/**           rw,
+
+  # Geçici dosyalar
+  /tmp/                   rw,
+  /tmp/**                 rw,
+
+  # Ağ erişimi
+  network tcp,
+  network udp,
+
+  # /proc erişimi (worker process bilgisi)
+  /proc/*/status          r,
+  /proc/sys/kernel/ngroups_max r,
+}</code></pre>
+
+  <h3>Dosya izin notasyonu</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">r</span><span class="desc">read — dosya okuma</span></div>
+    <div class="param"><span class="name">w</span><span class="desc">write — dosyaya yazma (create/unlink için ayrıca gerekir)</span></div>
+    <div class="param"><span class="name">x</span><span class="desc">execute — binary çalıştırma</span></div>
+    <div class="param"><span class="name">m</span><span class="desc">mmap — belleğe eşleme (shared libraries için)</span></div>
+    <div class="param"><span class="name">k</span><span class="desc">lock — dosya kilitleme</span></div>
+    <div class="param"><span class="name">l</span><span class="desc">link — hard link oluşturma</span></div>
+    <div class="param"><span class="name">ix</span><span class="desc">inherit execute — çalıştırılan child aynı profili miras alır</span></div>
+    <div class="param"><span class="name">px</span><span class="desc">profile execute — child için ayrı bir profil yükle</span></div>
+    <div class="param"><span class="name">ux</span><span class="desc">unconfined execute — child üzerinde AppArmor kısıtlaması yok</span></div>
+  </div>
+
+  <h3>Profil durumu yönetimi</h3>
+
+  <pre><code class="language-bash"># Tüm profillerin durumunu listele:
+aa-status
+
+# Profil yükle:
+sudo apparmor_parser -r /etc/apparmor.d/usr.sbin.nginx
+
+# Profili complain moduna al (log yaz, engelleme yok):
+sudo aa-complain /usr/sbin/nginx
+
+# Enforce moduna al:
+sudo aa-enforce /usr/sbin/nginx
+
+# Profili devre dışı bırak:
+sudo aa-disable /usr/sbin/nginx
+
+# Audit log izle:
+sudo journalctl -k -f | grep apparmor
+# veya:
+sudo tail -f /var/log/syslog | grep apparmor</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> aa-genprof ile profil oluşturma</h2>
+  <p class="section-lead">aa-genprof ve aa-logprof araçları, uygulamayı çalıştırarak AppArmor profilini otomatik olarak oluşturur. Bu yaklaşım sıfırdan profil yazmaktan çok daha hızlıdır.</p>
+
+  <h3>aa-genprof ile ilk profil</h3>
+
+  <pre><code class="language-bash"># 1. aa-genprof'u başlat (uygulama henüz çalışmıyor)
+sudo aa-genprof /usr/bin/myapp
+
+# aa-genprof şu mesajı gösterir:
+# Please start the application to be profiled in another window
+# and exercise its functionality now.
+# Once completed, select the (F)inish option below.
+
+# 2. Başka terminal'de uygulamayı çalıştır ve tüm işlevleri dene
+# (okuma, yazma, ağ bağlantısı, vs.)
+/usr/bin/myapp --config /etc/myapp/config.yaml
+
+# 3. aa-genprof terminalinde (S)can → kural önerileri incele → (F)inish
+
+# Örnek etkileşim:
+# = Change profile /usr/bin/myapp =
+#  ...
+# Profile: /usr/bin/myapp
+# Execute:  /bin/bash
+# Severity: 4
+#
+# (I)nherit / (C)hild / (P)rofile / (N)ame / (U)nconfined / (D)eny / Abo(r)t / (F)inish</code></pre>
+
+  <h3>aa-logprof — mevcut profili güncelleme</h3>
+
+  <pre><code class="language-bash"># Uygulama complain modunda çalışırken logları biriktir:
+sudo aa-complain /usr/bin/myapp
+# Uygulamayı çalıştır ve test et...
+
+# Biriken logları analiz et ve profili güncelle:
+sudo aa-logprof
+
+# Otomatik güncelleme (onaylama gerekmeden):
+sudo aa-logprof -f /var/log/syslog</code></pre>
+
+  <h3>audit log analizi</h3>
+
+  <pre><code class="language-bash"># AppArmor ret logları — syslog formatı:
+# kernel: [12345.678] audit: type=1400 audit(1714567890.123:456):
+# apparmor="DENIED" operation="open"
+# profile="/usr/bin/myapp" name="/etc/ssl/private/key.pem"
+# pid=1234 comm="myapp" requested_mask="r" denied_mask="r"
+# fsuid=0 ouid=0
+
+# Log'ları filtrele:
+sudo journalctl -k | grep 'apparmor="DENIED"'
+
+# Belirli uygulama için:
+sudo journalctl -k | grep 'profile="/usr/bin/myapp"'
+
+# Ret edilen dosya erişimlerini özetle:
+sudo journalctl -k | grep 'apparmor="DENIED"' | \
+    grep -oP 'name="\K[^"]+' | sort | uniq -c | sort -rn</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> AppArmor gömülü kullanımı</h2>
+  <p class="section-lead">AppArmor, Ubuntu Core ve snap ekosistemi aracılığıyla gömülü cihazlarda yaygınlaşmıştır. Yocto meta-security layer ile özel rootfs'e de entegre edilebilir.</p>
+
+  <h3>Ubuntu Core ve snap confinement</h3>
+
+  <p>Ubuntu Core, snap paket yöneticisini kullanan gömülü bir Ubuntu variantıdır. Her snap paketi otomatik olarak AppArmor + seccomp ile izole edilir. <code>snapd</code> profilleri dinamik olarak oluşturur ve uygular.</p>
+
+  <pre><code class="language-bash"># Snap AppArmor profillerini incele:
+ls /var/lib/snapd/apparmor/profiles/
+# snap.myapp.myapp
+# snap.myapp.hook.configure
+
+# Snap bağlantıları (interface):
+snap connections myapp
+# Interface         Plug              Slot            Notes
+# network           myapp:network     :network        -
+# camera            myapp:camera      -               -
+# gpio              myapp:gpio        pi:gpio         manual
+
+# Snap için AppArmor profil şablonu:
+cat /var/lib/snapd/apparmor/profiles/snap.myapp.myapp</code></pre>
+
+  <h3>Yocto meta-security layer</h3>
+
+  <pre><code class="language-bash"># meta-security AppArmor desteği:
+git clone https://git.yoctoproject.org/meta-security
+
+# conf/bblayers.conf:
+BBLAYERS += "/path/to/meta-security"
+
+# conf/local.conf:
+DISTRO_FEATURES:append = " apparmor"
+PREFERRED_PROVIDER_virtual/refpolicy = "refpolicy-targeted"
+
+# AppArmor paketlerini imaja ekle:
+IMAGE_INSTALL:append = " \
+  apparmor \
+  apparmor-utils \
+  apparmor-profiles \
+  apparmor-parser \
+"
+
+# Kernel konfigürasyonu (meta-security otomatik ayarlar):
+# CONFIG_SECURITY_APPARMOR=y
+# CONFIG_SECURITY_APPARMOR_BOOTPARAM_VALUE=1
+# CONFIG_DEFAULT_SECURITY_APPARMOR=y</code></pre>
+
+  <h3>Gömülü cihaz için özel profil stratejisi</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Minimal erişim prensibi</span><span class="desc">Her servis sadece ihtiyaç duyduğu dosya yollarına ve ağ protokollerine erişebilmeli</span></div>
+    <div class="param"><span class="name">Profil versiyonlama</span><span class="desc">Profilleri Git'te tutun, her firmware güncellemesiyle birlikte deploy edin</span></div>
+    <div class="param"><span class="name">Staging'de complain modu</span><span class="desc">Test ortamında complain modunda çalıştırın, logları toplayın, sonra enforce'a geçin</span></div>
+    <div class="param"><span class="name">Read-only profil dizini</span><span class="desc">/etc/apparmor.d dizinini read-only mount edin — runtime profil değişikliğini engeller</span></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: Web server için AppArmor profili</h2>
+  <p class="section-lead">Bu bölümde nginx web server'ı için sıfırdan AppArmor profili oluşturup enforce moduna alacağız. Profil dosya erişimini, ağ kurallarını ve capability'leri kapsar.</p>
+
+  <h3>Başlangıç: aa-genprof ile otomatik profil</h3>
+
+  <pre><code class="language-bash"># 1. nginx'i durdur:
+sudo systemctl stop nginx
+
+# 2. aa-genprof başlat:
+sudo aa-genprof /usr/sbin/nginx
+
+# 3. nginx'i başlat (başka terminal):
+sudo nginx -t    # konfigürasyon testi
+sudo nginx       # başlat
+
+# 4. Birkaç HTTP isteği gönder:
+curl http://localhost/
+curl http://localhost/index.html
+curl http://localhost/api/status
+
+# 5. aa-genprof'ta (S)can ve kuralları kabul et, (F)inish</code></pre>
+
+  <h3>Üretilen profili iyileştirme</h3>
+
+  <pre><code class="language-bash">sudo nano /etc/apparmor.d/usr.sbin.nginx</code></pre>
+
+  <pre><code class="language-bash"># /etc/apparmor.d/usr.sbin.nginx — tam ve optimize edilmiş profil
+#include &lt;tunables/global&gt;
+
+/usr/sbin/nginx {
+  #include &lt;abstractions/base&gt;
+  #include &lt;abstractions/nameservice&gt;
+  #include &lt;abstractions/openssl&gt;
+  #include &lt;abstractions/ssl_certs&gt;
+
+  # Gerekli capability'ler
+  capability net_bind_service,    # 80/443 portlarına bind
+  capability setgid,              # worker process'e gid değiştir
+  capability setuid,              # worker process'e uid değiştir
+  capability dac_override,        # log dosyası sahipliği
+  capability sys_resource,        # rlimit ayarı
+
+  # Ana nginx binary
+  /usr/sbin/nginx                 mr,
+
+  # Konfigürasyon (salt okunur)
+  /etc/nginx/                     r,
+  /etc/nginx/**                   r,
+  /etc/ssl/certs/                 r,
+  /etc/ssl/certs/**               r,
+  /etc/ssl/private/               r,
+  /etc/ssl/private/nginx.key      r,   # özel anahtar
+
+  # Web içeriği (salt okunur)
+  /var/www/                       r,
+  /var/www/html/                  r,
+  /var/www/html/**                r,
+
+  # Log dosyaları (yazılabilir)
+  /var/log/nginx/                 rw,
+  /var/log/nginx/access.log       rw,
+  /var/log/nginx/error.log        rw,
+
+  # Çalışma zamanı dosyaları
+  /run/nginx.pid                  rw,
+  /run/nginx/                     rw,
+  /run/nginx/**                   rw,
+
+  # Geçici dosyalar (proxy cache, upload buffer)
+  /var/cache/nginx/               rw,
+  /var/cache/nginx/**             rw,
+  /tmp/                           rw,
+
+  # /proc erişimi (worker process sayısı, CPU bilgisi)
+  /proc/*/status                  r,
+  /proc/cpuinfo                   r,
+  /proc/sys/kernel/ngroups_max    r,
+  /sys/devices/system/cpu/online  r,
+
+  # Ağ kuralları (explicit olarak belirt)
+  network tcp,
+  network udp,
+
+  # Unix socket (PHP-FPM, backend)
+  /run/php/php8.1-fpm.sock        rw,
+
+  # Worker process'leri için dahili geçiş
+  /usr/sbin/nginx                 px -> nginx_worker,
+}</code></pre>
+
+  <h3>Worker profili</h3>
+
+  <pre><code class="language-bash"># /etc/apparmor.d/nginx_worker — ayrı worker profili
+profile nginx_worker {
+  #include &lt;abstractions/base&gt;
+  #include &lt;abstractions/nameservice&gt;
+
+  # Worker sadece içerik okur ve ağ kullanır
+  /var/www/html/**    r,
+  /var/cache/nginx/** rw,
+  /tmp/**             rw,
+  /var/log/nginx/**   rw,
+  /run/nginx/**       rw,
+
+  network tcp,
+  network udp,
+
+  # Worker'ın yeni process başlatmasını engelle
+  deny /bin/**        x,
+  deny /usr/bin/**    x,
+  deny /sbin/**       x,
+}</code></pre>
+
+  <h3>Profili yükle ve test et</h3>
+
+  <pre><code class="language-bash"># 1. Önce complain modunda test et:
+sudo apparmor_parser -r /etc/apparmor.d/usr.sbin.nginx
+sudo aa-complain /usr/sbin/nginx
+
+# 2. nginx'i başlat ve logları izle:
+sudo systemctl start nginx
+sudo journalctl -k -f | grep apparmor &
+
+# 3. Kapsamlı test:
+curl http://localhost/
+curl https://localhost/ -k
+# Farklı endpoint'leri test et...
+
+# 4. 5-10 dakika bekle, ret mesajı var mı kontrol et:
+sudo journalctl -k | grep 'apparmor="DENIED"' | grep nginx
+
+# 5. Ret yoksa enforce moduna geç:
+sudo aa-enforce /usr/sbin/nginx
+sudo systemctl restart nginx
+
+# 6. Enforce modunu doğrula:
+sudo aa-status | grep nginx
+# /usr/sbin/nginx (enforce)</code></pre>
+
+  <h3>Test: profil çalışıyor mu?</h3>
+
+  <pre><code class="language-bash"># nginx üzerinden yasaklı dosyaya erişim denemesi
+# (profil /etc/passwd'ye erişimi engellemelidir)
+
+# nginx config'de test endpoint ekle (test ortamında):
+# location /test {
+#     alias /etc/passwd;
+# }
+
+# İstek gönder:
+curl http://localhost/test
+
+# Beklenen: 403 Forbidden (nginx izni yok)
+# AppArmor logu kontrol:
+sudo journalctl -k | grep 'DENIED.*nginx.*passwd'
+# apparmor="DENIED" operation="open"
+# profile="/usr/sbin/nginx" name="/etc/passwd"
+# requested_mask="r" denied_mask="r"
+
+echo "AppArmor profili doğru çalışıyor!"</code></pre>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Enforce moduna geçmeden önce tüm çalışma senaryolarını (normal trafik, hata koşulları, log rotation, SSL sertifika yenileme, reload sinyal işleme) complain modunda test edin. Eksik bir kural prodüksiyonda servis kesintisine yol açar. AppArmor'ın <code>audit</code> kuralı ile reddedilen değil, yalnızca izin verilen erişimleri de loglamak mümkündür — profil doğrulama için kullanışlıdır.</p>
+  </div>
+</section>
+
+</main>

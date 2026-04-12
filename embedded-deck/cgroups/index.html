@@ -1,0 +1,656 @@
+---
+layout: tutorial
+title: "cgroups v2 &amp; Namespaces — Container Primitifleri"
+back_url: "../index.html"
+back_label: "embedded-deck"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>LİNUX</span>
+    <span>CGROUPS</span>
+    <span>2026</span>
+  </div>
+  <h1>cgroups v2 &amp; Namespaces<br><em>Container Primitifleri.</em></h1>
+  <p class="subtitle">Linux çekirdeğinin namespace ve cgroup v2 mekanizmalarını kullanarak Docker olmadan sıfırdan container kurma: kaynak izolasyonu, bellek/CPU sınırlama ve güvenli sandbox oluşturma.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Linux izolasyon modeli</a></li>
+    <li><a href="#s1">Namespace türleri</a></li>
+    <li><a href="#s2">cgroups v2 unified hierarchy</a></li>
+    <li><a href="#s3">Memory controller</a></li>
+    <li><a href="#s4">CPU controller</a></li>
+    <li><a href="#s5">IO controller</a></li>
+    <li><a href="#s6">cgroup v2 ve systemd</a></li>
+    <li><a href="#s7">unshare ile sandbox oluşturma</a></li>
+    <li><a href="#s8">Pratik: Minimal container sıfırdan</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Linux izolasyon modeli</h2>
+  <p class="section-lead">Container teknolojisi tamamen yeni bir buluş değildir — Linux çekirdeğinde on yılı aşkın süredir var olan namespace ve cgroup mekanizmalarının üst seviyede paketlenmesidir.</p>
+
+  <h3>Container = cgroup + namespace + chroot</h3>
+  <div class="flow">
+    <pre>
+Container (Docker, Podman, LXC...)
+    |
+    ├── Namespaces (görünüm izolasyonu)
+    │   ├── PID ns    → kendi PID 1'i var
+    │   ├── Net ns    → kendi network stack'i
+    │   ├── Mount ns  → kendi dosya sistemi görünümü
+    │   ├── UTS ns    → kendi hostname'i
+    │   ├── IPC ns    → kendi mesaj kuyruğu
+    │   └── User ns   → UID/GID eşlemesi
+    │
+    ├── cgroups v2 (kaynak sınırlama)
+    │   ├── memory.max  → bellek limiti
+    │   ├── cpu.max     → CPU kota
+    │   └── io.max      → disk I/O limiti
+    │
+    └── chroot / pivot_root (rootfs izolasyonu)
+        └── /container/rootfs → /
+    </pre>
+  </div>
+
+  <h3>Neden cgroup + namespace birlikte kullanılır?</h3>
+  <p>Namespace yalnızca görünüm izolasyonu sağlar — bir process kendi PID namespace'inde PID 1'dir ama fiziksel CPU'yu sınırsız kullanabilir. cgroup ise kaynak kullanımını sınırlar ancak tek başına görünüm izolasyonu sağlamaz. İkisi birlikte gerçek container izolasyonu oluşturur.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Mekanizma</th><th>Sağladığı</th><th>Kernel Sürümü</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>chroot</td><td>Dosya sistemi kökü izolasyonu</td><td>Unix v7 (1979)</td></tr>
+        <tr><td>cgroups v1</td><td>Kaynak sınırlama (hiyerarşik)</td><td>Linux 2.6.24 (2008)</td></tr>
+        <tr><td>Namespaces</td><td>PID/Net/Mount/UTS/IPC/User izolasyonu</td><td>Linux 3.8 (2013)</td></tr>
+        <tr><td>cgroups v2</td><td>Unified hiyerarşi, gelişmiş kontroller</td><td>Linux 4.5 (2016)</td></tr>
+        <tr><td>seccomp</td><td>Sistem çağrısı filtreleme</td><td>Linux 3.5 (2012)</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Namespace türleri</h2>
+  <p class="section-lead">Linux 7 farklı namespace türüne sahiptir. Her biri process'e belirli bir sistem kaynağının izole görünümünü sunar.</p>
+
+  <h3>Namespace türleri ve unshare kullanımı</h3>
+  <div class="params">
+    <div class="param"><span class="name">PID namespace</span><span class="desc">Process ID izolasyonu — container içindeki ilk process PID 1'dir. Dışarıdan görünmez</span></div>
+    <div class="param"><span class="name">Mount namespace</span><span class="desc">Dosya sistemi bağlama noktaları izolasyonu — container içinde /proc /sys tamamen bağımsız</span></div>
+    <div class="param"><span class="name">Network namespace</span><span class="desc">Ağ arayüzleri, routing tablosu, iptables kuralları izolasyonu — her container'ın kendi eth0'ı</span></div>
+    <div class="param"><span class="name">UTS namespace</span><span class="desc">hostname ve domainname izolasyonu — container kendi hostname'ini ayarlayabilir</span></div>
+    <div class="param"><span class="name">IPC namespace</span><span class="desc">System V IPC, POSIX mesaj kuyrukları izolasyonu</span></div>
+    <div class="param"><span class="name">User namespace</span><span class="desc">UID/GID eşlemesi — container içinde root (UID 0), dışarıda normal kullanıcı (UID 1000)</span></div>
+    <div class="param"><span class="name">Time namespace</span><span class="desc">CLOCK_MONOTONIC ve CLOCK_BOOTTIME izolasyonu — Linux 5.6+</span></div>
+  </div>
+
+  <h3>unshare ile namespace oluşturma</h3>
+  <pre><code class="language-bash"># Yeni PID + mount namespace'de bash başlat
+unshare --pid --mount --fork /bin/bash
+
+# Tüm namespace türlerini izole et
+unshare --pid --mount --net --uts --ipc --user \
+    --map-root-user --fork /bin/bash
+
+# UTS namespace'de hostname değiştir (host etkilenmez)
+unshare --uts /bin/bash
+hostname container-01
+hostname  # container-01
+# Başka terminal: hostname → değişmedi
+
+# Mevcut process namespace'lerini listele
+ls -la /proc/self/ns/
+# lrwxrwxrwx 1 root root 0 ... cgroup -> cgroup:[4026531835]
+# lrwxrwxrwx 1 root root 0 ... ipc    -> ipc:[4026531839]
+# lrwxrwxrwx 1 root root 0 ... mnt    -> mnt:[4026531840]
+# lrwxrwxrwx 1 root root 0 ... net    -> net:[4026531840]
+# lrwxrwxrwx 1 root root 0 ... pid    -> pid:[4026531836]
+# lrwxrwxrwx 1 root root 0 ... user   -> user:[4026531837]
+# lrwxrwxrwx 1 root root 0 ... uts    -> uts:[4026531838]</code></pre>
+
+  <h3>nsenter ile namespace'e giriş</h3>
+  <pre><code class="language-bash"># Çalışan bir container'ın (PID 1234) namespace'ine gir
+nsenter --target 1234 --pid --mount --net /bin/bash
+
+# Sadece network namespace'e gir
+nsenter --target 1234 --net ip addr show
+
+# Docker container'ına nsenter ile giriş
+CPID=$(docker inspect --format '{{.State.Pid}}' my-container)
+nsenter --target $CPID --pid --mount --net --uts bash</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> cgroups v2 unified hierarchy</h2>
+  <p class="section-lead">cgroups v2, tüm controllerları tek bir hiyerarşik ağaç altında birleştirerek v1'in çoklu hiyerarşi karmaşıklığını ortadan kaldırır.</p>
+
+  <h3>v1 vs v2 karşılaştırması</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Özellik</th><th>cgroups v1</th><th>cgroups v2</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Hiyerarşi</td><td>Controller başına ayrı ağaç</td><td>Tek unified ağaç</td></tr>
+        <tr><td>Bağlama noktası</td><td>/sys/fs/cgroup/memory/, /sys/fs/cgroup/cpu/ ...</td><td>/sys/fs/cgroup/ tek nokta</td></tr>
+        <tr><td>Thread desteği</td><td>Thread granülasyon yok</td><td>Thread mode controller</td></tr>
+        <tr><td>Pressure</td><td>Yok</td><td>PSI (Pressure Stall Information)</td></tr>
+        <tr><td>Delegation</td><td>Karmaşık</td><td>Temiz, güvenli delegation</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>cgroup v2 filesystem yapısı</h3>
+  <pre><code class="language-bash"># cgroup v2 bağlı mı kontrol et
+mount | grep cgroup
+# cgroup2 on /sys/fs/cgroup type cgroup2 (rw,nosuid,nodev,noexec,...)
+
+# Root cgroup içeriği
+ls /sys/fs/cgroup/
+# cgroup.controllers  cpu.stat   io.stat   memory.stat
+# cgroup.procs        cpu.weight io.weight memory.max
+# cgroup.subtree_control           ...
+
+# Aktif controllerları gör
+cat /sys/fs/cgroup/cgroup.controllers
+# cpuset cpu io memory hugetlb pids rdma misc
+
+# Alt gruplara hangi controller'lar delege edilecek
+cat /sys/fs/cgroup/cgroup.subtree_control
+# cpu io memory pids</code></pre>
+
+  <h3>Yeni cgroup oluşturma</h3>
+  <pre><code class="language-bash"># myapp cgroup oluştur
+mkdir /sys/fs/cgroup/myapp
+
+# Controller'ları etkinleştir
+echo "+memory +cpu +io" > /sys/fs/cgroup/myapp/cgroup.subtree_control
+
+# Process'i cgroup'a ekle
+echo $$ > /sys/fs/cgroup/myapp/cgroup.procs
+
+# Tüm process'leri listele
+cat /sys/fs/cgroup/myapp/cgroup.procs
+
+# Bir process'in cgroup'unu bul
+cat /proc/$$/cgroup
+# 0::/myapp</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Memory controller</h2>
+  <p class="section-lead">Memory controller, bir cgroup'un kullanabileceği fiziksel bellek ve swap miktarını sınırlar; OOM killer davranışını yapılandırır ve bellek baskısını izler.</p>
+
+  <h3>Temel memory kontrolleri</h3>
+  <pre><code class="language-bash">CGRP=/sys/fs/cgroup/myapp
+
+# Bellek limiti: 256 MB
+echo $((256 * 1024 * 1024)) > $CGRP/memory.max
+
+# Yüksek eşik (soft limit — baskı başlar): 200 MB
+echo $((200 * 1024 * 1024)) > $CGRP/memory.high
+
+# Swap limiti (bellek+swap toplamı)
+echo $((512 * 1024 * 1024)) > $CGRP/memory.swap.max
+
+# OOM killer davranışı
+# 0 = normal OOM killer (cgroup içinde process seç)
+# 1 = cgroup başarısız olursa kill (daha deterministik)
+echo 1 > $CGRP/memory.oom.group</code></pre>
+
+  <h3>memory.stat ile izleme</h3>
+  <pre><code class="language-bash">cat /sys/fs/cgroup/myapp/memory.stat
+# anon 41943040         ← anonim bellek (heap/stack)
+# file 10485760         ← dosya cache
+# slab 2097152          ← kernel slab allocator
+# sock 0                ← socket buffer
+# pgfault 10234         ← page fault sayısı
+# pgmajfault 12         ← major (disk) fault sayısı
+# inactive_anon 0
+# active_anon 41943040
+# inactive_file 5242880
+# active_file 5242880
+
+# Anlık kullanım
+cat /sys/fs/cgroup/myapp/memory.current
+# 52428800  → 50 MB kullanımda</code></pre>
+
+  <h3>PSI — Pressure Stall Information</h3>
+  <pre><code class="language-bash"># Bellek baskısı istatistikleri
+cat /sys/fs/cgroup/myapp/memory.pressure
+# some avg10=0.00 avg60=0.00 avg300=0.00 total=0
+# full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+
+# "some" = en az 1 task bekliyor
+# "full" = tüm task'lar bellek için bekliyor
+# avg10/60/300 = 10/60/300 saniye ortalaması (%)</code></pre>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p><code>memory.high</code> yumuşak limit olarak çalışır: limit aşıldığında kernel bellekten geri kazanım (reclaim) yapar ve process yavaşlar. <code>memory.max</code> sert limittir ve aşıldığında OOM killer devreye girer. Önce <code>memory.high</code> ile uyarı almak, sonra <code>memory.max</code> ile sert limit koymak iyi bir pratiktir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> CPU controller</h2>
+  <p class="section-lead">CPU controller, cgroup'ların CPU zamanını ağırlık (weight) veya kota (quota/period) bazlı olarak sınırlamasını sağlar.</p>
+
+  <h3>cpu.weight — göreli ağırlık</h3>
+  <pre><code class="language-bash">CGRP=/sys/fs/cgroup/myapp
+
+# CPU ağırlığı (1–10000, varsayılan 100)
+# myapp'a 2x daha fazla CPU ver
+echo 200 > $CGRP/cpu.weight
+
+# İkinci cgroup oluştur
+mkdir /sys/fs/cgroup/background
+echo 50 > /sys/fs/cgroup/background/cpu.weight
+
+# CPU kullanımı oranı: myapp:background = 200:50 = 4:1
+# Yani myapp sistem yüklüyken 4x daha fazla CPU alır</code></pre>
+
+  <h3>cpu.max — mutlak kota (bandwidth control)</h3>
+  <pre><code class="language-bash"># FORMAT: quota period (microseconds)
+# Her 100ms'de maksimum 50ms CPU kullanabilsin = %50 CPU
+echo "50000 100000" > $CGRP/cpu.max
+
+# %25 CPU limiti
+echo "25000 100000" > $CGRP/cpu.max
+
+# Sınırsız (default)
+echo "max 100000" > $CGRP/cpu.max
+
+# CPU kullanım istatistikleri
+cat $CGRP/cpu.stat
+# usage_usec 1234567      ← toplam CPU kullanımı (µs)
+# user_usec  890000       ← user space
+# system_usec 344567      ← kernel space
+# nr_periods 1000         ← kota periyot sayısı
+# nr_throttled 45         ← throttle olan periyot sayısı
+# throttled_usec 450000   ← throttle süresi (µs)</code></pre>
+
+  <h3>cpuset — CPU core pinleme</h3>
+  <pre><code class="language-bash"># Yalnızca CPU 0 ve 1'i kullan
+echo "0-1" > $CGRP/cpuset.cpus
+
+# NUMA node 0'daki belleği kullan
+echo "0" > $CGRP/cpuset.mems
+
+# cpuset.cpus.effective — gerçekte kullanılan
+cat $CGRP/cpuset.cpus.effective</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> IO controller</h2>
+  <p class="section-lead">IO controller, blok cihazlarına erişimi ağırlık ve mutlak bant genişliği limitleriyle kısıtlar.</p>
+
+  <h3>io.max ile mutlak limit</h3>
+  <pre><code class="language-bash"># Cihaz major:minor numarasını öğren
+ls -la /dev/mmcblk0
+# brw-rw---- 1 root disk 179, 0 /dev/mmcblk0
+# major=179, minor=0
+
+CGRP=/sys/fs/cgroup/myapp
+DEV="179:0"
+
+# Okuma: max 50 MB/s, Yazma: max 10 MB/s
+echo "$DEV rbps=52428800 wbps=10485760" > $CGRP/io.max
+
+# IOPS limiti
+echo "$DEV riops=1000 wiops=100" > $CGRP/io.max
+
+# Her ikisi birlikte
+echo "$DEV rbps=52428800 wbps=10485760 riops=1000 wiops=100" > $CGRP/io.max
+
+# Limiti sıfırla (sınırsız)
+echo "$DEV rbps=max wbps=max riops=max wiops=max" > $CGRP/io.max</code></pre>
+
+  <h3>io.stat ile izleme</h3>
+  <pre><code class="language-bash">cat $CGRP/io.stat
+# 179:0 rbytes=10485760 wbytes=2097152 rios=1024 wios=256 dbytes=0 dios=0
+# rbytes = okunan toplam byte
+# wbytes = yazılan toplam byte
+# rios/wios = okuma/yazma işlem sayısı
+# dbytes/dios = DISCARD istatistikleri</code></pre>
+
+  <h3>io.weight — göreli I/O ağırlığı</h3>
+  <pre><code class="language-bash"># Genel I/O ağırlığı (1–10000, varsayılan 100)
+echo "default 200" > $CGRP/io.weight
+
+# Belirli cihaz için ağırlık
+echo "179:0 300" > $CGRP/io.weight</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> cgroup v2 ve systemd</h2>
+  <p class="section-lead">systemd, cgroup v2'yi birinci sınıf olarak destekler ve her servis, slice ve scope için otomatik cgroup yönetimi yapar.</p>
+
+  <h3>systemd cgroup hiyerarşisi</h3>
+  <div class="flow">
+    <pre>
+/sys/fs/cgroup/
+├── system.slice/          ← sistem servisleri
+│   ├── nginx.service/
+│   ├── sshd.service/
+│   └── myapp.service/
+├── user.slice/            ← kullanıcı oturumları
+│   └── user-1000.slice/
+│       └── session-1.scope/
+└── init.scope/            ← systemd kendisi (PID 1)
+    </pre>
+  </div>
+
+  <h3>Servis kaynak limitleri (unit dosyası)</h3>
+  <pre><code class="language-bash"># /etc/systemd/system/myapp.service
+[Unit]
+Description=My Application
+
+[Service]
+ExecStart=/usr/bin/myapp
+Restart=always
+
+# CPU sınırlama
+CPUWeight=200          # göreli ağırlık (varsayılan 100)
+CPUQuota=50%           # maksimum %50 CPU
+
+# Bellek sınırlama
+MemoryHigh=200M        # soft limit
+MemoryMax=256M         # hard limit (OOM)
+MemorySwapMax=0        # swap kullanma
+
+# IO sınırlama
+IOWeight=100
+IOReadBandwidthMax=/dev/mmcblk0 50M
+IOWriteBandwidthMax=/dev/mmcblk0 10M
+
+# Görev sayısı limiti
+TasksMax=100
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+
+  <h3>systemd-cgtop ile izleme</h3>
+  <pre><code class="language-bash"># Gerçek zamanlı cgroup kaynak kullanımı
+systemd-cgtop
+
+# Sadece bellek sıralaması
+systemd-cgtop --order=memory
+
+# 5 saniye aralıkla
+systemd-cgtop --delay=5
+
+# Belirli servisi sorgula
+systemctl show myapp.service --property=ControlGroup
+# ControlGroup=/system.slice/myapp.service
+
+# Cgroup'daki process'leri listele
+systemd-cgls /system.slice/myapp.service</code></pre>
+
+  <h3>Geçici kaynak limiti (systemd-run)</h3>
+  <pre><code class="language-bash"># Tek seferlik kısıtlı komut çalıştır
+systemd-run --scope \
+    -p MemoryMax=128M \
+    -p CPUQuota=25% \
+    -- /usr/bin/intensive-task arg1 arg2
+
+# Transient service olarak
+systemd-run --unit=my-transient \
+    -p MemoryMax=64M \
+    --remain-after-exit \
+    /bin/sleep 60</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> unshare ile sandbox oluşturma</h2>
+  <p class="section-lead"><code>unshare</code> komutu yeni namespace'ler oluştururken, <code>pivot_root</code> ve <code>capset</code> ile güvenlik sınırlamaları eklenerek Docker benzeri bir sandbox kurulabilir.</p>
+
+  <h3>Temel sandbox scripti</h3>
+  <pre><code class="language-bash">#!/bin/bash
+# sandbox.sh — basit Linux sandbox
+ROOTFS=${1:-/tmp/sandbox-rootfs}
+CMD=${2:-/bin/sh}
+
+# Minimal rootfs oluştur (yoksa)
+if [ ! -d "$ROOTFS" ]; then
+    mkdir -p $ROOTFS/{bin,lib,lib64,proc,sys,dev,tmp}
+    # busybox'ı kopyala
+    cp /bin/busybox $ROOTFS/bin/
+    (cd $ROOTFS/bin && busybox --install .)
+    cp /lib/x86_64-linux-gnu/libc.so.6 $ROOTFS/lib/ 2>/dev/null || true
+    cp /lib64/ld-linux-x86-64.so.2 $ROOTFS/lib64/ 2>/dev/null || true
+fi
+
+# Yeni namespace'lerde çalıştır
+unshare \
+    --mount \
+    --pid \
+    --uts \
+    --ipc \
+    --net \
+    --user \
+    --map-root-user \
+    --fork \
+    /bin/bash -c "
+        # Proc ve sys bağla
+        mount -t proc proc $ROOTFS/proc
+        mount -t sysfs sysfs $ROOTFS/sys
+        mount -t tmpfs tmpfs $ROOTFS/tmp
+        mount --bind /dev $ROOTFS/dev
+
+        # pivot_root ile yeni root'a geç
+        cd $ROOTFS
+        mkdir -p .old_root
+        pivot_root . .old_root
+        cd /
+
+        # Eski root'u unmount et
+        mount --make-rprivate /.old_root
+        umount -l /.old_root
+        rmdir /.old_root
+
+        # Hostname ayarla
+        hostname sandbox-\$\$
+
+        exec $CMD
+    "</code></pre>
+
+  <h3>Capabilities ile kısıtlama</h3>
+  <pre><code class="language-bash">#!/bin/bash
+# capsh ile minimum capability ile çalıştır
+# Sadece net_bind_service ve setuid bırak, diğerlerini kaldır
+
+capsh \
+    --drop=cap_sys_admin,cap_sys_ptrace,cap_net_admin \
+    --caps="cap_net_bind_service+eip cap_setuid+eip" \
+    -- -c "/usr/bin/myserver"
+
+# Çalışan process'in capability'lerini gör
+cat /proc/self/status | grep Cap
+# CapInh: 0000000000000000
+# CapPrm: 0000000000000400
+# CapEff: 0000000000000400
+# CapBnd: 000000000000ffff
+# CapAmb: 0000000000000000
+
+# Decode et
+capsh --decode=0000000000000400
+# 0x0000000000000400=cap_net_bind_service</code></pre>
+
+  <h3>seccomp filtresi</h3>
+  <pre><code class="language-bash"># libseccomp ile tehlikeli syscall'ları engelle (C örneği)
+#include &lt;seccomp.h&gt;
+
+scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_ALLOW);
+
+// ptrace'i engelle
+seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(ptrace), 0);
+// mount'u engelle
+seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(mount), 0);
+// kexec'i engelle
+seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(kexec_load), 0);
+
+seccomp_load(ctx);
+seccomp_release(ctx);</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: Minimal container sıfırdan</h2>
+  <p class="section-lead">Docker kullanmadan, yalnızca unshare + chroot + cgroup v2 ile çalışan minimal bir container kurulumu.</p>
+
+  <h3>Adım 1: Alpine Linux rootfs hazırla</h3>
+  <pre><code class="language-bash">#!/bin/bash
+# Minimal Alpine Linux rootfs indir
+ROOTFS=/tmp/mycontainer
+
+mkdir -p $ROOTFS
+ALPINE_VERSION=3.19
+ARCH=x86_64
+
+# Alpine minirootfs tar'ını indir
+wget -qO /tmp/alpine.tar.gz \
+    "https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/releases/${ARCH}/alpine-minirootfs-${ALPINE_VERSION}.0-${ARCH}.tar.gz"
+
+tar -xzf /tmp/alpine.tar.gz -C $ROOTFS
+echo "Rootfs hazır: $(du -sh $ROOTFS | cut -f1)"</code></pre>
+
+  <h3>Adım 2: cgroup v2 hazırla</h3>
+  <pre><code class="language-bash">#!/bin/bash
+CGROUP_NAME="mycontainer"
+CGRP=/sys/fs/cgroup/$CGROUP_NAME
+
+# cgroup oluştur
+mkdir -p $CGRP
+
+# Controller'ları etkinleştir
+echo "+memory +cpu +pids" > /sys/fs/cgroup/cgroup.subtree_control
+echo "+memory +cpu +pids" > $CGRP/../cgroup.subtree_control 2>/dev/null || true
+
+# Limitler ayarla
+echo $((128 * 1024 * 1024)) > $CGRP/memory.max   # 128 MB
+echo "50000 100000"          > $CGRP/cpu.max       # %50 CPU
+echo "50"                    > $CGRP/pids.max       # max 50 process
+
+echo "cgroup hazır: $CGRP"</code></pre>
+
+  <h3>Adım 3: Container başlat</h3>
+  <pre><code class="language-bash">#!/bin/bash
+# container-run.sh
+ROOTFS=/tmp/mycontainer
+CGRP=/sys/fs/cgroup/mycontainer
+
+# Bu scriptin PID'ini cgroup'a ekle
+echo $$ > $CGRP/cgroup.procs
+
+# Namespace izolasyonu ile çalıştır
+unshare \
+    --mount \
+    --pid \
+    --uts \
+    --ipc \
+    --net \
+    --fork \
+    /bin/bash -c "
+
+    # Mount bind'ları
+    mount --bind $ROOTFS $ROOTFS
+    mount --make-rprivate $ROOTFS
+
+    mkdir -p $ROOTFS/proc $ROOTFS/sys $ROOTFS/dev/pts
+
+    mount -t proc  proc  $ROOTFS/proc
+    mount -t sysfs sysfs $ROOTFS/sys
+    mount -t devpts devpts $ROOTFS/dev/pts
+
+    # Hostname
+    hostname mycontainer
+
+    # pivot_root
+    cd $ROOTFS
+    mkdir -p .oldroot
+    pivot_root . .oldroot
+    cd /
+    umount -l .oldroot
+    rmdir .oldroot
+
+    # DNS
+    echo 'nameserver 1.1.1.1' > /etc/resolv.conf
+
+    # Shell başlat
+    exec /bin/sh -l
+    "
+
+# cgroup temizle
+rmdir $CGRP 2>/dev/null || true</code></pre>
+
+  <h3>Adım 4: Doğrulama</h3>
+  <pre><code class="language-bash"># Container içinde:
+# PID namespace testi
+ps aux
+# PID 1 = sh (kendi PID 1'imiz)
+
+# Hostname testi
+hostname
+# mycontainer
+
+# Bellek limiti testi
+# Python ile 200MB ayırmayı dene
+python3 -c "x = bytearray(200 * 1024 * 1024)"
+# Killed (OOM — 128MB sınırını aştı)
+
+# cgroup durumunu host'tan gör
+cat /sys/fs/cgroup/mycontainer/memory.current
+cat /sys/fs/cgroup/mycontainer/cpu.stat
+cat /sys/fs/cgroup/mycontainer/pids.current</code></pre>
+
+  <h3>Network namespace'e veth çifti ekle</h3>
+  <pre><code class="language-bash">#!/bin/bash
+# container-network.sh — veth çifti ile network bağla
+CONTAINER_PID=$1
+
+# veth çifti oluştur
+ip link add veth0 type veth peer name veth1
+
+# veth1'i container namespace'ine taşı
+ip link set veth1 netns $CONTAINER_PID
+
+# Host tarafını konfigüre et
+ip addr add 10.200.0.1/24 dev veth0
+ip link set veth0 up
+
+# Container namespace içinde konfigüre et
+nsenter --target $CONTAINER_PID --net -- \
+    ip addr add 10.200.0.2/24 dev veth1
+nsenter --target $CONTAINER_PID --net -- \
+    ip link set veth1 up
+nsenter --target $CONTAINER_PID --net -- \
+    ip route add default via 10.200.0.1
+
+# NAT kur
+iptables -t nat -A POSTROUTING -s 10.200.0.0/24 -j MASQUERADE
+echo 1 > /proc/sys/net/ipv4/ip_forward</code></pre>
+
+  <div class="callout">
+    <div class="label">ÖZET</div>
+    <p>Container teknolojisi sihirli bir şey değildir — Linux çekirdeğinin namespace (görünüm izolasyonu) ve cgroup v2 (kaynak sınırlama) mekanizmalarının bir araya getirilmesidir. Docker ve Podman bu primitive'lerin üzerinde kullanıcı dostu bir API sağlar. Temel mekanizmaları anlamak, debug süreçlerini, güvenlik analizini ve özel sandbox gereksinimlerini çok daha kolay hale getirir.</p>
+  </div>
+</section>
+
+</main>

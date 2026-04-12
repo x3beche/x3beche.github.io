@@ -1,0 +1,645 @@
+---
+layout: tutorial
+title: "Thermal Framework — Güç Yönetimi"
+back_url: "../index.html"
+back_label: "Güç Yönetimi & Thermal"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÜÇ YÖNETİMİ</span>
+    <span>THERMAL</span>
+    <span>2026</span>
+  </div>
+  <h1>Thermal Framework —<br><em>trip &amp; cooling.</em></h1>
+  <p class="subtitle">Sıcaklık yönetimi: thermal zone, trip point ve cooling device zinciri. step_wise governor ile i.MX8 CPU freq cooling chain ve Raspberry Pi overtemp politikası.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Linux thermal framework mimarisi</a></li>
+    <li><a href="#s1">DT thermal zone tanımı</a></li>
+    <li><a href="#s2">Cooling device türleri</a></li>
+    <li><a href="#s3">Thermal governor — step_wise, bang_bang, fair_share</a></li>
+    <li><a href="#s4">sysfs arayüzü — okuma ve kontrol</a></li>
+    <li><a href="#s5">Ölçüm ve test — stress-ng, thermald</a></li>
+    <li><a href="#s6">ACPI thermal — laptop senaryosu</a></li>
+    <li><a href="#s7">Kernel config ve sensor driver</a></li>
+    <li><a href="#s8">Pratik: i.MX8 cooling chain · RPi overtemp · custom policy</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Linux thermal framework mimarisi</h2>
+  <p class="section-lead">Linux thermal framework, sıcaklık sensörlerini, soğutma eylemlerini ve politika kararlarını birbirine bağlayan üç bileşenli bir altyapıdır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>Mimari</span><span class="dot">●</span></div>
+    <pre><code>┌──────────────────────────────────────────────────────┐
+│                  thermal core                        │
+│                                                      │
+│  thermal_zone_device   thermal_cooling_device        │
+│         │                       │                    │
+│    trip_points              cooling ops              │
+│         │                       │                    │
+│         └───── governor ────────┘                    │
+│                (step_wise)                           │
+└──────────┬────────────────────────┬─────────────────┘
+           │                        │
+    ┌──────▼──────┐          ┌──────▼──────┐
+    │  Temp Sensor │          │ Cooling Dev │
+    │  (NTC/SoC)   │          │(cpufreq/fan)│
+    └─────────────┘          └─────────────┘</code></pre>
+  </div>
+
+  <h3>Temel bileşenler</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">thermal_zone_device</div><div class="desc">Sıcaklığı izlenen bölge. Her zone bir sensöre bağlıdır ve kendi trip point'lerini ve cooling map'lerini içerir.</div></div>
+    <div class="param"><div class="name">thermal_cooling_device</div><div class="desc">Sıcaklığı düşürmek için kullanılan eylem: CPU frekans azaltma, fan hızı artırma, devfreq vb.</div></div>
+    <div class="param"><div class="name">trip point</div><div class="desc">Belirli bir sıcaklık eşiği. Aşıldığında ilgili cooling device devreye girer.</div></div>
+    <div class="param"><div class="name">governor</div><div class="desc">Hangi cooling state'in seçileceğine karar veren politika motoru.</div></div>
+  </div>
+
+  <h3>Trip point türleri</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">active</div><div class="desc">Fan gibi aktif soğutma cihazları için. Bu eşikte fan devreye girer.</div></div>
+    <div class="param"><div class="name">passive</div><div class="desc">CPU/GPU frekansını düşürme gibi pasif soğutma. Güç tüketimini azaltarak sıcaklığı indirmeye çalışır.</div></div>
+    <div class="param"><div class="name">hot</div><div class="desc">Yüksek sıcaklık uyarısı. Kullanıcı alanına sinyal gönderilir (NETLINK event). Acil önlem alınabilir.</div></div>
+    <div class="param"><div class="name">critical</div><div class="desc">Kritik sıcaklık — kernel sistemi güvenli şekilde kapatır (orderly shutdown veya hardware reset).</div></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> DT thermal zone tanımı</h2>
+  <p class="section-lead">Thermal zone'lar Device Tree'de tanımlanır. Sensör, trip point'ler ve cooling map'ler bir arada belirtilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts — thermal zone örneği (Raspberry Pi benzeri)</span><span class="dot">●</span></div>
+    <pre><code>/ {
+    thermal-zones {
+        cpu_thermal: cpu-thermal {
+            polling-delay-passive = &lt;250&gt;;  /* ms, passive trip kontrolü */
+            polling-delay          = &lt;1000&gt;; /* ms, normal polling */
+
+            /* Sıcaklık sensörü */
+            thermal-sensors = &lt;&amp;cpu_tsens 0&gt;;
+
+            trips {
+                cpu_alert0: cpu-alert-0 {
+                    temperature = &lt;70000&gt;;  /* 70°C — milli-celsius */
+                    hysteresis  = &lt;2000&gt;;   /* 2°C histerezis */
+                    type = "passive";
+                };
+                cpu_alert1: cpu-alert-1 {
+                    temperature = &lt;80000&gt;;  /* 80°C */
+                    hysteresis  = &lt;2000&gt;;
+                    type = "passive";
+                };
+                cpu_hot: cpu-hot {
+                    temperature = &lt;85000&gt;;  /* 85°C */
+                    hysteresis  = &lt;2000&gt;;
+                    type = "hot";
+                };
+                cpu_crit: cpu-crit {
+                    temperature = &lt;95000&gt;;  /* 95°C — kritik */
+                    hysteresis  = &lt;5000&gt;;
+                    type = "critical";
+                };
+            };
+
+            cooling-maps {
+                map0 {
+                    trip = &lt;&amp;cpu_alert0&gt;;
+                    cooling-device = &lt;&amp;cpu0 THERMAL_NO_LIMIT 2&gt;;
+                    /* cooling state 0→2: frekansı %33 düşür */
+                };
+                map1 {
+                    trip = &lt;&amp;cpu_alert1&gt;;
+                    cooling-device = &lt;&amp;cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT&gt;;
+                    /* maksimum soğutma */
+                };
+                map2 {
+                    trip = &lt;&amp;cpu_alert0&gt;;
+                    cooling-device = &lt;&amp;fan0 1 3&gt;;
+                    /* fan state 1→3: düşük→yüksek hız */
+                };
+            };
+        };
+    };
+};</code></pre>
+  </div>
+
+  <h3>Çoklu thermal zone</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts — birden fazla zone</span><span class="dot">●</span></div>
+    <pre><code>thermal-zones {
+    cpu_thermal:   cpu-thermal   { thermal-sensors = &lt;&amp;tsens 0&gt;; ... };
+    gpu_thermal:   gpu-thermal   { thermal-sensors = &lt;&amp;tsens 1&gt;; ... };
+    board_thermal: board-thermal { thermal-sensors = &lt;&amp;ntc_sensor&gt;;  ... };
+};</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Cooling device türleri</h2>
+  <p class="section-lead">Cooling device, bir sıcaklık eşiği aşıldığında sistemin sıcaklığını düşürmek için aldığı somut eylemdir. Her cihazın N+1 adet "state"i vardır (0 = soğutma yok, N = maksimum soğutma).</p>
+
+  <h3>cpufreq cooling (cpu-thermal)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># cpu-thermal cooling device state'leri</span>
+cat /sys/class/thermal/cooling_device0/type
+<span class="cmt"># thermal-cpufreq-0</span>
+
+cat /sys/class/thermal/cooling_device0/max_state
+<span class="cmt"># 4  (4 = en yüksek throttling)</span>
+
+cat /sys/class/thermal/cooling_device0/cur_state
+<span class="cmt"># 0  (şu an throttling yok)</span>
+
+<span class="cmt"># elle state değiştir (test için)</span>
+echo 2 > /sys/class/thermal/cooling_device0/cur_state</code></pre>
+  </div>
+
+  <h3>PWM fan cooling</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts — pwm-fan</span><span class="dot">●</span></div>
+    <pre><code>fan0: pwm-fan {
+    compatible = "pwm-fan";
+    pwms = &lt;&amp;pwm1 0 10000 0&gt;;   /* 100Hz PWM */
+    #cooling-cells = &lt;2&gt;;
+    cooling-levels = &lt;0 64 128 192 255&gt;; /* 5 state: kapalı→tam */
+};</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — fan kontrolü</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># fan cooling device</span>
+cat /sys/class/thermal/cooling_device1/type
+<span class="cmt"># pwm-fan</span>
+
+cat /sys/class/thermal/cooling_device1/max_state
+<span class="cmt"># 4</span>
+
+<span class="cmt"># fan'ı orta hıza al (state 2)</span>
+echo 2 > /sys/class/thermal/cooling_device1/cur_state</code></pre>
+  </div>
+
+  <h3>devfreq cooling</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts — GPU devfreq cooling</span><span class="dot">●</span></div>
+    <pre><code>gpu: gpu@ff300000 {
+    compatible = "rockchip,rk3399-mali";
+    #cooling-cells = &lt;2&gt;;
+    operating-points-v2 = &lt;&amp;gpu_opp_table&gt;;
+};
+
+/* thermal zone cooling-map'te */
+map_gpu {
+    trip = &lt;&amp;cpu_alert1&gt;;
+    cooling-device = &lt;&amp;gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT&gt;;
+};</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Thermal governor — step_wise, bang_bang, fair_share</h2>
+  <p class="section-lead">Thermal governor, sıcaklık trip'lerle karşılaşıldığında cooling device state'ini nasıl ayarlayacağına karar verir.</p>
+
+  <div class="params">
+    <div class="param"><div class="name">step_wise (varsayılan)</div><div class="desc">Sıcaklık arttıkça cooling state'i bir adım artırır, azaldıkça bir adım düşürür. Yumuşak geçişler sağlar. Gömülü sistemler için önerilir.</div></div>
+    <div class="param"><div class="name">bang_bang</div><div class="desc">Trip aşılırsa maksimum soğutmaya gider, düşülürse tamamen kapatır. Hızlı ama agresif; fan gürültüsü için uygun değil.</div></div>
+    <div class="param"><div class="name">fair_share</div><div class="desc">Birden fazla cooling device'ı eşit şekilde paylaştırır. CPU+GPU paylaşımlı soğutma senaryolarında kullanışlı.</div></div>
+    <div class="param"><div class="name">user_space</div><div class="desc">Kararı tamamen kullanıcı alanına bırakır (thermald gibi daemon'lar için).</div></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — governor değiştirme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># mevcut governor</span>
+cat /sys/class/thermal/thermal_zone0/policy
+<span class="cmt"># step_wise</span>
+
+<span class="cmt"># mevcut seçenekler</span>
+cat /sys/class/thermal/thermal_zone0/available_policies
+<span class="cmt"># step_wise fair_share bang_bang user_space</span>
+
+<span class="cmt"># user_space moduna geç (thermald için)</span>
+echo user_space > /sys/class/thermal/thermal_zone0/policy</code></pre>
+  </div>
+
+  <h3>step_wise algoritması</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Pseudocode — step_wise</span><span class="dot">●</span></div>
+    <pre><code>for each trip_point (high → low sıcaklık):
+    if temp >= trip_temp:
+        if cur_state < max_state:
+            cur_state++          /* bir adım daha soğut */
+        break
+    else if temp < (trip_temp - hysteresis):
+        if cur_state > 0:
+            cur_state--          /* bir adım gevşet */</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> sysfs arayüzü — okuma ve kontrol</h2>
+  <p class="section-lead">/sys/class/thermal/ altında her thermal zone ve cooling device için ayrı bir dizin bulunur.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># tüm thermal zone'ları listele</span>
+ls /sys/class/thermal/
+<span class="cmt"># cooling_device0  cooling_device1  thermal_zone0  thermal_zone1</span>
+
+<span class="cmt"># zone0 sıcaklığını oku (milli-Celsius)</span>
+cat /sys/class/thermal/thermal_zone0/temp
+<span class="cmt"># 52000  → 52°C</span>
+
+<span class="cmt"># zone0 tipi</span>
+cat /sys/class/thermal/thermal_zone0/type
+<span class="cmt"># cpu-thermal</span>
+
+<span class="cmt"># trip point'leri oku</span>
+cat /sys/class/thermal/thermal_zone0/trip_point_0_temp
+<span class="cmt"># 70000  → 70°C</span>
+cat /sys/class/thermal/thermal_zone0/trip_point_0_type
+<span class="cmt"># passive</span>
+
+<span class="cmt"># tüm zone'ların sıcaklığını tek satırda izle</span>
+watch -n1 'for z in /sys/class/thermal/thermal_zone*/; do
+    name=$(cat "${z}type" 2>/dev/null)
+    temp=$(cat "${z}temp" 2>/dev/null)
+    echo "${name}: $((temp/1000))°C"
+done'
+
+<span class="cmt"># cooling device durumu</span>
+for cd in /sys/class/thermal/cooling_device*/; do
+    type=$(cat "${cd}type")
+    cur=$(cat  "${cd}cur_state")
+    max=$(cat  "${cd}max_state")
+    echo "$type: $cur/$max"
+done</code></pre>
+  </div>
+
+  <h3>Trip point'leri sysfs'ten değiştir</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># trip_point sıcaklığını değiştir (root gerekli)</span>
+echo 75000 > /sys/class/thermal/thermal_zone0/trip_point_0_temp
+
+<span class="cmt"># thermal zone'u izleme moduna al veya devre dışı bırak</span>
+cat /sys/class/thermal/thermal_zone0/mode
+<span class="cmt"># enabled</span>
+
+echo disabled > /sys/class/thermal/thermal_zone0/mode
+echo enabled  > /sys/class/thermal/thermal_zone0/mode</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Ölçüm ve test — stress-ng, thermald</h2>
+  <p class="section-lead">Thermal sistemini test etmek için CPU'yu ısıtmak ve throttling başlangıcını gözlemlemek gerekir.</p>
+
+  <h3>stress-ng ile ısınma testi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 4 CPU worker ile 60 saniye yükle</span>
+stress-ng --cpu 4 --timeout 60s &amp;
+
+<span class="cmt"># eş zamanlı sıcaklık ve frekans izle</span>
+while true; do
+    temp=$(cat /sys/class/thermal/thermal_zone0/temp)
+    freq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq)
+    cstate=$(cat /sys/class/thermal/cooling_device0/cur_state 2>/dev/null || echo N/A)
+    printf "[%s] Temp: %d°C  Freq: %dMHz  CoolState: %s\n" \
+        "$(date +%T)" "$((temp/1000))" "$((freq/1000))" "$cstate"
+    sleep 1
+done</code></pre>
+  </div>
+
+  <h3>thermald daemon</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — thermald kurulum ve kullanım</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Ubuntu/Debian</span>
+apt install thermald
+
+<span class="cmt"># thermald başlat</span>
+systemctl enable --now thermald
+
+<span class="cmt"># durum</span>
+systemctl status thermald
+<span class="cmt"># ● thermald.service - Thermal Daemon Service
+#   Loaded: loaded (/lib/systemd/system/thermald.service)
+#   Active: active (running)</span>
+
+<span class="cmt"># özel thermal konfigürasyon</span>
+cat /etc/thermald/thermal-conf.xml
+<span class="cmt"># thermald politikasını özelleştirmek için XML dosyasını düzenle</span>
+
+<span class="cmt"># debug modu</span>
+thermald --no-daemon --loglevel=debug 2&gt;&amp;1 | grep -E "(zone|trip|cool)"</code></pre>
+  </div>
+
+  <h3>Thermal event izleme (NETLINK)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>python3 — thermal netlink olayları</span><span class="dot">●</span></div>
+    <pre><code>#!/usr/bin/env python3
+"""Kernel thermal event'lerini NETLINK üzerinden izle"""
+import socket, struct
+
+NETLINK_KOBJECT_UEVENT = 15
+sock = socket.socket(socket.AF_NETLINK,
+                     socket.SOCK_RAW,
+                     NETLINK_KOBJECT_UEVENT)
+sock.bind((0, 1))
+
+print("Thermal event'ler bekleniyor...")
+while True:
+    data = sock.recv(4096).decode('utf-8', errors='ignore')
+    if 'thermal' in data.lower() or 'TEMP' in data:
+        events = [e for e in data.split('\x00') if e]
+        for e in events:
+            if any(k in e for k in ['TEMP', 'thermal', 'trip']):
+                print(f"  {e}")</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> ACPI thermal — laptop senaryosu</h2>
+  <p class="section-lead">x86 laptop/sunucu sistemlerde thermal zone'lar ACPI BIOS tabloları tarafından tanımlanır. Linux bu bilgileri ACPI _TZ (Thermal Zone) metodları aracılığıyla okur.</p>
+
+  <div class="params">
+    <div class="param"><div class="name">_TZ</div><div class="desc">ACPI Thermal Zone — sıcaklık sensörü ve politikasının tanımlandığı ACPI namespace nesnesi.</div></div>
+    <div class="param"><div class="name">_TMP</div><div class="desc">Anlık sıcaklık değeri (ACPI metodla okunur).</div></div>
+    <div class="param"><div class="name">_PSV</div><div class="desc">Passive Cooling başlama sıcaklığı.</div></div>
+    <div class="param"><div class="name">_HOT</div><div class="desc">Hot temperature — bu noktada kernel "hot" event üretir.</div></div>
+    <div class="param"><div class="name">_CRT</div><div class="desc">Critical temperature — bu noktada kernel sistemi kapatır.</div></div>
+    <div class="param"><div class="name">_AC0.._AC9</div><div class="desc">Active Cooling sıcaklıkları (fan devreye giriş noktaları).</div></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — ACPI thermal debug</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ACPI thermal zone'ları listele</span>
+ls /sys/bus/acpi/devices/ | grep TZ
+<span class="cmt"># ACPI0008:00  TZ00  TZ01</span>
+
+<span class="cmt"># ACPI thermal zone bilgisi</span>
+cat /sys/class/thermal/thermal_zone0/type
+<span class="cmt"># acpitz</span>
+
+<span class="cmt"># acpi_dump ile ACPI tablolarını oku</span>
+acpidump | acpixtract -a
+iasl -d DSDT.dat
+grep -A20 "ThermalZone" DSDT.dsl | head -40
+
+<span class="cmt"># thermal ACPI event'lerini izle</span>
+acpi_listen
+<span class="cmt"># ACPI group thermal PNP0C14:00 0000005c 00000000</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Kernel config ve sensor driver</h2>
+  <p class="section-lead">Thermal framework için temel Kconfig seçenekleri ve yaygın sensör driver'ları.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig</span><span class="dot">●</span></div>
+    <pre><code>CONFIG_THERMAL=y
+CONFIG_THERMAL_OF=y                 <span class="cmt"># Device Tree binding</span>
+CONFIG_THERMAL_STATISTICS=y        <span class="cmt"># sysfs istatistikleri</span>
+CONFIG_THERMAL_WRITABLE_TRIPS=y    <span class="cmt"># sysfs'ten trip değiştirme</span>
+
+<span class="cmt"># Governor'lar</span>
+CONFIG_THERMAL_GOV_STEP_WISE=y
+CONFIG_THERMAL_GOV_BANG_BANG=y
+CONFIG_THERMAL_GOV_FAIR_SHARE=y
+CONFIG_THERMAL_GOV_USER_SPACE=y
+
+<span class="cmt"># Cooling device'lar</span>
+CONFIG_CPU_THERMAL=y               <span class="cmt"># cpufreq cooling</span>
+CONFIG_DEVFREQ_THERMAL=y           <span class="cmt"># devfreq cooling</span>
+CONFIG_THERMAL_EMULATION=y         <span class="cmt"># test için sıcaklık emülasyonu</span>
+
+<span class="cmt"># Platform sensor driver'ları</span>
+CONFIG_IMX_THERMAL=y               <span class="cmt"># i.MX6/7/8 TMPMON</span>
+CONFIG_ROCKCHIP_THERMAL=y          <span class="cmt"># RK3368/3399/3568</span>
+CONFIG_BCM2711_THERMAL=y           <span class="cmt"># Raspberry Pi 4</span>
+
+<span class="cmt"># Harici sensörler (hwmon bridge)</span>
+CONFIG_NTC_THERMISTOR=y            <span class="cmt"># NTC termistör</span>
+CONFIG_SENSORS_BD70528=y           <span class="cmt"># ROHM BD718xx PMIC sensörü</span></code></pre>
+  </div>
+
+  <h3>NTC termistör DT tanımı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts — NTC termistör</span><span class="dot">●</span></div>
+    <pre><code>/ {
+    /* Sabit voltaj bölücü için */
+    ntc_vref: ntc-vref {
+        compatible = "voltage-divider";
+        io-channels = &lt;&amp;adc 0&gt;;
+        output-ohms  = &lt;10000&gt;;     /* pull-up R: 10kΩ */
+        full-ohms    = &lt;20000&gt;;     /* tam ölçek R */
+    };
+
+    ntc_temp: ntc-thermistor {
+        compatible = "epcos,b57891s0103";  /* NTC B57891S0103A010 */
+        io-channels = &lt;&amp;ntc_vref&gt;;
+        #thermal-sensor-cells = &lt;0&gt;;
+    };
+
+    thermal-zones {
+        board_thermal: board-thermal {
+            thermal-sensors = &lt;&amp;ntc_temp&gt;;
+            polling-delay = &lt;5000&gt;;
+            trips {
+                board_hot {
+                    temperature = &lt;60000&gt;;
+                    type = "hot";
+                    hysteresis = &lt;2000&gt;;
+                };
+            };
+        };
+    };
+};</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: i.MX8 cooling chain · RPi overtemp · custom policy</h2>
+  <p class="section-lead">Üç pratik senaryo: i.MX8'de CPU freq cooling zinciri inceleme, Raspberry Pi'de overtemp uyarısı ve özel thermal policy scripti.</p>
+
+  <h3>1 — i.MX8 Thermal Zone + CPU Freq Cooling Chain</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — i.MX8MQ thermal analizi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># i.MX8 TMPMON thermal zone'ları</span>
+ls /sys/class/thermal/
+<span class="cmt"># cooling_device0  thermal_zone0  thermal_zone1</span>
+
+cat /sys/class/thermal/thermal_zone0/type
+<span class="cmt"># imx_thermal_zone</span>
+
+cat /sys/class/thermal/thermal_zone1/type
+<span class="cmt"># imx_thermal_zone</span>
+
+<span class="cmt"># trip point yapısını oku</span>
+for i in 0 1 2; do
+    temp=$(cat /sys/class/thermal/thermal_zone0/trip_point_${i}_temp 2>/dev/null)
+    type=$(cat /sys/class/thermal/thermal_zone0/trip_point_${i}_type 2>/dev/null)
+    echo "trip$i: ${temp}m°C ($((temp/1000))°C) — $type"
+done
+<span class="cmt"># trip0: 85000m°C (85°C) — passive
+# trip1: 95000m°C (95°C) — hot
+# trip2: 105000m°C (105°C) — critical</span>
+
+<span class="cmt"># cooling zincirini test et (stress ile)</span>
+stress-ng --cpu 4 --timeout 120s &amp;
+STRESS_PID=$!
+
+while kill -0 $STRESS_PID 2>/dev/null; do
+    temp=$(cat /sys/class/thermal/thermal_zone0/temp)
+    freq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq)
+    cstate=$(cat /sys/class/thermal/cooling_device0/cur_state)
+    echo "[$(date +%T)] ${temp}m°C | ${freq}kHz | cooling_state=$cstate"
+    sleep 2
+done</code></pre>
+  </div>
+
+  <h3>2 — Raspberry Pi Overtemp Uyarısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — RPi thermal monitoring</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># RPi'de iki yöntem: vcgencmd ve sysfs</span>
+vcgencmd measure_temp
+<span class="cmt"># temp=52.1'C</span>
+
+cat /sys/class/thermal/thermal_zone0/temp
+<span class="cmt"># 52104</span>
+
+<span class="cmt"># RPi throttling eşikleri:
+# 80°C → CPU freq cap başlar
+# 85°C → CPU throttle (1.5GHz → 600MHz)
+# 90°C → ARM freq drop
+# 95°C → critical</span>
+
+<span class="cmt"># overtemp LED göstergesi scripti</span>
+cat &lt;&lt;'EOF' &gt; /usr/local/bin/thermal_led.sh
+#!/bin/bash
+TEMP_WARN=75000    # 75°C
+TEMP_CRIT=85000    # 85°C
+LED=/sys/class/leds/ACT/trigger
+
+while true; do
+    temp=$(cat /sys/class/thermal/thermal_zone0/temp)
+    if [ "$temp" -ge "$TEMP_CRIT" ]; then
+        echo "timer"   > $LED    # hızlı yanıp sönme
+        logger -p daemon.warning "CPU CRITICAL TEMP: $((temp/1000))C"
+    elif [ "$temp" -ge "$TEMP_WARN" ]; then
+        echo "heartbeat" > $LED  # yavaş yanıp sönme
+    else
+        echo "none" > $LED       # normal
+    fi
+    sleep 5
+done
+EOF
+chmod +x /usr/local/bin/thermal_led.sh</code></pre>
+  </div>
+
+  <h3>3 — Özel Thermal Policy Scripti</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>python3 — özel thermal policy</span><span class="dot">●</span></div>
+    <pre><code>#!/usr/bin/env python3
+"""
+Özel thermal policy: sıcaklığa göre fan hızı + CPU freq kombinasyonu.
+Gereksinim: thermal_zone0 user_space policy, fan ve cpufreq cooling device.
+"""
+import time, os, subprocess
+
+ZONE   = "/sys/class/thermal/thermal_zone0"
+FAN_CD = "/sys/class/thermal/cooling_device1"   # pwm-fan
+CPU_CD = "/sys/class/thermal/cooling_device0"   # cpufreq
+
+def read_temp():
+    with open(f"{ZONE}/temp") as f:
+        return int(f.read().strip()) // 1000  # °C
+
+def set_cooling(device, state):
+    with open(f"{device}/cur_state", 'w') as f:
+        f.write(str(state))
+
+def get_max_state(device):
+    with open(f"{device}/max_state") as f:
+        return int(f.read().strip())
+
+def policy(temp_c):
+    """Sıcaklığa göre fan ve CPU state döndür"""
+    if   temp_c &lt; 50: return 0, 0        # fan kapalı, CPU tam hız
+    elif temp_c &lt; 60: return 1, 0        # fan düşük, CPU normal
+    elif temp_c &lt; 70: return 2, 1        # fan orta, CPU hafif throttle
+    elif temp_c &lt; 80: return 3, 2        # fan yüksek, CPU throttle
+    else:             return 4, 4        # fan max, CPU min
+
+# user_space policy aktifleştir
+with open(f"{ZONE}/policy", 'w') as f:
+    f.write("user_space")
+
+FAN_MAX = get_max_state(FAN_CD)
+CPU_MAX = get_max_state(CPU_CD)
+
+print("Thermal policy başlatıldı")
+while True:
+    temp = read_temp()
+    fan_state, cpu_state = policy(temp)
+
+    # state'leri sınırla
+    fan_state = min(fan_state, FAN_MAX)
+    cpu_state = min(cpu_state, CPU_MAX)
+
+    set_cooling(FAN_CD, fan_state)
+    set_cooling(CPU_CD, cpu_state)
+
+    print(f"[{time.strftime('%H:%M:%S')}] "
+          f"Temp={temp}°C  Fan={fan_state}/{FAN_MAX}  "
+          f"CPU_throttle={cpu_state}/{CPU_MAX}")
+    time.sleep(5)</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">PRODUCTION NOTU</div>
+    <p>Özel policy script'i systemd service olarak çalıştırmak için <code class="inline">Restart=always</code> ve <code class="inline">RestartSec=5</code> ekle. Policy daemon çöktüğünde sistem çok yüksek sıcaklıkta sınırsız çalışabilir; bu kritik bir güvenlik riskidir. Watchdog entegrasyonu zorunludur.</p>
+  </div>
+
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

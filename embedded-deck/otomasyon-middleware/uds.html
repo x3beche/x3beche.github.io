@@ -1,0 +1,620 @@
+---
+layout: tutorial
+title: "UDS — Otomotiv Middleware"
+back_url: "../index.html"
+back_label: "Otomotiv Middleware"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>OTOMOTİV MİDDLEWARE</span>
+    <span>UDS ISO 14229</span>
+    <span>2026</span>
+  </div>
+  <h1>UDS<br><em>ISO 14229 araç diagnostics protokolü.</em></h1>
+  <p class="subtitle">Tüm OEM'lerin kullandığı standart — session kontrolü, güvenlik erişimi, DTC yönetimi ve yazılım güncellemesi tek protokolde.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">UDS nedir — ISO 14229</a></li>
+    <li><a href="#s1">OSI katman modeli</a></li>
+    <li><a href="#s2">Service ID tablosu</a></li>
+    <li><a href="#s3">Session yönetimi</a></li>
+    <li><a href="#s4">SecurityAccess — seed/key</a></li>
+    <li><a href="#s5">DID — Data Identifier okuma/yazma</a></li>
+    <li><a href="#s6">DTC okuma ve yönetimi</a></li>
+    <li><a href="#s7">python-udsoncan ile UDS istemcisi</a></li>
+    <li><a href="#s8">Pratik: ECU tester ve yazılım indirme</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> UDS nedir — ISO 14229</h2>
+  <p class="section-lead">UDS (Unified Diagnostic Services), ISO 14229-1 standardıyla tanımlanmış araç diagnostics protokolüdür. Tüm büyük OEM'ler (BMW, Mercedes, VW, Toyota, Ford) bu standardı uygular.</p>
+
+  <p>UDS'nin temel işlevleri şunlardır:</p>
+
+  <ul>
+    <li>ECU'ya bağlan ve teşhis session'ı aç</li>
+    <li>Hata kodlarını (DTC) oku ve sil</li>
+    <li>ECU parametrelerini oku/yaz (VIN, kalibrasyon değerleri)</li>
+    <li>Güvenlik erişimi ile yazılım güncellemesi yap (flash)</li>
+    <li>Rutin testleri çalıştır (sensör kalibrasyonu, aktuatör testi)</li>
+  </ul>
+
+  <div class="flow">
+    <pre>
+  ┌──────────────────────────────────────────────────────────┐
+  │                   UDS Kullanım Alanı                     │
+  ├──────────────────────────────────────────────────────────┤
+  │  Servis Merkezi      │ Araç bakımı, DTC okuma/silme      │
+  │  OEM Test Hattı      │ Üretim sonu kalibrasyon, flash    │
+  │  OTA Güncelleme      │ DoIP + UDS ile uzaktan flash      │
+  │  Araç Geliştirme     │ ECU kalibrasyonu, değer yazma     │
+  │  Araştırma           │ Araç güvenlik analizi             │
+  └──────────────────────────────────────────────────────────┘
+    </pre>
+  </div>
+
+  <h3>Temel Kavramlar</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">Tester</div><div class="desc">Teşhis cihazı. Fiziksel OBD-II dongle, laptop yazılımı veya Python scripti olabilir.</div></div>
+    <div class="param"><div class="name">ECU (Server)</div><div class="desc">UDS servislerini sunan araç birimi. Her ECU farklı bir adrese sahiptir.</div></div>
+    <div class="param"><div class="name">DID</div><div class="desc">Data Identifier — 2 byte'lık veri nesnesi kimliği. VIN = 0xF190, software version = 0xF101.</div></div>
+    <div class="param"><div class="name">DTC</div><div class="desc">Diagnostic Trouble Code — arıza kodu. ISO 15031-6 formatı: P0301 (ateşleme hatası) gibi.</div></div>
+    <div class="param"><div class="name">Service ID (SID)</div><div class="desc">1 byte'lık hizmet kodu. İstek için doğrudan SID, yanıt için SID + 0x40 kullanılır.</div></div>
+  </div>
+
+  <div class="callout">
+    <div class="label">ISO 14229 YAPILANMASI</div>
+    <p>ISO 14229 çok bölümlüdür: -1 uygulama katmanı (bu rehber), -2 session ve transport, -3 UDS on CAN, -5 UDS on Internet. DoIP (ISO 13400) ile birlikte UDS, Ethernet üzerinden de çalışır.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> OSI katman modeli</h2>
+  <p class="section-lead">UDS, uygulama katmanı protokolüdür. Altındaki katmanlar farklı fiziksel ortamlara göre değişebilir — CAN veya Ethernet.</p>
+
+  <div class="flow">
+    <pre>
+  ┌─────────────────────────────────────────────────────────────┐
+  │  Uygulama Katmanı   │  UDS (ISO 14229-1)                    │
+  │                     │  Service: 0x22 ReadDataByIdentifier   │
+  ├─────────────────────┼─────────────────────────────────────┤
+  │  Transport Katmanı  │  ISO-TP (ISO 15765-2)                 │
+  │                     │  Single/First/Consecutive Frame       │
+  ├──────────┬──────────┴─────────────────────────────────────┤
+  │  CAN yolu│  Ağ Katmanı   │  IPv4 / IPv6                    │
+  │          │  Veri Katmanı │  CAN 2.0B / CAN FD              │
+  │          │               │                                  │
+  │  IP yolu │  Transport    │  TCP (DoIP)                     │
+  │          │  Ağ           │  IPv4 / IPv6                    │
+  │          │  Veri         │  Ethernet                       │
+  └──────────┴───────────────┴─────────────────────────────────┘
+    </pre>
+  </div>
+
+  <h3>ISO-TP (ISO 15765-2)</h3>
+
+  <p>CAN frame'i maksimum 8 byte taşır. UDS mesajları daha büyük olabileceğinden ISO-TP segmentasyon/yeniden birleştirme yapar:</p>
+
+  <div class="params">
+    <div class="param"><div class="name">Single Frame (SF)</div><div class="desc">Toplam veri 7 byte veya daha az. Tek CAN frame'e sığar. PCI byte: 0x0N (N = uzunluk).</div></div>
+    <div class="param"><div class="name">First Frame (FF)</div><div class="desc">Çok parçalı mesajın ilk frame'i. PCI: 0x1NNN (NNN = toplam uzunluk). İlk 6 byte veri içerir.</div></div>
+    <div class="param"><div class="name">Consecutive Frame (CF)</div><div class="desc">Devam frame'leri. PCI: 0x2N (N = sıra numarası 1–15, sonra 0'a döner).</div></div>
+    <div class="param"><div class="name">Flow Control (FC)</div><div class="desc">Alıcı, göndereni yavaşlatmak için FC gönderir. BlockSize ve STmin parametrelerini belirler.</div></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>ISO-TP örnek — UDS Request (0x22 F190 = VIN oku)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tester → ECU (CAN ID: 0x7DF broadcast veya 0x7E0 + ECU offset)</span>
+<span class="cmt"># Single Frame: PCI=0x03 (3 byte), SID=0x22, DID=0xF190</span>
+CAN ID: 0x7DF
+Data:   03 22 F1 90 00 00 00 00
+
+<span class="cmt"># ECU → Tester (First Frame: toplam 20 byte VIN yanıtı)</span>
+CAN ID: 0x7E8
+Data:   10 14 62 F1 90 31 47 31   <span class="cmt"># FF: len=0x14=20, SID+0x40=0x62</span>
+
+<span class="cmt"># Tester → ECU (Flow Control: devam et)</span>
+CAN ID: 0x7DF
+Data:   30 00 00 00 00 00 00 00   <span class="cmt"># FC: BS=0 (sınırsız), STmin=0</span>
+
+<span class="cmt"># ECU → Tester (Consecutive Frame 1)</span>
+CAN ID: 0x7E8
+Data:   21 46 4A 31 32 33 34 35   <span class="cmt"># CF sn=1</span>
+
+<span class="cmt"># ECU → Tester (Consecutive Frame 2)</span>
+CAN ID: 0x7E8
+Data:   22 36 37 38 39 30 31 32   <span class="cmt"># CF sn=2, VIN tamamlandı</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Service ID tablosu</h2>
+  <p class="section-lead">UDS, her biri bir araç diagnostics işlevi için ayrılmış Service ID'lerden oluşur. Yanıtlar her zaman SID + 0x40 şeklindedir; hata yanıtı 0x7F SID NRC formatındadır.</p>
+
+  <div class="params">
+    <div class="param"><div class="name">0x10 — DiagnosticSessionControl</div><div class="desc">Teşhis session'ını değiştirir. Sub-func: 0x01=Default, 0x02=Programming, 0x03=Extended.</div></div>
+    <div class="param"><div class="name">0x11 — ECUReset</div><div class="desc">ECU'yu yeniden başlatır. Sub-func: 0x01=HardReset, 0x02=KeyOffOnReset, 0x03=SoftReset.</div></div>
+    <div class="param"><div class="name">0x14 — ClearDiagnosticInformation</div><div class="desc">DTC'leri siler. Parametre: DTC group (0xFFFFFF = tüm DTC'ler).</div></div>
+    <div class="param"><div class="name">0x19 — ReadDTCInformation</div><div class="desc">DTC listesini ve detaylarını okur. Birçok sub-function ile farklı filtreleme imkânı sunar.</div></div>
+    <div class="param"><div class="name">0x22 — ReadDataByIdentifier</div><div class="desc">DID (Data Identifier) ile veri okur. Tek istekte birden fazla DID sorgulanabilir.</div></div>
+    <div class="param"><div class="name">0x27 — SecurityAccess</div><div class="desc">Güvenlik kilidi açar. Seed/Key mekanizması. Hassas işlemler (flash, kalibrasyon) için gereklidir.</div></div>
+    <div class="param"><div class="name">0x2E — WriteDataByIdentifier</div><div class="desc">DID'e veri yazar. SecurityAccess sonrası kullanılır. VIN, kalibrasyon verisi yazılabilir.</div></div>
+    <div class="param"><div class="name">0x31 — RoutineControl</div><div class="desc">Aktuatör testi, kalibrasyon rutini gibi ECU içi prosedürleri tetikler. Start/Stop/Result sub-func.</div></div>
+    <div class="param"><div class="name">0x34 — RequestDownload</div><div class="desc">ECU'ya veri (firmware) indirme işlemini başlatır. Adres ve boyut bilgisi içerir.</div></div>
+    <div class="param"><div class="name">0x36 — TransferData</div><div class="desc">0x34 sonrası veri bloklarını ECU'ya iletir. Block Sequence Counter ile sıra doğrulaması yapılır.</div></div>
+    <div class="param"><div class="name">0x37 — RequestTransferExit</div><div class="desc">Transfer tamamlandığında oturumu kapatır. Checksum doğrulaması burada yapılabilir.</div></div>
+    <div class="param"><div class="name">0x3E — TesterPresent</div><div class="desc">Non-default session'ı canlı tutar. ECU, belirli süre TesterPresent görmezse Default Session'a döner.</div></div>
+  </div>
+
+  <h3>Negatif Yanıt Kodları (NRC)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Negatif yanıt formatı ve yaygın kodlar</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Format: 7F [SID] [NRC]</span>
+<span class="cmt"># Örnek: 0x27 SecurityAccess'e hatalı key gönderildi</span>
+7F 27 35   <span class="cmt"># NRC 0x35 = invalidKey</span>
+
+<span class="cmt"># Yaygın NRC kodları</span>
+<span class="cmt"># 0x10 — generalReject</span>
+<span class="cmt"># 0x11 — serviceNotSupported</span>
+<span class="cmt"># 0x12 — subFunctionNotSupported</span>
+<span class="cmt"># 0x13 — incorrectMessageLengthOrInvalidFormat</span>
+<span class="cmt"># 0x22 — conditionsNotCorrect (wrong session)</span>
+<span class="cmt"># 0x24 — requestSequenceError (wrong order)</span>
+<span class="cmt"># 0x31 — requestOutOfRange (invalid DID)</span>
+<span class="cmt"># 0x33 — securityAccessDenied</span>
+<span class="cmt"># 0x35 — invalidKey</span>
+<span class="cmt"># 0x36 — exceededNumberOfAttempts</span>
+<span class="cmt"># 0x37 — requiredTimeDelayNotExpired</span>
+<span class="cmt"># 0x78 — requestCorrectlyReceivedResponsePending (ECU meşgul, bekle)</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Session yönetimi</h2>
+  <p class="section-lead">UDS üç temel session türü tanımlar. Her session farklı bir yetki seviyesini ve erişilebilir servisleri kapsar.</p>
+
+  <div class="params">
+    <div class="param"><div class="name">Default Session (0x01)</div><div class="desc">ECU başlarken girer. Araç çalışırken daima bu session aktiftir. Temel okuma işlemleri izinlidir.</div></div>
+    <div class="param"><div class="name">Programming Session (0x02)</div><div class="desc">Yazılım güncellemesi için. Firmware flash işlemleri (0x34/36/37) bu session'da yapılır. ECU genellikle boot mode'a geçer.</div></div>
+    <div class="param"><div class="name">Extended Diagnostic Session (0x03)</div><div class="desc">Gelişmiş kalibrasyon ve güvenlik erişimi. SecurityAccess servisi bu session'da kullanılır.</div></div>
+  </div>
+
+  <h3>Session Zamanlama Parametreleri</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">P2 (50ms tipik)</div><div class="desc">Tester'ın yanıt bekleme süresi. ECU bu süre içinde yanıt veya 0x78 (pending) göndermelidir.</div></div>
+    <div class="param"><div class="name">P2* (5000ms tipik)</div><div class="desc">0x78 pending aldıktan sonra genişletilmiş bekleme süresi. Flash işlemleri uzun sürebilir.</div></div>
+    <div class="param"><div class="name">S3 (5000ms tipik)</div><div class="desc">Non-default session'da TesterPresent mesajları arası maksimum süre. Aşılırsa Default Session'a dönülür.</div></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>Session geçiş akışı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1. Default → Extended Session aç</span>
+<span class="cmt"># İstek:  10 03</span>
+<span class="cmt"># Yanıt:  50 03 00 32 01 F4  (P2=50ms, P2*=500ms)</span>
+
+<span class="cmt"># 2. Session canlı tut (her 4.5 saniyede bir)</span>
+<span class="cmt"># İstek:  3E 00  (TesterPresent, suppress response)</span>
+<span class="cmt"># Yanıt:  7E 00  (ya da suppress bit ile yanıt yok)</span>
+
+<span class="cmt"># 3. Default Session'a dön</span>
+<span class="cmt"># İstek:  10 01</span>
+<span class="cmt"># Yanıt:  50 01 ...</span>
+
+<span class="cmt"># 4. ECU Reset</span>
+<span class="cmt"># İstek:  11 01  (Hard Reset)</span>
+<span class="cmt"># Yanıt:  51 01  (sonra ECU yeniden başlar)</span></code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">S3 TIMER</div>
+    <p>Extended veya Programming session'da çalışırken S3 timer'ı aşmamaya dikkat et. Script içinde <code class="inline">TesterPresent (0x3E 0x80)</code> mesajlarını periyodik gönder. <code class="inline">0x80</code> sub-function "suppressPosRspMsgIndicationBit" anlamına gelir — yanıt istemediğini belirtir ve ağ trafiğini azaltır.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> SecurityAccess — seed/key mekanizması</h2>
+  <p class="section-lead">Hassas ECU işlemleri (yazılım güncelleme, kalibrasyon yazma) güvenlik kilidi arkasında bulunur. SecurityAccess (0x27) servisi challenge-response yöntemiyle bu kilidi açar.</p>
+
+  <h3>Seed/Key Akışı</h3>
+
+  <div class="flow">
+    <pre>
+  Tester                                    ECU
+    │                                         │
+    │── 27 01 (requestSeed, level 1) ────────►│
+    │                                         │  random seed üret
+    │◄─ 67 01 [seed bytes] ───────────────────│
+    │                                         │
+    │  key = f(seed, secret_algorithm)        │
+    │                                         │
+    │── 27 02 [key bytes] ────────────────────►│
+    │                              key doğrula│
+    │◄─ 67 02 (accessGranted) ────────────────│
+    │                                         │
+    │  Artık kısıtlı servisler kullanılabilir │
+    </pre>
+  </div>
+
+  <h3>Security Level'lar</h3>
+
+  <p>Her OEM farklı security level'lar tanımlar. Genel kural:</p>
+
+  <ul>
+    <li>Odd sub-function (0x01, 0x03, 0x05...): seed iste</li>
+    <li>Even sub-function (0x02, 0x04, 0x06...): key gönder</li>
+    <li>Level 0x01/0x02: geliştirici erişimi</li>
+    <li>Level 0x11/0x12: ECU supplier erişimi</li>
+    <li>Level 0x21/0x22: OEM erişimi (üretim hattı)</li>
+  </ul>
+
+  <h3>Brute Force Koruması</h3>
+
+  <p>ECU, ardışık yanlış key denemelerini sayar. Genellikle 3 yanlış denemeden sonra:</p>
+  <ul>
+    <li>Belirli süre (delay timer) yeni seed talebi reddeder (NRC 0x37)</li>
+    <li>Bazı ECU'larda kalıcı kilitleme gerektirir servis merkezi müdahalesi</li>
+  </ul>
+
+  <div class="code-block">
+    <div class="code-header"><span>Örnek seed/key algoritması (basit XOR — gerçek değil)</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">def</span> <span class="cmd">calculate_key</span>(seed: bytes, secret: int = <span class="num">0xABCD1234</span>) -&gt; bytes:
+    <span class="str">"""
+    Gerçek araçlarda bu algoritma OEM tarafından gizli tutulur.
+    Tersine mühendislik veya NDA ile temin edilir.
+    """</span>
+    seed_int = int.from_bytes(seed, <span class="str">'big'</span>)
+    key_int = seed_int ^ secret
+    key_int = ((key_int &lt;&lt; 3) | (key_int &gt;&gt; 29)) &amp; <span class="num">0xFFFFFFFF</span>
+    <span class="keyword">return</span> key_int.to_bytes(4, <span class="str">'big'</span>)
+
+<span class="cmt"># Kullanım:</span>
+seed = bytes.fromhex(<span class="str">'12 34 56 78'</span>.replace(<span class="str">' '</span>, <span class="str">''</span>))
+key  = calculate_key(seed)
+print(<span class="str">f"Seed: {seed.hex()}, Key: {key.hex()}"</span>)</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">GÜVENLİK NOTU</div>
+    <p>Gerçek araçlarda SecurityAccess algoritması OEM sırrıdır. GDPR ve araç güvenliği yasaları kapsamında bu algoritmanın izinsiz tersine mühendisliği yasal sorun yaratabilir. Araştırma ortamında kendi test ECU'nuzla çalışın.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> DID — Data Identifier okuma/yazma</h2>
+  <p class="section-lead">DID (Data Identifier), ECU içindeki veri nesnelerini tanımlayan 2 byte'lık anahtarlardır. ISO 14229 bazı standart DID'leri tanımlar; OEM'ler kendi özel DID'lerini ekler.</p>
+
+  <h3>Standart DID'ler</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">0xF190 — VINDataIdentifier</div><div class="desc">17 karakter araç kimlik numarası (VIN). ISO 3779 formatı. Örnek: 1G1JC5SH2F4176831.</div></div>
+    <div class="param"><div class="name">0xF101 — ECUSoftwareVersionNumber</div><div class="desc">ECU yazılım versiyon numarası. Format OEM'e göre değişir.</div></div>
+    <div class="param"><div class="name">0xF181 — ApplicationSoftwareFingerprint</div><div class="desc">Yüklü yazılımın parmak izi (hash veya versiyon bilgisi).</div></div>
+    <div class="param"><div class="name">0xF186 — ActiveDiagnosticSessionDataIdentifier</div><div class="desc">Mevcut aktif session ID'sini döner.</div></div>
+    <div class="param"><div class="name">0xF18A — SystemSupplierECUSoftwareVersionNumber</div><div class="desc">ECU tedarikçi yazılım versiyonu.</div></div>
+    <div class="param"><div class="name">0xF18B — ECUManufacturingDate</div><div class="desc">ECU üretim tarihi (YYYYMMDD ASCII formatında).</div></div>
+    <div class="param"><div class="name">0xF18C — ECUSerialNumber</div><div class="desc">ECU seri numarası.</div></div>
+  </div>
+
+  <h3>Tek istek — birden fazla DID</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>UDS ReadDataByIdentifier — ham çerçeve</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tek DID: VIN oku</span>
+<span class="cmt"># İstek:  22 F1 90</span>
+<span class="cmt"># Yanıt:  62 F1 90 [17 byte VIN ASCII]</span>
+
+<span class="cmt"># İki DID aynı anda: VIN + SW Version</span>
+<span class="cmt"># İstek:  22 F1 90 F1 01</span>
+<span class="cmt"># Yanıt:  62 F1 90 [17 byte] F1 01 [N byte versiyon]</span>
+
+<span class="cmt"># Örnek yanıt (ASCII VIN: "1G1JC5444Y7123456")</span>
+62 F1 90 \
+31 47 31 4A 43 35 34 34 \   <span class="cmt"># 1G1JC544</span>
+34 59 37 31 32 33 34 35 \   <span class="cmt"># 4Y712345</span>
+36                          <span class="cmt"># 6</span></code></pre>
+  </div>
+
+  <h3>DID Yazma — WriteDataByIdentifier (0x2E)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>UDS WriteDataByIdentifier — VIN yaz (kalibrasyon hattında)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Önce Extended Session ve SecurityAccess gerekli</span>
+<span class="cmt"># İstek:  2E F1 90 [17 byte VIN]</span>
+<span class="cmt"># Yanıt:  6E F1 90  (başarılı)</span>
+<span class="cmt"># Hata:   7F 2E 22  (conditionsNotCorrect — wrong session)</span>
+
+<span class="cmt"># Yeni VIN: "WBAC5441X1LB12345"</span>
+2E F1 90 \
+57 42 41 43 35 34 34 31 \   <span class="cmt"># WBAC5441</span>
+58 31 4C 42 31 32 33 34 \   <span class="cmt"># X1LB1234</span>
+35                          <span class="cmt"># 5</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> DTC okuma ve yönetimi</h2>
+  <p class="section-lead">0x19 ReadDTCInformation servisi, ECU'da kayıtlı arıza kodlarını (DTC) çeşitli kriterlere göre sorgular. DTC statusByte, arızanın mevcut durumunu kodlar.</p>
+
+  <h3>0x19 Sub-function'ları</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">0x01 — reportNumberOfDTCByStatusMask</div><div class="desc">Belirtilen status maskesine uyan DTC sayısını döner. Hızlı sayım için kullanılır.</div></div>
+    <div class="param"><div class="name">0x02 — reportDTCByStatusMask</div><div class="desc">Status maskesine uyan tüm DTC'leri listeler. En yaygın kullanılan sub-function.</div></div>
+    <div class="param"><div class="name">0x06 — reportDTCExtDataRecordByDTCNumber</div><div class="desc">Belirli bir DTC için genişletilmiş veri (freeze frame, oluşma sayısı) döner.</div></div>
+    <div class="param"><div class="name">0x0A — reportSupportedDTC</div><div class="desc">ECU'nun desteklediği tüm DTC'leri listeler. Araç geliştirme ve validasyon için kullanılır.</div></div>
+  </div>
+
+  <h3>statusByte Anatomisi</h3>
+
+  <div class="flow">
+    <pre>
+  Bit 7  Bit 6  Bit 5  Bit 4  Bit 3  Bit 2  Bit 1  Bit 0
+  ──────────────────────────────────────────────────────
+   WIR   TNASF   TNCSLC  PDTC  CDTC  PDTCSNC  TFTOC  TF
+    │      │       │       │     │      │         │     │
+    │      │       │       │     │      │         │     └─ testFailed (şu an arıza var)
+    │      │       │       │     │      │         └─ testFailedThisOperationCycle
+    │      │       │       │     │      └─ pendingDTC (bu sürüş döngüsünde başarısız)
+    │      │       │       │     └─ confirmedDTC (yeterince tekrar etti)
+    │      │       │       └─ pendingDTCnotConfirmed
+    │      │       └─ testNotCompletedSinceLastClear
+    │      └─ testNotCompletedThisOperationCycle
+    └─ warningIndicatorRequested (MIL lambası)
+    </pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>DTC okuma — ham çerçeve</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm aktif (testFailed) DTC'leri iste: statusMask = 0x01</span>
+<span class="cmt"># İstek:  19 02 01</span>
+<span class="cmt"># Yanıt:  59 02 FF [DTC1 3 byte] [status1] [DTC2 3 byte] [status2] ...</span>
+
+<span class="cmt"># Yanıt parse:</span>
+<span class="cmt"># 59 02 FF        — SID+0x40, sub-func, DTC format</span>
+<span class="cmt"># 00 12 34 09     — DTC: P0x1234, status: 0x09 (TF=1, confirmed=1)</span>
+<span class="cmt"># 00 45 67 0F     — DTC: P0x4567, status: 0x0F</span>
+
+<span class="cmt"># Tüm DTC'leri sil</span>
+<span class="cmt"># İstek:  14 FF FF FF</span>
+<span class="cmt"># Yanıt:  54</span></code></pre>
+  </div>
+
+  <h3>DTC Formatı</h3>
+
+  <p>ISO 15031-6 DTC formatı: 3 byte. İlk 2 bit domain kodunu, geri kalanı arıza numarasını belirler.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>Python — DTC decode</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">def</span> <span class="cmd">decode_dtc</span>(dtc_bytes: bytes) -&gt; str:
+    domain = {0: <span class="str">'P'</span>, 1: <span class="str">'C'</span>, 2: <span class="str">'B'</span>, 3: <span class="str">'U'</span>}
+    high = dtc_bytes[0]
+    code = ((high &amp; 0x3F) &lt;&lt; 8) | dtc_bytes[1]
+    d = domain[(high &gt;&gt; 6) &amp; 0x03]
+    <span class="keyword">return</span> <span class="str">f"{d}{code:04X}"</span>
+
+<span class="cmt"># Örnek: 0x001234 → P1234</span>
+print(decode_dtc(bytes([<span class="num">0x00</span>, <span class="num">0x12</span>, <span class="num">0x34</span>])))  <span class="cmt"># P1234</span>
+print(decode_dtc(bytes([<span class="num">0x40</span>, <span class="num">0x45</span>, <span class="num">0x67</span>])))  <span class="cmt"># C4567</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> python-udsoncan ile UDS istemcisi</h2>
+  <p class="section-lead">python-udsoncan, UDS protokolünü Python'da kolayca kullanmanızı sağlayan bir kütüphanedir. ISO-TP transport katmanı için python-can veya doipclient ile çalışır.</p>
+
+  <h3>Kurulum</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">pip</span> install udsoncan python-can
+<span class="cmt"># DoIP transport için:</span>
+<span class="cmd">pip</span> install doipclient</code></pre>
+  </div>
+
+  <h3>CAN üzerinde UDS — tam örnek</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Python</span><span class="dot">●</span></div>
+    <pre><code"><span class="keyword">import</span> udsoncan
+<span class="keyword">from</span> udsoncan.connections <span class="keyword">import</span> PythonIsoTpConnection
+<span class="keyword">from</span> udsoncan.client <span class="keyword">import</span> Client
+<span class="keyword">import</span> isotp
+<span class="keyword">import</span> can
+
+<span class="cmt"># CAN bus ve ISO-TP bağlantısı kur (SocketCAN: vcan0)</span>
+bus = can.interface.Bus(channel=<span class="str">'vcan0'</span>, bustype=<span class="str">'socketcan'</span>)
+tp_addr = isotp.Address(isotp.AddressingMode.Normal_11bits,
+                        txid=<span class="num">0x7E0</span>, rxid=<span class="num">0x7E8</span>)
+stack = isotp.CanStack(bus=bus, address=tp_addr)
+conn  = PythonIsoTpConnection(stack)
+
+config = udsoncan.configs.default_client_config.copy()
+config[<span class="str">'request_timeout'</span>] = 5
+
+<span class="keyword">with</span> Client(conn, config=config) <span class="keyword">as</span> client:
+
+    <span class="cmt"># 1. Extended Session aç</span>
+    client.change_session(
+        udsoncan.services.DiagnosticSessionControl.Session.extendedDiagnosticSession)
+    print(<span class="str">"Extended session açıldı"</span>)
+
+    <span class="cmt"># 2. SecurityAccess — seed iste, key hesapla, gönder</span>
+    result = client.request_seed(<span class="num">0x01</span>)
+    seed = result.service_data.seed
+    key  = calculate_key(seed)   <span class="cmt"># OEM'e özgü algoritma</span>
+    client.send_key(<span class="num">0x02</span>, key)
+    print(<span class="str">"SecurityAccess başarılı"</span>)
+
+    <span class="cmt"># 3. VIN oku</span>
+    result = client.read_data_by_identifier([<span class="num">0xF190</span>])
+    vin = result.service_data.values[<span class="num">0xF190</span>].decode(<span class="str">'ascii'</span>)
+    print(<span class="str">f"VIN: {vin}"</span>)
+
+    <span class="cmt"># 4. DTC listesini oku</span>
+    result = client.get_dtc_by_status_mask(<span class="num">0xFF</span>)
+    <span class="keyword">for</span> dtc_entry <span class="keyword">in</span> result.service_data.dtcs:
+        print(<span class="str">f"DTC: {dtc_entry.id:06X}  Status: {dtc_entry.status.get_byte():02X}"</span>)
+
+    <span class="cmt"># 5. DTC'leri temizle</span>
+    client.clear_dtc(<span class="num">0xFFFFFF</span>)
+    print(<span class="str">"DTC'ler temizlendi"</span>)
+
+    <span class="cmt"># 6. ECU soft reset</span>
+    client.ecu_reset(udsoncan.services.ECUReset.ResetType.softReset)</code></pre>
+  </div>
+
+  <h3>TesterPresent döngüsü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Python — background TesterPresent thread</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> threading, time
+
+<span class="keyword">def</span> <span class="cmd">keep_session_alive</span>(client, interval=4.5):
+    <span class="keyword">while</span> <span class="keyword">not</span> stop_event.is_set():
+        <span class="keyword">try</span>:
+            client.tester_present(suppress_positive_response=<span class="keyword">True</span>)
+        <span class="keyword">except</span>:
+            <span class="keyword">pass</span>
+        time.sleep(interval)
+
+stop_event = threading.Event()
+tp_thread = threading.Thread(target=keep_session_alive,
+                             args=(client,), daemon=<span class="keyword">True</span>)
+tp_thread.start()
+<span class="cmt"># ... UDS işlemler ...</span>
+stop_event.set()</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: ECU tester ve yazılım indirme</h2>
+  <p class="section-lead">Raspberry Pi + MCP2515 SPI-CAN modülü ile gerçek CAN bus'a bağlan, VIN oku ve UDS 0x34/36/37 servisleriyle yazılım indirme akışını uygula.</p>
+
+  <h3>Donanım Kurulumu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Raspberry Pi MCP2515 kurulumu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># /boot/config.txt eklemeleri</span>
+dtparam=spi=on
+dtoverlay=mcp2515-can0,oscillator=8000000,interrupt=25
+
+<span class="cmt"># CAN interface'i başlat</span>
+<span class="cmd">sudo</span> <span class="cmd">ip</span> link set can0 up type can bitrate 500000
+<span class="cmd">ip</span> <span class="flag">-details</span> link show can0
+
+<span class="cmt"># Test: candump ile CAN trafiği izle</span>
+<span class="cmd">candump</span> can0</code></pre>
+  </div>
+
+  <h3>Yazılım İndirme Akışı (0x34/36/37)</h3>
+
+  <div class="flow">
+    <pre>
+  Tester                                    ECU
+    │                                         │
+    │── 10 02 (Programming Session) ─────────►│
+    │◄─ 50 02 ────────────────────────────────│
+    │                                         │
+    │── 27 11 (Seed Request) ─────────────────►│
+    │◄─ 67 11 [seed] ─────────────────────────│
+    │── 27 12 [key]  ─────────────────────────►│
+    │◄─ 67 12 ────────────────────────────────│
+    │                                         │
+    │── 34 00 44 [addr:4] [len:4] ────────────►│  RequestDownload
+    │◄─ 74 20 [maxBlockLen:2] ────────────────│  maxBlockSize
+    │                                         │
+    │── 36 01 [block data] ──────────────────►│  TransferData blk 1
+    │◄─ 76 01 ────────────────────────────────│
+    │── 36 02 [block data] ──────────────────►│  TransferData blk 2
+    │◄─ 76 02 ────────────────────────────────│
+    │  ... (tüm bloklar) ...                  │
+    │── 37 (RequestTransferExit) ────────────►│
+    │◄─ 77 ───────────────────────────────────│
+    │── 31 01 FF 01 (CheckProgrammingDep.) ──►│  Opsiyonel
+    │◄─ 71 01 FF 01 ──────────────────────────│
+    │── 11 01 (ECU Hard Reset) ──────────────►│
+    </pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>Python — firmware flash akışı</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> udsoncan
+<span class="keyword">from</span> udsoncan.client <span class="keyword">import</span> Client
+
+<span class="keyword">def</span> <span class="cmd">flash_firmware</span>(client, firmware_path: str, flash_addr: int):
+    <span class="keyword">with</span> open(firmware_path, <span class="str">'rb'</span>) <span class="keyword">as</span> f:
+        firmware = f.read()
+
+    <span class="cmt"># Programming session</span>
+    client.change_session(
+        udsoncan.services.DiagnosticSessionControl.Session.programmingSession)
+
+    <span class="cmt"># Security access</span>
+    seed = client.request_seed(<span class="num">0x11</span>).service_data.seed
+    client.send_key(<span class="num">0x12</span>, calculate_key(seed))
+
+    <span class="cmt"># RequestDownload: mem addr 4 byte, len 4 byte</span>
+    mem_addr = udsoncan.MemoryLocation(
+        address=flash_addr,
+        memorysize=len(firmware),
+        address_format=32, memorysize_format=32)
+
+    result = client.request_download(
+        memory_location=mem_addr,
+        dfi=udsoncan.DataFormatIdentifier(0x00))  <span class="cmt"># no compression</span>
+
+    max_block = result.service_data.max_length
+    print(<span class="str">f"Max blok boyutu: {max_block} byte"</span>)
+
+    <span class="cmt"># TransferData bloklar halinde</span>
+    block_seq = 1
+    offset = 0
+    <span class="keyword">while</span> offset &lt; len(firmware):
+        chunk = firmware[offset:offset + max_block - 2]
+        client.transfer_data(block_seq, chunk)
+        offset += len(chunk)
+        block_seq = (block_seq % 0xFF) + 1
+        print(<span class="str">f"  {offset}/{len(firmware)} byte aktarıldı"</span>)
+
+    <span class="cmt"># Transfer tamamla</span>
+    client.request_transfer_exit()
+    print(<span class="str">"Flash tamamlandı, ECU resetleniyor..."</span>)
+
+    <span class="cmt"># ECU reset</span>
+    client.ecu_reset(udsoncan.services.ECUReset.ResetType.hardReset)
+
+<span class="cmt"># Örnek kullanım:</span>
+<span class="cmt"># flash_firmware(client, 'firmware_v2.bin', 0x08000000)</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">CANdela Studio</div>
+    <p>CANdela Studio (Vector Informatik), araç OEM'lerinin UDS servis tanımlarını (.cdd dosyası) oluşturmak için kullandığı ticari araçtır. python-udsoncan, .cdd dosyalarından otomatik DID/DTC yapılarını yükleyebilir. Açık kaynak alternatif: <strong>diag-gui</strong> veya <strong>python-uds</strong>.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

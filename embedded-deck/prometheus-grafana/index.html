@@ -1,0 +1,727 @@
+---
+layout: tutorial
+title: "Prometheus & Grafana — Gömülü Sistem İzleme"
+back_url: "../index.html"
+back_label: "embedded-deck"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>LİNUX ARAÇLAR</span>
+    <span>PROMETHEUS</span>
+    <span>2026</span>
+  </div>
+  <h1>Prometheus &amp; Grafana<br><em>Gömülü sistemleri gözlemleyin.</em></h1>
+  <p class="subtitle">CPU frekansından sıcaklığa, bellek baskısından özel donanım metriklerine — Prometheus pull modeli ve Grafana görselleştirme ile gömülü cihaz filonuzu tek yerden izleyin.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Neden metrik izleme?</a></li>
+    <li><a href="#s1">Prometheus mimarisi</a></li>
+    <li><a href="#s2">node_exporter</a></li>
+    <li><a href="#s3">Custom exporter yazma</a></li>
+    <li><a href="#s4">PromQL sorgu dili</a></li>
+    <li><a href="#s5">Grafana kurulumu ve dashboard</a></li>
+    <li><a href="#s6">Embedded device dashboard</a></li>
+    <li><a href="#s7">collectd entegrasyonu</a></li>
+    <li><a href="#s8">Pratik: Raspberry Pi fleet izleme</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Neden metrik izleme?</h2>
+  <p class="section-lead">Gömülü sistemler genellikle uzak konumlarda, müdahale imkânı kısıtlı ortamlarda çalışır. Sorun yaşandıktan sonra log incelemek yerine, sorun oluşmadan önce eşik aşımlarını tespit etmek — gözlemlenebilirlik (observability) — prodüksiyon kalitesinin temel göstergesidir.</p>
+
+  <h3>Gömülü sistemde monitoring gereksinimleri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Thermal yönetimi</span><span class="desc">SoC sıcaklığı eşiği aşmadan önce uyarı — kritik uygulamalarda thermal throttling öncesi aksiyon</span></div>
+    <div class="param"><span class="name">Bellek baskısı</span><span class="desc">OOM killer devreye girmeden önce bellek tükenmesini tespit et — mmzone, slab, fragmentation</span></div>
+    <div class="param"><span class="name">Depolama sağlığı</span><span class="desc">eMMC/flash yıpranma, I/O gecikme artışı, filesystem doluluk — veri kaybı önleme</span></div>
+    <div class="param"><span class="name">Ağ kalitesi</span><span class="desc">Paket kayıpları, yüksek gecikme, bant genişliği doyması — bağlantı sorunlarının erken tespiti</span></div>
+    <div class="param"><span class="name">Uygulama sağlığı</span><span class="desc">Process çökmesi, restart sayısı, yanıt süresi — servis kalitesi izleme</span></div>
+  </div>
+
+  <h3>Gözlemlenebilirlik üçgeni</h3>
+
+  <div class="flow">
+    <pre>
+              Metrics (Prometheus)
+                 / sayısal veriler \
+                /                   \
+               /                     \
+       Logs --+---- Observability ----+-- Traces
+        (loki)    üçgeni tamamlar    (jaeger/tempo)
+    </pre>
+  </div>
+
+  <p>Bu rehberde odak noktamız <strong>metrics</strong> — sayısal zaman serisi verisi. Logs ve traces ayrı konulardır; Loki ve Tempo Grafana ekosisteminde bu eksikleri kapatır ancak gömülü sistemlerde genellikle metrics tek başına yeterlidir.</p>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Prometheus mimarisi</h2>
+  <p class="section-lead">Prometheus, pull (çekme) tabanlı bir izleme sistemidir. Hedef sistemler HTTP /metrics endpoint'i sunar; Prometheus periyodik olarak bu endpoint'i scrape eder ve TSDB'ye (Time Series Database) yazar.</p>
+
+  <div class="flow">
+    <pre>
+  ┌──────────────┐     scrape     ┌──────────────────────────┐
+  │  node_exporter│◄──────────────│                          │
+  │  :9100/metrics│               │   Prometheus Server      │
+  └──────────────┘               │                          │
+                                  │   ┌──────────────────┐   │
+  ┌──────────────┐               │   │   TSDB (chunks)   │   │
+  │custom_exporter◄──────────────│   │   /data/chunks_  │   │
+  │  :8080/metrics│               │   └──────────────────┘   │
+  └──────────────┘               │           │               │
+                                  │     PromQL engine         │
+  ┌──────────────┐    push        │           │               │
+  │  Pushgateway │───────────────►│           │               │
+  └──────────────┘               └─────────┬─┘               │
+                                            │                 │
+                              ┌─────────────▼───────────────┐│
+                              │     Alertmanager            ││
+                              │  (email/slack/pagerduty)    ││
+                              └─────────────────────────────┘│
+                                            │
+                              ┌─────────────▼───────────────┐
+                              │       Grafana               │
+                              │  Datasource: Prometheus      │
+                              └─────────────────────────────┘
+    </pre>
+  </div>
+
+  <h3>prometheus.yml temel yapılandırma</h3>
+
+  <pre><code class="language-bash">global:
+  scrape_interval:     15s   # Her 15 saniyede bir scrape
+  evaluation_interval: 15s   # Alert kurallarını değerlendir
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+rule_files:
+  - "alerts/*.yml"
+
+scrape_configs:
+  # Prometheus'un kendisini izlemesi
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Statik hedef listesi
+  - job_name: 'embedded_devices'
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    static_configs:
+      - targets:
+          - '192.168.1.10:9100'   # cihaz-1
+          - '192.168.1.11:9100'   # cihaz-2
+          - '192.168.1.12:9100'   # cihaz-3
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: '(.*):.*'
+        target_label: instance
+
+  # Dinamik keşif (file-based SD)
+  - job_name: 'dynamic_devices'
+    file_sd_configs:
+      - files: ['/etc/prometheus/targets/*.json']
+        refresh_interval: 1m</code></pre>
+
+  <h3>TSDB saklama ayarları</h3>
+
+  <pre><code class="language-bash"># Prometheus başlatma parametreleri
+/usr/local/bin/prometheus \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/var/lib/prometheus \
+  --storage.tsdb.retention.time=30d \     # 30 gün saklama
+  --storage.tsdb.retention.size=10GB \    # veya 10GB ile sınırla
+  --web.listen-address=0.0.0.0:9090 \
+  --web.enable-lifecycle                  # /-/reload endpoint'i</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> node_exporter</h2>
+  <p class="section-lead">node_exporter, Linux sistem metriklerini Prometheus formatında sunan resmi exporter'dır. /proc ve /sys dosya sistemlerinden okuyarak CPU, bellek, disk, ağ ve sıcaklık metriklerini yayınlar.</p>
+
+  <h3>ARM binary kurulumu (gömülü cihaz)</h3>
+
+  <pre><code class="language-bash"># ARMv7 (Raspberry Pi 2/3 32-bit)
+wget https://github.com/prometheus/node_exporter/releases/download/v1.8.2/\
+node_exporter-1.8.2.linux-armv7.tar.gz
+tar xf node_exporter-1.8.2.linux-armv7.tar.gz
+sudo cp node_exporter-1.8.2.linux-armv7/node_exporter /usr/local/bin/
+
+# ARM64 (Raspberry Pi 4/5, 64-bit OS)
+wget https://github.com/prometheus/node_exporter/releases/download/v1.8.2/\
+node_exporter-1.8.2.linux-arm64.tar.gz
+
+# systemd servisi
+sudo tee /etc/systemd/system/node_exporter.service &lt;&lt; 'EOF'
+[Unit]
+Description=Prometheus Node Exporter
+After=network.target
+
+[Service]
+Type=simple
+User=node_exporter
+ExecStart=/usr/local/bin/node_exporter \
+    --collector.systemd \
+    --collector.processes \
+    --collector.hwmon \
+    --collector.thermal_zone \
+    --collector.cpu.info \
+    --web.listen-address=:9100
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo useradd -rs /bin/false node_exporter
+sudo systemctl daemon-reload
+sudo systemctl enable --now node_exporter</code></pre>
+
+  <h3>Önemli metrikler</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Metrik</th><th>Tip</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>node_cpu_seconds_total</code></td><td>Counter</td><td>Mod bazında CPU zamanı (user/system/idle/iowait)</td></tr>
+        <tr><td><code>node_memory_MemAvailable_bytes</code></td><td>Gauge</td><td>Kullanılabilir bellek — MemFree + cache/buffer</td></tr>
+        <tr><td><code>node_disk_io_time_seconds_total</code></td><td>Counter</td><td>Disk I/O'da geçen toplam süre — utilization için kullanılır</td></tr>
+        <tr><td><code>node_network_receive_bytes_total</code></td><td>Counter</td><td>Arayüz başına alınan byte sayısı</td></tr>
+        <tr><td><code>node_thermal_zone_temp</code></td><td>Gauge</td><td>Termal zon sıcaklığı (Celsius × 1000)</td></tr>
+        <tr><td><code>node_hwmon_temp_celsius</code></td><td>Gauge</td><td>hwmon sensör sıcaklıkları (CPU, GPU, board)</td></tr>
+        <tr><td><code>node_filesystem_avail_bytes</code></td><td>Gauge</td><td>Dosya sistemi kullanılabilir alan</td></tr>
+        <tr><td><code>node_load1</code></td><td>Gauge</td><td>1 dakikalık yük ortalaması</td></tr>
+        <tr><td><code>node_vmstat_oom_kill</code></td><td>Counter</td><td>OOM killer tetiklenme sayısı</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Sıcaklık metrikleri için <code>--collector.hwmon</code> ve <code>--collector.thermal_zone</code> collector'larının açık olması gerekir. <code>node_thermal_zone_temp</code> değeri Kelvin × 1000 cinsinden gelir — Celsius'a çevirmek için <code>/ 1000</code> yapmanız gerekir. <code>node_hwmon_temp_celsius</code> ise doğrudan Celsius cinsinden gelir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Custom exporter yazma</h2>
+  <p class="section-lead">node_exporter'ın sunmadığı uygulama düzeyi veya donanıma özgü metrikleri yayınlamak için custom exporter yazılır. Python veya Go tercih edilir; Go binary boyutu nedeniyle gömülü hedefler için Python daha pratiktir.</p>
+
+  <h3>Python ile custom exporter</h3>
+
+  <pre><code class="language-bash">pip install prometheus_client</code></pre>
+
+  <pre><code class="language-python">#!/usr/bin/env python3
+"""
+Özel gömülü sistem exporter'ı
+Raspberry Pi ADC sensör değerlerini ve GPIO durumunu izler
+"""
+import time
+import os
+from prometheus_client import start_http_server, Gauge, Counter, Histogram
+
+# Metrik tanımlamaları
+adc_voltage = Gauge(
+    'embedded_adc_voltage_volts',
+    'ADC kanalı gerilim değeri',
+    ['channel']          # label
+)
+
+gpio_state = Gauge(
+    'embedded_gpio_state',
+    'GPIO pin durumu (0=low, 1=high)',
+    ['pin', 'direction']
+)
+
+i2c_errors = Counter(
+    'embedded_i2c_errors_total',
+    'I2C okuma hataları',
+    ['bus', 'device']
+)
+
+sensor_read_duration = Histogram(
+    'embedded_sensor_read_seconds',
+    'Sensör okuma süresi',
+    ['sensor_type'],
+    buckets=[.001, .005, .01, .025, .05, .1, .25, .5, 1.0]
+)
+
+def read_adc_channel(channel: int) -> float:
+    """
+    /sys/bus/iio/devices/iio:device0/in_voltageN_raw oku
+    ve voltaja çevir (12-bit ADC, 3.3V ref)
+    """
+    path = f"/sys/bus/iio/devices/iio:device0/in_voltage{channel}_raw"
+    try:
+        with open(path) as f:
+            raw = int(f.read().strip())
+        return raw * 3.3 / 4095.0
+    except (FileNotFoundError, ValueError):
+        return -1.0
+
+def read_gpio_sysfs(pin: int) -> int:
+    """GPIO değerini sysfs'ten oku"""
+    try:
+        with open(f"/sys/class/gpio/gpio{pin}/value") as f:
+            return int(f.read().strip())
+    except FileNotFoundError:
+        return -1
+
+def collect_metrics():
+    """Periyodik metrik toplama"""
+    for ch in range(4):
+        with sensor_read_duration.labels('adc').time():
+            v = read_adc_channel(ch)
+        if v >= 0:
+            adc_voltage.labels(channel=str(ch)).set(v)
+
+    for pin in [17, 27, 22, 23]:
+        state = read_gpio_sysfs(pin)
+        if state >= 0:
+            gpio_state.labels(pin=str(pin), direction='input').set(state)
+
+if __name__ == '__main__':
+    start_http_server(8080)
+    print("Exporter başladı: http://0.0.0.0:8080/metrics")
+    while True:
+        collect_metrics()
+        time.sleep(10)  # 10 saniyede bir güncelle</code></pre>
+
+  <h3>Go ile minimal exporter</h3>
+
+  <pre><code class="language-bash">package main
+
+import (
+    "net/http"
+    "github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+var cpuFreqMHz = prometheus.NewGaugeVec(
+    prometheus.GaugeOpts{
+        Name: "embedded_cpu_freq_mhz",
+        Help: "CPU çekirdek frekansı MHz cinsinden",
+    },
+    []string{"cpu"},
+)
+
+func init() {
+    prometheus.MustRegister(cpuFreqMHz)
+}
+
+func main() {
+    http.Handle("/metrics", promhttp.Handler())
+    http.ListenAndServe(":9200", nil)
+}</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> PromQL sorgu dili</h2>
+  <p class="section-lead">PromQL (Prometheus Query Language), zaman serisi veri üzerinde anlık sorgular ve range sorgular yapmanızı sağlar. Grafana panelleri, alerting kuralları ve API çağrıları PromQL kullanır.</p>
+
+  <h3>Temel fonksiyonlar</h3>
+
+  <pre><code class="language-bash"># CPU kullanımı (son 5 dakikanın ortalaması, %)
+100 - (avg by (instance) (
+    rate(node_cpu_seconds_total{mode="idle"}[5m])
+) * 100)
+
+# Belirli instance için:
+100 - (avg by (instance) (
+    rate(node_cpu_seconds_total{mode="idle", instance="192.168.1.10:9100"}[5m])
+) * 100)
+
+# Disk I/O utilization (%):
+rate(node_disk_io_time_seconds_total{device="mmcblk0"}[5m]) * 100
+
+# Ağ bant genişliği (Mbps):
+rate(node_network_receive_bytes_total{device="eth0"}[1m]) * 8 / 1e6
+
+# Kullanılabilir bellek yüzdesi:
+node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes * 100
+
+# Sıcaklık (thermal_zone — Celsius):
+node_thermal_zone_temp / 1000
+
+# Dosya sistemi doluluk %:
+100 - (node_filesystem_avail_bytes{mountpoint="/"} /
+       node_filesystem_size_bytes{mountpoint="/"} * 100)</code></pre>
+
+  <h3>Aggregation operatörleri</h3>
+
+  <pre><code class="language-bash"># Tüm cihazların ortalama CPU kullanımı:
+avg(100 - rate(node_cpu_seconds_total{mode="idle"}[5m]) * 100)
+
+# En yüksek CPU kullanan 5 cihaz:
+topk(5, 100 - avg by (instance) (
+    rate(node_cpu_seconds_total{mode="idle"}[5m])
+) * 100)
+
+# Bellek ortalaması by job:
+avg by (job) (node_memory_MemAvailable_bytes)
+
+# Her instance için maksimum sıcaklık:
+max by (instance) (node_hwmon_temp_celsius)
+
+# Toplam ağ trafiği (tüm cihazlar):
+sum(rate(node_network_receive_bytes_total[5m]))
+
+# irate: anlık rate (spike tespiti için):
+irate(node_cpu_seconds_total{mode="user"}[1m])
+
+# histogram_quantile: P95 yanıt süresi:
+histogram_quantile(0.95,
+    rate(embedded_sensor_read_seconds_bucket[5m])
+)</code></pre>
+
+  <h3>Alert kuralı örneği</h3>
+
+  <pre><code class="language-bash"># /etc/prometheus/alerts/embedded.yml
+groups:
+  - name: embedded_alerts
+    rules:
+      - alert: HighCPUTemperature
+        expr: node_hwmon_temp_celsius > 80
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Yüksek CPU sıcaklığı {{ $labels.instance }}"
+          description: "Sıcaklık {{ $value }}°C — kritik eşik: 85°C"
+
+      - alert: LowDiskSpace
+        expr: (node_filesystem_avail_bytes{mountpoint="/"} /
+               node_filesystem_size_bytes{mountpoint="/"}) * 100 < 10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Disk dolmak üzere {{ $labels.instance }}"
+
+      - alert: OOMKillerTriggered
+        expr: increase(node_vmstat_oom_kill[1h]) > 0
+        labels:
+          severity: critical</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Grafana kurulumu ve dashboard</h2>
+  <p class="section-lead">Grafana, Prometheus TSDB verilerini görselleştirmek için en yaygın kullanılan açık kaynak araçtır. Panel, dashboard, variable ve annotation özellikleri ile esnek izleme arayüzleri oluşturulur.</p>
+
+  <h3>Docker Compose ile hızlı kurulum</h3>
+
+  <pre><code class="language-bash"># docker-compose.yml
+version: '3.8'
+services:
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    ports: ['9090:9090']
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./alerts:/etc/prometheus/alerts
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    ports: ['3000:3000']
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=embedded123
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    depends_on: [prometheus]
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    ports: ['9093:9093']
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml
+
+volumes:
+  prometheus_data:
+  grafana_data:</code></pre>
+
+  <h3>Grafana provisioning ile otomatik datasource</h3>
+
+  <pre><code class="language-bash"># grafana/provisioning/datasources/prometheus.yml
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      timeInterval: "15s"
+      queryTimeout: "60s"</code></pre>
+
+  <h3>Dashboard özellikleri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Variable</span><span class="desc"><code>$instance</code> değişkeni ile cihaz seçimi — tek dashboard, çok cihaz</span></div>
+    <div class="param"><span class="name">Annotation</span><span class="desc">Deploy zamanları, alarm olayları dashboard'a işaret olarak eklenir</span></div>
+    <div class="param"><span class="name">Alert</span><span class="desc">Panel bazında Grafana alerting — Grafana 8+ ile Unified Alerting</span></div>
+    <div class="param"><span class="name">Repeat</span><span class="desc">Variable ile panel çoğaltma — her cihaz için ayrı satır</span></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Embedded device dashboard</h2>
+  <p class="section-lead">Gömülü sistem dashboard'u, genel sunucu dashboard'undan farklı metriklere odaklanır: CPU frekans ölçekleme, termal yönetim, bellek baskısı ve özel donanım metrikleri.</p>
+
+  <h3>Dashboard JSON panel örnekleri</h3>
+
+  <pre><code class="language-bash"># CPU Frekans Skalama (ölçekleme governors ile)
+# Metrik: node_cpu_frequency_hertz (cpufreq collector)
+# Panel tipi: Time series
+# PromQL:
+node_cpu_frequency_hertz{instance="$instance"} / 1e9
+# Legend: {{cpu}} GHz
+
+# Thermal Zone Sıcaklığı
+# PromQL:
+node_thermal_zone_temp{instance="$instance"} / 1000
+# Threshold: Yellow=70, Red=80, Unit: Celsius
+
+# Bellek Baskısı (memory pressure)
+# PromQL - kswapd aktivitesi:
+rate(node_vmstat_pgpgout[5m]) + rate(node_vmstat_pgpgin[5m])
+
+# OOM Kill sayacı (stat panel)
+# PromQL:
+increase(node_vmstat_oom_kill{instance="$instance"}[24h])
+
+# eMMC I/O gecikme dağılımı
+# PromQL:
+rate(node_disk_read_time_seconds_total{instance="$instance",device="mmcblk0"}[5m]) /
+rate(node_disk_reads_completed_total{instance="$instance",device="mmcblk0"}[5m]) * 1000
+# Unit: Milliseconds</code></pre>
+
+  <h3>Dashboard JSON template (kısaltılmış)</h3>
+
+  <pre><code class="language-bash">{
+  "title": "Embedded Device Overview",
+  "uid": "embedded-overview",
+  "templating": {
+    "list": [{
+      "name": "instance",
+      "type": "query",
+      "datasource": "Prometheus",
+      "query": "label_values(node_uname_info, instance)",
+      "refresh": 2
+    }]
+  },
+  "panels": [
+    {
+      "title": "CPU Kullanımı",
+      "type": "timeseries",
+      "targets": [{
+        "expr": "100 - avg by(cpu)(rate(node_cpu_seconds_total{mode='idle',instance='$instance'}[5m]))*100",
+        "legendFormat": "{{cpu}}"
+      }]
+    }
+  ]
+}</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> collectd entegrasyonu</h2>
+  <p class="section-lead">Bazı gömülü sistemlerde Prometheus exporter çalıştırmak uygun olmayabilir — collectd, onlarca yıllık olgunluğa sahip hafif bir metrik toplama daemonu'dur ve Prometheus ile köprülenir.</p>
+
+  <h3>write_prometheus plugin</h3>
+
+  <pre><code class="language-bash"># /etc/collectd/collectd.conf
+
+Hostname "gömülü-cihaz-01"
+Interval 30
+
+LoadPlugin cpu
+LoadPlugin memory
+LoadPlugin interface
+LoadPlugin disk
+LoadPlugin sensors     # lm-sensors
+LoadPlugin thermal
+LoadPlugin processes
+
+# Prometheus bridge — /metrics endpoint açar
+LoadPlugin write_prometheus
+&lt;Plugin write_prometheus&gt;
+    Port "9103"
+&lt;/Plugin&gt;
+
+# CPU detayı
+&lt;Plugin cpu&gt;
+    ReportByCpu true
+    ReportByState true
+    ValuesPercentage true
+&lt;/Plugin&gt;
+
+# Network interface
+&lt;Plugin interface&gt;
+    Interface "eth0"
+    Interface "wlan0"
+    IgnoreSelected false
+&lt;/Plugin&gt;</code></pre>
+
+  <h3>collectd → Prometheus scrape config</h3>
+
+  <pre><code class="language-bash"># prometheus.yml
+scrape_configs:
+  - job_name: 'collectd_bridge'
+    static_configs:
+      - targets:
+          - '192.168.1.10:9103'   # collectd write_prometheus
+    metric_relabel_configs:
+      # collectd metrik adlarını normalize et
+      - source_labels: [__name__]
+        regex: 'collectd_(.*)'
+        target_label: __name__
+        replacement: 'node_${1}'</code></pre>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>collectd ile Prometheus arasında bir diğer yol <strong>collectd-exporter</strong> köprüsüdür. collectd binary protokolüyle collectd-exporter'a veri gönderir, exporter bunu Prometheus formatına çevirir. Bu yaklaşım write_prometheus plugin'ine göre daha esnek metrik dönüşümü imkânı sunar.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: Raspberry Pi fleet izleme</h2>
+  <p class="section-lead">Birden fazla Raspberry Pi'yi merkezi Prometheus + Grafana ile izleyen eksiksiz bir kurulum.</p>
+
+  <h3>Hedef mimari</h3>
+
+  <div class="flow">
+    <pre>
+  Raspberry Pi 1 (192.168.1.10) → node_exporter :9100
+  Raspberry Pi 2 (192.168.1.11) → node_exporter :9100
+  Raspberry Pi 3 (192.168.1.12) → node_exporter :9100 + custom_exporter :8080
+        │
+        │  HTTP scrape (pull model)
+        ▼
+  Linux Sunucu (192.168.1.1)
+  ├── Prometheus :9090
+  ├── Grafana    :3000
+  └── Alertmanager :9093 → Email/Slack
+    </pre>
+  </div>
+
+  <h3>Raspberry Pi'ye node_exporter kurulumu (Ansible)</h3>
+
+  <pre><code class="language-bash"># hosts.yml
+all:
+  hosts:
+    pi1: {ansible_host: 192.168.1.10}
+    pi2: {ansible_host: 192.168.1.11}
+    pi3: {ansible_host: 192.168.1.12}
+  vars:
+    ansible_user: pi
+    ansible_become: yes</code></pre>
+
+  <pre><code class="language-bash"># playbook.yml
+- hosts: all
+  tasks:
+    - name: node_exporter ARM64 indir
+      get_url:
+        url: "https://github.com/prometheus/node_exporter/releases/\
+download/v1.8.2/node_exporter-1.8.2.linux-arm64.tar.gz"
+        dest: /tmp/node_exporter.tar.gz
+
+    - name: Arşivden çıkar
+      unarchive:
+        src: /tmp/node_exporter.tar.gz
+        dest: /tmp/
+        remote_src: yes
+
+    - name: Binary kopyala
+      copy:
+        src: /tmp/node_exporter-1.8.2.linux-arm64/node_exporter
+        dest: /usr/local/bin/node_exporter
+        mode: '0755'
+        remote_src: yes
+
+    - name: Systemd servisi kur
+      copy:
+        content: |
+          [Unit]
+          Description=Node Exporter
+          [Service]
+          ExecStart=/usr/local/bin/node_exporter \
+            --collector.hwmon \
+            --collector.thermal_zone \
+            --collector.systemd
+          Restart=always
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/node_exporter.service
+
+    - name: Servisi başlat
+      systemd:
+        name: node_exporter
+        enabled: yes
+        state: started
+        daemon_reload: yes</code></pre>
+
+  <h3>Raspberry Pi özel metrikleri</h3>
+
+  <pre><code class="language-bash"># vcgencmd ile GPU sıcaklığı ve throttle durumu
+# /usr/local/bin/rpi_exporter.sh
+
+#!/bin/bash
+echo "# HELP rpi_temp_celsius Raspberry Pi SoC sıcaklığı"
+echo "# TYPE rpi_temp_celsius gauge"
+TEMP=$(vcgencmd measure_temp | grep -oP '\d+\.\d+')
+echo "rpi_temp_celsius $TEMP"
+
+echo "# HELP rpi_throttled Raspberry Pi throttling durumu"
+echo "# TYPE rpi_throttled gauge"
+THROTTLE=$(vcgencmd get_throttled | grep -oP '0x\w+')
+echo "rpi_throttled $((THROTTLE))"
+
+echo "# HELP rpi_cpu_freq_hz CPU frekansı"
+echo "# TYPE rpi_cpu_freq_hz gauge"
+FREQ=$(vcgencmd measure_clock arm | grep -oP '\d+$')
+echo "rpi_cpu_freq_hz $FREQ"</code></pre>
+
+  <pre><code class="language-bash"># textfile collector ile Prometheus'a sun:
+# node_exporter başlatma:
+/usr/local/bin/node_exporter \
+  --collector.textfile.directory=/var/lib/node_exporter/textfile_collector
+
+# Cron ile her dakika güncelle:
+* * * * * root /usr/local/bin/rpi_exporter.sh > \
+  /var/lib/node_exporter/textfile_collector/rpi.prom</code></pre>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Raspberry Pi'nin <code>vcgencmd get_throttled</code> çıktısı hex bit maskesidir. Bit 0: under-voltage, Bit 1: arm frequency capped, Bit 2: currently throttled, Bit 3: soft temperature limit. Grafana'da bu bitleri ayrıştırmak için PromQL'de <code>% 2</code> ve bitwise operatörler kullanılabilir.</p>
+  </div>
+</section>
+
+</main>

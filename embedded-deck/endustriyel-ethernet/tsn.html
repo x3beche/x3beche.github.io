@@ -1,0 +1,529 @@
+---
+layout: tutorial
+title: "TSN — Time-Sensitive Networking"
+back_url: "../index.html"
+back_label: "Endüstriyel Ethernet"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>ENDÜSTRİYEL ETHERNET</span>
+    <span>TSN</span>
+    <span>2026</span>
+  </div>
+  <h1>TSN —<br><em>Time-Sensitive Networking.</em></h1>
+  <p class="subtitle">IEEE 802.1 standartlar ailesi ile standart Ethernet üzerinde deterministik iletişim: zamanlama, önceliklendirme ve ağ senkronizasyonu.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">TSN nedir — IEEE 802.1 ailesi ve motivasyon</a></li>
+    <li><a href="#s1">802.1Qbv — Gate Control List ve TDMA zamanlama</a></li>
+    <li><a href="#s2">802.1Qav — Credit-Based Shaper</a></li>
+    <li><a href="#s3">802.1AS — gPTP ve ağ senkronizasyonu</a></li>
+    <li><a href="#s4">Linux TC alt sistemi — taprio ve ETF qdisc</a></li>
+    <li><a href="#s5">linuxptp — ptp4l, phc2sys, ts2phc</a></li>
+    <li><a href="#s6">LLDP ve komşu keşfi</a></li>
+    <li><a href="#s7">TSN destekli NIC'ler — Intel i210/i225 ve NXP LS1028A</a></li>
+    <li><a href="#s8">Pratik: taprio + ETF ile deterministik UDP gönderim</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> TSN nedir — IEEE 802.1 ailesi ve motivasyon</h2>
+  <p class="section-lead">TSN (Time-Sensitive Networking), IEEE 802.1 çalışma grubunun geliştirdiği, standart Ethernet üzerinde zaman garantili (deterministik) iletişim sağlayan standartlar bütünüdür. Amaç; EtherCAT veya PROFINET gibi özel protokollere gerek kalmadan, IT ve OT ağlarını tek bir Ethernet altyapısında birleştirmektir.</p>
+
+  <p>Standart Ethernet, CSMA/CD ve best-effort iletim modeliyle tasarlanmıştır. İki paket aynı anda gönderilirse çakışma olur; iletim gecikmesi değişkendir (jitter). Endüstriyel otomasyon, ses/video yayını ve araç içi ağlar ise garantili gecikme ve sıfıra yakın jitter gerektirir. TSN bu ihtiyacı standart donanım üzerinde karşılar.</p>
+
+  <h3>TSN standartlar ailesi</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Standart</th><th>Konu</th><th>Durum</th></tr></thead>
+      <tbody>
+        <tr><td>IEEE 802.1AS-2020</td><td>Zamanlama ve senkronizasyon (gPTP)</td><td>Yayımlandı</td></tr>
+        <tr><td>IEEE 802.1Qbv-2015</td><td>Enqueue Time ile iletim seçimi (TAS)</td><td>802.1Q'ya entegre</td></tr>
+        <tr><td>IEEE 802.1Qav-2009</td><td>Akış tabanlı gecikme sınırlaması (CBS)</td><td>802.1Q'ya entegre</td></tr>
+        <tr><td>IEEE 802.1Qbu-2016</td><td>Frame preemption</td><td>802.1Q'ya entegre</td></tr>
+        <tr><td>IEEE 802.1CB-2017</td><td>Frame replikasyon ve eleme (FRER)</td><td>Yayımlandı</td></tr>
+        <tr><td>IEEE 802.1Qcc-2018</td><td>Stream Reservation (SRP) güncellemeleri</td><td>802.1Q'ya entegre</td></tr>
+        <tr><td>IEEE 802.1Qci-2017</td><td>Per-Stream Filtering and Policing</td><td>802.1Q'ya entegre</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>TSN standartlar ailesi IEEE 802.1Q mega-standardında birleştirilmiştir. "802.1Qbv" gibi isimler artık ayrı doküman değil, 802.1Q revizyonlarındaki bölümlere atıfta bulunur.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> 802.1Qbv — Gate Control List ve TDMA zamanlama</h2>
+  <p class="section-lead">IEEE 802.1Qbv (Time-Aware Shaper, TAS), her çıkış kuyruğu için bir kapı (gate) tanımlar. Bu kapılar, kesin zamanlara göre açılıp kapatılarak belirli bir trafik sınıfının belirli zaman diliminde iletilmesi garantilenir.</p>
+
+  <h3>Temel kavramlar</h3>
+  <div class="params">
+    <div class="param"><span class="name">Gate Control List (GCL)</span><span class="desc">Her giriş, bir kapı durumu (bitmask: hangi kuyruk açık) ve süre (nanosaniye cinsinden) çiftinden oluşur. GCL döngüsel olarak tekrar eder.</span></div>
+    <div class="param"><span class="name">Cycle Time</span><span class="desc">GCL'nin toplam periyodu. Örneğin 1 ms döngü içinde 200 µs'lik "koruma penceresi" ve 800 µs'lik best-effort penceresi tanımlanabilir.</span></div>
+    <div class="param"><span class="name">Guard Band</span><span class="desc">Zaman kritik penceresinden hemen önce kapıların kapatıldığı kısa süre. Devam eden uzun bir frame'in kritik pencereye taşmasını engeller.</span></div>
+    <div class="param"><span class="name">Base Time</span><span class="desc">GCL'nin başladığı mutlak zaman damgası (gPTP ağ zamanı cinsinden). Tüm köprüler aynı base time'ı kullanarak senkronize çalışır.</span></div>
+    <div class="param"><span class="name">Trafik Sınıfları</span><span class="desc">802.1Q VLAN önceliği (PCP 0-7), 8 trafik sınıfına eşlenir. TC7 en yüksek öncelik, TC0 en düşük.</span></div>
+  </div>
+
+  <h3>GCL örneği — 1 ms döngü</h3>
+  <div class="flow">
+<pre>
+  Zaman (µs):  0    200    250    1000
+               │     │      │       │
+  TC7 (krit.)  ████████             │  (200 µs açık)
+  Guard band         ████           │  (50 µs kapalı)
+  TC0-6 (BE)              ██████████  (750 µs açık)
+
+  GCL:
+  [0]  gates=0x80  duration=200000 ns   (sadece TC7 açık)
+  [1]  gates=0x00  duration=50000  ns   (guard band)
+  [2]  gates=0x7F  duration=750000 ns   (TC0-6 açık)
+  cycle-time = 1000000 ns (1 ms)
+</pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">İPUCU</div>
+    <p>802.1Qbv tek başına yeterli değildir; köprülerdeki GCL'lerin birbirleriyle koordineli olması gerekir. Bu koordinasyonu 802.1Qcc Stream Reservation ve merkezi ağ yönetimi (CNC) sağlar.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> 802.1Qav — Credit-Based Shaper</h2>
+  <p class="section-lead">IEEE 802.1Qav (Credit-Based Shaper, CBS), akış bazlı bant genişliği rezervasyonu yapar. Her sınıf için bir "kredi" sayacı tutulur; frame ancak kredi pozitifken gönderilebilir. Bu mekanizma, ses/video akışları için garanti edilmiş bant genişliği ve sınırlı gecikme sağlar.</p>
+
+  <h3>CBS parametreleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">idleSlope</span><span class="desc">Saniyede kazanılan kredi miktarı (bit/s). Rezerve edilmek istenen bant genişliğine eşit olmalıdır.</span></div>
+    <div class="param"><span class="name">sendSlope</span><span class="desc">Frame gönderilirken saniyede tüketilen kredi. idleSlope - portSpeed ile hesaplanır (negatif değer).</span></div>
+    <div class="param"><span class="name">hiCredit</span><span class="desc">Maksimum pozitif kredi limiti. Taşma önler; burst büyüklüğünü sınırlar.</span></div>
+    <div class="param"><span class="name">loCredit</span><span class="desc">Minimum negatif kredi limiti. Frame gönderiminden sonra kredi bu sınıra kadar düşebilir.</span></div>
+  </div>
+
+  <h3>Kredi hesabı örneği</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Parametre</th><th>Sınıf A (SR Class A)</th><th>Sınıf B (SR Class B)</th></tr></thead>
+      <tbody>
+        <tr><td>Maks gecikme</td><td>2 ms (2 köprü)</td><td>50 ms (7 köprü)</td></tr>
+        <tr><td>Rezervasyon</td><td>75% portu</td><td>75% portu</td></tr>
+        <tr><td>idleSlope</td><td>75 Mbit/s</td><td>75 Mbit/s</td></tr>
+        <tr><td>sendSlope</td><td>-25 Mbit/s</td><td>-25 Mbit/s</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>CBS, TAS (802.1Qbv) ile birlikte kullanılır: TAS "ne zaman" göndereceğini belirlerken CBS "ne kadar" göndereceğini kontrol eder. Tipik bir TSN ağında ses/video akışları CBS ile, kritik kontrol mesajları ise TAS ile yönetilir.</p>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> 802.1AS — gPTP ve ağ senkronizasyonu</h2>
+  <p class="section-lead">IEEE 802.1AS (Generalized Precision Time Protocol, gPTP), TSN'in saat senkronizasyon standardıdır. IEEE 1588v2 (PTP) profilini endüstriyel Ethernet için özelleştirir ve tüm ağ düğümlerinin nanosaniye hassasiyetinde aynı zamana hizalanmasını sağlar.</p>
+
+  <h3>gPTP hiyerarşisi</h3>
+  <div class="params">
+    <div class="param"><span class="name">Grandmaster</span><span class="desc">Ağın en doğru saat kaynağı. GPS veya IEEE 1588 hardware clock'a bağlı olabilir. Tüm zaman referansını sağlar.</span></div>
+    <div class="param"><span class="name">Best Master Clock Algorithm (BMCA)</span><span class="desc">Her düğüm announce mesajları ile saat kalitesini (clockClass, clockAccuracy, offsetScaledLogVariance) ilan eder. En iyi saat Grandmaster seçilir.</span></div>
+    <div class="param"><span class="name">Transparent Clock</span><span class="desc">Köprü cihazlar. Mesajı iletirken kendi işleme gecikmesini "correction field"a ekler; bu sayede end-to-end gecikme telafisi otomatik yapılır.</span></div>
+    <div class="param"><span class="name">Boundary Clock</span><span class="desc">Her portunda bağımsız PTP zamanlayıcısı olan büyük köprüler. Segmentler arası senkronizasyon köprüsü görevi görür.</span></div>
+  </div>
+
+  <h3>Sync mesajlaşma akışı</h3>
+  <div class="flow">
+<pre>
+Grandmaster                 Slave
+    │                          │
+    │── Sync (t1) ────────────►│  (t2 slave'de ölçülür)
+    │── Follow_Up (t1) ───────►│
+    │                          │
+    │◄─ Delay_Req (t3) ────────│  (t3 slave'de ölçülür)
+    │── Delay_Resp (t4) ───────►│
+    │                          │
+    │  offset = ((t2-t1)-(t4-t3)) / 2
+    │  delay  = ((t2-t1)+(t4-t3)) / 2
+</pre>
+  </div>
+
+  <h3>gPTP vs IEEE 1588v2 farkları</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>IEEE 1588v2</th><th>gPTP (802.1AS)</th></tr></thead>
+      <tbody>
+        <tr><td>Taşıma katmanı</td><td>UDP/IPv4, UDP/IPv6, Ethernet</td><td>Sadece Ethernet (L2)</td></tr>
+        <tr><td>Mesaj türleri</td><td>Tüm PTP mesajları</td><td>Azaltılmış alt küme</td></tr>
+        <tr><td>Propagation delay</td><td>End-to-end veya peer delay</td><td>Sadece peer delay</td></tr>
+        <tr><td>Transparent Clock</td><td>Opsiyonel</td><td>Zorunlu</td></tr>
+        <tr><td>Profil</td><td>Genel amaçlı</td><td>TSN'e özel, AVB/otomotiv</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Linux TC alt sistemi — taprio ve ETF qdisc</h2>
+  <p class="section-lead">Linux traffic control (TC) alt sistemi, ağ paketlerinin sıralamasını ve zamanlamasını yönetir. TSN için iki kritik qdisc (queueing discipline) mevcuttur: taprio (TAS/802.1Qbv) ve ETF (Earliest TxTime First).</p>
+
+  <h3>taprio — Time-Aware Priority Shaper</h3>
+  <p>taprio, 802.1Qbv'nin Linux implementasyonudur. Gate Control List'i doğrudan kernel'da uygular ve donanım desteği varsa (hardware offload) NIC'in timestamp donanımına devret.</p>
+
+  <pre><code class="language-bash"># taprio konfigürasyonu — 1 ms döngü, 4 kuyruk
+# TC7: 200 µs kritik pencere | TC0-6: 750 µs | guard 50 µs
+tc qdisc replace dev eth0 parent root handle 100 taprio \
+    num_tc 4 \
+    map 3 3 3 3 3 3 3 0 1 2 0 0 0 0 0 0 \
+    queues 1@0 1@1 1@2 1@3 \
+    base-time 0 \
+    sched-entry S 0x08 200000 \
+    sched-entry S 0x00 50000  \
+    sched-entry S 0x07 750000 \
+    clockid CLOCK_TAI \
+    flags 0x2       # 0x2 = software mode, 0x0 = hardware offload</code></pre>
+
+  <div class="params">
+    <div class="param"><span class="name">num_tc</span><span class="desc">Trafik sınıfı sayısı (maks 8). NIC kuyruklarıyla eşleşmeli.</span></div>
+    <div class="param"><span class="name">map</span><span class="desc">VLAN önceliği (0-15) → trafik sınıfı eşleme. 16 giriş, her biri TC numarası.</span></div>
+    <div class="param"><span class="name">queues</span><span class="desc">"sayı@başlangıç" formatında her TC için NIC kuyruğu ataması.</span></div>
+    <div class="param"><span class="name">sched-entry S</span><span class="desc">GCL girişi: "S" = Set-And-Hold-MAC, bitmask, süre(ns).</span></div>
+    <div class="param"><span class="name">clockid CLOCK_TAI</span><span class="desc">TAI (International Atomic Time) — PTP zamanıyla uyumlu. GPS kaynaklı sistemlerde UTC+37 s offset.</span></div>
+  </div>
+
+  <h3>ETF — Earliest TxTime First</h3>
+  <p>ETF qdisc, pakete gömülü SO_TXTIME zaman damgasına göre iletimi zamanlar. taprio'nun alt qdisc'i olarak kullanılır ve nanosaniye hassasiyetinde paket gönderim zamanlaması sağlar.</p>
+
+  <pre><code class="language-bash"># ETF'yi taprio alt qdisc'i olarak ekle
+tc qdisc add dev eth0 parent 100:1 etf \
+    offload \
+    clockid CLOCK_TAI \
+    delta 200000    # 200 µs önceden kuyruğa al
+
+# ETF + taprio için socket konfigürasyonu (C kodu):
+# setsockopt(sock, SOL_SOCKET, SO_TXTIME, &sk_txtime, sizeof(sk_txtime));
+# cmsg ile SCM_TXTIME zaman damgası gönder</code></pre>
+
+  <h3>CBS — Credit-Based Shaper qdisc</h3>
+  <pre><code class="language-bash"># CBS qdisc (802.1Qav için)
+tc qdisc add dev eth0 parent 100:2 cbs \
+    idleslope 75000    \   # 75 Kbit/s
+    sendslope -925000  \   # sendslope = idle - port_speed
+    hicredit  30       \   # byte cinsinden
+    locredit  -38      \
+    offload 1              # NIC hardware offload</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> linuxptp — ptp4l, phc2sys, ts2phc</h2>
+  <p class="section-lead">linuxptp, Linux için IEEE 1588 ve 802.1AS uyumlu PTP implementasyonudur. ptp4l PTP protokolünü çalıştırır, phc2sys NIC hardware clock'u sistem saatiyle senkronize eder ve ts2phc ise GPS/1PPS sinyalinden hardware clock'u disipline eder.</p>
+
+  <h3>ptp4l konfigürasyonu (gPTP profili)</h3>
+  <pre><code class="language-ini"># /etc/ptp4l.conf — gPTP (802.1AS) profili
+[global]
+gmCapable               1
+priority1               128
+priority2               128
+logAnnounceInterval     0      # 1 saniyede 1 announce
+logSyncInterval         -3     # 8 ms'de 1 sync (2^-3)
+logMinDelayReqInterval  -3
+network_transport       L2     # Ethernet L2 (gPTP)
+delay_mechanism         P2P    # Peer delay (gPTP zorunluluğu)
+egressLatency           0
+ingressLatency          0
+time_stamping           hardware  # NIC hardware timestamping
+tsproc_mode             filter
+delay_filter            moving_median
+delay_filter_length     10
+clockServoDomain        0
+
+[eth0]                         # TSN NIC arayüzü</code></pre>
+
+  <pre><code class="language-bash"># ptp4l başlatma
+sudo ptp4l -f /etc/ptp4l.conf -i eth0 -m &
+
+# phc2sys: NIC PHC → CLOCK_REALTIME
+sudo phc2sys -s eth0 -c CLOCK_REALTIME \
+             -O 0 -R 8 -f /etc/ptp4l.conf -m &
+
+# phc2sys: CLOCK_REALTIME → CLOCK_TAI (taprio için)
+sudo phc2sys -s CLOCK_REALTIME -c CLOCK_TAI \
+             -O -37 -R 8 &
+
+# Senkronizasyon durumunu izle
+sudo pmc -u -b 0 'GET CURRENT_DATA_SET'
+# offset from master: -5 ns
+# mean path delay: 234 ns</code></pre>
+
+  <h3>ts2phc — GPS ile hardware clock senkronizasyonu</h3>
+  <pre><code class="language-ini"># /etc/ts2phc.conf
+[global]
+ts2phc.master 1          # Bu cihaz Grandmaster
+leapfile /usr/share/zoneinfo/leap-seconds.list
+
+[eth0]                   # TSN NIC
+ts2phc.extts_polarity rising
+
+[/dev/pps0]              # GPS 1PPS sinyali
+ts2phc.master 1</code></pre>
+
+  <h3>linuxptp araçları özeti</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Araç</th><th>Görev</th><th>Tipik Kullanım</th></tr></thead>
+      <tbody>
+        <tr><td>ptp4l</td><td>PTP protokol motoru</td><td>Her TSN düğümünde çalışır</td></tr>
+        <tr><td>phc2sys</td><td>PHC ↔ sistem saati senkronizasyonu</td><td>CLOCK_TAI'yi güncel tutar</td></tr>
+        <tr><td>ts2phc</td><td>Harici referans → PHC</td><td>GPS/GNSS Grandmaster kurulumu</td></tr>
+        <tr><td>pmc</td><td>PTP Management Client</td><td>Durum sorgulama, konfigürasyon</td></tr>
+        <tr><td>timemaster</td><td>NTP+PTP kombinasyonu</td><td>Sistem saati yönetimi</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Hardware timestamping zorunludur — software timestamping ile TSN performansı elde edilemez. NIC'in ethtool -T çıktısında "hardware-transmit" ve "hardware-receive" desteği görünmelidir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> LLDP ve komşu keşfi</h2>
+  <p class="section-lead">LLDP (Link Layer Discovery Protocol, IEEE 802.1AB), ağ cihazlarının komşularını keşfetmesi ve yeteneklerini ilan etmesi için kullanılır. TSN ağlarında her düğüm LLDP ile IEEE 802.1Qbv ve 802.1AS desteğini diğer düğümlere bildirir.</p>
+
+  <h3>TSN ile ilgili LLDP TLV'ler</h3>
+  <div class="params">
+    <div class="param"><span class="name">IEEE 802.1 OUI TLV (0x0080C2)</span><span class="desc">VLAN adı, port VLAN ID, protokol VLAN ID ve MAC/PHY konfigürasyonu için genişletilmiş TLV'ler.</span></div>
+    <div class="param"><span class="name">802.1AS Capabilities TLV</span><span class="desc">gPTP desteği, as capable flag, ölçülen link delay değerleri. Neighbor Discovery için kritik.</span></div>
+    <div class="param"><span class="name">IEEE 802.3 OUI TLV (0x00120F)</span><span class="desc">MAC/PHY konfigürasyonu, maksimum frame boyutu, güç üzerinden Ethernet (PoE) bilgileri.</span></div>
+  </div>
+
+  <pre><code class="language-bash"># lldpd kurulumu ve konfigürasyon
+sudo apt install lldpd
+
+# Konfigürasyon dosyası /etc/lldpd.conf
+configure system description "TSN Edge Node v1.0"
+configure lldp tx-interval 5       # Her 5 saniyede bir yayın
+configure lldp tx-hold 4           # TTL = tx-interval × tx-hold
+
+sudo systemctl enable lldpd
+sudo systemctl start lldpd
+
+# Komşuları listele
+sudo lldpcli show neighbors
+# -------------------------------------------------------------------------------
+# Interface:    eth0, via: LLDP, RID: 1, Time: 0 day, 00:02:34
+#   Chassis:
+#     ChassisID: mac aa:bb:cc:dd:ee:01
+#     SysName:   tsn-switch-01
+#     MgmtIP:    192.168.1.1
+#   Port:
+#     PortID:    ifname eth1
+#     PortDescr: TSN Port 1 (802.1Qbv)
+
+# Yetenekleri göster
+sudo lldpcli show neighbors details | grep -A5 802.1</code></pre>
+
+  <div class="callout">
+    <div class="label">İPUCU</div>
+    <p>TSN merkezi ağ konfigürasyonu (CNC/CUC) için NETCONF/YANG kullanan sistemler, LLDP bilgilerini topoloji veritabanını doldurmak için kullanır. lldpd'nin NETCONF köprüsü için yang-lldp modeli mevcuttur.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> TSN destekli NIC'ler — Intel i210/i225 ve NXP LS1028A</h2>
+  <p class="section-lead">TSN performansı büyük ölçüde NIC donanımına bağlıdır. Hardware timestamp, hardware taprio offload ve çoklu TX kuyruğu desteği olmadan yazılım tabanlı TSN'in jitter'ı yüzlerce mikrosaniyeye çıkabilir.</p>
+
+  <h3>Intel I210 / I225</h3>
+  <div class="params">
+    <div class="param"><span class="name">Intel I210-T1</span><span class="desc">GbE, 4 TX + 4 RX kuyruğu, hardware timestamping, taprio software mode. TSN prototipleri için standart seçim. igb sürücüsü.</span></div>
+    <div class="param"><span class="name">Intel I225-LM / I226-V</span><span class="desc">2.5 GbE, 4 kuyruk, hardware taprio offload, Launch Time Control (ETF hardware), 802.1Qbv. igc sürücüsü.</span></div>
+  </div>
+
+  <pre><code class="language-bash"># I225 hardware taprio offload kontrolü
+ethtool -k eth0 | grep -E "tx-checksum|hw-tc-offload"
+# hw-tc-offload: on   (taprio hardware offload aktif)
+
+# I225 timestamp yetenekleri
+ethtool -T eth0
+# Capabilities:
+#         hardware-transmit     (SOF_TIMESTAMPING_TX_HARDWARE)
+#         software-transmit     (SOF_TIMESTAMPING_TX_SOFTWARE)
+#         hardware-receive      (SOF_TIMESTAMPING_RX_HARDWARE)
+#         hardware-raw-clock    (SOF_TIMESTAMPING_RAW_HARDWARE)
+# PTP Hardware Clock: 0
+# Hardware Transmit Timestamp Modes:
+#         off                   (HWTSTAMP_TX_OFF)
+#         on                    (HWTSTAMP_TX_ON)
+
+# I225 için hardware taprio
+tc qdisc replace dev eth0 parent root taprio \
+    num_tc 4 \
+    map 3 3 3 3 3 3 3 0 1 2 0 0 0 0 0 0 \
+    queues 1@0 1@1 1@2 1@3 \
+    base-time 0 \
+    sched-entry S 0x08 200000 \
+    sched-entry S 0x07 800000 \
+    clockid CLOCK_TAI \
+    flags 0x0    # 0x0 = hardware offload</code></pre>
+
+  <h3>NXP LS1028A (SoC)</h3>
+  <p>LS1028A, entegre TSN switch çekirdeği içeren bir SoC'tur. ENETC (Ethernet Controller) ve Felix switch donanımı ile tam 802.1Qbv/Qav/AS desteği sunar; ayrı NIC gerekmez.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>Intel I225</th><th>NXP LS1028A</th></tr></thead>
+      <tbody>
+        <tr><td>Tip</td><td>PCIe NIC</td><td>Entegre SoC switch</td></tr>
+        <tr><td>Port sayısı</td><td>1</td><td>6 (Felix switch)</td></tr>
+        <tr><td>802.1Qbv offload</td><td>Evet</td><td>Evet</td></tr>
+        <tr><td>802.1AS</td><td>Software (ptp4l)</td><td>Hardware (ptp4l + enetc)</td></tr>
+        <tr><td>802.1CB FRER</td><td>Hayır</td><td>Evet</td></tr>
+        <tr><td>Linux sürücüsü</td><td>igc</td><td>enetc + mscc-felix</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: taprio + ETF ile deterministik UDP gönderim</h2>
+  <p class="section-lead">Bu bölümde Intel I225 NIC'e sahip bir Linux makinesinden, taprio + ETF qdisc kombinasyonunu kullanarak nanosaniye hassasiyetinde zamanlı UDP paket gönderimi gerçekleştirilir.</p>
+
+  <h3>Sistem hazırlığı</h3>
+  <pre><code class="language-bash"># 1. PTP senkronizasyonu başlat
+sudo ptp4l -f /etc/ptp4l.conf -i eth0 -m &
+sudo phc2sys -s eth0 -c CLOCK_REALTIME -O 0 -R 8 -m &
+sudo phc2sys -s CLOCK_REALTIME -c CLOCK_TAI -O -37 -R 8 &
+
+# 2. Senkronizasyonu doğrula (offset < 1 µs beklenir)
+sudo pmc -u -b 0 'GET CURRENT_DATA_SET' | grep offset
+# offsetFromMaster   -143
+
+# 3. taprio + ETF konfigürasyonu (I225 hardware offload)
+sudo tc qdisc del dev eth0 root 2>/dev/null
+sudo tc qdisc add dev eth0 parent root handle 100 taprio \
+    num_tc 2 \
+    map 1 1 1 1 1 1 1 0 1 1 1 1 1 1 1 1 \
+    queues 1@0 1@1 \
+    base-time $(date +%s)000000000 \
+    sched-entry S 0x01 300000 \
+    sched-entry S 0x02 700000 \
+    clockid CLOCK_TAI \
+    flags 0x0
+
+sudo tc qdisc add dev eth0 parent 100:1 etf \
+    offload clockid CLOCK_TAI delta 200000</code></pre>
+
+  <h3>SO_TXTIME ile zamanlı UDP gönderici</h3>
+  <pre><code class="language-c">/* tsn_sender.c — ETF + SO_TXTIME ile deterministik UDP */
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include &lt;time.h&gt;
+#include &lt;arpa/inet.h&gt;
+#include &lt;linux/net_tstamp.h&gt;
+#include &lt;linux/errqueue.h&gt;
+
+#define DST_IP    "192.168.1.2"
+#define DST_PORT  5000
+#define CYCLE_NS  1000000ULL   /* 1 ms */
+#define OFFSET_NS 200000ULL    /* pencere başından 200 µs sonra */
+
+int main(void)
+{
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+
+    /* SO_TXTIME'ı etkinleştir */
+    struct sock_txtime sk_txtime = {
+        .clockid = CLOCK_TAI,
+        .flags   = 0,
+    };
+    setsockopt(sock, SOL_SOCKET, SO_TXTIME,
+               &sk_txtime, sizeof(sk_txtime));
+
+    /* VLAN önceliği 7 (TC7) için SO_PRIORITY */
+    int prio = 7;
+    setsockopt(sock, SOL_SOCKET, SO_PRIORITY, &prio, sizeof(prio));
+
+    struct sockaddr_in dst = {
+        .sin_family = AF_INET,
+        .sin_port   = htons(DST_PORT),
+    };
+    inet_pton(AF_INET, DST_IP, &dst.sin_addr);
+
+    struct timespec now;
+    clock_gettime(CLOCK_TAI, &now);
+    uint64_t txtime = (uint64_t)now.tv_sec * 1000000000ULL
+                    + now.tv_nsec;
+    /* Bir sonraki döngü sınırına hizala */
+    txtime = (txtime / CYCLE_NS + 1) * CYCLE_NS + OFFSET_NS;
+
+    for (int i = 0; i < 1000; i++) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "TSN frame %d txtime=%lu", i, txtime);
+
+        /* Kontrol mesajında txtime gönder */
+        char cmsg_buf[CMSG_SPACE(sizeof(uint64_t))];
+        struct iovec  iov = { buf, strlen(buf) };
+        struct msghdr msg = {
+            .msg_name       = &dst,
+            .msg_namelen    = sizeof(dst),
+            .msg_iov        = &iov,
+            .msg_iovlen     = 1,
+            .msg_control    = cmsg_buf,
+            .msg_controllen = sizeof(cmsg_buf),
+        };
+        struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+        cm->cmsg_level  = SOL_SOCKET;
+        cm->cmsg_type   = SCM_TXTIME;
+        cm->cmsg_len    = CMSG_LEN(sizeof(uint64_t));
+        memcpy(CMSG_DATA(cm), &txtime, sizeof(txtime));
+
+        sendmsg(sock, &msg, 0);
+
+        txtime += CYCLE_NS;  /* Sonraki döngü */
+    }
+
+    close(sock);
+    return 0;
+}</code></pre>
+
+  <h3>Gecikme ölçümü</h3>
+  <pre><code class="language-bash"># Alıcı tarafta RX timestamp ile gecikme ölç
+# SO_TIMESTAMPING ile hardware RX zamanını al
+python3 -c "
+import socket, struct, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(('0.0.0.0', 5000))
+# SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE
+s.setsockopt(socket.SOL_SOCKET, socket.SO_TIMESTAMPING, 0x28)
+while True:
+    data, _, _, ts = s.recvmsg(1024, 1024)
+    print(f'Alındı: {data[:20]}, HW TS: {ts}')
+"
+
+# cyclictest ile sistem latency ölçümü
+sudo cyclictest -p80 -t1 -n -i1000 -l10000 \
+                --policy=fifo \
+                -h400 -q | tail -5
+# Max: 18 µs (TSN + PREEMPT_RT ile)</code></pre>
+
+  <div class="callout">
+    <div class="label">UYARI</div>
+    <p>SO_TXTIME ile gönderilen paketler, belirtilen txtime'dan önce gönderilemez. Eğer uygulama paketleri çok geç hazırlarsa ETF drop eder. ethtool -S eth0 | grep tx_late ile geç gönderilen paketleri izleyin.</p>
+  </div>
+</section>
+
+</main>

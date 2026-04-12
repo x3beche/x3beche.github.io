@@ -1,0 +1,731 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Yocto Test Altyapısı — oeqa &amp; ptest · Test &amp; CI</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Fraunces:ital,wght@0,300;0,400;0,600;0,800;1,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/tutorial.css">
+</head>
+<body>
+
+<a href="index.html" class="nav-link">Test &amp; CI</a>
+
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>TEST &amp; CI</span>
+    <span>YOCTO TEST</span>
+    <span>2026</span>
+  </div>
+  <h1>Yocto Test Altyapısı<br><em>oeqa &amp; ptest.</em></h1>
+  <p class="subtitle">OpenEmbedded test ekosistemi: testimage.bbclass, QEMU tabanlı test otomasyonu, ptest çerçevesi ve SDK test pipeline. Merge request'ten board'a otomatik kalite güvence.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Yocto test altyapısına genel bakış</a></li>
+    <li><a href="#s1">testimage.bbclass</a></li>
+    <li><a href="#s2">QEMU üzerinde test</a></li>
+    <li><a href="#s3">ptest çerçevesi</a></li>
+    <li><a href="#s4">Runtime test yazma — oeqa.runtime</a></li>
+    <li><a href="#s5">SDK test</a></li>
+    <li><a href="#s6">wic image + donanım testi</a></li>
+    <li><a href="#s7">Pratik: Custom ptest recipe + testimage pipeline</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Yocto Test Altyapısına Genel Bakış</h2>
+  <p class="section-lead">Yocto/OpenEmbedded, image düzeyinde test için kapsamlı bir ekosistem sunar. Bu ekosistem birbirine bağlı birkaç katmandan oluşur.</p>
+
+  <div class="flow">
+    <pre>
+  ┌──────────────────────────────────────────────────────────┐
+  │                  YOCTO TEST EKOSİSTEMİ                   │
+  ├────────────────┬─────────────────┬───────────────────────┤
+  │   testimage    │     ptest       │     SDK Test          │
+  │ (image-level) │  (package-level)│  (devtool test)       │
+  ├────────────────┼─────────────────┼───────────────────────┤
+  │ oeqa.runtime   │ ptest-runner    │  oeqa.sdk             │
+  │ SSH executor   │ per-package     │  env setup            │
+  │ QEMU / HW      │ test binary     │  cross-compile test   │
+  └────────────────┴─────────────────┴───────────────────────┘
+    </pre>
+  </div>
+
+  <h3>Test katmanları</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">testimage</div><div class="desc">Image seviyesi test. Tamamlanmış image'i QEMU'da boot eder, SSH ile bağlanır ve test case'leri çalıştırır. <code class="inline">bitbake -c testimage myimage</code> ile tetiklenir.</div></div>
+    <div class="param"><div class="name">ptest</div><div class="desc">Paket seviyesi test. Her paket kendi test binary'sini içerir. <code class="inline">ptest-runner</code> hepsini çalıştırır. Yocto recipe'de <code class="inline">inherit ptest</code> gerekir.</div></div>
+    <div class="param"><div class="name">oeqa.sdk</div><div class="desc">SDK test. Derlenmiş SDK ortamında derleme ve çalıştırma testleri yapar. <code class="inline">bitbake -c testsdk myimage-sdk</code> ile tetiklenir.</div></div>
+    <div class="param"><div class="name">devtool test</div><div class="desc">Recipe geliştirirken kullanılan hızlı test döngüsü. <code class="inline">devtool test myrecipe</code> ile doğrudan çalıştırılır.</div></div>
+  </div>
+
+  <h3>Gerekli Yocto layer'lar</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bblayers.conf</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Test altyapısı meta-openembedded'de bulunur</span>
+BBLAYERS ?= " \
+  ${BSPDIR}/sources/poky/meta \
+  ${BSPDIR}/sources/poky/meta-poky \
+  ${BSPDIR}/sources/meta-openembedded/meta-oe \
+  ${BSPDIR}/sources/meta-openembedded/meta-python \
+  ${BSPDIR}/sources/meta-openembedded/meta-networking \
+  ${BSPDIR}/sources/meta-custom \
+"</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> testimage.bbclass</h2>
+  <p class="section-lead">testimage.bbclass, tamamlanmış Yocto image'ini otomatik olarak test eden bitbake görevini (task) tanımlar.</p>
+
+  <h3>local.conf ayarları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>local.conf — testimage etkinleştirme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ─── Temel test altyapısı ────────────────────────────────────</span>
+<span class="cmt"># testimage için SSH sunucu gerekir</span>
+IMAGE_FEATURES:append = <span class="str">" ssh-server-openssh"</span>
+
+<span class="cmt"># Test sınıfını etkinleştir</span>
+INHERIT += <span class="str">"testimage"</span>
+
+<span class="cmt"># Test hedefi: simcontroller (QEMU), simpleremote (SSH/gerçek HW)</span>
+TEST_TARGET = <span class="str">"simcontroller"</span>  <span class="cmt"># QEMU için</span>
+<span class="cmt"># TEST_TARGET = "simpleremote"  # gerçek board için</span>
+
+<span class="cmt"># TEST_TARGET = "simpleremote" için board IP/port</span>
+<span class="cmt"># TEST_SERVER_IP = "192.168.1.100"</span>
+<span class="cmt"># TEST_SERVER_PORT = "22"</span>
+
+<span class="cmt"># Çalıştırılacak test suite'leri</span>
+TEST_SUITES = <span class="str">"ping ssh df date scp"</span>
+
+<span class="cmt"># Tüm oeqa.runtime testlerini çalıştır</span>
+<span class="cmt"># TEST_SUITES = "auto"</span>
+
+<span class="cmt"># ptest testlerini testimage'a dahil et</span>
+TEST_SUITES:append = <span class="str">" ptest"</span>
+
+<span class="cmt"># Test timeout (saniye)</span>
+TEST_TIMEOUT = <span class="str">"1200"</span></code></pre>
+  </div>
+
+  <h3>testimage çalıştırma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — testimage komutları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Image derle + test et (tek komut)</span>
+<span class="cmd">bitbake</span> core-image-full-cmdline -c testimage
+
+<span class="cmt"># Sadece testi tekrar çalıştır (image derleme olmadan)</span>
+<span class="cmd">bitbake</span> core-image-full-cmdline -c testimage --no-setscene
+
+<span class="cmt"># Belirli test sınıflarını çalıştır</span>
+<span class="cmd">bitbake</span> core-image-full-cmdline -c testimage \
+  -e TEST_SUITES="ping ssh df"
+
+<span class="cmt"># Sonuçlar:</span>
+<span class="cmt"># tmp/work/qemuarm64-poky-linux/core-image-full-cmdline/1.0-r0/testimage/</span>
+<span class="cmt"># ├── results-core-image-full-cmdline-20260412120000.log</span>
+<span class="cmt"># ├── results-core-image-full-cmdline-20260412120000.xml  (JUnit)</span>
+<span class="cmt"># └── qemu.log</span></code></pre>
+  </div>
+
+  <h3>Yerleşik test suite'leri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Suite</th><th>Ne test eder?</th><th>Gereksinim</th></tr></thead>
+      <tbody>
+        <tr><td>ping</td><td>Ağ bağlantısı</td><td>—</td></tr>
+        <tr><td>ssh</td><td>SSH sunucu çalışıyor mu?</td><td>ssh-server-openssh</td></tr>
+        <tr><td>df</td><td>Dosya sistemi mount durumu</td><td>—</td></tr>
+        <tr><td>date</td><td>Sistem saati doğruluğu</td><td>—</td></tr>
+        <tr><td>scp</td><td>Dosya kopyalama (SCP)</td><td>ssh-server-openssh</td></tr>
+        <tr><td>ptest</td><td>ptest-runner ile paket testleri</td><td>ptest-runner</td></tr>
+        <tr><td>runtime</td><td>Genel runtime kontrolleri</td><td>—</td></tr>
+        <tr><td>perl</td><td>Perl interpreter</td><td>perl</td></tr>
+        <tr><td>python</td><td>Python interpreter</td><td>python3</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> QEMU Üzerinde Test</h2>
+  <p class="section-lead">Yocto testimage, gerçek donanım olmadan QEMU üzerinde tam image testi yapabilir. CI pipeline'ı için idealdir.</p>
+
+  <h3>QEMU test konfigürasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>local.conf — QEMU test ayarları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># QEMU için test hedefi</span>
+TEST_TARGET = <span class="str">"simcontroller"</span>
+
+<span class="cmt"># QEMU arch seçimi (MACHINE'den otomatik gelir ama override edilebilir)</span>
+<span class="cmt"># qemuarm64, qemuarm, qemux86_64, qemuriscv64</span>
+MACHINE = <span class="str">"qemuarm64"</span>
+
+<span class="cmt"># QEMU bellek miktarı</span>
+QB_MEM = <span class="str">"-m 1024"</span>
+
+<span class="cmt"># QEMU network (testimage SSH için gerekli)</span>
+QB_NETWORK_DEVICE = <span class="str">"-device virtio-net-device"</span>
+
+<span class="cmt"># KVM varsa kullan (CI host Linux ise)</span>
+<span class="cmt"># QB_MACHINE = "-machine virt,accel=kvm"</span></code></pre>
+  </div>
+
+  <h3>runqemu ile manuel test</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — runqemu kullanımı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># QEMU'yu başlat, nographic modda</span>
+<span class="cmd">runqemu</span> qemuarm64 core-image-full-cmdline nographic
+
+<span class="cmt"># Ağ erişimiyle birlikte (host'tan ssh ile bağlanmak için)</span>
+<span class="cmd">runqemu</span> qemuarm64 core-image-full-cmdline nographic \
+  slirp <span class="cmt"># TAP değil, kullanıcı modu network</span>
+
+<span class="cmt"># SSH bağlantısı (default port 2222)</span>
+<span class="cmd">ssh</span> -p 2222 root@127.0.0.1
+
+<span class="cmt"># runqemu içinde ek QEMU parametreleri</span>
+<span class="cmd">runqemu</span> qemuarm64 core-image-full-cmdline nographic \
+  <span class="str">"QB_KERNEL_CMDLINE_APPEND=systemd.unit=emergency.target"</span></code></pre>
+  </div>
+
+  <h3>GitLab CI'da QEMU testimage</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>.gitlab-ci.yml — QEMU testimage</span><span class="dot">●</span></div>
+    <pre><code><span class="field">yocto-qemu-test:</span>
+  <span class="field">stage:</span> <span class="str">test</span>
+  <span class="field">image:</span> <span class="str">crops/poky:ubuntu-22.04</span>
+  <span class="field">script:</span>
+    - <span class="str">. oe-init-build-env</span>
+    <span class="cmt"># KVM yoksa slirp kullan</span>
+    - <span class="str">echo 'TEST_TARGET = "simcontroller"' >> conf/local.conf</span>
+    - <span class="str">echo 'INHERIT += "testimage"' >> conf/local.conf</span>
+    - <span class="str">echo 'TEST_SUITES = "ping ssh df date ptest"' >> conf/local.conf</span>
+    - <span class="str">bitbake core-image-full-cmdline</span>
+    - <span class="str">bitbake core-image-full-cmdline -c testimage</span>
+  <span class="field">artifacts:</span>
+    <span class="field">when:</span> <span class="str">always</span>
+    <span class="field">paths:</span>
+      - <span class="str">"build/tmp/work/qemuarm64*/core-image-full-cmdline/*/testimage/*.xml"</span>
+    <span class="field">reports:</span>
+      <span class="field">junit:</span> <span class="str">"build/tmp/work/qemuarm64*/core-image-full-cmdline/*/testimage/*.xml"</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">QEMU KVM HIZLANDIRMA</div>
+    <p>GitLab CI runner'ınız KVM destekliyorsa: <code class="inline">QB_MACHINE = "-machine virt,accel=kvm"</code> ekleyerek QEMU hızını 5-10x artırabilirsiniz. Docker içinde KVM için <code class="inline">--device /dev/kvm</code> gerekir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> ptest Çerçevesi</h2>
+  <p class="section-lead">ptest (package test), her Yocto paketinin kendi test binary'sini içermesini sağlar. ptest-runner tüm paket testlerini toplu olarak çalıştırır.</p>
+
+  <h3>ptest nedir?</h3>
+  <p>ptest, upstream projelerinin (openssl, glibc, bash, sqlite vs.) kendi test suite'lerini Yocto image'ına dahil etmenin standart yoludur. Bir recipe <code class="inline">inherit ptest</code> içerdiğinde, Yocto test binary'lerini ayrı bir paket (<code class="inline">packagename-ptest</code>) olarak derler.</p>
+
+  <h3>ptest'i image'a eklemek</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>local.conf veya image recipe — ptest</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ptest-runner ve seçili paket testlerini ekle</span>
+IMAGE_INSTALL:append = <span class="str">" ptest-runner"</span>
+
+<span class="cmt"># Hangi paketlerin ptest'i dahil edilsin?</span>
+DISTRO_FEATURES:append = <span class="str">" ptest"</span>
+
+<span class="cmt"># Belirli paketlerin ptest'leri:</span>
+IMAGE_INSTALL:append = <span class="str">" \</span>
+<span class="str">  openssl-ptest \</span>
+<span class="str">  glibc-ptest \</span>
+<span class="str">  sqlite3-ptest \</span>
+<span class="str">  python3-pytest-ptest \</span>
+<span class="str">  mylib-ptest \</span>
+<span class="str">"</span>
+
+<span class="cmt"># ptest test sonuç dizini</span>
+<span class="cmt"># /usr/lib/packagename/ptest/ altında test binary ve run-ptest scripti bulunur</span></code></pre>
+  </div>
+
+  <h3>ptest recipe örneği</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>mylib_1.0.bb — ptest recipe</span><span class="dot">●</span></div>
+    <pre><code>SUMMARY = <span class="str">"Örnek C kütüphanesi"</span>
+LICENSE = <span class="str">"MIT"</span>
+LIC_FILES_CHKSUM = <span class="str">"file://LICENSE;md5=..."</span>
+
+SRC_URI = <span class="str">"git://github.com/example/mylib.git;branch=main"</span>
+SRCREV = <span class="str">"abc1234"</span>
+
+<span class="cmt"># ptest sınıfını kullan</span>
+inherit ptest
+
+<span class="cmt"># Normal derleme</span>
+do_compile() {
+    oe_runmake
+}
+
+do_install() {
+    install -d ${D}${libdir}
+    install -m 0755 libmylib.so ${D}${libdir}/
+    install -d ${D}${includedir}
+    install -m 0644 mylib.h ${D}${includedir}/
+}
+
+<span class="cmt"># ptest binary ve run scripti yükle</span>
+do_install_ptest() {
+    install -d ${D}${PTEST_PATH}
+    <span class="cmt"># Test binary'sini kopyala</span>
+    install -m 0755 tests/test_mylib ${D}${PTEST_PATH}/
+    <span class="cmt"># run-ptest scripti — ZORUNLU</span>
+    install -m 0755 ${WORKDIR}/run-ptest ${D}${PTEST_PATH}/
+}
+
+<span class="cmt"># ptest için bağımlılıklar</span>
+RDEPENDS:${PN}-ptest += <span class="str">"bash"</span></code></pre>
+  </div>
+
+  <h3>run-ptest script formatı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>run-ptest — ptest çalıştırma scripti</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#!/bin/sh</span>
+<span class="cmt"># run-ptest — ptest-runner bu scripti çağırır</span>
+<span class="cmt"># Çıktı formatı: "PASS: test_name" veya "FAIL: test_name"</span>
+
+<span class="cmt">#!/bin/sh</span>
+BINDIR=$(dirname $0)
+
+<span class="cmt"># Test binary'sini çalıştır</span>
+${BINDIR}/test_mylib | \
+  sed -e <span class="str">'s/^ok /PASS: /'</span> \
+      -e <span class="str">'s/^not ok /FAIL: /'</span> \
+      -e <span class="str">'s/^# SKIP /SKIP: /'</span></code></pre>
+  </div>
+
+  <h3>Board üzerinde ptest çalıştırma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — ptest-runner kullanımı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm ptest'leri çalıştır</span>
+<span class="cmd">ptest-runner</span>
+
+<span class="cmt"># Belirli paket testleri</span>
+<span class="cmd">ptest-runner</span> openssl sqlite3 mylib
+
+<span class="cmt"># Sonuçları dosyaya kaydet</span>
+<span class="cmd">ptest-runner</span> 2>&1 | <span class="cmd">tee</span> /tmp/ptest-results.log
+
+<span class="cmt"># Çıktı formatı:</span>
+<span class="cmt"># START: ptest-runner</span>
+<span class="cmt"># BEGIN: /usr/lib/openssl/ptest/</span>
+<span class="cmt"># PASS: test_aes_128</span>
+<span class="cmt"># PASS: test_sha256</span>
+<span class="cmt"># FAIL: test_fips_mode</span>
+<span class="cmt"># END: /usr/lib/openssl/ptest/</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Runtime Test Yazma — oeqa.runtime</h2>
+  <p class="section-lead">Özel testimage test case'leri yazmak için oeqa.runtime.case.OERuntimeTestCase sınıfı kullanılır.</p>
+
+  <h3>Özel test case yapısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>meta-custom/lib/oeqa/runtime/cases/myapp.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">from</span> oeqa.runtime.case <span class="keyword">import</span> OERuntimeTestCase
+<span class="keyword">from</span> oeqa.core.decorator.depends <span class="keyword">import</span> OETestDepends
+<span class="keyword">from</span> oeqa.core.decorator.oetimeout <span class="keyword">import</span> OETimeout
+
+<span class="keyword">class</span> <span class="field">MyAppTest</span>(OERuntimeTestCase):
+    <span class="str">"""myapp servisinin doğru çalıştığını test et"""</span>
+
+    @OETestDepends([<span class="str">'ssh.SSHTest.test_ssh'</span>])
+    <span class="keyword">def</span> <span class="field">test_myapp_running</span>(self):
+        <span class="str">"""myapp.service aktif mi?"""</span>
+        status, output = self.target.run(<span class="str">'systemctl is-active myapp.service'</span>)
+        self.assertEqual(status, <span class="str">0</span>, msg=<span class="str">f"myapp çalışmıyor: {output}"</span>)
+        self.assertIn(<span class="str">'active'</span>, output)
+
+    @OETestDepends([<span class="str">'myapp.MyAppTest.test_myapp_running'</span>])
+    <span class="keyword">def</span> <span class="field">test_myapp_version</span>(self):
+        <span class="str">"""myapp versiyonu doğru mu?"""</span>
+        status, output = self.target.run(<span class="str">'myapp --version'</span>)
+        self.assertEqual(status, <span class="str">0</span>)
+        self.assertIn(<span class="str">'2.1'</span>, output)
+
+    @OETimeout(<span class="str">60</span>)
+    <span class="keyword">def</span> <span class="field">test_myapp_process_data</span>(self):
+        <span class="str">"""myapp veri işleme testi"""</span>
+        <span class="cmt"># Dosyayı board'a kopyala</span>
+        self.target.copy_to(<span class="str">'/tmp/test-input.bin'</span>, <span class="str">'/tmp/'</span>)
+        status, output = self.target.run(<span class="str">'myapp process /tmp/test-input.bin'</span>)
+        self.assertEqual(status, <span class="str">0</span>)
+        <span class="cmt"># Çıktı dosyasını host'a kopyala ve doğrula</span>
+        self.target.copy_from(<span class="str">'/tmp/output.bin'</span>, <span class="str">'/tmp/'</span>)
+        <span class="keyword">with</span> open(<span class="str">'/tmp/output.bin'</span>, <span class="str">'rb'</span>) <span class="keyword">as</span> f:
+            data = f.read()
+        self.assertEqual(data[:<span class="str">4</span>], <span class="str">b'MYAP'</span>)  <span class="cmt"># magic header</span>
+
+    <span class="keyword">def</span> <span class="field">test_myapp_config</span>(self):
+        <span class="str">"""Konfigürasyon dosyası mevcut mu?"""</span>
+        status, _ = self.target.run(<span class="str">'test -f /etc/myapp/myapp.conf'</span>)
+        self.assertEqual(status, <span class="str">0</span>, <span class="str">"/etc/myapp/myapp.conf bulunamadı"</span>)</code></pre>
+  </div>
+
+  <h3>Test case'i etkinleştirme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>local.conf — özel test case</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># BBPATH'a meta-custom layer'ı eklendiği varsayılan</span>
+<span class="cmt"># meta-custom/lib/oeqa/runtime/cases/myapp.py otomatik keşfedilir</span>
+
+<span class="cmt"># Test suite'e ekle</span>
+TEST_SUITES = <span class="str">"ping ssh myapp"</span>
+<span class="cmt"># veya tümünü çalıştır:</span>
+TEST_SUITES = <span class="str">"auto"</span>
+
+<span class="cmt"># Belirli testleri dışla:</span>
+TEST_SUITES_EXCLUDE = <span class="str">"date perl"</span></code></pre>
+  </div>
+
+  <h3>SSH executor ve dosya kopyalama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>python — target API</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># target.run(cmd) → (exit_code, stdout+stderr)</span>
+status, output = self.target.run(<span class="str">'cat /proc/cpuinfo | grep "Model"'</span>)
+
+<span class="cmt"># target.copy_to(src, dst) — host → board</span>
+self.target.copy_to(
+    os.path.join(self.target.server_ip, <span class="str">'testdata/config.json'</span>),
+    <span class="str">'/etc/myapp/'</span>
+)
+
+<span class="cmt"># target.copy_from(src, dst) — board → host</span>
+self.target.copy_from(
+    <span class="str">'/var/log/myapp.log'</span>,
+    os.path.join(self.td[<span class="str">'WORKDIR'</span>], <span class="str">'myapp.log'</span>)
+)
+
+<span class="cmt"># Uzun komut için timeout (oeqa için target.defaultenv'e ekle)</span>
+status, output = self.target.run(
+    <span class="str">'myapp heavy-task'</span>,
+    timeout=<span class="str">120</span>
+)</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> SDK Test</h2>
+  <p class="section-lead">Yocto SDK'sı, cross-derleme ortamını test ederek geliştiricilerin doğru araç zincirine sahip olduğunu garantiler.</p>
+
+  <h3>SDK derleme ve test</h3>
+
+  <div class="code-block">
+    <div name="code-header"><span>bash — SDK test</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># SDK derle</span>
+<span class="cmd">bitbake</span> core-image-full-cmdline -c populate_sdk
+
+<span class="cmt"># Çıktı: tmp/deploy/sdk/poky-*.sh</span>
+
+<span class="cmt"># SDK testlerini çalıştır</span>
+<span class="cmd">bitbake</span> core-image-full-cmdline -c testsdk
+
+<span class="cmt"># SDK'yı yükle ve test et</span>
+SDK=<span class="str">"tmp/deploy/sdk/poky-glibc-x86_64-core-image-full-cmdline-aarch64-toolchain-4.0.sh"</span>
+<span class="cmd">chmod</span> +x ${SDK}
+<span class="cmd">${SDK}</span> -y -d /opt/poky-sdk
+
+<span class="cmt"># SDK ortamını başlat</span>
+<span class="cmd">source</span> /opt/poky-sdk/environment-setup-aarch64-poky-linux
+
+<span class="cmt"># Cross-compile testi</span>
+<span class="cmd">echo</span> <span class="str">'#include &lt;stdio.h&gt;
+int main(){printf("Hello from embedded\n");return 0;}'</span> > /tmp/test.c
+${CC} /tmp/test.c -o /tmp/test-aarch64
+<span class="cmd">file</span> /tmp/test-aarch64
+<span class="cmt"># Çıktı: ELF 64-bit LSB executable, ARM aarch64</span></code></pre>
+  </div>
+
+  <h3>Özel SDK test case</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>meta-custom/lib/oeqa/sdk/cases/mylib.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> os, subprocess
+<span class="keyword">from</span> oeqa.sdk.case <span class="keyword">import</span> OESDKTestCase
+
+<span class="keyword">class</span> <span class="field">MyLibSDKTest</span>(OESDKTestCase):
+    <span class="str">"""mylib SDK testleri — cross-compile ve link doğrulama"""</span>
+
+    <span class="keyword">def</span> <span class="field">test_header_exists</span>(self):
+        <span class="str">"""mylib.h başlık dosyası SDK'da mevcut mu?"""</span>
+        header = os.path.join(self.tc.sdk_dir,
+            <span class="str">"sysroots"</span>, self.tc.sdk_machine,
+            <span class="str">"usr/include/mylib.h"</span>)
+        self.assertTrue(os.path.exists(header),
+            <span class="str">f"Başlık bulunamadı: {header}"</span>)
+
+    <span class="keyword">def</span> <span class="field">test_compile_and_link</span>(self):
+        <span class="str">"""mylib ile basit bir program derle"""</span>
+        src = <span class="str">"""
+#include <mylib.h>
+int main(void) {
+    mylib_t *ctx = mylib_init();
+    mylib_free(ctx);
+    return 0;
+}
+"""</span>
+        <span class="keyword">with</span> self._create_tmpdir() <span class="keyword">as</span> tmpdir:
+            srcfile = os.path.join(tmpdir, <span class="str">"test.c"</span>)
+            <span class="keyword">with</span> open(srcfile, <span class="str">"w"</span>) <span class="keyword">as</span> f:
+                f.write(src)
+            result = subprocess.run(
+                [<span class="str">f"{self.tc.env['CC']}"</span>, srcfile, <span class="str">"-lmylib"</span>, <span class="str">"-o"</span>,
+                 os.path.join(tmpdir, <span class="str">"test"</span>)],
+                env=self.tc.env,
+                capture_output=<span class="keyword">True</span>
+            )
+            self.assertEqual(result.returncode, <span class="str">0</span>,
+                msg=result.stderr.decode())</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> wic Image + Donanım Testi</h2>
+  <p class="section-lead">wic ile oluşturulan SD kart image'ları donanım üzerinde LAVA veya manuel olarak test edilebilir.</p>
+
+  <h3>wic image oluşturma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — wic image</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># wic image derle (core-image-full-cmdline.wic)</span>
+<span class="cmd">bitbake</span> core-image-full-cmdline
+
+<span class="cmt"># Image çıktısı:</span>
+<span class="cmt"># tmp/deploy/images/rpi4/core-image-full-cmdline-rpi4.rootfs.wic</span>
+<span class="cmt"># tmp/deploy/images/rpi4/core-image-full-cmdline-rpi4.rootfs.wic.bz2</span>
+
+<span class="cmt"># SD karta yaz</span>
+<span class="cmd">bzip2</span> -d core-image-full-cmdline-rpi4.rootfs.wic.bz2
+<span class="cmd">dd</span> if=core-image-full-cmdline-rpi4.rootfs.wic of=/dev/sdb bs=4M status=progress
+<span class="cmd">sync</span></code></pre>
+  </div>
+
+  <h3>LAVA ile wic image testi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>lava-wic-job.yaml</span><span class="dot">●</span></div>
+    <pre><code><span class="field">job_name:</span> <span class="str">"yocto-wic-image-test"</span>
+<span class="field">device_type:</span> <span class="str">rpi4b</span>
+
+<span class="field">actions:</span>
+  - <span class="field">deploy:</span>
+      <span class="field">to:</span> <span class="str">removable-media</span>
+      <span class="field">image:</span>
+        <span class="field">url:</span> <span class="str">http://artifacts.example.com/rpi4/core-image-full-cmdline.wic.bz2</span>
+        <span class="field">compression:</span> <span class="str">bz2</span>
+      <span class="field">device:</span> <span class="str">/dev/sda</span>
+
+  - <span class="field">boot:</span>
+      <span class="field">method:</span> <span class="str">u-boot</span>
+      <span class="field">commands:</span> <span class="str">sdcard</span>
+      <span class="field">auto_login:</span>
+        <span class="field">login_prompt:</span> <span class="str">"login:"</span>
+        <span class="field">username:</span> <span class="str">root</span>
+      <span class="field">prompts:</span>
+        - <span class="str">"root@rpi4:~#"</span>
+
+  - <span class="field">test:</span>
+      <span class="field">definitions:</span>
+        - <span class="field">repository:</span> <span class="str">https://gitlab.example.com/lava-tests.git</span>
+          <span class="field">from:</span> <span class="str">git</span>
+          <span class="field">path:</span> <span class="str">yocto/smoke-test.yaml</span>
+          <span class="field">name:</span> <span class="str">yocto-smoke</span></code></pre>
+  </div>
+
+  <h3>simpleremote ile gerçek board testimage</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>local.conf — simpleremote</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Gerçek board üzerinde testimage</span>
+TEST_TARGET = <span class="str">"simpleremote"</span>
+TEST_TARGET_IP = <span class="str">"192.168.1.100"</span>
+TEST_SERVER_IP  = <span class="str">"192.168.1.10"</span>  <span class="cmt"># build host IP (SCP için)</span>
+
+<span class="cmt"># SSH passwordless erişim gerekir:</span>
+<span class="cmt"># IMAGE_INSTALL:append = " authorized-keys"</span>
+<span class="cmt"># veya root_authorized_keys.py recipe'si ile</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Pratik: Custom ptest + testimage Pipeline</h2>
+  <p class="section-lead">Sıfırdan bir custom ptest recipe yazmak ve GitLab CI'da tam testimage pipeline'ı çalıştırmak için adım adım rehber.</p>
+
+  <h3>Adım 1: C kütüphanesi ve test kodu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>mymath/mymath.c + tests/test_mymath.c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* mymath.c */</span>
+<span class="keyword">#include</span> <span class="str">"mymath.h"</span>
+int mymath_add(int a, int b) { return a + b; }
+int mymath_mul(int a, int b) { return a * b; }
+
+<span class="cmt">/* tests/test_mymath.c — TAP protokolü kullanır */</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdio.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">"mymath.h"</span>
+
+<span class="keyword">static int</span> pass=<span class="str">0</span>, fail=<span class="str">0</span>, total=<span class="str">0</span>;
+
+<span class="keyword">static void</span> <span class="field">ok</span>(<span class="keyword">int</span> cond, <span class="keyword">const char</span> *name) {
+    total++;
+    <span class="keyword">if</span> (cond) { printf(<span class="str">"ok %d - %s\n"</span>, total, name); pass++; }
+    <span class="keyword">else</span>       { printf(<span class="str">"not ok %d - %s\n"</span>, total, name); fail++; }
+}
+
+<span class="keyword">int</span> <span class="field">main</span>(<span class="keyword">void</span>) {
+    printf(<span class="str">"TAP version 13\n"</span>);
+    ok(mymath_add(<span class="str">1</span>, <span class="str">2</span>) == <span class="str">3</span>,   <span class="str">"add 1+2=3"</span>);
+    ok(mymath_add(-<span class="str">1</span>, <span class="str">1</span>) == <span class="str">0</span>,  <span class="str">"add -1+1=0"</span>);
+    ok(mymath_mul(<span class="str">3</span>, <span class="str">4</span>) == <span class="str">12</span>,  <span class="str">"mul 3*4=12"</span>);
+    ok(mymath_mul(<span class="str">0</span>, <span class="str">99</span>) == <span class="str">0</span>,  <span class="str">"mul 0*99=0"</span>);
+    printf(<span class="str">"1..%d\n"</span>, total);
+    return fail > <span class="str">0</span> ? <span class="str">1</span> : <span class="str">0</span>;
+}</code></pre>
+  </div>
+
+  <h3>Adım 2: Yocto recipe (ptest ile)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>meta-custom/recipes-core/mymath/mymath_1.0.bb</span><span class="dot">●</span></div>
+    <pre><code>SUMMARY = <span class="str">"mymath — basit matematik kütüphanesi"</span>
+LICENSE = <span class="str">"MIT"</span>
+LIC_FILES_CHKSUM = <span class="str">"file://LICENSE;md5=abc123"</span>
+
+SRC_URI = <span class="str">"git://github.com/example/mymath.git;protocol=https;branch=main"</span>
+SRCREV  = <span class="str">"${AUTOREV}"</span>
+
+S = <span class="str">"${WORKDIR}/git"</span>
+
+inherit cmake ptest
+
+EXTRA_OECMAKE = <span class="str">"-DBUILD_TESTING=ON"</span>
+
+do_install() {
+    install -d ${D}${libdir}
+    install -m 0755 ${B}/libmymath.so.1.0 ${D}${libdir}/libmymath.so.1.0
+    <span class="cmd">ln</span> -s libmymath.so.1.0 ${D}${libdir}/libmymath.so
+    install -d ${D}${includedir}
+    install -m 0644 ${S}/mymath.h ${D}${includedir}/
+}
+
+do_install_ptest() {
+    install -d ${D}${PTEST_PATH}
+    install -m 0755 ${B}/tests/test_mymath ${D}${PTEST_PATH}/
+    install -m 0755 ${WORKDIR}/run-ptest  ${D}${PTEST_PATH}/
+}
+
+FILES:${PN} = <span class="str">"${libdir} ${includedir}"</span>
+RDEPENDS:${PN}-ptest = <span class="str">"bash"</span></code></pre>
+  </div>
+
+  <h3>Adım 3: run-ptest</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>meta-custom/recipes-core/mymath/files/run-ptest</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#!/bin/sh</span>
+<span class="keyword">cd</span> $(dirname $0)
+./test_mymath | sed -e <span class="str">'s/^ok /PASS: /'</span> -e <span class="str">'s/^not ok /FAIL: /'</span></code></pre>
+  </div>
+
+  <h3>Adım 4: GitLab CI tam pipeline</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>.gitlab-ci.yml — Yocto tam pipeline</span><span class="dot">●</span></div>
+    <pre><code><span class="field">stages:</span>
+  - <span class="str">yocto-build</span>
+  - <span class="str">qemu-test</span>
+  - <span class="str">hw-test</span>
+
+<span class="field">yocto-build:</span>
+  <span class="field">stage:</span> <span class="str">yocto-build</span>
+  <span class="field">script:</span>
+    - <span class="str">. oe-init-build-env</span>
+    - <span class="str">bitbake core-image-full-cmdline</span>
+  <span class="field">artifacts:</span>
+    <span class="field">paths:</span>
+      - <span class="str">build/tmp/deploy/images/qemuarm64/</span>
+    <span class="field">expire_in:</span> <span class="str">1 day</span>
+
+<span class="field">qemu-testimage:</span>
+  <span class="field">stage:</span> <span class="str">qemu-test</span>
+  <span class="field">needs:</span> [<span class="str">yocto-build</span>]
+  <span class="field">script:</span>
+    - <span class="str">. oe-init-build-env</span>
+    - <span class="str">cat >> conf/local.conf << 'EOF'</span>
+      <span class="str">TEST_TARGET = "simcontroller"</span>
+      <span class="str">INHERIT += "testimage"</span>
+      <span class="str">TEST_SUITES = "ping ssh mymath ptest"</span>
+      <span class="str">EOF</span>
+    - <span class="str">bitbake core-image-full-cmdline -c testimage</span>
+    - <span class="str">cp build/tmp/work/qemuarm64*/core-image-full-cmdline/*/testimage/*.xml results-qemu.xml</span>
+  <span class="field">artifacts:</span>
+    <span class="field">when:</span> <span class="str">always</span>
+    <span class="field">reports:</span>
+      <span class="field">junit:</span> <span class="str">results-qemu.xml</span>
+
+<span class="field">hw-testimage:</span>
+  <span class="field">stage:</span> <span class="str">hw-test</span>
+  <span class="field">tags:</span> [<span class="str">hil-runner</span>, <span class="str">rpi4</span>]
+  <span class="field">needs:</span> [<span class="str">qemu-testimage</span>]
+  <span class="field">script:</span>
+    - <span class="str">./ci/flash-sd.sh build/tmp/deploy/images/rpi4/*.wic.bz2</span>
+    - <span class="str">. oe-init-build-env</span>
+    - <span class="str">cat >> conf/local.conf << 'EOF'</span>
+      <span class="str">TEST_TARGET = "simpleremote"</span>
+      <span class="str">TEST_TARGET_IP = "192.168.1.100"</span>
+      <span class="str">TEST_SUITES = "ping ssh ptest mymath"</span>
+      <span class="str">EOF</span>
+    - <span class="str">bitbake core-image-full-cmdline -c testimage</span>
+  <span class="field">artifacts:</span>
+    <span class="field">when:</span> <span class="str">always</span>
+    <span class="field">reports:</span>
+      <span class="field">junit:</span> <span class="str">"build/tmp/work/*/core-image-full-cmdline/*/testimage/*.xml"</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">PIPELINE ÖZET</div>
+    <p>Bu pipeline şu adımları otomatik gerçekleştirir: Yocto build → QEMU testimage (ptest dahil) → QEMU geçerse gerçek RPi4'te wic image flash + testimage. Her aşama JUnit XML üretir ve GitLab test raporuna eklenir. Herhangi bir aşama başarısız olursa pipeline durur.</p>
+  </div>
+</section>
+
+</main>
+
+</body>
+</html>

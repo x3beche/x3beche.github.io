@@ -1,0 +1,645 @@
+---
+layout: tutorial
+title: "DRM/KMS — Grafik & Görüntü"
+back_url: "../index.html"
+back_label: "Grafik & Görüntü"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GRAFİK &amp; GÖRÜNTÜ</span>
+    <span>DRM/KMS</span>
+    <span>2026</span>
+  </div>
+  <h1>DRM/KMS —<br><em>kernel mode setting.</em></h1>
+  <p class="subtitle">libdrm ile display pipeline'ı doğrudan yönet. CRTC, encoder, connector ve plane hiyerarşisini anla; atomic commit ile tear-free sayfa çevirimi yap; GEM ve DMA-BUF ile zero-copy grafik pipeline kur.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">DRM/KMS mimarisi — CRTC, encoder, connector, plane</a></li>
+    <li><a href="#s1">libdrm API — kaynakları keşfet</a></li>
+    <li><a href="#s2">Mode setting — drmModeSetCrtc ve modeline</a></li>
+    <li><a href="#s3">Atomic commit — non-blocking sayfa çevirimi</a></li>
+    <li><a href="#s4">GEM buffer yönetimi — mmap, PRIME ve DMA-BUF</a></li>
+    <li><a href="#s5">KMS plane ve overlay — z-order, blend, scaler</a></li>
+    <li><a href="#s6">Device tree ve driver — MIPI DSI, LVDS, HDMI</a></li>
+    <li><a href="#s7">Debug — modetest, kmscube, drm_info</a></li>
+    <li><a href="#s8">Pratik — RPi4 HDMI, i.MX8 MIPI DSI, triple buffering</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> DRM/KMS mimarisi</h2>
+  <p class="section-lead">DRM (Direct Rendering Manager), Linux'ta GPU ve display donanımını yöneten kernel alt sistemidir. KMS (Kernel Mode Setting) ise display modunu (çözünürlük, piksel saati) kullanıcı alanından değil kernel içinden ayarlayan katmandır.</p>
+
+  <h3>Nesneler ve hiyerarşi</h3>
+
+  <div class="flow">
+    <pre>
+  GPU/Display Engine
+  ┌─────────────────────────────────────────────┐
+  │  Framebuffer (FB)  ←  GEM buffer            │
+  │       ↓                                     │
+  │  Plane (Primary / Overlay / Cursor)          │
+  │       ↓                                     │
+  │  CRTC  (display controller, scan-out)        │
+  │       ↓                                     │
+  │  Encoder  (HDMI TX / MIPI DSI / LVDS)        │
+  │       ↓                                     │
+  │  Connector  (HDMI-A-1 / DSI-1 / LVDS-1)     │
+  └─────────────────────────────────────────────┘
+    </pre>
+  </div>
+
+  <div class="params">
+    <div class="param">
+      <div class="name">CRTC</div>
+      <div class="desc">Display controller — framebuffer'ı tarar ve piksel saatiyle senkronize sinyal üretir. Bir CRTC birden fazla plane'i birleştirebilir.</div>
+    </div>
+    <div class="param">
+      <div class="name">Encoder</div>
+      <div class="desc">CRTC çıkışını HDMI, MIPI DSI, LVDS gibi fiziksel sinyale dönüştürür. Tek CRTC'ye birden fazla encoder bağlanabilir (mirror/clone).</div>
+    </div>
+    <div class="param">
+      <div class="name">Connector</div>
+      <div class="desc">Fiziksel konnektör — HDMI-A-1, DP-1, DSI-1. EDID okur, desteklenen modları bildirir, hot-plug algılar.</div>
+    </div>
+    <div class="param">
+      <div class="name">Plane</div>
+      <div class="desc">Primary (zorunlu), Overlay (opsiyonel bindirme) ve Cursor (fare imleci) olmak üzere 3 türü vardır. Her plane bağımsız framebuffer ve pozisyon içerir.</div>
+    </div>
+    <div class="param">
+      <div class="name">Framebuffer</div>
+      <div class="desc">GEM handle'a bağlı piksel tamponu. Genişlik, yükseklik, piksel formatı (DRM_FORMAT_*) ve pitch (satır uzunluğu) bilgilerini taşır.</div>
+    </div>
+  </div>
+
+  <h3>Kernel konfigürasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig</span><span class="dot">●</span></div>
+    <pre><code>CONFIG_DRM=y
+CONFIG_DRM_KMS_HELPER=y
+CONFIG_DRM_GEM_DMA_HELPER=y      <span class="cmt"># DMA koherent buffer</span>
+CONFIG_DRM_PANEL=y               <span class="cmt"># panel framework</span>
+CONFIG_DRM_MIPI_DSI=y            <span class="cmt"># MIPI DSI host</span>
+CONFIG_DRM_VC4=y                 <span class="cmt"># Raspberry Pi 4 GPU</span>
+CONFIG_DRM_IMX=y                 <span class="cmt"># i.MX8 display engine</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">UDL vs MODESET</div>
+    <p>Eski UMS (User Mode Setting) artık kullanılmıyor. Modern DRM sürücülerinin tamamı KMS'i destekler. <code class="inline">drm_info</code> ile hangi sürücünün MODESET özelliğine sahip olduğunu doğrulayabilirsin.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> libdrm API — kaynakları keşfet</h2>
+  <p class="section-lead">libdrm, <code class="inline">/dev/dri/card0</code> cihaz dosyası üzerinden DRM ioctl'lerini saran kullanıcı alanı kütüphanesidir. Bağlantı, kaynakları listeleme ve mod sorgulama için temel fonksiyonları sağlar.</p>
+
+  <h3>Temel API fonksiyonları</h3>
+
+  <div class="params">
+    <div class="param">
+      <div class="name">drmOpen()</div>
+      <div class="desc">DRM cihazını açar. İlk parametre sürücü adı ("vc4", "imx-drm"), ikincisi NULL. Başarısızlıkta -1 döner.</div>
+    </div>
+    <div class="param">
+      <div class="name">drmModeGetResources()</div>
+      <div class="desc">CRTC, encoder ve connector ID listelerini içeren <code class="inline">drmModeRes</code> yapısını döner.</div>
+    </div>
+    <div class="param">
+      <div class="name">drmModeGetConnector()</div>
+      <div class="desc">Belirli bir connector'ın durumunu (bağlı/bağlı değil), desteklenen mod listesini ve EDID bilgisini döner.</div>
+    </div>
+    <div class="param">
+      <div class="name">drmModeGetCrtc()</div>
+      <div class="desc">Mevcut CRTC konfigürasyonunu döner: aktif mod, framebuffer ID ve x/y offset.</div>
+    </div>
+    <div class="param">
+      <div class="name">drmModeFreeResources()</div>
+      <div class="desc">Tüm Get* fonksiyonlarına karşılık gelen Free* fonksiyonları belleği serbest bırakır.</div>
+    </div>
+  </div>
+
+  <h3>Ekranları listeleme — tam C örneği</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>drm_list.c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;stdio.h&gt;
+#include &lt;xf86drm.h&gt;
+#include &lt;xf86drmMode.h&gt;
+
+int main(void)
+{
+    int fd = drmOpen("vc4", NULL);   <span class="cmt">/* ya da open("/dev/dri/card0", O_RDWR) */</span>
+    if (fd &lt; 0) { perror("drmOpen"); return 1; }
+
+    drmModeRes *res = drmModeGetResources(fd);
+    printf("CRTC sayısı   : %d\n", res-&gt;count_crtcs);
+    printf("Encoder sayısı: %d\n", res-&gt;count_encoders);
+    printf("Connector say.: %d\n", res-&gt;count_connectors);
+
+    for (int i = 0; i &lt; res-&gt;count_connectors; i++) {
+        drmModeConnector *conn =
+            drmModeGetConnector(fd, res-&gt;connectors[i]);
+
+        const char *state = (conn-&gt;connection == DRM_MODE_CONNECTED)
+                            ? "BAĞLI" : "bağlı değil";
+        printf("  Connector %d: %s (%d mod)\n",
+               conn-&gt;connector_id, state, conn-&gt;count_modes);
+
+        for (int m = 0; m &lt; conn-&gt;count_modes; m++) {
+            drmModeModeInfo *mode = &amp;conn-&gt;modes[m];
+            printf("    [%d] %dx%d @ %d Hz\n",
+                   m, mode-&gt;hdisplay, mode-&gt;vdisplay,
+                   mode-&gt;vrefresh);
+        }
+        drmModeFreeConnector(conn);
+    }
+
+    drmModeFreeResources(res);
+    drmClose(fd);
+    return 0;
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>Derleme</span><span class="dot">●</span></div>
+    <pre><code>gcc -o drm_list drm_list.c $(pkg-config --cflags --libs libdrm)</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Mode setting — drmModeSetCrtc ve modeline</h2>
+  <p class="section-lead">Ekrana içerik göstermek için framebuffer oluştur, CRTC'yi o framebuffer'a ve seçilen moda bağla.</p>
+
+  <h3>Modeline anatomisi</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">clock</div><div class="desc">Piksel saati (kHz). 1920x1080@60Hz için ~148500 kHz.</div></div>
+    <div class="param"><div class="name">hdisplay / vdisplay</div><div class="desc">Aktif piksel bölgesi. Gerçek çözünürlük burada.</div></div>
+    <div class="param"><div class="name">hsync_start/end, htotal</div><div class="desc">Yatay senkronizasyon darbesinin başlangıç, bitiş ve toplam piksel sayısı.</div></div>
+    <div class="param"><div class="name">vrefresh</div><div class="desc">Saniyedeki kare sayısı (Hz). Hesaplanmış değer: clock / (htotal * vtotal).</div></div>
+  </div>
+
+  <h3>Framebuffer oluştur ve modu ayarla</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — mode set</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;xf86drm.h&gt;
+#include &lt;xf86drmMode.h&gt;
+#include &lt;drm/drm_fourcc.h&gt;
+#include &lt;sys/mman.h&gt;
+
+<span class="cmt">/* 1. dumb buffer oluştur */</span>
+struct drm_mode_create_dumb creq = {
+    .width  = mode-&gt;hdisplay,
+    .height = mode-&gt;vdisplay,
+    .bpp    = 32,
+};
+drmIoctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &amp;creq);
+<span class="cmt">/* creq.handle = GEM handle, creq.pitch = satır uzunluğu */</span>
+
+<span class="cmt">/* 2. framebuffer kaydı */</span>
+uint32_t fb_id;
+drmModeAddFB(fd,
+    mode-&gt;hdisplay, mode-&gt;vdisplay,
+    24,            <span class="cmt">/* depth */</span>
+    32,            <span class="cmt">/* bpp   */</span>
+    creq.pitch,
+    creq.handle,
+    &amp;fb_id);
+
+<span class="cmt">/* 3. buffer'ı mmap et — piksel yaz */</span>
+struct drm_mode_map_dumb mreq = { .handle = creq.handle };
+drmIoctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &amp;mreq);
+uint32_t *pixels = mmap(NULL, creq.size,
+    PROT_READ | PROT_WRITE, MAP_SHARED, fd, mreq.offset);
+
+<span class="cmt">/* kırmızı ekran */</span>
+for (uint64_t i = 0; i &lt; creq.size / 4; i++)
+    pixels[i] = 0x00FF0000;
+
+<span class="cmt">/* 4. CRTC'yi ayarla */</span>
+drmModeSetCrtc(fd,
+    crtc_id,
+    fb_id,
+    0, 0,             <span class="cmt">/* x, y offset */</span>
+    &amp;connector_id, 1, <span class="cmt">/* connector listesi */</span>
+    mode);            <span class="cmt">/* drmModeModeInfo* */</span></code></pre>
+  </div>
+
+  <h3>Double buffering</h3>
+  <p>İki framebuffer oluştur (fb_id[0] ve fb_id[1]). Birini gösterirken diğerine yaz. <code class="inline">drmModeSetCrtc()</code> veya sayfa çevirimi ile aktif tamponu değiştir.</p>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Atomic commit — non-blocking sayfa çevirimi</h2>
+  <p class="section-lead">Eski API tek nesneyi değiştirirken, atomic commit tüm display pipeline değişikliklerini tek atomik işlemde uygular. Bu hem tutarlılığı garanti eder hem de non-blocking modda VBlank senkronizasyonu sağlar.</p>
+
+  <h3>Atomic API adımları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — atomic commit</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;xf86drmMode.h&gt;
+
+<span class="cmt">/* 1. atomic capability aç */</span>
+drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1);
+drmSetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+
+<span class="cmt">/* 2. property ID'lerini al (önceden bir kere yap) */</span>
+<span class="cmt">/*    drmModeObjectGetProperties() ile CRTC/plane property'lerini sorgula */</span>
+
+<span class="cmt">/* 3. atomic request oluştur */</span>
+drmModeAtomicReqPtr req = drmModeAtomicAlloc();
+
+<span class="cmt">/* 4. property'leri ekle: nesne tipi | ID | property ID | değer */</span>
+drmModeAtomicAddProperty(req,
+    plane_id,
+    prop_fb_id,          <span class="cmt">/* "FB_ID" property */</span>
+    new_fb_id);
+
+drmModeAtomicAddProperty(req,
+    plane_id,
+    prop_crtc_id,        <span class="cmt">/* "CRTC_ID" property */</span>
+    crtc_id);
+
+drmModeAtomicAddProperty(req, plane_id, prop_src_x,  0);
+drmModeAtomicAddProperty(req, plane_id, prop_src_y,  0);
+drmModeAtomicAddProperty(req, plane_id, prop_src_w,  width  &lt;&lt; 16);
+drmModeAtomicAddProperty(req, plane_id, prop_src_h,  height &lt;&lt; 16);
+drmModeAtomicAddProperty(req, plane_id, prop_crtc_x, 0);
+drmModeAtomicAddProperty(req, plane_id, prop_crtc_y, 0);
+drmModeAtomicAddProperty(req, plane_id, prop_crtc_w, width);
+drmModeAtomicAddProperty(req, plane_id, prop_crtc_h, height);
+
+<span class="cmt">/* 5. commit — non-blocking, page flip event iste */</span>
+drmModeAtomicCommit(fd, req,
+    DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT,
+    user_data);
+
+drmModeAtomicFree(req);
+
+<span class="cmt">/* 6. VBlank event bekle */</span>
+drmEventContext evctx = {
+    .version           = DRM_EVENT_CONTEXT_VERSION,
+    .page_flip_handler = on_page_flip,
+};
+fd_set fds;
+FD_ZERO(&amp;fds);
+FD_SET(fd, &amp;fds);
+select(fd + 1, &amp;fds, NULL, NULL, NULL);
+drmHandleEvent(fd, &amp;evctx);</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">DRM_MODE_ATOMIC_TEST_ONLY</div>
+    <p><code class="inline">DRM_MODE_ATOMIC_TEST_ONLY</code> bayrağı ile commit'i gerçekten uygulamadan donanımın konfigürasyonu destekleyip desteklemediğini test edebilirsin. Overlay plane formatını önceden doğrulamak için kullanışlıdır.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> GEM buffer yönetimi — mmap, PRIME ve DMA-BUF</h2>
+  <p class="section-lead">GEM (Graphics Execution Manager), GPU belleğini yöneten kernel nesnesidir. Her GEM nesnesinin bir handle'ı vardır; bu handle fd'ye dönüştürülerek süreçler arası paylaşılabilir (PRIME).</p>
+
+  <h3>GEM handle ömrü</h3>
+
+  <div class="flow">
+    <pre>
+  CREATE_DUMB ioctl   →  GEM handle (uint32_t)
+         ↓
+  MAP_DUMB ioctl      →  mmap offset  →  mmap()  →  CPU erişimi
+         ↓
+  drmModeAddFB()      →  FB ID  (display engine okur)
+         ↓
+  drmPrimeHandleToFD()→  DMA-BUF fd  (başka sürücüye/sürece ver)
+    </pre>
+  </div>
+
+  <h3>PRIME — sürücüler arası sıfır kopya</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — PRIME export/import</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* GPU sürücüsünden DMA-BUF fd al */</span>
+int dmabuf_fd;
+drmPrimeHandleToFD(gpu_fd,
+    gem_handle,
+    DRM_CLOEXEC | DRM_RDWR,
+    &amp;dmabuf_fd);
+
+<span class="cmt">/* Display sürücüsüne aynı buffer'ı import et */</span>
+uint32_t import_handle;
+drmPrimeFDToHandle(disp_fd, dmabuf_fd, &amp;import_handle);
+
+<span class="cmt">/* Artık import_handle üzerinden FB oluşturulabilir */</span>
+drmModeAddFB2(disp_fd, width, height,
+    DRM_FORMAT_ARGB8888,
+    handles, pitches, offsets,
+    &amp;fb_id, 0);</code></pre>
+  </div>
+
+  <h3>dma_buf_export — zero-copy pipeline</h3>
+  <p>GPU render eder → DMA-BUF fd → display engine okur, tek kopya olmadan. V4L2 kamera çıkışını da aynı yolla display'e besleyebilirsin: <code class="inline">VIDIOC_EXPBUF</code> → <code class="inline">drmPrimeFDToHandle()</code> → <code class="inline">drmModeAddFB2()</code>.</p>
+
+  <div class="callout">
+    <div class="label">DRM_FORMAT_MOD_*</div>
+    <p>Modern donanımlar tiled veya compressed format kullanır. <code class="inline">drmModeAddFB2WithModifiers()</code> ile <code class="inline">DRM_FORMAT_MOD_BROADCOM_VC4_T_TILED</code> gibi modifier'ları belirtebilirsin.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> KMS plane ve overlay — z-order, blend, scaler</h2>
+  <p class="section-lead">Overlay plane'ler video oynatma, OSD ve cursor için ayrı framebuffer katmanları sunar. Donanım compositor gibi çalışır; CPU karıştırması gerekmez.</p>
+
+  <h3>Plane türleri</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">DRM_PLANE_TYPE_PRIMARY</div><div class="desc">Ana içerik katmanı. Her CRTC için en az bir primary plane zorunludur.</div></div>
+    <div class="param"><div class="name">DRM_PLANE_TYPE_OVERLAY</div><div class="desc">Bindirme katmanı. Video, grafik UI veya kamera önizlemesi için kullanılır. Sayısı donanıma göre değişir.</div></div>
+    <div class="param"><div class="name">DRM_PLANE_TYPE_CURSOR</div><div class="desc">Fare imleci için optimize edilmiş, genellikle 64×64 piksel sınırlı özel katman.</div></div>
+  </div>
+
+  <h3>Plane property'leri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — plane property listesi</span><span class="dot">●</span></div>
+    <pre><code>modetest -p   <span class="cmt"># tüm plane property'lerini listele</span>
+
+<span class="cmt"># Tipik property'ler:</span>
+<span class="cmt"># FB_ID       — bağlı framebuffer</span>
+<span class="cmt"># CRTC_ID     — bağlı CRTC</span>
+<span class="cmt"># SRC_X/Y/W/H — kaynak dikdörtgen (16.16 sabit noktalı)</span>
+<span class="cmt"># CRTC_X/Y/W/H— hedef dikdörtgen (piksel)</span>
+<span class="cmt"># zpos        — z sırası (küçük = altta)</span>
+<span class="cmt"># alpha       — 0..65535 genel saydamlık</span>
+<span class="cmt"># pixel blend mode — None / Pre-multiplied / Coverage</span>
+<span class="cmt"># rotation    — 0 / 90 / 180 / 270 / reflect-x / reflect-y</span>
+<span class="cmt"># COLOR_ENCODING— YUV BT.601 / BT.709 / BT.2020</span>
+<span class="cmt"># COLOR_RANGE — limited / full</span></code></pre>
+  </div>
+
+  <h3>YUV overlay örneği (video playback)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — NV12 overlay</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* NV12 (YUV 4:2:0) framebuffer oluştur */</span>
+uint32_t handles[4] = { y_handle, uv_handle, 0, 0 };
+uint32_t pitches[4] = { width, width, 0, 0 };
+uint32_t offsets[4] = { 0, 0, 0, 0 };
+
+drmModeAddFB2(fd, width, height,
+    DRM_FORMAT_NV12,
+    handles, pitches, offsets,
+    &amp;fb_id, 0);
+
+<span class="cmt">/* overlay plane'e ata — donanım renk dönüşümü yapar */</span>
+drmModeAtomicAddProperty(req, overlay_plane_id,
+    prop_fb_id, fb_id);
+drmModeAtomicAddProperty(req, overlay_plane_id,
+    prop_color_encoding, DRM_COLOR_YCBCR_BT709);
+drmModeAtomicAddProperty(req, overlay_plane_id,
+    prop_color_range,    DRM_COLOR_YCBCR_FULL_RANGE);</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Device tree ve driver — MIPI DSI, LVDS, HDMI</h2>
+  <p class="section-lead">Display alt sistemi, device tree'deki panel ve encoder tanımlamalarına dayanır. Yanlış zamanlama parametresi ya da eksik binding, sürücünün probe etmemesine yol açar.</p>
+
+  <h3>MIPI DSI panel tanımı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>DTS — MIPI DSI panel</span><span class="dot">●</span></div>
+    <pre><code>&amp;mipi_dsi {
+    status = "okay";
+    #address-cells = &lt;1&gt;;
+    #size-cells = &lt;0&gt;;
+
+    panel@0 {
+        compatible = "jadard,jd9365da";  /* panel sürücüsü */
+        reg = &lt;0&gt;;
+        reset-gpios = &lt;&amp;gpio1 8 GPIO_ACTIVE_LOW&gt;;
+        backlight = &lt;&amp;backlight&gt;;
+        dsi-lanes = &lt;4&gt;;
+
+        display-timings {
+            native-mode = &lt;&amp;timing0&gt;;
+            timing0: timing0 {
+                clock-frequency = &lt;65000000&gt;;  /* 65 MHz piksel saati */
+                hactive = &lt;1024&gt;;
+                vactive = &lt;600&gt;;
+                hfront-porch = &lt;160&gt;;
+                hback-porch  = &lt;140&gt;;
+                hsync-len    = &lt;20&gt;;
+                vfront-porch = &lt;12&gt;;
+                vback-porch  = &lt;20&gt;;
+                vsync-len    = &lt;3&gt;;
+                hsync-active = &lt;0&gt;;
+                vsync-active = &lt;0&gt;;
+                de-active    = &lt;1&gt;;
+                pixelclk-active = &lt;1&gt;;
+            };
+        };
+    };
+};</code></pre>
+  </div>
+
+  <h3>simple-panel ve LVDS</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>DTS — LVDS simple-panel</span><span class="dot">●</span></div>
+    <pre><code>panel: panel {
+    compatible = "panel-lvds";
+    width-mm  = &lt;203&gt;;
+    height-mm = &lt;133&gt;;
+    data-mapping = "jeida-24";    /* veya "vesa-24" */
+
+    panel-timing {
+        clock-frequency = &lt;65000000&gt;;
+        hactive = &lt;1024&gt;; vactive = &lt;600&gt;;
+        hfront-porch = &lt;40&gt;;  hback-porch = &lt;220&gt;;
+        vfront-porch = &lt;5&gt;;   vback-porch = &lt;20&gt;;
+    };
+
+    ports {
+        #address-cells = &lt;1&gt;;
+        #size-cells = &lt;0&gt;;
+        port@0 {
+            reg = &lt;0&gt;;
+            panel_in: endpoint {
+                remote-endpoint = &lt;&amp;lvds_out&gt;;
+            };
+        };
+    };
+};</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">drm-panel framework</div>
+    <p>Kernel 5.10+, panel sürücülerini <code class="inline">drm_panel_funcs</code> arayüzü üzerinden standartlaştırır. <code class="inline">prepare()</code>, <code class="inline">enable()</code>, <code class="inline">disable()</code>, <code class="inline">unprepare()</code> sırası backlight ve reset sinyali sırasını belirler.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Debug — modetest, kmscube, drm_info</h2>
+  <p class="section-lead">Display sorunlarını izole etmek için katmanlı debug araçları kullanılır: önce donanım tespiti, sonra basit test, sonra OpenGL ES test.</p>
+
+  <h3>modetest</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># libdrm-tests paketinden gelir</span>
+modetest -M vc4           <span class="cmt"># vc4 modülünü kullan</span>
+modetest -p               <span class="cmt"># tüm plane property'leri</span>
+modetest -c               <span class="cmt"># connector ve mod listesi</span>
+
+<span class="cmt"># Test deseni göster: 1920x1080 HDMI-A-1 üzerinde</span>
+modetest -M vc4 -s 31:1920x1080 -P 26:1920x1080@XR24
+
+<span class="cmt"># Belirli bir connector ID ile test</span>
+modetest -s &lt;connector_id&gt;:&lt;mode_string&gt;</code></pre>
+  </div>
+
+  <h3>kmscube — OpenGL ES dönen küp</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># GPU + DRM + EGL yığınını bir arada test eder</span>
+kmscube -D /dev/dri/card0
+
+<span class="cmt"># Belirli CRTC ve connector ile</span>
+kmscube -D /dev/dri/card0 -M vc4
+
+<span class="cmt"># NV12 video modunda (video decoder testi)</span>
+kmscube -D /dev/dri/card0 -V /dev/video0</code></pre>
+  </div>
+
+  <h3>drm_info ve debugfs</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># JSON formatında tüm DRM nesnelerini döker</span>
+drm_info
+
+<span class="cmt"># debugfs — mevcut CRTC durumu</span>
+cat /sys/kernel/debug/dri/0/state
+
+<span class="cmt"># GPU sürücüsüne özel debugfs (vc4)</span>
+ls /sys/kernel/debug/dri/0/
+<span class="cmt"># bo_stats  crtc0  gem_names  name  state  vc4_hdmi ...</span>
+
+<span class="cmt"># framebuffer listesi</span>
+cat /sys/kernel/debug/dri/0/framebuffer
+
+<span class="cmt"># EDID dump</span>
+cat /sys/kernel/debug/dri/0/HDMI-A-1/edid_override</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik</h2>
+  <p class="section-lead">Üç gerçek dünya senaryosu: Raspberry Pi 4 HDMI libdrm örneği, i.MX8 MIPI DSI panel bring-up ve triple buffering ile tear-free render.</p>
+
+  <h3>Raspberry Pi 4 — libdrm dumb buffer ile gradyan</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>rpi4_drm.c (özet)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* /dev/dri/card0 = vc4 sürücüsü */</span>
+int fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+drmSetMaster(fd);    <span class="cmt">/* gerekli: modeset izni */</span>
+
+drmModeRes *res = drmModeGetResources(fd);
+<span class="cmt">/* ilk bağlı connector'ı bul */</span>
+for (int i = 0; i &lt; res-&gt;count_connectors; i++) {
+    drmModeConnector *c = drmModeGetConnector(fd, res-&gt;connectors[i]);
+    if (c-&gt;connection == DRM_MODE_CONNECTED &amp;&amp; c-&gt;count_modes &gt; 0) {
+        connector = c;
+        break;
+    }
+}
+<span class="cmt">/* preferred modu seç (ilk mod genellikle en yüksek çözünürlük) */</span>
+drmModeModeInfo mode = connector-&gt;modes[0];
+
+<span class="cmt">/* dumb buffer + FB + mmap + renk gradyanı ... */</span>
+for (int y = 0; y &lt; mode.vdisplay; y++)
+    for (int x = 0; x &lt; mode.hdisplay; x++)
+        pixels[y * pitch/4 + x] =
+            ((y * 255 / mode.vdisplay) &lt;&lt; 16) |  <span class="cmt">/* R */</span>
+            ((x * 255 / mode.hdisplay) &lt;&lt; 8);     <span class="cmt">/* G */</span>
+
+drmModeSetCrtc(fd, crtc_id, fb_id, 0, 0,
+    &amp;connector-&gt;connector_id, 1, &amp;mode);
+
+sleep(5);
+drmModeSetCrtc(fd, crtc_id, 0, 0, 0, NULL, 0, NULL); <span class="cmt">/* temizle */</span></code></pre>
+  </div>
+
+  <h3>i.MX8 MIPI DSI panel bring-up adımları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — bring-up kontrol listesi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1. Sürücünün probe ettiğini doğrula</span>
+dmesg | grep -E "imx-drm|mipi-dsi|panel"
+
+<span class="cmt"># 2. Connector durumu</span>
+drm_info | grep -A5 connector
+
+<span class="cmt"># 3. Panel güç sırasını izle (GPIO reset)</span>
+cat /sys/kernel/debug/gpio
+
+<span class="cmt"># 4. MIPI DSI register dump (sürücüye özgü)</span>
+cat /sys/kernel/debug/dri/1/imx-drm/dsi0
+
+<span class="cmt"># 5. Basit test deseni</span>
+modetest -M imx-drm -s &lt;conn_id&gt;:1024x600</code></pre>
+  </div>
+
+  <h3>Triple buffering ile tear-free render döngüsü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — render döngüsü (sözde kod)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* 3 framebuffer: fb[0], fb[1], fb[2] */</span>
+int display_idx = 0;   <span class="cmt">/* şu an ekranda */</span>
+int render_idx  = 1;   <span class="cmt">/* şu an render edilen */</span>
+int queued_idx  = 2;   <span class="cmt">/* queued (bir sonraki flip) */</span>
+
+while (running) {
+    /* render_idx'e çiz (CPU/GPU) */
+    render_frame(fb[render_idx]);
+
+    /* queued_idx'i atomik flip için gönder */
+    atomic_flip(fb[render_idx]);
+
+    /* page flip eventi bekle */
+    wait_vblank_event();  <span class="cmt">/* drmHandleEvent() */</span>
+
+    /* indeksleri döndür */
+    int tmp    = display_idx;
+    display_idx = queued_idx;
+    queued_idx  = render_idx;
+    render_idx  = tmp;
+}
+<span class="cmt">/* Sonuç: display ve render hiçbir zaman aynı buffer'ı paylaşmaz */</span></code></pre>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

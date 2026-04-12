@@ -1,0 +1,592 @@
+---
+layout: tutorial
+title: "EtherCAT — Gerçek Zamanlı Endüstriyel Ethernet"
+back_url: "../index.html"
+back_label: "Endüstriyel Ethernet"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>ENDÜSTRİYEL ETHERNET</span>
+    <span>ETHERCAT</span>
+    <span>2026</span>
+  </div>
+  <h1>EtherCAT —<br><em>Gerçek zamanlı endüstriyel Ethernet.</em></h1>
+  <p class="subtitle">IEC 61158 Type 12: daisy-chain topoloji, on-the-fly frame işleme ve sub-mikrosaniye distributed clock ile endüstriyel otomasyon ağlarında deterministik iletişim.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">EtherCAT nedir — IEC 61158 ve Beckhoff mirası</a></li>
+    <li><a href="#s1">Fiziksel katman — 100BASE-TX ve daisy-chain</a></li>
+    <li><a href="#s2">Datagram yapısı ve adres modeli</a></li>
+    <li><a href="#s3">Distributed Clock — ağ genelinde senkronizasyon</a></li>
+    <li><a href="#s4">PDO ve SDO — süreç verisi ve servis erişimi</a></li>
+    <li><a href="#s5">ESC — EtherCAT Slave Controller donanımı</a></li>
+    <li><a href="#s6">IgH EtherCAT Master — Linux kurulumu</a></li>
+    <li><a href="#s7">Slave state machine — INIT → OP geçişi</a></li>
+    <li><a href="#s8">Pratik: IgH ile motor kontrolü — C API ve RT görev</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> EtherCAT nedir — IEC 61158 ve Beckhoff mirası</h2>
+  <p class="section-lead">EtherCAT (Ethernet for Control Automation Technology), 2003 yılında Beckhoff Automation tarafından geliştirilmiş ve 2007'de IEC 61158 Type 12 / IEC 61784-2 standardı olarak yayımlanmış bir endüstriyel Ethernet protokolüdür. Temel yeniliği, Ethernet frame'inin slave düğümlerden geçerken "on-the-fly" okunup yazılmasıdır.</p>
+
+  <p>Geleneksel Ethernet ağlarında her düğüm tam bir frame alır, işler ve iletir. EtherCAT'ta ise frame master'dan çıkar, her slave sadece kendine ait bayt(lar)ı okur ve günceller; frame hattın sonuna ulaştığında tüm process data güncellenmiş olur. Bu yaklaşım, yüzlerce slave için bile <strong>100 µs'nin altında döngü süreleri</strong> sağlar.</p>
+
+  <div class="flow">
+<pre>
+Master ──► [Slave 1] ──► [Slave 2] ──► [Slave 3] ──┐
+  ▲                                                  │ (son slave geri döner)
+  └──────────────────────────────────────────────────┘
+       Frame tek geçişte tüm slave'leri dolaşır
+</pre>
+  </div>
+
+  <h3>Standart ailesi</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Standart</th><th>Kapsam</th></tr></thead>
+      <tbody>
+        <tr><td>IEC 61158 Type 12</td><td>EtherCAT veri bağı katmanı</td></tr>
+        <tr><td>IEC 61784-2 CP12</td><td>Profil ve konfigürasyon</td></tr>
+        <tr><td>ETG.1000</td><td>EtherCAT Technology Group spesifikasyonu</td></tr>
+        <tr><td>ETG.5000</td><td>Slave Uygulama Katmanı (CoE, FoE, EoE, SoE)</td></tr>
+        <tr><td>ETG.1020</td><td>Redundancy (halka topoloji)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>EtherCAT Technology Group (ETG), 5000'den fazla üyesiyle dünyanın en büyük endüstriyel Ethernet kuruluşudur. Ücretsiz standart dokümanlara ethercat.org adresinden ulaşılabilir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Fiziksel katman — 100BASE-TX ve daisy-chain</h2>
+  <p class="section-lead">EtherCAT, standart 100BASE-TX Ethernet fiziksel katmanını kullanır; bu sayede mevcut RJ-45 kablolar ve anahtarlar kolayca devreye alınabilir. Ancak her slave'in iki portu vardır ve bu portlar birbirine zincirlenerek daisy-chain (ardışık) topoloji oluşturur.</p>
+
+  <h3>Topoloji seçenekleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">Daisy-chain (hat)</span><span class="desc">En yaygın topoloji. Her slave'in IN ve OUT portu vardır. Kablo kesintisi tüm zinciri etkiler.</span></div>
+    <div class="param"><span class="name">Yıldız (junction slave)</span><span class="desc">EK1122 gibi junction slave'ler 4+ port sunarak yıldız topoloji sağlar. Her dal bağımsız çalışabilir.</span></div>
+    <div class="param"><span class="name">Halka (redundancy)</span><span class="desc">İki NIC ile kapalı halka oluşturulur. Tek kablo arızasında iletişim kesilmez; ETG.1020 standardı.</span></div>
+    <div class="param"><span class="name">Ağaç</span><span class="desc">Junction slave'lerin kombinasyonuyla ağaç yapısı kurulabilir. Makine modüleritesi için idealdir.</span></div>
+  </div>
+
+  <h3>On-the-fly işleme mekanizması</h3>
+  <p>Her EtherCAT slave'inde bir ESC (EtherCAT Slave Controller) yongası bulunur. Bu yonga, gelen Ethernet frame'ini geçirirken kendine ait Process Data alanlarını donanım seviyesinde (FPGA/ASIC) okur ve yazar. Yazılım müdahalesi olmadığından gecikme sabit ve öngörülebilirdir: tipik slave geçiş gecikmesi <strong>~300 ns</strong>'dir.</p>
+
+  <div class="flow">
+<pre>
+Ethernet Frame (1518 byte maks)
+┌──────────┬──────────┬───────────────────────────────┬──────┐
+│ Ethernet │ EtherCAT │  EtherCAT Datagram(lar)        │ FCS  │
+│ Header   │ Header   │  [Hdr|Data|WKC] [Hdr|Data|WKC] │      │
+│ 14 byte  │ 2 byte   │  her biri bir slave grubuna    │ 4B   │
+└──────────┴──────────┴───────────────────────────────┴──────┘
+EtherType: 0x88A4
+</pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">İPUCU</div>
+    <p>Bir EtherCAT frame'i birden fazla datagram içerebilir. Tipik uygulamalarda PDO verisi için bir datagram, distributed clock senkronizasyonu için ayrı bir datagram kullanılır.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Datagram yapısı ve adres modeli</h2>
+  <p class="section-lead">EtherCAT datagramı, komut türü, adres, veri ve WKC (Working Counter) alanlarından oluşur. WKC, kaç slave'in datagramı başarıyla işlediğini sayar; master bu değeri beklenen sayıyla karşılaştırarak iletişim durumunu doğrular.</p>
+
+  <h3>Datagram başlığı</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Alan</th><th>Boyut</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td>CMD</td><td>1 byte</td><td>Komut (APRD, APWR, FPRD, FPWR, BRD, LRD, LWR, LRW…)</td></tr>
+        <tr><td>IDX</td><td>1 byte</td><td>Master tarafından atanan datagram index'i</td></tr>
+        <tr><td>ADR</td><td>4 byte</td><td>Adres alanı (auto-increment veya configured station address)</td></tr>
+        <tr><td>LEN</td><td>11 bit</td><td>Veri uzunluğu (maks 1486 byte)</td></tr>
+        <tr><td>R</td><td>3 bit</td><td>Rezerve</td></tr>
+        <tr><td>C</td><td>1 bit</td><td>Döngüsel bit (halka topoloji)</td></tr>
+        <tr><td>NEXT</td><td>1 bit</td><td>Sonraki datagram var mı?</td></tr>
+        <tr><td>IRQ</td><td>2 byte</td><td>Kesme bayrağı</td></tr>
+        <tr><td>DATA</td><td>n byte</td><td>Process/servis verisi</td></tr>
+        <tr><td>WKC</td><td>2 byte</td><td>Working Counter</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Komut türleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">APRD / APWR</span><span class="desc">Auto-increment Physical Read/Write. Zincirdeki pozisyona göre adresleme; konfigürasyon öncesi slave keşfi için kullanılır.</span></div>
+    <div class="param"><span class="name">FPRD / FPWR</span><span class="desc">Fixed Physical Read/Write. Konfigüre edilmiş station adresine göre adresleme. Tek slave hedeflenir.</span></div>
+    <div class="param"><span class="name">BRD / BWR</span><span class="desc">Broadcast Read/Write. Tüm slave'lere aynı anda erişim. DC referans clock ayarı için kullanılır.</span></div>
+    <div class="param"><span class="name">LRD / LWR / LRW</span><span class="desc">Logical Read/Write/ReadWrite. FMMU mantıksal adres eşlemesi üzerinden tüm süreç verisine tek datagramla erişim. En verimli yöntem.</span></div>
+  </div>
+
+  <h3>FMMU ve SyncManager</h3>
+  <p><strong>FMMU (Fieldbus Memory Management Unit):</strong> Slave içinde mantıksal adreslerden fiziksel ESC kayıt adreslerine dönüşüm yapar. Master, konfigürasyon aşamasında her slave'in FMMU'sunu programlar; böylece tek bir LRW komutu tüm ağın process datasını günceller.</p>
+  <p><strong>SyncManager:</strong> ESC'deki çift tampon mekanizmasıdır. SM0/SM1 mailbox iletişimi (SDO), SM2/SM3 ise cyclic PDO verisi için kullanılır. Datanın tutarlı okunmasını ve yarış koşullarını önler.</p>
+
+  <div class="flow">
+<pre>
+Master Mantıksal Adres Alanı (0x00000000 - 0xFFFFFFFF)
+         │
+    ┌────┴──────────────────────────────────┐
+    │           FMMU (Slave 1)              │
+    │  Mantıksal 0x1000 → Fiziksel 0x6000  │
+    └───────────────────────────────────────┘
+         │
+    ┌────┴──────────────────────────────────┐
+    │      SyncManager 3 (PDO Rx)          │
+    │      ESC DPRAM: 0x6000 - 0x6007      │
+    └───────────────────────────────────────┘
+</pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Distributed Clock — ağ genelinde senkronizasyon</h2>
+  <p class="section-lead">EtherCAT Distributed Clock (DC), tüm slave'lerin aynı zaman referansını paylaşmasını sağlar. Sub-mikrosaniye hassasiyetiyle elde edilen bu senkronizasyon, çok eksenli hareket kontrolü gibi uygulamalarda kritik öneme sahiptir.</p>
+
+  <h3>DC çalışma prensibi</h3>
+  <p>DC özellikli ilk slave, ağın <strong>referans saati</strong> olarak atanır. Master, zincirdeki her slave'in ESC saatini ölçerek propagation delay'i hesaplar ve her slave'in saatini referansa göre offset kalibrasyonu ile hizalar.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Propagation delay ölçümü</span><span class="desc">Master, BWR komutuyla zaman damgası gönderir; her slave kendi saatini yazar. Farklar hesaplanarak kablo ve işleme gecikmeleri belirlenir.</span></div>
+    <div class="param"><span class="name">Clock offset kalibrasyonu</span><span class="desc">Her slave'e hesaplanan offset değeri yazılır. Slave saati = ESC saati + offset formülüyle referansa hizalanır.</span></div>
+    <div class="param"><span class="name">Clock drift kompanzasyonu</span><span class="desc">Kristal frekans sapmalarını gidermek için master periyodik olarak drift değerlerini günceller. Uzun süre çalışmalarda da hassasiyet korunur.</span></div>
+    <div class="param"><span class="name">SYNC0 / SYNC1 sinyalleri</span><span class="desc">Her slave ESC'si, senkronize edilmiş saate göre periyodik SYNC0 kesmesi üretir. Bu kesme, slave uygulamasının tam zamanında çalışmasını tetikler.</span></div>
+  </div>
+
+  <h3>DC konfigürasyon parametreleri</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>ESC Kaydı</th><th>Adres</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td>DC Receive Time Port 0</td><td>0x0900</td><td>Giriş portundan frame alış zamanı</td></tr>
+        <tr><td>System Time</td><td>0x0910</td><td>64-bit sistem zamanı (ns cinsinden)</td></tr>
+        <tr><td>System Time Offset</td><td>0x0920</td><td>Master tarafından yazılan offset değeri</td></tr>
+        <tr><td>SYNC0 Cycle Time</td><td>0x09A0</td><td>SYNC0 periyodu (ns). 0 = devre dışı</td></tr>
+        <tr><td>SYNC0 Start Time</td><td>0x0990</td><td>İlk SYNC0'ın mutlak başlangıç zamanı</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>IgH Master, DC senkronizasyonunu otomatik olarak yönetir. Uygulama geliştiricisinin yapması gereken tek şey slave'lerde DC'yi etkinleştirmek ve döngü süresini DC SYNC0 periyoduyla eşleştirmektir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> PDO ve SDO — süreç verisi ve servis erişimi</h2>
+  <p class="section-lead">EtherCAT'ta veri iletişimi iki ana kanaldan gerçekleşir: döngüsel süreç verisi için PDO (Process Data Object) ve parametre/konfigürasyon erişimi için SDO (Service Data Object). Bu ayrım, CoE (CANopen over EtherCAT) standardından miras alınmıştır.</p>
+
+  <h3>PDO — Process Data Object</h3>
+  <p>PDO'lar, her döngüde otomatik olarak aktarılan gerçek zamanlı verilerdir. Bir servo sürücünün konum geri bildirimi, hız referansı veya I/O modülünün dijital giriş durumu PDO üzerinden taşınır.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">RxPDO (Master → Slave)</span><span class="desc">Master'ın slave'e gönderdiği çıkış verisi. Servo sürücüde: hedef konum, hedef hız, kontrol kelimesi.</span></div>
+    <div class="param"><span class="name">TxPDO (Slave → Master)</span><span class="desc">Slave'in master'a gönderdiği giriş verisi. Servo sürücüde: gerçek konum, gerçek hız, durum kelimesi.</span></div>
+    <div class="param"><span class="name">PDO Mapping</span><span class="desc">Hangi nesne dictionary girdisinin PDO'ya eşlendiğini tanımlar. CoE object 0x1600-0x17FF (RxPDO) ve 0x1A00-0x1BFF (TxPDO).</span></div>
+    <div class="param"><span class="name">PDO Assignment</span><span class="desc">Hangi PDO'ların hangi SyncManager'a atandığını belirtir. CoE object 0x1C12 (SM2) ve 0x1C13 (SM3).</span></div>
+  </div>
+
+  <h3>SDO — Service Data Object</h3>
+  <p>SDO'lar, mailbox iletişim kanalı (SM0/SM1) üzerinden çalışır ve başlatma/konfigürasyon aşamalarında kullanılır. Her SDO transferi bir istek-yanıt çiftidir; gerçek zamanlı değildir.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>CoE Nesnesi</th><th>İndeks</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td>Device Type</td><td>0x1000</td><td>Cihaz profil türü</td></tr>
+        <tr><td>Manufacturer Device Name</td><td>0x1008</td><td>Üretici cihaz adı (string)</td></tr>
+        <tr><td>Identity Object</td><td>0x1018</td><td>Vendor ID, Product Code, Revision, Serial</td></tr>
+        <tr><td>Controlword</td><td>0x6040</td><td>CIA-402 motor kontrol kelimesi</td></tr>
+        <tr><td>Statusword</td><td>0x6041</td><td>CIA-402 motor durum kelimesi</td></tr>
+        <tr><td>Target Position</td><td>0x607A</td><td>Hedef konum (cyclic position mode)</td></tr>
+        <tr><td>Actual Position</td><td>0x6064</td><td>Gerçek encoder pozisyonu</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre><code class="language-c">/* IgH API ile SDO okuma örneği */
+uint32_t vendor_id;
+size_t result_size;
+
+/* PREOP veya OP modunda SDO okuma */
+if (ecrt_master_sdo_upload(master,
+        slave_pos,          /* slave zincir pozisyonu */
+        0x1018,             /* index: Identity Object */
+        0x01,               /* sub-index: Vendor ID */
+        (uint8_t *)&vendor_id,
+        sizeof(vendor_id),
+        &result_size,
+        &abort_code) == 0) {
+    printf("Vendor ID: 0x%08X\n", vendor_id);
+}</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> ESC — EtherCAT Slave Controller donanımı</h2>
+  <p class="section-lead">ESC (EtherCAT Slave Controller), her slave'in kalbindeki ASIC veya FPGA IP çekirdeğidir. Ethernet frame'ini "on-the-fly" işleyen, FMMU/SyncManager yönetimini ve DC saatini donanımda gerçekleştiren bu yonga, EtherCAT'ın determinizm garantisinin temelini oluşturur.</p>
+
+  <h3>Yaygın ESC çözümleri</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Çözüm</th><th>Tür</th><th>Özellik</th></tr></thead>
+      <tbody>
+        <tr><td>ET1100 (Beckhoff)</td><td>ASIC</td><td>4 port, FMMU × 8, SM × 8, DC, 64 KB DPRAM</td></tr>
+        <tr><td>ET1200 (Beckhoff)</td><td>ASIC</td><td>2 port, düşük maliyet, FMMU × 3, SM × 4</td></tr>
+        <tr><td>LAN9252 (Microchip)</td><td>ASIC</td><td>SPI/SQI arayüzü, MCU entegrasyonu için</td></tr>
+        <tr><td>AMIC110 (TI)</td><td>SoC + PRU</td><td>ARM + PRU-ICSS ile yazılım tabanlı ESC</td></tr>
+        <tr><td>EtherCAT IP (xilinx)</td><td>FPGA IP</td><td>Zynq/Artix serisi için lisanslı IP çekirdeği</td></tr>
+        <tr><td>SOES (yazılım)</td><td>Soft ESC</td><td>PREEMPT_RT Linux üzerinde yazılım slave (test amaçlı)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>ESC iç yapısı</h3>
+  <div class="flow">
+<pre>
+          Ethernet PHY (100BASE-TX)
+               │
+        ┌──────▼──────────────────────────┐
+        │         ESC (ET1100)            │
+        │  ┌─────────────────────────┐    │
+        │  │  Frame İşleme (ASIC)    │    │
+        │  │  On-the-fly R/W         │    │
+        │  └──────────┬──────────────┘    │
+        │  ┌──────────▼──────────────┐    │
+        │  │  DPRAM (64 KB)          │    │
+        │  │  SM0: Mailbox Out       │    │
+        │  │  SM1: Mailbox In        │    │
+        │  │  SM2: PDO Out (RxPDO)   │    │
+        │  │  SM3: PDO In  (TxPDO)   │    │
+        │  └──────────┬──────────────┘    │
+        │  ┌──────────▼──────────────┐    │
+        │  │  Yerel işlemci arayüzü  │    │
+        │  │  (SPI / parallel bus /  │    │
+        │  │   HBI / PDI)            │    │
+        │  └─────────────────────────┘    │
+        │  Distributed Clock (64-bit)     │
+        └─────────────────────────────────┘
+               │
+           Uygulama MCU/SoC
+</pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>LAN9252 + STM32 kombinasyonu, düşük maliyetli EtherCAT slave geliştirme için popüler bir seçimdir. LAN9252'nin SPI arayüzü, herhangi bir MCU'ya kolayca bağlanabilir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> IgH EtherCAT Master — Linux kurulumu</h2>
+  <p class="section-lead">IgH EtherCAT Master (Ingenieurgemeinschaft IgH), Linux çekirdeği için açık kaynaklı bir EtherCAT master uygulamasıdır. Kernel modülü olarak çalışır ve raw Ethernet soket yerine kernel seviyesinde NIC sürücüsünü devralarak en düşük gecikmeyi sağlar.</p>
+
+  <h3>Gereksinimler</h3>
+  <div class="params">
+    <div class="param"><span class="name">Linux kernel</span><span class="desc">4.19+ önerilir. PREEMPT_RT yaması ile gerçek zamanlı performans için.</span></div>
+    <div class="param"><span class="name">Desteklenen NIC'ler</span><span class="desc">e1000e (Intel I210/I350), e100, r8169, igb. Diğerleri için generic soket modu kullanılabilir.</span></div>
+    <div class="param"><span class="name">DKMS (opsiyonel)</span><span class="desc">Kernel güncellemelerinde otomatik yeniden derleme için.</span></div>
+  </div>
+
+  <h3>Kaynak koddan derleme</h3>
+  <pre><code class="language-bash"># Bağımlılıklar
+sudo apt install build-essential linux-headers-$(uname -r) \
+                 autoconf libtool dkms
+
+# Kaynak kodu al (gitlab.com/etherlab.org/ethercat)
+git clone https://gitlab.com/etherlab.org/ethercat.git
+cd ethercat
+git checkout stable-1.5
+
+# Yapılandırma (e1000e sürücüsü için)
+./bootstrap
+./configure --prefix=/usr/local \
+            --with-linux-dir=/lib/modules/$(uname -r)/build \
+            --enable-generic \
+            --enable-e1000e \
+            --disable-8139too
+
+make -j$(nproc)
+sudo make modules_install install
+
+# Modül yükleme
+sudo depmod -a
+sudo modprobe ec_master
+sudo modprobe ec_e1000e  # veya ec_generic</code></pre>
+
+  <h3>Yapılandırma dosyası</h3>
+  <pre><code class="language-bash"># /etc/ethercat.conf
+MASTER0_DEVICE="aa:bb:cc:dd:ee:ff"   # NIC MAC adresi
+DEVICE_MODULES="e1000e"              # kullanılan sürücü
+
+# systemd servisi
+sudo systemctl enable ethercat
+sudo systemctl start ethercat
+
+# Durum kontrolü
+ethercat master        # master bilgisi
+ethercat slaves        # bağlı slave'lerin listesi
+ethercat pdos          # PDO eşleme bilgisi
+ethercat sdo-upload 0 0x1000 0  # slave 0'dan device type oku</code></pre>
+
+  <h3>ethercat komut satırı araçları</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Komut</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td><code>ethercat master</code></td><td>Master durumu, istatistikler, döngü süresi</td></tr>
+        <tr><td><code>ethercat slaves</code></td><td>Slave listesi: pozisyon, vendor, state</td></tr>
+        <tr><td><code>ethercat pdos &lt;pos&gt;</code></td><td>Slave PDO eşleme detayları</td></tr>
+        <tr><td><code>ethercat sdo-upload &lt;pos&gt; &lt;idx&gt; &lt;sub&gt;</code></td><td>SDO okuma</td></tr>
+        <tr><td><code>ethercat sdo-download &lt;pos&gt; &lt;idx&gt; &lt;sub&gt; &lt;val&gt;</code></td><td>SDO yazma</td></tr>
+        <tr><td><code>ethercat graph</code></td><td>Ağ topoloji grafiği (dot formatı)</td></tr>
+        <tr><td><code>ethercat xml &lt;pos&gt;</code></td><td>Slave'den SII ESI verisini XML olarak al</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Slave state machine — INIT → OP geçişi</h2>
+  <p class="section-lead">Her EtherCAT slave, dört ana durumdan oluşan bir state machine uygular. Master bu geçişleri yönetir; her geçişte konfigürasyon ve doğrulama adımları gerçekleştirilir.</p>
+
+  <div class="flow">
+<pre>
+    ┌──────────────────────────────────────────────┐
+    │                  INIT                        │
+    │  • Temel ESC kaydı erişimi                   │
+    │  • Mailbox konfigürasyonu yapılmaz            │
+    └──────────────┬───────────────────────────────┘
+                   │ Master SyncManager'ları konfigüre eder
+                   ▼
+    ┌──────────────────────────────────────────────┐
+    │                 PRE-OP                        │
+    │  • Mailbox iletişimi aktif (SM0/SM1)          │
+    │  • SDO ile konfigürasyon yapılır              │
+    │  • PDO eşleme ayarlanır                      │
+    └──────────────┬───────────────────────────────┘
+                   │ Master FMMU + PDO konfigürasyonu
+                   ▼
+    ┌──────────────────────────────────────────────┐
+    │                 SAFE-OP                       │
+    │  • Cyclic PDO verisi alınır (TxPDO)          │
+    │  • Çıkış (RxPDO) henüz uygulanmaz            │
+    │  • DC senkronizasyonu başlar                 │
+    └──────────────┬───────────────────────────────┘
+                   │ Tüm slave'ler hazır, çıkışlar aktif
+                   ▼
+    ┌──────────────────────────────────────────────┐
+    │                   OP                         │
+    │  • Tam cyclic iletişim (RxPDO + TxPDO)       │
+    │  • Motor kontrolü, I/O okuma/yazma aktif     │
+    └──────────────────────────────────────────────┘
+</pre>
+  </div>
+
+  <h3>State geçiş hataları</h3>
+  <div class="params">
+    <div class="param"><span class="name">AL Status Code 0x001B</span><span class="desc">Invalid output configuration — PDO eşlemesi tutarsız. SDO 0x1600/0x1C12 değerlerini kontrol et.</span></div>
+    <div class="param"><span class="name">AL Status Code 0x001D</span><span class="desc">Invalid input configuration — TxPDO eşleme hatası.</span></div>
+    <div class="param"><span class="name">AL Status Code 0x0025</span><span class="desc">No valid outputs — SAFEOP'tan OP'a geçişte watchdog süresi dolmuş.</span></div>
+    <div class="param"><span class="name">AL Status Code 0x0011</span><span class="desc">Mailbox sync manager mismatch — SM0/SM1 konfigürasyonu GSD'deki ile uyuşmuyor.</span></div>
+  </div>
+
+  <pre><code class="language-c">/* IgH ile state kontrolü */
+ec_slave_config_t *sc;
+ec_slave_config_state_t sc_state;
+
+ecrt_slave_config_state(sc, &sc_state);
+
+if (sc_state.al_state != EC_AL_STATE_OP) {
+    fprintf(stderr, "Slave OP durumunda değil! AL state: %u\n",
+            sc_state.al_state);
+    if (sc_state.al_state == EC_AL_STATE_SAFEOP) {
+        /* Watchdog timeout — cyclic göreve devam et */
+    }
+}</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: IgH ile motor kontrolü — C API ve RT görev</h2>
+  <p class="section-lead">Bu bölümde IgH EtherCAT Master C API'sini kullanarak bir servo sürücüyü (CIA-402 profili) kontrol eden, PREEMPT_RT ile gerçek zamanlı çalışan döngüsel bir görev yazılır.</p>
+
+  <h3>Proje yapısı</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Dosya</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td>main.c</td><td>RT görev, PDO erişimi, CIA-402 state machine</td></tr>
+        <tr><td>Makefile</td><td>IgH kütüphane bağlantısı</td></tr>
+        <tr><td>/etc/ethercat.conf</td><td>NIC MAC adresi konfigürasyonu</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre><code class="language-c">/* motor_control.c — IgH EtherCAT + PREEMPT_RT */
+#include &lt;ecrt.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;time.h&gt;
+#include &lt;pthread.h&gt;
+#include &lt;signal.h&gt;
+
+#define VENDOR_ID     0x00000002   /* Beckhoff */
+#define PRODUCT_CODE  0x06120000   /* AX5206 servo */
+#define SLAVE_POS     0            /* Zincir pozisyonu */
+#define CYCLE_NS      1000000UL    /* 1 ms döngü */
+
+/* PDO ofsetleri (ecrt_domain_data + FMMU offset) */
+static unsigned int off_ctrl_word;
+static unsigned int off_target_pos;
+static unsigned int off_status_word;
+static unsigned int off_actual_pos;
+
+/* PDO giriş/çıkış tanımları (CIA-402) */
+static ec_pdo_entry_reg_t domain_regs[] = {
+    {SLAVE_POS, VENDOR_ID, PRODUCT_CODE, 0x6040, 0x00, &off_ctrl_word},
+    {SLAVE_POS, VENDOR_ID, PRODUCT_CODE, 0x607A, 0x00, &off_target_pos},
+    {SLAVE_POS, VENDOR_ID, PRODUCT_CODE, 0x6041, 0x00, &off_status_word},
+    {SLAVE_POS, VENDOR_ID, PRODUCT_CODE, 0x6064, 0x00, &off_actual_pos},
+    {}
+};
+
+static ec_master_t       *master;
+static ec_domain_t       *domain;
+static ec_slave_config_t *slave_cfg;
+static uint8_t           *domain_pd;
+static volatile int       run = 1;
+
+static void sig_handler(int sig) { run = 0; }
+
+static void *rt_task(void *arg)
+{
+    struct timespec next;
+    clock_gettime(CLOCK_MONOTONIC, &next);
+
+    ecrt_master_activate(master);
+    domain_pd = ecrt_domain_data(domain);
+
+    while (run) {
+        /* Sonraki uyanma zamanı */
+        next.tv_nsec += CYCLE_NS;
+        if (next.tv_nsec >= 1000000000L) {
+            next.tv_nsec -= 1000000000L;
+            next.tv_sec++;
+        }
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
+
+        /* EtherCAT döngüsü */
+        ecrt_master_receive(master);
+        ecrt_domain_process(domain);
+
+        /* Durum kelimesini oku */
+        uint16_t sw = EC_READ_U16(domain_pd + off_status_word);
+        int32_t  ap = EC_READ_S32(domain_pd + off_actual_pos);
+
+        /* CIA-402: Operation Enabled durumuna geç */
+        uint16_t cw = 0x000F;  /* Enable Operation */
+        int32_t  tp = 100000;  /* Hedef konum: 100000 artım */
+
+        EC_WRITE_U16(domain_pd + off_ctrl_word, cw);
+        EC_WRITE_S32(domain_pd + off_target_pos, tp);
+
+        ecrt_domain_queue(domain);
+        ecrt_master_send(master);
+
+        printf("\rSW: 0x%04X  Pos: %d", sw, ap);
+        fflush(stdout);
+    }
+    return NULL;
+}
+
+int main(void)
+{
+    signal(SIGINT, sig_handler);
+
+    master = ecrt_request_master(0);
+    if (!master) { perror("ecrt_request_master"); return 1; }
+
+    domain = ecrt_master_create_domain(master);
+
+    slave_cfg = ecrt_master_slave_config(master,
+                    SLAVE_POS, VENDOR_ID, PRODUCT_CODE);
+    if (!slave_cfg) { fprintf(stderr, "Slave config hatası\n"); return 1; }
+
+    /* DC konfigürasyonu: 1 ms SYNC0 */
+    ecrt_slave_config_dc(slave_cfg,
+        0x0300,       /* AssignActivate (DC + SYNC0) */
+        CYCLE_NS,     /* SYNC0 periyodu */
+        4400000,      /* shift time (ns) */
+        0, 0);
+
+    ecrt_domain_reg_pdo_entry_list(domain, domain_regs);
+    ecrt_master_config(master);
+
+    /* PREEMPT_RT: gerçek zamanlı thread */
+    struct sched_param sp = { .sched_priority = 80 };
+    pthread_attr_t attr;
+    pthread_t tid;
+    pthread_attr_init(&attr);
+    pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+    pthread_attr_setschedparam(&attr, &sp);
+    pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+    pthread_create(&tid, &attr, rt_task, NULL);
+    pthread_join(tid, NULL);
+
+    ecrt_release_master(master);
+    return 0;
+}</code></pre>
+
+  <pre><code class="language-makefile"># Makefile
+CC      = gcc
+CFLAGS  = -O2 -Wall -I/usr/local/include/ethercat
+LDFLAGS = -L/usr/local/lib -lethercat -lpthread -lrt
+
+motor_control: motor_control.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)</code></pre>
+
+  <h3>Çalıştırma ve doğrulama</h3>
+  <pre><code class="language-bash"># Master servisi başlat
+sudo systemctl start ethercat
+
+# Slave'lerin listesi
+ethercat slaves
+# 0  0:0  PREOP  +  Beckhoff EL7211
+
+# Programı derle ve çalıştır (root veya CAP_NET_RAW gerekir)
+make
+sudo ./motor_control
+
+# Başka terminal: döngü istatistikleri
+ethercat master | grep -E "Frames|Lost|cycle"</code></pre>
+
+  <div class="callout">
+    <div class="label">UYARI</div>
+    <p>SCHED_FIFO ile çalışan RT görev, sistem kaynaklarını tamamen ele geçirebilir. Geliştirme ortamında ulimit veya cgroups ile sınırlandırma yapın. Üretim ortamında watchdog entegrasyonu zorunludur.</p>
+  </div>
+</section>
+
+</main>

@@ -1,0 +1,571 @@
+---
+layout: tutorial
+title: "cpuidle — Güç Yönetimi"
+back_url: "../index.html"
+back_label: "Güç Yönetimi & Thermal"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÜÇ YÖNETİMİ</span>
+    <span>CPUIDLE</span>
+    <span>2026</span>
+  </div>
+  <h1>cpuidle —<br><em>CPU uyku halleri.</em></h1>
+  <p class="subtitle">C-state latency/residency dengelemi, PSCI ile ARM koordinasyonu, menu ve TEO governor'ları — boşta geçen her mikrosaniyeyi enerji tasarrufuna dönüştür.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">cpuidle nedir — C-states ve idle driver</a></li>
+    <li><a href="#s1">C-state anatomisi — latency, residency, tradeoff</a></li>
+    <li><a href="#s2">idle governor — menu, ladder, TEO</a></li>
+    <li><a href="#s3">PSCI — Power State Coordination Interface</a></li>
+    <li><a href="#s4">sysfs arayüzü — state kontrolü</a></li>
+    <li><a href="#s5">Ölçüm araçları — cpupower, powertop, perf</a></li>
+    <li><a href="#s6">Latency kısıtları — pm_qos ve real-time</a></li>
+    <li><a href="#s7">Kernel config — platform driver</a></li>
+    <li><a href="#s8">Pratik: idle latency ölçümü ve Cortex-A53 C-state profili</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> cpuidle nedir — C-states ve idle driver</h2>
+  <p class="section-lead">CPU boşta kaldığında — çalışacak görev yokken — enerji tüketmeye devam eder. cpuidle subsystem, boşta geçen süreyi güce çevirme fırsatı olarak görür ve CPU'yu farklı "uyku derinliği" kademelerine sokar.</p>
+
+  <p>Bu kademelere <strong>C-state</strong> (veya idle state) denir. C0 tamamen aktif, C1'den itibaren giderek daha derin uyku. Her uyku derinliği daha az güç tüketir ama uyanma için daha uzun süre harcar.</p>
+
+  <h3>clock gating vs power gating</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">Clock gating (sığ uyku)</div><div class="desc">CPU'nun clock sinyali durdurulur; devreler güçlendirilmiş kalır. Uyanma çok hızlı (&lt;1 µs), güç tasarrufu az.</div></div>
+    <div class="param"><div class="name">Power gating (derin uyku)</div><div class="desc">CPU'nun güç kaynağı kesilir; register içeriği SRAM'e kaydedilir. Uyanma yavaş (100-1000 µs), güç tasarrufu büyük.</div></div>
+    <div class="param"><div class="name">Cluster power-down</div><div class="desc">Tüm cluster (birden fazla CPU) kapanır; paylaşılan L2 cache flush gerekir. En derin uyku — PSCI ile koordine edilir.</div></div>
+  </div>
+
+  <h3>idle driver türleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># aktif cpuidle driver</span>
+cat /sys/devices/system/cpu/cpuidle/current_driver
+<span class="cmt"># arm_idle  (veya psci, acpi_idle, intel_idle)</span>
+
+<span class="cmt"># mevcut governor</span>
+cat /sys/devices/system/cpu/cpuidle/current_governor
+<span class="cmt"># menu</span>
+
+<span class="cmt"># kullanılabilir governor'lar</span>
+cat /sys/devices/system/cpu/cpuidle/available_governors
+<span class="cmt"># ladder menu teo</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> C-state anatomisi — latency, residency, tradeoff</h2>
+  <p class="section-lead">Her C-state dört temel parametreyle tanımlanır. Governor, bu parametrelerle beklenen boş kalma süresini karşılaştırarak en uygun uyku derinliğini seçer.</p>
+
+  <div class="params">
+    <div class="param"><div class="name">exit latency</div><div class="desc">C-state'ten çıkıp CPU'nun tekrar görev çalıştırabilir hale gelmesi için gereken süre (µs). Gecikme toleransı için üst sınır.</div></div>
+    <div class="param"><div class="name">target residency</div><div class="desc">Bu C-state'e girmenin "kârlı" olması için gereken minimum bekleme süresi (µs). exit latency'den büyük olmalı.</div></div>
+    <div class="param"><div class="name">power (idle power)</div><div class="desc">Bu C-state'te tüketilen güç (mW veya uW). Derin uyku = düşük güç.</div></div>
+    <div class="param"><div class="name">flags</div><div class="desc">CPUIDLE_FLAG_TIMER_STOP: bu state'te local timer durur. CPUIDLE_FLAG_COUPLED: cluster-level uyku.</div></div>
+  </div>
+
+  <h3>Örnek: Cortex-A53 C-state tablosu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Cortex-A53 (tipik değerler)</span><span class="dot">●</span></div>
+    <pre><code>State  Name           Exit Lat  Residency  Power
+ C0    WFI (wait)        1 µs       2 µs   ~80% aktif
+ C1    CPU idle         10 µs      20 µs   ~30% aktif
+ C2    Cluster idle    200 µs     400 µs   ~5% aktif
+ C3    SoC sleep      1000 µs    2000 µs   ~1% aktif</code></pre>
+  </div>
+
+  <h3>Tradeoff: derin uyku her zaman daha iyi değil</h3>
+
+  <p>Eğer CPU 50 µs sonra yeniden uyanacaksa, 200 µs exit latency'li C2'ye girmenin anlamı yoktur. Governor bu kararı beklenen idle süresini tahmin ederek verir. Yanlış tahmin performansı düşürür.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>Maliyet analizi örneği</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Senaryo: 300 µs boş kalma beklentisi</span>
+<span class="cmt"># C1: exit_lat=10µs, power_saving=50µW × 300µs = 15nJ tasarruf</span>
+<span class="cmt"># C2: exit_lat=200µs, power_saving=75µW × (300-200)µs = 7.5nJ tasarruf</span>
+<span class="cmt"># Sonuç: C1 daha kârlı, C2'ye girme!</span>
+
+<span class="cmt"># Senaryo: 5000 µs boş kalma beklentisi</span>
+<span class="cmt"># C2: 75µW × (5000-200)µs = 360nJ tasarruf — C2 mantıklı</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> idle governor — menu, ladder, TEO</h2>
+  <p class="section-lead">idle governor, CPU'nun boşta kalma süresini tahmin eder ve en uygun C-state'i seçer. Üç ana governor mevcuttur.</p>
+
+  <h3>menu governor (varsayılan)</h3>
+
+  <p>Linux'un varsayılan idle governor'ıdır. Tahmin için iki girdi kullanır: (1) bir sonraki zamanlayıcı olayına kalan süre, (2) geçmişteki boşta kalma sürelerinin istatistiksel ortalaması. Gerçek zamanlı olmayan sistemlerin büyük çoğunluğu için en iyi seçenektir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — menu governor seç</span><span class="dot">●</span></div>
+    <pre><code>echo menu > /sys/devices/system/cpu/cpuidle/current_governor</code></pre>
+  </div>
+
+  <h3>ladder governor</h3>
+
+  <p>ACPI sistemler için tasarlanmış basit bir governor. Her idle geçişinde bir sonraki derinlik kademesine iner (ladder = merdiven). Çok kısa idle sürelerinde aşırı derin uyku girme riski vardır; tickful HZ=100/250 sistemlerde kullanılır.</p>
+
+  <h3>TEO — Timer Events Oriented governor</h3>
+
+  <p>Linux 5.1'de eklendi. Sadece timer'a değil, interrupt gelme örüntüsüne de bakar. NO_HZ_IDLE (tickless) sistemlerde timer dışı wakeup'ları daha iyi modelleyerek menu'den daha isabetli kararlar verebilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># TEO governor'a geç</span>
+echo teo > /sys/devices/system/cpu/cpuidle/current_governor
+
+<span class="cmt"># governor değişikliğini doğrula</span>
+cat /sys/devices/system/cpu/cpuidle/current_governor
+<span class="cmt"># teo</span></code></pre>
+  </div>
+
+  <h3>Governor seçim rehberi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Senaryo → Governor</span><span class="dot">●</span></div>
+    <pre><code>Genel amaçlı (HZ=250/CONFIG_HZ_250)  → menu
+Tickless (CONFIG_NO_HZ_IDLE)          → teo (dene, karşılaştır)
+ACPI tabanlı eski x86               → ladder (kernel default)
+Gerçek zamanlı (PREEMPT_RT)         → menu + pm_qos kısıtı</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> PSCI — Power State Coordination Interface</h2>
+  <p class="section-lead">PSCI (ARM Specification IHI0054), birden fazla CPU'lu ARM sistemlerde uyku/uyanma işlemlerini güvenli biçimde koordine eden bir firmware arayüzüdür. Linux cpuidle bu arayüzü kullanarak ARM Trusted Firmware veya U-Boot SPL ile iletişim kurar.</p>
+
+  <h3>PSCI sürümleri ve fonksiyonlar</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">CPU_SUSPEND (0x84000001)</div><div class="desc">Tek CPU'yu belirtilen power state'e sokar. Kernel cpuidle'ın temel çağrısı.</div></div>
+    <div class="param"><div class="name">CPU_OFF (0x84000002)</div><div class="desc">CPU'yu tamamen kapatır. Hotplug ile kullanılır.</div></div>
+    <div class="param"><div class="name">CPU_ON (0xC4000003)</div><div class="desc">Kapalı CPU'yu belirtilen entry point'ten başlatır.</div></div>
+    <div class="param"><div class="name">AFFINITY_INFO (0xC4000004)</div><div class="desc">Bir CPU veya cluster'ın güç durumunu sorgular (ON/OFF/ON_PENDING).</div></div>
+    <div class="param"><div class="name">SYSTEM_SUSPEND (0x8400000E)</div><div class="desc">Tüm sistemi suspend-to-RAM için hazırlar. suspend-resume subsystem ile kullanılır.</div></div>
+  </div>
+
+  <h3>DT PSCI node tanımı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts</span><span class="dot">●</span></div>
+    <pre><code>/ {
+    psci {
+        compatible = "arm,psci-1.0";
+        method = "smc";   /* Secure Monitor Call; bazı SoC'larda "hvc" */
+    };
+
+    cpus {
+        cpu@0 {
+            compatible = "arm,cortex-a53";
+            enable-method = "psci";   /* PSCI kullan */
+            cpu-idle-states = &lt;&amp;CPU_SLEEP_0 &amp;CLUSTER_SLEEP_0&gt;;
+        };
+    };
+
+    idle-states {
+        entry-method = "arm,psci";
+
+        CPU_SLEEP_0: cpu-sleep-0 {
+            compatible = "arm,idle-state";
+            arm,psci-suspend-param = &lt;0x0010000&gt;;  /* power state encoding */
+            entry-latency-us  = &lt;40&gt;;
+            exit-latency-us   = &lt;100&gt;;
+            min-residency-us  = &lt;150&gt;;
+        };
+
+        CLUSTER_SLEEP_0: cluster-sleep-0 {
+            compatible = "arm,idle-state";
+            arm,psci-suspend-param = &lt;0x1010000&gt;;
+            entry-latency-us  = &lt;500&gt;;
+            exit-latency-us   = &lt;1000&gt;;
+            min-residency-us  = &lt;2500&gt;;
+            local-timer-stop; /* cluster sleep sırasında timer durur */
+        };
+    };
+};</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — PSCI doğrulama</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># PSCI versiyon ve özellikleri</span>
+cat /sys/kernel/debug/psci
+<span class="cmt"># PSCI version: 1.1
+# SYSTEM_SUSPEND: supported</span>
+
+<span class="cmt"># ya da dmesg'de</span>
+dmesg | grep -i psci
+<span class="cmt"># [    0.000000] psci: probing for conduit method from DT.
+# [    0.000000] psci: PSCIv1.1 detected in firmware.</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> sysfs arayüzü — state kontrolü</h2>
+  <p class="section-lead">/sys/devices/system/cpu/cpu0/cpuidle/ altında her C-state için bir dizin bulunur. Bu arayüzden state istatistikleri izlenebilir ve bireysel state'ler devre dışı bırakılabilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># CPU0 idle state'leri listele</span>
+ls /sys/devices/system/cpu/cpu0/cpuidle/
+<span class="cmt"># state0  state1  state2</span>
+
+<span class="cmt"># state1 bilgilerini oku</span>
+cat /sys/devices/system/cpu/cpu0/cpuidle/state1/name
+<span class="cmt"># cpu-sleep-0</span>
+
+cat /sys/devices/system/cpu/cpu0/cpuidle/state1/latency
+<span class="cmt"># 100  (µs)</span>
+
+cat /sys/devices/system/cpu/cpu0/cpuidle/state1/residency
+<span class="cmt"># 150  (µs)</span>
+
+cat /sys/devices/system/cpu/cpu0/cpuidle/state1/usage
+<span class="cmt"># 42831  (kaç kez girildi)</span>
+
+cat /sys/devices/system/cpu/cpu0/cpuidle/state1/time
+<span class="cmt"># 1847392  (toplam geçirilen süre, µs)</span>
+
+<span class="cmt"># state1'i devre dışı bırak</span>
+echo 1 > /sys/devices/system/cpu/cpu0/cpuidle/state1/disable
+
+<span class="cmt"># tüm CPU'larda state2'yi kapat (yüksek gecikme durumunu engelle)</span>
+for cpu in /sys/devices/system/cpu/cpu*/cpuidle/state2/disable; do
+    echo 1 > "$cpu"
+done
+
+<span class="cmt"># tüm state'leri görüntüle (tüm CPU)</span>
+for state in /sys/devices/system/cpu/cpu0/cpuidle/state*/; do
+    name=$(cat "${state}name")
+    lat=$(cat  "${state}latency")
+    usage=$(cat "${state}usage")
+    echo "  $name  latency=${lat}µs  usage=${usage}"
+done</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>Derin C-state'leri (cluster sleep) devre dışı bırakmak güç tüketimini artırır ama wakeup latency'yi garanti altına alır. Gerçek zamanlı görevlerin bulunduğu sistemlerde pm_qos ile daha kontrollü bir yaklaşım tercih edilmelidir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Ölçüm araçları — cpupower, powertop, perf</h2>
+  <p class="section-lead">C-state kullanım oranlarını ve etkinliğini ölçmek için birden fazla araç mevcuttur. Her biri farklı bir perspektif sunar.</p>
+
+  <h3>cpupower idle-info</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code>cpupower idle-info
+<span class="cmt"># CPUIdle driver: arm_idle
+# CPUIdle governor: menu
+# Number of idle states: 3
+#
+# Idle state name            : WFI
+#   Flags/Description        : ARM WFI
+#   Exit latency             : 1 us
+#   Power usage              : 1 mW
+#   Residency                : 1 us
+#   Usage                    : 2847391
+#   Duration                 : 8291827 us
+#
+# Idle state name            : cpu-sleep-0
+#   Exit latency             : 100 us
+#   Usage                    : 47821
+#   Duration                 : 9182736 us</span></code></pre>
+  </div>
+
+  <h3>powertop — C-state dağılımı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># interaktif arayüz (Tab ile sekmeler arası geç)</span>
+powertop
+
+<span class="cmt"># 30 saniye CSV raporu</span>
+powertop --csv=idle_report.csv --time=30
+
+<span class="cmt"># HTML raporu</span>
+powertop --html=idle_report.html --time=30</code></pre>
+  </div>
+
+  <h3>perf ile C-state geçişleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># cpu-cycles sayacı (idle'da 0 olması gerekir)</span>
+perf stat -e cpu/cpu-cycles/,cpu/instructions/ sleep 5
+
+<span class="cmt"># idle tracepoint'leri izle</span>
+perf trace -e cpu_idle sleep 5
+<span class="cmt"># cpu_idle: state=1 cpu_id=0
+# cpu_idle: state=4294967295 cpu_id=0  (wakeup: state=-1)</span>
+
+<span class="cmt"># C-state istatistiklerini sysfs'ten hızlı oku</span>
+for cpu in 0 1 2 3; do
+  total=0
+  for st in /sys/devices/system/cpu/cpu${cpu}/cpuidle/state*/time; do
+    t=$(cat "$st")
+    total=$((total + t))
+  done
+  echo "CPU$cpu toplam idle süre: ${total} µs"
+done</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Latency kısıtları — pm_qos ve real-time</h2>
+  <p class="section-lead">Bazı uygulamalar (gerçek zamanlı kontrol döngüleri, ağ paket işleme) öngörülemeyen wakeup gecikmelerine tahammül edemez. pm_qos (Power Management Quality of Service) bu uygulamaların maksimum kabul edilebilir gecikmeyi sisteme bildirmesine olanak tanır.</p>
+
+  <h3>cpu_latency_qos_request API</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — pm_qos latency kısıtı</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/pm_qos.h&gt;
+
+/* Driver içinde */
+static struct pm_qos_request latency_req;
+
+/* Başlatma: maksimum 100 µs wakeup latency isteği */
+cpu_latency_qos_add_request(&amp;latency_req, 100);  /* µs */
+
+/* Kısıtı güncelle */
+cpu_latency_qos_update_request(&amp;latency_req, 50);
+
+/* Kısıtı kaldır */
+cpu_latency_qos_remove_request(&amp;latency_req);</code></pre>
+  </div>
+
+  <h3>Userspace'den pm_qos</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash / c — userspace pm_qos</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># /dev/cpu_dma_latency'e istenen max latency'yi yaz (µs, binary int32)</span>
+<span class="cmt"># Dosya açık olduğu sürece kısıt aktif kalır</span>
+
+python3 -c "
+import struct, time
+# 100 µs max latency iste
+fd = open('/dev/cpu_dma_latency', 'wb', buffering=0)
+fd.write(struct.pack('i', 100))
+print('pm_qos kısıtı aktif (100 µs)')
+time.sleep(30)   # 30 saniye boyunca derin C-state'ler engellenir
+fd.close()
+print('kısıt kaldırıldı')
+"</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — sürekli çalışan RT görev</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;unistd.h&gt;
+
+int main(void) {
+    int fd = open("/dev/cpu_dma_latency", O_RDWR);
+    if (fd &lt; 0) { perror("open"); return 1; }
+
+    int32_t target_us = 50;  /* 50 µs max wakeup latency */
+    write(fd, &amp;target_us, sizeof(target_us));
+
+    /* ... gerçek zamanlı işlem döngüsü ... */
+
+    close(fd);   /* kısıt otomatik kaldırılır */
+    return 0;
+}</code></pre>
+  </div>
+
+  <h3>Latency kısıtlarını izle</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># mevcut CPU latency QoS kısıtlarını görüntüle</span>
+cat /sys/kernel/debug/pm_qos/cpu_dma_latency
+<span class="cmt"># Default value: 2147483647
+# CPU 0 (task: rt_task, pid: 1842): 50</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">PREEMPT_RT İLE BİRLİKTE</div>
+    <p>PREEMPT_RT çekirdeği kullanıyorsanız, yüksek öncelikli RT görevlerinizin bulunduğu CPU'larda derin C-state'leri <code class="inline">pm_qos</code> ile sınırlamanız önerilir. Aksi takdirde 1 ms'lik wakeup gecikmesi bile zamanlama ihlallerine yol açabilir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Kernel config — platform driver</h2>
+  <p class="section-lead">cpuidle subsystem'ini etkinleştirmek için birkaç temel Kconfig seçeneği gerekir. Platform driver seçimi SoC'a bağlıdır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig</span><span class="dot">●</span></div>
+    <pre><code>CONFIG_CPU_IDLE=y
+CONFIG_CPU_IDLE_GOV_LADDER=y
+CONFIG_CPU_IDLE_GOV_MENU=y
+CONFIG_CPU_IDLE_GOV_TEO=y           <span class="cmt"># Linux 5.1+</span>
+CONFIG_CPU_IDLE_GOV_HALTPOLL=y      <span class="cmt"># sanal makine için</span>
+
+<span class="cmt"># ARM platform-specific</span>
+CONFIG_ARM_CPUIDLE=y                 <span class="cmt"># generic ARM idle driver</span>
+CONFIG_ARM64_CPUIDLE=y               <span class="cmt"># ARM64 için</span>
+CONFIG_ARM_PSCI_CPUIDLE=y            <span class="cmt"># PSCI tabanlı idle</span>
+
+<span class="cmt"># x86 / ACPI</span>
+CONFIG_INTEL_IDLE=y                  <span class="cmt"># Intel-specific idle driver</span>
+CONFIG_ACPI_PROCESSOR=y
+
+<span class="cmt"># İstatistik ve hata ayıklama</span>
+CONFIG_CPU_IDLE_STAT=y</code></pre>
+  </div>
+
+  <h3>Platform-specific notlar</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Platform → Driver</span><span class="dot">●</span></div>
+    <pre><code>Raspberry Pi 4 (BCM2711)  → arm_idle + PSCI (firmware gerekli)
+BeagleBone Black (AM335x) → cpuidle-am335x veya arm_idle
+i.MX8 (NXP)               → arm_idle + PSCI (ATF gerekli)
+RK3568 (Rockchip)         → arm_idle + PSCI
+x86 Intel                 → intel_idle
+x86 AMD                   → acpi_idle veya amd_idle</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>ARM64 sistemlerde derin C-state'ler (cluster sleep) için ARM Trusted Firmware'in (ATF/TF-A) doğru şekilde yapılandırılmış ve çalışır halde olması gerekir. ATF yoksa veya yanlış derlenirse PSCI çağrıları başarısız olur ve kernel sadece WFI düzeyinde idle yapar.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: idle latency ölçümü ve Cortex-A53 C-state profili</h2>
+  <p class="section-lead">İki pratik: cyclictest ile C-state'lerin wakeup latency'ye etkisini ölçmek, ve ARM Cortex-A53 sistemde C-state profilini çıkarmak.</p>
+
+  <h3>1 — cyclictest ile idle latency ölçümü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — cyclictest + cpuidle</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># rt-tests paketi: apt install rt-tests</span>
+
+<span class="cmt"># Baseline: tüm C-state'ler etkin, menu governor</span>
+cyclictest --mlockall --smp --priority=99 \
+           --interval=1000 --duration=30s \
+           --histogram=50 --histfile=hist_cstates_on.txt
+<span class="cmt"># # Min Latencies: 00014 00015 00016 00014
+# # Avg Latencies: 00024 00026 00022 00025
+# # Max Latencies: 00847 01023 00912 00788</span>
+
+<span class="cmt"># C-state'leri kapat (performans baseline)</span>
+for st in /sys/devices/system/cpu/cpu*/cpuidle/state*/disable; do
+    echo 1 > "$st"
+done
+
+cyclictest --mlockall --smp --priority=99 \
+           --interval=1000 --duration=30s \
+           --histogram=50 --histfile=hist_cstates_off.txt
+<span class="cmt"># # Min Latencies: 00012 00012 00013 00012
+# # Avg Latencies: 00015 00016 00014 00015
+# # Max Latencies: 00045 00052 00038 00041
+# Sonuç: C-state'ler kapalıyken max latency ~20x daha düşük!</span>
+
+<span class="cmt"># Sadece derin state'i kapat (C2/cluster sleep)</span>
+for cpu in /sys/devices/system/cpu/cpu*/cpuidle/state2/disable; do
+    echo 1 > "$cpu"
+done
+
+<span class="cmt"># pm_qos ile 100 µs latency kısıtı koy (C-state'ler açık ama derin girişler engellenir)</span>
+echo 100 | python3 -c "import sys,struct; open('/dev/cpu_dma_latency','wb').write(struct.pack('i',int(sys.stdin.read().strip())))" &amp;</code></pre>
+  </div>
+
+  <h3>2 — Cortex-A53 C-state profil scripti</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — C-state profil scripti</span><span class="dot">●</span></div>
+    <pre><code>#!/bin/bash
+# Cortex-A53 C-state profil çıkarma
+# Kullanım: ./cstate_profile.sh [saniye]
+
+DURATION=${1:-30}
+echo "=== cpuidle C-state Profil ($DURATION saniye) ==="
+echo ""
+
+# Başlangıç değerlerini kaydet
+declare -A start_usage start_time
+for cpu in 0 1 2 3; do
+    for state_dir in /sys/devices/system/cpu/cpu${cpu}/cpuidle/state*/; do
+        key="${cpu}_$(basename $state_dir)"
+        start_usage[$key]=$(cat "${state_dir}usage" 2>/dev/null || echo 0)
+        start_time[$key]=$(cat  "${state_dir}time"  2>/dev/null || echo 0)
+    done
+done
+
+sleep "$DURATION"
+
+# Delta hesapla ve raporla
+echo "CPU | State        | Giriş/sn | Toplam%"
+echo "----|--------------|-----------|--------"
+for cpu in 0 1 2 3; do
+    for state_dir in /sys/devices/system/cpu/cpu${cpu}/cpuidle/state*/; do
+        name=$(cat "${state_dir}name" 2>/dev/null)
+        key="${cpu}_$(basename $state_dir)"
+        end_usage=$(cat "${state_dir}usage" 2>/dev/null || echo 0)
+        end_time=$(cat  "${state_dir}time"  2>/dev/null || echo 0)
+        delta_usage=$(( end_usage - ${start_usage[$key]} ))
+        delta_time=$(( end_time - ${start_time[$key]} ))
+        per_sec=$(( delta_usage / DURATION ))
+        pct=$(( delta_time / (DURATION * 10000) ))
+        printf " %d  | %-12s | %9d | %5d%%\n" \
+               "$cpu" "$name" "$per_sec" "$pct"
+    done
+done</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>Örnek çıktı — boşta sistem</span><span class="dot">●</span></div>
+    <pre><code>=== cpuidle C-state Profil (30 saniye) ===
+
+CPU | State        | Giriş/sn | Toplam%
+----|--------------|-----------|--------
+ 0  | WFI          |      1203 |    12%
+ 0  | cpu-sleep-0  |       847 |    71%
+ 0  | cluster-slp  |        23 |    14%
+ 1  | WFI          |       998 |     9%
+ 1  | cpu-sleep-0  |       901 |    78%
+ 1  | cluster-slp  |        19 |    11%</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">YORUM</div>
+    <p>Sağlıklı bir gömülü sistemde boşta CPU, zamanının büyük çoğunluğunu (<strong>&gt;80%</strong>) orta veya derin C-state'lerde geçirmelidir. WFI (C1) oranı çok yüksekse, daha derin state'lere geçişi engelleyen bir pm_qos kısıtı veya yüksek frekanslı interrupt kaynağı olabilir.</p>
+  </div>
+
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

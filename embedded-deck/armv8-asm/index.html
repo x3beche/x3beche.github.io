@@ -1,0 +1,753 @@
+---
+layout: tutorial
+title: "ARMv8 Assembly &amp; NEON — Performans Kritik Kod"
+back_url: "../index.html"
+back_label: "embedded-deck"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ PERFORMANS</span>
+    <span>ARMv8 ASM</span>
+    <span>2026</span>
+  </div>
+  <h1>ARMv8 Assembly &amp; NEON<br><em>Performans Kritik Kod.</em></h1>
+  <p class="subtitle">AArch64 ISA temellerinden NEON SIMD vektör işlemlerine, SVE tahmin register'larından perf ile donanım sayaç ölçümüne kadar gömülü sistemlerde performans kritik kod yazma rehberi.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Neden assembly?</a></li>
+    <li><a href="#s1">AArch64 ISA primer</a></li>
+    <li><a href="#s2">A64 instruction set</a></li>
+    <li><a href="#s3">Calling convention (AAPCS64)</a></li>
+    <li><a href="#s4">Inline assembly</a></li>
+    <li><a href="#s5">NEON basics</a></li>
+    <li><a href="#s6">NEON intrinsics</a></li>
+    <li><a href="#s7">SVE giriş</a></li>
+    <li><a href="#s8">Profiling ile doğrulama</a></li>
+    <li><a href="#s9">Pratik: memcpy ve dot product karşılaştırma</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Neden assembly?</h2>
+  <p class="section-lead">Modern derleyiciler çoğu durumda mükemmel makine kodu üretir. Ancak belirli hotpath senaryolarında, SIMD kullanımında ve donanıma özgü optimizasyonlarda elle yazılmış assembly ya da intrinsics %2–10 arasında değil, kimi zaman %200–500 düzeyinde kazanım sağlayabilir.</p>
+
+  <h3>Derleyicinin yetersiz kaldığı durumlar</h3>
+  <div class="params">
+    <div class="param"><span class="name">Vektörizasyon sınırları</span><span class="desc">Derleyici alias analizi yapamadığında auto-vectorization başarısız olur — restrict veya manual SIMD gerekir</span></div>
+    <div class="param"><span class="name">Cross-lane SIMD</span><span class="desc">Permute, shuffle, complex lane operasyonları derleyici tarafından üretilmez; intrinsics zorunlu</span></div>
+    <div class="param"><span class="name">Özel donanım komutu</span><span class="desc">CRC32, AES, SHA, cache prefetch — C'de doğrudan erişilemez</span></div>
+    <div class="param"><span class="name">Register renaming trick</span><span class="desc">Belirli pipeline bağımlılıklarını kırmak için komut sıralama derleyicinin göremeyeceği mikro-optimizasyon</span></div>
+    <div class="param"><span class="name">Memory barrier sıralaması</span><span class="desc">DMB/DSB/ISB bariyerleri ve atomik işlem memory order'ı — lockless veri yapıları</span></div>
+  </div>
+
+  <h3>Profil önce, optimize sonra</h3>
+  <pre><code class="language-bash"># Önce gerçek bottleneck'i bul
+perf stat -e cycles,instructions,cache-misses ./program
+
+# IPC (instructions per cycle) &lt; 1.0 ise memory bound
+# cache-miss yüksekse bellek erişim düzeni optimize et
+# Sadece sonra SIMD/assembly yaz</code></pre>
+
+  <div class="callout">
+    <div class="label">ALTIN KURAL</div>
+    <p>Kodu önce doğru yaz, sonra profilini al, sonra sadece gerçek bottleneck olan %5'lik kısmı optimize et. Assembly yazmadan önce <code>-O3 -march=native -ffast-math</code> derleyici flaglerini dene; çoğu zaman bu yeterlidir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> AArch64 ISA primer</h2>
+  <p class="section-lead">AArch64, ARMv8 mimarisinin 64-bit execution state'idir. A64 instruction set'i yalnızca AArch64'te çalışır ve önceki ARM instruction encoding'lerinden tamamen farklıdır.</p>
+
+  <h3>Execution states</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>State</th><th>Bit Genişliği</th><th>Instruction Set</th><th>Not</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>AArch64</td><td>64-bit</td><td>A64</td><td>ARMv8 yeni mod — gömülü Linux hedefi</td></tr>
+        <tr><td>AArch32</td><td>32-bit</td><td>A32 (ARM) + T32 (Thumb)</td><td>Geriye dönük uyumluluk</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Register seti</h3>
+  <div class="flow">
+    <pre>
+Genel Amaçlı Registerlar (64-bit)
+x0  – x7   : Fonksiyon argümanları / dönüş değerleri
+x8          : Dolaylı sonuç konumu / syscall numarası
+x9  – x15  : Caller-saved geçici registerlar
+x16 – x17  : Intra-procedure-call scratch (IP0, IP1)
+x18         : Platform register (genelde dokunulmamalı)
+x19 – x28  : Callee-saved registerlar
+x29 (fp)   : Frame pointer
+x30 (lr)   : Link register (dönüş adresi)
+sp          : Stack pointer (16-byte hizalı olmalı)
+pc          : Program counter (doğrudan yazılamaz)
+xzr/wzr    : Sıfır register (her zaman 0 okur, yazmalar yoksayılır)
+
+32-bit alt kayıtlara w prefix ile erişilir:
+x0 → w0, x1 → w1, ... (üst 32-bit sıfırlanır)
+
+PSTATE (işlemci durum registerı):
+N (Negative), Z (Zero), C (Carry), V (Overflow)
+
+SIMD / Floating-point Registerlar:
+v0 – v31   : 128-bit vektör registerları
+  b0 (8-bit), h0 (16-bit), s0 (32-bit), d0 (64-bit), q0 (128-bit)
+    </pre>
+  </div>
+
+  <h3>Exception Levels (EL)</h3>
+  <div class="params">
+    <div class="param"><span class="name">EL0</span><span class="desc">Kullanıcı alanı uygulamaları — en az ayrıcalıklı</span></div>
+    <div class="param"><span class="name">EL1</span><span class="desc">Kernel / işletim sistemi</span></div>
+    <div class="param"><span class="name">EL2</span><span class="desc">Hypervisor (KVM, Xen)</span></div>
+    <div class="param"><span class="name">EL3</span><span class="desc">Secure Monitor (TrustZone / ATF)</span></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> A64 instruction set</h2>
+  <p class="section-lead">A64 tüm komutlar 32-bit genişliğindedir (sabit uzunluk). Temel komut gruplarını bilmek assembly okuma ve yazma için yeterlidir.</p>
+
+  <h3>Load / Store</h3>
+  <pre><code class="language-bash">// Tek register yükle / depola
+ldr  x0, [x1]          // x0 = *(x1)
+ldr  x0, [x1, #8]      // x0 = *(x1 + 8)
+ldr  x0, [x1, x2]      // x0 = *(x1 + x2)
+ldr  x0, [x1, x2, lsl #3] // x0 = *(x1 + x2*8)
+ldr  x0, [x1], #8      // x0 = *x1; x1 += 8  (post-index)
+ldr  x0, [x1, #8]!     // x1 += 8; x0 = *x1  (pre-index)
+
+str  x0, [x1]          // *(x1) = x0
+str  w0, [x1, #4]      // 32-bit store
+
+// Çift register yükle / depola (verimli — 2 register = 1 komut)
+ldp  x0, x1, [x2]      // x0 = *(x2), x1 = *(x2+8)
+stp  x0, x1, [sp, #-16]! // stack'e push (pre-decrement)</code></pre>
+
+  <h3>Aritmetik ve mantık</h3>
+  <pre><code class="language-bash">// Toplama / Çıkarma
+add  x0, x1, x2        // x0 = x1 + x2
+add  x0, x1, #100      // x0 = x1 + 100 (immediate)
+adds x0, x1, x2        // flag'leri güncelle
+adc  x0, x1, x2        // x0 = x1 + x2 + C (carry)
+sub  x0, x1, x2        // x0 = x1 - x2
+subs x0, x1, x2        // subtraction + flags
+mul  x0, x1, x2        // x0 = x1 * x2 (düşük 64-bit)
+madd x0, x1, x2, x3    // x0 = x1*x2 + x3 (fused multiply-add)
+sdiv x0, x1, x2        // x0 = x1 / x2 (signed)
+
+// Bit kaydırma
+lsl  x0, x1, #3        // x0 = x1 &lt;&lt; 3
+lsr  x0, x1, #3        // x0 = x1 &gt;&gt; 3 (logical, zero-fill)
+asr  x0, x1, #3        // x0 = x1 &gt;&gt; 3 (arithmetic, sign-fill)
+
+// Mantık
+and  x0, x1, x2
+orr  x0, x1, x2
+eor  x0, x1, x2        // XOR
+bic  x0, x1, x2        // x0 = x1 &amp; ~x2</code></pre>
+
+  <h3>Dal (Branch) komutları</h3>
+  <pre><code class="language-bash">// Koşulsuz dal
+b    label              // PC-relative dal (±128MB)
+br   x0                 // register'daki adrese dal
+bl   func               // subroutine call (lr = PC+4)
+blr  x0                 // indirect call
+ret                     // return (br lr)
+ret  x19                // başka register'dan return
+
+// Koşullu dal
+cmp  x0, x1             // x0 - x1 (flags güncelle, sonuç atılır)
+beq  label              // Z=1 ise dal
+bne  label              // Z=0 ise dal
+blt  label              // N≠V ise dal (signed less than)
+bge  label              // N=V ise dal (signed greater or equal)
+blo  label              // C=0 ise dal (unsigned lower)
+bhs  label              // C=1 ise dal (unsigned higher or same)
+
+// Sıfır/sıfır-değil testi (cmp yerine daha verimli)
+cbz  x0, label          // x0==0 ise dal
+cbnz x0, label          // x0!=0 ise dal
+
+// Bit testi
+tbz  x0, #5, label      // bit 5 sıfır ise dal
+tbnz x0, #5, label      // bit 5 bir ise dal</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Calling convention (AAPCS64)</h2>
+  <p class="section-lead">AAPCS64 (Procedure Call Standard for AArch64), fonksiyon argümanlarının, dönüş değerlerinin ve register tasarruf sorumluluklarının nasıl dağıtıldığını tanımlar.</p>
+
+  <h3>Argüman ve dönüş register kuralları</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Register</th><th>Rol</th><th>Kimin sorumluluğunda</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>x0 – x7</td><td>İlk 8 integer/pointer argüman + dönüş değeri</td><td>Caller-saved (çağıran kurtarır)</td></tr>
+        <tr><td>x8</td><td>Dolaylı sonuç adresi (büyük struct dönüşü)</td><td>Caller-saved</td></tr>
+        <tr><td>x9 – x15</td><td>Geçici (scratch) registerlar</td><td>Caller-saved</td></tr>
+        <tr><td>x16, x17</td><td>PLT / linker scratch</td><td>Caller-saved</td></tr>
+        <tr><td>x19 – x28</td><td>Callee-saved registerlar</td><td>Callee-saved (çağrılan kurtarır)</td></tr>
+        <tr><td>x29 (fp)</td><td>Frame pointer</td><td>Callee-saved</td></tr>
+        <tr><td>x30 (lr)</td><td>Link register</td><td>Caller-saved (ama fonksiyon içinde kaydedilmeli)</td></tr>
+        <tr><td>v0 – v7</td><td>SIMD/FP argümanlar ve dönüş</td><td>Caller-saved</td></tr>
+        <tr><td>v8 – v15</td><td>Callee-saved SIMD (sadece alt 64-bit)</td><td>Callee-saved</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Fonksiyon prologue / epilogue</h3>
+  <pre><code class="language-bash">// Standart AArch64 fonksiyon yapısı:
+.globl my_function
+my_function:
+    // Prologue: frame pointer + link register kaydet
+    stp  x29, x30, [sp, #-32]!   // sp -= 32; *(sp) = x29; *(sp+8) = x30
+    mov  x29, sp                  // frame pointer kur
+
+    // Callee-saved register kullanılacaksa kaydet
+    stp  x19, x20, [sp, #16]      // *(sp+16) = x19; *(sp+24) = x20
+
+    // ... fonksiyon gövdesi ...
+    // x0 = dönüş değeri
+
+    // Epilogue: kayıtlı registerleri geri yükle
+    ldp  x19, x20, [sp, #16]
+    ldp  x29, x30, [sp], #32      // x29,x30 geri yükle; sp += 32
+    ret</code></pre>
+
+  <h3>Stack alignment</h3>
+  <p>AArch64'te stack pointer her fonksiyon çağrısında 16-byte hizalı olmalıdır. AAPCS64 bu kuralı zorunlu kılar; hizasız erişimde bazı sistemlerde alignment fault atılır.</p>
+  <pre><code class="language-bash">// Yerel değişkenler için alan aç (16-byte katları)
+sub  sp, sp, #32    // 32 byte (2 × 16) — OK
+// sub sp, sp, #12  // 12 byte — YANLIŞ! 16'nın katı değil
+
+// sp her zaman 16-byte hizalı:
+and  x0, sp, #0xf   // 0 olmalı</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Inline assembly</h2>
+  <p class="section-lead">C kodu içinde <code>asm volatile</code> ile assembly komutları gömülür. GCC/Clang constraint sistemi, C değişkenlerini assembly registerlarına bağlar.</p>
+
+  <h3>Temel sözdizimi</h3>
+  <pre><code class="language-bash">// asm("komutlar" : çıkış : giriş : clobber);
+
+// Basit örnek: x = x + y
+int x = 10, y = 5, result;
+asm volatile(
+    "add %0, %1, %2"         // komut: %0=çıkış, %1/%2=giriş
+    : "=r"(result)            // çıkış constraint: "r"=register
+    : "r"(x), "r"(y)          // giriş constraint
+    :                          // clobber listesi (boş)
+);
+// result = 15</code></pre>
+
+  <h3>Constraint türleri</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Constraint</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>"r"</td><td>Genel amaçlı register (x0–x30)</td></tr>
+        <tr><td>"m"</td><td>Bellek operandı</td></tr>
+        <tr><td>"i"</td><td>Immediate (sabit) değer</td></tr>
+        <tr><td>"=r"</td><td>Yazılacak register (çıkış)</td></tr>
+        <tr><td>"+r"</td><td>Hem okunacak hem yazılacak register</td></tr>
+        <tr><td>"w"</td><td>SIMD/FP register (v0–v31)</td></tr>
+        <tr><td>"0"</td><td>0. constraint ile aynı register</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Gerçek kullanım örnekleri</h3>
+  <pre><code class="language-bash">// 1. Sistem sayaç oku (PMU cycle counter)
+static inline uint64_t read_cycles(void) {
+    uint64_t val;
+    asm volatile("mrs %0, cntvct_el0" : "=r"(val));
+    return val;
+}
+
+// 2. Cache satırını prefetch
+static inline void prefetch(const void *addr) {
+    asm volatile("prfm pldl1keep, [%0]" : : "r"(addr));
+}
+
+// 3. Memory barrier
+static inline void dmb_sy(void) {
+    asm volatile("dmb sy" ::: "memory");
+    // "memory" clobber: derleyiciye bellek operasyonlarını
+    // bu barrier etrafında yeniden sıralama
+}
+
+// 4. CRC32 donanım hızlandırması
+static inline uint32_t crc32_hw(uint32_t crc, uint64_t data) {
+    asm volatile("crc32x %w0, %w0, %1"
+                 : "+r"(crc)
+                 : "r"(data));
+    return crc;
+}
+
+// 5. Atomic compare-and-swap (LDXR/STXR)
+static inline int cas64(uint64_t *ptr, uint64_t old, uint64_t new_val) {
+    uint64_t tmp;
+    int res;
+    asm volatile(
+        "1: ldxr  %0, [%2]      \n"
+        "   cmp   %0, %3        \n"
+        "   bne   2f            \n"
+        "   stxr  %w1, %4, [%2] \n"
+        "   cbnz  %w1, 1b       \n"
+        "2:                     \n"
+        : "=&r"(tmp), "=&r"(res)
+        : "r"(ptr), "r"(old), "r"(new_val)
+        : "cc", "memory"
+    );
+    return (res == 0);
+}</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> NEON basics</h2>
+  <p class="section-lead">NEON, AArch64'ün Advanced SIMD (Single Instruction Multiple Data) uzantısıdır. 128-bit vektör registerlarında tek seferde birden fazla veri elemanını paralel işler.</p>
+
+  <h3>Vektör register veri tipleri</h3>
+  <div class="flow">
+    <pre>
+v0 (128-bit, q0 olarak da yazılır)
+┌────────────────────────────────────────────────────────────────┐
+│ 127                                                           0 │
+└────────────────────────────────────────────────────────────────┘
+
+Aynı register farklı veri tipleri olarak görülebilir:
+v0.16b  → 16 × 8-bit  unsigned byte
+v0.8b   →  8 × 8-bit  (64-bit alt yarı)
+v0.8h   →  8 × 16-bit unsigned halfword
+v0.4h   →  4 × 16-bit (64-bit alt yarı)
+v0.4s   →  4 × 32-bit unsigned word
+v0.2s   →  2 × 32-bit (64-bit alt yarı)
+v0.2d   →  2 × 64-bit doubleword
+v0.1d   →  1 × 64-bit (64-bit alt yarı)
+    </pre>
+  </div>
+
+  <h3>Temel vektör yükleme / depolama</h3>
+  <pre><code class="language-bash">// Belirli sayıda eleman yükle
+ld1  {v0.4s}, [x0]          // 4 × 32-bit, tek register
+ld1  {v0.4s, v1.4s}, [x0]   // 8 × 32-bit, iki register, interleaved
+ld2  {v0.4s, v1.4s}, [x0]   // de-interleaved çift (LRLRLRLR → LL RR)
+ld4  {v0.8b-v3.8b}, [x0]    // 4-way de-interleave (RGBA → R,G,B,A)
+
+// Store
+st1  {v0.16b}, [x0]
+st1  {v0.4s, v1.4s}, [x0], #32  // post-increment
+
+// Tek eleman yükle (broadcast için)
+ld1r {v0.4s}, [x0]          // [x0]'daki 32-bit'i 4 lane'e çoğalt</code></pre>
+
+  <h3>Temel NEON aritmetik</h3>
+  <pre><code class="language-bash">// Vektör toplama
+add  v0.4s, v1.4s, v2.4s    // v0 = v1 + v2 (4 × 32-bit paralel)
+add  v0.8h, v1.8h, v2.8h    // 8 × 16-bit paralel
+
+// Çarpma-toplama (FMA)
+fmla v0.4s, v1.4s, v2.4s    // v0 += v1 * v2 (float)
+mla  v0.4s, v1.4s, v2.4s    // v0 += v1 * v2 (integer)
+
+// Scalar ile çarp (lane broadcast)
+fmul v0.4s, v1.4s, v2.s[0]  // v1'i v2'nin lane-0 ile çarp
+
+// Karşılaştırma
+cmeq v0.4s, v1.4s, v2.4s    // v0 = (v1 == v2) ? 0xFFFFFFFF : 0
+cmgt v0.4s, v1.4s, v2.4s    // v0 = (v1 > v2)  ? 0xFFFFFFFF : 0
+
+// Yatay toplama (horizontal)
+addv s0, v1.4s               // s0 = v1[0]+v1[1]+v1[2]+v1[3]
+faddp v0.4s, v1.4s, v2.4s   // pairwise add</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> NEON intrinsics</h2>
+  <p class="section-lead">NEON intrinsics, assembly yazmadan SIMD işlemlerini C/C++ kodunda kullanmayı sağlayan <code>arm_neon.h</code> başlık dosyasının fonksiyonlarıdır.</p>
+
+  <h3>Temel intrinsic tipleri ve fonksiyonlar</h3>
+  <pre><code class="language-bash">#include &lt;arm_neon.h&gt;
+
+// Veri tipleri:
+// int8x8_t, int8x16_t, uint8x8_t, uint8x16_t
+// int16x4_t, int16x8_t, uint16x4_t, uint16x8_t
+// int32x2_t, int32x4_t, float32x2_t, float32x4_t
+// int64x1_t, int64x2_t, float64x1_t, float64x2_t
+
+// Vektör doldurma
+float32x4_t a = vdupq_n_f32(1.0f);    // {1,1,1,1}
+int32x4_t   b = vdupq_n_s32(0);        // {0,0,0,0}
+
+// Yükleme
+float32x4_t v = vld1q_f32(ptr);        // 4 × float yükle
+int16x8_t   w = vld1q_s16(ptr);        // 8 × int16 yükle
+
+// Depolama
+vst1q_f32(ptr, v);                      // 4 × float yaz
+
+// Toplama
+float32x4_t c = vaddq_f32(a, b);       // a + b (lane-wise)
+int32x4_t   d = vaddq_s32(x, y);
+
+// Çarpma
+float32x4_t e = vmulq_f32(a, b);
+// Scalar çarpma
+float32x4_t f = vmulq_n_f32(a, 2.5f);
+
+// FMA: a = a + b*c
+float32x4_t result = vfmaq_f32(a, b, c);  // a += b*c</code></pre>
+
+  <h3>4x4 matrix-vector product (NEON intrinsics)</h3>
+  <pre><code class="language-bash">// 4x4 float matrix ile 4-element vector çarpımı
+void mat4_vec4_mul(const float *mat, const float *vec, float *out) {
+    // Vektörü 4 lane'e yükle
+    float32x4_t v = vld1q_f32(vec);
+
+    // Matrix sütunlarını yükle
+    float32x4_t m0 = vld1q_f32(mat +  0);
+    float32x4_t m1 = vld1q_f32(mat +  4);
+    float32x4_t m2 = vld1q_f32(mat +  8);
+    float32x4_t m3 = vld1q_f32(mat + 12);
+
+    // Her sütunu scalar ile çarp ve topla
+    float32x4_t res = vmulq_laneq_f32(m0, v, 0);  // m0 * v[0]
+    res = vfmaq_laneq_f32(res, m1, v, 1);           // += m1 * v[1]
+    res = vfmaq_laneq_f32(res, m2, v, 2);           // += m2 * v[2]
+    res = vfmaq_laneq_f32(res, m3, v, 3);           // += m3 * v[3]
+
+    vst1q_f32(out, res);
+}
+// 4 FMA = 4 × 4 = 16 işlem paralel</code></pre>
+
+  <h3>RGB → Grayscale dönüşümü (NEON)</h3>
+  <pre><code class="language-bash">// Y = 0.299R + 0.587G + 0.114B
+void rgb_to_gray_neon(const uint8_t *rgb, uint8_t *gray, int pixels) {
+    // Katsayılar Q8 fixed-point: 0.299*256≈77, 0.587*256≈150, 0.114*256≈29
+    const uint8x8_t kr = vdup_n_u8(77);
+    const uint8x8_t kg = vdup_n_u8(150);
+    const uint8x8_t kb = vdup_n_u8(29);
+
+    for (int i = 0; i &lt; pixels; i += 8) {
+        // 8 pixel RGB'yi de-interleave ederek yükle
+        uint8x8x3_t pixel = vld3_u8(rgb + i * 3);
+
+        uint16x8_t sum;
+        sum = vmull_u8(pixel.val[0], kr);      // R * 77
+        sum = vmlal_u8(sum, pixel.val[1], kg); // + G * 150
+        sum = vmlal_u8(sum, pixel.val[2], kb); // + B * 29
+
+        // 16-bit → 8-bit (sağa kaydırarak normalize)
+        uint8x8_t result = vshrn_n_u16(sum, 8);
+        vst1_u8(gray + i, result);
+    }
+}</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> SVE — Scalable Vector Extension</h2>
+  <p class="section-lead">SVE, ARMv8.2-A ile tanıtılan ölçeklenebilir vektör uzantısıdır. Sabit 128-bit NEON'un aksine SVE vektör uzunluğu donanıma göre 128-bit'ten 2048-bit'e kadar değişir.</p>
+
+  <h3>SVE vs NEON temel farklar</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Özellik</th><th>NEON</th><th>SVE</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Vektör genişliği</td><td>128-bit sabit</td><td>128–2048-bit, donanıma göre</td></tr>
+        <tr><td>Predicate register</td><td>Yok</td><td>p0–p15 (per-lane maskeleme)</td></tr>
+        <tr><td>Gather/Scatter</td><td>Sınırlı</td><td>Doğrudan ld1 gather desteği</td></tr>
+        <tr><td>Loop yönetimi</td><td>Manuel unroll</td><td>whilelt ile otomatik</td></tr>
+        <tr><td>Kayıt sayısı</td><td>v0–v31 (32)</td><td>z0–z31 (32 geniş)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Temel SVE döngüsü</h3>
+  <pre><code class="language-bash">// SVE: SIMD uzunluğundan bağımsız vektör toplama döngüsü
+// void add_vectors(float *a, float *b, float *c, int n)
+.globl add_vectors_sve
+add_vectors_sve:
+    // x0=a, x1=b, x2=c, w3=n
+    mov  x4, #0                   // i = 0
+.loop:
+    // Kalan eleman sayısına göre predicate hesapla
+    // p0 = (i + lane < n) olan lane'ler aktif
+    whilelt p0.s, w4, w3          // p0 = {i<n, i+1<n, i+2<n, ...}
+    b.none  .done                  // hiç aktif lane yoksa çık
+
+    // Vektör yükle (sadece aktif lane'ler)
+    ld1w  {z0.s}, p0/z, [x0, x4, lsl #2]   // a[i..]
+    ld1w  {z1.s}, p0/z, [x1, x4, lsl #2]   // b[i..]
+
+    // Topla
+    fadd  z0.s, p0/m, z0.s, z1.s            // z0 = z0 + z1 (masked)
+
+    // Sonucu yaz
+    st1w  {z0.s}, p0, [x2, x4, lsl #2]      // c[i..] = z0
+
+    // İndeks güncelle
+    incw  x4                                  // i += vl (vector length)
+    b     .loop
+.done:
+    ret</code></pre>
+
+  <h3>SVE intrinsics (C)</h3>
+  <pre><code class="language-bash">#include &lt;arm_sve.h&gt;
+
+void axpy_sve(float *y, const float *x, float a, int n) {
+    // y[i] += a * x[i]
+    int64_t i = 0;
+    svbool_t pg;
+
+    while (i &lt; n) {
+        pg = svwhilelt_b32(i, n);   // predicate mask
+
+        svfloat32_t vx = svld1_f32(pg, x + i);  // x[i..]
+        svfloat32_t vy = svld1_f32(pg, y + i);  // y[i..]
+
+        vy = svmla_n_f32_m(pg, vy, vx, a);       // vy += vx * a
+
+        svst1_f32(pg, y + i, vy);               // store
+
+        i += svcntw();  // VL/4 ilerle (float sayısı)
+    }
+}</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Profiling ile doğrulama</h2>
+  <p class="section-lead">Optimizasyonun işe yarayıp yaramadığını nesnel olarak görmek için donanım performans sayaçlarını kullanmak gerekir. <code>perf stat</code> ve PMU sayaçları bu iş için biçilmiş kaftandır.</p>
+
+  <h3>perf stat temel kullanım</h3>
+  <pre><code class="language-bash"># Temel sayaçlarla çalıştır
+perf stat ./my_program
+
+# Çıktı örneği:
+# Performance counter stats for './my_program':
+#     1,234,567,890   cycles           # 1.23 GHz
+#     2,456,789,123   instructions     # 1.99 insn/cycle (IPC)
+#        12,345,678   cache-misses     # 1.2% of all cache refs
+#         1,023,456   branch-misses    # 0.5% of all branches
+#           0.987654  seconds elapsed
+
+# Özel sayaçlar
+perf stat -e cycles,instructions,L1-dcache-misses,L1-icache-misses \
+    ./my_program
+
+# SIMD verimliliği için
+perf stat -e cycles,instructions,fp_scale_ops_spec,fp_fixed_ops_spec \
+    ./my_program</code></pre>
+
+  <h3>PMU sayaçlarını C'den okuma</h3>
+  <pre><code class="language-bash">#include &lt;sys/ioctl.h&gt;
+#include &lt;linux/perf_event.h&gt;
+
+// Basit cycle counter wrapper
+static int perf_fd = -1;
+
+void perf_init(void) {
+    struct perf_event_attr pe = {
+        .type           = PERF_TYPE_HARDWARE,
+        .config         = PERF_COUNT_HW_CPU_CYCLES,
+        .disabled       = 1,
+        .exclude_kernel = 1,
+        .exclude_hv     = 1,
+    };
+    perf_fd = syscall(298, &pe, 0, -1, -1, 0); // SYS_perf_event_open
+}
+
+void perf_start(void) {
+    ioctl(perf_fd, PERF_EVENT_IOC_RESET,  0);
+    ioctl(perf_fd, PERF_EVENT_IOC_ENABLE, 0);
+}
+
+uint64_t perf_stop(void) {
+    uint64_t count;
+    ioctl(perf_fd, PERF_EVENT_IOC_DISABLE, 0);
+    read(perf_fd, &count, sizeof(count));
+    return count;
+}
+
+// Kullanım:
+perf_init();
+perf_start();
+my_function(data, N);
+uint64_t cycles = perf_stop();
+printf("Cycles: %lu, Per-element: %.2f\n", cycles, (double)cycles/N);</code></pre>
+
+  <h3>AArch64 donanım sayaçları doğrudan okuma</h3>
+  <pre><code class="language-bash">// User-space cycle counter (PMU erişimi açıksa)
+static inline uint64_t armv8_pmccntr_read(void) {
+    uint64_t val;
+    asm volatile("mrs %0, pmccntr_el0" : "=r"(val));
+    return val;
+}
+
+// pmccntr_el0 user-space erişimi için:
+// echo 1 > /sys/bus/event_source/devices/armv8_pmuv3/userspace_access
+// PMCR_EL0.E = 1, PMCNTENSET_EL0.C = 1 (kernel driver yapar)</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 09 ═══════════════════ -->
+<section id="s9">
+  <h2><span class="num">09</span> Pratik: memcpy ve dot product karşılaştırma</h2>
+  <p class="section-lead">Scalar ve NEON implementasyonlarını yan yana yazıp perf ile throughput ölçümü yapalım.</p>
+
+  <h3>Dot product: scalar vs NEON</h3>
+  <pre><code class="language-bash">// dotprod.c — scalar ve NEON dot product karşılaştırması
+#include &lt;arm_neon.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;time.h&gt;
+#include &lt;string.h&gt;
+
+#define N (1 &lt;&lt; 20)  // 1M float
+
+// Scalar implementasyon
+float dot_scalar(const float *a, const float *b, int n) {
+    float sum = 0.0f;
+    for (int i = 0; i &lt; n; i++)
+        sum += a[i] * b[i];
+    return sum;
+}
+
+// NEON implementasyon
+float dot_neon(const float *a, const float *b, int n) {
+    float32x4_t acc = vdupq_n_f32(0.0f);
+
+    int i;
+    for (i = 0; i &lt;= n - 4; i += 4) {
+        float32x4_t va = vld1q_f32(a + i);
+        float32x4_t vb = vld1q_f32(b + i);
+        acc = vfmaq_f32(acc, va, vb);     // acc += va * vb
+    }
+
+    // Yatay toplama: 4 lane'i topla
+    float32x2_t sum2 = vadd_f32(vget_high_f32(acc), vget_low_f32(acc));
+    float32x2_t sum1 = vpadd_f32(sum2, sum2);
+    float result = vget_lane_f32(sum1, 0);
+
+    // Kalan elemanlar (n % 4)
+    for (; i &lt; n; i++)
+        result += a[i] * b[i];
+
+    return result;
+}
+
+static uint64_t get_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1e9 + ts.tv_nsec;
+}
+
+int main(void) {
+    float *a = aligned_alloc(64, N * sizeof(float));
+    float *b = aligned_alloc(64, N * sizeof(float));
+
+    for (int i = 0; i &lt; N; i++) { a[i] = (float)i; b[i] = 1.0f / N; }
+
+    const int ITERS = 100;
+    uint64_t t0, t1;
+
+    // Scalar
+    t0 = get_ns();
+    float r1 = 0;
+    for (int k = 0; k &lt; ITERS; k++) r1 = dot_scalar(a, b, N);
+    t1 = get_ns();
+    double scalar_ms = (t1 - t0) / 1e6 / ITERS;
+
+    // NEON
+    t0 = get_ns();
+    float r2 = 0;
+    for (int k = 0; k &lt; ITERS; k++) r2 = dot_neon(a, b, N);
+    t1 = get_ns();
+    double neon_ms = (t1 - t0) / 1e6 / ITERS;
+
+    printf("Scalar: %.3f ms  (result=%.4f)\n", scalar_ms, r1);
+    printf("NEON:   %.3f ms  (result=%.4f)\n", neon_ms,   r2);
+    printf("Speedup: %.2fx\n", scalar_ms / neon_ms);
+
+    // Throughput: float/sn
+    double neon_gflops = (double)N * 2 / (neon_ms * 1e-3) / 1e9;
+    printf("NEON GFLOP/s: %.2f\n", neon_gflops);
+
+    free(a); free(b);
+    return 0;
+}</code></pre>
+
+  <h3>Derleme ve çalıştırma</h3>
+  <pre><code class="language-bash"># AArch64 için derle
+aarch64-linux-gnu-gcc -O3 -march=armv8-a+simd \
+    -ftree-vectorize \
+    dotprod.c -o dotprod
+
+# Cross-compile sonrası QEMU veya cihazda çalıştır
+./dotprod
+
+# Örnek çıktı (Cortex-A55):
+# Scalar: 2.847 ms  (result=0.5000)
+# NEON:   0.731 ms  (result=0.5000)
+# Speedup: 3.89x
+# NEON GFLOP/s: 2.87
+
+# perf ile doğrula
+perf stat -e cycles,instructions,L1-dcache-misses ./dotprod</code></pre>
+
+  <h3>memcpy throughput karşılaştırması</h3>
+  <pre><code class="language-bash">// NEON memcpy (128-bit lane kullanımı)
+void memcpy_neon(void *dst, const void *src, size_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+
+    // 64-byte (4 × 128-bit) blok kopyalama
+    size_t blocks = n / 64;
+    for (size_t i = 0; i &lt; blocks; i++) {
+        uint8x16x4_t data = vld1q_u8_x4(s);  // 64 byte yükle
+        vst1q_u8_x4(d, data);                  // 64 byte yaz
+        s += 64; d += 64;
+    }
+
+    // Kalan byte'lar
+    size_t rem = n % 64;
+    if (rem) memcpy(d, s, rem);
+}
+
+// Karşılaştırma:
+// libc memcpy (glibc aarch64): ~8–12 GB/s (NEON + prefetch + unroll)
+// Basit NEON: ~4–6 GB/s
+// Scalar:     ~1–2 GB/s</code></pre>
+
+  <div class="callout">
+    <div class="label">ÖZET</div>
+    <p>ARMv8 NEON, 4× float'ı paralel işleyerek döngü başına 4 FMA üretir. Gerçek dünya kazanımı 2–4× arasında değişir; bellek bant genişliği, cache missi ve branch prediction çoğunlukla SIMD verimliliğini sınırlayan faktörlerdir. SVE ise donanım bağımsız vektör genişliğiyle kod yeniden derlenmeden daha geniş SIMD'den otomatik faydalanmayı sağlar.</p>
+  </div>
+</section>
+
+</main>
