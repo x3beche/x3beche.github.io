@@ -1,0 +1,881 @@
+---
+layout: tutorial
+title: "systemd — Service, Timer, Journal"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>Rehber</span>
+    <span>Linux / Sistem</span>
+    <span>systemd</span>
+  </div>
+  <h1>systemd —<br><em>service, timer, journal.</em></h1>
+  <p class="subtitle">cron'dan öteye — unit file anatomisi, timer'lar, journald, dependency graph ve sandboxing.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Giriş: sysvinit'ten systemd'ye</a></li>
+    <li><a href="#s1">Unit türleri</a></li>
+    <li><a href="#s2">[Service] anatomisi</a></li>
+    <li><a href="#s3">systemctl komutları</a></li>
+    <li><a href="#s4">journald ve log yönetimi</a></li>
+    <li><a href="#s5">Timer unit'leri</a></li>
+    <li><a href="#s6">User units</a></li>
+    <li><a href="#s7">Dependency management</a></li>
+    <li><a href="#s8">Sandboxing ve güvenlik</a></li>
+    <li><a href="#s9">Debugging ve sorun giderme</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Giriş: sysvinit'ten systemd'ye</h2>
+  <p class="section-lead">PID 1 olarak systemd, boot sürecini orkestra eder — sysvinit'in sıralı çalışma modelinin yerini parallel socket activation aldı.</p>
+
+  <p>Kernel, userspace'i başlatmak için ilk process olarak PID 1'i çalıştırır. Tarihsel olarak bu <strong>sysvinit</strong>'ti: <span class="path">/etc/init.d/</span> altındaki shell script'leri, S10-S99 gibi sayısal sıraya göre teker teker çalıştırıyordu. Her servis bir öncekinin bitmesini bekliyordu — sequential bir pipeline. 20 servis varsa, her biri 1 saniye sürse bile boot 20 saniyeydi.</p>
+
+  <p>systemd'nin çözümü <strong>socket activation</strong>'dır: servis başlamadan önce socket'i kernel açar. Bir servis başka bir servisi bekliyorsa, isteği socket'e gönderir; kernel tampon tutar; servis hazır olunca yanıt verir. Bu sayede bağımlı servisler bile parallel başlayabilir.</p>
+
+  <div class="flow">
+    <pre>
+  sysvinit: S10_udev → S20_network → S30_dbus → S40_ssh  (sıralı, yavaş)
+
+  systemd:  udev ─┬─ network ─┬─ dbus ─┬─ ssh     (parallel, hızlı)
+                  └─ syslog   └─ ntp   └─ crond
+    </pre>
+  </div>
+
+  <h3>systemd-analyze blame</h3>
+
+  <p>Hangi servisin boot'u yavaşlattığını görmek için:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">systemd-analyze</span> blame
+<span class="cmt"># Örnek çıktı:</span>
+<span class="cmt">#   7.423s NetworkManager-wait-online.service</span>
+<span class="cmt">#   2.101s dev-sda1.device</span>
+<span class="cmt">#   1.832s initrd-switch-root.service</span>
+<span class="cmt">#     823ms systemd-journal-flush.service</span>
+<span class="cmt">#     612ms accounts-daemon.service</span>
+<span class="cmt">#     289ms ModemManager.service</span>
+
+<span class="cmd">systemd-analyze</span> time
+<span class="cmt"># Startup finished in 1.823s (kernel) + 4.201s (initrd) + 8.112s (userspace)</span>
+<span class="cmt"># = 14.136s</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>systemd tüm büyük dağıtımlarda varsayılan init sistemidir: Ubuntu 16.04+, Debian 8+, CentOS/RHEL 7+, Fedora 15+, Arch Linux. Embedded sistemlerde Buildroot ve Yocto ile de kullanılabilir; ancak çok kısıtlı hedeflerde busybox init veya s6 tercih edilebilir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Unit türleri</h2>
+  <p class="section-lead">systemd'de her yönetilen nesne bir "unit" — dosya uzantısı türü belirler.</p>
+
+  <table class="file-table">
+    <thead>
+      <tr>
+        <th>Uzantı</th>
+        <th>Ne yönetir</th>
+        <th>Örnek</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td><code class="inline">.service</code></td><td>Daemon veya tek seferlik process</td><td>nginx.service, sshd.service</td></tr>
+      <tr><td><code class="inline">.timer</code></td><td>Zamana bağlı tetikleyici (cron yerine)</td><td>backup.timer, logrotate.timer</td></tr>
+      <tr><td><code class="inline">.socket</code></td><td>IPC/network socket — on-demand activation</td><td>sshd.socket, cups.socket</td></tr>
+      <tr><td><code class="inline">.target</code></td class="inline"><td>Senkronizasyon noktası / grup</td><td>multi-user.target, network.target</td></tr>
+      <tr><td><code class="inline">.mount</code></td><td>Filesystem mount noktası</td><td>home.mount, mnt-data.mount</td></tr>
+      <tr><td><code class="inline">.path</code></td><td>Dosya sistemi değişikliği izleme</td><td>cups.path</td></tr>
+      <tr><td><code class="inline">.device</code></td><td>udev tarafından expose edilen cihaz</td><td>sys-bus-usb.device</td></tr>
+      <tr><td><code class="inline">.scope</code></td><td>Dışarıdan başlatılan process grubu</td><td>session-1.scope</td></tr>
+      <tr><td><code class="inline">.slice</code></td><td>cgroup kaynak yönetim hiyerarşisi</td><td>user.slice, system.slice</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Unit listesi görüntüleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># çalışan tüm service unit'leri</span>
+<span class="cmd">systemctl</span> list-units <span class="flag">--type=service</span>
+
+<span class="cmt"># aktif timer'lar</span>
+<span class="cmd">systemctl</span> list-units <span class="flag">--type=timer</span>
+
+<span class="cmt"># FAILED durumundaki tüm unit'ler</span>
+<span class="cmd">systemctl</span> <span class="flag">--failed</span>
+
+<span class="cmt"># yüklü ama çalışmayan dahil — tüm bilinenleri listele</span>
+<span class="cmd">systemctl</span> list-unit-files <span class="flag">--type=service</span></code></pre>
+  </div>
+
+  <h3>Unit dosya konumları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name"><span class="path">/etc/systemd/system/</span></span><span class="desc">Sistem yöneticisi (admin) tarafından yazılan unit'ler. En yüksek öncelik — distro unit'lerini override eder.</span></div>
+    <div class="param"><span class="name"><span class="path">/usr/lib/systemd/system/</span></span><span class="desc">Paket yöneticisi (apt, dnf, pacman) tarafından kurulan unit'ler. Güncellemede üzerine yazılır — doğrudan düzenleme önerilmez.</span></div>
+    <div class="param"><span class="name"><span class="path">/run/systemd/system/</span></span><span class="desc">Runtime'da oluşturulan geçici unit'ler. Reboot sonrası kaybolur.</span></div>
+    <div class="param"><span class="name"><span class="path">~/.config/systemd/user/</span></span><span class="desc">Kullanıcı unit'leri — root yetkisi gerektirmez, <code class="inline">systemctl --user</code> ile yönetilir.</span></div>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Öncelik sırası: <span class="path">/etc/systemd/system/</span> &gt; <span class="path">/run/systemd/system/</span> &gt; <span class="path">/usr/lib/systemd/system/</span>. Aynı isimli unit birden fazla yerde varsa en yüksek öncelikteki kazanır.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> [Service] anatomisi</h2>
+  <p class="section-lead">Service unit dosyası üç bölümden oluşur: [Unit], [Service], [Install].</p>
+
+  <h3>Minimal bir servis: hello.service</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/systemd/system/hello.service</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># [Unit] — metadata ve bağımlılıklar</span>
+[<span class="keyword">Unit</span>]
+<span class="field">Description</span>=Hello World servisi
+<span class="field">After</span>=network.target
+
+<span class="cmt"># [Service] — çalışma parametreleri</span>
+[<span class="keyword">Service</span>]
+<span class="field">Type</span>=simple
+<span class="field">User</span>=nobody
+<span class="field">Group</span>=nogroup
+<span class="field">WorkingDirectory</span>=<span class="path">/opt/hello</span>
+<span class="field">ExecStart</span>=<span class="path">/opt/hello/hello</span> <span class="flag">--port 8080</span>
+<span class="field">Restart</span>=on-failure
+<span class="field">RestartSec</span>=5s
+<span class="field">StandardOutput</span>=journal
+<span class="field">StandardError</span>=journal
+
+<span class="cmt"># [Install] — enable/disable için hangi target'a bağlanacak</span>
+[<span class="keyword">Install</span>]
+<span class="field">WantedBy</span>=multi-user.target</code></pre>
+  </div>
+
+  <h3>[Service] parametreleri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">ExecStart=</span><span class="desc">Çalıştırılacak komut. Tam path zorunlu. Argümanlar aynı satıra yazılabilir. Birden fazla ExecStart= birden fazla komut zinciri oluşturmaz — sadece son satır geçerlidir (override için ExecStart= boş bırakıp yeniden yaz).</span></div>
+    <div class="param"><span class="name">ExecStartPre=</span><span class="desc">ExecStart öncesi çalışan komut(lar). Birden fazla yazılabilir. Başa <code class="inline">-</code> koyarsan başarısız olsa da devam eder: <code class="inline">ExecStartPre=-/bin/mkdir -p /var/run/myapp</code></span></div>
+    <div class="param"><span class="name">ExecStartPost=</span><span class="desc">Servis başladıktan sonra çalışır. Sağlık kontrolü veya bildirim için kullanışlı.</span></div>
+    <div class="param"><span class="name">ExecStop=</span><span class="desc">Servis durdurulurken çalışacak komut. Belirtilmezse systemd SIGTERM gönderir.</span></div>
+    <div class="param"><span class="name">ExecReload=</span><span class="desc">systemctl reload çağrısında çalışır. Genellikle SIGHUP: <code class="inline">ExecReload=/bin/kill -HUP $MAINPID</code></span></div>
+    <div class="param"><span class="name">Type=</span><span class="desc"><strong>simple</strong> (default): ExecStart fork etmez, PID=1 process'tir. <strong>forking</strong>: daemon double-fork yapar, PIDFile= ile ana PID bildirilir. <strong>notify</strong>: daemon sd_notify() ile hazır olduğunu söyler. <strong>oneshot</strong>: komut çalışıp çıkar (ExecStart biter = servis tamamlandı). <strong>idle</strong>: tüm işler bittikten sonra çalışır (boot mesajlarını karıştırmamak için).</span></div>
+    <div class="param"><span class="name">Restart=</span><span class="desc"><strong>no</strong>: restart yok (default). <strong>always</strong>: her çıkışta yeniden başlat. <strong>on-failure</strong>: sıfır dışı exit code veya signal'da yeniden başlat. <strong>on-abnormal</strong>: signal veya timeout'da yeniden başlat. <strong>unless-stopped</strong>: elle durdurulmadıkça her zaman yeniden başlat.</span></div>
+    <div class="param"><span class="name">RestartSec=</span><span class="desc">Restart denemesi öncesi bekleme süresi. Saniye veya "5s", "500ms" formatı.</span></div>
+    <div class="param"><span class="name">User= / Group=</span><span class="desc">Servisi çalıştıracak kullanıcı ve grup. Root yerine düşük yetkili bir kullanıcı belirt — en iyi pratik.</span></div>
+    <div class="param"><span class="name">WorkingDirectory=</span><span class="desc">Çalışma dizini. ~ kullanılabilir. Belirtilmezse / olur.</span></div>
+    <div class="param"><span class="name">Environment=</span><span class="desc">Ortam değişkeni tanımla: <code class="inline">Environment="PORT=8080" "DEBUG=false"</code></span></div>
+    <div class="param"><span class="name">EnvironmentFile=</span><span class="desc">Dosyadan ortam değişkeni yükle: <code class="inline">EnvironmentFile=/etc/default/myapp</code>. Dosya <code class="inline">KEY=VALUE</code> formatında olmalı.</span></div>
+    <div class="param"><span class="name">StandardOutput= / StandardError=</span><span class="desc"><strong>journal</strong> (default): journald'a gönder. <strong>syslog</strong>: syslog'a gönder. <strong>console</strong>: /dev/console'a yaz. <strong>null</strong>: sil. <strong>append:/path</strong>: dosyaya ekle.</span></div>
+  </div>
+
+  <h3>Type=notify örneği</h3>
+
+  <p><code class="inline">Type=notify</code> ile daemon, başlamaya hazır olduğunda systemd'ye bildirim gönderir. systemd bu bildirimi alana kadar servisi "starting" durumunda tutar — bağımlı servisler bekler.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>notify-daemon.c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* gcc -o notify-daemon notify-daemon.c -lsystemd */</span>
+<span class="keyword">#include</span> <span class="str">&lt;systemd/sd-daemon.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdio.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;unistd.h&gt;</span>
+
+<span class="keyword">int</span> <span class="cmd">main</span>(<span class="keyword">void</span>) {
+    <span class="cmt">/* başlatma işlemleri — socket aç, DB bağlan, vs. */</span>
+    <span class="cmd">sleep</span>(<span class="num">2</span>);
+
+    <span class="cmt">/* systemd'ye "hazırım" bildir */</span>
+    <span class="cmd">sd_notify</span>(<span class="num">0</span>, <span class="str">"READY=1\nSTATUS=Listening on port 8080\n"</span>);
+
+    <span class="cmt">/* ana döngü */</span>
+    <span class="keyword">while</span> (<span class="num">1</span>) {
+        <span class="cmd">sd_notify</span>(<span class="num">0</span>, <span class="str">"WATCHDOG=1"</span>); <span class="cmt">/* watchdog ping */</span>
+        <span class="cmd">sleep</span>(<span class="num">30</span>);
+    }
+    <span class="keyword">return</span> <span class="num">0</span>;
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/systemd/system/notify-daemon.service</span><span class="dot">●</span></div>
+    <pre><code>[<span class="keyword">Unit</span>]
+<span class="field">Description</span>=sd_notify örnek daemon
+
+[<span class="keyword">Service</span>]
+<span class="field">Type</span>=notify
+<span class="field">ExecStart</span>=<span class="path">/usr/local/bin/notify-daemon</span>
+<span class="field">WatchdogSec</span>=60s
+<span class="field">Restart</span>=on-failure
+
+[<span class="keyword">Install</span>]
+<span class="field">WantedBy</span>=multi-user.target</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde öğrendikleriniz</h4>
+    <ul>
+      <li>Unit dosyası [Unit], [Service], [Install] üç bölümünden oluşur</li>
+      <li>Type= değeri systemd'nin PID ve hazır olma durumunu nasıl takip ettiğini belirler</li>
+      <li>Restart= ve RestartSec= ile servis otomatik yeniden başlatılabilir</li>
+      <li>sd_notify() ile daemon, başlangıç tamamlandığında systemd'yi bilgilendirir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> systemctl komutları</h2>
+  <p class="section-lead">systemctl, systemd'yi yöneten CLI aracıdır — servis başlatmaktan override dosyası yazmaya kadar her şey buradan.</p>
+
+  <h3>Temel lifecycle komutları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># servisi başlat / durdur / yeniden başlat</span>
+<span class="cmd">systemctl</span> start   nginx.service
+<span class="cmd">systemctl</span> stop    nginx.service
+<span class="cmd">systemctl</span> restart nginx.service
+
+<span class="cmt"># reload: process'i öldürmeden konfigürasyonu yeniden yükle (ExecReload= çalışır)</span>
+<span class="cmd">systemctl</span> reload  nginx.service
+
+<span class="cmt"># restart gerekirse reload dene, olmazsa restart yap</span>
+<span class="cmd">systemctl</span> reload-or-restart nginx.service
+
+<span class="cmt"># durum — Active, Loaded, Main PID, CGroup, son log satırları</span>
+<span class="cmd">systemctl</span> status  nginx.service
+
+<span class="cmt"># boot'ta otomatik başlat / devre dışı bırak</span>
+<span class="cmd">systemctl</span> enable  nginx.service
+<span class="cmd">systemctl</span> disable nginx.service
+
+<span class="cmt"># enable + hemen başlat</span>
+<span class="cmd">systemctl</span> enable <span class="flag">--now</span> nginx.service
+
+<span class="cmt"># mask: enable/start çağrılarını engelle (kalıcı devre dışı)</span>
+<span class="cmd">systemctl</span> mask   nginx.service
+<span class="cmd">systemctl</span> unmask nginx.service
+
+<span class="cmt"># çalışıyor mu? (exit 0 = evet, 3 = hayır — script'lerde kullan)</span>
+<span class="cmd">systemctl</span> is-active  nginx.service
+<span class="cmd">systemctl</span> is-enabled nginx.service
+<span class="cmd">systemctl</span> is-failed  nginx.service</code></pre>
+  </div>
+
+  <h3>daemon-reload ne zaman gerekli?</h3>
+
+  <p>Unit dosyasını disk üzerinde değiştirdiğinde, systemd'nin bellekteki tanımı hâlâ eskidir. <code class="inline">daemon-reload</code> tüm unit dosyalarını yeniden okur:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># /etc/systemd/system/myapp.service dosyasını düzenledikten sonra</span>
+<span class="cmd">systemctl</span> daemon-reload
+<span class="cmd">systemctl</span> restart myapp.service</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p><code class="inline">daemon-reload</code> çalışan servisleri durdurmaz. Ama reload yapmadan restart ederseniz eski konfigürasyon çalışmaya devam eder. Unit dosyası her değiştikten sonra daemon-reload zorunlu.</p>
+  </div>
+
+  <h3>systemctl edit — override.conf</h3>
+
+  <p>Paket yöneticisinin unit dosyasını doğrudan düzenlemek yerine, <strong>drop-in override</strong> kullan — orijinal korunur, güncellemede kaybolmaz:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># editörü açar → /etc/systemd/system/nginx.service.d/override.conf oluşturur</span>
+<span class="cmd">systemctl</span> edit nginx.service
+
+<span class="cmt"># yoksa oluştur (--force), tam dosya düzenle (--full)</span>
+<span class="cmd">systemctl</span> edit <span class="flag">--force</span> <span class="flag">--full</span> myapp.service
+
+<span class="cmt"># override.conf örneği — sadece değiştirmek istediğin parametreler</span></code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/systemd/system/nginx.service.d/override.conf</span><span class="dot">●</span></div>
+    <pre><code>[<span class="keyword">Service</span>]
+<span class="cmt"># Restart politikasını değiştir — orijinal paket dosyasına dokunma</span>
+<span class="field">Restart</span>=always
+<span class="field">RestartSec</span>=3s
+<span class="field">LimitNOFILE</span>=65536</code></pre>
+  </div>
+
+  <h3>Tam lifecycle örneği</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1. unit dosyasını yaz</span>
+<span class="cmd">vim</span> <span class="path">/etc/systemd/system/myapp.service</span>
+
+<span class="cmt"># 2. systemd'ye bildir</span>
+<span class="cmd">systemctl</span> daemon-reload
+
+<span class="cmt"># 3. başlat ve durumu kontrol et</span>
+<span class="cmd">systemctl</span> start myapp.service
+<span class="cmd">systemctl</span> status myapp.service
+
+<span class="cmt"># 4. boot'ta otomatik başlat</span>
+<span class="cmd">systemctl</span> enable myapp.service
+
+<span class="cmt"># 5. konfigürasyon değiştikten sonra</span>
+<span class="cmd">systemctl</span> daemon-reload
+<span class="cmd">systemctl</span> reload-or-restart myapp.service
+
+<span class="cmt"># 6. servis yanıt vermiyorsa zorla durdur</span>
+<span class="cmd">systemctl</span> kill <span class="flag">-s SIGKILL</span> myapp.service
+
+<span class="cmt"># 7. kalıcı olarak devre dışı bırak</span>
+<span class="cmd">systemctl</span> disable <span class="flag">--now</span> myapp.service</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> journald ve log yönetimi</h2>
+  <p class="section-lead">journald, binary ve indexed yapıda log depolar — metadata ile sorgulama, syslog'un yapamadığı şeydir.</p>
+
+  <h3>journald'ın syslog'a göre avantajları</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Özellik</th><th>syslog</th><th>journald</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Format</td><td>Düz metin</td><td>Binary + structured</td></tr>
+      <tr><td>Metadata</td><td>Yok / sınırlı</td><td>PID, UID, GID, cgroup, unit adı, boot ID</td></tr>
+      <tr><td>Indexleme</td><td>Yok</td><td>Var — hızlı cursor tabanlı sorgulama</td></tr>
+      <tr><td>Tamper evidence</td><td>Yok</td><td>Forward-secure sealing (opsiyonel)</td></tr>
+      <tr><td>Filtreleme</td><td>grep</td><td>journalctl field= sorguları</td></tr>
+      <tr><td>Rate limiting</td><td>Yok</td><td>RateLimitBurst=, RateLimitInterval=</td></tr>
+    </tbody>
+  </table>
+
+  <h3>journalctl temel kullanım</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># servis loglarını takip et (tail -f gibi)</span>
+<span class="cmd">journalctl</span> <span class="flag">-u</span> myapp.service <span class="flag">-f</span>
+
+<span class="cmt"># son 50 satır</span>
+<span class="cmd">journalctl</span> <span class="flag">-u</span> myapp.service <span class="flag">-n 50</span>
+
+<span class="cmt"># son 1 saat içindeki loglar</span>
+<span class="cmd">journalctl</span> <span class="flag">-u</span> myapp.service <span class="flag">--since</span> <span class="str">"1 hour ago"</span>
+
+<span class="cmt"># zaman aralığı</span>
+<span class="cmd">journalctl</span> <span class="flag">-u</span> nginx.service <span class="flag">--since</span> <span class="str">"2026-04-12 00:00"</span> <span class="flag">--until</span> <span class="str">"2026-04-12 06:00"</span>
+
+<span class="cmt"># sadece err ve üstü (emerg, alert, crit, err)</span>
+<span class="cmd">journalctl</span> <span class="flag">-u</span> myapp.service <span class="flag">-p err</span>
+
+<span class="cmt"># kernel mesajları (dmesg gibi)</span>
+<span class="cmd">journalctl</span> <span class="flag">-k</span>
+
+<span class="cmt"># context ile birlikte — hata öncesi/sonrası satırlar</span>
+<span class="cmd">journalctl</span> <span class="flag">-xe</span>
+
+<span class="cmt"># JSON formatında çıktı (log analizi pipeline için)</span>
+<span class="cmd">journalctl</span> <span class="flag">-u</span> myapp.service <span class="flag">-o json</span> <span class="keyword">|</span> <span class="cmd">jq</span> <span class="str">'.'</span>
+
+<span class="cmt"># belirli bir boot'un logları</span>
+<span class="cmd">journalctl</span> <span class="flag">-b</span> -1 <span class="cmt"># bir önceki boot</span>
+<span class="cmd">journalctl</span> <span class="flag">-b</span> <span class="cmt"># bu boot</span></code></pre>
+  </div>
+
+  <h3>Log öncelikleri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">0 — emerg</span><span class="desc">Sistem kullanılamaz durumda.</span></div>
+    <div class="param"><span class="name">1 — alert</span><span class="desc">Hemen aksiyon alınması gerekiyor.</span></div>
+    <div class="param"><span class="name">2 — crit</span><span class="desc">Kritik hatalar.</span></div>
+    <div class="param"><span class="name">3 — err</span><span class="desc">Hatalar. <code class="inline">-p err</code> bu ve üstünü gösterir.</span></div>
+    <div class="param"><span class="name">4 — warning</span><span class="desc">Uyarılar.</span></div>
+    <div class="param"><span class="name">5 — notice</span><span class="desc">Normal ama önemli olaylar.</span></div>
+    <div class="param"><span class="name">6 — info</span><span class="desc">Bilgi mesajları.</span></div>
+    <div class="param"><span class="name">7 — debug</span><span class="desc">Debug mesajları.</span></div>
+  </div>
+
+  <h3>Kalıcı log: journald.conf</h3>
+
+  <p>Varsayılan olarak journald logları RAM'de (<span class="path">/run/log/journal/</span>) tutar — reboot'ta kaybolur. Kalıcı yapmak için:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/systemd/journald.conf</span><span class="dot">●</span></div>
+    <pre><code>[<span class="keyword">Journal</span>]
+<span class="field">Storage</span>=persistent          <span class="cmt"># /var/log/journal/ dizinine yaz</span>
+<span class="field">Compress</span>=yes               <span class="cmt"># LZ4 sıkıştırma</span>
+<span class="field">SystemMaxUse</span>=2G            <span class="cmt"># /var/log/journal/ maksimum boyut</span>
+<span class="field">SystemKeepFree</span>=512M        <span class="cmt"># diskte bırakılacak minimum boş alan</span>
+<span class="field">MaxRetentionSec</span>=1month     <span class="cmt"># 1 aydan eski logları sil</span>
+<span class="field">RateLimitBurst</span>=1000        <span class="cmt"># aralık başına maksimum mesaj</span>
+<span class="field">RateLimitInterval</span>=30s</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># journald.conf değişikliği sonrası yeniden başlat</span>
+<span class="cmd">systemctl</span> restart systemd-journald
+
+<span class="cmt"># log kullanım alanı</span>
+<span class="cmd">journalctl</span> <span class="flag">--disk-usage</span>
+
+<span class="cmt"># 1 GB üstünü temizle</span>
+<span class="cmd">journalctl</span> <span class="flag">--vacuum-size=1G</span>
+
+<span class="cmt"># 2 haftadan eski logları temizle</span>
+<span class="cmd">journalctl</span> <span class="flag">--vacuum-time=2weeks</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Timer unit'leri</h2>
+  <p class="section-lead">systemd timer, cron'un yapamadığı şeyleri yapar: kaçırılan görevleri yakalar, log tutar, bağımlılık yönetir.</p>
+
+  <h3>cron vs systemd timer</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Özellik</th><th>cron</th><th>systemd timer</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Log</td><td>stdout/stderr belirli değil</td><td>journald'a otomatik</td></tr>
+      <tr><td>Kaçırılan görev</td><td>Çalışmaz</td><td>Persistent=true ile boot'ta çalışır</td></tr>
+      <tr><td>Bağımlılık</td><td>Yok</td><td>Wants=, After= kullanılabilir</td></tr>
+      <tr><td>Kaynak limiti</td><td>Yok</td><td>CPUQuota=, MemoryLimit= gibi cgroup</td></tr>
+      <tr><td>Randomize delay</td><td>Yok</td><td>RandomizedDelaySec=</td></tr>
+      <tr><td>Durum takibi</td><td>Yok</td><td>systemctl status backup.timer</td></tr>
+    </tbody>
+  </table>
+
+  <h3>backup.timer + backup.service ikilisi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/systemd/system/backup.service</span><span class="dot">●</span></div>
+    <pre><code>[<span class="keyword">Unit</span>]
+<span class="field">Description</span>=Günlük yedekleme
+<span class="field">After</span>=network.target
+
+[<span class="keyword">Service</span>]
+<span class="field">Type</span>=oneshot
+<span class="field">User</span>=backup
+<span class="field">ExecStart</span>=<span class="path">/usr/local/bin/backup.sh</span>
+<span class="field">StandardOutput</span>=journal
+<span class="field">StandardError</span>=journal</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/systemd/system/backup.timer</span><span class="dot">●</span></div>
+    <pre><code>[<span class="keyword">Unit</span>]
+<span class="field">Description</span>=Günlük yedekleme timer'ı
+
+[<span class="keyword">Timer</span>]
+<span class="field">OnCalendar</span>=*-*-* 03:00:00   <span class="cmt"># her gün 03:00</span>
+<span class="field">RandomizedDelaySec</span>=300      <span class="cmt"># 0-5 dakika rastgele gecikme (çakışma önleme)</span>
+<span class="field">Persistent</span>=true             <span class="cmt"># kaçırılan çalışma boot'ta tetiklenir</span>
+<span class="field">Unit</span>=backup.service
+
+[<span class="keyword">Install</span>]
+<span class="field">WantedBy</span>=timers.target</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># timer'ı etkinleştir ve başlat</span>
+<span class="cmd">systemctl</span> enable <span class="flag">--now</span> backup.timer
+
+<span class="cmt"># bir sonraki tetikleme zamanını gör</span>
+<span class="cmd">systemctl</span> list-timers backup.timer
+
+<span class="cmt"># tüm aktif timer'lar</span>
+<span class="cmd">systemctl</span> list-timers <span class="flag">--all</span></code></pre>
+  </div>
+
+  <h3>OnCalendar sözdizimi</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">daily</span><span class="desc">Her gün 00:00:00. <code class="inline">*-*-* 00:00:00</code> ile aynı.</span></div>
+    <div class="param"><span class="name">weekly</span><span class="desc">Her pazartesi 00:00:00.</span></div>
+    <div class="param"><span class="name">monthly</span><span class="desc">Her ayın 1'i 00:00:00.</span></div>
+    <div class="param"><span class="name">Mon 03:00</span><span class="desc">Her pazartesi saat 03:00.</span></div>
+    <div class="param"><span class="name">Mon..Fri 09:00</span><span class="desc">Pazartesi'den cuma'ya 09:00.</span></div>
+    <div class="param"><span class="name">*-*-1 04:00:00</span><span class="desc">Her ayın 1'i saat 04:00.</span></div>
+    <div class="param"><span class="name">*-*-* 00/6:00:00</span><span class="desc">Her 6 saatte bir (00:00, 06:00, 12:00, 18:00).</span></div>
+    <div class="param"><span class="name">*:0/15</span><span class="desc">Her 15 dakikada bir.</span></div>
+  </div>
+
+  <h3>Monotonic timer'lar</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">OnBootSec=5min</span><span class="desc">Boot'tan 5 dakika sonra bir kez çalıştır.</span></div>
+    <div class="param"><span class="name">OnUnitActiveSec=1h</span><span class="desc">Servis son aktif olduğundan 1 saat sonra yeniden çalıştır.</span></div>
+    <div class="param"><span class="name">OnStartupSec=10s</span><span class="desc">systemd başladıktan 10 saniye sonra.</span></div>
+    <div class="param"><span class="name">OnActiveSec=30min</span><span class="desc">Timer aktif olduğundan 30 dakika sonra.</span></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — list-timers çıktısı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># systemctl list-timers çıktısı örneği:</span>
+<span class="cmt"># NEXT                         LEFT          LAST                         PASSED       UNIT</span>
+<span class="cmt"># Sun 2026-04-13 03:04:22 UTC  23h left      Sat 2026-04-12 03:01:15 UTC  58min ago    backup.timer</span>
+<span class="cmt"># Sun 2026-04-13 00:00:00 UTC  20h left      Sat 2026-04-12 00:00:00 UTC  4h ago       logrotate.timer</span>
+<span class="cmt"># Sun 2026-04-13 00:00:00 UTC  20h left      Sat 2026-04-12 00:00:00 UTC  4h ago       man-db.timer</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p><code class="inline">Persistent=true</code> çok kritik: sistem kapalıyken geçen bir çalışma zamanı varsa, boot'tan sonra hemen tetiklenir. Yedekleme ve güncelleme görevlerinde her zaman açık olmalı.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> User units</h2>
+  <p class="section-lead">Root yetkisi gerektirmeyen servisler kullanıcı kapsamında çalıştırılabilir — geliştirici araçları, agent'lar, kişisel daemon'lar için idealdir.</p>
+
+  <h3>User unit dosyası</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>~/.config/systemd/user/myapp.service</span><span class="dot">●</span></div>
+    <pre><code>[<span class="keyword">Unit</span>]
+<span class="field">Description</span>=Kişisel uygulama
+
+[<span class="keyword">Service</span>]
+<span class="field">Type</span>=simple
+<span class="field">ExecStart</span>=<span class="path">%h/bin/myapp</span>   <span class="cmt"># %h = $HOME</span>
+<span class="field">Restart</span>=on-failure
+<span class="field">Environment</span>=<span class="str">"PORT=9090"</span>
+
+[<span class="keyword">Install</span>]
+<span class="field">WantedBy</span>=default.target</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># kullanıcı systemd instance'ı için daemon-reload</span>
+<span class="cmd">systemctl</span> <span class="flag">--user</span> daemon-reload
+
+<span class="cmt"># başlat / durdur / durum</span>
+<span class="cmd">systemctl</span> <span class="flag">--user</span> start   myapp.service
+<span class="cmd">systemctl</span> <span class="flag">--user</span> stop    myapp.service
+<span class="cmd">systemctl</span> <span class="flag">--user</span> status  myapp.service
+
+<span class="cmt"># boot'ta başlat</span>
+<span class="cmd">systemctl</span> <span class="flag">--user</span> enable myapp.service
+
+<span class="cmt"># kullanıcı logları</span>
+<span class="cmd">journalctl</span> <span class="flag">--user</span> <span class="flag">-u</span> myapp.service <span class="flag">-f</span></code></pre>
+  </div>
+
+  <h3>loginctl enable-linger</h3>
+
+  <p>Varsayılan olarak kullanıcı systemd instance'ı, kullanıcı login olduğunda başlar ve logout'ta durur. <code class="inline">enable-linger</code> ile kullanıcı login olmadan da servis çalışmaya devam eder:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># emirhan kullanıcısı için linger etkinleştir (root gerektirir)</span>
+<span class="cmd">loginctl</span> enable-linger emirhan
+
+<span class="cmt"># linger durumunu kontrol et</span>
+<span class="cmd">loginctl</span> show-user emirhan <span class="keyword">|</span> <span class="cmd">grep</span> Linger
+
+<span class="cmt"># devre dışı bırak</span>
+<span class="cmd">loginctl</span> disable-linger emirhan</code></pre>
+  </div>
+
+  <h3>Önemli ortam değişkenleri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">XDG_RUNTIME_DIR</span><span class="desc">Kullanıcıya özel geçici dizin: <span class="path">/run/user/1000/</span>. systemd user socket'leri buradadır. Logout'ta temizlenir.</span></div>
+    <div class="param"><span class="name">DBUS_SESSION_BUS_ADDRESS</span><span class="desc">Kullanıcı session bus adresi. <code class="inline">unix:path=/run/user/1000/bus</code> formatında. D-Bus kullanan uygulamalar için gerekli.</span></div>
+    <div class="param"><span class="name">SYSTEMD_LOG_LEVEL</span><span class="desc">systemd log seviyesi: debug, info, notice, warning, err. Sorun giderme için debug kullan.</span></div>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>User unit'leri sistem unit'lerinden önce çalışır demek değildir. network.target gibi sistem target'larına After= ile bağımlılık tanımlamak user scope'ta çalışmaz. User unit'lerin network bağımlılığı için <code class="inline">After=network-online.target</code> yerine bağlantıyı servisin kendi içinde yönet.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Dependency management</h2>
+  <p class="section-lead">Wants vs Requires, After vs Before — yanlış anlaşıldığında servisler yanlış sırada veya hiç başlamaz.</p>
+
+  <h3>Wants vs Requires</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Wants=B</span><span class="desc">A, B'nin başlamasını ister. B başlamazsa veya başarısız olursa A <strong>yine de çalışır</strong>. Yumuşak bağımlılık.</span></div>
+    <div class="param"><span class="name">Requires=B</span><span class="desc">A, B olmadan çalışamaz. B başlamazsa veya durumda başarısız olursa A da <strong>durdurulur</strong>. Güçlü bağımlılık.</span></div>
+    <div class="param"><span class="name">BindsTo=B</span><span class="desc">Requires'dan daha güçlü: B herhangi bir nedenle dursa, A da durur (çalışırken bile).</span></div>
+    <div class="param"><span class="name">PartOf=B</span><span class="desc">A, B'nin parçasıdır. B restart/stop edilince A da restart/stop edilir. Ama A bağımsız başlayabilir.</span></div>
+    <div class="param"><span class="name">Conflicts=B</span><span class="desc">A çalışırken B çalışamaz (karşılıklı dışlama). <code class="inline">shutdown.target</code> servislerle çakışır.</span></div>
+  </div>
+
+  <h3>After ve Before — sıralama</h3>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT — yaygın yanlış anlama</div>
+    <p><code class="inline">After=</code> ve <code class="inline">Before=</code> sadece <strong>başlama sırası</strong> belirler, bağımlılık oluşturmaz. <code class="inline">After=network.target</code> yazmak, network.target'ın başlatılacağını garanti etmez — sadece "eğer ikisi de başlatılacaksa, network önce başlasın" demektir. Bağımlılık için <code class="inline">Wants=</code> veya <code class="inline">Requires=</code> ile birlikte kullan.</p>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/systemd/system/myapp.service</span><span class="dot">●</span></div>
+    <pre><code>[<span class="keyword">Unit</span>]
+<span class="field">Description</span>=Uygulama servisi
+<span class="cmt"># postgresql başlamadan çalışma, postgresql dursa dur</span>
+<span class="field">Requires</span>=postgresql.service
+<span class="field">After</span>=postgresql.service
+
+<span class="cmt"># redis opsiyonel — yoksa da çalış ama varsa sonra başla</span>
+<span class="field">Wants</span>=redis.service
+<span class="field">After</span>=redis.service
+
+[<span class="keyword">Service</span>]
+<span class="field">Type</span>=notify
+<span class="field">ExecStart</span>=<span class="path">/opt/myapp/bin/server</span>
+
+[<span class="keyword">Install</span>]
+<span class="field">WantedBy</span>=multi-user.target</code></pre>
+  </div>
+
+  <h3>Target zinciri</h3>
+
+  <div class="flow">
+    <pre>
+  sysinit.target          <span class="cmt">── temel sistem bileşenleri: udev, journal, cryptsetup</span>
+       │
+  basic.target            <span class="cmt">── sockets, timers, paths hazır</span>
+       │
+  multi-user.target       <span class="cmt">── ağ, servisler — text mode login ekranı</span>
+       │
+  graphical.target        <span class="cmt">── X11/Wayland display manager</span>
+    </pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># servisin bağımlılık ağacını göster</span>
+<span class="cmd">systemctl</span> list-dependencies myapp.service
+
+<span class="cmt"># tersine: hangi unit'ler myapp'e bağımlı?</span>
+<span class="cmd">systemctl</span> list-dependencies <span class="flag">--reverse</span> myapp.service
+
+<span class="cmt"># tüm bağımlılıkları (özyinelemeli) göster</span>
+<span class="cmd">systemctl</span> list-dependencies <span class="flag">--all</span> myapp.service
+
+<span class="cmt"># hangi target'ta çalışıyor?</span>
+<span class="cmd">systemctl</span> get-default</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Sandboxing ve güvenlik</h2>
+  <p class="section-lead">systemd, unit dosyasına eklenen direktiflerle servisler için Linux security primitive'leri (namespace, capability, seccomp) etkinleştirir.</p>
+
+  <h3>Temel sandboxing direktifleri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">ProtectSystem=strict</span><span class="desc"><span class="path">/usr</span>, <span class="path">/boot</span>, <span class="path">/etc</span> read-only mount eder. Servis bu dizinlere yazamaz. <code class="inline">strict</code> en kapsamlı seçenek; <code class="inline">full</code> /usr ve /boot'u read-only yapar; <code class="inline">true</code> sadece /usr'u.</span></div>
+    <div class="param"><span class="name">ProtectHome=true</span><span class="desc">/home, /root, /run/user inaccessible. Servisin kullanıcı home dizinlerine erişimini engeller.</span></div>
+    <div class="param"><span class="name">PrivateTmp=true</span><span class="desc">Servise özel /tmp ve /var/tmp namespace'i oluşturur. Diğer servisler bu /tmp'yi göremez. Tmp race condition saldırılarını önler.</span></div>
+    <div class="param"><span class="name">NoNewPrivileges=true</span><span class="desc">setuid binary'ler ve file capability'ler çalışamaz. Process'in privilege escalation yapması engellenir. Her servis için açık olmalı.</span></div>
+    <div class="param"><span class="name">CapabilityBoundingSet=</span><span class="desc">Servise verilecek capability listesi. Örnek: <code class="inline">CAP_NET_BIND_SERVICE</code> — 1024 altı port'a bind için. Tüm capability'leri kaldırmak için: <code class="inline">CapabilityBoundingSet=</code> (boş).</span></div>
+    <div class="param"><span class="name">PrivateNetwork=true</span><span class="desc">Ağ namespace'i izole eder — servis ağa erişemez. Sadece yerel işlem yapan servisler için.</span></div>
+    <div class="param"><span class="name">ReadOnlyPaths=</span><span class="desc">Belirli path'leri read-only yap: <code class="inline">ReadOnlyPaths=/etc/myapp</code></span></div>
+    <div class="param"><span class="name">ReadWritePaths=</span><span class="desc">ProtectSystem=strict ile birlikte kullanılır — sadece belirtilen path'lere yazma izni ver: <code class="inline">ReadWritePaths=/var/lib/myapp</code></span></div>
+    <div class="param"><span class="name">ProtectKernelTunables=true</span><span class="desc">/proc/sys, /sys read-only. Kernel parametrelerini değiştirmeyi engeller.</span></div>
+    <div class="param"><span class="name">RestrictAddressFamilies=AF_INET AF_INET6</span><span class="desc">Sadece belirtilen socket ailelerine izin ver. Unix socket kullanmıyorsa AF_UNIX'i çıkar.</span></div>
+    <div class="param"><span class="name">SystemCallFilter=@system-service</span><span class="desc">seccomp ile izin verilen syscall'ları filtrele. <code class="inline">@system-service</code> standart daemon'lar için güvenli bir preset'tir.</span></div>
+  </div>
+
+  <h3>Güvenli bir web servisi örneği</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/systemd/system/secure-web.service</span><span class="dot">●</span></div>
+    <pre><code>[<span class="keyword">Unit</span>]
+<span class="field">Description</span>=Güvenli web servisi
+<span class="field">After</span>=network.target
+
+[<span class="keyword">Service</span>]
+<span class="field">Type</span>=simple
+<span class="field">User</span>=www-data
+<span class="field">Group</span>=www-data
+<span class="field">ExecStart</span>=<span class="path">/opt/web/server</span>
+
+<span class="cmt"># sandboxing</span>
+<span class="field">ProtectSystem</span>=strict
+<span class="field">ReadWritePaths</span>=<span class="path">/var/lib/web</span> <span class="path">/var/log/web</span>
+<span class="field">ProtectHome</span>=true
+<span class="field">PrivateTmp</span>=true
+<span class="field">NoNewPrivileges</span>=true
+<span class="field">CapabilityBoundingSet</span>=CAP_NET_BIND_SERVICE
+<span class="field">AmbientCapabilities</span>=CAP_NET_BIND_SERVICE
+<span class="field">ProtectKernelTunables</span>=true
+<span class="field">RestrictAddressFamilies</span>=AF_INET AF_INET6
+<span class="field">SystemCallFilter</span>=@system-service
+
+[<span class="keyword">Install</span>]
+<span class="field">WantedBy</span>=multi-user.target</code></pre>
+  </div>
+
+  <h3>systemd-analyze security</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">systemd-analyze</span> security secure-web.service
+<span class="cmt"># Örnek çıktı:</span>
+<span class="cmt">#   NAME                                                        DESCRIPTION                              EXPOSURE</span>
+<span class="cmt">#   ✓ CapabilityBoundingSet=~CAP_SYS_ADMIN                    Service has no administrator privileges</span>
+<span class="cmt">#   ✓ PrivateTmp=yes                                          Service has no access to other software's temporary files</span>
+<span class="cmt">#   ✓ NoNewPrivileges=yes                                     Service processes cannot acquire new privileges</span>
+<span class="cmt">#   ✗ MemoryDenyWriteExecute=                                 Service may create writable executable memory mappings   0.1</span>
+<span class="cmt">#   ✗ RestrictRealtime=                                       Service may acquire realtime scheduling                  0.1</span>
+<span class="cmt">#   → Overall exposure level for secure-web.service: 2.1 OK</span></code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>Sandboxing direktiflerini production'da bir anda ekleme. Her direktifi test ortamında tek tek ekle, servisin hâlâ çalıştığını doğrula. Özellikle <code class="inline">ProtectSystem=strict</code> + <code class="inline">ReadWritePaths=</code> kombinasyonu, atladığın bir path varsa servisi kırabilir. <code class="inline">AuditType=yes</code> veya <code class="inline">strace</code> ile erişilen path'leri önceden tespit et.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 09 ═══════════════════ -->
+<section id="s9">
+  <h2><span class="num">09</span> Debugging ve sorun giderme</h2>
+  <p class="section-lead">Servis başlamıyorsa, doğru araçlarla sebebi dakikalar içinde bulunur.</p>
+
+  <h3>İlk adım: systemctl status</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">systemctl</span> status myapp.service
+<span class="cmt"># Örnek çıktı:</span>
+<span class="cmt"># ● myapp.service - Uygulama servisi</span>
+<span class="cmt">#      Loaded: loaded (/etc/systemd/system/myapp.service; enabled; vendor preset: enabled)</span>
+<span class="cmt">#      Active: failed (Result: exit-code) since Sat 2026-04-12 03:14:22 UTC; 5min ago</span>
+<span class="cmt">#     Process: 12483 ExecStart=/opt/myapp/bin/server (code=exited, status=1/FAILURE)</span>
+<span class="cmt">#    Main PID: 12483 (code=exited, status=1/FAILURE)</span>
+<span class="cmt">#         CPU: 102ms</span>
+<span class="cmt">#</span>
+<span class="cmt"># Apr 12 03:14:22 host myapp[12483]: FATAL: cannot open config file /etc/myapp/config.yaml</span></code></pre>
+  </div>
+
+  <h3>journalctl -xe — extended context</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># hata öncesi/sonrası bağlam ile genişletilmiş log</span>
+<span class="cmd">journalctl</span> <span class="flag">-xe</span> <span class="flag">-u</span> myapp.service
+
+<span class="cmt"># bu boot'ta sadece bu servise ait loglar</span>
+<span class="cmd">journalctl</span> <span class="flag">-b</span> <span class="flag">-u</span> myapp.service
+
+<span class="cmt"># tüm systemd mesajları (PID 1)</span>
+<span class="cmd">journalctl</span> _PID=1</code></pre>
+  </div>
+
+  <h3>systemd-analyze — boot analizi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># boot süresi özeti</span>
+<span class="cmd">systemd-analyze</span> time
+
+<span class="cmt"># en yavaş servisler</span>
+<span class="cmd">systemd-analyze</span> blame
+
+<span class="cmt"># kritik path — boot süresini belirleyen servis zinciri</span>
+<span class="cmd">systemd-analyze</span> critical-chain
+
+<span class="cmt"># belirli bir servisin critical chain'i</span>
+<span class="cmd">systemd-analyze</span> critical-chain myapp.service
+
+<span class="cmt"># tüm boot grafiğini SVG olarak dışa aktar</span>
+<span class="cmd">systemd-analyze</span> plot <span class="keyword">&gt;</span> boot.svg</code></pre>
+  </div>
+
+  <h3>FAILED durumdan kurtarma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># failed bayrağını temizle (log'u silmez)</span>
+<span class="cmd">systemctl</span> reset-failed myapp.service
+
+<span class="cmt"># hepsini temizle</span>
+<span class="cmd">systemctl</span> reset-failed
+
+<span class="cmt"># başarısız servis listesi</span>
+<span class="cmd">systemctl</span> <span class="flag">--failed</span></code></pre>
+  </div>
+
+  <h3>Sık karşılaşılan hatalar</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Hata</th><th>Neden</th><th>Çözüm</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code class="inline">status=203/EXEC</code></td><td>ExecStart yolu bulunamadı veya çalıştırılabilir değil</td><td>Tam path doğrula, chmod +x kontrol et</td></tr>
+      <tr><td><code class="inline">status=217/USER</code></td><td>User= alanında belirtilen kullanıcı yok</td><td>useradd ile kullanıcı oluştur</td></tr>
+      <tr><td><code class="inline">status=218/CAPABILITIES</code></td><td>Capability talep edilemiyor</td><td>AmbientCapabilities= veya User=root</td></tr>
+      <tr><td><code class="inline">start request repeated too quickly</code></td><td>Servis çok hızlı yeniden başlıyor — rate limit</td><td>StartLimitBurst= ve StartLimitIntervalSec= ayarla</td></tr>
+      <tr><td><code class="inline">Failed to connect to bus</code></td><td>User unit için D-Bus erişimi yok</td><td>loginctl enable-linger veya session içinde çalıştır</td></tr>
+      <tr><td><code class="inline">Permission denied</code></td><td>ProtectSystem veya ReadOnlyPaths kısıtlaması</td><td>ReadWritePaths= ile gerekli path'i ekle</td></tr>
+      <tr><td><code class="inline">Supervising process ... which is not our child</code></td><td>Type=forking ama PIDFile= yazılmamış</td><td>PIDFile= ekle veya Type=simple kullan</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Unit doğrulama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># unit dosyasını sözdizimi açısından kontrol et</span>
+<span class="cmd">systemd-analyze</span> verify <span class="path">/etc/systemd/system/myapp.service</span>
+
+<span class="cmt"># unit'in tam içeriğini (override'larla birlikte) göster</span>
+<span class="cmd">systemctl</span> cat myapp.service
+
+<span class="cmt"># unit property'lerini göster</span>
+<span class="cmd">systemctl</span> show myapp.service
+
+<span class="cmt"># belirli bir property</span>
+<span class="cmd">systemctl</span> show myapp.service <span class="flag">-p</span> Restart</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde öğrendikleriniz</h4>
+    <ul>
+      <li>systemctl status, ilk bakışta exit code ve son log satırlarını gösterir</li>
+      <li>journalctl -xe ile hata bağlamı genişletilir</li>
+      <li>systemd-analyze critical-chain, boot süresini belirleyen zinciri gösterir</li>
+      <li>reset-failed ile failed bayrağı temizlenip servis yeniden denenebilir</li>
+      <li>systemd-analyze verify, deploy öncesi unit dosyalarını kontrol eder</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

@@ -1,0 +1,896 @@
+---
+layout: tutorial
+title: "MQTT — Publish/Subscribe'dan QoS'a"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>Rehber</span>
+    <span>Network · MQTT</span>
+    <span>paho-mqtt</span>
+  </div>
+  <h1>MQTT —<br><em>publish/subscribe'dan QoS'a.</em></h1>
+  <p class="subtitle">IoT için tasarlanmış hafif protokol — broker, topic hiyerarşisi, QoS ve Python ile uçtan uca.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">MQTT nedir ve neden</a></li>
+    <li><a href="#s1">MQTT vs HTTP vs gRPC</a></li>
+    <li><a href="#s2">Broker ve client mimarisi</a></li>
+    <li><a href="#s3">Topic hiyerarşisi</a></li>
+    <li><a href="#s4">QoS seviyeleri</a></li>
+    <li><a href="#s5">Retained messages</a></li>
+    <li><a href="#s6">Last Will and Testament (LWT)</a></li>
+    <li><a href="#s7">paho-mqtt Python client</a></li>
+    <li><a href="#s8">Mosquitto broker kurulumu ve TLS</a></li>
+    <li><a href="#s9">Pratik: sensör simülatörü ve dashboard subscriber</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> MQTT nedir ve neden</h2>
+  <p class="section-lead">MQTT, dar bant genişliğinde, yüksek gecikmeli ve güvenilmez ağlarda çalışmak üzere tasarlanmış, makine-makine iletişim protokolüdür.</p>
+
+  <p>1999 yılında IBM'den Andy Stanford-Clark ve Arcom'dan Arlen Nipper, Suudi Arabistan'daki petrol boru hatlarını uydu bağlantısı üzerinden izlemek için MQTT'yi geliştirdi. O dönem uydu bağlantıları pahalı, düşük bant genişlikli ve sık kesintiliydi. Protokol, bu kısıtlar altında çalışabilmek için tasarlandı: minimum overhead, broker üzerinden dolaylı iletişim ve bağlantı kesintisine dayanıklılık.</p>
+
+  <p>MQTT 2013'te OASIS standardına alındı. Günümüzde milyonlarca IoT cihazı bu protokolü kullanır: akıllı ev sensörlerinden endüstriyel SCADA sistemlerine, araç takip sistemlerinden hastane ekipman izlemeye kadar.</p>
+
+  <h3>Request-response vs Publish/Subscribe</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Özellik</th><th>HTTP (Request-Response)</th><th>MQTT (Pub/Sub)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Bağlantı modeli</td><td>Client → Server, tek yönlü</td><td>Client → Broker → Client, çift yönlü</td></tr>
+      <tr><td>Veri akışı</td><td>Client talep eder (pull)</td><td>Broker iter (push)</td></tr>
+      <tr><td>Yeni veri bildirimi</td><td>Polling veya long-polling</td><td>Anlık — client bekler, broker gönderir</td></tr>
+      <tr><td>Bağlantı sürekliliği</td><td>Her istek ayrı bağlantı (HTTP/1.1) veya multiplexed (HTTP/2)</td><td>Kalıcı TCP bağlantısı</td></tr>
+      <tr><td>Overhead</td><td>Büyük (header, verb, path, version...)</td><td>Çok küçük — minimum 2 byte fixed header</td></tr>
+      <tr><td>Gönderici/alıcı bilgisi</td><td>Client her iki tarafı bilir</td><td>Publisher, subscriber'ı hiç bilmez</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Bağlantı modeli</h3>
+
+  <div class="flow">
+    <pre>
+  Sensör A ──publish──▶ BROKER ──route──▶ Dashboard (subscribe: sensors/#)
+  Sensör B ──publish──▶        ──route──▶ Logger    (subscribe: sensors/#)
+  Aktüatör ──subscribe──▶      ◀──publish─ Kontrolcü (publish: cmd/actuator)</pre>
+  </div>
+
+  <h3>Portlar</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">1883</span><span class="desc">Şifresiz (plaintext) MQTT. Üretim ortamında kullanmayın.</span></div>
+    <div class="param"><span class="name">8883</span><span class="desc">TLS üzerinden MQTT. Üretim için standart port.</span></div>
+    <div class="param"><span class="name">9001</span><span class="desc">WebSocket üzerinden MQTT. Tarayıcı tabanlı client'lar için.</span></div>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>MQTT, TCP üzerinde çalışır. UDP versiyonu yoktur. Protokolün güvenilirliği (QoS 1 ve QoS 2) TCP'nin sağladığı sıralı, kayıpsız byte akışı üzerine inşa edilmiştir. UDP'nin düşük gecikmesi gerekiyorsa CoAP protokolü değerlendirilebilir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> MQTT vs HTTP vs gRPC</h2>
+  <p class="section-lead">Doğru protokol seçimi, sistemin bant genişliği tüketimini, gecikme süresini ve uygulama karmaşıklığını doğrudan etkiler.</p>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Kriter</th><th>MQTT 3.1.1</th><th>HTTP/1.1</th><th>gRPC (HTTP/2)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Header overhead</td><td>2 byte minimum</td><td>Yüzlerce byte</td><td>Orta (binary framing)</td></tr>
+      <tr><td>Bağlantı</td><td>Kalıcı TCP</td><td>Her istek yeni (veya keep-alive)</td><td>Kalıcı HTTP/2 stream</td></tr>
+      <tr><td>Bildirim modeli</td><td>Push (broker iletir)</td><td>Pull (client polling)</td><td>Server streaming ile push</td></tr>
+      <tr><td>Bant genişliği</td><td>Çok düşük</td><td>Yüksek</td><td>Düşük-orta</td></tr>
+      <tr><td>Kesinti toleransı</td><td>Yüksek (QoS + session)</td><td>Düşük</td><td>Orta</td></tr>
+      <tr><td>Embedded uygunluğu</td><td>Çok yüksek</td><td>Düşük-orta</td><td>Düşük (proto derleyici gerekir)</td></tr>
+      <tr><td>Browser desteği</td><td>WebSocket ile</td><td>Doğal</td><td>gRPC-Web ile sınırlı</td></tr>
+      <tr><td>Schema/IDL</td><td>Yok — payload serbest</td><td>Yok (OpenAPI isteğe bağlı)</td><td>Zorunlu (.proto dosyası)</td></tr>
+    </tbody>
+  </table>
+
+  <h3>HTTP polling vs MQTT push</h3>
+
+  <p>Bir sıcaklık sensöründen 1 dakikada bir veri almak istediğinizi varsayın. HTTP polling ile client her dakika bağlantı kurar, header gönderir, yanıt bekler, bağlantıyı kapatır — her cycle için ~500 byte overhead. MQTT ile sensör sadece veri değiştiğinde yayın yapar; dashboard sürekli bağlı bekler ve sadece yeni mesaj geldiğinde birkaç byte alır.</p>
+
+  <h3>MQTT 3.1.1 vs 5.0</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Özellik</th><th>MQTT 3.1.1</th><th>MQTT 5.0</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Reason codes</td><td>Sadece başarı/hata</td><td>Detaylı hata kodları</td></tr>
+      <tr><td>Message expiry</td><td>Yok</td><td>Mesaj TTL ayarlanabilir</td></tr>
+      <tr><td>User properties</td><td>Yok</td><td>Anahtar-değer metadata</td></tr>
+      <tr><td>Shared subscriptions</td><td>Yok (broker uzantısı)</td><td>Standart</td></tr>
+      <tr><td>Request/response pattern</td><td>Manuel</td><td>Response topic + correlation data</td></tr>
+      <tr><td>Destek</td><td>Yaygın (paho default)</td><td>Yeni broker'larda mevcut</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>paho-mqtt 2.0'da MQTT 5.0 desteği için <code class="inline">CallbackAPIVersion.VERSION2</code> kullanılmalıdır. MQTT 3.1.1 için <code class="inline">CallbackAPIVersion.VERSION1</code> veya eski API kullanılabilir. Bu rehberde her iki versiyonu da gösteren örnekler yer alır.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Broker ve client mimarisi</h2>
+  <p class="section-lead">Broker, tüm client bağlantılarını yöneten merkezi bileşendir; subscription tablosunu tutar ve mesajları ilgili subscriber'lara iletir.</p>
+
+  <h3>Broker'ın görevi</h3>
+
+  <div class="flow">
+    <pre>
+  Publisher
+  publish("sensors/temp", "23.5") ──▶ BROKER
+                                        │
+                              subscription tablosu
+                              "sensors/temp" → [Client A, Client B]
+                              "sensors/#"    → [Logger, Dashboard]
+                                        │
+                              ┌─────────┴──────────┐
+                              ▼                     ▼
+                           Client A             Logger</pre>
+  </div>
+
+  <h3>Popüler broker'lar</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Mosquitto</span><span class="desc">Eclipse Foundation. Hafif, C ile yazılı, embedded ve Raspberry Pi için ideal. <code class="inline">apt install mosquitto</code> ile kurulur.</span></div>
+    <div class="param"><span class="name">EMQX</span><span class="desc">Erlang ile yazılı, Erlang'ın eşzamanlılık modeliyle milyonlarca bağlantı. Küme desteği var. Dashboard içerir.</span></div>
+    <div class="param"><span class="name">HiveMQ</span><span class="desc">Java tabanlı, enterprise odaklı. WebSocket, Kafka entegrasyonu, persistence. Ticari ve Community sürüm.</span></div>
+    <div class="param"><span class="name">AWS IoT Core</span><span class="desc">Yönetilen bulut broker. Kendi sertifika otoritesi, cihaz shadow, rules engine. X.509 mTLS zorunlu.</span></div>
+  </div>
+
+  <h3>Temel CLI araçları (mosquitto-clients)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># broker'a bağlan ve TÜM topic'leri dinle (wildcard #)</span>
+<span class="cmd">mosquitto_sub</span> <span class="flag">-h</span> localhost <span class="flag">-t</span> <span class="str">"#"</span> <span class="flag">-v</span>
+<span class="cmt"># -v: topic adını da göster</span>
+
+<span class="cmt"># sadece belirli bir topic</span>
+<span class="cmd">mosquitto_sub</span> <span class="flag">-h</span> localhost <span class="flag">-t</span> <span class="str">"sensors/temperature"</span>
+
+<span class="cmt"># mesaj yayınla</span>
+<span class="cmd">mosquitto_pub</span> <span class="flag">-h</span> localhost <span class="flag">-t</span> <span class="str">"test/hello"</span> <span class="flag">-m</span> <span class="str">"world"</span>
+
+<span class="cmt"># QoS 1 ile yayınla</span>
+<span class="cmd">mosquitto_pub</span> <span class="flag">-h</span> localhost <span class="flag">-t</span> <span class="str">"sensors/temp"</span> <span class="flag">-m</span> <span class="str">"23.5"</span> <span class="flag">-q</span> 1
+
+<span class="cmt"># retained mesaj</span>
+<span class="cmd">mosquitto_pub</span> <span class="flag">-h</span> localhost <span class="flag">-t</span> <span class="str">"sensors/temp"</span> <span class="flag">-m</span> <span class="str">"23.5"</span> <span class="flag">-r</span>
+
+<span class="cmt"># TLS ile bağlan (8883)</span>
+<span class="cmd">mosquitto_sub</span> <span class="flag">-h</span> broker.example.com <span class="flag">-p</span> 8883 <span class="flag">--cafile</span> <span class="path">ca.crt</span> <span class="flag">-t</span> <span class="str">"#"</span></code></pre>
+  </div>
+
+  <h3>Client ID önemi</h3>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>Her client benzersiz bir Client ID ile bağlanmalıdır. Aynı Client ID ile ikinci bir client bağlanırsa broker ilk client'ı kopar (disconnect eder). Bu davranış MQTT spesifikasyonunda tanımlanmıştır; test ortamında sık yapılan bir hatadır. Rastgele ID üretmek için Python'da <code class="inline">str(uuid.uuid4())</code> kullanılabilir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Topic hiyerarşisi</h2>
+  <p class="section-lead">Topic, mesajların yönlendirildiği adresi tanımlar — / ile ayrılmış seviyeli bir yol dizisidir.</p>
+
+  <h3>Topic yapısı</h3>
+
+  <p>Topic, forward slash (<code class="inline">/</code>) ile ayrılmış string seviyelerinden oluşur. Büyük/küçük harf duyarlıdır: <code class="inline">sensors/Temperature</code> ile <code class="inline">sensors/temperature</code> farklı topic'lerdir. Boşluk içerebilir ama önerilmez. Uzunluk 65535 UTF-8 byte ile sınırlıdır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>topic örnekleri</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># iyi yapılandırılmış topic hiyerarşisi</span>
+home/bedroom/temperature
+home/bedroom/humidity
+home/living_room/temperature
+sensors/device_001/status
+factory/line_3/machine_7/vibration
+cmd/device_001/set_led</code></pre>
+  </div>
+
+  <h3>Wildcard'lar</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">+ (tek seviye)</span><span class="desc">Tam olarak bir topic seviyesinin yerini tutar. Birden fazla kullanılabilir: <code class="inline">sensors/+/+/temperature</code></span></div>
+    <div class="param"><span class="name"># (çok seviye)</span><span class="desc">Sıfır veya daha fazla seviyenin yerini tutar. Sadece topic'in sonunda kullanılabilir: <code class="inline">sensors/#</code></span></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>wildcard örnekleri</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># sensors/+/temperature → sadece bir seviye</span>
+<span class="cmt"># eşleşir: sensors/bedroom/temperature</span>
+<span class="cmt"># eşleşmez: sensors/floor1/bedroom/temperature</span>
+sensors/+/temperature
+
+<span class="cmt"># home/# → home altındaki her şey</span>
+<span class="cmt"># eşleşir: home/bedroom/temp, home/kitchen, home/living_room/a/b/c</span>
+home/<span class="flag">#</span>
+
+<span class="cmt"># tüm status topic'leri (herhangi derinlikte)</span>
+<span class="cmd">mosquitto_sub</span> <span class="flag">-t</span> <span class="str">"+/+/status"</span>
+<span class="cmd">mosquitto_sub</span> <span class="flag">-t</span> <span class="str">"sensors/#"</span></code></pre>
+  </div>
+
+  <h3>$SYS topic'leri</h3>
+
+  <p><code class="inline">$SYS/</code> ile başlayan topic'ler broker'ın kendisi tarafından yayınlanır. Broker istatistiklerini, bağlı client sayısını ve mesaj trafiğini içerir. Wildcard ile subscibe edilemez.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># broker istatistikleri</span>
+<span class="cmd">mosquitto_sub</span> <span class="flag">-h</span> localhost <span class="flag">-t</span> <span class="str">"\$SYS/#"</span> <span class="flag">-v</span>
+<span class="cmt"># $SYS/broker/clients/connected → bağlı client sayısı</span>
+<span class="cmt"># $SYS/broker/messages/received → alınan mesaj sayısı</span>
+<span class="cmt"># $SYS/broker/load/bytes/received → gelen byte/sn</span></code></pre>
+  </div>
+
+  <h3>Geçerli ve geçersiz topic örnekleri</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Topic</th><th>Geçerli?</th><th>Açıklama</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code class="inline">sensors/temp</code></td><td>Geçerli</td><td>Standart iki seviyeli topic</td></tr>
+      <tr><td><code class="inline">sensors/+/temp</code></td><td>Geçerli (subscribe)</td><td>+ wildcard — publish için geçersiz</td></tr>
+      <tr><td><code class="inline">sensors/#</code></td><td>Geçerli (subscribe)</td><td># sonda — publish için geçersiz</td></tr>
+      <tr><td><code class="inline">sensors/#/temp</code></td><td>Geçersiz</td><td># sonda olmalı</td></tr>
+      <tr><td><code class="inline">/sensors/temp</code></td><td>Geçerli ama önerilmez</td><td>Başta / — boş ilk seviye oluşturur</td></tr>
+      <tr><td><code class="inline">$SYS/info</code></td><td>Özel</td><td>Broker iç topic'i — normal publish yapılamaz</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> QoS seviyeleri</h2>
+  <p class="section-lead">QoS (Quality of Service), publisher ile broker ve broker ile subscriber arasındaki mesaj teslim garantisini tanımlar.</p>
+
+  <h3>QoS 0 — At most once</h3>
+
+  <p>En hızlı, en hafif seçenek. Mesaj bir kez gönderilir, alındı onayı beklenmez. Ağ kesintisi veya broker restart'ında mesaj kaybolur. Telemetri verileri için uygundur: sıcaklık her 5 saniyede yayınlanıyorsa bir mesajın kaybolması önemli değildir.</p>
+
+  <div class="flow">
+    <pre>
+  QoS 0:  Publisher ──PUBLISH──▶ Broker ──PUBLISH──▶ Subscriber
+                     (fire &amp; forget — ACK yok)</pre>
+  </div>
+
+  <h3>QoS 1 — At least once</h3>
+
+  <p>Mesaj en az bir kez teslim edilmesi garanti edilir. Broker PUBACK göndermezse publisher yeniden dener. Bu nedenle duplicate mesaj mümkündür. Subscriber tarafında idempotent işleme gerekebilir.</p>
+
+  <div class="flow">
+    <pre>
+  QoS 1:  Publisher ──PUBLISH (DUP=0)──▶ Broker ──PUBACK──▶ Publisher
+                        │
+                   (PUBACK gelmezse)
+                        │
+          Publisher ──PUBLISH (DUP=1)──▶ Broker ──PUBACK──▶ Publisher
+
+          Broker ──PUBLISH──▶ Subscriber ──PUBACK──▶ Broker</pre>
+  </div>
+
+  <h3>QoS 2 — Exactly once</h3>
+
+  <p>4-way handshake ile mesaj tam olarak bir kez teslim edilir. En yüksek güvenilirlik, en yüksek overhead. Finansal işlemler veya kritik komutlar için uygundur.</p>
+
+  <div class="flow">
+    <pre>
+  QoS 2:  Publisher ──PUBLISH──▶ Broker ──PUBREC──▶ Publisher
+          Publisher ──PUBREL──▶  Broker ──PUBCOMP──▶ Publisher
+
+          Broker ──PUBLISH──▶ Subscriber ──PUBREC──▶ Broker
+          Broker ──PUBREL──▶  Subscriber ──PUBCOMP──▶ Broker</pre>
+  </div>
+
+  <h3>Ne zaman hangi QoS?</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Kullanım</th><th>Önerilen QoS</th><th>Neden</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Sıcaklık / nem telemetrisi</td><td>QoS 0</td><td>Kayıp tolere edilir, hız önemli</td></tr>
+      <tr><td>Durum bildirimi (online/offline)</td><td>QoS 1</td><td>Teslim garantisi, duplicate tolere edilir</td></tr>
+      <tr><td>Aktüatör komutu (röle aç/kapat)</td><td>QoS 1 veya 2</td><td>Komutun ulaşması kritik</td></tr>
+      <tr><td>Ödeme / kritik iş olayı</td><td>QoS 2</td><td>Tam olarak bir kez — duplicate kabul edilemez</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Subscribe QoS ve Publish QoS</h3>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Subscriber, subscribe ederken bir QoS seviyesi belirtir. Broker, mesajı subscriber'a iletirken <code class="inline">min(publish_qos, subscribe_qos)</code> seviyesini kullanır. Publisher QoS 2 ile yayınlamış olsa bile subscriber QoS 0 ile subscribe ettiyse mesajı QoS 0 alır. Bu nedenle kritik mesajlar için hem publisher hem subscriber'ın QoS 1 veya 2 kullanması gerekir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Retained messages</h2>
+  <p class="section-lead">Retained mesaj, broker'ın bir topic için sakladığı "son bilinen değer"dir — yeni bir subscriber bağlandığında geçmişte ne yayınlandığını hemen öğrenir.</p>
+
+  <h3>Nasıl çalışır?</h3>
+
+  <p>Publisher <code class="inline">retain=True</code> ile bir mesaj yayınladığında broker bu mesajı topic için saklar. Sonradan o topic'e subscribe olan her yeni client bu mesajı bağlanır bağlanmaz alır — mesaj ne zaman gönderilmiş olursa olsun. Bu, "Last Known Value" pattern'inin temelidir.</p>
+
+  <div class="flow">
+    <pre>
+  T=0  Sensör ──retain PUBLISH "23.5"──▶ Broker (saklar)
+  T=5  Dashboard bağlanır, subscribe("sensors/temp")
+  T=5  Broker ──PUBLISH "23.5"──▶ Dashboard (anında — T=0'daki değer)</pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># retained mesaj yayınla</span>
+<span class="cmd">mosquitto_pub</span> <span class="flag">-h</span> localhost <span class="flag">-t</span> <span class="str">"sensors/temp"</span> <span class="flag">-m</span> <span class="str">"23.5"</span> <span class="flag">-r</span>
+
+<span class="cmt"># retained mesajı sil: boş payload ile retain=True</span>
+<span class="cmd">mosquitto_pub</span> <span class="flag">-h</span> localhost <span class="flag">-t</span> <span class="str">"sensors/temp"</span> <span class="flag">-m</span> <span class="str">""</span> <span class="flag">-r</span></code></pre>
+  </div>
+
+  <h3>Kullanım senaryoları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Cihaz durumu</span><span class="desc"><code class="inline">devices/sensor001/status</code> topic'inde "online" retained — yeni subscriber anında durumu bilir.</span></div>
+    <div class="param"><span class="name">Konfigürasyon</span><span class="desc">Cihaz yeniden bağlandığında <code class="inline">config/device001</code> topic'inden mevcut konfigürasyonu alır.</span></div>
+    <div class="param"><span class="name">Sistem bilgisi</span><span class="desc">Broker versiyonu, kapasite limitleri gibi değişmeyen veriler retained olarak saklanır.</span></div>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>Retained mesajın QoS'u, yayınlandığı QoS seviyesidir. Broker mesajı saklarken QoS bilgisini de korur. Ancak çok sık değişen değerler için retain kullanmak broker üzerinde yük oluşturabilir — yalnızca gerçekten "son bilinen değer" semantiği gereken topic'lerde kullanın.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Last Will and Testament (LWT)</h2>
+  <p class="section-lead">LWT, bir client beklenmedik biçimde bağlantıyı kaybettiğinde broker'ın otomatik olarak yayınladığı önceden tanımlanmış mesajdır.</p>
+
+  <h3>LWT nasıl çalışır?</h3>
+
+  <p>Client, broker'a bağlanırken (CONNECT paketi) bir "will" mesajı tanımlar: topic, payload, QoS ve retain bayrağı. Eğer client bağlantısını temiz kapatmadan (graceful disconnect olmadan) koparırsa broker bu mesajı otomatik olarak yayınlar. TCP bağlantısının kopması, keepalive timeout'u veya uygulama crash'i bu durumu tetikler.</p>
+
+  <div class="flow">
+    <pre>
+  CONNECT paketi: willTopic="devices/s1/status"
+                  willMessage="offline"
+                  willQoS=1, willRetain=True
+         │
+         ▼
+  Normal çalışma...
+         │
+  (bağlantı kesildi — crash, timeout, ağ hatası)
+         │
+         ▼
+  Broker ──PUBLISH "offline" retain──▶ devices/s1/status topic subscribers</pre>
+  </div>
+
+  <h3>LWT ile sistem sağlık monitörü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>lwt_pattern.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> paho.mqtt.client <span class="keyword">as</span> mqtt
+
+CLIENT_ID = <span class="str">"sensor_001"</span>
+WILL_TOPIC = <span class="str">f"devices/{CLIENT_ID}/status"</span>
+
+client = mqtt.Client(client_id=CLIENT_ID)
+
+<span class="cmt"># bağlanmadan ÖNCE will tanımla</span>
+client.will_set(
+    topic=WILL_TOPIC,
+    payload=<span class="str">"offline"</span>,
+    qos=1,
+    retain=<span class="keyword">True</span>
+)
+
+client.connect(<span class="str">"localhost"</span>, 1883)
+
+<span class="cmt"># başarılı bağlantıda "online" yayınla (retained)</span>
+client.publish(WILL_TOPIC, <span class="str">"online"</span>, qos=1, retain=<span class="keyword">True</span>)</code></pre>
+  </div>
+
+  <h3>LWT vs graceful disconnect</h3>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p><code class="inline">client.disconnect()</code> çağrıldığında broker LWT mesajını yayınlamaz — normal (temiz) bağlantı kapanması olarak değerlendirir. LWT yalnızca beklenmedik kopmalarda tetiklenir. Graceful shutdown'da kendiniz "offline" mesajı yayınlamalısınız: <code class="inline">client.publish(WILL_TOPIC, "offline", retain=True)</code> ardından <code class="inline">client.disconnect()</code>.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> paho-mqtt Python client</h2>
+  <p class="section-lead">paho-mqtt, Eclipse Foundation'ın Python MQTT client kütüphanesidir — MQTT 3.1.1 ve 5.0 desteği, callback tabanlı asenkron API.</p>
+
+  <h3>Kurulum</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">pip</span> install paho-mqtt
+<span class="cmt"># paho-mqtt >= 2.0 önerilir</span></code></pre>
+  </div>
+
+  <h3>paho-mqtt 2.0 API farkı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>api_versions.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> paho.mqtt.client <span class="keyword">as</span> mqtt
+
+<span class="cmt"># paho-mqtt >= 2.0: CallbackAPIVersion belirtmek zorunlu</span>
+client = mqtt.Client(
+    callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+    client_id=<span class="str">"mydevice_001"</span>,
+    protocol=mqtt.MQTTv311  <span class="cmt"># veya MQTTv5</span>
+)
+
+<span class="cmt"># paho-mqtt < 2.0 (eski API — deprecated)</span>
+client = mqtt.Client(client_id=<span class="str">"mydevice_001"</span>)</code></pre>
+  </div>
+
+  <h3>Publisher: sensör simülatörü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>publisher.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> paho.mqtt.client <span class="keyword">as</span> mqtt
+<span class="keyword">import</span> json
+<span class="keyword">import</span> time
+<span class="keyword">import</span> random
+
+BROKER   = <span class="str">"localhost"</span>
+PORT     = 1883
+TOPIC    = <span class="str">"sensors/device_001"</span>
+CLIENT_ID = <span class="str">"publisher_001"</span>
+
+<span class="keyword">def</span> <span class="cmd">on_connect</span>(client, userdata, flags, reason_code, properties):
+    <span class="keyword">if</span> reason_code == 0:
+        print(<span class="str">f"Broker'a bağlandı: {BROKER}:{PORT}"</span>)
+    <span class="keyword">else</span>:
+        print(<span class="str">f"Bağlantı hatası: {reason_code}"</span>)
+
+client = mqtt.Client(
+    callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+    client_id=CLIENT_ID
+)
+client.on_connect = on_connect
+
+<span class="cmt"># LWT: beklenmedik kopma durumunda "offline" yayınla</span>
+client.will_set(<span class="str">"devices/device_001/status"</span>, <span class="str">"offline"</span>, qos=1, retain=<span class="keyword">True</span>)
+
+client.connect(BROKER, PORT, keepalive=60)
+client.loop_start()  <span class="cmt"># arka planda network döngüsü</span>
+
+<span class="cmt"># bağlantı bildir</span>
+client.publish(<span class="str">"devices/device_001/status"</span>, <span class="str">"online"</span>, qos=1, retain=<span class="keyword">True</span>)
+
+<span class="keyword">try</span>:
+    <span class="keyword">while</span> <span class="keyword">True</span>:
+        payload = json.dumps({
+            <span class="str">"temperature"</span>: round(random.uniform(18.0, 30.0), 2),
+            <span class="str">"humidity"</span>:    round(random.uniform(40.0, 80.0), 2),
+            <span class="str">"pressure"</span>:    round(random.uniform(1000.0, 1020.0), 2),
+            <span class="str">"timestamp"</span>:   int(time.time())
+        })
+        result = client.publish(TOPIC, payload, qos=1)
+        result.wait_for_publish()
+        print(<span class="str">f"Yayınlandı → {TOPIC}: {payload}"</span>)
+        time.sleep(5)
+<span class="keyword">except</span> KeyboardInterrupt:
+    <span class="keyword">pass</span>
+<span class="keyword">finally</span>:
+    client.publish(<span class="str">"devices/device_001/status"</span>, <span class="str">"offline"</span>, qos=1, retain=<span class="keyword">True</span>)
+    client.loop_stop()
+    client.disconnect()</code></pre>
+  </div>
+
+  <h3>Subscriber: mesaj dinle ve işle</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>subscriber.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> paho.mqtt.client <span class="keyword">as</span> mqtt
+<span class="keyword">import</span> json
+
+BROKER = <span class="str">"localhost"</span>
+PORT   = 1883
+
+<span class="keyword">def</span> <span class="cmd">on_connect</span>(client, userdata, flags, reason_code, properties):
+    <span class="keyword">if</span> reason_code == 0:
+        <span class="cmt"># bağlantı kurulunca subscribe — yeniden bağlanmada da çalışır</span>
+        client.subscribe(<span class="str">"sensors/#"</span>, qos=1)
+        print(<span class="str">"Bağlandı, sensors/# dinleniyor"</span>)
+
+<span class="keyword">def</span> <span class="cmd">on_message</span>(client, userdata, msg):
+    <span class="keyword">try</span>:
+        data = json.loads(msg.payload.decode())
+        print(<span class="str">f"[{msg.topic}] sıcaklık={data['temperature']}°C  "</span>
+              <span class="str">f"nem={data['humidity']}%  basınç={data['pressure']} hPa"</span>)
+    <span class="keyword">except</span> (json.JSONDecodeError, KeyError) <span class="keyword">as</span> e:
+        print(<span class="str">f"Parse hatası: {e} | ham: {msg.payload}"</span>)
+
+<span class="keyword">def</span> <span class="cmd">on_disconnect</span>(client, userdata, flags, reason_code, properties):
+    print(<span class="str">f"Bağlantı kesildi: {reason_code}"</span>)
+
+client = mqtt.Client(
+    callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+    client_id=<span class="str">"subscriber_dashboard"</span>
+)
+client.on_connect    = on_connect
+client.on_message    = on_message
+client.on_disconnect = on_disconnect
+
+client.connect(BROKER, PORT, keepalive=60)
+client.loop_forever()  <span class="cmt"># bloklar, Ctrl+C ile dur</span></code></pre>
+  </div>
+
+  <h3>loop_start() vs loop_forever()</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">loop_start()</span><span class="desc">Arka plan thread'i başlatır. Engelleme yapmaz; kodu çalışmaya devam eder. Diğer işler yapılırken broker ile iletişim sürer. loop_stop() ile durdurulur.</span></div>
+    <div class="param"><span class="name">loop_forever()</span><span class="desc">Mevcut thread'i bloklar. SIGINT (Ctrl+C) veya disconnect() ile durur. Sadece dinleme yapan programlarda tercih edilir.</span></div>
+  </div>
+
+  <h3>TLS bağlantısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>tls_connect.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> ssl
+<span class="keyword">import</span> paho.mqtt.client <span class="keyword">as</span> mqtt
+
+client = mqtt.Client(
+    callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+    client_id=<span class="str">"tls_client_001"</span>
+)
+
+<span class="cmt"># CA sertifikası ile doğrulama</span>
+client.tls_set(
+    ca_certs=<span class="str">"/etc/ssl/certs/ca.crt"</span>,
+    certfile=<span class="keyword">None</span>,     <span class="cmt"># mTLS değil — sadece sunucu doğrulama</span>
+    keyfile=<span class="keyword">None</span>,
+    tls_version=ssl.PROTOCOL_TLS_CLIENT
+)
+
+<span class="cmt"># kullanıcı adı / şifre</span>
+client.username_pw_set(<span class="str">"sensor_user"</span>, <span class="str">"güçlü_şifre"</span>)
+
+client.connect(<span class="str">"broker.example.com"</span>, 8883, keepalive=60)
+client.loop_forever()</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Mosquitto broker kurulumu ve TLS</h2>
+  <p class="section-lead">Mosquitto, geliştirme ve küçük ölçekli üretim ortamları için en yaygın kullanılan açık kaynak MQTT broker'ıdır.</p>
+
+  <h3>Kurulum</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Debian / Ubuntu</span>
+<span class="cmd">apt</span> install mosquitto mosquitto-clients
+
+<span class="cmt"># durum kontrol</span>
+<span class="cmd">systemctl</span> status mosquitto
+
+<span class="cmt"># verbose başlatma (test için)</span>
+<span class="cmd">mosquitto</span> <span class="flag">-c</span> <span class="path">/etc/mosquitto/mosquitto.conf</span> <span class="flag">-v</span></code></pre>
+  </div>
+
+  <h3>Minimal konfigürasyon</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/mosquitto/mosquitto.conf</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># plaintext listener — yalnızca localhost</span>
+<span class="field">listener</span> 1883 127.0.0.1
+
+<span class="cmt"># anonymous bağlantıya izin ver (test ortamı)</span>
+<span class="field">allow_anonymous</span> true
+
+<span class="cmt"># log seviyesi</span>
+<span class="field">log_type</span> all
+<span class="field">log_dest</span> file <span class="path">/var/log/mosquitto/mosquitto.log</span>
+
+<span class="cmt"># persistent session için mesaj kalıcılığı</span>
+<span class="field">persistence</span> true
+<span class="field">persistence_location</span> <span class="path">/var/lib/mosquitto/</span></code></pre>
+  </div>
+
+  <h3>Parola dosyası ile kimlik doğrulama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># yeni parola dosyası oluştur (-c), kullanıcı ekle</span>
+<span class="cmd">mosquitto_passwd</span> <span class="flag">-c</span> <span class="path">/etc/mosquitto/passwd</span> sensor_user
+
+<span class="cmt"># mevcut dosyaya kullanıcı ekle (dosyayı yeniden oluşturmaz)</span>
+<span class="cmd">mosquitto_passwd</span> <span class="path">/etc/mosquitto/passwd</span> dashboard_user
+
+<span class="cmt"># kullanıcı sil</span>
+<span class="cmd">mosquitto_passwd</span> <span class="flag">-D</span> <span class="path">/etc/mosquitto/passwd</span> eski_kullanici</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/mosquitto/mosquitto.conf (auth)</span><span class="dot">●</span></div>
+    <pre><code><span class="field">listener</span> 1883 127.0.0.1
+<span class="field">allow_anonymous</span> false
+<span class="field">password_file</span> <span class="path">/etc/mosquitto/passwd</span></code></pre>
+  </div>
+
+  <h3>TLS listener</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/mosquitto/mosquitto.conf (TLS)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># TLS listener — port 8883</span>
+<span class="field">listener</span> 8883
+<span class="field">cafile</span>   <span class="path">/etc/mosquitto/certs/ca.crt</span>
+<span class="field">certfile</span> <span class="path">/etc/mosquitto/certs/server.crt</span>
+<span class="field">keyfile</span>  <span class="path">/etc/mosquitto/certs/server.key</span>
+
+<span class="cmt"># mTLS için (client sertifikası zorunlu)</span>
+<span class="field">require_certificate</span> true
+<span class="field">use_identity_as_username</span> true
+
+<span class="field">allow_anonymous</span> false
+<span class="field">password_file</span> <span class="path">/etc/mosquitto/passwd</span></code></pre>
+  </div>
+
+  <h3>Self-signed sertifika ile test</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># CA key ve sertifika oluştur</span>
+<span class="cmd">openssl</span> genrsa <span class="flag">-out</span> ca.key 4096
+<span class="cmd">openssl</span> req <span class="flag">-new -x509 -days 1826 -key</span> ca.key <span class="flag">-out</span> ca.crt \
+    <span class="flag">-subj</span> <span class="str">"/CN=MQTT CA"</span>
+
+<span class="cmt"># sunucu key ve CSR</span>
+<span class="cmd">openssl</span> genrsa <span class="flag">-out</span> server.key 2048
+<span class="cmd">openssl</span> req <span class="flag">-new -key</span> server.key <span class="flag">-out</span> server.csr \
+    <span class="flag">-subj</span> <span class="str">"/CN=localhost"</span>
+
+<span class="cmt"># CA ile imzala</span>
+<span class="cmd">openssl</span> x509 <span class="flag">-req -days 365 -in</span> server.csr \
+    <span class="flag">-CA</span> ca.crt <span class="flag">-CAkey</span> ca.key <span class="flag">-CAcreateserial -out</span> server.crt
+
+<span class="cmt"># test bağlantısı</span>
+<span class="cmd">mosquitto_sub</span> <span class="flag">-h</span> localhost <span class="flag">-p</span> 8883 <span class="flag">--cafile</span> ca.crt <span class="flag">-t</span> <span class="str">"test/#"</span></code></pre>
+  </div>
+
+  <h3>Sistem servisi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># boot'ta başlat ve hemen başlat</span>
+<span class="cmd">systemctl</span> enable <span class="flag">--now</span> mosquitto
+
+<span class="cmt"># config değişikliği sonrası reload</span>
+<span class="cmd">systemctl</span> reload mosquitto
+
+<span class="cmt"># log izle</span>
+<span class="cmd">journalctl</span> <span class="flag">-u</span> mosquitto <span class="flag">-f</span></code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>Üretim ortamında <code class="inline">allow_anonymous true</code> kullanmayın. Her client için ayrı kimlik bilgisi tanımlayın. mTLS rehberi ile X.509 sertifika tabanlı kimlik doğrulama için çapraz referans yapabilirsiniz.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 09 ═══════════════════ -->
+<section id="s9">
+  <h2><span class="num">09</span> Pratik: sensör simülatörü ve dashboard subscriber</h2>
+  <p class="section-lead">QoS 1, retained mesaj ve LWT'yi birlikte kullanan tam bir örnek — sadece Python stdlib ve paho-mqtt.</p>
+
+  <h3>Çalıştırma adımları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1. mosquitto başlat (ayrı terminal)</span>
+<span class="cmd">mosquitto</span> <span class="flag">-v</span>
+
+<span class="cmt"># 2. subscriber başlat (ayrı terminal)</span>
+<span class="cmd">python3</span> dashboard.py
+
+<span class="cmt"># 3. publisher başlat (ayrı terminal)</span>
+<span class="cmd">python3</span> sensor_sim.py
+
+<span class="cmt"># 4. Ctrl+C ile publisher'ı durdur — LWT "offline" yayınlanır</span></code></pre>
+  </div>
+
+  <h3>sensor_sim.py — tam publisher</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>sensor_sim.py</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">#!/usr/bin/env python3
+"""Sensör simülatörü — bağımlılık yok: paho-mqtt + stdlib"""</span>
+
+<span class="keyword">import</span> json
+<span class="keyword">import</span> random
+<span class="keyword">import</span> time
+<span class="keyword">import</span> paho.mqtt.client <span class="keyword">as</span> mqtt
+
+BROKER    = <span class="str">"localhost"</span>
+PORT      = 1883
+CLIENT_ID = <span class="str">"sensor_sim_001"</span>
+BASE      = <span class="str">"home/sensors/sim_001"</span>
+STATUS    = <span class="str">f"devices/{CLIENT_ID}/status"</span>
+INTERVAL  = 5  <span class="cmt"># saniye</span>
+
+<span class="keyword">def</span> <span class="cmd">on_connect</span>(client, userdata, flags, reason_code, properties):
+    <span class="keyword">if</span> reason_code == 0:
+        client.publish(STATUS, <span class="str">"online"</span>, qos=1, retain=<span class="keyword">True</span>)
+        print(<span class="str">f"[sim] Bağlandı → {BROKER}:{PORT}"</span>)
+    <span class="keyword">else</span>:
+        print(<span class="str">f"[sim] Bağlantı hatası: {reason_code}"</span>)
+
+client = mqtt.Client(
+    callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+    client_id=CLIENT_ID
+)
+client.on_connect = on_connect
+<span class="cmt"># LWT: ani kopma → "offline" (retained QoS 1)</span>
+client.will_set(STATUS, <span class="str">"offline"</span>, qos=1, retain=<span class="keyword">True</span>)
+
+client.connect(BROKER, PORT, keepalive=30)
+client.loop_start()
+
+<span class="cmt"># broker'a bağlanmak için kısa süre ver</span>
+time.sleep(1)
+
+seq = 0
+<span class="keyword">try</span>:
+    <span class="keyword">while</span> <span class="keyword">True</span>:
+        seq += 1
+        payload = {
+            <span class="str">"seq"</span>:         seq,
+            <span class="str">"temperature"</span>: round(20.0 + random.gauss(0, 1.5), 2),
+            <span class="str">"humidity"</span>:    round(55.0 + random.gauss(0, 5.0), 1),
+            <span class="str">"pressure"</span>:    round(1013.25 + random.gauss(0, 2.0), 2),
+            <span class="str">"ts"</span>:          int(time.time())
+        }
+        msg = json.dumps(payload)
+
+        <span class="cmt"># telemetri: QoS 1, retained (son değer her zaman mevcut)</span>
+        client.publish(<span class="str">f"{BASE}/telemetry"</span>, msg, qos=1, retain=<span class="keyword">True</span>)
+        print(<span class="str">f"[sim] #{seq:04d} → {BASE}/telemetry"</span>)
+        time.sleep(INTERVAL)
+
+<span class="keyword">except</span> KeyboardInterrupt:
+    print(<span class="str">"[sim] Kapatılıyor..."</span>)
+<span class="keyword">finally</span>:
+    <span class="cmt"># graceful disconnect: LWT tetiklenmez, manuel "offline"</span>
+    client.publish(STATUS, <span class="str">"offline"</span>, qos=1, retain=<span class="keyword">True</span>)
+    time.sleep(0.5)  <span class="cmt"># mesajın gönderilmesi için bekle</span>
+    client.loop_stop()
+    client.disconnect()
+    print(<span class="str">"[sim] Çıkıldı."</span>)</code></pre>
+  </div>
+
+  <h3>dashboard.py — tam subscriber</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dashboard.py</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">#!/usr/bin/env python3
+"""Terminal dashboard — sensör verilerini canlı göster"""</span>
+
+<span class="keyword">import</span> json
+<span class="keyword">import</span> time
+<span class="keyword">import</span> paho.mqtt.client <span class="keyword">as</span> mqtt
+
+BROKER     = <span class="str">"localhost"</span>
+PORT       = 1883
+CLIENT_ID  = <span class="str">"dashboard_001"</span>
+TOPICS     = [
+    (<span class="str">"home/sensors/#"</span>, 1),       <span class="cmt"># telemetri</span>
+    (<span class="str">"devices/+/status"</span>, 1),   <span class="cmt"># cihaz durumu</span>
+]
+
+stats = {<span class="str">"received"</span>: 0, <span class="str">"errors"</span>: 0}
+
+<span class="keyword">def</span> <span class="cmd">on_connect</span>(client, userdata, flags, reason_code, properties):
+    <span class="keyword">if</span> reason_code == 0:
+        client.subscribe(TOPICS)
+        print(<span class="str">f"[dash] Bağlandı → {BROKER}:{PORT}"</span>)
+        print(<span class="str">f"[dash] Dinlenen topic'ler: {[t for t, _ in TOPICS]}"</span>)
+        print(<span class="str">"-" * 60</span>)
+    <span class="keyword">else</span>:
+        print(<span class="str">f"[dash] Hata: {reason_code}"</span>)
+
+<span class="keyword">def</span> <span class="cmd">on_message</span>(client, userdata, msg):
+    ts = time.strftime(<span class="str">"%H:%M:%S"</span>)
+    stats[<span class="str">"received"</span>] += 1
+
+    <span class="keyword">if</span> <span class="str">"status"</span> <span class="keyword">in</span> msg.topic:
+        status = msg.payload.decode()
+        icon = <span class="str">"🟢"</span> <span class="keyword">if</span> status == <span class="str">"online"</span> <span class="keyword">else</span> <span class="str">"🔴"</span>
+        print(<span class="str">f"[{ts}] {icon} {msg.topic}: {status}"</span>)
+        <span class="keyword">return</span>
+
+    <span class="keyword">try</span>:
+        d = json.loads(msg.payload)
+        print(
+            <span class="str">f"[{ts}] #{d.get('seq', '?'):04}  "</span>
+            <span class="str">f"🌡 {d['temperature']:6.2f}°C  "</span>
+            <span class="str">f"💧 {d['humidity']:5.1f}%  "</span>
+            <span class="str">f"🔵 {d['pressure']:8.2f} hPa"</span>
+        )
+    <span class="keyword">except</span> (json.JSONDecodeError, KeyError) <span class="keyword">as</span> e:
+        stats[<span class="str">"errors"</span>] += 1
+        print(<span class="str">f"[{ts}] PARSE HATASI ({e}): {msg.payload[:80]}"</span>)
+
+<span class="keyword">def</span> <span class="cmd">on_disconnect</span>(client, userdata, flags, reason_code, properties):
+    print(<span class="str">f"\n[dash] Bağlantı kesildi (kod={reason_code})"</span>)
+    print(<span class="str">f"[dash] Toplam: {stats['received']} mesaj, {stats['errors']} hata"</span>)
+
+client = mqtt.Client(
+    callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+    client_id=CLIENT_ID
+)
+client.on_connect    = on_connect
+client.on_message    = on_message
+client.on_disconnect = on_disconnect
+
+client.connect(BROKER, PORT, keepalive=60)
+<span class="keyword">try</span>:
+    client.loop_forever()
+<span class="keyword">except</span> KeyboardInterrupt:
+    print(<span class="str">"\n[dash] Ctrl+C ile durduruldu."</span>)</code></pre>
+  </div>
+
+  <h3>Örnek çıktı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>terminal (dashboard)</span><span class="dot">●</span></div>
+    <pre><code>[dash] Bağlandı → localhost:1883
+[dash] Dinlenen topic'ler: ['home/sensors/#', 'devices/+/status']
+------------------------------------------------------------
+[09:14:01] 🟢 devices/sensor_sim_001/status: online
+[09:14:02] #0001  🌡  21.34°C  💧  58.3%  🔵  1014.83 hPa
+[09:14:07] #0002  🌡  19.87°C  💧  52.1%  🔵  1012.44 hPa
+[09:14:12] #0003  🌡  22.10°C  💧  60.7%  🔵  1015.21 hPa
+[09:14:17] 🔴 devices/sensor_sim_001/status: offline</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde öğrendikleriniz</h4>
+    <ul>
+      <li>paho-mqtt CallbackAPIVersion.VERSION2 ile modern API kullanımı</li>
+      <li>LWT, retained mesaj ve QoS 1'i aynı uygulamada birleştirme</li>
+      <li>on_connect içinde subscribe — yeniden bağlanmada abonelik kaybı önleme</li>
+      <li>Graceful shutdown sırasında manuel "offline" yayınlama</li>
+      <li>loop_start() ile non-blocking publisher, loop_forever() ile bloklu subscriber</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

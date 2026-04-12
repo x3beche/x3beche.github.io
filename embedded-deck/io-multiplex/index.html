@@ -1,0 +1,1087 @@
+---
+layout: tutorial
+title: "epoll · select · poll — I/O Multiplexing"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>Rehber</span>
+    <span>Linux / Performans</span>
+    <span>C</span>
+    <span>asyncio</span>
+  </div>
+  <h1>epoll · select · poll —<br><em>I/O multiplexing.</em></h1>
+  <p class="subtitle">binlerce bağlantıyı tek thread'de yönetmek — select'in sınırlarından epoll'un edge-triggered moduna.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Giriş: C10K problemi</a></li>
+    <li><a href="#s1">select()</a></li>
+    <li><a href="#s2">poll()</a></li>
+    <li><a href="#s3">epoll temelleri</a></li>
+    <li><a href="#s4">Level-triggered vs Edge-triggered</a></li>
+    <li><a href="#s5">epoll_data_t ile bağlam taşıma</a></li>
+    <li><a href="#s6">Tam accept loop implementasyonu</a></li>
+    <li><a href="#s7">Python asyncio ve epoll bağlantısı</a></li>
+    <li><a href="#s8">kqueue, io_uring ve gelecek</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Giriş: C10K problemi</h2>
+  <p class="section-lead">10.000 eşzamanlı bağlantıyı tek sunucuda yönetmek — 1999'da Dan Kegel'in tanımladığı bu problem, modern event-driven mimarilerin temelini attı.</p>
+
+  <h3>Blocking I/O modeli ve maliyeti</h3>
+
+  <p>Klasik yaklaşım: her gelen bağlantı için bir thread veya process oluştur. Bu model küçük ölçekte çalışır. 10.000 bağlantıda durum şöyle:</p>
+
+  <div class="flow">
+    <pre>
+  10.000 bağlantı
+       │
+       ├─ 10.000 thread × ~8 MB stack  =  ~80 GB RAM  (Linux default)
+       ├─ 10.000 thread × context switch  =  CPU thrash
+       └─ Scheduler O(n) → her tick 10.000 thread seçim yapar
+    </pre>
+  </div>
+
+  <p>Gerçek dünya sınırı çok daha düşük: Linux default stack boyutu 8 MB, ama RSS pratikte 64–128 KB civarında kalır. Yine de 10.000 thread'de context switch maliyeti ciddi bir tavan oluşturur.</p>
+
+  <h3>Non-blocking I/O + multiplexing</h3>
+
+  <p>Çözüm, tek thread içinde birden fazla file descriptor'ı <em>aynı anda izlemek</em>: hangisi okumaya hazır, hangisi yazmaya hazır bilgisini OS kernel'den al, sadece hazır olanları işle.</p>
+
+  <div class="flow">
+    <pre>
+  tek thread
+       │
+       ├─ fd_1 (socket) ──┐
+       ├─ fd_2 (socket) ──┤── kernel'e ver: "hangisi hazır?"
+       ├─ fd_3 (pipe)   ──┤
+       └─ fd_N (...)    ──┘
+                           │
+                     [select/poll/epoll]
+                           │
+                    hazır fd listesi → işle → tekrar bekle
+    </pre>
+  </div>
+
+  <h3>nginx vs Apache modeli</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Sunucu</th><th>Model</th><th>10K bağlantıda</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Apache (prefork)</td><td>Thread/process per connection</td><td>10.000 thread — ağır, yavaş</td></tr>
+      <tr><td>nginx</td><td>Event-driven, epoll</td><td>Tek thread per core — hafif, hızlı</td></tr>
+      <tr><td>Node.js</td><td>Event loop (libuv + epoll)</td><td>Tek thread, callback tabanlı</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Non-blocking mod: fcntl</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>nonblocking.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">&lt;fcntl.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;unistd.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;errno.h&gt;</span>
+
+<span class="keyword">int</span> <span class="cmd">set_nonblocking</span>(<span class="keyword">int</span> fd) {
+    <span class="keyword">int</span> flags = <span class="cmd">fcntl</span>(fd, F_GETFL, <span class="num">0</span>);
+    <span class="keyword">if</span> (flags == <span class="num">-1</span>) <span class="keyword">return</span> <span class="num">-1</span>;
+    <span class="keyword">return</span> <span class="cmd">fcntl</span>(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+<span class="cmt">/* non-blocking read örneği */</span>
+<span class="keyword">char</span> buf[<span class="num">4096</span>];
+<span class="keyword">ssize_t</span> n = <span class="cmd">read</span>(fd, buf, <span class="keyword">sizeof</span>(buf));
+<span class="keyword">if</span> (n == <span class="num">-1</span>) {
+    <span class="keyword">if</span> (errno == EAGAIN || errno == EWOULDBLOCK) {
+        <span class="cmt">/* veri yok — daha sonra tekrar dene */</span>
+    } <span class="keyword">else</span> {
+        <span class="cmt">/* gerçek hata */</span>
+    }
+}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Non-blocking I/O tek başına yeterli değildir: hangi fd'nin hazır olduğunu bilmek için multiplexing API (select/poll/epoll) gerekir. Aksi hâlde tüm fd'leri tek tek <code class="inline">EAGAIN</code> alana kadar döndürmek (busy-wait) CPU'yu %100 kullanır.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> select()</h2>
+  <p class="section-lead">POSIX standardı, her platformda çalışır — ama FD_SETSIZE=1024 hard limiti onu modern sistemler için yetersiz kılar.</p>
+
+  <h3>API</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>select-api.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">&lt;sys/select.h&gt;</span>
+
+<span class="cmt">/* fd_set işlemleri */</span>
+<span class="cmd">FD_ZERO</span>(&amp;set);          <span class="cmt">/* seti sıfırla */</span>
+<span class="cmd">FD_SET</span>(fd, &amp;set);       <span class="cmt">/* fd'yi sete ekle */</span>
+<span class="cmd">FD_CLR</span>(fd, &amp;set);       <span class="cmt">/* fd'yi setten çıkar */</span>
+<span class="cmd">FD_ISSET</span>(fd, &amp;set);     <span class="cmt">/* fd sette mi? */</span>
+
+<span class="cmt">/* imza */</span>
+<span class="keyword">int</span> <span class="cmd">select</span>(<span class="keyword">int</span> nfds,                  <span class="cmt">/* izlenecek en büyük fd + 1 */</span>
+           fd_set *readfds,            <span class="cmt">/* okuma izlenenler */</span>
+           fd_set *writefds,           <span class="cmt">/* yazma izlenenler */</span>
+           fd_set *exceptfds,          <span class="cmt">/* istisna (nadiren kullanılır) */</span>
+           <span class="keyword">struct</span> timeval *timeout);   <span class="cmt">/* NULL = sonsuz bekle */</span></code></pre>
+  </div>
+
+  <h3>Tam çalışan örnek: stdin okuma ile timeout</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>select-stdin.c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* gcc -o select-stdin select-stdin.c */</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdio.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;sys/select.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;unistd.h&gt;</span>
+
+<span class="keyword">int</span> <span class="cmd">main</span>(<span class="keyword">void</span>) {
+    fd_set readfds;
+    <span class="keyword">struct</span> timeval tv;
+    <span class="keyword">char</span> buf[<span class="num">256</span>];
+
+    <span class="keyword">while</span> (<span class="num">1</span>) {
+        <span class="cmt">/* DİKKAT: select() her çağrıda fd_set'i modifiye eder — her seferinde yeniden doldur */</span>
+        <span class="cmd">FD_ZERO</span>(&amp;readfds);
+        <span class="cmd">FD_SET</span>(STDIN_FILENO, &amp;readfds);
+
+        <span class="cmt">/* 3 saniye timeout */</span>
+        tv.tv_sec  = <span class="num">3</span>;
+        tv.tv_usec = <span class="num">0</span>;
+
+        <span class="keyword">int</span> ret = <span class="cmd">select</span>(STDIN_FILENO + <span class="num">1</span>, &amp;readfds, NULL, NULL, &amp;tv);
+
+        <span class="keyword">if</span> (ret == <span class="num">-1</span>) {
+            <span class="cmd">perror</span>(<span class="str">"select"</span>);
+            <span class="keyword">break</span>;
+        } <span class="keyword">else if</span> (ret == <span class="num">0</span>) {
+            <span class="cmd">printf</span>(<span class="str">"timeout — giriş yok\n"</span>);
+        } <span class="keyword">else if</span> (<span class="cmd">FD_ISSET</span>(STDIN_FILENO, &amp;readfds)) {
+            <span class="keyword">ssize_t</span> n = <span class="cmd">read</span>(STDIN_FILENO, buf, <span class="keyword">sizeof</span>(buf) - <span class="num">1</span>);
+            <span class="keyword">if</span> (n &lt;= <span class="num">0</span>) <span class="keyword">break</span>;
+            buf[n] = <span class="str">'\0'</span>;
+            <span class="cmd">printf</span>(<span class="str">"okunan: %s"</span>, buf);
+        }
+    }
+    <span class="keyword">return</span> <span class="num">0</span>;
+}</code></pre>
+  </div>
+
+  <h3>FD_SETSIZE=1024 limiti</h3>
+
+  <p><code class="inline">fd_set</code> kernel space'e kopyalanan sabit boyutlu bir bitmask'tır. Boyutu derleme zamanında <code class="inline">FD_SETSIZE</code> sabiti ile belirlenir — çoğu sistemde 1024. Stack üzerinde allocate edilir:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># FD_SETSIZE değerini kontrol et</span>
+<span class="cmd">grep</span> <span class="str">'FD_SETSIZE'</span> <span class="path">/usr/include/bits/typesizes.h</span>
+<span class="cmt"># #define FD_SETSIZE 1024</span>
+
+<span class="cmt"># fd sayısını artırmak için derleme zamanında override (taşınabilir değil)</span>
+<span class="cmd">gcc</span> <span class="flag">-DFD_SETSIZE=4096</span> myserver.c <span class="flag">-o</span> myserver
+<span class="cmt"># ama bu kernel ABI'ını kırar — önerilmez</span></code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT — FD_SETSIZE tuzağı</div>
+    <p>fd numarası 1024 veya daha yüksek bir socket accept edilirse ve bu fd, FD_SET ile fd_set'e eklenirse, <strong>buffer overflow</strong> oluşur — tanımsız davranış. select() 1024'ten büyük fd numarasıyla çağrılırsa kernel hata döner. 100'den fazla eşzamanlı bağlantı bekliyorsan poll veya epoll kullan.</p>
+  </div>
+
+  <h3>select() tuzakları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">fd_set her çağrıda sıfırlanmalı</span><span class="desc">select() dönüşte fd_set içindeki hazır olmayan fd'leri <em>temizler</em>. Döngünün başında mutlaka FD_ZERO + FD_SET yap.</span></div>
+    <div class="param"><span class="name">timeval her çağrıda yenilenmeli</span><span class="desc">Linux, select() sonrası timeval'i kalan süre ile günceller. POSIX bunu garanti etmez — her döngüde yeniden ata.</span></div>
+    <div class="param"><span class="name">nfds = max_fd + 1</span><span class="desc">select() 0'dan nfds-1'e kadar kontrol eder. max fd'yi takip et ve +1 ekle.</span></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> poll()</h2>
+  <p class="section-lead">poll(), select()'in FD_SETSIZE kısıtını ortadan kaldırır — izlenecek fd listesi dinamik dizide taşınır.</p>
+
+  <h3>API</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>poll-api.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">&lt;poll.h&gt;</span>
+
+<span class="keyword">struct</span> pollfd {
+    <span class="keyword">int</span>   fd;       <span class="cmt">/* izlenecek fd */</span>
+    <span class="keyword">short</span> events;   <span class="cmt">/* izlenecek olaylar (giriş) */</span>
+    <span class="keyword">short</span> revents;  <span class="cmt">/* gerçekleşen olaylar (çıkış — kernel doldurur) */</span>
+};
+
+<span class="keyword">int</span> <span class="cmd">poll</span>(<span class="keyword">struct</span> pollfd *fds,   <span class="cmt">/* fd dizisi */</span>
+         nfds_t nfds,           <span class="cmt">/* dizi eleman sayısı */</span>
+         <span class="keyword">int</span> timeout);          <span class="cmt">/* ms cinsinden, -1 = sonsuz */</span></code></pre>
+  </div>
+
+  <h3>events / revents bayrakları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">POLLIN</span><span class="desc">Okuma verisi mevcut (read() bloklamaz).</span></div>
+    <div class="param"><span class="name">POLLOUT</span><span class="desc">Yazma mümkün (write() bloklamaz).</span></div>
+    <div class="param"><span class="name">POLLERR</span><span class="desc">Hata durumu. Sadece revents'te görünür.</span></div>
+    <div class="param"><span class="name">POLLHUP</span><span class="desc">Karşı taraf bağlantıyı kapattı (hangup). Sadece revents'te.</span></div>
+    <div class="param"><span class="name">POLLNVAL</span><span class="desc">Geçersiz fd (kapalı). Sadece revents'te.</span></div>
+    <div class="param"><span class="name">POLLRDHUP</span><span class="desc">Karşı taraf write tarafını kapattı (Linux uzantısı). <code class="inline">_GNU_SOURCE</code> gerektirir.</span></div>
+  </div>
+
+  <h3>Tam örnek: çoklu fd izleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>poll-multi.c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* gcc -o poll-multi poll-multi.c */</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdio.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;poll.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;unistd.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;string.h&gt;</span>
+
+<span class="keyword">int</span> <span class="cmd">main</span>(<span class="keyword">void</span>) {
+    <span class="cmt">/* stdin ve bir pipe fd'sini aynı anda izle */</span>
+    <span class="keyword">int</span> pipefd[<span class="num">2</span>];
+    <span class="cmd">pipe</span>(pipefd);
+
+    <span class="keyword">struct</span> pollfd fds[<span class="num">2</span>] = {
+        { .fd = STDIN_FILENO, .events = POLLIN },
+        { .fd = pipefd[<span class="num">0</span>],   .events = POLLIN },
+    };
+
+    <span class="cmt">/* pipe'a asenkron veri yaz (gerçek senaryoda başka thread/process) */</span>
+    <span class="cmd">write</span>(pipefd[<span class="num">1</span>], <span class="str">"pipe verisi\n"</span>, <span class="num">12</span>);
+
+    <span class="keyword">int</span> ret = <span class="cmd">poll</span>(fds, <span class="num">2</span>, <span class="num">3000</span>); <span class="cmt">/* 3 saniye timeout */</span>
+    <span class="keyword">if</span> (ret &lt;= <span class="num">0</span>) {
+        <span class="cmd">puts</span>(ret == <span class="num">0</span> ? <span class="str">"timeout"</span> : <span class="str">"poll hatası"</span>);
+        <span class="keyword">return</span> <span class="num">1</span>;
+    }
+
+    <span class="keyword">char</span> buf[<span class="num">256</span>];
+    <span class="keyword">for</span> (<span class="keyword">int</span> i = <span class="num">0</span>; i &lt; <span class="num">2</span>; i++) {
+        <span class="keyword">if</span> (fds[i].revents &amp; POLLIN) {
+            <span class="keyword">ssize_t</span> n = <span class="cmd">read</span>(fds[i].fd, buf, <span class="keyword">sizeof</span>(buf) - <span class="num">1</span>);
+            buf[n] = <span class="str">'\0'</span>;
+            <span class="cmd">printf</span>(<span class="str">"fd[%d] okunan: %s"</span>, i, buf);
+        }
+        <span class="keyword">if</span> (fds[i].revents &amp; POLLHUP) {
+            <span class="cmd">printf</span>(<span class="str">"fd[%d] kapandı\n"</span>, i);
+        }
+    }
+
+    <span class="cmd">close</span>(pipefd[<span class="num">0</span>]); <span class="cmd">close</span>(pipefd[<span class="num">1</span>]);
+    <span class="keyword">return</span> <span class="num">0</span>;
+}</code></pre>
+  </div>
+
+  <h3>select'e göre avantajlar ve sınırlar</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Özellik</th><th>select</th><th>poll</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>fd limiti</td><td>FD_SETSIZE=1024</td><td>Sınırsız (nfds adet)</td></tr>
+      <tr><td>fd_set kopyalama</td><td>Her çağrıda kernel'e kopyala</td><td>pollfd dizisi kopyalanır ama daha temiz</td></tr>
+      <tr><td>Tarama karmaşıklığı</td><td>O(n) — nfds kadar kontrol</td><td>O(n) — nfds kadar kontrol</td></tr>
+      <tr><td>Taşınabilirlik</td><td>POSIX, her OS</td><td>POSIX, her OS</td></tr>
+      <tr><td>Yeniden doldurma</td><td>Her çağrıda FD_ZERO + FD_SET zorunlu</td><td>events değişmezse sadece revents sıfırlanır</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>poll()'un select'e göre temel avantajı FD_SETSIZE kısıtının olmamasıdır. Ama her iki API'da da kernel, her çağrıda tüm fd listesini O(n) karmaşıklıkla tarar. 1000+ fd için bu her çağrıda ciddi bir overhead demektir — bu yüzden epoll gerekir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> epoll temelleri</h2>
+  <p class="section-lead">epoll, kernel içinde fd'leri bir red-black tree'de tutar — sadece hazır olanları döner, tüm listeyi taramaz. O(1) notification.</p>
+
+  <h3>API</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>epoll-api.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">&lt;sys/epoll.h&gt;</span>
+
+<span class="cmt">/* epoll instance oluştur — epfd döner (bir fd) */</span>
+<span class="keyword">int</span> epfd = <span class="cmd">epoll_create1</span>(<span class="num">0</span>);
+<span class="cmt">/* EPOLL_CLOEXEC flag'i: exec() sonrası fd otomatik kapanır */</span>
+<span class="keyword">int</span> epfd = <span class="cmd">epoll_create1</span>(EPOLL_CLOEXEC);
+
+<span class="cmt">/* fd'yi epoll'a ekle / değiştir / çıkar */</span>
+<span class="keyword">struct</span> epoll_event ev;
+ev.events   = EPOLLIN;  <span class="cmt">/* izlenecek olaylar */</span>
+ev.data.fd  = fd;       <span class="cmt">/* geri dönüşte tanımlama için veri */</span>
+
+<span class="cmd">epoll_ctl</span>(epfd, EPOLL_CTL_ADD, fd, &amp;ev);  <span class="cmt">/* ekle */</span>
+<span class="cmd">epoll_ctl</span>(epfd, EPOLL_CTL_MOD, fd, &amp;ev);  <span class="cmt">/* güncelle */</span>
+<span class="cmd">epoll_ctl</span>(epfd, EPOLL_CTL_DEL, fd, NULL); <span class="cmt">/* çıkar */</span>
+
+<span class="cmt">/* hazır olayları bekle */</span>
+<span class="keyword">struct</span> epoll_event events[<span class="num">64</span>];
+<span class="keyword">int</span> n = <span class="cmd">epoll_wait</span>(epfd, events, <span class="num">64</span>, <span class="num">-1</span>); <span class="cmt">/* -1 = sonsuz bekle */</span>
+<span class="cmt">/* n: hazır fd sayısı, events[0..n-1] dolu */</span></code></pre>
+  </div>
+
+  <h3>struct epoll_event</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>epoll-event-struct.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">struct</span> epoll_event {
+    uint32_t events;   <span class="cmt">/* EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLHUP, EPOLLET ... */</span>
+    epoll_data_t data; <span class="cmt">/* kullanıcı verisi — union */</span>
+};
+
+<span class="keyword">typedef union</span> epoll_data {
+    <span class="keyword">void</span>    *ptr;  <span class="cmt">/* struct pointer — bağlam taşıma için */</span>
+    <span class="keyword">int</span>      fd;   <span class="cmt">/* sadece fd numarası */</span>
+    uint32_t u32;
+    uint64_t u64;
+} epoll_data_t;</code></pre>
+  </div>
+
+  <h3>epoll olayları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">EPOLLIN</span><span class="desc">Okuma mevcut — read() bloklamaz.</span></div>
+    <div class="param"><span class="name">EPOLLOUT</span><span class="desc">Yazma mümkün — write() bloklamaz.</span></div>
+    <div class="param"><span class="name">EPOLLERR</span><span class="desc">Hata durumu. Otomatik izlenir, events'te belirtmek gerekmez.</span></div>
+    <div class="param"><span class="name">EPOLLHUP</span><span class="desc">Hangup — karşı taraf kapandı. Otomatik izlenir.</span></div>
+    <div class="param"><span class="name">EPOLLET</span><span class="desc">Edge-triggered mod. Bölüm 04'te detay.</span></div>
+    <div class="param"><span class="name">EPOLLONESHOT</span><span class="desc">Olay bir kez tetiklenir, sonra fd deaktive olur. epoll_ctl MOD ile yeniden etkinleştir.</span></div>
+    <div class="param"><span class="name">EPOLLRDHUP</span><span class="desc">Karşı taraf write tarafını kapattı (half-close). <code class="inline">_GNU_SOURCE</code> gerekir.</span></div>
+    <div class="param"><span class="name">EPOLLEXCLUSIVE</span><span class="desc">Birden fazla thread aynı fd'yi izliyorsa sadece birine bildir (thundering herd önleme).</span></div>
+  </div>
+
+  <h3>Echo server skeleton</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>epoll-echo-skeleton.c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* gcc -o epoll-echo epoll-echo-skeleton.c */</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdio.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdlib.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;sys/epoll.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;sys/socket.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;netinet/in.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;unistd.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;fcntl.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;errno.h&gt;</span>
+
+<span class="keyword">#define</span> PORT      <span class="num">8080</span>
+<span class="keyword">#define</span> MAX_EVENTS <span class="num">64</span>
+
+<span class="keyword">static int</span> <span class="cmd">make_listen_socket</span>(<span class="keyword">int</span> port);
+<span class="keyword">static int</span> <span class="cmd">set_nonblocking</span>(<span class="keyword">int</span> fd);
+
+<span class="keyword">int</span> <span class="cmd">main</span>(<span class="keyword">void</span>) {
+    <span class="keyword">int</span> listen_fd = <span class="cmd">make_listen_socket</span>(PORT);
+    <span class="cmd">set_nonblocking</span>(listen_fd);
+
+    <span class="keyword">int</span> epfd = <span class="cmd">epoll_create1</span>(EPOLL_CLOEXEC);
+
+    <span class="keyword">struct</span> epoll_event ev = { .events = EPOLLIN, .data.fd = listen_fd };
+    <span class="cmd">epoll_ctl</span>(epfd, EPOLL_CTL_ADD, listen_fd, &amp;ev);
+
+    <span class="keyword">struct</span> epoll_event events[MAX_EVENTS];
+
+    <span class="cmd">printf</span>(<span class="str">"dinleniyor: port %d\n"</span>, PORT);
+
+    <span class="keyword">while</span> (<span class="num">1</span>) {
+        <span class="keyword">int</span> n = <span class="cmd">epoll_wait</span>(epfd, events, MAX_EVENTS, <span class="num">-1</span>);
+        <span class="keyword">for</span> (<span class="keyword">int</span> i = <span class="num">0</span>; i &lt; n; i++) {
+            <span class="keyword">int</span> fd = events[i].data.fd;
+
+            <span class="keyword">if</span> (fd == listen_fd) {
+                <span class="cmt">/* yeni bağlantı kabul et */</span>
+                <span class="keyword">int</span> conn = <span class="cmd">accept</span>(listen_fd, NULL, NULL);
+                <span class="keyword">if</span> (conn == <span class="num">-1</span>) <span class="keyword">continue</span>;
+                <span class="cmd">set_nonblocking</span>(conn);
+                ev.events  = EPOLLIN;
+                ev.data.fd = conn;
+                <span class="cmd">epoll_ctl</span>(epfd, EPOLL_CTL_ADD, conn, &amp;ev);
+            } <span class="keyword">else</span> {
+                <span class="cmt">/* istemciden veri */</span>
+                <span class="keyword">char</span> buf[<span class="num">4096</span>];
+                <span class="keyword">ssize_t</span> r = <span class="cmd">read</span>(fd, buf, <span class="keyword">sizeof</span>(buf));
+                <span class="keyword">if</span> (r &lt;= <span class="num">0</span>) {
+                    <span class="cmd">epoll_ctl</span>(epfd, EPOLL_CTL_DEL, fd, NULL);
+                    <span class="cmd">close</span>(fd);
+                } <span class="keyword">else</span> {
+                    <span class="cmd">write</span>(fd, buf, r); <span class="cmt">/* echo */</span>
+                }
+            }
+        }
+    }
+}
+
+<span class="keyword">static int</span> <span class="cmd">make_listen_socket</span>(<span class="keyword">int</span> port) {
+    <span class="keyword">int</span> fd = <span class="cmd">socket</span>(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, <span class="num">0</span>);
+    <span class="keyword">int</span> opt = <span class="num">1</span>;
+    <span class="cmd">setsockopt</span>(fd, SOL_SOCKET, SO_REUSEADDR, &amp;opt, <span class="keyword">sizeof</span>(opt));
+    <span class="keyword">struct</span> sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = INADDR_ANY,
+        .sin_port = <span class="cmd">htons</span>(port),
+    };
+    <span class="cmd">bind</span>(fd, (<span class="keyword">struct</span> sockaddr*)&amp;addr, <span class="keyword">sizeof</span>(addr));
+    <span class="cmd">listen</span>(fd, SOMAXCONN);
+    <span class="keyword">return</span> fd;
+}
+
+<span class="keyword">static int</span> <span class="cmd">set_nonblocking</span>(<span class="keyword">int</span> fd) {
+    <span class="keyword">int</span> flags = <span class="cmd">fcntl</span>(fd, F_GETFL, <span class="num">0</span>);
+    <span class="keyword">return</span> <span class="cmd">fcntl</span>(fd, F_SETFL, flags | O_NONBLOCK);
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Level-triggered vs Edge-triggered</h2>
+  <p class="section-lead">epoll'un iki çalışma modu arasındaki fark, veri buffer'ında ne zaman bildirim yapıldığıdır.</p>
+
+  <h3>Level-triggered (LT) — varsayılan</h3>
+
+  <p>Kernel buffer'da okunmamış veri olduğu sürece, her <code class="inline">epoll_wait</code> çağrısında EPOLLIN döner. "Seviye" — buffer dolu kaldıkça tetikler:</p>
+
+  <div class="flow">
+    <pre>
+  100 byte veri geldi
+  epoll_wait → EPOLLIN  ✓
+  50 byte oku → 50 byte kaldı
+  epoll_wait → EPOLLIN  ✓  (hâlâ veri var)
+  50 byte oku → 0 byte kaldı
+  epoll_wait → bekle  (veri yok)
+    </pre>
+  </div>
+
+  <h3>Edge-triggered (ET) — EPOLLET</h3>
+
+  <p>Kernel, sadece yeni veri <em>geldiğinde</em> (buffer boşken dolduğunda = kenar değişimi) bir kez EPOLLIN üretir. Veri okunmadan bir sonraki <code class="inline">epoll_wait</code>'e geçilirse bildirim kaybolur:</p>
+
+  <div class="flow">
+    <pre>
+  100 byte veri geldi
+  epoll_wait → EPOLLIN  ✓  (kenar: boş→dolu geçişi)
+  50 byte oku → 50 byte kaldı
+  epoll_wait → bekle  ✗  (kenar değişmedi — hâlâ dolu)
+  50 byte daha oku → 0 byte
+  epoll_wait → bekle  (boş — yeni veri bekleniyor)
+    </pre>
+  </div>
+
+  <h3>ET zorunluluğu: EAGAIN'e kadar oku</h3>
+
+  <p>ET modunda bir bildirim aldığında, o fd'deki tüm veriyi bitirene kadar döngüde okumak zorundasın. Aksi hâlde bir sonraki epoll_wait bildirim üretmez ve veri kaybolmaz ama asla işlenmez:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>et-recv-loop.c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* ET modunda EPOLLIN geldiğinde çağrılır */</span>
+<span class="keyword">void</span> <span class="cmd">handle_epollin_et</span>(<span class="keyword">int</span> fd) {
+    <span class="keyword">char</span> buf[<span class="num">4096</span>];
+    <span class="keyword">ssize_t</span> total = <span class="num">0</span>;
+
+    <span class="keyword">while</span> (<span class="num">1</span>) {
+        <span class="keyword">ssize_t</span> n = <span class="cmd">read</span>(fd, buf, <span class="keyword">sizeof</span>(buf));
+
+        <span class="keyword">if</span> (n == <span class="num">-1</span>) {
+            <span class="keyword">if</span> (errno == EAGAIN || errno == EWOULDBLOCK) {
+                <span class="cmt">/* buffer boşaldı — döngüyü bitir, epoll_wait'e dön */</span>
+                <span class="keyword">break</span>;
+            }
+            <span class="cmt">/* gerçek hata */</span>
+            <span class="cmd">perror</span>(<span class="str">"read"</span>);
+            <span class="keyword">break</span>;
+        }
+        <span class="keyword">if</span> (n == <span class="num">0</span>) {
+            <span class="cmt">/* bağlantı kapandı (EOF) */</span>
+            <span class="cmd">close</span>(fd);
+            <span class="keyword">break</span>;
+        }
+
+        total += n;
+        <span class="cmt">/* veriyi işle */</span>
+        <span class="cmd">write</span>(fd, buf, n); <span class="cmt">/* echo */</span>
+    }
+    <span class="cmd">printf</span>(<span class="str">"toplam okunan: %zd byte\n"</span>, total);
+}
+
+<span class="cmt">/* epoll_ctl ile ET modunda ekle */</span>
+<span class="keyword">struct</span> epoll_event ev = {
+    .events  = EPOLLIN | EPOLLET,  <span class="cmt">/* edge-triggered */</span>
+    .data.fd = client_fd,
+};
+<span class="cmd">epoll_ctl</span>(epfd, EPOLL_CTL_ADD, client_fd, &amp;ev);</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>ET daha yüksek performans sağlar çünkü aynı verisi için tekrar tekrar epoll_wait→işle döngüsüne girmez. Ama doğru implement etmek daha zordur: fd mutlaka non-blocking olmalı, EAGAIN alana kadar döngü kırılmamalı. Hata: ET + blocking fd kombinasyonu kesinlikle deadlock'a yol açar.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> epoll_data_t ile bağlam taşıma</h2>
+  <p class="section-lead">epoll_data_t union'ı ile her fd'ye bağlam verisi atanır — bağlantı state'ini pointer olarak taşıyarak çok istemcili yönetim mümkün olur.</p>
+
+  <h3>data.fd vs data.ptr</h3>
+
+  <p><code class="inline">data.fd</code> sadece fd numarasını tutar. Birden fazla bağlantı varsa her bağlantının buffer'ını, durumunu ve protokol state makinesini takip etmek için <code class="inline">data.ptr</code> kullan:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>conn-state.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">&lt;sys/epoll.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdlib.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;string.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;unistd.h&gt;</span>
+
+<span class="keyword">#define</span> BUF_SIZE <span class="num">8192</span>
+
+<span class="cmt">/* bağlantı başına state yapısı */</span>
+<span class="keyword">typedef struct</span> {
+    <span class="keyword">int</span>    fd;
+    <span class="keyword">char</span>   buf[BUF_SIZE];
+    <span class="keyword">int</span>    buf_len;
+    <span class="keyword">int</span>    bytes_sent;
+    <span class="keyword">int</span>    state;    <span class="cmt">/* 0=reading, 1=writing, 2=closing */</span>
+} conn_state_t;
+
+conn_state_t* <span class="cmd">conn_new</span>(<span class="keyword">int</span> fd) {
+    conn_state_t *c = <span class="cmd">calloc</span>(<span class="num">1</span>, <span class="keyword">sizeof</span>(conn_state_t));
+    c->fd = fd;
+    <span class="keyword">return</span> c;
+}
+
+<span class="keyword">void</span> <span class="cmd">conn_free</span>(conn_state_t *c) {
+    <span class="keyword">if</span> (c) { <span class="cmd">close</span>(c->fd); <span class="cmd">free</span>(c); }
+}
+
+<span class="cmt">/* yeni bağlantıyı epoll'a ptr ile ekle */</span>
+<span class="keyword">void</span> <span class="cmd">add_conn</span>(<span class="keyword">int</span> epfd, <span class="keyword">int</span> client_fd) {
+    conn_state_t *c = <span class="cmd">conn_new</span>(client_fd);
+    <span class="keyword">struct</span> epoll_event ev = {
+        .events   = EPOLLIN | EPOLLET,
+        .data.ptr = c,   <span class="cmt">/* fd yerine struct pointer */</span>
+    };
+    <span class="cmd">epoll_ctl</span>(epfd, EPOLL_CTL_ADD, client_fd, &amp;ev);
+}
+
+<span class="cmt">/* event loop içinde bağlamı geri al */</span>
+<span class="keyword">void</span> <span class="cmd">process_event</span>(<span class="keyword">struct</span> epoll_event *ev) {
+    conn_state_t *c = (<span class="keyword">struct</span> conn_state_t *)ev->data.ptr;
+
+    <span class="keyword">if</span> (ev->events &amp; EPOLLIN) {
+        <span class="keyword">ssize_t</span> n = <span class="cmd">read</span>(c->fd, c->buf + c->buf_len,
+                          BUF_SIZE - c->buf_len);
+        <span class="keyword">if</span> (n &gt; <span class="num">0</span>) {
+            c->buf_len += n;
+            <span class="cmt">/* protokol işleme buraya gelir */</span>
+        } <span class="keyword">else if</span> (n == <span class="num">0</span> || (n == <span class="num">-1</span> &amp;&amp; errno != EAGAIN)) {
+            <span class="cmd">conn_free</span>(c);
+        }
+    }
+}</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT — double free</div>
+    <p>conn_state_t pointer'ını hem EPOLLERR hem EPOLLHUP aldığında iki kez free etmemeye dikkat et. Hemen epoll_ctl DEL + close çağır, pointer'ı NULL'a ata. Aynı fd'ye ait birden fazla event, tek epoll_wait döngüsünde gelebilir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Tam accept loop implementasyonu</h2>
+  <p class="section-lead">Gerçek bir multi-client echo server — listen socket, accept4, hata yönetimi ve bağlantı temizliği ile birlikte.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>epoll-server.c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* gcc -o epoll-server epoll-server.c */</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdio.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdlib.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;string.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;unistd.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;fcntl.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;errno.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;sys/epoll.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;sys/socket.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;netinet/in.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;arpa/inet.h&gt;</span>
+
+<span class="keyword">#define</span> PORT       <span class="num">8080</span>
+<span class="keyword">#define</span> MAX_EVENTS <span class="num">128</span>
+<span class="keyword">#define</span> BUF_SIZE   <span class="num">4096</span>
+
+<span class="keyword">static int</span> <span class="cmd">set_nonblocking</span>(<span class="keyword">int</span> fd) {
+    <span class="keyword">int</span> flags = <span class="cmd">fcntl</span>(fd, F_GETFL, <span class="num">0</span>);
+    <span class="keyword">if</span> (flags == <span class="num">-1</span>) <span class="keyword">return</span> <span class="num">-1</span>;
+    <span class="keyword">return</span> <span class="cmd">fcntl</span>(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+<span class="keyword">static int</span> <span class="cmd">create_listen_socket</span>() {
+    <span class="keyword">int</span> fd = <span class="cmd">socket</span>(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, <span class="num">0</span>);
+    <span class="keyword">if</span> (fd == <span class="num">-1</span>) { <span class="cmd">perror</span>(<span class="str">"socket"</span>); <span class="cmd">exit</span>(<span class="num">1</span>); }
+
+    <span class="keyword">int</span> opt = <span class="num">1</span>;
+    <span class="cmd">setsockopt</span>(fd, SOL_SOCKET, SO_REUSEADDR, &amp;opt, <span class="keyword">sizeof</span>(opt));
+    <span class="cmd">setsockopt</span>(fd, SOL_SOCKET, SO_REUSEPORT, &amp;opt, <span class="keyword">sizeof</span>(opt));
+
+    <span class="keyword">struct</span> sockaddr_in addr = {
+        .sin_family      = AF_INET,
+        .sin_addr.s_addr = INADDR_ANY,
+        .sin_port        = <span class="cmd">htons</span>(PORT),
+    };
+    <span class="keyword">if</span> (<span class="cmd">bind</span>(fd, (<span class="keyword">struct</span> sockaddr*)&amp;addr, <span class="keyword">sizeof</span>(addr)) == <span class="num">-1</span>) {
+        <span class="cmd">perror</span>(<span class="str">"bind"</span>); <span class="cmd">exit</span>(<span class="num">1</span>);
+    }
+    <span class="keyword">if</span> (<span class="cmd">listen</span>(fd, SOMAXCONN) == <span class="num">-1</span>) {
+        <span class="cmd">perror</span>(<span class="str">"listen"</span>); <span class="cmd">exit</span>(<span class="num">1</span>);
+    }
+    <span class="keyword">return</span> fd;
+}
+
+<span class="keyword">static void</span> <span class="cmd">handle_accept</span>(<span class="keyword">int</span> epfd, <span class="keyword">int</span> listen_fd) {
+    <span class="keyword">while</span> (<span class="num">1</span>) {
+        <span class="keyword">struct</span> sockaddr_in client_addr;
+        <span class="keyword">socklen_t</span> addrlen = <span class="keyword">sizeof</span>(client_addr);
+
+        <span class="cmt">/* accept4: atomik olarak non-blocking + cloexec ayarla */</span>
+        <span class="keyword">int</span> conn = <span class="cmd">accept4</span>(listen_fd,
+                            (<span class="keyword">struct</span> sockaddr*)&amp;client_addr,
+                            &amp;addrlen,
+                            SOCK_NONBLOCK | SOCK_CLOEXEC);
+
+        <span class="keyword">if</span> (conn == <span class="num">-1</span>) {
+            <span class="keyword">if</span> (errno == EAGAIN || errno == EWOULDBLOCK)
+                <span class="keyword">break</span>;  <span class="cmt">/* bekleyen bağlantı kalmadı */</span>
+            <span class="keyword">if</span> (errno == EINTR)
+                <span class="keyword">continue</span>;  <span class="cmt">/* sinyal tarafından kesildi, tekrar dene */</span>
+            <span class="cmd">perror</span>(<span class="str">"accept4"</span>);
+            <span class="keyword">break</span>;
+        }
+
+        <span class="keyword">char</span> ip[INET_ADDRSTRLEN];
+        <span class="cmd">inet_ntop</span>(AF_INET, &amp;client_addr.sin_addr, ip, <span class="keyword">sizeof</span>(ip));
+        <span class="cmd">printf</span>(<span class="str">"yeni bağlantı: %s:%d (fd=%d)\n"</span>,
+               ip, <span class="cmd">ntohs</span>(client_addr.sin_port), conn);
+
+        <span class="keyword">struct</span> epoll_event ev = {
+            .events  = EPOLLIN | EPOLLET | EPOLLRDHUP,
+            .data.fd = conn,
+        };
+        <span class="keyword">if</span> (<span class="cmd">epoll_ctl</span>(epfd, EPOLL_CTL_ADD, conn, &amp;ev) == <span class="num">-1</span>) {
+            <span class="cmd">perror</span>(<span class="str">"epoll_ctl add conn"</span>);
+            <span class="cmd">close</span>(conn);
+        }
+    }
+}
+
+<span class="keyword">static void</span> <span class="cmd">handle_client</span>(<span class="keyword">int</span> epfd, <span class="keyword">struct</span> epoll_event *ev) {
+    <span class="keyword">int</span> fd = ev->data.fd;
+
+    <span class="keyword">if</span> (ev->events &amp; (EPOLLHUP | EPOLLRDHUP | EPOLLERR)) {
+        <span class="cmd">printf</span>(<span class="str">"bağlantı kapandı: fd=%d\n"</span>, fd);
+        <span class="cmd">epoll_ctl</span>(epfd, EPOLL_CTL_DEL, fd, NULL);
+        <span class="cmd">close</span>(fd);
+        <span class="keyword">return</span>;
+    }
+
+    <span class="keyword">if</span> (ev->events &amp; EPOLLIN) {
+        <span class="keyword">char</span> buf[BUF_SIZE];
+        <span class="keyword">while</span> (<span class="num">1</span>) {
+            <span class="keyword">ssize_t</span> n = <span class="cmd">read</span>(fd, buf, <span class="keyword">sizeof</span>(buf));
+            <span class="keyword">if</span> (n == <span class="num">-1</span>) {
+                <span class="keyword">if</span> (errno == EAGAIN || errno == EWOULDBLOCK)
+                    <span class="keyword">break</span>;  <span class="cmt">/* buffer boşaldı */</span>
+                <span class="keyword">if</span> (errno == ECONNRESET) {
+                    <span class="cmd">printf</span>(<span class="str">"bağlantı sıfırlandı: fd=%d\n"</span>, fd);
+                    <span class="cmd">epoll_ctl</span>(epfd, EPOLL_CTL_DEL, fd, NULL);
+                    <span class="cmd">close</span>(fd);
+                    <span class="keyword">return</span>;
+                }
+                <span class="cmd">perror</span>(<span class="str">"read"</span>); <span class="keyword">break</span>;
+            }
+            <span class="keyword">if</span> (n == <span class="num">0</span>) {
+                <span class="cmt">/* EOF — bağlantı düzgün kapandı */</span>
+                <span class="cmd">epoll_ctl</span>(epfd, EPOLL_CTL_DEL, fd, NULL);
+                <span class="cmd">close</span>(fd);
+                <span class="keyword">return</span>;
+            }
+            <span class="cmt">/* echo: okunanı geri yaz */</span>
+            <span class="keyword">ssize_t</span> sent = <span class="num">0</span>;
+            <span class="keyword">while</span> (sent &lt; n) {
+                <span class="keyword">ssize_t</span> w = <span class="cmd">write</span>(fd, buf + sent, n - sent);
+                <span class="keyword">if</span> (w &lt;= <span class="num">0</span>) <span class="keyword">break</span>;
+                sent += w;
+            }
+        }
+    }
+}
+
+<span class="keyword">int</span> <span class="cmd">main</span>(<span class="keyword">void</span>) {
+    <span class="keyword">int</span> listen_fd = <span class="cmd">create_listen_socket</span>();
+    <span class="cmd">set_nonblocking</span>(listen_fd);
+
+    <span class="keyword">int</span> epfd = <span class="cmd">epoll_create1</span>(EPOLL_CLOEXEC);
+    <span class="keyword">if</span> (epfd == <span class="num">-1</span>) { <span class="cmd">perror</span>(<span class="str">"epoll_create1"</span>); <span class="cmd">exit</span>(<span class="num">1</span>); }
+
+    <span class="keyword">struct</span> epoll_event ev = {
+        .events  = EPOLLIN | EPOLLET,
+        .data.fd = listen_fd,
+    };
+    <span class="cmd">epoll_ctl</span>(epfd, EPOLL_CTL_ADD, listen_fd, &amp;ev);
+
+    <span class="keyword">struct</span> epoll_event events[MAX_EVENTS];
+    <span class="cmd">printf</span>(<span class="str">"epoll echo server başladı, port %d\n"</span>, PORT);
+
+    <span class="keyword">while</span> (<span class="num">1</span>) {
+        <span class="keyword">int</span> n = <span class="cmd">epoll_wait</span>(epfd, events, MAX_EVENTS, <span class="num">-1</span>);
+        <span class="keyword">if</span> (n == <span class="num">-1</span>) {
+            <span class="keyword">if</span> (errno == EINTR) <span class="keyword">continue</span>; <span class="cmt">/* sinyal */</span>
+            <span class="cmd">perror</span>(<span class="str">"epoll_wait"</span>); <span class="keyword">break</span>;
+        }
+        <span class="keyword">for</span> (<span class="keyword">int</span> i = <span class="num">0</span>; i &lt; n; i++) {
+            <span class="keyword">if</span> (events[i].data.fd == listen_fd)
+                <span class="cmd">handle_accept</span>(epfd, listen_fd);
+            <span class="keyword">else</span>
+                <span class="cmd">handle_client</span>(epfd, &amp;events[i]);
+        }
+    }
+    <span class="cmd">close</span>(epfd);
+    <span class="cmd">close</span>(listen_fd);
+    <span class="keyword">return</span> <span class="num">0</span>;
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde öğrendikleriniz</h4>
+    <ul>
+      <li>accept4() ile atomik SOCK_NONBLOCK + SOCK_CLOEXEC ayarlanır</li>
+      <li>Listen socket ET modunda, accept döngüsü EAGAIN'e kadar çalışır</li>
+      <li>EPOLLRDHUP ile half-close durumu temiz yakalanır</li>
+      <li>EINTR kontrolü: signal handler'lar epoll_wait'i keser, döngü devam etmeli</li>
+      <li>ECONNRESET: karşı taraf RST gönderdi — fd hemen temizlenmeli</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Python asyncio ve epoll bağlantısı</h2>
+  <p class="section-lead">asyncio'nun altında epoll vardır — await bir coroutine'i askıya aldığında, event loop ilgili fd'yi epoll ile izler.</p>
+
+  <h3>Event loop ve selector katmanı</h3>
+
+  <div class="flow">
+    <pre>
+  asyncio.run(main())
+       │
+  EventLoop  (DefaultEventLoopPolicy → SelectorEventLoop)
+       │
+  SelectorEventLoop._selector
+       ├─ Linux    → EpollSelector  (selectors.EpollSelector)
+       ├─ macOS    → KqueueSelector
+       └─ Windows  → SelectSelector (ProactorEventLoop tercih edilir)
+    </pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>asyncio-selector.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> asyncio
+<span class="keyword">import</span> selectors
+
+<span class="cmt"># çalışan selector tipini doğrula</span>
+loop = asyncio.<span class="cmd">get_event_loop</span>()
+<span class="cmd">print</span>(<span class="cmd">type</span>(loop._selector))
+<span class="cmt"># &lt;class 'selectors.EpollSelector'&gt;  (Linux'ta)</span>
+
+<span class="cmt"># EpollSelector'ın altındaki epoll fd'sini al</span>
+selector = loop._selector
+<span class="cmd">print</span>(selector._epoll)
+<span class="cmt"># &lt;select.epoll object at 0x...&gt;</span></code></pre>
+  </div>
+
+  <h3>asyncio ile TCP server ve client</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>asyncio-server.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> asyncio
+
+<span class="keyword">async def</span> <span class="cmd">handle_client</span>(reader: asyncio.StreamReader,
+                        writer: asyncio.StreamWriter):
+    addr = writer.get_extra_info(<span class="str">'peername'</span>)
+    <span class="cmd">print</span>(<span class="str">f"bağlantı: {addr}"</span>)
+
+    <span class="keyword">try</span>:
+        <span class="keyword">while</span> <span class="keyword">True</span>:
+            <span class="cmt"># await → coroutine askıya alınır, event loop epoll ile bekler</span>
+            data = <span class="keyword">await</span> reader.<span class="cmd">read</span>(<span class="num">4096</span>)
+            <span class="keyword">if</span> <span class="keyword">not</span> data:
+                <span class="keyword">break</span>
+            writer.<span class="cmd">write</span>(data)         <span class="cmt"># buffer'a yaz</span>
+            <span class="keyword">await</span> writer.<span class="cmd">drain</span>()       <span class="cmt"># kernel buffer'ı boşalana kadar bekle</span>
+    <span class="keyword">except</span> (asyncio.CancelledError, ConnectionResetError):
+        <span class="keyword">pass</span>
+    <span class="keyword">finally</span>:
+        writer.<span class="cmd">close</span>()
+        <span class="keyword">await</span> writer.<span class="cmd">wait_closed</span>()
+        <span class="cmd">print</span>(<span class="str">f"kapatıldı: {addr}"</span>)
+
+<span class="keyword">async def</span> <span class="cmd">main</span>():
+    server = <span class="keyword">await</span> asyncio.<span class="cmd">start_server</span>(
+        handle_client, <span class="str">'0.0.0.0'</span>, <span class="num">8080</span>
+    )
+    async <span class="keyword">with</span> server:
+        <span class="keyword">await</span> server.<span class="cmd">serve_forever</span>()
+
+asyncio.<span class="cmd">run</span>(<span class="cmd">main</span>())</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>asyncio-client.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> asyncio
+
+<span class="keyword">async def</span> <span class="cmd">tcp_client</span>():
+    reader, writer = <span class="keyword">await</span> asyncio.<span class="cmd">open_connection</span>(<span class="str">'127.0.0.1'</span>, <span class="num">8080</span>)
+
+    writer.<span class="cmd">write</span>(<span class="str">b"merhaba\n"</span>)
+    <span class="keyword">await</span> writer.<span class="cmd">drain</span>()
+
+    data = <span class="keyword">await</span> reader.<span class="cmd">readline</span>()
+    <span class="cmd">print</span>(<span class="str">f"yanıt: {data.decode()!r}"</span>)
+
+    writer.<span class="cmd">close</span>()
+    <span class="keyword">await</span> writer.<span class="cmd">wait_closed</span>()
+
+asyncio.<span class="cmd">run</span>(<span class="cmd">tcp_client</span>())</code></pre>
+  </div>
+
+  <h3>await → epoll bağlantısı</h3>
+
+  <p>asyncio'da <code class="inline">await reader.read(4096)</code> çağrısının arka planında olan şu:</p>
+
+  <div class="flow">
+    <pre>
+  await reader.read(4096)
+       │
+  SelectorEventLoop._read_ready_cb → fd EPOLLIN bekliyor
+       │
+  epoll_wait() (blocking — tüm ready event'ler için)
+       │
+  fd hazır → callback → coroutine resume → read() çağrısı
+    </pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT — uvloop</div>
+    <p>uvloop, asyncio'nun default event loop'unun yerine geçen Cython tabanlı bir alternatiftir. libuv (Node.js'in C event loop kütüphanesi) kullanır ve Linux'ta epoll'u daha verimli şekilde sarmalar. <code class="inline">pip install uvloop</code>, ardından <code class="inline">asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())</code> — benchmark'larda asyncio'dan 2-4x daha hızlı sonuçlar verir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> kqueue, io_uring ve gelecek</h2>
+  <p class="section-lead">epoll Linux'a özgüdür. BSD/macOS'ta kqueue, Linux 5.1+'da ise io_uring daha güçlü bir alternatif sunar.</p>
+
+  <h3>kqueue — BSD ve macOS</h3>
+
+  <p>kqueue, FreeBSD 4.1 (2000) ile geldi, macOS/iOS'ta da desteklenir. API epoll'a benzer ama event filter sistemi daha zengindir:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>kqueue-example.c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* macOS / FreeBSD — Linux'ta derlenmez */</span>
+<span class="keyword">#include</span> <span class="str">&lt;sys/event.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;unistd.h&gt;</span>
+
+<span class="keyword">int</span> <span class="cmd">main</span>(<span class="keyword">void</span>) {
+    <span class="keyword">int</span> kq = <span class="cmd">kqueue</span>();           <span class="cmt">/* epoll_create1 gibi */</span>
+
+    <span class="keyword">struct</span> kevent change;
+    <span class="cmt">/* EV_SET: fd, filter, flags, fflags, data, udata */</span>
+    <span class="cmd">EV_SET</span>(&amp;change, STDIN_FILENO, EVFILT_READ, EV_ADD | EV_ENABLE,
+           <span class="num">0</span>, <span class="num">0</span>, NULL);
+
+    <span class="cmd">kevent</span>(kq, &amp;change, <span class="num">1</span>, NULL, <span class="num">0</span>, NULL);  <span class="cmt">/* ekle */</span>
+
+    <span class="keyword">struct</span> kevent events[<span class="num">16</span>];
+    <span class="keyword">int</span> n = <span class="cmd">kevent</span>(kq, NULL, <span class="num">0</span>, events, <span class="num">16</span>, NULL);  <span class="cmt">/* bekle */</span>
+
+    <span class="keyword">for</span> (<span class="keyword">int</span> i = <span class="num">0</span>; i &lt; n; i++) {
+        <span class="keyword">if</span> (events[i].filter == EVFILT_READ)
+            <span class="cmd">printf</span>(<span class="str">"fd %lu okumaya hazır\n"</span>, events[i].ident);
+    }
+
+    <span class="cmd">close</span>(kq);
+    <span class="keyword">return</span> <span class="num">0</span>;
+}</code></pre>
+  </div>
+
+  <h3>io_uring — Linux 5.1+</h3>
+
+  <p>io_uring, kernel ve user space arasında paylaşılan ring buffer kullanır. Sistem çağrısı overhead'i minimize edilir; batch I/O, zero-copy, async dosya I/O mümkün olur:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>io-uring-echo.c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* gcc -o io-uring-echo io-uring-echo.c -luring */</span>
+<span class="keyword">#include</span> <span class="str">&lt;liburing.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdio.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;unistd.h&gt;</span>
+
+<span class="keyword">#define</span> QUEUE_DEPTH <span class="num">64</span>
+
+<span class="keyword">int</span> <span class="cmd">main</span>(<span class="keyword">void</span>) {
+    <span class="keyword">struct</span> io_uring ring;
+    <span class="keyword">int</span> ret = <span class="cmd">io_uring_queue_init</span>(QUEUE_DEPTH, &amp;ring, <span class="num">0</span>);
+    <span class="keyword">if</span> (ret) { <span class="cmd">perror</span>(<span class="str">"io_uring_queue_init"</span>); <span class="keyword">return</span> <span class="num">1</span>; }
+
+    <span class="keyword">char</span> buf[<span class="num">256</span>];
+
+    <span class="cmt">/* submission queue'ya async read isteği ekle */</span>
+    <span class="keyword">struct</span> io_uring_sqe *sqe = <span class="cmd">io_uring_get_sqe</span>(&amp;ring);
+    <span class="cmd">io_uring_prep_read</span>(sqe, STDIN_FILENO, buf, <span class="keyword">sizeof</span>(buf), <span class="num">0</span>);
+    <span class="cmd">io_uring_sqe_set_data64</span>(sqe, <span class="num">1</span>); <span class="cmt">/* kullanıcı veri = 1 */</span>
+
+    <span class="cmd">io_uring_submit</span>(&amp;ring);  <span class="cmt">/* tek syscall: tüm pending SQE'leri gönder */</span>
+
+    <span class="cmt">/* completion queue'dan sonuç al */</span>
+    <span class="keyword">struct</span> io_uring_cqe *cqe;
+    <span class="cmd">io_uring_wait_cqe</span>(&amp;ring, &amp;cqe);
+
+    <span class="keyword">if</span> (cqe->res &gt; <span class="num">0</span>) {
+        buf[cqe->res] = <span class="str">'\0'</span>;
+        <span class="cmd">printf</span>(<span class="str">"okunan: %s"</span>, buf);
+    }
+
+    <span class="cmd">io_uring_cqe_seen</span>(&amp;ring, cqe);  <span class="cmt">/* CQE'yi tüketildi olarak işaretle */</span>
+    <span class="cmd">io_uring_queue_exit</span>(&amp;ring);
+    <span class="keyword">return</span> <span class="num">0</span>;
+}</code></pre>
+  </div>
+
+  <h3>Karşılaştırma tablosu</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr>
+        <th>Özellik</th>
+        <th>select</th>
+        <th>poll</th>
+        <th>epoll</th>
+        <th>kqueue</th>
+        <th>io_uring</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>OS desteği</td>
+        <td>POSIX</td>
+        <td>POSIX</td>
+        <td>Linux 2.5.44+</td>
+        <td>BSD / macOS</td>
+        <td>Linux 5.1+</td>
+      </tr>
+      <tr>
+        <td>fd limiti</td>
+        <td>FD_SETSIZE (1024)</td>
+        <td>Sınırsız</td>
+        <td>Sınırsız</td>
+        <td>Sınırsız</td>
+        <td>Sınırsız</td>
+      </tr>
+      <tr>
+        <td>Notification</td>
+        <td>O(n) tarama</td>
+        <td>O(n) tarama</td>
+        <td>O(1) ready</td>
+        <td>O(1) ready</td>
+        <td>O(1) async</td>
+      </tr>
+      <tr>
+        <td>Kernel/user kopyalama</td>
+        <td>Her çağrıda tüm set</td>
+        <td>Her çağrıda dizi</td>
+        <td>Sadece hazır event'ler</td>
+        <td>Sadece hazır event'ler</td>
+        <td>Ring buffer — zero-copy</td>
+      </tr>
+      <tr>
+        <td>Dosya I/O desteği</td>
+        <td>Hayır</td>
+        <td>Hayır</td>
+        <td>Hayır</td>
+        <td>Kısmi</td>
+        <td>Evet (async file I/O)</td>
+      </tr>
+      <tr>
+        <td>Syscall sayısı (batch)</td>
+        <td>N event = N syscall</td>
+        <td>N event = N syscall</td>
+        <td>N event = 1 epoll_wait</td>
+        <td>N event = 1 kevent</td>
+        <td>N iş = 1 submit</td>
+      </tr>
+      <tr>
+        <td>Edge-triggered</td>
+        <td>Hayır</td>
+        <td>Hayır</td>
+        <td>EPOLLET ile evet</td>
+        <td>EV_CLEAR ile evet</td>
+        <td>Doğası gereği async</td>
+      </tr>
+      <tr>
+        <td>Öğrenme eğrisi</td>
+        <td>Düşük</td>
+        <td>Düşük</td>
+        <td>Orta</td>
+        <td>Orta</td>
+        <td>Yüksek</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <div class="label">NOT — liburing</div>
+    <p><code class="inline">liburing</code>, io_uring system call'larını sarmalayan C kütüphanesidir. Ax Bhatt'ın Jens Axboe tarafından geliştirilmiştir (kernel io_uring'in yazarı). <code class="inline">apt install liburing-dev</code> veya Buildroot/Yocto recipe olarak eklenebilir. io_uring, yüksek throughput depolama I/O, network I/O ve async dosya işlemleri için şu an en performanslı Linux API'dır.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde öğrendikleriniz</h4>
+    <ul>
+      <li>select(): POSIX ama FD_SETSIZE=1024 hard limiti var, O(n) tarama</li>
+      <li>poll(): fd sayısı sınırsız ama yine O(n); kernel/user kopyalama var</li>
+      <li>epoll: O(1) hazır fd bildirim, Linux-spesifik, LT ve ET mod desteği</li>
+      <li>ET modunda fd non-blocking olmalı, EAGAIN'e kadar döngüde oku</li>
+      <li>data.ptr ile bağlantı state'i epoll event'ine taşınır</li>
+      <li>asyncio, Linux'ta altta EpollSelector kullanır</li>
+      <li>io_uring: ring buffer + zero-copy + async dosya I/O ile geleceğin API'ı</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

@@ -1,0 +1,1007 @@
+---
+layout: tutorial
+title: "WebSocket — HTTP Upgrade'den Wire Frame'e"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>Rehber</span>
+    <span>Network · WebSocket · asyncio</span>
+    <span>websockets</span>
+  </div>
+  <h1>WebSocket —<br><em>HTTP Upgrade'den Wire Frame'e.</em></h1>
+  <p class="subtitle">HTTP polling'i geride bırak — full-duplex bağlantı, frame anatomisi ve asyncio ile Python server.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">WebSocket nedir</a></li>
+    <li><a href="#s1">HTTP Upgrade handshake</a></li>
+    <li><a href="#s2">Frame formatı</a></li>
+    <li><a href="#s3">Control frames: ping, pong, close</a></li>
+    <li><a href="#s4">Python websockets — server</a></li>
+    <li><a href="#s5">asyncio ile client</a></li>
+    <li><a href="#s6">JSON mesajlaşma ve routing</a></li>
+    <li><a href="#s7">Reconnect ve exponential backoff</a></li>
+    <li><a href="#s8">Pratik: minimal chat server</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> WebSocket nedir</h2>
+  <p class="section-lead">WebSocket, tek bir TCP bağlantısı üzerinde tarayıcı ile sunucu arasında full-duplex iletişim sağlayan, IETF tarafından RFC 6455 ile 2011'de standartlaştırılmış bir protokoldür.</p>
+
+  <p>HTTP, istek-yanıt modeli üzerine kurulmuştur: client bir şey ister, server yanıt verir, bağlantı kapanır. Bu model statik web sayfaları için mükemmeldir; ancak gerçek zamanlı veri gerektiren uygulamalarda ciddi sorunlar yaratır. Sunucunun kendi inisiyatifiyle client'a mesaj gönderemeyişi, uzun yıllar boyunca çeşitli geçici çözümlerin doğmasına yol açtı.</p>
+
+  <p>WebSocket bu sorunu kökten çözdü: HTTP üzerinde başlayan ancak hemen TCP stream'e dönüşen, her iki tarafın da istediği zaman mesaj gönderebildiği kalıcı bir kanal sağlar. Tek bir handshake, sürekli bir bağlantı.</p>
+
+  <h3>Hangi uygulamalar WebSocket ister</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Real-time dashboard</span><span class="desc">Sunucu tarafındaki metrikler (CPU, bellek, ağ) anlık olarak tarayıcıya gönderilir; client polling gerekmez.</span></div>
+    <div class="param"><span class="name">Chat uygulaması</span><span class="desc">Her kullanıcı mesajı tüm oturum sahiplerine anında iletilir; gecikme yoktur.</span></div>
+    <div class="param"><span class="name">Live sensor feed</span><span class="desc">Gömülü sistem, sıcaklık veya titreşim verisini 100 ms aralıklarla göndermek için kalıcı bağlantıyı kullanır.</span></div>
+    <div class="param"><span class="name">Game server</span><span class="desc">Oyuncu pozisyonları, skoru ve olayları düşük gecikmeyle senkronize edilir.</span></div>
+    <div class="param"><span class="name">Collaborative editing</span><span class="desc">Birden fazla kullanıcının aynı belge üzerinde çalışması için anlık değişiklik senkronizasyonu.</span></div>
+  </div>
+
+  <h3>HTTP polling vs WebSocket karşılaştırması</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Yöntem</th><th>Nasıl çalışır</th><th>Gecikme</th><th>Sunucu yükü</th><th>Sunucudan push</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>HTTP Polling</td><td>Client düzenli aralıklarla GET atar</td><td>Yüksek (interval kadar)</td><td>Çok yüksek (boş yanıtlar)</td><td>Hayır</td></tr>
+      <tr><td>HTTP Long-Polling</td><td>Client bekler, server veri olunca yanıt verir; client tekrar ister</td><td>Orta</td><td>Yüksek (yarı açık bağlantılar)</td><td>Dolaylı</td></tr>
+      <tr><td>SSE (EventSource)</td><td>Server tek yönlü event stream açar</td><td>Düşük</td><td>Orta</td><td>Evet — tek yön</td></tr>
+      <tr><td>WebSocket</td><td>Tek TCP bağlantısı, iki yönlü</td><td>Çok düşük</td><td>Düşük (kalıcı bağlantı)</td><td>Evet — iki yön</td></tr>
+    </tbody>
+  </table>
+
+  <h3>URL şeması</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">ws://</span><span class="desc">Şifresiz WebSocket. Varsayılan port 80. Sadece geliştirme ortamında kullanın.</span></div>
+    <div class="param"><span class="name">wss://</span><span class="desc">TLS üzerinden WebSocket. Varsayılan port 443. Üretim için zorunlu.</span></div>
+  </div>
+
+  <div class="flow">
+    <pre>ws://example.com/socket        → TCP:80, şifresiz
+wss://example.com/socket       → TCP:443, TLS ile şifreli
+ws://localhost:8765/           → yerel geliştirme
+wss://api.example.com:8443/ws  → özel port, TLS</pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>WebSocket, RFC 6455 ile 2011'de standartlaştırıldı. Tüm modern tarayıcılar ve popüler sunucu framework'leri destekler. HTTP/1.1 üzerinde kurulur; HTTP/2 üzerinden WebSocket için RFC 8441 ayrı bir mekanizma tanımlar ancak nadiren kullanılır.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>HTTP request-response modelinin gerçek zamanlı senaryolardaki yetersizliği</li>
+      <li>Polling, long-polling, SSE ve WebSocket arasındaki farklar</li>
+      <li><span class="keyword">ws://</span> ve <span class="keyword">wss://</span> URL şemaları</li>
+      <li>RFC 6455, 2011</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> HTTP Upgrade handshake</h2>
+  <p class="section-lead">WebSocket bağlantısı, sıradan bir HTTP/1.1 isteğiyle başlar; sunucu 101 Switching Protocols yanıtını verdiği andan itibaren TCP soket WebSocket protokolüne devredilir.</p>
+
+  <p>WebSocket, sıfırdan yeni bir ağ protokolü olarak tasarlanmadı. Mevcut HTTP altyapısından — proxy'ler, firewall'lar, 80/443 portları — yararlanmak için HTTP üzerinde yükseltme (upgrade) mekanizmasını kullanır. Bu sayede bir WebSocket bağlantısı, standart bir HTTP isteğiyle başlayarak ağ cihazlarında herhangi bir özel konfigürasyon gerektirmez.</p>
+
+  <h3>Client'tan gelen Upgrade isteği</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>HTTP request (client → server)</span><span class="dot">●</span></div>
+    <pre><code>GET /chat HTTP/1.1
+Host: example.com
+<span class="field">Upgrade</span>: websocket
+<span class="field">Connection</span>: Upgrade
+<span class="field">Sec-WebSocket-Key</span>: dGhlIHNhbXBsZSBub25jZQ==
+<span class="field">Sec-WebSocket-Version</span>: 13
+<span class="field">Origin</span>: http://example.com</code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">Upgrade: websocket</span><span class="desc">Protokol yükseltme talebi. HTTP'den WebSocket'e geçmek istediğimizi bildirir.</span></div>
+    <div class="param"><span class="name">Connection: Upgrade</span><span class="desc">Bu bağlantıda Upgrade başlığının uygulanmasını ister.</span></div>
+    <div class="param"><span class="name">Sec-WebSocket-Key</span><span class="desc">Rastgele üretilmiş 16 byte'ın base64 kodlaması. Sunucu bunu GUID ile birleştirip SHA-1 hash'ler ve geri gönderir — cevabın gerçek olduğunu kanıtlamak için.</span></div>
+    <div class="param"><span class="name">Sec-WebSocket-Version: 13</span><span class="desc">Kullanılan WebSocket protokol sürümü. RFC 6455 ile tanımlanan tek geçerli sürüm 13'tür.</span></div>
+  </div>
+
+  <h3>Sunucudan gelen 101 yanıtı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>HTTP response (server → client)</span><span class="dot">●</span></div>
+    <pre><code>HTTP/1.1 101 Switching Protocols
+<span class="field">Upgrade</span>: websocket
+<span class="field">Connection</span>: Upgrade
+<span class="field">Sec-WebSocket-Accept</span>: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=</code></pre>
+  </div>
+
+  <h3>Sec-WebSocket-Accept hesabı</h3>
+
+  <p>Sunucu, <span class="field">Sec-WebSocket-Key</span> değerini RFC 6455'te tanımlı sabit bir GUID ile birleştirir, SHA-1 hash alır ve base64'e dönüştürür. Bu mekanizma, sunucunun gerçekten WebSocket'i desteklediğini kanıtlar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>accept_key.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> hashlib
+<span class="keyword">import</span> base64
+
+<span class="cmt"># RFC 6455 Section 1.3 — sabit magic UUID</span>
+GUID = <span class="str">"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"</span>
+
+<span class="keyword">def</span> compute_accept(sec_websocket_key: str) -> str:
+    combined = sec_websocket_key + GUID
+    sha1_hash = hashlib.sha1(combined.encode(<span class="str">"utf-8"</span>)).digest()
+    <span class="keyword">return</span> base64.b64encode(sha1_hash).decode(<span class="str">"utf-8"</span>)
+
+<span class="cmt"># Örnek: tarayıcının gönderdiği key</span>
+key = <span class="str">"dGhlIHNhbXBsZSBub25jZQ=="</span>
+accept = compute_accept(key)
+print(f<span class="str">"Sec-WebSocket-Accept: {accept}"</span>)
+<span class="cmt"># → s3pPLMBiTxaQ9kYGzzhZRbK+xOo=</span></code></pre>
+  </div>
+
+  <div class="flow">
+    <pre>client → GET /ws HTTP/1.1 + Upgrade: websocket + Sec-WebSocket-Key
+server → 101 Switching Protocols + Sec-WebSocket-Accept
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HTTP bitti ───▶ TCP soket artık WebSocket protocol taşıyor</pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>Handshake tamamlandıktan sonra HTTP protokolü sona erer. Aynı TCP bağlantısı artık WebSocket frame'leri taşır. HTTP cookie'leri ve header'lar yalnızca handshake sırasında geçerlidir — kimlik doğrulama bu aşamada yapılmalıdır.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><span class="field">Upgrade</span> ve <span class="field">Connection</span> header'larının rolü</li>
+      <li><span class="field">Sec-WebSocket-Key</span> → SHA-1 → base64 → <span class="field">Sec-WebSocket-Accept</span> akışı</li>
+      <li>101 Switching Protocols sonrası HTTP'nin sona ermesi</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Frame formatı</h2>
+  <p class="section-lead">WebSocket verisi, her biri kontrol bitleri, opcode, uzunluk alanı ve isteğe bağlı maskeleme anahtarı içeren frame'lere bölünür.</p>
+
+  <p>Handshake tamamlanınca TCP bağlantısı WebSocket frame'leri taşımaya başlar. Her frame, ilk iki zorunlu byte ile başlar; kalan alanlar frame içeriğine göre değişir. Wire üzerinde gereksiz byte bulunmaz: küçük mesajlar 2-6 byte header ile gönderilir.</p>
+
+  <h3>Frame bit diyagramı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>RFC 6455 Frame Layout</span><span class="dot">●</span></div>
+    <pre><code> 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-------+-+-------------+-------------------------------+
+|F|R|R|R| opcode|M| Payload len |    Extended payload length    |
+|I|S|S|S|  (4)  |A|     (7)    |             (16/64)           |
+|N|V|V|V|       |S|             |   (if payload len==126/127)   |
+| |1|2|3|       |K|             |                               |
++-+-+-+-+-------+-+-------------+ - - - - - - - - - - - - - - -+
+|     Extended payload length continued, if payload len == 127  |
++ - - - - - - - - - - - - - - -+-------------------------------+
+|  Masking-key (4 bytes, if MASK=1)                             |
++---------------------------------------------------------------+
+|                      Payload Data                             |
++---------------------------------------------------------------+</code></pre>
+  </div>
+
+  <h3>Alan açıklamaları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">FIN (1 bit)</span><span class="desc">1 = bu frame mesajın son (veya tek) parçası. 0 = fragmentation devam ediyor.</span></div>
+    <div class="param"><span class="name">RSV1/RSV2/RSV3 (1 bit)</span><span class="desc">Extension reserved. Uzantı anlaşması olmadan her biri 0 olmalı. Örneğin permessage-deflate sıkıştırması RSV1'i kullanır.</span></div>
+    <div class="param"><span class="name">Opcode (4 bit)</span><span class="desc">Frame türünü belirtir. Tanımsız bir opcode gelmesi durumunda bağlantı kapatılmalıdır.</span></div>
+    <div class="param"><span class="name">MASK (1 bit)</span><span class="desc">1 = payload maskelenmiş. Client → Server yönünde zorunlu; Server → Client yönünde yasak.</span></div>
+    <div class="param"><span class="name">Payload len (7 bit)</span><span class="desc">0–125: gerçek uzunluk. 126: sonraki 2 byte unsigned 16-bit uzunluk. 127: sonraki 8 byte unsigned 64-bit uzunluk.</span></div>
+    <div class="param"><span class="name">Masking-key (4 byte)</span><span class="desc">MASK=1 ise bu dört byte XOR anahtarı olarak payload'a uygulanır. Her frame için rastgele seçilmeli.</span></div>
+  </div>
+
+  <h3>Opcode tablosu</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Opcode</th><th>İsim</th><th>Açıklama</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>0x0</code></td><td>Continuation</td><td>Önceki fragmente edilmiş mesajın devamı</td></tr>
+      <tr><td><code>0x1</code></td><td>Text</td><td>UTF-8 metin mesajı</td></tr>
+      <tr><td><code>0x2</code></td><td>Binary</td><td>Ham binary veri</td></tr>
+      <tr><td><code>0x3–0x7</code></td><td>—</td><td>Gelecekteki data frame'ler için rezerve</td></tr>
+      <tr><td><code>0x8</code></td><td>Close</td><td>Bağlantı kapatma isteği</td></tr>
+      <tr><td><code>0x9</code></td><td>Ping</td><td>Heartbeat / canlılık kontrolü</td></tr>
+      <tr><td><code>0xA</code></td><td>Pong</td><td>Ping'e yanıt</td></tr>
+      <tr><td><code>0xB–0xF</code></td><td>—</td><td>Gelecekteki control frame'ler için rezerve</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Maskeleme: XOR uygulaması</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>masking.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">def</span> apply_mask(payload: bytes, masking_key: bytes) -> bytes:
+    <span class="str">"""RFC 6455 Section 5.3 — XOR masking/unmasking (aynı işlem)."""</span>
+    <span class="keyword">return</span> bytes(
+        b ^ masking_key[i % 4]
+        <span class="keyword">for</span> i, b <span class="keyword">in</span> enumerate(payload)
+    )
+
+<span class="cmt"># Client "Hello" metnini sunucuya gönderecek</span>
+payload  = <span class="str">b"Hello"</span>
+mask_key = <span class="str">b"\x37\xfa\x21\x3d"</span>  <span class="cmt"># rastgele 4 byte</span>
+
+masked   = apply_mask(payload, mask_key)
+unmasked = apply_mask(masked, mask_key)   <span class="cmt"># aynı fonksiyon ile geri al</span>
+print(unmasked)  <span class="cmt"># b'Hello'</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Maskeleme, güvenlik amacıyla değil, önbellek zehirlenmesi saldırılarına (cache poisoning) karşı tasarlanmıştır. Proxy'lerin WebSocket frame'lerini HTTP yanıtı sanıp önbelleğe almasını engeller. Server-to-client mesajlar maskelenmez.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>FIN, RSV, MASK bitlerinin anlamı</li>
+      <li>7-bit payload length ve extended length kodlamaları</li>
+      <li>Opcode tablosu: 0x0–0xA</li>
+      <li>XOR maskeleme mekanizması ve amacı</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Control frames: ping, pong, close</h2>
+  <p class="section-lead">Control frame'ler (ping, pong, close) bağlantı yönetimine hizmet eder; veri frame'lerinin aksine fragmente edilemez ve payload'ları 125 byte ile sınırlıdır.</p>
+
+  <h3>Ping / Pong — heartbeat</h3>
+
+  <p>Ping frame'i (opcode <code>0x9</code>), bir tarafın karşı tarafın hâlâ bağlı olup olmadığını sorgulamak için gönderdiği kontrol mesajıdır. Ping alan taraf, aynı payload ile bir pong frame'i (opcode <code>0xA</code>) göndermek zorundadır.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Unsolicited Pong</span><span class="desc">Ping beklemeden gönderilen pong frame'i de geçerlidir. Tek yönlü "ben hayattayım" bildirimi olarak kullanılabilir.</span></div>
+    <div class="param"><span class="name">Ping interval</span><span class="desc">Best practice: 30–60 saniye. Çok sık ping, gereksiz trafik ve CPU yükü yaratır. Çok seyrek ping, kopan bağlantıların geç fark edilmesine yol açar.</span></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>ping_example.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> asyncio
+<span class="keyword">import</span> websockets
+
+<span class="keyword">async def</span> server_with_ping(websocket):
+    <span class="keyword">try</span>:
+        <span class="keyword">async for</span> message <span class="keyword">in</span> websocket:
+            <span class="keyword">await</span> websocket.send(f<span class="str">"echo: {message}"</span>)
+    <span class="keyword">except</span> websockets.ConnectionClosed:
+        print(<span class="str">"Bağlantı kapandı"</span>)
+
+<span class="cmt"># ping_interval ve ping_timeout websockets.serve() parametresi olarak verilir</span>
+<span class="keyword">async def</span> main():
+    <span class="keyword">async with</span> websockets.serve(
+        server_with_ping,
+        <span class="str">"0.0.0.0"</span>,
+        8765,
+        ping_interval=30,   <span class="cmt"># her 30 saniyede ping gönder</span>
+        ping_timeout=10,    <span class="cmt"># 10 saniye içinde pong gelmezse bağlantıyı kes</span>
+    ):
+        <span class="keyword">await</span> asyncio.get_event_loop().run_until_complete(asyncio.Future())
+
+asyncio.run(main())</code></pre>
+  </div>
+
+  <h3>Close frame ve kapanış el sıkışması</h3>
+
+  <p>Bağlantıyı düzgün şekilde kapatmak için her iki tarafın da close frame göndermesi gerekir. İlk close frame'i gönderen taraf kapanışı başlatır; diğer taraf aynı status code ile yanıt vermelidir. Ardından TCP FIN ile bağlantı sonlandırılır.</p>
+
+  <div class="flow">
+    <pre>Client → Close frame (code: 1000, reason: "Normal closure")
+Server ← Close frame (code: 1000)   ← server echo
+Server → TCP FIN
+Client ← TCP FIN ACK</pre>
+  </div>
+
+  <h3>Close status kodları</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Kod</th><th>İsim</th><th>Kullanım</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1000</td><td>Normal Closure</td><td>Bağlantı amacına ulaştı, normal kapanış</td></tr>
+      <tr><td>1001</td><td>Going Away</td><td>Sunucu kapatılıyor veya tarayıcı sayfadan ayrılıyor</td></tr>
+      <tr><td>1002</td><td>Protocol Error</td><td>Protokol ihlali tespit edildi</td></tr>
+      <tr><td>1003</td><td>Unsupported Data</td><td>Desteklenmeyen veri türü alındı</td></tr>
+      <tr><td>1008</td><td>Policy Violation</td><td>Mesaj politikayı ihlal etti</td></tr>
+      <tr><td>1009</td><td>Message Too Big</td><td>Mesaj izin verilen boyutu aştı</td></tr>
+      <tr><td>1011</td><td>Internal Error</td><td>Sunucu tarafında beklenmedik hata</td></tr>
+      <tr><td>1012</td><td>Service Restart</td><td>Sunucu yeniden başlıyor, tekrar bağlanabilirsiniz</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>Aniden TCP bağlantısını kesmek (FIN göndermeden) yerine close frame ile düzgün kapanış yapın. Özellikle sunucu yeniden başlarken 1012 kodu göndermek, client'ların akıllıca reconnect yapmasını sağlar.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Ping (0x9) ve pong (0xA) opcode'larının heartbeat işlevi</li>
+      <li>30–60 saniye ping interval best practice</li>
+      <li>Close frame (0x8) ile iki taraflı kapanış el sıkışması</li>
+      <li>1000, 1001, 1011, 1012 close status kodları</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Python websockets kütüphanesi — server</h2>
+  <p class="section-lead"><span class="cmd">websockets</span> kütüphanesi, asyncio tabanlı WebSocket sunucusu ve client'ı yazmak için Python'ın en olgun ve RFC uyumlu seçeneğidir.</p>
+
+  <h3>Kurulum</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">pip</span> install <span class="str">websockets</span>          <span class="cmt"># en güncel stabil sürüm</span>
+<span class="cmd">python</span> <span class="flag">-c</span> <span class="str">"import websockets; print(websockets.__version__)"</span></code></pre>
+  </div>
+
+  <h3>Handler fonksiyonu imzası</h3>
+
+  <p>Her WebSocket bağlantısı için bir coroutine handler çağrılır. Handler tamamlandığında bağlantı kapatılır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>handler_signature.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> asyncio
+<span class="keyword">import</span> websockets
+<span class="keyword">from</span> websockets.server <span class="keyword">import</span> WebSocketServerProtocol
+
+<span class="keyword">async def</span> handler(websocket: WebSocketServerProtocol) -> <span class="keyword">None</span>:
+    <span class="cmt"># websocket.remote_address → (ip, port) tuple</span>
+    <span class="cmt"># websocket.path          → "/chat" gibi URL path</span>
+    <span class="cmt"># websocket.request_headers → HTTP upgrade header'ları</span>
+    remote = websocket.remote_address
+    print(f<span class="str">"Yeni bağlantı: {remote[0]}:{remote[1]} — path: {websocket.path}"</span>)
+    <span class="keyword">try</span>:
+        <span class="keyword">async for</span> message <span class="keyword">in</span> websocket:
+            print(f<span class="str">"[{remote}] aldı: {message}"</span>)
+            <span class="keyword">await</span> websocket.send(f<span class="str">"echo: {message}"</span>)
+    <span class="keyword">except</span> websockets.ConnectionClosedOK:
+        print(f<span class="str">"[{remote}] normal kapandı"</span>)
+    <span class="keyword">except</span> websockets.ConnectionClosedError <span class="keyword">as</span> e:
+        print(f<span class="str">"[{remote}] hata: {e.code} {e.reason}"</span>)</code></pre>
+  </div>
+
+  <h3>Echo server — tam örnek</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>echo_server.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> asyncio
+<span class="keyword">import</span> websockets
+
+<span class="keyword">async def</span> echo(websocket):
+    <span class="keyword">async for</span> message <span class="keyword">in</span> websocket:
+        <span class="keyword">await</span> websocket.send(message)
+
+<span class="keyword">async def</span> main():
+    <span class="keyword">async with</span> websockets.serve(echo, <span class="str">"0.0.0.0"</span>, 8765) <span class="keyword">as</span> server:
+        print(<span class="str">"Echo server başlatıldı → ws://localhost:8765"</span>)
+        <span class="keyword">await</span> server.wait_closed()
+
+asyncio.run(main())</code></pre>
+  </div>
+
+  <h3>Broadcast: tüm client'lara gönderme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>broadcast_server.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> asyncio
+<span class="keyword">import</span> websockets
+
+<span class="cmt"># Bağlı tüm client'ları takip eden set</span>
+CONNECTED: set = set()
+
+<span class="keyword">async def</span> handler(websocket):
+    CONNECTED.add(websocket)
+    <span class="keyword">try</span>:
+        <span class="keyword">async for</span> message <span class="keyword">in</span> websocket:
+            <span class="cmt"># Gönderici hariç herkese ilet</span>
+            recipients = CONNECTED - {websocket}
+            <span class="keyword">if</span> recipients:
+                <span class="keyword">await</span> asyncio.gather(
+                    *[r.send(message) <span class="keyword">for</span> r <span class="keyword">in</span> recipients]
+                )
+    <span class="keyword">finally</span>:
+        CONNECTED.discard(websocket)
+
+<span class="keyword">async def</span> main():
+    <span class="keyword">async with</span> websockets.serve(handler, <span class="str">"0.0.0.0"</span>, 8765):
+        <span class="keyword">await</span> asyncio.Future()  <span class="cmt"># sonsuza kadar çalış</span>
+
+asyncio.run(main())</code></pre>
+  </div>
+
+  <h3>Path-based routing</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>router_server.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">async def</span> handler(websocket):
+    path = websocket.path
+    <span class="keyword">if</span> path == <span class="str">"/chat"</span>:
+        <span class="keyword">await</span> chat_handler(websocket)
+    <span class="keyword">elif</span> path == <span class="str">"/metrics"</span>:
+        <span class="keyword">await</span> metrics_handler(websocket)
+    <span class="keyword">else</span>:
+        <span class="keyword">await</span> websocket.close(1008, <span class="str">"Unknown endpoint"</span>)</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><span class="keyword">async def</span> handler(websocket) imzası ve yaşam döngüsü</li>
+      <li><span class="cmd">recv()</span>, <span class="cmd">send()</span>, <span class="cmd">close()</span> metodları</li>
+      <li><span class="keyword">async with</span> websockets.serve() ile server başlatma</li>
+      <li>CONNECTED set pattern ile broadcast</li>
+      <li><span class="field">websocket.path</span> ile URL tabanlı routing</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> asyncio ile client</h2>
+  <p class="section-lead">websockets client'ı, asyncio context manager sözdizimi ile bağlanır; hem tek seferlik sorgular hem de sürekli mesaj akışı için kullanılabilir.</p>
+
+  <h3>Temel bağlantı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>basic_client.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> asyncio
+<span class="keyword">import</span> websockets
+
+<span class="keyword">async def</span> main():
+    uri = <span class="str">"ws://localhost:8765"</span>
+    <span class="keyword">async with</span> websockets.connect(uri) <span class="keyword">as</span> ws:
+        <span class="keyword">await</span> ws.send(<span class="str">"Merhaba sunucu!"</span>)
+        response = <span class="keyword">await</span> ws.recv()
+        print(f<span class="str">"Yanıt: {response}"</span>)
+        <span class="cmt"># context manager bloğu sonunda bağlantı kapatılır</span>
+
+asyncio.run(main())</code></pre>
+  </div>
+
+  <h3>Async generator ile mesaj stream</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>stream_client.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> asyncio
+<span class="keyword">import</span> websockets
+
+<span class="keyword">async def</span> listen():
+    uri = <span class="str">"ws://localhost:8765"</span>
+    <span class="keyword">async with</span> websockets.connect(uri) <span class="keyword">as</span> ws:
+        <span class="cmt"># async for: sunucu close frame gönderene kadar döngü sürer</span>
+        <span class="keyword">async for</span> message <span class="keyword">in</span> ws:
+            print(f<span class="str">"Gelen: {message}"</span>)
+            <span class="cmt"># binary veriyse: isinstance(message, bytes)</span>
+
+asyncio.run(listen())</code></pre>
+  </div>
+
+  <h3>Ping/pong ve bağlantı durumu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>status_client.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> asyncio
+<span class="keyword">import</span> websockets
+
+<span class="keyword">async def</span> check_connection():
+    <span class="keyword">async with</span> websockets.connect(<span class="str">"ws://localhost:8765"</span>) <span class="keyword">as</span> ws:
+        <span class="cmt"># Manuel ping — latency ölçümü</span>
+        latency = <span class="keyword">await</span> ws.ping()
+        print(f<span class="str">"Round-trip latency: {latency:.3f}s"</span>)
+
+        <span class="cmt"># Bağlantı durumu</span>
+        print(f<span class="str">"Kapalı mı: {ws.closed}"</span>)          <span class="cmt"># False</span>
+        print(f<span class="str">"Close code: {ws.close_code}"</span>)    <span class="cmt"># None (henüz kapalı değil)</span>
+
+        <span class="keyword">await</span> ws.send(<span class="str">"test"</span>)
+        msg = <span class="keyword">await</span> ws.recv()
+
+    <span class="cmt"># Context manager'dan çıkıldıktan sonra</span>
+    print(f<span class="str">"Close code: {ws.close_code}"</span>)   <span class="cmt"># 1000</span>
+
+asyncio.run(check_connection())</code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">ws.closed</span><span class="desc">Boolean — bağlantı kapatılmış mı. Close frame alındıktan veya TCP kopunca True olur.</span></div>
+    <div class="param"><span class="name">ws.close_code</span><span class="desc">Integer — bağlantı kapanış kodu (ör. 1000). Bağlantı açıkken None.</span></div>
+    <div class="param"><span class="name">ws.latency</span><span class="desc">Float — son ping/pong round-trip süresi saniye cinsinden. Bağlantı kalitesini izlemek için kullanılır.</span></div>
+    <div class="param"><span class="name">ws.ping()</span><span class="desc">Ping frame gönderir, pong alınınca tamamlanan bir awaitable döner. Dönüş değeri round-trip süresidir.</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><span class="keyword">async with</span> websockets.connect() context manager kullanımı</li>
+      <li><span class="keyword">async for</span> message in ws ile sürekli okuma</li>
+      <li><span class="field">ws.ping()</span> ile manuel latency ölçümü</li>
+      <li><span class="field">ws.closed</span>, <span class="field">ws.close_code</span> durum alanları</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> JSON mesajlaşma ve routing</h2>
+  <p class="section-lead">WebSocket, ham byte akışı sağlar; uygulama katmanında mesaj türü ve yük ayrımını sağlamak için JSON tabanlı envelope pattern kullanılır.</p>
+
+  <h3>Mesaj zarfı (envelope) şeması</h3>
+
+  <p>Ham string mesajlar yönetilemez hale gelince her mesajı bir JSON zarfı içinde gönderin. <span class="field">type</span> alanı mesajı doğru handler'a yönlendirir; <span class="field">payload</span> ise uygulama verisini taşır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>message_schema.json</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">// Komut mesajı</span>
+{
+  <span class="field">"type"</span>: <span class="str">"command"</span>,
+  <span class="field">"payload"</span>: { <span class="field">"action"</span>: <span class="str">"start"</span>, <span class="field">"target"</span>: <span class="str">"motor_1"</span> }
+}
+
+<span class="cmt">// Sensör verisi</span>
+{
+  <span class="field">"type"</span>: <span class="str">"sensor"</span>,
+  <span class="field">"payload"</span>: { <span class="field">"temp"</span>: 42.5, <span class="field">"unit"</span>: <span class="str">"C"</span>, <span class="field">"ts"</span>: 1712345678 }
+}
+
+<span class="cmt">// Hata bildirimi</span>
+{
+  <span class="field">"type"</span>: <span class="str">"error"</span>,
+  <span class="field">"payload"</span>: { <span class="field">"code"</span>: 404, <span class="field">"message"</span>: <span class="str">"Unknown command"</span> }
+}</code></pre>
+  </div>
+
+  <h3>Dispatch pattern: type → handler</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>router_server.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> asyncio
+<span class="keyword">import</span> json
+<span class="keyword">import</span> websockets
+
+<span class="keyword">async def</span> handle_command(websocket, payload: dict):
+    action = payload.get(<span class="str">"action"</span>)
+    target = payload.get(<span class="str">"target"</span>)
+    print(f<span class="str">"Komut: {action} → {target}"</span>)
+    <span class="keyword">await</span> websocket.send(json.dumps({
+        <span class="str">"type"</span>: <span class="str">"ack"</span>,
+        <span class="str">"payload"</span>: {<span class="str">"action"</span>: action, <span class="str">"status"</span>: <span class="str">"ok"</span>}
+    }))
+
+<span class="keyword">async def</span> handle_subscribe(websocket, payload: dict):
+    topic = payload.get(<span class="str">"topic"</span>, <span class="str">"all"</span>)
+    print(f<span class="str">"Subscribe: {topic}"</span>)
+    <span class="keyword">await</span> websocket.send(json.dumps({
+        <span class="str">"type"</span>: <span class="str">"subscribed"</span>,
+        <span class="str">"payload"</span>: {<span class="str">"topic"</span>: topic}
+    }))
+
+<span class="cmt"># Tip → coroutine eşlemesi</span>
+DISPATCH = {
+    <span class="str">"command"</span>: handle_command,
+    <span class="str">"subscribe"</span>: handle_subscribe,
+}
+
+<span class="keyword">async def</span> handler(websocket):
+    <span class="keyword">async for</span> raw <span class="keyword">in</span> websocket:
+        <span class="keyword">try</span>:
+            msg = json.loads(raw)
+            msg_type = msg.get(<span class="str">"type"</span>)
+            payload  = msg.get(<span class="str">"payload"</span>, {})
+        <span class="keyword">except</span> json.JSONDecodeError:
+            <span class="keyword">await</span> websocket.send(json.dumps({
+                <span class="str">"type"</span>: <span class="str">"error"</span>,
+                <span class="str">"payload"</span>: {<span class="str">"message"</span>: <span class="str">"Invalid JSON"</span>}
+            }))
+            <span class="keyword">continue</span>
+
+        handler_fn = DISPATCH.get(msg_type)
+        <span class="keyword">if</span> handler_fn:
+            <span class="keyword">await</span> handler_fn(websocket, payload)
+        <span class="keyword">else</span>:
+            <span class="keyword">await</span> websocket.send(json.dumps({
+                <span class="str">"type"</span>: <span class="str">"error"</span>,
+                <span class="str">"payload"</span>: {<span class="str">"message"</span>: f<span class="str">"Unknown type: {msg_type}"</span>}
+            }))</code></pre>
+  </div>
+
+  <h3>Binary mesajlar: bytes gönderme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>binary_send.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> struct
+
+<span class="cmt"># Sensör verisi: 4 byte float (sıcaklık) + 4 byte float (nem) + 8 byte int (timestamp)</span>
+packet = struct.pack(<span class="str">"!ff q"</span>, 42.5, 68.3, 1712345678901)
+
+<span class="cmt"># Binary websocket mesajı olarak gönder</span>
+<span class="keyword">await</span> websocket.send(packet)
+
+<span class="cmt"># Alıcı tarafta</span>
+raw = <span class="keyword">await</span> websocket.recv()
+<span class="keyword">if</span> <span class="keyword">isinstance</span>(raw, bytes):
+    temp, humidity, ts = struct.unpack(<span class="str">"!ff q"</span>, raw)
+    print(f<span class="str">"Sıcaklık: {temp:.1f}°C, Nem: {humidity:.1f}%"</span>)</code></pre>
+  </div>
+
+  <h3>Rate limiting: per-client sayaç</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>rate_limit.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> asyncio
+<span class="keyword">import</span> time
+
+<span class="keyword">async def</span> handler(websocket):
+    window_start = time.monotonic()
+    msg_count    = 0
+    MAX_PER_SEC  = 20
+
+    <span class="keyword">async for</span> raw <span class="keyword">in</span> websocket:
+        now = time.monotonic()
+        <span class="keyword">if</span> now - window_start >= 1.0:
+            window_start = now
+            msg_count    = 0
+        msg_count += 1
+        <span class="keyword">if</span> msg_count > MAX_PER_SEC:
+            <span class="keyword">await</span> websocket.close(1008, <span class="str">"Rate limit exceeded"</span>)
+            <span class="keyword">return</span>
+        <span class="cmt"># normal işleme...</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>JSON envelope: <span class="field">type</span> + <span class="field">payload</span> şeması</li>
+      <li>DISPATCH dict ile type-based routing</li>
+      <li>JSON parse hatası yönetimi ve hata mesajı gönderme</li>
+      <li><span class="keyword">struct.pack</span> ile binary sensör verisi gönderme</li>
+      <li>Per-client rate limiting (sliding window)</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Reconnect ve exponential backoff</h2>
+  <p class="section-lead">Gerçek dünyada bağlantılar kopar; iyi bir client, akıllı bir bekleme stratejisiyle sunucuyu bunaltmadan yeniden bağlanır.</p>
+
+  <h3>Bağlantı kopma senaryoları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Server restart</span><span class="desc">Sunucu yeniden başlarken close frame göndermeden TCP'yi keser. Client ConnectionClosed alır.</span></div>
+    <div class="param"><span class="name">Network glitch</span><span class="desc">Ağ kesintisi TCP bağlantısını sessizce öldürür. Sonraki send/recv başarısız olur.</span></div>
+    <div class="param"><span class="name">Ping timeout</span><span class="desc">Sunucu ping'e yanıt vermezse websockets kütüphanesi bağlantıyı otomatik kapatır.</span></div>
+    <div class="param"><span class="name">Idle timeout</span><span class="desc">Bazı proxy ve firewall'lar uzun süre veri geçmeyen bağlantıları keser (tipik: 60–300s).</span></div>
+  </div>
+
+  <h3>websockets.connect() parametreleri</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Parametre</th><th>Tip</th><th>Açıklama</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>additional_headers</code></td><td>dict</td><td>Handshake sırasında eklenecek özel HTTP header'ları (ör. Authorization)</td></tr>
+      <tr><td><code>open_timeout</code></td><td>float</td><td>Handshake tamamlanma zaman aşımı (saniye). None = sınırsız.</td></tr>
+      <tr><td><code>close_timeout</code></td><td>float</td><td>Close frame el sıkışması için beklenecek süre.</td></tr>
+      <tr><td><code>ping_interval</code></td><td>float</td><td>Otomatik ping gönderme aralığı (saniye). None = devre dışı.</td></tr>
+      <tr><td><code>ping_timeout</code></td><td>float</td><td>Ping'e yanıt bekleme süresi. Aşılırsa bağlantı kesilir.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Exponential backoff with jitter</h3>
+
+  <p>Her başarısız denemeden sonra bekleme süresini ikiye katla; üzerine rastgele bir değer ekle (jitter). Bu yöntem, birden fazla client'ın aynı anda yeniden bağlanmasını (thundering herd) önler.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>reconnect_client.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> asyncio
+<span class="keyword">import</span> random
+<span class="keyword">import</span> websockets
+
+URI       = <span class="str">"ws://localhost:8765"</span>
+MAX_DELAY = 60.0   <span class="cmt"># saniye — maksimum bekleme</span>
+
+<span class="keyword">async def</span> connect_with_backoff():
+    attempt = 0
+    <span class="keyword">while True</span>:
+        <span class="keyword">try</span>:
+            <span class="keyword">async with</span> websockets.connect(
+                URI,
+                open_timeout=10,
+                ping_interval=20,
+                ping_timeout=10,
+            ) <span class="keyword">as</span> ws:
+                attempt = 0  <span class="cmt"># başarıyla bağlandık, sayacı sıfırla</span>
+                print(<span class="str">"Bağlandı"</span>)
+                <span class="keyword">await</span> on_connected(ws)  <span class="cmt"># subscribe yenile, işleme başla</span>
+
+        <span class="keyword">except</span> (
+            websockets.ConnectionClosed,
+            OSError,
+            asyncio.TimeoutError,
+        ) <span class="keyword">as</span> exc:
+            delay = min(2 ** attempt + random.uniform(0, 1), MAX_DELAY)
+            print(f<span class="str">"Bağlantı kesildi ({exc}). {delay:.1f}s sonra tekrar dene."</span>)
+            <span class="keyword">await</span> asyncio.sleep(delay)
+            attempt += 1
+
+<span class="keyword">async def</span> on_connected(ws):
+    <span class="cmt"># Bağlanıldığında subscribe mesajı gönder</span>
+    <span class="keyword">import</span> json
+    <span class="keyword">await</span> ws.send(json.dumps({<span class="str">"type"</span>: <span class="str">"subscribe"</span>, <span class="str">"payload"</span>: {<span class="str">"topic"</span>: <span class="str">"sensors"</span>}}))
+    <span class="keyword">async for</span> msg <span class="keyword">in</span> ws:
+        print(f<span class="str">"Mesaj: {msg}"</span>)
+
+asyncio.run(connect_with_backoff())</code></pre>
+  </div>
+
+  <h3>Backoff değerleri (örnek)</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Deneme</th><th>2^attempt</th><th>Jitter (0–1)</th><th>Toplam bekleme</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>0</td><td>1s</td><td>~0.4s</td><td>~1.4s</td></tr>
+      <tr><td>1</td><td>2s</td><td>~0.7s</td><td>~2.7s</td></tr>
+      <tr><td>2</td><td>4s</td><td>~0.2s</td><td>~4.2s</td></tr>
+      <tr><td>3</td><td>8s</td><td>~0.9s</td><td>~8.9s</td></tr>
+      <tr><td>5</td><td>32s</td><td>~0.5s</td><td>~32.5s</td></tr>
+      <tr><td>6+</td><td>60s (max)</td><td>~0.x s</td><td>≤60s</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Circuit breaker pattern: belirli sayıda ardışık başarısız denemeden sonra bağlantıyı "açık" (open) duruma al ve yeniden denemeden önce daha uzun süre bekle. Bu, tamamen erişilmez bir sunucuya sürekli bağlanma girişimini önler. Üretim sistemlerinde tenacity veya stamina gibi kütüphaneler bu pattern'i hazır sunar.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Server restart, network glitch, ping timeout senaryoları</li>
+      <li><span class="field">open_timeout</span>, <span class="field">ping_interval</span>, <span class="field">ping_timeout</span> parametreleri</li>
+      <li><code>min(2^attempt + random(0,1), max_delay)</code> formülü</li>
+      <li>Reconnect sonrası subscribe yenileme</li>
+      <li>Circuit breaker pattern özeti</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: minimal chat server</h2>
+  <p class="section-lead">Bu bölümde WebSocket ile gerçek bir chat sistemi inşa ediyoruz: broadcast server, nickname yönetimi ve asyncio ile eşzamanlı gönderme/alma.</p>
+
+  <h3>Mesaj formatı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>message_types.json</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">// Kullanıcı odaya katıldı</span>
+{ <span class="field">"type"</span>: <span class="str">"join"</span>,  <span class="field">"nick"</span>: <span class="str">"ahmet"</span>, <span class="field">"text"</span>: <span class="str">""</span> }
+
+<span class="cmt">// Normal mesaj</span>
+{ <span class="field">"type"</span>: <span class="str">"chat"</span>,  <span class="field">"nick"</span>: <span class="str">"ahmet"</span>, <span class="field">"text"</span>: <span class="str">"Merhaba!"</span> }
+
+<span class="cmt">// Kullanıcı ayrıldı (server üretir)</span>
+{ <span class="field">"type"</span>: <span class="str">"leave"</span>, <span class="field">"nick"</span>: <span class="str">"ahmet"</span>, <span class="field">"text"</span>: <span class="str">""</span> }</code></pre>
+  </div>
+
+  <h3>Server</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>chat_server.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> asyncio
+<span class="keyword">import</span> json
+<span class="keyword">import</span> websockets
+
+<span class="cmt"># nick → websocket eşlemesi</span>
+USERS: dict = {}
+
+<span class="keyword">async def</span> broadcast(msg: dict, exclude=None):
+    <span class="str">"""Tüm bağlı kullanıcılara mesaj gönder."""</span>
+    data = json.dumps(msg, ensure_ascii=<span class="keyword">False</span>)
+    targets = [ws <span class="keyword">for</span> ws <span class="keyword">in</span> USERS.values() <span class="keyword">if</span> ws <span class="keyword">is not</span> exclude]
+    <span class="keyword">if</span> targets:
+        <span class="keyword">await</span> asyncio.gather(*[ws.send(data) <span class="keyword">for</span> ws <span class="keyword">in</span> targets])
+
+<span class="keyword">async def</span> handler(websocket):
+    nick = <span class="keyword">None</span>
+    <span class="keyword">try</span>:
+        <span class="cmt"># İlk mesaj: join frame</span>
+        raw = <span class="keyword">await</span> websocket.recv()
+        data = json.loads(raw)
+        nick = data.get(<span class="str">"nick"</span>, <span class="str">"anonim"</span>).strip()[:20]
+
+        <span class="keyword">if</span> nick <span class="keyword">in</span> USERS:
+            <span class="keyword">await</span> websocket.send(json.dumps({
+                <span class="str">"type"</span>: <span class="str">"error"</span>, <span class="str">"nick"</span>: <span class="str">"server"</span>,
+                <span class="str">"text"</span>: f<span class="str">"'{nick}' takma adı zaten kullanımda."</span>
+            }))
+            <span class="keyword">await</span> websocket.close(1008, <span class="str">"Nick taken"</span>)
+            <span class="keyword">return</span>
+
+        USERS[nick] = websocket
+        print(f<span class="str">"[+] {nick} katıldı ({len(USERS)} kullanıcı)"</span>)
+        <span class="keyword">await</span> broadcast({<span class="str">"type"</span>: <span class="str">"join"</span>, <span class="str">"nick"</span>: nick, <span class="str">"text"</span>: <span class="str">""</span>}, exclude=websocket)
+        <span class="keyword">await</span> websocket.send(json.dumps({
+            <span class="str">"type"</span>: <span class="str">"info"</span>, <span class="str">"nick"</span>: <span class="str">"server"</span>,
+            <span class="str">"text"</span>: f<span class="str">"Hoşgeldin {nick}! Odada {len(USERS)} kişi var."</span>
+        }))
+
+        <span class="keyword">async for</span> raw <span class="keyword">in</span> websocket:
+            msg = json.loads(raw)
+            <span class="keyword">if</span> msg.get(<span class="str">"type"</span>) == <span class="str">"chat"</span>:
+                text = str(msg.get(<span class="str">"text"</span>, <span class="str">""</span>))[:500]
+                <span class="keyword">await</span> broadcast({<span class="str">"type"</span>: <span class="str">"chat"</span>, <span class="str">"nick"</span>: nick, <span class="str">"text"</span>: text})
+
+    <span class="keyword">except</span> (websockets.ConnectionClosed, json.JSONDecodeError):
+        <span class="keyword">pass</span>
+    <span class="keyword">finally</span>:
+        <span class="keyword">if</span> nick <span class="keyword">and</span> nick <span class="keyword">in</span> USERS:
+            <span class="keyword">del</span> USERS[nick]
+            print(f<span class="str">"[-] {nick} ayrıldı ({len(USERS)} kullanıcı)"</span>)
+            <span class="keyword">await</span> broadcast({<span class="str">"type"</span>: <span class="str">"leave"</span>, <span class="str">"nick"</span>: nick, <span class="str">"text"</span>: <span class="str">""</span>})
+
+<span class="keyword">async def</span> main():
+    <span class="keyword">async with</span> websockets.serve(handler, <span class="str">"0.0.0.0"</span>, 8765):
+        print(<span class="str">"Chat server → ws://localhost:8765"</span>)
+        <span class="keyword">await</span> asyncio.Future()
+
+asyncio.run(main())</code></pre>
+  </div>
+
+  <h3>Client — eşzamanlı gönderme ve alma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>chat_client.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> asyncio
+<span class="keyword">import</span> json
+<span class="keyword">import</span> sys
+<span class="keyword">import</span> websockets
+
+URI = <span class="str">"ws://localhost:8765"</span>
+
+<span class="keyword">async def</span> receive_messages(ws):
+    <span class="keyword">async for</span> raw <span class="keyword">in</span> ws:
+        msg = json.loads(raw)
+        t, nick, text = msg[<span class="str">"type"</span>], msg[<span class="str">"nick"</span>], msg.get(<span class="str">"text"</span>, <span class="str">""</span>)
+        <span class="keyword">if</span> t == <span class="str">"chat"</span>:
+            print(f<span class="str">"\r[{nick}] {text}"</span>)
+        <span class="keyword">elif</span> t == <span class="str">"join"</span>:
+            print(f<span class="str">"\r*** {nick} odaya katıldı ***"</span>)
+        <span class="keyword">elif</span> t == <span class="str">"leave"</span>:
+            print(f<span class="str">"\r*** {nick} ayrıldı ***"</span>)
+        <span class="keyword">elif</span> t <span class="keyword">in</span> (<span class="str">"info"</span>, <span class="str">"error"</span>):
+            print(f<span class="str">"\r[server] {text}"</span>)
+
+<span class="keyword">async def</span> send_messages(ws, nick: str):
+    loop = asyncio.get_event_loop()
+    <span class="keyword">while True</span>:
+        <span class="cmt"># stdin'i asyncio ile oku (blocking olmadan)</span>
+        line = <span class="keyword">await</span> loop.run_in_executor(<span class="keyword">None</span>, sys.stdin.readline)
+        line = line.rstrip(<span class="str">"\n"</span>)
+        <span class="keyword">if</span> line.lower() == <span class="str">"/quit"</span>:
+            <span class="keyword">await</span> ws.close()
+            <span class="keyword">break</span>
+        <span class="keyword">await</span> ws.send(json.dumps({
+            <span class="str">"type"</span>: <span class="str">"chat"</span>, <span class="str">"nick"</span>: nick, <span class="str">"text"</span>: line
+        }))
+
+<span class="keyword">async def</span> main():
+    nick = input(<span class="str">"Nick: "</span>).strip()
+    <span class="keyword">async with</span> websockets.connect(URI) <span class="keyword">as</span> ws:
+        <span class="cmt"># Join mesajı gönder</span>
+        <span class="keyword">await</span> ws.send(json.dumps({<span class="str">"type"</span>: <span class="str">"join"</span>, <span class="str">"nick"</span>: nick, <span class="str">"text"</span>: <span class="str">""</span>}))
+        <span class="cmt"># Gönderme ve alma'yı eşzamanlı çalıştır</span>
+        <span class="keyword">await</span> asyncio.gather(
+            receive_messages(ws),
+            send_messages(ws, nick),
+        )
+
+asyncio.run(main())</code></pre>
+  </div>
+
+  <h3>Çalıştırma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Terminal 1: server</span>
+<span class="cmd">python</span> chat_server.py
+
+<span class="cmt"># Terminal 2: birinci client</span>
+<span class="cmd">python</span> chat_client.py
+<span class="cmt"># Nick: ahmet</span>
+
+<span class="cmt"># Terminal 3: ikinci client</span>
+<span class="cmd">python</span> chat_client.py
+<span class="cmt"># Nick: fatma</span>
+
+<span class="cmt"># Mesaj gönder:</span>
+<span class="cmt"># ahmet terminali: Merhaba!</span>
+<span class="cmt"># fatma terminali: *** ahmet odaya katıldı *** → [ahmet] Merhaba!</span></code></pre>
+  </div>
+
+  <h3>TLS ile wss://: SSLContext</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>tls_server.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> asyncio
+<span class="keyword">import</span> ssl
+<span class="keyword">import</span> websockets
+
+<span class="keyword">def</span> create_ssl_context() -> ssl.SSLContext:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(
+        certfile=<span class="path">"/etc/ssl/certs/server.crt"</span>,
+        keyfile=<span class="path">"/etc/ssl/private/server.key"</span>,
+    )
+    <span class="keyword">return</span> ctx
+
+<span class="keyword">async def</span> main():
+    ssl_ctx = create_ssl_context()
+    <span class="keyword">async with</span> websockets.serve(
+        handler, <span class="str">"0.0.0.0"</span>, 8443, ssl=ssl_ctx
+    ):
+        print(<span class="str">"TLS chat server → wss://localhost:8443"</span>)
+        <span class="keyword">await</span> asyncio.Future()
+
+asyncio.run(main())</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Self-signed sertifika için: <code>openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -days 365 -nodes</code>. Client'ta <code>ssl=True</code> (sistem CA kullan) veya özel CA için <code>ssl.create_default_context()</code> ile custom CA yükleyin.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Chat server: USERS dict, broadcast, join/leave bildirimleri</li>
+      <li>Nick çakışması kontrolü ve 1008 ile bağlantı reddi</li>
+      <li><span class="keyword">asyncio.gather</span> ile eşzamanlı gönderme + alma</li>
+      <li><span class="cmd">loop.run_in_executor</span> ile async stdin okuma</li>
+      <li><span class="keyword">ssl.SSLContext</span> ile wss:// TLS desteği</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

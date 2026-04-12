@@ -1,0 +1,1206 @@
+---
+layout: tutorial
+title: "Unix IPC — Pipe, FIFO, Socket, Shared Memory"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>Rehber</span>
+    <span>Linux / Sistem</span>
+    <span>C</span>
+    <span>IPC</span>
+  </div>
+  <h1>Unix IPC —<br><em>Pipe, FIFO, Socket, Shared Memory.</em></h1>
+  <p class="subtitle">süreçler arası iletişim mekanizmalarını syscall seviyesinde öğren — hangisini ne zaman seçersin?</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">IPC mekanizmaları</a></li>
+    <li><a href="#s1">Pipe</a></li>
+    <li><a href="#s2">Named pipe (FIFO)</a></li>
+    <li><a href="#s3">Unix domain socket</a></li>
+    <li><a href="#s4">socketpair()</a></li>
+    <li><a href="#s5">mmap ile shared memory</a></li>
+    <li><a href="#s6">POSIX shm</a></li>
+    <li><a href="#s7">POSIX message queue</a></li>
+    <li><a href="#s8">Senkronizasyon: semaphore ve mutex</a></li>
+    <li><a href="#s9">Hangisini seçmeli: karar matrisi</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> IPC mekanizmaları</h2>
+  <p class="section-lead">Her Linux process'i izole bir address space'te çalışır; IPC bu izolasyonu kontrollü biçimde aşmanın kernel destekli yoludur.</p>
+
+  <h3>Neden IPC gerekli?</h3>
+
+  <p>Linux'ta her process, kendi sanal address space'ine sahiptir. Bir process'in <code>0x7fff...</code> adresindeki değişken, başka bir process'in aynı adresindeki değişkenden tamamen bağımsızdır. Bu izolasyon güvenlik ve kararlılık için kritiktir, ancak iş bölümü yapan process'lerin veri paylaşması gerektiğinde bir iletişim mekanizması şarttır.</p>
+
+  <div class="flow">
+    <pre>
+  Process A          Process B
+  [addr space A]     [addr space B]
+       │                   │
+       │   ← IPC →         │
+       │  (kernel buffer    │
+       │   veya shared map) │
+    </pre>
+  </div>
+
+  <h3>Mekanizmalar karşılaştırma tablosu</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr>
+        <th>Mekanizma</th>
+        <th>Latency</th>
+        <th>Throughput</th>
+        <th>Kalıcılık</th>
+        <th>Multi-process</th>
+        <th>Karmaşıklık</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>pipe()</strong></td><td>Düşük</td><td>Orta (64 KB buffer)</td><td>Geçici</td><td>Sadece parent-child</td><td>Çok düşük</td></tr>
+      <tr><td><strong>FIFO</strong></td><td>Düşük</td><td>Orta</td><td>Dosya sistemi</td><td>İlgisiz process'ler</td><td>Düşük</td></tr>
+      <tr><td><strong>Unix socket</strong></td><td>Düşük–orta</td><td>Yüksek</td><td>Geçici (abstract) / FS</td><td>Çok process, çok istemci</td><td>Orta</td></tr>
+      <tr><td><strong>TCP loopback</strong></td><td>Orta</td><td>Yüksek</td><td>Geçici</td><td>Evet, ağ üzeri de</td><td>Orta</td></tr>
+      <tr><td><strong>mmap (anonim)</strong></td><td>Çok düşük</td><td>Çok yüksek</td><td>Geçici</td><td>Sadece fork sonrası</td><td>Orta</td></tr>
+      <tr><td><strong>POSIX shm</strong></td><td>Çok düşük</td><td>Çok yüksek</td><td><span class="path">/dev/shm</span></td><td>İlgisiz process'ler</td><td>Orta–yüksek</td></tr>
+      <tr><td><strong>POSIX mq</strong></td><td>Düşük</td><td>Orta</td><td>Kernel nesne</td><td>İlgisiz process'ler</td><td>Orta</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Seçim rehberi</h3>
+
+  <div class="flow">
+    <pre>
+  Hangi IPC?
+       │
+       ├─ Parent-child, tek yön → pipe()
+       │
+       ├─ İlgisiz process'ler, basit mesaj → FIFO
+       │
+       ├─ İlgisiz process'ler, bidirectional
+       │   veya fd passing gerekiyor       → Unix domain socket
+       │
+       ├─ Yüksek throughput, düşük latency → POSIX shm + semaphore
+       │
+       └─ Öncelikli mesaj sıralaması       → POSIX message queue
+    </pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde öğrendikleriniz</h4>
+    <ul>
+      <li>Process izolasyonu güvenlik için gereklidir; IPC bu izolasyonu kontrollü aşar</li>
+      <li>Latency açısından shm > Unix socket > pipe/FIFO > TCP loopback sıralaması geçerlidir</li>
+      <li>Doğru mekanizma seçimi gereksiz karmaşıklıktan ve performans kayıplarından korur</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Pipe</h2>
+  <p class="section-lead">pipe(), Linux'un en temel IPC mekanizmasıdır: kernel içinde tek yönlü bir byte akışı tamponu — fork ve exec ile birleşince shell pipe'ının temelini oluşturur.</p>
+
+  <h3>pipe() syscall</h3>
+
+  <p><code>pipe(int fds[2])</code> iki file descriptor döner: <code>fds[0]</code> okuma ucu, <code>fds[1]</code> yazma ucudur. Data her zaman <code>fds[1]</code>'e yazılır, <code>fds[0]</code>'dan okunur.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>pipe-example.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;unistd.h&gt;
+<span class="keyword">#include</span> &lt;stdio.h&gt;
+<span class="keyword">#include</span> &lt;string.h&gt;
+<span class="keyword">#include</span> &lt;sys/wait.h&gt;
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>) {
+    <span class="keyword">int</span> fds[2];
+    <span class="keyword">char</span> buf[128];
+
+    <span class="keyword">if</span> (pipe(fds) == -1) {   <span class="cmt">/* pipe oluştur */</span>
+        perror(<span class="str">"pipe"</span>);
+        <span class="keyword">return</span> 1;
+    }
+
+    pid_t pid = fork();
+
+    <span class="keyword">if</span> (pid == 0) {
+        <span class="cmt">/* child: okuyucu — yazma ucunu kapat */</span>
+        close(fds[1]);
+        ssize_t n = read(fds[0], buf, <span class="keyword">sizeof</span>(buf) - 1);
+        buf[n] = <span class="str">'\0'</span>;
+        printf(<span class="str">"child okudu: %s\n"</span>, buf);
+        close(fds[0]);
+        _exit(0);
+    }
+
+    <span class="cmt">/* parent: yazıcı — okuma ucunu kapat */</span>
+    close(fds[0]);
+    <span class="keyword">const char</span> *msg = <span class="str">"merhaba child"</span>;
+    write(fds[1], msg, strlen(msg));
+    close(fds[1]);   <span class="cmt">/* kapat → child'da EOF görülür */</span>
+
+    wait(NULL);
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <h3>Shell pipe'ı nasıl çalışır?</h3>
+
+  <p><code>ls | grep txt</code> yazdığınızda shell şunları yapar:</p>
+
+  <div class="flow">
+    <pre>
+  shell
+   │
+   ├─ pipe(fds)          ← kernel buffer oluştur
+   │
+   ├─ fork() → child1    ← ls için
+   │    └─ dup2(fds[1], STDOUT_FILENO)  ← stdout → pipe yazma ucu
+   │       close(fds[0]); close(fds[1])
+   │       exec("ls")
+   │
+   └─ fork() → child2    ← grep için
+        └─ dup2(fds[0], STDIN_FILENO)   ← stdin → pipe okuma ucu
+           close(fds[0]); close(fds[1])
+           exec("grep", "txt")
+    </pre>
+  </div>
+
+  <h3>Pipe kapasitesi ve blocking semantiği</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Durum</th><th>Davranış</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Boş pipe'tan <code>read()</code></td><td>Yazma ucu açıksa bloklar; yazma ucu kapalıysa 0 (EOF) döner</td></tr>
+      <tr><td>Dolu pipe'a <code>write()</code></td><td>Okuma ucu açıksa bloklar; okuma ucu kapalıysa <strong>SIGPIPE</strong> gönderilir</td></tr>
+      <tr><td>Kapasite (Linux)</td><td>Varsayılan 65536 byte; <code>fcntl(fd, F_SETPIPE_SZ, size)</code> ile değiştirilebilir</td></tr>
+    </tbody>
+  </table>
+
+  <div class="code-block">
+    <div class="code-header"><span>pipe-nonblock.c — SIGPIPE bastırma</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;signal.h&gt;
+<span class="keyword">#include</span> &lt;unistd.h&gt;
+<span class="keyword">#include</span> &lt;errno.h&gt;
+
+<span class="cmt">/* Yöntem 1: SIGPIPE'ı yoksay */</span>
+signal(SIGPIPE, SIG_IGN);
+ssize_t n = write(fds[1], buf, len);
+<span class="keyword">if</span> (n == -1 &amp;&amp; errno == EPIPE) {
+    <span class="cmt">/* okuyucu kapandı, yazma başarısız */</span>
+}
+
+<span class="cmt">/* Yöntem 2: MSG_NOSIGNAL (send() için) */</span>
+send(sock_fd, buf, len, MSG_NOSIGNAL);</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde öğrendikleriniz</h4>
+    <ul>
+      <li><code>pipe(fds)</code>: fds[0] okuma, fds[1] yazma — tek yönlü, kernel buffer</li>
+      <li>Shell <code>|</code> operatörü pipe + fork + dup2 + exec zinciridir</li>
+      <li>Dolu pipe'a yazma ve okuyucu yoksa SIGPIPE — <code>SIG_IGN</code> veya <code>MSG_NOSIGNAL</code> ile bastırılır</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Named pipe (FIFO)</h2>
+  <p class="section-lead">FIFO, pipe'ın dosya sistemi üzerinde kalıcı bir adrese sahip versiyonudur — ilgisiz process'ler arasında isimsiz pipe olmaksızın haberleşmeyi mümkün kılar.</p>
+
+  <h3>mkfifo ile oluşturma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>terminal</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Komut satırından FIFO oluştur</span>
+<span class="cmd">mkfifo</span> /tmp/myfifo
+
+<span class="cmt"># İzinleri kontrol et</span>
+<span class="cmd">ls</span> <span class="flag">-l</span> /tmp/myfifo
+<span class="cmt"># prw-r--r-- 1 user user 0 Apr 12 10:00 /tmp/myfifo</span>
+<span class="cmt"># "p" → named pipe</span></code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>fifo-server.c — okuyucu process</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;fcntl.h&gt;
+<span class="keyword">#include</span> &lt;sys/stat.h&gt;
+<span class="keyword">#include</span> &lt;unistd.h&gt;
+<span class="keyword">#include</span> &lt;stdio.h&gt;
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>) {
+    <span class="keyword">const char</span> *path = <span class="str">"/tmp/myfifo"</span>;
+
+    <span class="cmt">/* FIFO oluştur (zaten varsa EEXIST — sorun değil) */</span>
+    mkfifo(path, 0666);
+
+    printf(<span class="str">"Yazıcı bekleniyor...\n"</span>);
+
+    <span class="cmt">/* O_RDONLY: yazıcı taraf açana kadar BLOKLAR */</span>
+    <span class="keyword">int</span> fd = open(path, O_RDONLY);
+
+    <span class="keyword">char</span> buf[256];
+    ssize_t n;
+    <span class="keyword">while</span> ((n = read(fd, buf, <span class="keyword">sizeof</span>(buf))) > 0) {
+        buf[n] = <span class="str">'\0'</span>;
+        printf(<span class="str">"Alındı: %s"</span>, buf);
+    }
+
+    close(fd);
+    unlink(path);   <span class="cmt">/* FIFO'yu sil */</span>
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>fifo-client.c — yazıcı process</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;fcntl.h&gt;
+<span class="keyword">#include</span> &lt;unistd.h&gt;
+<span class="keyword">#include</span> &lt;string.h&gt;
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>) {
+    <span class="cmt">/* O_WRONLY: okuyucu taraf açana kadar BLOKLAR */</span>
+    <span class="keyword">int</span> fd = open(<span class="str">"/tmp/myfifo"</span>, O_WRONLY);
+
+    <span class="keyword">const char</span> *msg = <span class="str">"merhaba fifo\n"</span>;
+    write(fd, msg, strlen(msg));
+
+    close(fd);
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <h3>Blocking semantiği ve O_NONBLOCK</h3>
+
+  <p>FIFO'nun kritik özelliği: <code>open()</code> çağrısı kendisi bloklar. Okuyucu <code>O_RDONLY</code> ile açarken yazıcı gelene kadar bekler; yazıcı <code>O_WRONLY</code> ile açarken okuyucu gelene kadar bekler. Bu senkronizasyonu <code>O_NONBLOCK</code> ile kırabilirsiniz:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>fifo-nonblock.c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Non-blocking open: karşı taraf yoksa -1 / ENXIO döner */</span>
+<span class="keyword">int</span> fd = open(<span class="str">"/tmp/myfifo"</span>, O_RDONLY | O_NONBLOCK);
+<span class="keyword">if</span> (fd == -1) {
+    perror(<span class="str">"open"</span>);   <span class="cmt">/* ENXIO: yazıcı henüz bağlanmamış */</span>
+}</code></pre>
+  </div>
+
+  <h3>FIFO vs pipe farkları</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Özellik</th><th>pipe()</th><th>FIFO</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Dosya sistemi girişi</td><td>Yok</td><td>Var (<code>mkfifo</code>)</td></tr>
+      <tr><td>Process ilişkisi</td><td>Sadece fork ile parent-child</td><td>İlgisiz process'ler</td></tr>
+      <tr><td>Kalıcılık</td><td>Tüm fd'ler kapanınca yok olur</td><td>Dosya sisteminde kalır (<code>unlink</code> gerekir)</td></tr>
+      <tr><td>open() bloklama</td><td>Yok (fork sonrası fd zaten var)</td><td>Var — karşı taraf açana kadar bloklar</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>FIFO'lar syslog pipe gibi "log aggregator" senaryolarında kullanışlıdır: bir process sürekli FIFO'dan okurken birden fazla başka process aynı FIFO'ya yazar. Kernel, yazmaları sırayla kuyruğa alır.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde öğrendikleriniz</h4>
+    <ul>
+      <li>FIFO, dosya sisteminde görünür bir pipe — <code>mkfifo(path, mode)</code> ile oluşturulur</li>
+      <li>Her iki taraf da <code>open()</code> yapana kadar bloklar — randevu noktası gibi davranır</li>
+      <li><code>O_NONBLOCK</code> ile blocking open davranışı kırılabilir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Unix domain socket</h2>
+  <p class="section-lead">AF_UNIX socket'leri, TCP/IP stack'i olmadan dosya sistemi üzerinde tam çift yönlü haberleşme sağlar — nginx, systemd, Docker daemon'ı hepsi Unix socket kullanır.</p>
+
+  <h3>AF_UNIX vs AF_INET</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Özellik</th><th>AF_UNIX</th><th>AF_INET (TCP loopback)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Yol</td><td>Dosya sistemi (<code>/tmp/app.sock</code>) veya abstract</td><td>IP:port (<code>127.0.0.1:8080</code>)</td></tr>
+      <tr><td>TCP/IP overhead</td><td>Yok</td><td>Var (checksum, seq number…)</td></tr>
+      <tr><td>Latency</td><td>Daha düşük</td><td>Daha yüksek</td></tr>
+      <tr><td>Ağ üzeri erişim</td><td>Hayır (sadece aynı host)</td><td>Evet</td></tr>
+      <tr><td>fd passing</td><td>Evet (SCM_RIGHTS)</td><td>Hayır</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Tam server/client örneği</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>unix-server.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;sys/socket.h&gt;
+<span class="keyword">#include</span> &lt;sys/un.h&gt;
+<span class="keyword">#include</span> &lt;unistd.h&gt;
+<span class="keyword">#include</span> &lt;stdio.h&gt;
+<span class="keyword">#include</span> &lt;string.h&gt;
+
+<span class="keyword">#define</span> SOCK_PATH <span class="str">"/tmp/myapp.sock"</span>
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>) {
+    <span class="keyword">int</span> srv, cli;
+    <span class="keyword">struct</span> sockaddr_un addr;
+    <span class="keyword">char</span> buf[256];
+
+    <span class="cmt">/* 1. Socket oluştur */</span>
+    srv = socket(AF_UNIX, SOCK_STREAM, 0);
+
+    <span class="cmt">/* 2. Adres ayarla */</span>
+    memset(&amp;addr, 0, <span class="keyword">sizeof</span>(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, SOCK_PATH, <span class="keyword">sizeof</span>(addr.sun_path) - 1);
+
+    <span class="cmt">/* 3. Önceki socket dosyasını temizle */</span>
+    unlink(SOCK_PATH);
+
+    <span class="cmt">/* 4. Bind + listen */</span>
+    bind(srv, (<span class="keyword">struct</span> sockaddr *)&amp;addr, <span class="keyword">sizeof</span>(addr));
+    listen(srv, 5);
+
+    printf(<span class="str">"İstemci bekleniyor: %s\n"</span>, SOCK_PATH);
+
+    <span class="cmt">/* 5. Accept döngüsü */</span>
+    <span class="keyword">while</span> (1) {
+        cli = accept(srv, NULL, NULL);
+        ssize_t n = read(cli, buf, <span class="keyword">sizeof</span>(buf) - 1);
+        buf[n] = <span class="str">'\0'</span>;
+        printf(<span class="str">"Alındı: %s\n"</span>, buf);
+
+        <span class="keyword">const char</span> *resp = <span class="str">"ACK"</span>;
+        write(cli, resp, strlen(resp));
+        close(cli);
+    }
+
+    close(srv);
+    unlink(SOCK_PATH);
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>unix-client.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;sys/socket.h&gt;
+<span class="keyword">#include</span> &lt;sys/un.h&gt;
+<span class="keyword">#include</span> &lt;unistd.h&gt;
+<span class="keyword">#include</span> &lt;stdio.h&gt;
+<span class="keyword">#include</span> &lt;string.h&gt;
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>) {
+    <span class="keyword">int</span> fd;
+    <span class="keyword">struct</span> sockaddr_un addr;
+    <span class="keyword">char</span> buf[64];
+
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+    memset(&amp;addr, 0, <span class="keyword">sizeof</span>(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, <span class="str">"/tmp/myapp.sock"</span>, <span class="keyword">sizeof</span>(addr.sun_path) - 1);
+
+    <span class="keyword">if</span> (connect(fd, (<span class="keyword">struct</span> sockaddr *)&amp;addr, <span class="keyword">sizeof</span>(addr)) == -1) {
+        perror(<span class="str">"connect"</span>);
+        <span class="keyword">return</span> 1;
+    }
+
+    <span class="keyword">const char</span> *msg = <span class="str">"merhaba server"</span>;
+    write(fd, msg, strlen(msg));
+
+    ssize_t n = read(fd, buf, <span class="keyword">sizeof</span>(buf) - 1);
+    buf[n] = <span class="str">'\0'</span>;
+    printf(<span class="str">"Yanıt: %s\n"</span>, buf);
+
+    close(fd);
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <h3>Abstract namespace</h3>
+
+  <p>Abstract namespace socket'leri dosya sistemine yazılmaz; <code>sun_path[0] = '\0'</code> olduğunda kernel otomatik olarak abstract namespace'e bağlar. <code>unlink()</code> gerekmez, socket tüm referanslar kapandığında kaybolur.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>abstract-socket.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">struct</span> sockaddr_un addr;
+memset(&amp;addr, 0, <span class="keyword">sizeof</span>(addr));
+addr.sun_family = AF_UNIX;
+
+<span class="cmt">/* sun_path[0] = '\0' → abstract namespace */</span>
+<span class="cmt">/* gerçek isim sun_path[1]'den başlar        */</span>
+strncpy(addr.sun_path + 1, <span class="str">"myapp"</span>, <span class="keyword">sizeof</span>(addr.sun_path) - 2);
+
+<span class="cmt">/* addrlen: sun_family boyutu + 1 (null byte) + isim uzunluğu */</span>
+socklen_t len = <span class="keyword">sizeof</span>(sa_family_t) + 1 + strlen(<span class="str">"myapp"</span>);
+bind(fd, (<span class="keyword">struct</span> sockaddr *)&amp;addr, len);</code></pre>
+  </div>
+
+  <h3>SCM_RIGHTS: fd passing</h3>
+
+  <p>Unix socket'lerin benzersiz özelliği: bir process, açık bir file descriptor'ı başka bir process'e gönderebilir. Docker'ın containerd ile haberleşmesi, systemd'nin socket activation mekanizması bu yöntemi kullanır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>fd-pass-sender.c — fd gönderme</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;sys/socket.h&gt;
+<span class="keyword">#include</span> &lt;sys/un.h&gt;
+<span class="keyword">#include</span> &lt;unistd.h&gt;
+<span class="keyword">#include</span> &lt;fcntl.h&gt;
+<span class="keyword">#include</span> &lt;string.h&gt;
+
+<span class="keyword">void</span> send_fd(<span class="keyword">int</span> sock, <span class="keyword">int</span> fd_to_send) {
+    <span class="keyword">struct</span> msghdr msg = {0};
+    <span class="keyword">char</span> cmsg_buf[CMSG_SPACE(<span class="keyword">sizeof</span>(<span class="keyword">int</span>))];
+    <span class="keyword">char</span> dummy = <span class="str">'!'</span>;
+    <span class="keyword">struct</span> iovec iov = { .iov_base = &amp;dummy, .iov_len = 1 };
+
+    msg.msg_iov     = &amp;iov;
+    msg.msg_iovlen  = 1;
+    msg.msg_control = cmsg_buf;
+    msg.msg_controllen = <span class="keyword">sizeof</span>(cmsg_buf);
+
+    <span class="keyword">struct</span> cmsghdr *cmsg = CMSG_FIRSTHDR(&amp;msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type  = SCM_RIGHTS;     <span class="cmt">/* fd passing protokolü */</span>
+    cmsg->cmsg_len   = CMSG_LEN(<span class="keyword">sizeof</span>(<span class="keyword">int</span>));
+    memcpy(CMSG_DATA(cmsg), &amp;fd_to_send, <span class="keyword">sizeof</span>(<span class="keyword">int</span>));
+
+    sendmsg(sock, &amp;msg, 0);
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde öğrendikleriniz</h4>
+    <ul>
+      <li>AF_UNIX, TCP/IP overhead'i olmadan tam çift yönlü haberleşme sağlar</li>
+      <li>Abstract namespace (<code>sun_path[0]='\0'</code>) dosya sistemi bağımlılığını ortadan kaldırır</li>
+      <li>SCM_RIGHTS ile process'ler arası file descriptor transferi mümkündür</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> socketpair()</h2>
+  <p class="section-lead">socketpair(), dosya sistemi kullanmadan iki bağlı socket oluşturur — fork tabanlı parent-child haberleşmede pipe()'a göre çift yönlü çalışması öne çıkan avantajıdır.</p>
+
+  <h3>socketpair() nedir?</h3>
+
+  <p><code>socketpair(AF_UNIX, SOCK_STREAM, 0, sv)</code> çağrısı, birbirine bağlı iki socket descriptor döner. Normal pipe'tan farkı: her iki uç da hem okuyup hem yazabilir (full-duplex). Bir çift ile parent-child arasında çift yönlü kanal kurulur.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>socketpair-example.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;sys/socket.h&gt;
+<span class="keyword">#include</span> &lt;unistd.h&gt;
+<span class="keyword">#include</span> &lt;stdio.h&gt;
+<span class="keyword">#include</span> &lt;string.h&gt;
+<span class="keyword">#include</span> &lt;sys/wait.h&gt;
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>) {
+    <span class="keyword">int</span> sv[2];
+    <span class="keyword">char</span> buf[128];
+
+    <span class="cmt">/* İki bağlı socket oluştur */</span>
+    <span class="keyword">if</span> (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == -1) {
+        perror(<span class="str">"socketpair"</span>);
+        <span class="keyword">return</span> 1;
+    }
+
+    pid_t pid = fork();
+
+    <span class="keyword">if</span> (pid == 0) {
+        <span class="cmt">/* child: sv[1] kullanır, sv[0]'ı kapatır */</span>
+        close(sv[0]);
+
+        <span class="keyword">const char</span> *msg = <span class="str">"child'dan mesaj"</span>;
+        write(sv[1], msg, strlen(msg));
+
+        ssize_t n = read(sv[1], buf, <span class="keyword">sizeof</span>(buf) - 1);
+        buf[n] = <span class="str">'\0'</span>;
+        printf(<span class="str">"child yanıt aldı: %s\n"</span>, buf);
+
+        close(sv[1]);
+        _exit(0);
+    }
+
+    <span class="cmt">/* parent: sv[0] kullanır, sv[1]'i kapatır */</span>
+    close(sv[1]);
+
+    ssize_t n = read(sv[0], buf, <span class="keyword">sizeof</span>(buf) - 1);
+    buf[n] = <span class="str">'\0'</span>;
+    printf(<span class="str">"parent aldı: %s\n"</span>, buf);
+
+    <span class="keyword">const char</span> *reply = <span class="str">"parent yanıtı"</span>;
+    write(sv[0], reply, strlen(reply));
+
+    wait(NULL);
+    close(sv[0]);
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <h3>pipe vs socketpair karşılaştırması</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Özellik</th><th>pipe()</th><th>socketpair()</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Yön</td><td>Tek yönlü (fds[0] oku, fds[1] yaz)</td><td>Çift yönlü (her iki uç da oku/yaz)</td></tr>
+      <tr><td>Çift yön için</td><td>İki pipe gerekir</td><td>Tek çift yeterli</td></tr>
+      <tr><td>fd sayısı</td><td>2 (çift yön için 4)</td><td>2 (çift yön yeterli)</td></tr>
+      <tr><td>SOCK_DGRAM desteği</td><td>Yok</td><td>Var (mesaj sınırları korunur)</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p><code>SOCK_DGRAM</code> ile kullanılan socketpair(), mesaj sınırlarını korur: <code>write(sv[0], "abc", 3)</code> ve <code>write(sv[0], "xyz", 3)</code> iki ayrı <code>read()</code> çağrısı ile alınır. <code>SOCK_STREAM</code>'de byte akışı birleşebilir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde öğrendikleriniz</h4>
+    <ul>
+      <li><code>socketpair()</code>, dosya sistemi olmadan iki bağlı socket üretir</li>
+      <li>Full-duplex olduğundan çift yönlü haberleşme için tek çift yeterlidir</li>
+      <li><code>SOCK_DGRAM</code> ile mesaj sınırları korunur; <code>SOCK_STREAM</code>'de byte akışı birleşir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> mmap ile shared memory</h2>
+  <p class="section-lead">mmap ile anonim bellek eşlemesi, fork sonrası parent-child arasında sıfır kopya veri paylaşımı sağlar — en düşük latency IPC mekanizmasıdır.</p>
+
+  <h3>MAP_SHARED | MAP_ANONYMOUS</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>mmap-shm.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;sys/mman.h&gt;
+<span class="keyword">#include</span> &lt;unistd.h&gt;
+<span class="keyword">#include</span> &lt;stdio.h&gt;
+<span class="keyword">#include</span> &lt;sys/wait.h&gt;
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>) {
+    <span class="cmt">/* MAP_SHARED: fork sonrası aynı fiziksel sayfayı paylaşırlar */</span>
+    <span class="cmt">/* MAP_ANONYMOUS: dosya değil, sıfır-başlatılmış bellek       */</span>
+    <span class="keyword">int</span> *shared = mmap(
+        NULL,
+        <span class="keyword">sizeof</span>(<span class="keyword">int</span>),
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS,
+        -1, 0
+    );
+
+    <span class="keyword">if</span> (shared == MAP_FAILED) {
+        perror(<span class="str">"mmap"</span>);
+        <span class="keyword">return</span> 1;
+    }
+
+    *shared = 0;
+
+    pid_t pid = fork();
+
+    <span class="keyword">if</span> (pid == 0) {
+        <span class="cmt">/* child: değeri artır */</span>
+        *shared = 42;
+        _exit(0);
+    }
+
+    wait(NULL);
+
+    <span class="cmt">/* parent: child'ın yazdığı değeri görür */</span>
+    printf(<span class="str">"shared değer: %d\n"</span>, *shared);   <span class="cmt">/* 42 */</span>
+
+    munmap(shared, <span class="keyword">sizeof</span>(<span class="keyword">int</span>));
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <h3>MAP_SHARED vs MAP_PRIVATE</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Flag</th><th>Yazma Davranışı</th><th>Kullanım</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>MAP_SHARED</code></td><td>Tüm mapping'ler aynı fiziksel sayfayı görür; yazma diğerlerini etkiler</td><td>IPC, dosyaya geri yazma</td></tr>
+      <tr><td><code>MAP_PRIVATE</code></td><td>Copy-on-write: yazma anında özel kopya oluşturulur; diğerleri etkilenmez</td><td>Process-özel çalışma kopyası</td></tr>
+    </tbody>
+  </table>
+
+  <h3>/dev/shm ile dosya tabanlı mmap</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>devshm-mmap.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;sys/mman.h&gt;
+<span class="keyword">#include</span> &lt;fcntl.h&gt;
+<span class="keyword">#include</span> &lt;unistd.h&gt;
+<span class="keyword">#include</span> &lt;string.h&gt;
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>) {
+    <span class="cmt">/* /dev/shm: RAM-backed tmpfs */</span>
+    <span class="keyword">int</span> fd = open(<span class="str">"/dev/shm/myapp-buf"</span>, O_CREAT | O_RDWR, 0600);
+    ftruncate(fd, 4096);   <span class="cmt">/* boyutu ayarla */</span>
+
+    <span class="keyword">char</span> *buf = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);   <span class="cmt">/* fd'yi kapat, mapping hâlâ aktif */</span>
+
+    strcpy(buf, <span class="str">"paylaşılan veri"</span>);
+
+    msync(buf, 4096, MS_SYNC);   <span class="cmt">/* değişiklikleri garantile */</span>
+    munmap(buf, 4096);
+    unlink(<span class="str">"/dev/shm/myapp-buf"</span>);
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>Senkronizasyon olmadan paylaşılan belleğe birden fazla process eş zamanlı yazdığında race condition kaçınılmazdır. <code>MAP_SHARED</code> bellek kullanımında her zaman mutex (PTHREAD_PROCESS_SHARED) veya semaphore kullanın. Bu kural hem anonim mmap hem POSIX shm için geçerlidir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde öğrendikleriniz</h4>
+    <ul>
+      <li><code>MAP_SHARED | MAP_ANONYMOUS</code> ile fork sonrası aynı fiziksel sayfa paylaşılır</li>
+      <li><code>MAP_PRIVATE</code> copy-on-write sağlar — yazma diğer mapping'leri etkilemez</li>
+      <li>Senkronizasyon olmadan race condition kaçınılmazdır; mutex veya semaphore şarttır</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> POSIX shm</h2>
+  <p class="section-lead">POSIX shared memory, anonim mmap'ten farklı olarak ilgisiz process'lerin isim üzerinden aynı bellek bölgesine erişmesine olanak tanır.</p>
+
+  <h3>shm_open + mmap akışı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>posix-shm-producer.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;sys/mman.h&gt;
+<span class="keyword">#include</span> &lt;sys/stat.h&gt;
+<span class="keyword">#include</span> &lt;fcntl.h&gt;
+<span class="keyword">#include</span> &lt;unistd.h&gt;
+<span class="keyword">#include</span> &lt;string.h&gt;
+<span class="keyword">#include</span> &lt;stdio.h&gt;
+
+<span class="keyword">#define</span> SHM_NAME  <span class="str">"/myapp-shm"</span>
+<span class="keyword">#define</span> SHM_SIZE  4096
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>) {
+    <span class="cmt">/* 1. shm_open: /dev/shm/myapp-shm dosyası oluşturur */</span>
+    <span class="keyword">int</span> fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+    <span class="keyword">if</span> (fd == -1) { perror(<span class="str">"shm_open"</span>); <span class="keyword">return</span> 1; }
+
+    <span class="cmt">/* 2. Boyutu ayarla */</span>
+    ftruncate(fd, SHM_SIZE);
+
+    <span class="cmt">/* 3. mmap ile adres alanına eşle */</span>
+    <span class="keyword">char</span> *ptr = mmap(NULL, SHM_SIZE,
+                    PROT_READ | PROT_WRITE,
+                    MAP_SHARED, fd, 0);
+    close(fd);
+
+    <span class="cmt">/* 4. Veri yaz */</span>
+    snprintf(ptr, SHM_SIZE, <span class="str">"producer verisi: %d"</span>, getpid());
+    printf(<span class="str">"Yazıldı, consumer bekleniyor...\n"</span>);
+
+    sleep(10);   <span class="cmt">/* consumer okuyana kadar bekle */</span>
+
+    munmap(ptr, SHM_SIZE);
+    shm_unlink(SHM_NAME);   <span class="cmt">/* temizlik */</span>
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>posix-shm-consumer.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;sys/mman.h&gt;
+<span class="keyword">#include</span> &lt;sys/stat.h&gt;
+<span class="keyword">#include</span> &lt;fcntl.h&gt;
+<span class="keyword">#include</span> &lt;unistd.h&gt;
+<span class="keyword">#include</span> &lt;stdio.h&gt;
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>) {
+    <span class="cmt">/* O_RDONLY: sadece oku */</span>
+    <span class="keyword">int</span> fd = shm_open(<span class="str">"/myapp-shm"</span>, O_RDONLY, 0);
+    <span class="keyword">if</span> (fd == -1) { perror(<span class="str">"shm_open"</span>); <span class="keyword">return</span> 1; }
+
+    <span class="keyword">char</span> *ptr = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+
+    printf(<span class="str">"Okunan: %s\n"</span>, ptr);
+
+    munmap(ptr, 4096);
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <h3>İsimlendirme kuralları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">/myapp-shm</span><span class="desc">İsim / ile başlamalı, sonrasında / içermemeli — <span class="path">/dev/shm/myapp-shm</span> dosyasına karşılık gelir</span></div>
+    <div class="param"><span class="name">ftruncate(fd, size)</span><span class="desc">shm_open sonrası boyutu ayarlamak için şart; yoksa mmap SIGBUS üretir</span></div>
+    <div class="param"><span class="name">shm_unlink(name)</span><span class="desc">İsmi siler, ancak tüm mmap'ler kapanana kadar bellek kullanımda kalır</span></div>
+    <div class="param"><span class="name">-lrt</span><span class="desc">Bazı eski sistemlerde gerekli; glibc 2.17+ ile artık gerekmez</span></div>
+  </div>
+
+  <h3>Pipe vs shm hız karşılaştırması</h3>
+
+  <p>1 GB veri transferi için kaba ölçüm (aynı host, Linux 5.15):</p>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Mekanizma</th><th>Süre</th><th>Throughput</th><th>Kopya</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>POSIX shm + pointer</td><td>~10 ms</td><td>~100 GB/s</td><td>Sıfır kopya</td></tr>
+      <tr><td>Unix socket</td><td>~1200 ms</td><td>~850 MB/s</td><td>2 kopya (kernel buffer)</td></tr>
+      <tr><td>pipe</td><td>~1500 ms</td><td>~680 MB/s</td><td>2 kopya (kernel buffer)</td></tr>
+      <tr><td>TCP loopback</td><td>~2100 ms</td><td>~480 MB/s</td><td>2 kopya + TCP overhead</td></tr>
+    </tbody>
+  </table>
+
+  <div class="summary">
+    <h4>Bu bölümde öğrendikleriniz</h4>
+    <ul>
+      <li><code>shm_open → ftruncate → mmap</code> üçlüsü POSIX shm'nin temel akışıdır</li>
+      <li>İsim <code>/</code> ile başlamalı; <code>shm_unlink</code> ile temizlenmelidir</li>
+      <li>Shared memory, sıfır kopya ile pipe/socket'ten çok daha yüksek throughput sağlar</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> POSIX message queue</h2>
+  <p class="section-lead">POSIX message queue, öncelik tabanlı mesaj sıralama ve async bildirim desteği ile pipe/socket'ten farklı bir IPC semantiği sunar.</p>
+
+  <h3>mq_open ve mq_attr yapısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>mq-producer.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;mqueue.h&gt;
+<span class="keyword">#include</span> &lt;fcntl.h&gt;
+<span class="keyword">#include</span> &lt;sys/stat.h&gt;
+<span class="keyword">#include</span> &lt;stdio.h&gt;
+<span class="keyword">#include</span> &lt;string.h&gt;
+
+<span class="keyword">#define</span> QUE_NAME  <span class="str">"/myqueue"</span>
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>) {
+    <span class="keyword">struct</span> mq_attr attr = {
+        .mq_flags   = 0,
+        .mq_maxmsg  = 10,       <span class="cmt">/* en fazla 10 mesaj bekleyebilir */</span>
+        .mq_msgsize = 256,      <span class="cmt">/* her mesaj en fazla 256 byte   */</span>
+        .mq_curmsgs = 0
+    };
+
+    mqd_t mqd = mq_open(QUE_NAME, O_CREAT | O_WRONLY, 0666, &amp;attr);
+    <span class="keyword">if</span> (mqd == (mqd_t)-1) { perror(<span class="str">"mq_open"</span>); <span class="keyword">return</span> 1; }
+
+    <span class="keyword">const char</span> *msg1 = <span class="str">"normal mesaj"</span>;
+    <span class="keyword">const char</span> *msg2 = <span class="str">"acil mesaj"</span>;
+
+    <span class="cmt">/* Priority 5: normal */</span>
+    mq_send(mqd, msg1, strlen(msg1) + 1, 5);
+
+    <span class="cmt">/* Priority 10: daha yüksek → kuyrukta öne geçer */</span>
+    mq_send(mqd, msg2, strlen(msg2) + 1, 10);
+
+    mq_close(mqd);
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>mq-consumer.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;mqueue.h&gt;
+<span class="keyword">#include</span> &lt;fcntl.h&gt;
+<span class="keyword">#include</span> &lt;sys/stat.h&gt;
+<span class="keyword">#include</span> &lt;stdio.h&gt;
+<span class="keyword">#include</span> &lt;string.h&gt;
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>) {
+    mqd_t mqd = mq_open(<span class="str">"/myqueue"</span>, O_RDONLY);
+    <span class="keyword">if</span> (mqd == (mqd_t)-1) { perror(<span class="str">"mq_open"</span>); <span class="keyword">return</span> 1; }
+
+    <span class="keyword">struct</span> mq_attr attr;
+    mq_getattr(mqd, &amp;attr);
+
+    <span class="keyword">char</span> buf[256];
+    <span class="keyword">unsigned int</span> prio;
+    ssize_t n;
+
+    <span class="cmt">/* Yüksek priority'li mesaj önce gelir */</span>
+    <span class="keyword">while</span> ((n = mq_receive(mqd, buf, attr.mq_msgsize, &amp;prio)) > 0) {
+        printf(<span class="str">"[prio=%u] %s\n"</span>, prio, buf);
+    }
+
+    mq_close(mqd);
+    mq_unlink(<span class="str">"/myqueue"</span>);   <span class="cmt">/* temizlik */</span>
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <h3>mq_notify: async bildirim</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>mq-notify.c — signal ile async bildirim</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;mqueue.h&gt;
+<span class="keyword">#include</span> &lt;signal.h&gt;
+<span class="keyword">#include</span> &lt;fcntl.h&gt;
+<span class="keyword">#include</span> &lt;stdio.h&gt;
+
+<span class="keyword">static</span> mqd_t g_mqd;
+
+<span class="keyword">static void</span> mq_handler(<span class="keyword">int</span> sig) {
+    <span class="keyword">char</span> buf[256];
+    <span class="keyword">unsigned int</span> prio;
+    ssize_t n = mq_receive(g_mqd, buf, <span class="keyword">sizeof</span>(buf), &amp;prio);
+    <span class="keyword">if</span> (n > 0) {
+        buf[n] = <span class="str">'\0'</span>;
+        printf(<span class="str">"async alındı: %s\n"</span>, buf);
+    }
+
+    <span class="cmt">/* Her alımdan sonra notify yeniden kaydet */</span>
+    <span class="keyword">struct</span> sigevent sev = { .sigev_notify = SIGEV_SIGNAL,
+                           .sigev_signo  = SIGUSR1 };
+    mq_notify(g_mqd, &amp;sev);
+}
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>) {
+    g_mqd = mq_open(<span class="str">"/myqueue"</span>, O_RDONLY);
+
+    signal(SIGUSR1, mq_handler);
+
+    <span class="keyword">struct</span> sigevent sev = { .sigev_notify = SIGEV_SIGNAL,
+                           .sigev_signo  = SIGUSR1 };
+    mq_notify(g_mqd, &amp;sev);
+
+    <span class="cmt">/* Ana döngü: mesaj geldiğinde signal handler çalışır */</span>
+    <span class="keyword">while</span> (1) pause();
+
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <h3>Kernel parametreleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>terminal</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Maksimum kuyruk sayısı</span>
+<span class="cmd">cat</span> <span class="path">/proc/sys/fs/mqueue/queues_max</span>
+
+<span class="cmt"># Maksimum mesaj sayısı per kuyruk</span>
+<span class="cmd">cat</span> <span class="path">/proc/sys/fs/mqueue/msg_max</span>
+
+<span class="cmt"># Maksimum mesaj boyutu</span>
+<span class="cmd">cat</span> <span class="path">/proc/sys/fs/mqueue/msgsize_max</span>
+
+<span class="cmt"># Geçici olarak artır</span>
+<span class="cmd">sudo sysctl</span> fs.mqueue.msg_max=100</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde öğrendikleriniz</h4>
+    <ul>
+      <li><code>mq_open → mq_send/mq_receive → mq_close → mq_unlink</code> tam yaşam döngüsüdür</li>
+      <li>Yüksek priority mesajlar kuyrukta otomatik olarak öne geçer</li>
+      <li><code>mq_notify</code> ile mesaj geldiğinde SIGEV_SIGNAL veya SIGEV_THREAD ile async bildirim alınır</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Senkronizasyon: semaphore ve mutex</h2>
+  <p class="section-lead">Shared memory ile birlikte senkronizasyon kullanmak zorunludur — sem_t ve PTHREAD_PROCESS_SHARED mutex bu ihtiyacı karşılar.</p>
+
+  <h3>POSIX semaphore: sem_open (named)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>named-sem.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;semaphore.h&gt;
+<span class="keyword">#include</span> &lt;fcntl.h&gt;
+<span class="keyword">#include</span> &lt;sys/stat.h&gt;
+<span class="keyword">#include</span> &lt;stdio.h&gt;
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>) {
+    <span class="cmt">/* Named semaphore: /my-sem → /dev/shm/sem.my-sem */</span>
+    sem_t *sem = sem_open(<span class="str">"/my-sem"</span>, O_CREAT, 0666, 1);
+    <span class="keyword">if</span> (sem == SEM_FAILED) { perror(<span class="str">"sem_open"</span>); <span class="keyword">return</span> 1; }
+
+    sem_wait(sem);          <span class="cmt">/* değer > 0 ise azalt ve devam et; 0 ise blokla */</span>
+    <span class="cmt">/* kritik bölge */</span>
+    printf(<span class="str">"kritik bölgedeyim\n"</span>);
+    sem_post(sem);          <span class="cmt">/* değeri artır, bekleyenleri uyandır */</span>
+
+    sem_close(sem);
+    sem_unlink(<span class="str">"/my-sem"</span>);
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <h3>Unnamed semaphore: fork ile kullanım</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>unnamed-sem.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;semaphore.h&gt;
+<span class="keyword">#include</span> &lt;sys/mman.h&gt;
+<span class="keyword">#include</span> &lt;unistd.h&gt;
+<span class="keyword">#include</span> &lt;stdio.h&gt;
+<span class="keyword">#include</span> &lt;sys/wait.h&gt;
+
+<span class="keyword">typedef struct</span> {
+    sem_t sem;
+    <span class="keyword">int</span>   counter;
+} SharedData;
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>) {
+    SharedData *data = mmap(NULL, <span class="keyword">sizeof</span>(SharedData),
+                            PROT_READ | PROT_WRITE,
+                            MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+
+    <span class="cmt">/* pshared=1: fork sonrası process'ler arasında paylaşılabilir */</span>
+    sem_init(&amp;data->sem, 1, 1);
+    data->counter = 0;
+
+    <span class="keyword">for</span> (<span class="keyword">int</span> i = 0; i &lt; 4; i++) {
+        <span class="keyword">if</span> (fork() == 0) {
+            <span class="keyword">for</span> (<span class="keyword">int</span> j = 0; j &lt; 10000; j++) {
+                sem_wait(&amp;data->sem);
+                data->counter++;        <span class="cmt">/* race condition yok */</span>
+                sem_post(&amp;data->sem);
+            }
+            _exit(0);
+        }
+    }
+
+    <span class="keyword">for</span> (<span class="keyword">int</span> i = 0; i &lt; 4; i++) wait(NULL);
+
+    printf(<span class="str">"Sonuç: %d (beklenen: 40000)\n"</span>, data->counter);
+
+    sem_destroy(&amp;data->sem);
+    munmap(data, <span class="keyword">sizeof</span>(SharedData));
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <h3>PTHREAD_PROCESS_SHARED mutex</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>process-shared-mutex.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;pthread.h&gt;
+<span class="keyword">#include</span> &lt;sys/mman.h&gt;
+<span class="keyword">#include</span> &lt;unistd.h&gt;
+<span class="keyword">#include</span> &lt;stdio.h&gt;
+<span class="keyword">#include</span> &lt;sys/wait.h&gt;
+
+<span class="keyword">typedef struct</span> {
+    pthread_mutex_t mtx;
+    <span class="keyword">int</span>             value;
+} ShmRegion;
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>) {
+    ShmRegion *reg = mmap(NULL, <span class="keyword">sizeof</span>(ShmRegion),
+                          PROT_READ | PROT_WRITE,
+                          MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+
+    <span class="cmt">/* Mutex'i process-shared olarak başlat */</span>
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&amp;attr);
+    pthread_mutexattr_setpshared(&amp;attr, PTHREAD_PROCESS_SHARED);
+    pthread_mutex_init(&amp;reg->mtx, &amp;attr);
+    pthread_mutexattr_destroy(&amp;attr);
+
+    reg->value = 0;
+
+    <span class="keyword">if</span> (fork() == 0) {
+        pthread_mutex_lock(&amp;reg->mtx);
+        reg->value = 99;
+        pthread_mutex_unlock(&amp;reg->mtx);
+        _exit(0);
+    }
+
+    wait(NULL);
+
+    pthread_mutex_lock(&amp;reg->mtx);
+    printf(<span class="str">"value: %d\n"</span>, reg->value);   <span class="cmt">/* 99 */</span>
+    pthread_mutex_unlock(&amp;reg->mtx);
+
+    pthread_mutex_destroy(&amp;reg->mtx);
+    munmap(reg, <span class="keyword">sizeof</span>(ShmRegion));
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <h3>Producer-consumer: shm + semaphore</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>prod-cons.c — tam örnek</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;semaphore.h&gt;
+<span class="keyword">#include</span> &lt;sys/mman.h&gt;
+<span class="keyword">#include</span> &lt;unistd.h&gt;
+<span class="keyword">#include</span> &lt;stdio.h&gt;
+<span class="keyword">#include</span> &lt;sys/wait.h&gt;
+<span class="keyword">#include</span> &lt;string.h&gt;
+
+<span class="keyword">#define</span> BUF_SIZE 256
+
+<span class="keyword">typedef struct</span> {
+    sem_t  empty;   <span class="cmt">/* başlangıç: 1 (boş slot var) */</span>
+    sem_t  full;    <span class="cmt">/* başlangıç: 0 (dolu slot yok) */</span>
+    <span class="keyword">char</span>   buf[BUF_SIZE];
+} Channel;
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>) {
+    Channel *ch = mmap(NULL, <span class="keyword">sizeof</span>(Channel),
+                       PROT_READ | PROT_WRITE,
+                       MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+
+    sem_init(&amp;ch->empty, 1, 1);
+    sem_init(&amp;ch->full,  1, 0);
+
+    <span class="keyword">if</span> (fork() == 0) {
+        <span class="cmt">/* consumer */</span>
+        sem_wait(&amp;ch->full);             <span class="cmt">/* veri gelene kadar bekle */</span>
+        printf(<span class="str">"consumer: %s\n"</span>, ch->buf);
+        sem_post(&amp;ch->empty);            <span class="cmt">/* slot boşaldı */</span>
+        _exit(0);
+    }
+
+    <span class="cmt">/* producer */</span>
+    sem_wait(&amp;ch->empty);               <span class="cmt">/* slot boşalana kadar bekle */</span>
+    strncpy(ch->buf, <span class="str">"merhaba consumer"</span>, BUF_SIZE);
+    sem_post(&amp;ch->full);                <span class="cmt">/* veri hazır */</span>
+
+    wait(NULL);
+    sem_destroy(&amp;ch->empty);
+    sem_destroy(&amp;ch->full);
+    munmap(ch, <span class="keyword">sizeof</span>(Channel));
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde öğrendikleriniz</h4>
+    <ul>
+      <li>Named semaphore (<code>sem_open</code>) ilgisiz process'ler arasında kullanılır; unnamed (<code>sem_init</code> pshared=1) fork sonrası çalışır</li>
+      <li><code>PTHREAD_PROCESS_SHARED</code> ile pthread mutex shared memory üzerine yerleştirilir</li>
+      <li>Producer-consumer pattern: empty/full semaphore çifti ile senkronize edilir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 09 ═══════════════════ -->
+<section id="s9">
+  <h2><span class="num">09</span> Hangisini seçmeli: karar matrisi</h2>
+  <p class="section-lead">Doğru IPC mekanizması seçimi; kullanım senaryosu, performans gereksinimi ve geliştirme maliyeti dengesinde yapılır.</p>
+
+  <h3>Büyük karar tablosu</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr>
+        <th>Koşul</th>
+        <th>Önerilen Mekanizma</th>
+        <th>Neden</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>Parent-child, tek yön, basit</td><td><strong>pipe()</strong></td><td>En az API, fork ile doğal entegrasyon</td></tr>
+      <tr><td>Parent-child, çift yön</td><td><strong>socketpair()</strong></td><td>Tek fd çifti, full-duplex</td></tr>
+      <tr><td>İlgisiz process'ler, tek yön, kalıcı kanal</td><td><strong>FIFO</strong></td><td>İsim tabanlı bağlantı, düşük karmaşıklık</td></tr>
+      <tr><td>İlgisiz process'ler, bidirectional / fd passing</td><td><strong>Unix domain socket</strong></td><td>SCM_RIGHTS, tam çift yön, çok istemci</td></tr>
+      <tr><td>Yüksek throughput, büyük veri blokları</td><td><strong>POSIX shm + mutex/sem</strong></td><td>Sıfır kopya, en düşük latency</td></tr>
+      <tr><td>Öncelikli mesaj sıralama gerekiyor</td><td><strong>POSIX mq</strong></td><td>Priority-based kuyruk, mq_notify</td></tr>
+      <tr><td>Farklı host'lar arası</td><td><strong>TCP socket (AF_INET)</strong></td><td>Sadece TCP ağ üzeri çalışır</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Latency sıralaması</h3>
+
+  <div class="flow">
+    <pre>
+  En hızlı ←──────────────────────────────────────────→ En yavaş
+
+  POSIX shm    Unix socket    FIFO / pipe    TCP loopback
+  (0 kopya)    (2 kopya)      (2 kopya)      (2 kopya + TCP)
+  ~10 ns/op    ~1 µs/op       ~2 µs/op       ~5–20 µs/op
+    </pre>
+  </div>
+
+  <h3>Bandwidth sıralaması</h3>
+
+  <div class="flow">
+    <pre>
+  En yüksek ←──────────────────────────────────────────→ En düşük
+
+  POSIX shm / mmap    Unix socket    pipe    POSIX mq    TCP loopback
+  RAM bant genişliği   ~4–8 GB/s    ~2 GB/s  msgsize     ~1–3 GB/s
+    </pre>
+  </div>
+
+  <h3>Pratik tavsiyeler</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Parent-child, tek yön</span><span class="desc">pipe() kullan — en minimal API, kernel buffer ücretsiz, fork ile doğal</span></div>
+    <div class="param"><span class="name">İlgisiz process'ler, basit mesaj</span><span class="desc">FIFO yeterli — mkfifo + open + read/write, overhead düşük</span></div>
+    <div class="param"><span class="name">İlgisiz process'ler, bidirectional veya fd-passing</span><span class="desc">Unix domain socket — nginx, systemd, DBus'ın tercihi</span></div>
+    <div class="param"><span class="name">Yüksek throughput, düşük latency</span><span class="desc">POSIX shm + semaphore — video frame, sensör verisi, büyük buffer paylaşımı</span></div>
+    <div class="param"><span class="name">Öncelikli mesajlar</span><span class="desc">POSIX mq — gerçek zamanlı sistemlerde kontrol/veri ayırımı için</span></div>
+    <div class="param"><span class="name">Farklı makine veya container</span><span class="desc">TCP/Unix socket — Unix socket container içi haberleşmede de tercih edilir</span></div>
+  </div>
+
+  <h3>Yaygın hatalar ve kaçınma yolları</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Hata</th><th>Sonuç</th><th>Çözüm</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Shared memory'de senkronizasyon yok</td><td>Race condition, veri bozulması</td><td>sem_t veya PTHREAD_PROCESS_SHARED mutex</td></tr>
+      <tr><td>FIFO'yu unlink etmemek</td><td>Sonraki başlatmada stale dosya kalır</td><td>Başlangıçta <code>unlink</code> + sonunda tekrar</td></tr>
+      <tr><td>shm_open'dan sonra ftruncate yapmamak</td><td>mmap başarısız veya SIGBUS</td><td>Her zaman <code>ftruncate(fd, size)</code> uygula</td></tr>
+      <tr><td>SIGPIPE'ı ignore etmemek</td><td>Okuyucu kapandığında process crash</td><td><code>signal(SIGPIPE, SIG_IGN)</code> veya <code>MSG_NOSIGNAL</code></td></tr>
+      <tr><td>pipe() ile çift yönlü iletişim</td><td>Deadlock riski</td><td>socketpair() veya iki pipe kullan</td></tr>
+    </tbody>
+  </table>
+
+  <div class="summary">
+    <h4>Bu bölümde öğrendikleriniz</h4>
+    <ul>
+      <li>Latency: shm &gt; Unix socket &gt; pipe/FIFO &gt; TCP loopback</li>
+      <li>Bandwidth: shm/mmap &gt; Unix socket &gt; pipe &gt; TCP</li>
+      <li>Senaryo eşleştirmesi: parent-child → pipe; ilgisiz → FIFO veya Unix socket; hız kritik → shm; öncelik → mq</li>
+      <li>Shared memory her zaman senkronizasyonla birlikte kullanılmalıdır</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

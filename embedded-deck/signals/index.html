@@ -1,0 +1,777 @@
+---
+layout: tutorial
+title: "Linux Sinyalleri — sigaction, Masking, Graceful Shutdown"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>Rehber</span>
+    <span>Linux / Sistem</span>
+    <span>C</span>
+  </div>
+  <h1>Linux Sinyalleri —<br><em>sigaction, masking, graceful shutdown.</em></h1>
+  <p class="subtitle">kernel'dan process'e asenkron bildirim — SIGTERM yakalamaktan zombie önlemeye.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Signal nedir</a></li>
+    <li><a href="#s1">Önemli sinyaller</a></li>
+    <li><a href="#s2">signal() vs sigaction()</a></li>
+    <li><a href="#s3">Signal handler yazımı</a></li>
+    <li><a href="#s4">Signal masking</a></li>
+    <li><a href="#s5">Graceful shutdown</a></li>
+    <li><a href="#s6">Zombie process ve SIGCHLD</a></li>
+    <li><a href="#s7">Pratik: daemon için signal-safe shutdown</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Signal nedir</h2>
+  <p class="section-lead">Sinyal, kernel'ın veya başka bir process'in, çalışan bir process'e gönderdiği asenkron bildirimdir — process'in o sırada ne yaptığına bakılmaksızın iletilir.</p>
+
+  <p>Bir process herhangi bir system call beklerken, CPU hesabı yaparken veya belleği okurken; tamamen farklı bir noktadan gelen bir sinyal onu keser. Bu mekanizma, Unix'in ilk günlerinden beri var olan temel bir IPC aracıdır. Modern Linux çekirdeği de aynı modeli sürdürür: sinyal gönderildiğinde process'in normal akışı durdurulur, handler (varsa) çalıştırılır ve ardından kaldığı yerden devam eder.</p>
+
+  <h3>Signal delivery akışı</h3>
+
+  <div class="flow">
+    <pre>
+  kill(pid, SIGTERM)
+      │
+      ▼
+  kernel: hedef process'in signal queue'suna SIGTERM ekle
+      │
+      ▼
+  process scheduled (CPU'ya alınır) → signal mask kontrolü
+      │              │
+      │          masked? → pending set'te bekle
+      │
+      ▼
+  handler veya default action çalışır</pre>
+  </div>
+
+  <h3>kill -l çıktısı</h3>
+
+  <p>Linux'ta <code class="inline">kill -l</code> komutu tüm sinyalleri listeler. 1–31 arası standart (POSIX) sinyaller, 32–64 arası ise POSIX real-time sinyallerdir:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">kill</span> <span class="flag">-l</span>
+<span class="cmt"># 1) SIGHUP   2) SIGINT   3) SIGQUIT  4) SIGILL   5) SIGTRAP</span>
+<span class="cmt"># 6) SIGABRT  7) SIGBUS   8) SIGFPE   9) SIGKILL 10) SIGUSR1</span>
+<span class="cmt">#11) SIGSEGV 12) SIGUSR2 13) SIGPIPE 14) SIGALRM 15) SIGTERM</span>
+<span class="cmt">#16) SIGSTKFLT 17) SIGCHLD 18) SIGCONT 19) SIGSTOP 20) SIGTSTP</span>
+<span class="cmt">#21) SIGTTIN 22) SIGTTOU 23) SIGURG  24) SIGXCPU 25) SIGXFSZ</span>
+<span class="cmt">#26) SIGVTALRM 27) SIGPROF 28) SIGWINCH 29) SIGIO 30) SIGPWR</span>
+<span class="cmt">#31) SIGSYS  34) SIGRTMIN 35) SIGRTMIN+1 ... 64) SIGRTMAX</span></code></pre>
+  </div>
+
+  <h3>Default action tablosu</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Default action</th><th>Açıklama</th><th>Örnekler</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code class="inline">Term</code></td><td>Process'i sonlandır</td><td>SIGTERM, SIGINT, SIGHUP, SIGPIPE</td></tr>
+      <tr><td><code class="inline">Core</code></td><td>Core dump oluştur, sonlandır</td><td>SIGQUIT, SIGSEGV, SIGFPE, SIGABRT, SIGBUS</td></tr>
+      <tr><td><code class="inline">Ign</code></td><td>Sinyali yoksay</td><td>SIGCHLD, SIGURG, SIGWINCH</td></tr>
+      <tr><td><code class="inline">Stop</code></td><td>Process'i durdur (suspend)</td><td>SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU</td></tr>
+      <tr><td><code class="inline">Cont</code></td><td>Durdurulmuş process'i devam ettir</td><td>SIGCONT</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Sinyal göndermenin tek yolu <code class="inline">kill()</code> değildir. Klavyeden Ctrl+C → <code class="inline">SIGINT</code>, Ctrl+\ → <code class="inline">SIGQUIT</code>, Ctrl+Z → <code class="inline">SIGTSTP</code> gönderir. Kernel de donanım hatalarında SIGSEGV, SIGBUS, SIGFPE üretir. <code class="inline">alarm()</code> system call'u ise belirtilen süre sonra SIGALRM gönderir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Önemli sinyaller</h2>
+  <p class="section-lead">Her sinyalin bir numarası, bir default action'ı ve tipik bir kullanım senaryosu vardır — bunları ezberlemek değil, nereye bakacağınızı bilmek önemlidir.</p>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>No</th><th>İsim</th><th>Default</th><th>Açıklama / Kullanım</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1</td><td><code class="inline">SIGHUP</code></td><td>Term</td><td>Terminal kapandı; daemon'larda config reload için kullanılır</td></tr>
+      <tr><td>2</td><td><code class="inline">SIGINT</code></td><td>Term</td><td>Ctrl+C — kullanıcı interrupt</td></tr>
+      <tr><td>3</td><td><code class="inline">SIGQUIT</code></td><td>Core</td><td>Ctrl+\ — core dump ile çık</td></tr>
+      <tr><td>4</td><td><code class="inline">SIGILL</code></td><td>Core</td><td>Geçersiz CPU instruction</td></tr>
+      <tr><td>5</td><td><code class="inline">SIGTRAP</code></td><td>Core</td><td>Breakpoint / trace — debugger kullanır</td></tr>
+      <tr><td>6</td><td><code class="inline">SIGABRT</code></td><td>Core</td><td>abort() çağrısı — assertion failure</td></tr>
+      <tr><td>7</td><td><code class="inline">SIGBUS</code></td><td>Core</td><td>Bus error — hizalanmamış bellek erişimi</td></tr>
+      <tr><td>8</td><td><code class="inline">SIGFPE</code></td><td>Core</td><td>Floating point / tamsayı sıfıra bölme</td></tr>
+      <tr><td>9</td><td><code class="inline">SIGKILL</code></td><td>Term</td><td>Yakalanamaz, maskelenemez — zorla sonlandır</td></tr>
+      <tr><td>10</td><td><code class="inline">SIGUSR1</code></td><td>Term</td><td>Kullanıcı tanımlı; log rotate, durum dökümü</td></tr>
+      <tr><td>11</td><td><code class="inline">SIGSEGV</code></td><td>Core</td><td>Geçersiz bellek erişimi (segmentation fault)</td></tr>
+      <tr><td>12</td><td><code class="inline">SIGUSR2</code></td><td>Term</td><td>Kullanıcı tanımlı; config reload, mod değişimi</td></tr>
+      <tr><td>13</td><td><code class="inline">SIGPIPE</code></td><td>Term</td><td>Yazılan pipe/socket kapandı — genellikle ignore edilir</td></tr>
+      <tr><td>14</td><td><code class="inline">SIGALRM</code></td><td>Term</td><td>alarm() veya setitimer() süresi doldu</td></tr>
+      <tr><td>15</td><td><code class="inline">SIGTERM</code></td><td>Term</td><td>Nazik sonlandırma isteği — graceful shutdown için</td></tr>
+      <tr><td>17</td><td><code class="inline">SIGCHLD</code></td><td>Ign</td><td>Child process bitti veya durdu</td></tr>
+      <tr><td>18</td><td><code class="inline">SIGCONT</code></td><td>Cont</td><td>Durdurulmuş process'i devam ettir</td></tr>
+      <tr><td>19</td><td><code class="inline">SIGSTOP</code></td><td>Stop</td><td>Yakalanamaz, maskelenemez — process'i durdur</td></tr>
+      <tr><td>20</td><td><code class="inline">SIGTSTP</code></td><td>Stop</td><td>Ctrl+Z — terminal stop, yakalanabilir</td></tr>
+    </tbody>
+  </table>
+
+  <h3>SIGKILL ve SIGSTOP neden yakalanamaz?</h3>
+
+  <p>SIGKILL ve SIGSTOP, kernel tarafından doğrudan işlenir — process'in kullanıcı alanındaki signal handler mekanizması hiç devreye girmez. Bu iki sinyal için <code class="inline">sigaction()</code> çağrısı <code class="inline">EINVAL</code> döndürür. Tasarım gereğidir: işletim sistemi her zaman bir process'i durdurabilmeli veya öldürebilmelidir; aksi hâlde kilitlenmiş bir process sistemi bloke edebilir.</p>
+
+  <h3>SIGUSR1 / SIGUSR2 kullanım senaryoları</h3>
+
+  <p>Bu iki sinyal uygulama tarafından serbestçe kullanılabilir. Yaygın örüntüler:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">SIGUSR1</span><span class="desc">Log dosyasını kapat ve yeniden aç (log rotation sonrası). nginx bu sinyal ile log dosyalarını rotate eder.</span></div>
+    <div class="param"><span class="name">SIGUSR2</span><span class="desc">Konfigürasyon dosyasını yeniden yükle; debug modunu aç/kapat; istatistik dökümü al.</span></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># nginx log rotation: önce log dosyalarını rotate et, sonra sinyal gönder</span>
+<span class="cmd">mv</span> <span class="path">/var/log/nginx/access.log</span> <span class="path">/var/log/nginx/access.log.1</span>
+<span class="cmd">kill</span> <span class="flag">-SIGUSR1</span> $(<span class="cmd">cat</span> <span class="path">/var/run/nginx.pid</span>)
+<span class="cmt"># nginx yeni access.log açar, eski dosya kapatılır</span>
+
+<span class="cmt"># pidof ile: çalışan prosese sinyal gönder</span>
+<span class="cmd">kill</span> <span class="flag">-SIGUSR1</span> $(<span class="cmd">pidof</span> nginx)
+
+<span class="cmt"># SIGUSR2 ile config reload (uygulama bunu destekliyorsa)</span>
+<span class="cmd">kill</span> <span class="flag">-SIGUSR2</span> $(<span class="cmd">pidof</span> myapp)</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>SIGPIPE genellikle daemon'larda <code class="inline">SIG_IGN</code> ile ignore edilir. Bir TCP bağlantısı kapandıktan sonra <code class="inline">write()</code> çağrısı SIGPIPE üretir; ignore edilmezse daemon beklenmedik biçimde sonlanabilir. Bunun yerine <code class="inline">send(..., MSG_NOSIGNAL)</code> veya <code class="inline">SO_NOSIGPIPE</code> socket seçeneği de kullanılabilir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> signal() vs sigaction()</h2>
+  <p class="section-lead">signal() POSIX tarafından eskimiş (obsolescent) kabul edilir; sigaction() güvenilir, taşınabilir ve özellik bakımından üstündür.</p>
+
+  <h3>signal() API'sinin sorunları</h3>
+
+  <p><code class="inline">signal(SIGTERM, handler)</code> çağrısı basit görünse de ciddi sorunlar içerir. POSIX, handler çalıştırıldıktan sonra sinyalin default action'a sıfırlanıp sıfırlanmayacağını platforma bırakmıştır. Linux'ta sıfırlanmaz, ancak BSD türevlerinde sıfırlanabilir. Bunun ötesinde <code class="inline">SA_RESTART</code> bayrağı yok: sistem çağrıları EINTR ile kesilebilir ve <code class="inline">errno == EINTR</code> kontrolü yapılmazsa hatalar oluşur.</p>
+
+  <h3>sigaction() yapısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>signals.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">&lt;signal.h&gt;</span>
+
+<span class="cmt">/* struct sigaction alanları */</span>
+<span class="keyword">struct</span> sigaction {
+    <span class="keyword">void</span>     (*<span class="field">sa_handler</span>)(<span class="keyword">int</span>);           <span class="cmt">/* basit handler */</span>
+    <span class="keyword">void</span>     (*<span class="field">sa_sigaction</span>)(<span class="keyword">int</span>, siginfo_t *, <span class="keyword">void</span> *); <span class="cmt">/* SA_SIGINFO ile */</span>
+    sigset_t   <span class="field">sa_mask</span>;                     <span class="cmt">/* handler çalışırken blokla */</span>
+    <span class="keyword">int</span>        <span class="field">sa_flags</span>;                    <span class="cmt">/* SA_RESTART vb. */</span>
+    <span class="keyword">void</span>     (*<span class="field">sa_restorer</span>)(void);          <span class="cmt">/* dahili, kullanma */</span>
+};
+
+<span class="cmt">/* imza */</span>
+<span class="keyword">int</span> <span class="cmd">sigaction</span>(<span class="keyword">int</span> signum,
+              <span class="keyword">const struct</span> sigaction *act,
+              <span class="keyword">struct</span> sigaction *oldact); <span class="cmt">/* eski handler'ı kaydet */</span></code></pre>
+  </div>
+
+  <h3>sa_flags tablosu</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Flag</th><th>Açıklama</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code class="inline">SA_RESTART</code></td><td>Signal tarafından kesilen sistem çağrılarını otomatik yeniden başlat; EINTR döndürme</td></tr>
+      <tr><td><code class="inline">SA_SIGINFO</code></td><td>sa_handler yerine sa_sigaction kullan; siginfo_t ve ucontext_t bilgisi ile</td></tr>
+      <tr><td><code class="inline">SA_NOCLDWAIT</code></td><td>SIGCHLD için: child zombie oluşturma, kernel otomatik temizler</td></tr>
+      <tr><td><code class="inline">SA_NODEFER</code></td><td>Handler çalışırken aynı sinyalin tekrar teslimini engelleme (re-entrant handler)</td></tr>
+      <tr><td><code class="inline">SA_RESETHAND</code></td><td>Handler çağrıldıktan sonra default action'a dön (signal() davranışını taklit eder)</td></tr>
+      <tr><td><code class="inline">SA_ONSTACK</code></td><td>Alternatif sinyal stack'te çalıştır (sigaltstack ile)</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Doğru kullanım örneği</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>setup_handlers.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">&lt;signal.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;string.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdio.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdlib.h&gt;</span>
+
+<span class="keyword">static void</span> <span class="cmd">term_handler</span>(<span class="keyword">int</span> sig) {
+    <span class="cmt">/* Bu bölümde ne yazılmalı — s3'te detaylandırılıyor */</span>
+    (void)sig;
+}
+
+<span class="keyword">int</span> <span class="cmd">setup_signals</span>(<span class="keyword">void</span>) {
+    <span class="keyword">struct</span> sigaction sa;
+    <span class="cmd">memset</span>(&amp;sa, 0, <span class="keyword">sizeof</span>(sa));
+
+    sa.<span class="field">sa_handler</span> = term_handler;
+    <span class="cmd">sigemptyset</span>(&amp;sa.<span class="field">sa_mask</span>);
+    sa.<span class="field">sa_flags</span> = <span class="flag">SA_RESTART</span>;  <span class="cmt">/* sistem çağrılarını yeniden başlat */</span>
+
+    <span class="keyword">if</span> (<span class="cmd">sigaction</span>(<span class="flag">SIGTERM</span>, &amp;sa, <span class="keyword">NULL</span>) != 0) {
+        <span class="cmd">perror</span>(<span class="str">"sigaction SIGTERM"</span>);
+        <span class="keyword">return</span> -1;
+    }
+    <span class="keyword">if</span> (<span class="cmd">sigaction</span>(<span class="flag">SIGINT</span>, &amp;sa, <span class="keyword">NULL</span>) != 0) {
+        <span class="cmd">perror</span>(<span class="str">"sigaction SIGINT"</span>);
+        <span class="keyword">return</span> -1;
+    }
+
+    <span class="cmt">/* SIGPIPE: yazılan pipe kapanınca crash yerine hata kodu dönsün */</span>
+    sa.<span class="field">sa_handler</span> = <span class="flag">SIG_IGN</span>;
+    <span class="cmd">sigaction</span>(<span class="flag">SIGPIPE</span>, &amp;sa, <span class="keyword">NULL</span>);
+
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>Eski kod tabanlarında <code class="inline">signal()</code> ile karşılaşabilirsiniz. Yeni kod yazarken her zaman <code class="inline">sigaction()</code> kullanın. Her iki API de aynı signal numaralarını kabul eder; geçiş sadece yapısal olarak birkaç satır eklemek demektir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Signal handler yazımı</h2>
+  <p class="section-lead">Signal handler, interrupt context'te çalışır — ana program yarım kalmış olabilir; güvensiz fonksiyon çağırmak tanımsız davranışa yol açar.</p>
+
+  <h3>Async-signal-safe nedir?</h3>
+
+  <p>Bir fonksiyon, signal handler içinde çağrılabilmesi için "async-signal-safe" olmalıdır. POSIX bu listeyi açıkça tanımlar. Bu fonksiyonlar re-entrant'tır: yani hem normal akışta hem de sinyal kesintisi sırasında eş zamanlı çağrılabilirler. POSIX listesinden önemli olanlar:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Güvenli — kullanılabilir</span><span class="desc"><code class="inline">write(2)</code>, <code class="inline">read(2)</code>, <code class="inline">_exit(2)</code>, <code class="inline">open(2)</code>, <code class="inline">close(2)</code>, <code class="inline">sem_post(3)</code>, <code class="inline">kill(2)</code>, <code class="inline">signal(2)</code>, <code class="inline">sigaction(2)</code>, <code class="inline">getpid(2)</code>, <code class="inline">getppid(2)</code></span></div>
+    <div class="param"><span class="name">Yasak — kullanılamaz</span><span class="desc"><code class="inline">malloc()</code>, <code class="inline">free()</code>, <code class="inline">printf()</code>, <code class="inline">fprintf()</code>, <code class="inline">syslog()</code>, <code class="inline">pthread_mutex_lock()</code>, <code class="inline">exit()</code> (flushing yapar), <code class="inline">fopen()</code>, <code class="inline">fclose()</code>, <code class="inline">strdup()</code></span></div>
+  </div>
+
+  <h3>Neden malloc yasak?</h3>
+
+  <p>malloc, heap'i yönetmek için dahili bir mutex kullanır. Handler, malloc çağrısı yapan normal kodu tam ortasında keserse bu mutex zaten kilitli olabilir. Handler tekrar malloc çağırırsa kilitlenme (deadlock) oluşur. printf da benzer nedenle yasaktır: stdio tamponlarını manipüle eder ve dahili kilit kullanır.</p>
+
+  <h3>Canonical pattern: flag set</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>flag_pattern.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">&lt;signal.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdio.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdlib.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;unistd.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;string.h&gt;</span>
+
+<span class="cmt">/* volatile: derleyici optimize etmesin; sig_atomic_t: atomik okuma/yazma */</span>
+<span class="keyword">static volatile</span> sig_atomic_t <span class="field">g_shutdown</span> = 0;
+<span class="keyword">static volatile</span> sig_atomic_t <span class="field">g_reload</span>   = 0;
+
+<span class="keyword">static void</span> <span class="cmd">handle_term</span>(<span class="keyword">int</span> sig) {
+    (void)sig;
+    <span class="field">g_shutdown</span> = 1; <span class="cmt">/* tek ve güvenli işlem */</span>
+}
+
+<span class="keyword">static void</span> <span class="cmd">handle_usr1</span>(<span class="keyword">int</span> sig) {
+    (void)sig;
+    <span class="field">g_reload</span> = 1;
+}
+
+<span class="keyword">static int</span> <span class="cmd">setup_signals</span>(<span class="keyword">void</span>) {
+    <span class="keyword">struct</span> sigaction sa;
+    <span class="cmd">memset</span>(&amp;sa, 0, <span class="keyword">sizeof</span>(sa));
+    <span class="cmd">sigemptyset</span>(&amp;sa.<span class="field">sa_mask</span>);
+    sa.<span class="field">sa_flags</span> = <span class="flag">SA_RESTART</span>;
+
+    sa.<span class="field">sa_handler</span> = handle_term;
+    <span class="cmd">sigaction</span>(<span class="flag">SIGTERM</span>, &amp;sa, <span class="keyword">NULL</span>);
+    <span class="cmd">sigaction</span>(<span class="flag">SIGINT</span>,  &amp;sa, <span class="keyword">NULL</span>);
+
+    sa.<span class="field">sa_handler</span> = handle_usr1;
+    <span class="cmd">sigaction</span>(<span class="flag">SIGUSR1</span>, &amp;sa, <span class="keyword">NULL</span>);
+
+    <span class="keyword">return</span> 0;
+}
+
+<span class="keyword">static void</span> <span class="cmd">do_reload</span>(<span class="keyword">void</span>) {
+    <span class="cmt">/* burası normal akışta çalışır — malloc, printf hepsi serbest */</span>
+    printf(<span class="str">"Config yeniden yükleniyor...\n"</span>);
+}
+
+<span class="keyword">int</span> <span class="cmd">main</span>(<span class="keyword">void</span>) {
+    <span class="cmd">setup_signals</span>();
+    printf(<span class="str">"PID: %d — SIGTERM veya SIGINT ile durdurun\n"</span>, <span class="cmd">getpid</span>());
+
+    <span class="keyword">while</span> (!<span class="field">g_shutdown</span>) {
+        <span class="keyword">if</span> (<span class="field">g_reload</span>) {
+            <span class="field">g_reload</span> = 0;
+            <span class="cmd">do_reload</span>(); <span class="cmt">/* normal akışta güvenli */</span>
+        }
+        <span class="cmt">/* asıl iş burada */</span>
+        <span class="cmd">sleep</span>(1);
+    }
+
+    printf(<span class="str">"Kapatılıyor...\n"</span>);
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <h3>SA_SIGINFO ile genişletilmiş bilgi</h3>
+
+  <p><code class="inline">SA_SIGINFO</code> bayrağı ile handler üç parametre alır: signal numarası, <code class="inline">siginfo_t</code> yapısı (sinyali kimin ve neden gönderdiği) ve <code class="inline">ucontext_t</code> (CPU durumu). SIGSEGV gibi hatalarda <code class="inline">si_addr</code> alanı hangi adreste hata oluştuğunu gösterir.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">si_signo</span><span class="desc">Sinyal numarası</span></div>
+    <div class="param"><span class="name">si_pid</span><span class="desc">Sinyali gönderen process'in PID'i</span></div>
+    <div class="param"><span class="name">si_uid</span><span class="desc">Sinyali gönderenin UID'si</span></div>
+    <div class="param"><span class="name">si_addr</span><span class="desc">SIGSEGV / SIGBUS: hata oluşan bellek adresi</span></div>
+    <div class="param"><span class="name">si_status</span><span class="desc">SIGCHLD: child'ın exit status'u</span></div>
+    <div class="param"><span class="name">si_value</span><span class="desc">Real-time signal ile gönderilen kullanıcı verisi</span></div>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>Handler içinde <code class="inline">write()</code> kullanmak güvenlidir ama <code class="inline">printf()</code> kesinlikle değildir. Debug amacıyla bile olsa handler'dan printf çağırmayın; beklenmedik deadlock veya heap bozulmasına neden olabilir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde öğrendikleriniz</h4>
+    <ul>
+      <li>Async-signal-safe fonksiyonlar nelerdir ve neden önemlidir</li>
+      <li>Signal handler'da yalnızca volatile sig_atomic_t flag set edilmeli</li>
+      <li>Asıl iş, main döngüsünde flag kontrol edilerek yapılmalı</li>
+      <li>SA_SIGINFO ile sinyali gönderenin kimliği ve hata adresi öğrenilebilir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Signal masking</h2>
+  <p class="section-lead">Signal mask, bir process'in hangi sinyalleri şu an teslim almayacağını belirler — kritik bölümleri korumak ve sinyal teslimini kontrol etmek için kullanılır.</p>
+
+  <h3>sigprocmask</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>masking.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">&lt;signal.h&gt;</span>
+
+<span class="cmt">/* sinyal seti oluşturma */</span>
+sigset_t mask, oldmask;
+<span class="cmd">sigemptyset</span>(&amp;mask);             <span class="cmt">/* boş set */</span>
+<span class="cmd">sigfillset</span>(&amp;mask);              <span class="cmt">/* tüm sinyaller */</span>
+<span class="cmd">sigaddset</span>(&amp;mask, <span class="flag">SIGTERM</span>);     <span class="cmt">/* belirli sinyal ekle */</span>
+<span class="cmd">sigdelset</span>(&amp;mask, <span class="flag">SIGTERM</span>);     <span class="cmt">/* belirli sinyal çıkar */</span>
+<span class="cmd">sigismember</span>(&amp;mask, <span class="flag">SIGTERM</span>);   <span class="cmt">/* üye mi? → 1/0 */</span>
+
+<span class="cmt">/* mask uygula */</span>
+<span class="cmd">sigprocmask</span>(<span class="flag">SIG_BLOCK</span>,   &amp;mask, &amp;oldmask); <span class="cmt">/* ekle, eskiyi kaydet */</span>
+<span class="cmd">sigprocmask</span>(<span class="flag">SIG_UNBLOCK</span>, &amp;mask, <span class="keyword">NULL</span>);    <span class="cmt">/* kaldır */</span>
+<span class="cmd">sigprocmask</span>(<span class="flag">SIG_SETMASK</span>, &amp;mask, <span class="keyword">NULL</span>);    <span class="cmt">/* tam değiştir */</span>
+
+<span class="cmt">/* kritik bölüm: SIGTERM gelirse pending'de beklesin */</span>
+<span class="cmd">sigprocmask</span>(<span class="flag">SIG_BLOCK</span>, &amp;mask, &amp;oldmask);
+    <span class="cmt">/* ... kritik işlem ... */</span>
+<span class="cmd">sigprocmask</span>(<span class="flag">SIG_SETMASK</span>, &amp;oldmask, <span class="keyword">NULL</span>); <span class="cmt">/* eski mask'e dön */</span></code></pre>
+  </div>
+
+  <h3>sigpending — bekleyen sinyaller</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>pending.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">&lt;signal.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdio.h&gt;</span>
+
+sigset_t pending;
+<span class="cmd">sigpending</span>(&amp;pending); <span class="cmt">/* mevcut pending sinyalleri al */</span>
+
+<span class="keyword">if</span> (<span class="cmd">sigismember</span>(&amp;pending, <span class="flag">SIGTERM</span>)) {
+    printf(<span class="str">"SIGTERM pending — mask kaldırıldığında teslim edilecek\n"</span>);
+}</code></pre>
+  </div>
+
+  <h3>sigsuspend — atomik bekle</h3>
+
+  <p><code class="inline">sigsuspend()</code>, mask'i değiştirip signal beklemeyi atomik olarak yapar. Mask değiştirip <code class="inline">pause()</code> çağırmak arasında sinyal gelirse kaçırılır; <code class="inline">sigsuspend()</code> bu race condition'ı önler.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>sigsuspend.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">&lt;signal.h&gt;</span>
+
+sigset_t wait_mask;
+<span class="cmd">sigemptyset</span>(&amp;wait_mask);
+<span class="cmt">/* SIGTERM dışındaki her şeyi blokla ve sinyal bekle */</span>
+<span class="cmd">sigfillset</span>(&amp;wait_mask);
+<span class="cmd">sigdelset</span>(&amp;wait_mask, <span class="flag">SIGTERM</span>);
+
+<span class="cmt">/* atomik: mask'i uygula + uyku, sinyal gelince dön */</span>
+<span class="cmd">sigsuspend</span>(&amp;wait_mask); <span class="cmt">/* her zaman -1 döndürür, errno=EINTR */</span></code></pre>
+  </div>
+
+  <h3>Multi-thread: pthread_sigmask</h3>
+
+  <p>Çok thread'li programlarda her thread'in ayrı bir signal mask'i vardır. <code class="inline">sigprocmask()</code> çağrısı POSIX'te multi-threaded programlarda tanımsız davranışa yol açabilir; bunun yerine <code class="inline">pthread_sigmask()</code> kullanılmalıdır. Aynı parametre yapısına sahiptir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>thread_mask.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">&lt;signal.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;pthread.h&gt;</span>
+
+<span class="keyword">void</span> *<span class="cmd">worker_thread</span>(<span class="keyword">void</span> *arg) {
+    sigset_t mask;
+    <span class="cmd">sigfillset</span>(&amp;mask); <span class="cmt">/* bu thread tüm sinyalleri bloklar */</span>
+    <span class="cmd">pthread_sigmask</span>(<span class="flag">SIG_BLOCK</span>, &amp;mask, <span class="keyword">NULL</span>);
+    <span class="cmt">/* sinyaller yalnızca main thread'e teslim edilir */</span>
+    <span class="keyword">return</span> <span class="keyword">NULL</span>;
+}
+
+<span class="keyword">int</span> <span class="cmd">main</span>(<span class="keyword">void</span>) {
+    <span class="cmt">/* main thread: sinyalleri dinler */</span>
+    pthread_t t;
+    <span class="cmd">pthread_create</span>(&amp;t, <span class="keyword">NULL</span>, worker_thread, <span class="keyword">NULL</span>);
+    <span class="cmt">/* ... signal handling burada ... */</span>
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <div class="callout danger">
+    <div class="label">UYARI</div>
+    <p>Multi-threaded programlarda <code class="inline">sigprocmask()</code> yerine mutlaka <code class="inline">pthread_sigmask()</code> kullanın. sigprocmask() POSIX'te single-threaded programlar için tanımlanmıştır; multi-thread bağlamda hangi thread'in mask'ini değiştirdiği belirsizdir ve davranış platform bağımlıdır.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Graceful shutdown</h2>
+  <p class="section-lead">Graceful shutdown, bir process'in SIGTERM aldığında kaynakları temizleyerek düzgünce kapanmasıdır — zorla öldürme yerine her zaman tercih edilmeli.</p>
+
+  <h3>Neden graceful shutdown?</h3>
+
+  <p>Bir daemon aniden öldürülürse şu sorunlar oluşabilir: açık dosyalar flush edilmez ve veri kaybolur; veritabanı bağlantıları kapanmaz, bağlantı havuzu tükenir; lock dosyaları kalır, bir sonraki başlatmada process başlayamaz; PID dosyaları temizlenmez; yarım işlemler geri alınmaz. SIGTERM bunların hepsini önler — process'e "kapatılmak istiyorsun" der.</p>
+
+  <div class="flow">
+    <pre>
+  systemctl stop myapp
+      │
+      ▼
+  SIGTERM → g_shutdown = 1
+      │
+      ▼
+  main loop: g_shutdown kontrol → cleanup() → exit(0)
+      │
+      ▼
+  zaman aşımı (5s): SIGKILL → zorla sonlandır</pre>
+  </div>
+
+  <h3>Shell'den graceful shutdown</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># nazik sonlandırma — process'e SIGTERM gönder</span>
+<span class="cmd">kill</span> &lt;PID&gt;          <span class="cmt"># varsayılan: SIGTERM</span>
+<span class="cmd">kill</span> <span class="flag">-SIGTERM</span> &lt;PID&gt;  <span class="cmt"># açık</span>
+<span class="cmd">kill</span> <span class="flag">-15</span> &lt;PID&gt;       <span class="cmt"># numarası ile</span>
+
+<span class="cmt"># 5 saniye bekle, hâlâ çalışıyorsa SIGKILL</span>
+<span class="cmd">kill</span> <span class="flag">-SIGTERM</span> &lt;PID&gt;
+<span class="cmd">sleep</span> 5
+<span class="keyword">if</span> <span class="cmd">kill</span> <span class="flag">-0</span> &lt;PID&gt; 2&gt;<span class="path">/dev/null</span>; <span class="keyword">then</span>
+    <span class="cmd">kill</span> <span class="flag">-SIGKILL</span> &lt;PID&gt;  <span class="cmt"># son çare</span>
+<span class="keyword">fi</span></code></pre>
+  </div>
+
+  <h3>atexit() ve on_exit()</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>atexit_demo.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">&lt;stdio.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdlib.h&gt;</span>
+
+<span class="keyword">static void</span> <span class="cmd">cleanup_db</span>(<span class="keyword">void</span>) {
+    printf(<span class="str">"DB bağlantısı kapatılıyor\n"</span>);
+}
+
+<span class="keyword">static void</span> <span class="cmd">remove_pidfile</span>(<span class="keyword">void</span>) {
+    <span class="cmd">unlink</span>(<span class="str">"/var/run/myapp.pid"</span>);
+}
+
+<span class="keyword">int</span> <span class="cmd">main</span>(<span class="keyword">void</span>) {
+    <span class="cmt">/* atexit: exit() veya return çağrısında çalışır */</span>
+    <span class="cmt">/* Kayıt sırası LIFO: en son kayıt ilk çalışır */</span>
+    <span class="cmd">atexit</span>(remove_pidfile); <span class="cmt">/* 2. çalışır */</span>
+    <span class="cmd">atexit</span>(cleanup_db);    <span class="cmt">/* 1. çalışır */</span>
+
+    <span class="cmt">/* NOT: atexit _exit() veya SIGKILL'de çalışmaz */</span>
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p><code class="inline">atexit()</code> yalnızca <code class="inline">exit()</code> veya main'den return ile çalışır. <code class="inline">_exit()</code>, <code class="inline">_Exit()</code> veya SIGKILL ile öldürüldüğünde çalışmaz. Bu nedenle SIGTERM handler'ı, cleanup'ı doğrudan tetiklemeli ya da <code class="inline">exit()</code> çağırmalıdır — <code class="inline">_exit()</code> değil.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Zombie process ve SIGCHLD</h2>
+  <p class="section-lead">Zombie, işini bitirmiş ama parent'ı henüz exit status'unu okumamış process'tir — kernel process tablosunda bir satır kaplar ama CPU kullanmaz.</p>
+
+  <h3>Zombie nasıl oluşur?</h3>
+
+  <p>Bir child process bittiğinde kernel onu hemen process tablosundan silmez. Parent'ın <code class="inline">wait()</code> veya <code class="inline">waitpid()</code> çağırarak exit status'u okumasını bekler. Parent bunu yapmadan önce child "zombie" (Z) durumundadır. Parent bu çağrıyı hiç yapmazsa veya kendisi de ölürse (init/systemd sahip olur ve temizler), zombie'ler birikerek process tablosunu doldurabilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># zombie'leri görmek</span>
+<span class="cmd">ps</span> aux | <span class="cmd">grep</span> <span class="str">" Z "</span>
+<span class="cmd">pstree</span> <span class="flag">-p</span>  <span class="cmt"># ağaç yapısında — &lt;defunct&gt; = zombie</span></code></pre>
+  </div>
+
+  <h3>waitpid ile çocuk topla</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>waitpid.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">&lt;sys/wait.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;unistd.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdio.h&gt;</span>
+
+<span class="cmt">/* belirli bir child bekle — bloklayan */</span>
+pid_t pid = <span class="cmd">fork</span>();
+<span class="keyword">if</span> (pid == 0) { <span class="cmd">_exit</span>(42); }   <span class="cmt">/* child */</span>
+
+<span class="keyword">int</span> status;
+<span class="cmd">waitpid</span>(pid, &amp;status, 0);         <span class="cmt">/* blokla: child bitene kadar bekle */</span>
+<span class="keyword">if</span> (<span class="cmd">WIFEXITED</span>(status))
+    printf(<span class="str">"exit: %d\n"</span>, <span class="cmd">WEXITSTATUS</span>(status));  <span class="cmt">/* 42 */</span>
+
+<span class="cmt">/* tüm child'ları non-blocking topla (SIGCHLD handler içinde) */</span>
+<span class="keyword">while</span> (<span class="cmd">waitpid</span>(-1, <span class="keyword">NULL</span>, <span class="flag">WNOHANG</span>) &gt; 0)
+    ;  <span class="cmt">/* daha fazla zombie kalmayınca -1 döner */</span></code></pre>
+  </div>
+
+  <h3>SIGCHLD handler ile async reaping</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>sigchld_handler.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">&lt;signal.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;sys/wait.h&gt;</span>
+
+<span class="keyword">static void</span> <span class="cmd">sigchld_handler</span>(<span class="keyword">int</span> sig) {
+    (void)sig;
+    <span class="keyword">int</span> saved_errno = errno; <span class="cmt">/* handler errno'yu bozabilir */</span>
+    <span class="keyword">while</span> (<span class="cmd">waitpid</span>(-1, <span class="keyword">NULL</span>, <span class="flag">WNOHANG</span>) &gt; 0)
+        ;
+    errno = saved_errno;
+}
+
+<span class="cmt">/* setup */</span>
+<span class="keyword">struct</span> sigaction sa;
+<span class="cmd">memset</span>(&amp;sa, 0, <span class="keyword">sizeof</span>(sa));
+sa.<span class="field">sa_handler</span> = sigchld_handler;
+sa.<span class="field">sa_flags</span>   = <span class="flag">SA_RESTART</span> | <span class="flag">SA_NOCLDSTOP</span>; <span class="cmt">/* yalnızca exit, stop değil */</span>
+<span class="cmd">sigaction</span>(<span class="flag">SIGCHLD</span>, &amp;sa, <span class="keyword">NULL</span>);</code></pre>
+  </div>
+
+  <h3>SA_NOCLDWAIT ile otomatik temizlik</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>nocldwait.c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* SA_NOCLDWAIT: child'lar zombie olmadan doğrudan silinir
+   SIGCHLD hâlâ üretilir ama waitpid() gerek kalmaz */</span>
+<span class="keyword">struct</span> sigaction sa;
+<span class="cmd">memset</span>(&amp;sa, 0, <span class="keyword">sizeof</span>(sa));
+sa.<span class="field">sa_handler</span> = <span class="flag">SIG_DFL</span>;
+sa.<span class="field">sa_flags</span>   = <span class="flag">SA_NOCLDWAIT</span>;
+<span class="cmd">sigaction</span>(<span class="flag">SIGCHLD</span>, &amp;sa, <span class="keyword">NULL</span>);
+
+<span class="cmt">/* Linux'ta signal(SIGCHLD, SIG_IGN) de zombie önler ama POSIX garantisi yok */</span>
+<span class="cmd">signal</span>(<span class="flag">SIGCHLD</span>, <span class="flag">SIG_IGN</span>); <span class="cmt">/* çalışır ama taşınabilir değil */</span></code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>SIGCHLD handler içinde <code class="inline">errno</code>'yu kaydedin ve geri yükleyin. <code class="inline">waitpid()</code> başarısız olduğunda errno'yu değiştirir; normal akışın errno'sunu bozarsanız tespit edilmesi güç hatalar oluşur.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Pratik: daemon için signal-safe shutdown</h2>
+  <p class="section-lead">Tüm öğrendiklerinizi birleştiren tam bir daemon: PID dosyası, graceful shutdown, config reload ve child reaping.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>daemon.c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* gcc -o daemon daemon.c
+   Derle: gcc -Wall -Wextra -o daemon daemon.c */</span>
+
+<span class="keyword">#include</span> <span class="str">&lt;stdio.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdlib.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;string.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;unistd.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;signal.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;fcntl.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;errno.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;poll.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;sys/wait.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;sys/stat.h&gt;</span>
+
+<span class="keyword">#define</span> <span class="flag">PID_FILE</span> <span class="str">"/var/run/mydaemon.pid"</span>
+
+<span class="keyword">static volatile</span> sig_atomic_t <span class="field">g_shutdown</span> = 0;
+<span class="keyword">static volatile</span> sig_atomic_t <span class="field">g_reload</span>   = 0;
+
+<span class="cmt">/* ─── signal handlers ─────────────────────────────── */</span>
+
+<span class="keyword">static void</span> <span class="cmd">handle_term</span>(<span class="keyword">int</span> sig) { (void)sig; <span class="field">g_shutdown</span> = 1; }
+<span class="keyword">static void</span> <span class="cmd">handle_usr1</span>(<span class="keyword">int</span> sig) { (void)sig; <span class="field">g_reload</span>   = 1; }
+
+<span class="keyword">static void</span> <span class="cmd">handle_chld</span>(<span class="keyword">int</span> sig) {
+    (void)sig;
+    <span class="keyword">int</span> saved = errno;
+    <span class="keyword">while</span> (<span class="cmd">waitpid</span>(-1, <span class="keyword">NULL</span>, <span class="flag">WNOHANG</span>) &gt; 0) ;
+    errno = saved;
+}
+
+<span class="cmt">/* ─── PID file ────────────────────────────────────── */</span>
+
+<span class="keyword">static int</span> <span class="cmd">write_pidfile</span>(<span class="keyword">void</span>) {
+    <span class="keyword">int</span> fd = <span class="cmd">open</span>(<span class="flag">PID_FILE</span>,
+                   <span class="flag">O_WRONLY</span> | <span class="flag">O_CREAT</span> | <span class="flag">O_TRUNC</span>, 0644);
+    <span class="keyword">if</span> (fd &lt; 0) { <span class="cmd">perror</span>(<span class="str">"open pid"</span>); <span class="keyword">return</span> -1; }
+    <span class="keyword">char</span> buf[32];
+    <span class="keyword">int</span> n = <span class="cmd">snprintf</span>(buf, <span class="keyword">sizeof</span>(buf), <span class="str">"%d\n"</span>, <span class="cmd">getpid</span>());
+    <span class="cmd">write</span>(fd, buf, n);
+    <span class="cmd">close</span>(fd);
+    <span class="keyword">return</span> 0;
+}
+
+<span class="keyword">static void</span> <span class="cmd">remove_pidfile</span>(<span class="keyword">void</span>) {
+    <span class="cmd">unlink</span>(<span class="flag">PID_FILE</span>);
+}
+
+<span class="cmt">/* ─── cleanup ─────────────────────────────────────── */</span>
+
+<span class="keyword">static void</span> <span class="cmd">cleanup</span>(<span class="keyword">void</span>) {
+    <span class="cmd">remove_pidfile</span>();
+    <span class="cmt">/* flush buffers, close DB, release locks... */</span>
+    printf(<span class="str">"[daemon] temizlendi, çıkılıyor.\n"</span>);
+}
+
+<span class="cmt">/* ─── signal setup ────────────────────────────────── */</span>
+
+<span class="keyword">static void</span> <span class="cmd">setup_signals</span>(<span class="keyword">void</span>) {
+    <span class="keyword">struct</span> sigaction sa;
+    <span class="cmd">memset</span>(&amp;sa, 0, <span class="keyword">sizeof</span>(sa));
+    <span class="cmd">sigemptyset</span>(&amp;sa.<span class="field">sa_mask</span>);
+    sa.<span class="field">sa_flags</span> = <span class="flag">SA_RESTART</span>;
+
+    sa.<span class="field">sa_handler</span> = handle_term;
+    <span class="cmd">sigaction</span>(<span class="flag">SIGTERM</span>, &amp;sa, <span class="keyword">NULL</span>);
+    <span class="cmd">sigaction</span>(<span class="flag">SIGINT</span>,  &amp;sa, <span class="keyword">NULL</span>);
+
+    sa.<span class="field">sa_handler</span> = handle_usr1;
+    <span class="cmd">sigaction</span>(<span class="flag">SIGUSR1</span>, &amp;sa, <span class="keyword">NULL</span>);
+
+    sa.<span class="field">sa_handler</span> = handle_chld;
+    sa.<span class="field">sa_flags</span>  |= <span class="flag">SA_NOCLDSTOP</span>;
+    <span class="cmd">sigaction</span>(<span class="flag">SIGCHLD</span>, &amp;sa, <span class="keyword">NULL</span>);
+
+    sa.<span class="field">sa_handler</span> = <span class="flag">SIG_IGN</span>;
+    sa.<span class="field">sa_flags</span>   = 0;
+    <span class="cmd">sigaction</span>(<span class="flag">SIGPIPE</span>, &amp;sa, <span class="keyword">NULL</span>);
+}
+
+<span class="cmt">/* ─── main ────────────────────────────────────────── */</span>
+
+<span class="keyword">int</span> <span class="cmd">main</span>(<span class="keyword">void</span>) {
+    <span class="keyword">if</span> (<span class="cmd">write_pidfile</span>() != 0) <span class="keyword">return</span> 1;
+    <span class="cmd">atexit</span>(remove_pidfile);
+    <span class="cmd">setup_signals</span>();
+
+    <span class="cmd">printf</span>(<span class="str">"[daemon] başladı, PID=%d\n"</span>, <span class="cmd">getpid</span>());
+
+    <span class="cmt">/* systemd Type=notify ile entegrasyon */</span>
+    <span class="cmt">/* sd_notify(0, "READY=1"); */</span>
+
+    <span class="keyword">struct</span> pollfd pfd = { .fd = -1, .events = 0 };
+
+    <span class="keyword">while</span> (!<span class="field">g_shutdown</span>) {
+        <span class="keyword">int</span> ret = <span class="cmd">poll</span>(&amp;pfd, 1, 1000); <span class="cmt">/* 1s timeout */</span>
+
+        <span class="keyword">if</span> (ret &lt; 0 &amp;&amp; errno != <span class="flag">EINTR</span>) {
+            <span class="cmd">perror</span>(<span class="str">"poll"</span>);
+            <span class="keyword">break</span>;
+        }
+
+        <span class="keyword">if</span> (<span class="field">g_reload</span>) {
+            <span class="field">g_reload</span> = 0;
+            <span class="cmd">printf</span>(<span class="str">"[daemon] SIGUSR1 — config reload\n"</span>);
+            <span class="cmt">/* load_config() burada */</span>
+        }
+
+        <span class="cmt">/* periyodik iş */</span>
+        <span class="cmd">printf</span>(<span class="str">"[daemon] çalışıyor...\n"</span>);
+    }
+
+    <span class="cmd">cleanup</span>();
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <h3>systemd entegrasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/systemd/system/mydaemon.service</span><span class="dot">●</span></div>
+    <pre><code>[<span class="keyword">Unit</span>]
+<span class="field">Description</span>=Signal-safe örnek daemon
+<span class="field">After</span>=network.target
+
+[<span class="keyword">Service</span>]
+<span class="field">Type</span>=simple
+<span class="field">ExecStart</span>=<span class="path">/usr/local/bin/daemon</span>
+<span class="field">ExecReload</span>=<span class="path">/bin/kill</span> <span class="flag">-SIGUSR1</span> $MAINPID
+<span class="field">Restart</span>=on-failure
+<span class="field">RestartSec</span>=5s
+<span class="field">TimeoutStopSec</span>=10s
+
+[<span class="keyword">Install</span>]
+<span class="field">WantedBy</span>=multi-user.target</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p><strong>POSIX real-time sinyalleri (SIGRTMIN..SIGRTMAX):</strong> Linux'ta SIGRTMIN (34) ile SIGRTMAX (64) arasında 30 adet real-time sinyal vardır. Standart sinyallerden farkları: kuyruğa alınırlar (aynı sinyal birden fazla kez gönderilebilir, hepsi teslim edilir), öncelik sırasına göre işlenirler ve sigqueue() ile birlikte bir değer (integer veya pointer) taşıyabilirler. Standart sinyaller birden fazla pending kalırsa tek birleştirilir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde öğrendikleriniz</h4>
+    <ul>
+      <li>PID dosyası yazma ve atexit() ile temizleme</li>
+      <li>SIGTERM, SIGUSR1, SIGCHLD handler'larını tek setup fonksiyonunda toplamak</li>
+      <li>poll() ile event loop: SA_RESTART sayesinde EINTR'yi yönetmek</li>
+      <li>systemd ExecReload ile SIGUSR1 tabanlı reload entegrasyonu</li>
+      <li>Real-time sinyallerin standart sinyallerden temel farkları</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

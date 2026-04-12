@@ -1,0 +1,1005 @@
+---
+layout: tutorial
+title: "SSH Derinlemesine — Tunnel, Config, Agent"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>Rehber</span>
+    <span>Linux · Network · OpenSSH</span>
+    <span>OpenSSH</span>
+  </div>
+  <h1>SSH Derinlemesine —<br><em>Tunnel, Config, Agent.</em></h1>
+  <p class="subtitle">Ed25519 key'den ProxyJump'a, port forwarding'den SOCKS proxy'ye — SSH'ın tam potansiyeli.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">SSH mimarisi</a></li>
+    <li><a href="#s1">Anahtar üretimi</a></li>
+    <li><a href="#s2">Sunucuya key kopyalama ve authorized_keys</a></li>
+    <li><a href="#s3">ssh-agent ve key forwarding</a></li>
+    <li><a href="#s4">~/.ssh/config dosyası</a></li>
+    <li><a href="#s5">Port forwarding — Local (-L)</a></li>
+    <li><a href="#s6">Port forwarding — Remote (-R)</a></li>
+    <li><a href="#s7">Dynamic forwarding: SOCKS proxy</a></li>
+    <li><a href="#s8">ProxyJump ve bastion host</a></li>
+    <li><a href="#s9">sshd hardening</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> SSH mimarisi</h2>
+  <p class="section-lead">SSH, üç katmanlı bir protokol ailesidir: transport layer şifreleme ve kimlik doğrulamayı, authentication layer kimlik kanıtlamayı, connection layer ise çok kanallı veri akışını yönetir.</p>
+
+  <p>Secure Shell (SSH), 1995'te Tatu Ylönen tarafından geliştirildi. Bugün pratik olarak her Linux yöneticisinin, gömülü sistem geliştiricisinin ve DevOps mühendisinin kullandığı bu protokol, yalnızca uzak terminal erişimi sağlamakla kalmaz; aynı zamanda güvenli dosya transferi, port yönlendirme, agent forwarding ve tünel altyapısı için sağlam bir temel oluşturur.</p>
+
+  <h3>Üç katman</h3>
+
+  <div class="flow">
+    <pre>┌─────────────────────────────────────────────────────────┐
+│  Connection Layer  — shell, exec, sftp, port-forward    │
+├─────────────────────────────────────────────────────────┤
+│  Authentication Layer — publickey, password, kbd-inter  │
+├─────────────────────────────────────────────────────────┤
+│  Transport Layer — TCP, key exchange, şifreleme, MAC    │
+└─────────────────────────────────────────────────────────┘
+                        TCP (port 22)</pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">Transport Layer</span><span class="desc">TCP bağlantısı kurulur. Diffie-Hellman (veya ECDH) ile oturum anahtarı üretilir. Sunucu host key'i ile kimliğini kanıtlar. ChaCha20-Poly1305 veya AES-GCM şifreleme, HMAC ile veri bütünlüğü sağlanır.</span></div>
+    <div class="param"><span class="name">Authentication Layer</span><span class="desc">Client kimliğini kanıtlar. Yöntemler: publickey (önerilen), password, keyboard-interactive. Başarılı kimlik doğrulaması connection layer'ı açar.</span></div>
+    <div class="param"><span class="name">Connection Layer</span><span class="desc">Şifreli tünel üzerinde birden fazla mantıksal kanal çoğullanır: terminal oturumu (shell), komut çalıştırma (exec), dosya transferi (sftp), port yönlendirme, agent forwarding.</span></div>
+  </div>
+
+  <h3>ssh -v ile protokol adımları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>ssh -v çıktısı (sadeleştirilmiş)</span><span class="dot">●</span></div>
+    <pre><code>$ <span class="cmd">ssh</span> <span class="flag">-v</span> user@host
+OpenSSH_9.6p1, OpenSSL 3.2.0
+<span class="cmt"># 1. TCP bağlantısı</span>
+debug1: Connecting to host [192.168.1.10] port 22.
+debug1: Connection established.
+<span class="cmt"># 2. Protokol sürüm müzakeresi</span>
+debug1: Remote protocol version 2.0, remote software version OpenSSH_9.6
+<span class="cmt"># 3. Anahtar değişimi (key exchange)</span>
+debug1: kex: algorithm: curve25519-sha256
+debug1: kex: host key algorithm: ssh-ed25519
+<span class="cmt"># 4. Host key doğrulama</span>
+debug1: Server host key: ssh-ed25519 SHA256:...
+debug1: Host 'host' is known and matches the ED25519 host key.
+<span class="cmt"># 5. Kimlik doğrulama</span>
+debug1: Authenticating to host:22 as 'user'
+debug1: Trying private key: ~/.ssh/id_ed25519
+debug1: Authentication succeeded (publickey).
+<span class="cmt"># 6. Kanal açılışı</span>
+debug1: channel 0: new session</code></pre>
+  </div>
+
+  <h3>SSHv1 vs SSHv2</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Özellik</th><th>SSHv1</th><th>SSHv2</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Durum</td><td>Obsolete — kullanmayın</td><td>Aktif standart</td></tr>
+      <tr><td>Şifreleme</td><td>DES, 3DES — zayıf</td><td>AES-GCM, ChaCha20</td></tr>
+      <tr><td>Bütünlük</td><td>CRC-32 — zayıf</td><td>HMAC-SHA2, Poly1305</td></tr>
+      <tr><td>Kanal çoğullama</td><td>Yok</td><td>Var — bağlantı başına N kanal</td></tr>
+      <tr><td>SFTP</td><td>Yok</td><td>Standart alt sistem</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>SSHv1, MITM saldırılarına karşı savunmasızdır ve modern OpenSSH tarafından tamamen kaldırılmıştır. Eski cihazlarda SSHv1 gören bir <code>sshd</code> varsa derhal kapatın veya firmware güncelleyin.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Transport, Authentication, Connection katmanlarının rolleri</li>
+      <li><span class="flag">-v</span> ile TCP → kex → host key → auth → channel akışını izleme</li>
+      <li>SSHv1 (obsolete) ve SSHv2 farkları</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Anahtar üretimi</h2>
+  <p class="section-lead">Modern SSH kimlik doğrulaması için Ed25519 tercih edilir: RSA-4096'ya eşdeğer güvenlik ile çok daha küçük key boyutu ve hızlı imzalama.</p>
+
+  <h3>RSA vs Ed25519 karşılaştırması</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Özellik</th><th>RSA-2048</th><th>RSA-4096</th><th>Ed25519</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Güvenlik seviyesi</td><td>~112 bit</td><td>~140 bit</td><td>~128 bit</td></tr>
+      <tr><td>Public key boyutu</td><td>~370 byte</td><td>~720 byte</td><td>68 byte</td></tr>
+      <tr><td>İmzalama hızı</td><td>Yavaş</td><td>Çok yavaş</td><td>Çok hızlı</td></tr>
+      <tr><td>Doğrulama hızı</td><td>Hızlı</td><td>Orta</td><td>Hızlı</td></tr>
+      <tr><td>Eski sistem desteği</td><td>Evrensel</td><td>Evrensel</td><td>OpenSSH 6.5+ (2014)</td></tr>
+      <tr><td>Algoritma</td><td>RSA (PKCS#1)</td><td>RSA (PKCS#1)</td><td>Edwards-curve DSA</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Ed25519 key üretimi (modern standart)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Ed25519 key çifti üret</span>
+<span class="cmd">ssh-keygen</span> <span class="flag">-t</span> ed25519 <span class="flag">-C</span> <span class="str">"emirp@workstation"</span>
+<span class="cmt"># -C: yorum alanı — genellikle user@host veya tarih</span>
+
+<span class="cmt"># Dosya yolu belirt</span>
+<span class="cmd">ssh-keygen</span> <span class="flag">-t</span> ed25519 <span class="flag">-f</span> <span class="path">~/.ssh/id_ed25519</span> <span class="flag">-C</span> <span class="str">"prod server key"</span>
+
+<span class="cmt"># Passphrase ile (önerilen)</span>
+Enter passphrase (empty for no passphrase): <span class="str">güçlü-bir-parola</span>
+Enter same passphrase again: <span class="str">güçlü-bir-parola</span></code></pre>
+  </div>
+
+  <p>Üretim sonucunda iki dosya oluşur:</p>
+
+  <div class="params">
+    <div class="param"><span class="name"><span class="path">~/.ssh/id_ed25519</span></span><span class="desc">Private key. 600 izinle korunmalı. Asla paylaşılmamalı — bu dosyayı kaybetmek veya sızdırmak tüm güvenliği tehlikeye atar.</span></div>
+    <div class="param"><span class="name"><span class="path">~/.ssh/id_ed25519.pub</span></span><span class="desc">Public key. Sunuculara kopyalanacak dosya. İçerik: <code>ssh-ed25519 AAAA... comment</code> formatında tek satır.</span></div>
+  </div>
+
+  <h3>RSA key — eski sistemler için</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># RSA 4096 bit — Ed25519 desteklemeyen eski OpenSSH sürümleri için</span>
+<span class="cmd">ssh-keygen</span> <span class="flag">-t</span> rsa <span class="flag">-b</span> 4096 <span class="flag">-f</span> <span class="path">~/.ssh/id_rsa_legacy</span> <span class="flag">-C</span> <span class="str">"legacy-device"</span></code></pre>
+  </div>
+
+  <h3>Fingerprint doğrulama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Public key fingerprint'i göster (SHA-256)</span>
+<span class="cmd">ssh-keygen</span> <span class="flag">-l</span> <span class="flag">-f</span> <span class="path">~/.ssh/id_ed25519.pub</span>
+<span class="cmt"># → 256 SHA256:xXxXxX... emirp@workstation (ED25519)</span>
+
+<span class="cmt"># MD5 formatında (eski araçlar için)</span>
+<span class="cmd">ssh-keygen</span> <span class="flag">-l</span> <span class="flag">-E</span> md5 <span class="flag">-f</span> <span class="path">~/.ssh/id_ed25519.pub</span>
+
+<span class="cmt"># Mevcut tüm key'lerin fingerprint'i</span>
+<span class="keyword">for</span> f <span class="keyword">in</span> ~/.ssh/*.pub; <span class="keyword">do</span>
+    <span class="cmd">ssh-keygen</span> <span class="flag">-l</span> <span class="flag">-f</span> <span class="str">"$f"</span>
+<span class="keyword">done</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Passphrase olmayan key, private key dosyasını ele geçiren herkesin tüm sunuculara doğrudan erişmesini sağlar. Passphrase kullanın ve <span class="cmd">ssh-agent</span> ile günlük kullanım konforunu koruyun. Private key dosyasını asla bulut depolama veya versiyon kontrolüne eklemeyin.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Ed25519: 68 byte public key, ~128 bit güvenlik, çok hızlı imzalama</li>
+      <li><span class="flag">-t ed25519 -C "yorum"</span> ile modern key üretimi</li>
+      <li><span class="path">~/.ssh/id_ed25519</span> (private) ve <span class="path">~/.ssh/id_ed25519.pub</span> (public)</li>
+      <li><span class="flag">-l -f</span> ile fingerprint doğrulama</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Sunucuya key kopyalama ve authorized_keys</h2>
+  <p class="section-lead">Public key'i sunucuya taşımak için ssh-copy-id kullanın; izin sorunları ve known_hosts yönetimi bu bölümde ele alınmaktadır.</p>
+
+  <h3>ssh-copy-id ile otomatik kopyalama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Public key'i uzak sunucuya ekle (password ile kimlik doğrular, sonra key'i ekler)</span>
+<span class="cmd">ssh-copy-id</span> <span class="flag">-i</span> <span class="path">~/.ssh/id_ed25519.pub</span> user@192.168.1.10
+
+<span class="cmt"># Özel port için</span>
+<span class="cmd">ssh-copy-id</span> <span class="flag">-i</span> <span class="path">~/.ssh/id_ed25519.pub</span> <span class="flag">-p</span> 2222 user@host
+
+<span class="cmt"># Başarılı çıktı:</span>
+<span class="cmt"># Number of key(s) added: 1</span>
+<span class="cmt"># Now try logging into the machine: ssh 'user@192.168.1.10'</span></code></pre>
+  </div>
+
+  <h3>Manuel kopyalama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash (sunucuda)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># .ssh dizini ve authorized_keys dosyasını oluştur</span>
+<span class="cmd">mkdir</span> <span class="flag">-p</span> ~/.ssh
+<span class="cmd">chmod</span> 700 ~/.ssh
+
+<span class="cmt"># Public key'i ekle (>> ile var olanı silme)</span>
+<span class="cmd">cat</span> ~/.ssh/id_ed25519.pub <span class="keyword">>></span> ~/.ssh/authorized_keys
+<span class="cmd">chmod</span> 600 ~/.ssh/authorized_keys
+
+<span class="cmt"># Sahiplik kontrolü</span>
+<span class="cmd">ls</span> <span class="flag">-la</span> ~/.ssh/
+<span class="cmt"># drwx------  .ssh/              (700)</span>
+<span class="cmt"># -rw-------  authorized_keys    (600)</span></code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>SSH daemon, <span class="path">~/.ssh</span> dizini veya <span class="path">authorized_keys</span> dosyası için izinler yanlışsa key authentication'ı sessizce reddeder. Dizin 700 (rwx------), dosya 600 (rw-------) olmalıdır. Dosyanın sahibi login eden kullanıcı olmalıdır.</p>
+  </div>
+
+  <h3>known_hosts: host key parmak izi</h3>
+
+  <p>İlk kez bağlandığınızda SSH, sunucunun host key'ini <span class="path">~/.ssh/known_hosts</span> dosyasına kaydeder. Sonraki bağlantılarda bu key değişmişse MITM uyarısı verilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Script ile known_hosts'u önceden doldur (CI/CD pipeline için)</span>
+<span class="cmd">ssh-keyscan</span> <span class="flag">-H</span> 192.168.1.10 <span class="keyword">>></span> ~/.ssh/known_hosts
+<span class="cmd">ssh-keyscan</span> <span class="flag">-H</span> host.example.com <span class="keyword">>></span> ~/.ssh/known_hosts
+
+<span class="cmt"># -H: hostname'i hash'le (known_hosts okunabilirliğini azaltır, güvenliği artırır)</span>
+
+<span class="cmt"># Değişen host key temizleme (sunucu yeniden kuruldu ise)</span>
+<span class="cmd">ssh-keygen</span> <span class="flag">-R</span> 192.168.1.10
+<span class="cmd">ssh-keygen</span> <span class="flag">-R</span> host.example.com</code></pre>
+  </div>
+
+  <h3>StrictHostKeyChecking seçenekleri</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Değer</th><th>Davranış</th><th>Kullanım</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>ask</code></td><td>Yeni host için onay ister (varsayılan)</td><td>İnteraktif kullanım</td></tr>
+      <tr><td><code>yes</code></td><td>Bilinmeyen host'u reddeder</td><td>Güvenlik kritik ortamlar</td></tr>
+      <tr><td><code>accept-new</code></td><td>Yeni host'u kabul eder, değişeni reddeder</td><td>Automation güvenli</td></tr>
+      <tr><td><code>no</code></td><td>Her host'u kabul eder, doğrulama yok</td><td>Sadece test/debug</td></tr>
+    </tbody>
+  </table>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash (CI/CD pipeline örneği)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Pipeline'da güvenli yeni host kabul etme</span>
+<span class="cmd">ssh</span> <span class="flag">-o</span> StrictHostKeyChecking=accept-new user@deploy-host <span class="str">"./deploy.sh"</span>
+
+<span class="cmt"># Veya known_hosts'u önceden doldur + strict kullan</span>
+<span class="cmd">ssh-keyscan</span> <span class="flag">-H</span> deploy-host <span class="keyword">>></span> ~/.ssh/known_hosts
+<span class="cmd">ssh</span> <span class="flag">-o</span> StrictHostKeyChecking=yes user@deploy-host <span class="str">"./deploy.sh"</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><span class="cmd">ssh-copy-id -i key.pub user@host</span> ile otomatik key kurulumu</li>
+      <li><span class="path">~/.ssh</span> 700 ve <span class="path">authorized_keys</span> 600 izin gereksinimleri</li>
+      <li><span class="path">~/.ssh/known_hosts</span> ve host key doğrulama</li>
+      <li><span class="cmd">ssh-keyscan -H</span> ile script tabanlı pre-population</li>
+      <li><span class="field">StrictHostKeyChecking</span>: ask / yes / accept-new / no</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> ssh-agent ve key forwarding</h2>
+  <p class="section-lead">ssh-agent, private key'i bellekte şifresiz olarak tutar; passphrase'i bir kez girerek tüm oturum boyunca kullanırsınız.</p>
+
+  <h3>Agent başlatma ve key ekleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Yeni bir shell'de agent başlat</span>
+<span class="keyword">eval</span> $(<span class="cmd">ssh-agent</span> <span class="flag">-s</span>)
+<span class="cmt"># → Agent pid 1234</span>
+
+<span class="cmt"># Ed25519 key'i agent'a ekle (passphrase bir kez sorulur)</span>
+<span class="cmd">ssh-add</span> <span class="path">~/.ssh/id_ed25519</span>
+<span class="cmt"># Enter passphrase for /home/user/.ssh/id_ed25519: ...</span>
+<span class="cmt"># Identity added: /home/user/.ssh/id_ed25519 (emirp@workstation)</span>
+
+<span class="cmt"># TTL ile ekle: 3600 saniye sonra agent'tan silinir</span>
+<span class="cmd">ssh-add</span> <span class="flag">-t</span> 3600 <span class="path">~/.ssh/id_ed25519</span>
+
+<span class="cmt"># Yüklü key'leri listele</span>
+<span class="cmd">ssh-add</span> <span class="flag">-l</span>
+<span class="cmt"># → 256 SHA256:... emirp@workstation (ED25519)</span>
+
+<span class="cmt"># Tüm key'leri agent'tan kaldır</span>
+<span class="cmd">ssh-add</span> <span class="flag">-D</span></code></pre>
+  </div>
+
+  <h3>SSH_AUTH_SOCK ortam değişkeni</h3>
+
+  <p>Agent, <code class="inline">SSH_AUTH_SOCK</code> ortam değişkeniyle iletişim kuracak Unix socket'in yolunu dışa aktarır. SSH client bu değişkeni okuyarak agent'a ulaşır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">echo</span> $SSH_AUTH_SOCK
+<span class="cmt"># → /tmp/ssh-XXXXXX/agent.1234</span>
+
+<span class="cmt"># Agent çalışıyor mu kontrol et</span>
+<span class="keyword">if</span> [[ <span class="flag">-z</span> <span class="str">"$SSH_AUTH_SOCK"</span> ]]; <span class="keyword">then</span>
+    <span class="cmd">echo</span> <span class="str">"Agent yok, başlatılıyor..."</span>
+    <span class="keyword">eval</span> $(<span class="cmd">ssh-agent</span> <span class="flag">-s</span>)
+    <span class="cmd">ssh-add</span> <span class="path">~/.ssh/id_ed25519</span>
+<span class="keyword">fi</span></code></pre>
+  </div>
+
+  <h3>Agent forwarding: -A ile zincirleme bağlantı</h3>
+
+  <p>Agent forwarding, uzak bir sunucudayken başka bir sunucuya kendi local key'inizi kullanarak bağlanmanızı sağlar. Uzak sunucuya private key kopyalamaya gerek kalmaz.</p>
+
+  <div class="flow">
+    <pre>local (key burada) ──ssh -A──▶ bastion ──ssh──▶ internal-server
+                                  │
+                          agent forward socket
+                    (SSH_AUTH_SOCK bastion'da da çalışır)</pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Agent forwarding ile bastion'a bağlan</span>
+<span class="cmd">ssh</span> <span class="flag">-A</span> user@bastion.example.com
+
+<span class="cmt"># Bastion'dan internal-server'a geç (local agent kullanılır)</span>
+user@bastion:~$ <span class="cmd">ssh</span> user@internal-server.local</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>Agent forwarding, bastion sunucusundaki root veya başka kullanıcıların agent socket'inizi kötüye kullanmasına izin verebilir. Sadece tam güvendiğiniz sunucularda <span class="flag">-A</span> kullanın. Alternatif: <span class="field">ProxyJump</span> (Bölüm 08) — key'inizi hiç uzak sunucudan geçirmez.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><span class="keyword">eval $(ssh-agent -s)</span> ile agent başlatma</li>
+      <li><span class="cmd">ssh-add -t 3600</span> ile TTL'li key ekleme</li>
+      <li><span class="field">SSH_AUTH_SOCK</span>: agent-client iletişim socket'i</li>
+      <li><span class="flag">-A</span> ile agent forwarding ve güvenlik riski</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> ~/.ssh/config dosyası</h2>
+  <p class="section-lead">SSH config dosyası, sık kullanılan bağlantı parametrelerini alias'larla tanımlar; uzun komut satırı seçenekleri yazmak yerine <code>ssh prod</code> gibi kısa isimlerle bağlanabilirsiniz.</p>
+
+  <h3>Temel yapı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span><span class="path">~/.ssh/config</span></span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ─── Üretim sunucusu ───────────────────────────────────────────</span>
+<span class="field">Host</span> prod
+    <span class="field">HostName</span>          10.20.30.40
+    <span class="field">User</span>              ubuntu
+    <span class="field">IdentityFile</span>      <span class="path">~/.ssh/prod_ed25519</span>
+    <span class="field">Port</span>              22
+    <span class="field">ForwardAgent</span>      no
+
+<span class="cmt"># ─── Geliştirme sunucusu ──────────────────────────────────────</span>
+<span class="field">Host</span> dev
+    <span class="field">HostName</span>          dev.company.internal
+    <span class="field">User</span>              emirp
+    <span class="field">IdentityFile</span>      <span class="path">~/.ssh/id_ed25519</span>
+    <span class="field">Port</span>              22
+
+<span class="cmt"># ─── Bastion (jump host) ──────────────────────────────────────</span>
+<span class="field">Host</span> bastion
+    <span class="field">HostName</span>          bastion.example.com
+    <span class="field">User</span>              emirp
+    <span class="field">IdentityFile</span>      <span class="path">~/.ssh/id_ed25519</span>
+
+<span class="cmt"># ─── İç ağ sunucuları (bastion üzerinden) ─────────────────────</span>
+<span class="field">Host</span> internal-*
+    <span class="field">User</span>              emirp
+    <span class="field">ProxyJump</span>         bastion
+    <span class="field">IdentityFile</span>      <span class="path">~/.ssh/id_ed25519</span>
+
+<span class="cmt"># ─── Tüm bağlantılar için genel ayarlar ───────────────────────</span>
+<span class="field">Host</span> *
+    <span class="field">ServerAliveInterval</span>   60
+    <span class="field">ServerAliveCountMax</span>   3
+    <span class="field">ControlMaster</span>         auto
+    <span class="field">ControlPath</span>           <span class="path">~/.ssh/cm_%h_%p_%r</span>
+    <span class="field">ControlPersist</span>        10m
+    <span class="field">AddKeysToAgent</span>        yes</code></pre>
+  </div>
+
+  <h3>Direktifler</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Host</span><span class="desc">Config bloğunun adı. <code>ssh prod</code> komutu bu bloğu tetikler. Wildcard destekler: <code>Host *.internal</code>.</span></div>
+    <div class="param"><span class="name">HostName</span><span class="desc">Gerçek hostname veya IP adresi. Host alias'ından farklı olabilir.</span></div>
+    <div class="param"><span class="name">User</span><span class="desc">Uzak sistemdeki kullanıcı adı.</span></div>
+    <div class="param"><span class="name">IdentityFile</span><span class="desc">Bu host için kullanılacak private key dosyası.</span></div>
+    <div class="param"><span class="name">ServerAliveInterval</span><span class="desc">Saniye cinsinden keep-alive paketi gönderme aralığı. 60 sn önerilir.</span></div>
+    <div class="param"><span class="name">ControlMaster auto</span><span class="desc">Aynı host'a ikinci bağlantı açıldığında mevcut TCP bağlantısını yeniden kullanır. İlk bağlantı master channel'dır.</span></div>
+    <div class="param"><span class="name">ControlPersist 10m</span><span class="desc">Master bağlantısını son client kapandıktan sonra 10 dakika daha açık tut. Sonraki bağlantılar anında açılır.</span></div>
+  </div>
+
+  <h3>Match direktifi ile koşullu config</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span><span class="path">~/.ssh/config</span> (Match örnekleri)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Sadece belirli bir kullanıcı için geçerli</span>
+<span class="field">Match</span> User deploy
+    <span class="field">IdentityFile</span>   <span class="path">~/.ssh/deploy_key</span>
+    <span class="field">ForwardAgent</span>   no
+
+<span class="cmt"># Belirli bir network'te (exec ile)</span>
+<span class="field">Match</span> exec <span class="str">"ip route | grep -q '10.20.0.0/16'"</span>
+    <span class="field">ProxyJump</span>     none</code></pre>
+  </div>
+
+  <h3>Connection multiplexing — performans</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># İlk bağlantı — master channel oluşturulur</span>
+<span class="cmd">ssh</span> prod
+<span class="cmt"># → Yeni TCP bağlantısı, kex, auth (normal süre: ~300ms)</span>
+
+<span class="cmt"># İkinci bağlantı — mevcut channel'ı paylaşır</span>
+<span class="cmd">ssh</span> prod
+<span class="cmt"># → Anında bağlantı (~10ms) — kex ve auth tekrar yok</span>
+
+<span class="cmt"># Aktif ControlMaster socket'lerini listele</span>
+<span class="cmd">ls</span> ~/.ssh/cm_*</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><span class="field">Host</span> alias ile <code>ssh prod</code> kısayolları</li>
+      <li><span class="field">ServerAliveInterval</span> + <span class="field">ServerAliveCountMax</span> ile keep-alive</li>
+      <li><span class="field">ControlMaster auto</span> + <span class="field">ControlPersist 10m</span> ile bağlantı multiplexing</li>
+      <li><span class="field">Match</span> direktifi ile koşullu konfigürasyon</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Port forwarding — Local (-L)</h2>
+  <p class="section-lead">Local forwarding, uzak bir ağdaki servisi yerel bir port üzerinden erişilebilir kılar; güvenli tünel içinden geçer.</p>
+
+  <h3>Sözdizimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">ssh</span> <span class="flag">-L</span> [bind_address:]local_port:target_host:target_port user@jump_host</code></pre>
+  </div>
+
+  <div class="flow">
+    <pre>local:local_port ──SSH tünel──▶ jump_host ──TCP──▶ target_host:target_port
+localhost:5432   ──────────────▶ jump      ──────▶ db.internal:5432</pre>
+  </div>
+
+  <h3>Pratik senaryo 1: uzak veritabanına yerel erişim</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># İç ağdaki PostgreSQL'e yerel erişim</span>
+<span class="cmd">ssh</span> <span class="flag">-L</span> 5432:db.internal:5432 <span class="flag">-N</span> <span class="flag">-f</span> emirp@jump.example.com
+
+<span class="cmt"># -N: shell açma, sadece forward</span>
+<span class="cmt"># -f: background'a gönd</span>
+<span class="cmt"># Artık local 5432'ye bağlanarak db.internal'a ulaşırsın:</span>
+<span class="cmd">psql</span> <span class="flag">-h</span> localhost <span class="flag">-p</span> 5432 <span class="flag">-U</span> dbuser mydb</code></pre>
+  </div>
+
+  <h3>Pratik senaryo 2: iç ağ Grafana'sına yerel erişim</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Grafana iç ağda 3000 portunda çalışıyor</span>
+<span class="cmd">ssh</span> <span class="flag">-L</span> 8080:grafana.internal:3000 <span class="flag">-N</span> emirp@jump.example.com
+
+<span class="cmt"># Tarayıcıda: http://localhost:8080 → grafana.internal:3000</span>
+
+<span class="cmt"># Veya config üzerinden (arka planda):</span>
+<span class="cmd">ssh</span> <span class="flag">-L</span> 8080:grafana.internal:3000 <span class="flag">-N</span> <span class="flag">-f</span> jump</code></pre>
+  </div>
+
+  <h3>Diğer makinelere açma: GatewayPorts</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 0.0.0.0 ile tüm interface'e bind et (aynı subnet'teki makineler erişebilir)</span>
+<span class="cmd">ssh</span> <span class="flag">-L</span> 0.0.0.0:8080:target.internal:80 <span class="flag">-N</span> emirp@jump
+
+<span class="cmt"># sshd_config'de şu ayar gerekli:</span>
+<span class="cmt"># GatewayPorts yes   ← veya clientspecified</span>
+<span class="cmt"># NOT: varsayılan sadece localhost'a bind eder</span></code></pre>
+  </div>
+
+  <h3>~/.ssh/config ile local forward</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span><span class="path">~/.ssh/config</span></span><span class="dot">●</span></div>
+    <pre><code><span class="field">Host</span> grafana-tunnel
+    <span class="field">HostName</span>        jump.example.com
+    <span class="field">User</span>            emirp
+    <span class="field">LocalForward</span>    8080 grafana.internal:3000
+    <span class="field">LocalForward</span>    5432 db.internal:5432
+    <span class="field">RequestTTY</span>      no
+    <span class="field">ExitOnForwardFailure</span> yes</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><span class="flag">-L local_port:target:target_port</span> sözdizimi</li>
+      <li><span class="flag">-N</span> (shell açma) ve <span class="flag">-f</span> (background) kombinasyonu</li>
+      <li>PostgreSQL ve Grafana tünel senaryoları</li>
+      <li><span class="field">GatewayPorts</span> ile tüm interface'e bind</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Port forwarding — Remote (-R)</h2>
+  <p class="section-lead">Remote forwarding, yerel makinenizdeki bir servisi uzak sunucu üzerinden dışarıya açar; NAT arkasındaki uygulamaları internet'e sunmak için kullanılır.</p>
+
+  <h3>Sözdizimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">ssh</span> <span class="flag">-R</span> [bind_address:]remote_port:local_host:local_port user@remote_server</code></pre>
+  </div>
+
+  <div class="flow">
+    <pre>local:local_port ◀──SSH tünel──  remote_server:remote_port ◀── dış dünya
+localhost:3000   ◀─────────────  public-server:8080        ◀── browser</pre>
+  </div>
+
+  <h3>Pratik senaryo: yerel geliştirme sunucusunu paylaş</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Yerel 3000 portundaki dev server'ı public-server:8080'den eriştir</span>
+<span class="cmd">ssh</span> <span class="flag">-R</span> 8080:localhost:3000 <span class="flag">-N</span> emirp@public-server.example.com
+
+<span class="cmt"># public-server'ı ziyaret eden kullanıcı http://public-server:8080'e girebilir</span>
+<span class="cmt"># trafik SSH tüneli üzerinden yerel 3000'e gelir</span></code></pre>
+  </div>
+
+  <h3>GatewayPorts: tüm interface'e açma</h3>
+
+  <p>Varsayılan olarak remote forward sadece uzak sunucunun <code>127.0.0.1</code> adresine bind olur. Tüm internet'e açmak için <span class="path">/etc/ssh/sshd_config</span> düzenlenmesi gerekir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span><span class="path">/etc/ssh/sshd_config</span> (remote server)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Remote forward'ı tüm interface'e aç</span>
+GatewayPorts yes
+
+<span class="cmt"># Veya sadece client'ın istediği adresi kabul et</span>
+GatewayPorts clientspecified</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 0.0.0.0 ile tüm interface'e bind (GatewayPorts clientspecified gerekli)</span>
+<span class="cmd">ssh</span> <span class="flag">-R</span> 0.0.0.0:8080:localhost:3000 <span class="flag">-N</span> emirp@public-server</code></pre>
+  </div>
+
+  <h3>autossh ile kalıcı tünel</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># autossh: tünel koparsa otomatik yeniden bağlan</span>
+<span class="cmd">autossh</span> <span class="flag">-M</span> 20000 <span class="flag">-N</span> <span class="flag">-R</span> 8080:localhost:3000 emirp@public-server
+
+<span class="cmt"># -M 20000: monitoring port (0 ile devre dışı, ServerAlive kullan)</span>
+<span class="cmt"># systemd service olarak çalıştırmak için:</span></code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span><span class="path">/etc/systemd/system/ssh-tunnel.service</span></span><span class="dot">●</span></div>
+    <pre><code>[Unit]
+Description=SSH Remote Tunnel
+After=network.target
+
+[Service]
+ExecStart=<span class="path">/usr/bin/autossh</span> <span class="flag">-M</span> 0 <span class="flag">-N</span> \
+    <span class="flag">-o</span> ServerAliveInterval=30 \
+    <span class="flag">-o</span> ServerAliveCountMax=3 \
+    <span class="flag">-R</span> 8080:localhost:3000 \
+    emirp@public-server.example.com
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><span class="flag">-R remote_port:local_host:local_port</span> sözdizimi</li>
+      <li>NAT arkasındaki servisi internet'e açma senaryosu</li>
+      <li><span class="field">GatewayPorts yes</span> ile tüm interface'e bind</li>
+      <li>autossh ve systemd ile kalıcı reverse tunnel</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Dynamic forwarding: SOCKS proxy</h2>
+  <p class="section-lead">Dynamic forwarding, SSH bağlantısını genel amaçlı bir SOCKS5 proxy'ye dönüştürür; tüm uygulama trafiğini şifreli SSH tünelinden geçirmenizi sağlar.</p>
+
+  <h3>SOCKS proxy başlatma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># localhost:1080'de SOCKS5 proxy aç</span>
+<span class="cmd">ssh</span> <span class="flag">-D</span> 1080 emirp@remote-host.example.com
+
+<span class="cmt"># Arka planda çalıştır (shell yok, background)</span>
+<span class="cmd">ssh</span> <span class="flag">-D</span> 1080 <span class="flag">-N</span> <span class="flag">-f</span> emirp@remote-host.example.com
+
+<span class="cmt"># Farklı port ile</span>
+<span class="cmd">ssh</span> <span class="flag">-D</span> 8888 <span class="flag">-N</span> <span class="flag">-f</span> emirp@remote-host.example.com</code></pre>
+  </div>
+
+  <h3>curl ile SOCKS proxy test</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># SOCKS5 proxy üzerinden HTTP isteği</span>
+<span class="cmd">curl</span> <span class="flag">--socks5</span> localhost:1080 https://example.com
+
+<span class="cmt"># DNS çözümleme de proxy üzerinden (SOCKS5h)</span>
+<span class="cmd">curl</span> <span class="flag">--socks5-hostname</span> localhost:1080 https://internal-service.local
+
+<span class="cmt"># IP adresini doğrula (proxy üzerinden ne görünüyor)</span>
+<span class="cmd">curl</span> <span class="flag">--socks5</span> localhost:1080 https://ifconfig.me</code></pre>
+  </div>
+
+  <h3>proxychains ile herhangi bir uygulamayı tünelden geçir</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span><span class="path">/etc/proxychains4.conf</span></span><span class="dot">●</span></div>
+    <pre><code>strict_chain
+proxy_dns
+[ProxyList]
+socks5  127.0.0.1  1080</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Herhangi bir uygulamayı SOCKS proxy üzerinden çalıştır</span>
+<span class="cmd">proxychains4</span> <span class="flag">-q</span> nmap 10.20.30.0/24 <span class="flag">-p</span> 22,80,443
+<span class="cmd">proxychains4</span> <span class="flag">-q</span> wget http://internal.host/file.tar.gz
+<span class="cmd">proxychains4</span> <span class="flag">-q</span> python3 my_scanner.py</code></pre>
+  </div>
+
+  <h3>~/.ssh/config ile SOCKS proxy daemon</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span><span class="path">~/.ssh/config</span></span><span class="dot">●</span></div>
+    <pre><code><span class="field">Host</span> socks-proxy
+    <span class="field">HostName</span>         remote-host.example.com
+    <span class="field">User</span>             emirp
+    <span class="field">DynamicForward</span>   1080
+    <span class="field">RequestTTY</span>       no
+    <span class="field">ExitOnForwardFailure</span> yes</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Config ile başlat</span>
+<span class="cmd">ssh</span> <span class="flag">-N</span> <span class="flag">-f</span> socks-proxy
+
+<span class="cmt"># Tüm bağlantıları listele</span>
+<span class="cmd">ss</span> <span class="flag">-tlnp</span> | <span class="cmd">grep</span> 1080
+<span class="cmt"># → 0.0.0.0:1080  ... ssh</span>
+
+<span class="cmt"># Proxy'yi durdur</span>
+<span class="cmd">pkill</span> <span class="flag">-f</span> <span class="str">"ssh -N -f socks-proxy"</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Tarayıcı proxy ayarı: Firefox → Ağ Ayarları → Manuel proxy → SOCKS Host: <code>127.0.0.1</code>, Port: <code>1080</code>, SOCKS v5. "Proxy DNS with SOCKS v5" seçeneğini işaretleyin — böylece DNS sorguları da tünel üzerinden gider.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><span class="flag">-D 1080</span> ile SOCKS5 proxy açma</li>
+      <li><span class="flag">-N -f</span> kombinasyonu: background daemon</li>
+      <li><span class="cmd">curl --socks5</span> ve <span class="cmd">curl --socks5-hostname</span> ile test</li>
+      <li><span class="cmd">proxychains4</span> ile proxy-agnostic uygulama tünellemesi</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> ProxyJump ve bastion host</h2>
+  <p class="section-lead">Bastion host pattern, iç ağa doğrudan erişim olmadan güvenli geçiş noktası sağlar; ProxyJump bunu tek komutla ve agent forwarding gerekmeksizin yapar.</p>
+
+  <h3>Bastion host nedir</h3>
+
+  <div class="flow">
+    <pre>İnternet ──22──▶ bastion.example.com (public IP)
+                        │
+                   iç ağ geçidi
+                        │
+         ┌──────────────┼──────────────┐
+         ▼              ▼              ▼
+  web-01.internal  db-01.internal  ci.internal
+  (private IP)     (private IP)   (private IP)</pre>
+  </div>
+
+  <h3>ProxyJump: tek adımda iç ağa</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># bastion üzerinden internal-server'a bağlan</span>
+<span class="cmd">ssh</span> <span class="flag">-J</span> emirp@bastion.example.com emirp@web-01.internal
+
+<span class="cmt"># Kısa syntax (aynı user ise)</span>
+<span class="cmd">ssh</span> <span class="flag">-J</span> bastion.example.com web-01.internal
+
+<span class="cmt"># Çoklu hop: bastion1 → bastion2 → hedef</span>
+<span class="cmd">ssh</span> <span class="flag">-J</span> bastion1.example.com,bastion2.internal emirp@final-target.internal</code></pre>
+  </div>
+
+  <h3>~/.ssh/config ile ProxyJump</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span><span class="path">~/.ssh/config</span></span><span class="dot">●</span></div>
+    <pre><code><span class="field">Host</span> bastion
+    <span class="field">HostName</span>        bastion.example.com
+    <span class="field">User</span>            emirp
+    <span class="field">IdentityFile</span>    <span class="path">~/.ssh/id_ed25519</span>
+
+<span class="field">Host</span> web-01
+    <span class="field">HostName</span>        web-01.internal
+    <span class="field">User</span>            emirp
+    <span class="field">ProxyJump</span>       bastion
+    <span class="field">IdentityFile</span>    <span class="path">~/.ssh/id_ed25519</span>
+
+<span class="field">Host</span> *.internal
+    <span class="field">User</span>            emirp
+    <span class="field">ProxyJump</span>       bastion
+    <span class="field">IdentityFile</span>    <span class="path">~/.ssh/id_ed25519</span></code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Config ile artık doğrudan bağlanabilirsin</span>
+<span class="cmd">ssh</span> web-01
+<span class="cmd">ssh</span> db-01.internal</code></pre>
+  </div>
+
+  <h3>Eski ProxyCommand yöntemi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span><span class="path">~/.ssh/config</span> (eski stil)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ProxyJump desteklemeyen eski OpenSSH için</span>
+<span class="field">Host</span> legacy-internal
+    <span class="field">HostName</span>        10.20.30.50
+    <span class="field">User</span>            emirp
+    <span class="field">ProxyCommand</span>    ssh <span class="flag">-W</span> %h:%p emirp@bastion.example.com
+    <span class="cmt"># %h → hedef hostname, %p → hedef port</span></code></pre>
+  </div>
+
+  <h3>SCP ve SFTP ile ProxyJump</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Bastion üzerinden dosya kopyalama (scp)</span>
+<span class="cmd">scp</span> <span class="flag">-J</span> bastion.example.com \
+    emirp@web-01.internal:<span class="path">/var/log/app.log</span> \
+    <span class="path">./local-copy/</span>
+
+<span class="cmt"># Config tanımlıysa doğrudan:</span>
+<span class="cmd">scp</span> web-01:<span class="path">/var/log/app.log</span> <span class="path">./</span>
+
+<span class="cmt"># SFTP ile</span>
+<span class="cmd">sftp</span> <span class="flag">-J</span> bastion.example.com emirp@web-01.internal</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>ProxyJump, agent forwarding'in aksine private key'i bastion üzerinden geçirmez. SSH client, bastion'a bir TCP tüneli açar ve iç sunucuyla doğrudan el sıkışır. Bu nedenle ProxyJump, <span class="flag">-A</span> agent forwarding'den çok daha güvenlidir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Bastion host mimarisi: tek giriş noktası, iç ağ yalıtımı</li>
+      <li><span class="flag">-J jump_host</span> ile ProxyJump</li>
+      <li>Çoklu hop: <span class="flag">-J host1,host2</span></li>
+      <li>Config'de <span class="field">ProxyJump</span> ve wildcard host pattern</li>
+      <li>Eski <span class="field">ProxyCommand -W %h:%p</span> alternatifi</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 09 ═══════════════════ -->
+<section id="s9">
+  <h2><span class="num">09</span> sshd hardening</h2>
+  <p class="section-lead">Varsayılan SSH konfigürasyonu, üretim sunucuları için yeterince kısıtlayıcı değildir; temel güvenlik adımları ile saldırı yüzeyini önemli ölçüde azaltabilirsiniz.</p>
+
+  <h3>Kritik sshd_config ayarları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span><span class="path">/etc/ssh/sshd_config</span></span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ─── Temel güvenlik ───────────────────────────────────────────</span>
+
+<span class="cmt"># Root login: key ile bile olsa kapatın — sudo ile yönetin</span>
+PermitRootLogin no
+<span class="cmt"># Alternatif: PermitRootLogin prohibit-password (şifre yok, key olabilir)</span>
+
+<span class="cmt"># Şifre kimlik doğrulamasını kapat — sadece key kabul</span>
+PasswordAuthentication no
+ChallengeResponseAuthentication no
+UsePAM yes
+
+<span class="cmt"># ─── Erişim kısıtlaması ───────────────────────────────────────</span>
+
+<span class="cmt"># İzin verilen kullanıcılar (space-separated)</span>
+AllowUsers emirp deploy
+<span class="cmt"># veya grup bazlı:</span>
+AllowGroups sshusers sudo
+
+<span class="cmt"># ─── Brute-force koruma ───────────────────────────────────────</span>
+MaxAuthTries 3
+LoginGraceTime 30
+
+<span class="cmt"># ─── Gereksiz özellikleri kapat ───────────────────────────────</span>
+X11Forwarding no
+PermitEmptyPasswords no
+PrintMotd no
+
+<span class="cmt"># ─── Keepalive (dead connection temizle) ─────────────────────</span>
+ClientAliveInterval 300
+ClientAliveCountMax 2
+
+<span class="cmt"># ─── Modern kriptografi ───────────────────────────────────────</span>
+KexAlgorithms curve25519-sha256,diffie-hellman-group16-sha512
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
+
+<span class="cmt"># Değişiklikleri uygula:</span>
+<span class="cmt"># sudo sshd -t   → config syntax kontrolü</span>
+<span class="cmt"># sudo systemctl reload sshd</span></code></pre>
+  </div>
+
+  <h3>Port değişikliği</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span><span class="path">/etc/ssh/sshd_config</span></span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Varsayılan 22 yerine özel port (otomatik tarama trafiğini azaltır)</span>
+Port 2222
+<span class="cmt"># SELinux/AppArmor varsa port için ek konfigürasyon gerekebilir</span>
+<span class="cmt"># Firewall güncelleme: ufw allow 2222/tcp</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Port değiştirmek "güvenlik yoluyla gizlilik" (security through obscurity) değildir; gerçek güvenlik sağlamaz. Ancak 22 portundaki otomatik tarayıcı trafiğini ve log kirliliğini ciddi ölçüde azaltır. Gerçek güvenlik: <span class="field">PasswordAuthentication no</span> + key only.</p>
+  </div>
+
+  <h3>fail2ban kurulumu ve konfigürasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">apt</span> install fail2ban
+<span class="cmd">systemctl</span> enable <span class="flag">--now</span> fail2ban</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span><span class="path">/etc/fail2ban/jail.local</span></span><span class="dot">●</span></div>
+    <pre><code>[DEFAULT]
+bantime  = 3600      <span class="cmt"># 1 saat ban</span>
+findtime = 600       <span class="cmt"># 10 dakika penceresi</span>
+maxretry = 5         <span class="cmt"># 5 başarısız denemede ban</span>
+ignoreip = 127.0.0.1/8 ::1 10.0.0.0/8
+
+[sshd]
+enabled  = true
+port     = ssh
+logpath  = /var/log/auth.log
+maxretry = 3         <span class="cmt"># SSH için daha katı</span>
+bantime  = 86400     <span class="cmt"># 24 saat</span></code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash (fail2ban yönetimi)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># fail2ban durumu</span>
+<span class="cmd">fail2ban-client</span> status sshd
+
+<span class="cmt"># Banlı IP'leri listele</span>
+<span class="cmd">fail2ban-client</span> status sshd | <span class="cmd">grep</span> <span class="str">"Banned IP"</span>
+
+<span class="cmt"># IP ban kaldır</span>
+<span class="cmd">fail2ban-client</span> set sshd unbanip 1.2.3.4
+
+<span class="cmt"># Log izle</span>
+<span class="cmd">tail</span> <span class="flag">-f</span> /var/log/fail2ban.log</code></pre>
+  </div>
+
+  <h3>ssh-audit ile konfigürasyon denetimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ssh-audit kurulumu</span>
+<span class="cmd">pip</span> install ssh-audit
+<span class="cmt"># veya: apt install ssh-audit</span>
+
+<span class="cmt"># Uzak sunucuyu denetle</span>
+<span class="cmd">ssh-audit</span> host.example.com
+
+<span class="cmt"># Yerel sshd konfigürasyonunu denetle (client mode)</span>
+<span class="cmd">ssh-audit</span> <span class="flag">-c</span>
+
+<span class="cmt"># JSON çıktısı (CI/CD entegrasyonu için)</span>
+<span class="cmd">ssh-audit</span> <span class="flag">--json</span> host.example.com</code></pre>
+  </div>
+
+  <h3>Güvenli değer özet tablosu</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Direktif</th><th>Varsayılan</th><th>Güvenli Değer</th><th>Açıklama</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>PermitRootLogin</td><td>prohibit-password</td><td><strong>no</strong></td><td>Root erişimini tamamen kapat</td></tr>
+      <tr><td>PasswordAuthentication</td><td>yes</td><td><strong>no</strong></td><td>Şifre ile girişi kapat</td></tr>
+      <tr><td>MaxAuthTries</td><td>6</td><td><strong>3</strong></td><td>Brute-force sınırı</td></tr>
+      <tr><td>LoginGraceTime</td><td>120</td><td><strong>30</strong></td><td>Auth için saniye</td></tr>
+      <tr><td>X11Forwarding</td><td>no</td><td><strong>no</strong></td><td>GUI forwarding gereksizse kapalı</td></tr>
+      <tr><td>PermitEmptyPasswords</td><td>no</td><td><strong>no</strong></td><td>Boş şifreli hesaplara erişim yok</td></tr>
+      <tr><td>AllowUsers</td><td>(herkese açık)</td><td><strong>liste</strong></td><td>Yalnızca belirtilen kullanıcılar</td></tr>
+      <tr><td>ClientAliveInterval</td><td>0</td><td><strong>300</strong></td><td>Ölü bağlantıları temizle</td></tr>
+      <tr><td>ClientAliveCountMax</td><td>3</td><td><strong>2</strong></td><td>Yanıt gelmezse bağlantıyı kes</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p><span class="field">PasswordAuthentication no</span> yapmadan önce key authentication'ın çalıştığını doğrulayın. Yeni bir terminal oturumu açıp key ile bağlanabildiğinizden emin olun, sonra mevcut oturumunuzda sshd reload yapın. Aksi takdirde kendinizi kilitleyebilirsiniz.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><span class="field">PermitRootLogin no</span> ve <span class="field">PasswordAuthentication no</span> zorunlu iki adım</li>
+      <li><span class="field">AllowUsers</span> ile kullanıcı kısıtlaması</li>
+      <li><span class="field">MaxAuthTries 3</span>, <span class="field">LoginGraceTime 30</span> brute-force önlemi</li>
+      <li>fail2ban: <span class="path">/etc/fail2ban/jail.local</span> ile SSH koruması</li>
+      <li><span class="cmd">ssh-audit</span> ile konfigürasyon güvenlik denetimi</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>
