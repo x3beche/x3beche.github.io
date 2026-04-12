@@ -1,0 +1,897 @@
+---
+layout: tutorial
+title: "KVM Sanallaştırma — Linux Hypervisor"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>KVM</span>
+    <span>2026</span>
+  </div>
+  <h1>KVM Sanallaştırma<br><em>Linux Hypervisor</em></h1>
+  <p class="subtitle">Linux kernel içindeki Type-1 hypervisor — QEMU/KVM, virtio sürücüleri, libvirt, PCIe passthrough ve otomotiv IVI platformlarında gerçek zamanlı guest.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">KVM mimarisi</a></li>
+    <li><a href="#s1">QEMU + KVM</a></li>
+    <li><a href="#s2">Virtio sürücüleri</a></li>
+    <li><a href="#s3">libvirt ve virsh</a></li>
+    <li><a href="#s4">vCPU pinning ve NUMA</a></li>
+    <li><a href="#s5">PCIe passthrough — VFIO</a></li>
+    <li><a href="#s6">Nested virtualization</a></li>
+    <li><a href="#s7">Otomotif / embedded IVI</a></li>
+    <li><a href="#s8">Pratik uygulamalar</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> KVM mimarisi</h2>
+  <p class="section-lead">KVM (Kernel-based Virtual Machine), Linux kernel'ını tam teşekküllü bir hypervisor'a dönüştüren bir çekirdek modülüdür. Intel VT-x ve AMD-V donanım sanallaştırma uzantılarını kullanır.</p>
+
+  <h3>Type-1 vs Type-2 hypervisor</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Tür</th><th>Tanım</th><th>Örnek</th><th>Performans</th></tr></thead>
+      <tbody>
+        <tr><td>Type-1 (bare-metal)</td><td>Doğrudan donanım üzerinde çalışır; OS yoktur</td><td>VMware ESXi, Xen (dom0), Hyper-V</td><td>Yüksek — doğrudan donanım erişimi</td></tr>
+        <tr><td>Type-2 (hosted)</td><td>Var olan OS üzerinde çalışır</td><td>VirtualBox, VMware Workstation</td><td>Düşük — host OS overhead'ı</td></tr>
+        <tr><td>KVM (hybrid)</td><td>Linux kernel modülü; host OS = hypervisor</td><td>KVM + QEMU</td><td>Type-1'e yakın — HW sanallaştırma</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>KVM, Linux kernel'ını Type-1 hypervisor'a dönüştürür. <code>kvm.ko</code> modülü yüklendikten sonra Linux hem normal OS görevi görür hem de VM'leri çalıştırır. Her VM, kernel tarafından özel izinlerle yönetilen bir process olarak görünür.</p>
+
+  <h3>/dev/kvm arayüzü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — KVM varlığını doğrula</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Intel VT-x / AMD-V desteğini kontrol et</span>
+<span class="cmd">egrep</span> -c '(vmx|svm)' /proc/cpuinfo
+<span class="cmt"># 0: sanallaştırma yok, >0: destekli</span>
+
+<span class="cmt"># kvm-ok aracı (cpu-checker paketi)</span>
+<span class="cmd">sudo</span> apt install cpu-checker
+<span class="cmd">kvm-ok</span>
+<span class="cmt"># INFO: /dev/kvm exists</span>
+<span class="cmt"># KVM acceleration can be used</span>
+
+<span class="cmt"># KVM modülünü yükle</span>
+<span class="cmd">sudo</span> modprobe kvm
+<span class="cmd">sudo</span> modprobe kvm_intel    <span class="cmt"># Intel için</span>
+<span class="cmd">sudo</span> modprobe kvm_amd      <span class="cmt"># AMD için</span>
+
+<span class="cmt"># /dev/kvm yetki kontrolü</span>
+<span class="cmd">ls</span> -la /dev/kvm
+<span class="cmt"># crw-rw---- 1 root kvm 10, 232 ...</span>
+<span class="cmd">sudo</span> usermod -aG kvm $USER   <span class="cmt"># kullanıcıyı kvm grubuna ekle</span></code></pre>
+  </div>
+
+  <h3>KVM mimarisi — VM çalıştırma akışı</h3>
+
+  <div class="flow">
+    <pre>QEMU (userspace) → /dev/kvm ioctl → kvm.ko → VT-x VMLAUNCH → Guest code → VM-exit → kvm.ko handler → QEMU emulation → tekrar</pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">VMX root mode (host)</span><span class="desc">Normal kernel + userspace modu; VMLAUNCH/VMRESUME ile guest'e geçilir</span></div>
+    <div class="param"><span class="name">VMX non-root mode (guest)</span><span class="desc">Guest OS ve uygulamaları bu modda çalışır; bazı işlemler VM-exit tetikler</span></div>
+    <div class="param"><span class="name">VM-exit</span><span class="desc">Privileged instruction, I/O, interrupt gibi durumlar guest'ten host'a geçişe neden olur</span></div>
+    <div class="param"><span class="name">VMCS (VM Control Structure)</span><span class="desc">Her vCPU için donanım state machine — register'lar, I/O bitmap, MSR bitmap</span></div>
+  </div>
+
+  <h3>ARM v8 EL2 (KVM/ARM)</h3>
+  <p>ARM mimarisinde sanallaştırma EL2 (Exception Level 2) ile sağlanır. KVM/ARM, Cortex-A ve server sınıfı ARM64 işlemcilerinde çalışır. QEMU ile <code>-M virt -cpu cortex-a57</code> kombinasyonu ARM64 guest'leri çalıştırır.</p>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>KVM: Linux modülü olarak Type-1 hypervisor — host OS = hypervisor</li>
+      <li>/dev/kvm: QEMU → kernel arasındaki ioctl arayüzü</li>
+      <li>Intel VT-x: vmx; AMD-V: svm — /proc/cpuinfo ile kontrol</li>
+      <li>ARM EL2: ARM64 sunucularda KVM; QEMU -M virt ile kullanım</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> QEMU + KVM</h2>
+  <p class="section-lead">QEMU, cihaz emülasyonu ve VM yaşam döngüsü yönetimi yapan userspace programdır. KVM ile birlikte CPU işlemleri donanım hızında çalışır; yalnızca I/O emüle edilir.</p>
+
+  <h3>Temel QEMU + KVM kullanımı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — QEMU KVM kurulumu ve ilk VM</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># QEMU kurulumu</span>
+<span class="cmd">sudo</span> apt install qemu-kvm qemu-utils virtinst
+
+<span class="cmt"># Hızlı Alpine VM başlat (ISO ile)</span>
+<span class="cmd">qemu-system-x86_64</span> \
+  <span class="flag">-enable-kvm</span> \
+  <span class="flag">-m</span> 1024 \
+  <span class="flag">-smp</span> 2 \
+  <span class="flag">-cdrom</span> alpine-virt-3.19.0-x86_64.iso \
+  <span class="flag">-nographic</span>
+
+<span class="cmt"># Disk imajı oluştur ve VM başlat</span>
+<span class="cmd">qemu-img</span> create <span class="flag">-f</span> qcow2 vm.qcow2 20G
+
+<span class="cmd">qemu-system-x86_64</span> \
+  <span class="flag">-enable-kvm</span> \
+  <span class="flag">-m</span> 2048 \
+  <span class="flag">-smp</span> 4 \
+  <span class="flag">-drive</span> file=vm.qcow2,format=qcow2,if=virtio \
+  <span class="flag">-cdrom</span> ubuntu-22.04-server.iso \
+  <span class="flag">-net</span> nic,model=virtio \
+  <span class="flag">-net</span> user,hostfwd=tcp::2222-:22 \
+  <span class="flag">-nographic</span>
+
+<span class="cmt"># Kurulu sistemi başlat</span>
+<span class="cmd">qemu-system-x86_64</span> \
+  <span class="flag">-enable-kvm</span> \
+  <span class="flag">-m</span> 2048 \
+  <span class="flag">-smp</span> 4 \
+  <span class="flag">-drive</span> file=vm.qcow2,format=qcow2,if=virtio \
+  <span class="flag">-net</span> nic,model=virtio \
+  <span class="flag">-net</span> user,hostfwd=tcp::2222-:22 \
+  <span class="flag">-nographic</span> \
+  <span class="flag">-serial</span> mon:stdio</code></pre>
+  </div>
+
+  <h3>KVM hızlandırmasını doğrulama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — KVM performans doğrulama</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Guest içinde: sanallaştırma tespit</span>
+<span class="cmd">systemd-detect-virt</span>
+<span class="cmt"># kvm</span>
+
+<span class="cmt"># CPUID kontrol (guest içinde)</span>
+<span class="cmd">cpuid</span> | grep -i hypervisor
+
+<span class="cmt"># dmesg'de KVM hypervisor mesajı</span>
+<span class="cmd">dmesg</span> | grep -i kvm
+<span class="cmt"># [    0.000000] Hypervisor detected: KVM</span>
+
+<span class="cmt"># KVM paravirt clock (yüksek çözünürlüklü zaman)</span>
+<span class="cmd">cat</span> /sys/devices/system/clocksource/clocksource0/current_clocksource
+<span class="cmt"># kvm-clock</span></code></pre>
+  </div>
+
+  <h3>Önemli QEMU bayrakları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Bayrak</th><th>Açıklama</th><th>Örnek</th></tr></thead>
+      <tbody>
+        <tr><td>-enable-kvm</td><td>KVM hızlandırmasını etkinleştir</td><td>-enable-kvm</td></tr>
+        <tr><td>-cpu</td><td>vCPU modeli</td><td>-cpu host (host özelliklerini aktar)</td></tr>
+        <tr><td>-smp</td><td>vCPU sayısı ve topoloji</td><td>-smp 4,sockets=1,cores=2,threads=2</td></tr>
+        <tr><td>-m</td><td>RAM miktarı</td><td>-m 2G veya -m 2048M</td></tr>
+        <tr><td>-drive</td><td>Disk bağlantısı</td><td>-drive file=disk.qcow2,if=virtio</td></tr>
+        <tr><td>-net</td><td>Ağ adaptörü</td><td>-net nic,model=virtio -net bridge,br=br0</td></tr>
+        <tr><td>-nographic</td><td>Grafik yok, konsol STDIO</td><td>Headless server</td></tr>
+        <tr><td>-daemonize</td><td>Arka planda çalış</td><td>-daemonize -pidfile /run/vm.pid</td></tr>
+        <tr><td>-monitor</td><td>QEMU monitor bağlantısı</td><td>-monitor unix:/tmp/qemu.sock,server</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>QEMU + -enable-kvm: CPU işlemleri donanım hızında; I/O emüle edilir</li>
+      <li>-cpu host: host CPU özelliklerini guest'e geç — performans için önerilir</li>
+      <li>qemu-img create: qcow2 format — thin-provisioned, snapshot destekli</li>
+      <li>systemd-detect-virt: guest'te KVM'i doğrula; kvm-clock: yüksek çözünürlüklü saat</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Virtio sürücüleri</h2>
+  <p class="section-lead">Virtio, hypervisor ile guest arasında yüksek performanslı I/O için tasarlanmış paravirtualization standardıdır. Tam emülasyon yerine guest ve host arasında protokol düzeyinde işbirliği yapar.</p>
+
+  <h3>Paravirtualization vs tam emülasyon</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Yaklaşım</th><th>Nasıl çalışır</th><th>Performans</th><th>Uyumluluk</th></tr></thead>
+      <tbody>
+        <tr><td>Tam emülasyon (e1000, IDE)</td><td>QEMU gerçek donanım davranışını taklit eder</td><td>Düşük — her I/O VM-exit + emülasyon</td><td>Yüksek — modifiye edilmemiş OS</td></tr>
+        <tr><td>Paravirtualization (virtio)</td><td>Guest, hypervisor'ı biliyor; özel driver kullanır</td><td>Yüksek — optimize edilmiş I/O yolu</td><td>Orta — guest'te virtio driver gerekli</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Temel virtio cihazları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — virtio cihaz örnekleri</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># virtio-blk: disk (en yüksek I/O throughput)</span>
+<span class="cmd">qemu-system-x86_64</span> \
+  <span class="flag">-drive</span> file=disk.qcow2,format=qcow2,if=virtio \
+  ...
+
+<span class="cmt"># virtio-scsi: çok disk, SCSI komutları</span>
+<span class="cmd">qemu-system-x86_64</span> \
+  <span class="flag">-device</span> virtio-scsi-pci \
+  <span class="flag">-drive</span> file=disk.qcow2,if=none,id=disk0 \
+  <span class="flag">-device</span> scsi-hd,drive=disk0 \
+  ...
+
+<span class="cmt"># virtio-net: ağ adaptörü</span>
+<span class="cmd">qemu-system-x86_64</span> \
+  <span class="flag">-device</span> virtio-net-pci,netdev=net0 \
+  <span class="flag">-netdev</span> bridge,id=net0,br=br0 \
+  ...
+
+<span class="cmt"># virtio-console: seri konsol</span>
+<span class="cmd">qemu-system-x86_64</span> \
+  <span class="flag">-device</span> virtio-serial \
+  <span class="flag">-device</span> virtconsole,chardev=con0 \
+  <span class="flag">-chardev</span> socket,id=con0,server=on,wait=off,path=/tmp/console.sock \
+  ...
+
+<span class="cmt"># virtio-balloon: dinamik bellek</span>
+<span class="cmd">qemu-system-x86_64</span> \
+  <span class="flag">-device</span> virtio-balloon \
+  ...</code></pre>
+  </div>
+
+  <h3>vhost-net — kernel bypass</h3>
+  <p><code>vhost-net</code>, virtio-net'in kernel içi implementasyonudur. Ağ paketleri QEMU userspace'ten geçmez; kernel doğrudan guest ring buffer'ını işler. Özellikle yüksek paket hızı (10G+) uygulamalarında kritik fark yaratır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — vhost-net etkinleştirme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># vhost-net kernel modülünü yükle</span>
+<span class="cmd">sudo</span> modprobe vhost-net
+<span class="cmd">ls</span> /dev/vhost-net
+
+<span class="cmt"># QEMU'da vhost-net kullan</span>
+<span class="cmd">qemu-system-x86_64</span> \
+  <span class="flag">-device</span> virtio-net-pci,netdev=net0 \
+  <span class="flag">-netdev</span> bridge,id=net0,br=br0,vhost=on \
+  ...
+
+<span class="cmt"># Guest içinde virtio sürücüleri doğrula</span>
+<span class="cmd">lspci</span> | grep -i virtio
+<span class="cmt"># 00:03.0 Ethernet controller: Red Hat, Inc. Virtio network device</span>
+<span class="cmt"># 00:04.0 SCSI storage controller: Red Hat, Inc. Virtio block device</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Virtio: paravirtualization — guest hypervisor'ı biliyor, optimize I/O yolu</li>
+      <li>virtio-blk: disk; virtio-net: ağ; virtio-console: seri port; virtio-balloon: RAM</li>
+      <li>vhost-net: ağ işlemlerini kernel'a taşır — QEMU bypass, düşük latency</li>
+      <li>Linux guest'te virtio driver'lar kernel'da mevcut — ekstra kurulum gerekmez</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> libvirt ve virsh</h2>
+  <p class="section-lead">libvirt, KVM/QEMU'nun üzerinde oturan VM yönetim katmanıdır. virsh komut satırı aracı, libvirt API'sini kullanarak VM'leri XML ile tanımlar ve yönetir.</p>
+
+  <h3>libvirt kurulumu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — libvirt kurulumu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Ubuntu/Debian</span>
+<span class="cmd">sudo</span> apt install libvirt-daemon-system libvirt-clients virt-manager
+
+<span class="cmt"># Servis başlat</span>
+<span class="cmd">sudo</span> systemctl enable --now libvirtd
+
+<span class="cmt"># Kullanıcıyı libvirt grubuna ekle</span>
+<span class="cmd">sudo</span> usermod -aG libvirt $USER
+
+<span class="cmt"># Bağlantıyı doğrula</span>
+<span class="cmd">virsh</span> -c qemu:///system version
+<span class="cmt"># Compiled against library: libvirt 8.0.0</span></code></pre>
+  </div>
+
+  <h3>Domain XML anatomisi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>xml — domain tanımı (özet)</span><span class="dot">●</span></div>
+    <pre><code>&lt;domain type='kvm'&gt;
+  &lt;name&gt;alpine-test&lt;/name&gt;
+  &lt;memory unit='MiB'&gt;1024&lt;/memory&gt;
+  &lt;currentMemory unit='MiB'&gt;1024&lt;/currentMemory&gt;
+  &lt;vcpu placement='static'&gt;2&lt;/vcpu&gt;
+
+  &lt;os&gt;
+    &lt;type arch='x86_64' machine='pc-q35-6.2'&gt;hvm&lt;/type&gt;
+    &lt;boot dev='hd'/&gt;
+  &lt;/os&gt;
+
+  &lt;features&gt;
+    &lt;acpi/&gt; &lt;apic/&gt;
+  &lt;/features&gt;
+
+  &lt;cpu mode='host-passthrough' check='none'/&gt;
+
+  &lt;clock offset='utc'&gt;
+    &lt;timer name='rtc' tickpolicy='catchup'/&gt;
+    &lt;timer name='pit' tickpolicy='delay'/&gt;
+    &lt;timer name='hpet' present='no'/&gt;
+  &lt;/clock&gt;
+
+  &lt;devices&gt;
+    &lt;emulator&gt;/usr/bin/qemu-system-x86_64&lt;/emulator&gt;
+
+    &lt;disk type='file' device='disk'&gt;
+      &lt;driver name='qemu' type='qcow2' cache='none' io='native'/&gt;
+      &lt;source file='/var/lib/libvirt/images/alpine.qcow2'/&gt;
+      &lt;target dev='vda' bus='virtio'/&gt;
+    &lt;/disk&gt;
+
+    &lt;interface type='bridge'&gt;
+      &lt;source bridge='br0'/&gt;
+      &lt;model type='virtio'/&gt;
+    &lt;/interface&gt;
+
+    &lt;serial type='pty'&gt;
+      &lt;target port='0'/&gt;
+    &lt;/serial&gt;
+
+    &lt;console type='pty'&gt;
+      &lt;target type='serial' port='0'/&gt;
+    &lt;/console&gt;
+  &lt;/devices&gt;
+&lt;/domain&gt;</code></pre>
+  </div>
+
+  <h3>virsh temel komutları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — virsh komutları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># VM tanımla (XML dosyasından)</span>
+<span class="cmd">virsh</span> define alpine.xml
+
+<span class="cmt"># VM başlat</span>
+<span class="cmd">virsh</span> start alpine-test
+
+<span class="cmt"># Tüm VM'leri listele</span>
+<span class="cmd">virsh</span> list --all
+
+<span class="cmt"># VM konsola bağlan</span>
+<span class="cmd">virsh</span> console alpine-test   <span class="cmt"># Ctrl+] ile çık</span>
+
+<span class="cmt"># Düzgün kapat</span>
+<span class="cmd">virsh</span> shutdown alpine-test
+
+<span class="cmt"># Zorla kapat</span>
+<span class="cmd">virsh</span> destroy alpine-test
+
+<span class="cmt"># VM sil (disk dahil)</span>
+<span class="cmd">virsh</span> undefine alpine-test --remove-all-storage
+
+<span class="cmt"># Anlık görüntü (snapshot)</span>
+<span class="cmd">virsh</span> snapshot-create-as alpine-test snap1 "Temiz kurulum" --disk-only
+<span class="cmd">virsh</span> snapshot-list alpine-test
+<span class="cmd">virsh</span> snapshot-revert alpine-test snap1
+
+<span class="cmt"># Canlı göç (live migration) — iki host arasında</span>
+<span class="cmd">virsh</span> migrate --live alpine-test qemu+ssh://host2/system</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>libvirt: KVM/QEMU yönetim API'si; virsh CLI, virt-manager GUI</li>
+      <li>Domain XML: VM'nin tüm konfigürasyonu — CPU, RAM, disk, ağ, cihazlar</li>
+      <li>virsh define/start/shutdown/destroy: VM yaşam döngüsü</li>
+      <li>snapshot-create-as: anlık görüntü; migrate --live: sıcak göç</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> vCPU pinning ve NUMA</h2>
+  <p class="section-lead">Gerçek zamanlı ve yüksek performanslı VM'lerde vCPU'ları belirli fiziksel CPU'lara sabitlemek (pinning) ve NUMA topolojisine uygun bellek tahsisi kritik öneme sahiptir.</p>
+
+  <h3>vCPU pinning — XML ile</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>xml — vCPU pinning konfigürasyonu</span><span class="dot">●</span></div>
+    <pre><code>&lt;domain type='kvm'&gt;
+  &lt;vcpu placement='static'&gt;4&lt;/vcpu&gt;
+
+  &lt;!-- vCPU'ları fiziksel CPU'lara sabitle --&gt;
+  &lt;cputune&gt;
+    &lt;vcpupin vcpu='0' cpuset='2'/&gt;   &lt;!-- vCPU 0 → pCPU 2 --&gt;
+    &lt;vcpupin vcpu='1' cpuset='3'/&gt;   &lt;!-- vCPU 1 → pCPU 3 --&gt;
+    &lt;vcpupin vcpu='2' cpuset='4'/&gt;
+    &lt;vcpupin vcpu='3' cpuset='5'/&gt;
+    &lt;emulatorpin cpuset='0-1'/&gt;       &lt;!-- QEMU emulator thread'leri için --&gt;
+  &lt;/cputune&gt;
+
+  &lt;!-- Hugepage backed memory --&gt;
+  &lt;memoryBacking&gt;
+    &lt;hugepages&gt;
+      &lt;page size='2048' unit='KiB'/&gt;   &lt;!-- 2 MB hugepage --&gt;
+    &lt;/hugepages&gt;
+    &lt;nosharepages/&gt;
+    &lt;locked/&gt;
+  &lt;/memoryBacking&gt;
+
+  &lt;numatune&gt;
+    &lt;memory mode='strict' nodeset='0'/&gt;   &lt;!-- NUMA node 0'dan bellek --&gt;
+  &lt;/numatune&gt;
+&lt;/domain&gt;</code></pre>
+  </div>
+
+  <h3>Hugepage hazırlığı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — hugepage konfigürasyonu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 2MB hugepage sayısını ayarla (1024 * 2MB = 2GB)</span>
+<span class="cmd">sudo</span> sysctl vm.nr_hugepages=1024
+
+<span class="cmt"># Kalıcı konfigürasyon</span>
+<span class="cmd">echo</span> "vm.nr_hugepages=1024" | <span class="cmd">sudo</span> tee /etc/sysctl.d/99-hugepages.conf
+
+<span class="cmt"># Hugepage durumunu kontrol et</span>
+<span class="cmd">cat</span> /proc/meminfo | grep -i huge
+<span class="cmt"># HugePages_Total:    1024</span>
+<span class="cmt"># HugePages_Free:     1024</span>
+<span class="cmt"># Hugepagesize:       2048 kB</span>
+
+<span class="cmt"># 1GB hugepage (NUMA destekli sistemlerde)</span>
+<span class="cmd">sudo</span> sysctl vm.nr_hugepages=2   <span class="cmt"># 2 * 1GB = 2GB</span>
+<span class="cmt"># ya da kernel parametresi:</span>
+<span class="cmt"># hugepagesz=1G hugepages=2</span>
+
+<span class="cmt"># NUMA topolojisini incele</span>
+<span class="cmd">numactl</span> --hardware
+<span class="cmd">numactl</span> --show</code></pre>
+  </div>
+
+  <h3>Runtime CPU pinning</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — virsh CPU pinning</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Çalışan VM'in vCPU'larını sabitle</span>
+<span class="cmd">virsh</span> vcpupin alpine-test 0 2    <span class="cmt"># vCPU 0 → pCPU 2</span>
+<span class="cmd">virsh</span> vcpupin alpine-test 1 3    <span class="cmt"># vCPU 1 → pCPU 3</span>
+
+<span class="cmt"># Mevcut CPU pinning'i göster</span>
+<span class="cmd">virsh</span> vcpuinfo alpine-test
+
+<span class="cmt"># numactl ile process bağla (QEMU süreci)</span>
+<span class="cmd">QEMU_PID</span>=$(virsh dominfo alpine-test | grep "CPU time" | ...)
+<span class="cmd">numactl</span> --cpubind=0 --membind=0 qemu-system-x86_64 ...
+
+<span class="cmt"># CPU izolasyonu (isolcpus) — kernel parametresi</span>
+<span class="cmt"># GRUB_CMDLINE_LINUX="isolcpus=2,3,4,5 nohz_full=2,3,4,5 rcu_nocbs=2,3,4,5"</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>vCPU pinning: vCPU N → pCPU M; NUMA-aware düzenle — cache thrash önlenir</li>
+      <li>Hugepages: TLB miss azaltır — 2MB veya 1GB; VM için locked memory</li>
+      <li>numatune strict: belleği tek NUMA node'a kısıtla — cross-NUMA gecikmeyi önler</li>
+      <li>isolcpus kernel parametresi: pCPU'ları OS zamanlayıcısından ayır</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> PCIe passthrough — VFIO</h2>
+  <p class="section-lead">VFIO (Virtual Function I/O), PCIe cihazlarını (GPU, NIC, NVMe) doğrudan guest'e geçirmeyi sağlar. Guest, cihaza neredeyse bare-metal performansıyla erişir.</p>
+
+  <h3>IOMMU etkinleştirme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — IOMMU konfigürasyonu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># GRUB kernel parametreleri ekle:</span>
+<span class="cmt"># Intel: intel_iommu=on iommu=pt</span>
+<span class="cmt"># AMD:   amd_iommu=on iommu=pt</span>
+
+<span class="cmd">sudo</span> vim /etc/default/grub
+<span class="cmt"># GRUB_CMDLINE_LINUX_DEFAULT="intel_iommu=on iommu=pt"</span>
+<span class="cmd">sudo</span> update-grub
+<span class="cmd">sudo</span> reboot
+
+<span class="cmt"># IOMMU aktif olduğunu doğrula</span>
+<span class="cmd">dmesg</span> | grep -e DMAR -e IOMMU
+<span class="cmt"># [    0.000000] ACPI: DMAR 0x00000000BFAF1890 000088 (v01 ...)</span>
+<span class="cmt"># [    0.326874] Intel-IOMMU: enabled</span>
+
+<span class="cmt"># IOMMU gruplarını listele</span>
+<span class="cmd">for</span> g in /sys/kernel/iommu_groups/*; do
+    echo "Group $(basename $g):"
+    <span class="cmd">ls</span> $g/devices/
+done</code></pre>
+  </div>
+
+  <h3>VFIO ile cihaz ayırma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — GPU passthrough örneği</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Passthrough yapılacak cihazı bul (örnek: GPU)</span>
+<span class="cmd">lspci</span> -nn | grep NVIDIA
+<span class="cmt"># 01:00.0 VGA compatible controller [0300]: NVIDIA Corporation [10de:2204]</span>
+<span class="cmt"># 01:00.1 Audio device [0403]: NVIDIA Corporation [10de:1aef]</span>
+
+<span class="cmt"># VFIO modüllerini yükle</span>
+<span class="cmd">sudo</span> modprobe vfio-pci
+
+<span class="cmt"># Cihazı VFIO'ya bağla (GPU+Audio — aynı IOMMU grubunda)</span>
+<span class="cmd">echo</span> "10de 2204" | <span class="cmd">sudo</span> tee /sys/bus/pci/drivers/vfio-pci/new_id
+<span class="cmd">echo</span> "10de 1aef" | <span class="cmd">sudo</span> tee /sys/bus/pci/drivers/vfio-pci/new_id
+
+<span class="cmt"># Ya da mevcut sürücüyü önce ayır</span>
+<span class="cmd">echo</span> "0000:01:00.0" | <span class="cmd">sudo</span> tee /sys/bus/pci/devices/0000:01:00.0/driver/unbind
+<span class="cmd">echo</span> "0000:01:00.0" | <span class="cmd">sudo</span> tee /sys/bus/pci/drivers/vfio-pci/bind
+
+<span class="cmt"># QEMU'da GPU passthrough</span>
+<span class="cmd">qemu-system-x86_64</span> \
+  <span class="flag">-enable-kvm</span> \
+  <span class="flag">-m</span> 8G \
+  <span class="flag">-device</span> vfio-pci,host=01:00.0,multifunction=on \
+  <span class="flag">-device</span> vfio-pci,host=01:00.1 \
+  ...</code></pre>
+  </div>
+
+  <h3>NIC passthrough (SR-IOV)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — SR-IOV sanal fonksiyon</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># SR-IOV destekli NIC'de sanal fonksiyon oluştur</span>
+<span class="cmd">echo</span> 4 | <span class="cmd">sudo</span> tee /sys/class/net/eth0/device/sriov_numvfs
+
+<span class="cmt"># VF'leri listele</span>
+<span class="cmd">lspci</span> | grep "Virtual Function"
+
+<span class="cmt"># VF'yi VFIO'ya bağla ve VM'e geç</span>
+<span class="cmd">echo</span> "0000:00:10.1" | <span class="cmd">sudo</span> tee /sys/bus/pci/drivers/vfio-pci/bind
+
+<span class="cmd">qemu-system-x86_64</span> \
+  <span class="flag">-enable-kvm</span> \
+  <span class="flag">-device</span> vfio-pci,host=00:10.1 \
+  ...</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>IOMMU: intel_iommu=on veya amd_iommu=on kernel parametresi — temel gereksinim</li>
+      <li>IOMMU grubu: aynı gruptaki tüm cihazlar birlikte geçirilmeli</li>
+      <li>vfio-pci: cihazı host sürücüsünden ayır, guest'e geç — neredeyse native performans</li>
+      <li>SR-IOV: tek fiziksel NIC'den çok sayıda sanal fonksiyon — her VM'e ayrı VF</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Nested virtualization</h2>
+  <p class="section-lead">Nested KVM, bir VM içinde başka VM çalıştırmayı sağlar. L0 (bare-metal host), L1 (nested hypervisor) ve L2 (guest içi guest) katmanlarından oluşur.</p>
+
+  <h3>Nested KVM etkinleştirme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — nested virtualization</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Intel için nested etkinleştir</span>
+<span class="cmd">sudo</span> modprobe -r kvm_intel
+<span class="cmd">sudo</span> modprobe kvm_intel nested=1
+
+<span class="cmt"># Kalıcı konfigürasyon</span>
+<span class="cmd">echo</span> "options kvm_intel nested=1" | <span class="cmd">sudo</span> tee /etc/modprobe.d/kvm-intel.conf
+
+<span class="cmt"># AMD için</span>
+<span class="cmd">echo</span> "options kvm_amd nested=1" | <span class="cmd">sudo</span> tee /etc/modprobe.d/kvm-amd.conf
+
+<span class="cmt"># Etkin olduğunu doğrula</span>
+<span class="cmd">cat</span> /sys/module/kvm_intel/parameters/nested
+<span class="cmt"># Y</span>
+
+<span class="cmt"># L1 VM'i nested özelliğiyle başlat</span>
+<span class="cmd">qemu-system-x86_64</span> \
+  <span class="flag">-enable-kvm</span> \
+  <span class="flag">-cpu</span> host \
+  <span class="flag">-m</span> 4G \
+  <span class="flag">-drive</span> file=nested-host.qcow2,if=virtio \
+  ...</code></pre>
+  </div>
+
+  <h3>L0/L1/L2 katmanları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Katman</th><th>Tanım</th><th>Rol</th></tr></thead>
+      <tbody>
+        <tr><td>L0</td><td>Bare-metal Linux host</td><td>Gerçek donanım, kvm.ko modülü, VMCS sahibi</td></tr>
+        <tr><td>L1</td><td>İlk seviye VM (nested hypervisor)</td><td>L0'ın guest'i; kendi içinde KVM çalıştırır</td></tr>
+        <tr><td>L2</td><td>İkinci seviye VM</td><td>L1'in guest'i; çift sanallaştırma katmanı</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — L1 içinde L2 VM başlatma</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># L1 VM içinde (nested hypervisor)</span>
+<span class="cmd">egrep</span> '(vmx|svm)' /proc/cpuinfo
+<span class="cmt"># vmx: host -cpu host ile aktarıldı</span>
+
+<span class="cmd">kvm-ok</span>
+<span class="cmt"># INFO: /dev/kvm exists — nested çalışıyor</span>
+
+<span class="cmt"># L1 içinde L2 VM başlat</span>
+<span class="cmd">qemu-system-x86_64</span> \
+  <span class="flag">-enable-kvm</span> \
+  <span class="flag">-m</span> 512M \
+  <span class="flag">-cdrom</span> alpine.iso \
+  <span class="flag">-nographic</span></code></pre>
+  </div>
+
+  <h3>Kullanım senaryoları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">CI/CD test altyapısı</span><span class="desc">VM içinde VM testi — kuberentes node simülasyonu, hypervisor geliştirme, Vagrant içi KVM</span></div>
+    <div class="param"><span class="name">Güvenlik araştırması</span><span class="desc">Kötü amaçlı yazılım analizi — iç içe izole ortam; L1 şüpheli, L0 gözlemci</span></div>
+    <div class="param"><span class="name">Bulut geliştirme</span><span class="desc">AWS/GCP/Azure VM'lerinde KVM geliştirme — cloud provider'lar nested sanallaştırmayı destekler</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>options kvm_intel nested=1: L1'de /dev/kvm aktif — tek parametre</li>
+      <li>-cpu host: VMCS özelliklerini L1'e aktar — nested için zorunlu</li>
+      <li>L0/L1/L2: her geçiş ek VM-exit overhead'ı — üretim için kaçınılabilir</li>
+      <li>CI/CD ve güvenlik araştırması: nested KVM'in pratik kullanım alanları</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Otomotif / embedded IVI</h2>
+  <p class="section-lead">Automotive Grade Linux (AGL) ve benzeri platformlarda KVM, araç içi bilgi-eğlence sistemlerinde (IVI) izolasyon ve güvenlik için kullanılır. Gerçek zamanlı guest ve virtio-vsock önemli role sahiptir.</p>
+
+  <h3>Otomotif KVM kullanım senaryosu</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>VM</th><th>İşlev</th><th>Gereksinim</th></tr></thead>
+      <tbody>
+        <tr><td>Guest 1 (Android Auto)</td><td>Navigasyon, medya, ses</td><td>Yüksek performans GPU, latency tolerant</td></tr>
+        <tr><td>Guest 2 (RT Guest)</td><td>CAN/LIN bus, ADAS, araç kontrol</td><td>PREEMPT_RT, determinizm, watchdog</td></tr>
+        <tr><td>Guest 3 (Güvenlik)</td><td>Firmware imza, TPM, HSM</td><td>TrustZone / TEE izolasyonu</td></tr>
+        <tr><td>Host (AGL/Yocto)</td><td>Donanım yönetimi, hypervisor</td><td>Kararlı, minimal yüzey</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>PREEMPT_RT guest konfigürasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — RT guest için QEMU</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># RT guest için vCPU pinning + realtime öncelik</span>
+<span class="cmd">qemu-system-x86_64</span> \
+  <span class="flag">-enable-kvm</span> \
+  <span class="flag">-cpu</span> host \
+  <span class="flag">-smp</span> 2 \
+  <span class="flag">-m</span> 1G \
+  <span class="flag">-realtime</span> mlock=on \
+  <span class="flag">-drive</span> file=rt-guest.qcow2,if=virtio,cache=none \
+  <span class="flag">-device</span> virtio-serial \
+  <span class="flag">-device</span> virtio-rng-pci \
+  <span class="flag">-nographic</span>
+
+<span class="cmt"># QEMU thread'lerini RT sched politikasıyla çalıştır</span>
+<span class="cmd">sudo</span> chrt -f 80 -p $(pgrep -f "qemu-system-x86_64")</code></pre>
+  </div>
+
+  <h3>virtio-vsock — VM'ler arası iletişim</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — vsock konfigürasyonu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Host: vhost-vsock modülü</span>
+<span class="cmd">sudo</span> modprobe vhost-vsock
+
+<span class="cmt"># QEMU'da vsock ekle (her VM'in benzersiz CID'i olmalı)</span>
+<span class="cmd">qemu-system-x86_64</span> \
+  <span class="flag">-enable-kvm</span> \
+  <span class="flag">-device</span> vhost-vsock-pci,guest-cid=5 \
+  ...
+
+<span class="cmt"># Guest içinde vsock server (Python)</span>
+<span class="cmt"># import socket</span>
+<span class="cmt"># s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)</span>
+<span class="cmt"># s.bind((socket.VMADDR_CID_ANY, 1234))</span>
+<span class="cmt"># s.listen(1)</span>
+
+<span class="cmt"># Host'tan guest'e bağlan (CID 5, port 1234)</span>
+<span class="cmd">socat</span> - VSOCK-CONNECT:5:1234</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>AGL + KVM: IVI sistemi — medya VM + RT kontrol VM + güvenlik VM izolasyonu</li>
+      <li>RT guest: PREEMPT_RT kernel + -realtime mlock=on + vCPU pinning</li>
+      <li>virtio-vsock: VM'ler arası lightweight socket — TCP/IP yok, overhead düşük</li>
+      <li>chrt -f ile QEMU thread'lerine SCHED_FIFO: RT host-guest iletişimi</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik uygulamalar</h2>
+  <p class="section-lead">Üç senaryo: minimal Alpine VM, bridge ağ, cloud-init ile hızlı deploy ve ARM64 QEMU KVM.</p>
+
+  <h3>Minimal Alpine VM</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Alpine Linux VM</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Alpine ISO indir</span>
+<span class="cmd">wget</span> https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/alpine-virt-3.19.0-x86_64.iso
+
+<span class="cmt"># Disk imajı oluştur</span>
+<span class="cmd">qemu-img</span> create -f qcow2 alpine.qcow2 4G
+
+<span class="cmt"># Kurulum</span>
+<span class="cmd">qemu-system-x86_64</span> \
+  -enable-kvm \
+  -m 512M \
+  -smp 2 \
+  -drive file=alpine.qcow2,format=qcow2,if=virtio \
+  -cdrom alpine-virt-3.19.0-x86_64.iso \
+  -boot d \
+  -net nic,model=virtio \
+  -net user \
+  -nographic
+
+<span class="cmt"># Kurulum tamamlandıktan sonra:</span>
+<span class="cmd">qemu-system-x86_64</span> \
+  -enable-kvm \
+  -m 512M \
+  -smp 2 \
+  -drive file=alpine.qcow2,format=qcow2,if=virtio \
+  -net nic,model=virtio \
+  -net user,hostfwd=tcp::2222-:22 \
+  -nographic
+
+<span class="cmt"># SSH bağlantısı</span>
+<span class="cmd">ssh</span> -p 2222 root@localhost</code></pre>
+  </div>
+
+  <h3>Bridge ağ kurulumu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — br0 bridge konfigürasyonu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Bridge oluştur</span>
+<span class="cmd">sudo</span> ip link add br0 type bridge
+<span class="cmd">sudo</span> ip link set br0 up
+<span class="cmd">sudo</span> ip link set eth0 master br0
+<span class="cmd">sudo</span> ip addr add 192.168.1.1/24 dev br0
+
+<span class="cmt"># Kalıcı (Netplan — Ubuntu)</span>
+<span class="cmt"># /etc/netplan/00-bridge.yaml:</span>
+<span class="cmt"># network:</span>
+<span class="cmt">#   ethernets:</span>
+<span class="cmt">#     eth0: {dhcp4: false}</span>
+<span class="cmt">#   bridges:</span>
+<span class="cmt">#     br0:</span>
+<span class="cmt">#       interfaces: [eth0]</span>
+<span class="cmt">#       dhcp4: true</span>
+
+<span class="cmt"># VM'i bridge'e bağla</span>
+<span class="cmd">qemu-system-x86_64</span> \
+  -enable-kvm \
+  -m 512M \
+  -net nic,model=virtio,macaddr=52:54:00:12:34:56 \
+  -net bridge,br=br0 \
+  ...</code></pre>
+  </div>
+
+  <h3>cloud-init ile hızlı VM deploy</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — cloud-init ile Ubuntu Server</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Ubuntu cloud image indir (cloud-init destekli)</span>
+<span class="cmd">wget</span> https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img
+
+<span class="cmt"># Disk imajını genişlet</span>
+<span class="cmd">qemu-img</span> resize jammy-server-cloudimg-amd64.img +10G
+
+<span class="cmt"># cloud-init user-data hazırla</span>
+<span class="cmd">cat</span> &gt; user-data &lt;&lt;'EOF'
+#cloud-config
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAA... user@host
+packages:
+  - htop
+  - vim
+runcmd:
+  - systemctl enable --now ssh
+EOF
+
+<span class="cmt"># cloud-init ISO oluştur</span>
+<span class="cmd">cloud-localds</span> seed.img user-data
+
+<span class="cmt"># VM başlat (cloud-init ilk boot'ta çalışır)</span>
+<span class="cmd">qemu-system-x86_64</span> \
+  -enable-kvm \
+  -m 2G \
+  -smp 2 \
+  -drive file=jammy-server-cloudimg-amd64.img,if=virtio \
+  -drive file=seed.img,if=virtio \
+  -net nic,model=virtio \
+  -net user,hostfwd=tcp::2222-:22 \
+  -nographic</code></pre>
+  </div>
+
+  <h3>ARM64 KVM — qemu-system-aarch64</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — ARM64 VM (x86 host üzerinde)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ARM64 QEMU (ARM host'ta KVM, x86'da emülasyon)</span>
+<span class="cmd">sudo</span> apt install qemu-system-arm
+
+<span class="cmt"># ARM64 cloud image indir</span>
+<span class="cmd">wget</span> https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-arm64.img
+
+<span class="cmt"># UEFI firmware (ARM64 için gerekli)</span>
+<span class="cmd">sudo</span> apt install qemu-efi-aarch64
+
+<span class="cmt"># ARM64 VM başlat</span>
+<span class="cmd">qemu-system-aarch64</span> \
+  -M virt \
+  -cpu cortex-a57 \
+  -m 2G \
+  -smp 4 \
+  -bios /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
+  -drive file=jammy-server-cloudimg-arm64.img,if=virtio \
+  -drive file=seed.img,if=virtio \
+  -net nic,model=virtio \
+  -net user,hostfwd=tcp::2223-:22 \
+  -nographic
+
+<span class="cmt"># ARM64 host'ta KVM hızlandırma ile:</span>
+<span class="cmd">qemu-system-aarch64</span> \
+  -M virt \
+  -enable-kvm \
+  -cpu host \
+  -m 2G \
+  ...</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Alpine: en küçük footprint — kurulum ~5 dk, 4GB disk yeterli</li>
+      <li>bridge br0: VM'ler gerçek ağa katılır — DHCP sunucu gerekebilir</li>
+      <li>cloud-init: ilk boot'ta user/ssh/package otomasyonu — sıfır elle müdahale</li>
+      <li>qemu-system-aarch64 -M virt -cpu cortex-a57: ARM64 emülasyon; ARM host'ta -enable-kvm</li>
+    </ul>
+  </div>
+</section>
+
+</main>

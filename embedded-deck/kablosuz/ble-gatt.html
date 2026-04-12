@@ -1,0 +1,887 @@
+---
+layout: tutorial
+title: "BLE GATT — Kablosuz Yığını"
+back_url: "../index.html"
+back_label: "Kablosuz Yığını"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>KABLOSUZ YIĞINI</span>
+    <span>BLE GATT</span>
+    <span>2026</span>
+  </div>
+  <h1>BLE GATT<br><em>servis yazma.</em></h1>
+  <p class="subtitle">GAP, GATT, ATT — BLE protokol temellerinden BlueZ D-Bus ile özel GATT servisine, Yocto entegrasyonuna kadar tam rehber.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">BLE temel kavramlar — Advertising, GAP, GATT, ATT</a></li>
+    <li><a href="#s1">GATT hiyerarşisi — Profile, Service, Characteristic, Descriptor</a></li>
+    <li><a href="#s2">BlueZ D-Bus GATT server API</a></li>
+    <li><a href="#s3">Python ile custom GATT service — sıcaklık sensörü</a></li>
+    <li><a href="#s4">UUID tanımlama — SIG vs özel 128-bit</a></li>
+    <li><a href="#s5">Characteristic properties — READ, WRITE, NOTIFY</a></li>
+    <li><a href="#s6">Notify/Indicate mekanizması ve MTU</a></li>
+    <li><a href="#s7">C ile GATT client — libbluetooth</a></li>
+    <li><a href="#s8">Embedded — BlueZ Yocto entegrasyonu ve minimal BLE advertiser</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> BLE temel kavramlar — Advertising, GAP, GATT, ATT</h2>
+  <p class="section-lead">Bluetooth Low Energy (BLE), Bluetooth 4.0 ile gelen düşük güç tüketimli versiyondur. IoT sensör düğümleri için tasarlanmıştır.</p>
+
+  <div class="flow">
+    <pre>
+  BLE Protokol Yığını
+  ──────────────────────────────────────────
+  <span class="field">GATT</span>        Generic Attribute Profile
+              → Servis ve karakteristik tanımları
+  <span class="field">GAP</span>         Generic Access Profile
+              → Advertising, connection, security
+  <span class="field">ATT</span>         Attribute Protocol
+              → GATT'ın taşıma katmanı (client/server)
+  <span class="field">L2CAP</span>       Logical Link Control and Adaptation
+              → Paket segmentasyonu, channel multiplexing
+  <span class="field">HCI</span>         Host Controller Interface
+  <span class="field">LL</span>          Link Layer → advertising, connections
+  <span class="field">PHY</span>         Physical Layer → 2.4 GHz RF
+    </pre>
+  </div>
+
+  <h3>Advertising (reklam yayını)</h3>
+
+  <p>BLE cihazları sürekli bağlantı tutmak yerine periyodik olarak advertisement paketleri yayınlar. Central (merkez) cihaz bu paketleri dinler (scanning) ve bağlanmak isterse Connection Request gönderir.</p>
+
+  <div class="params">
+    <div class="param"><div class="name">Advertiser (Peripheral)</div><div class="desc">Veri yayınlayan cihaz — sensör, beacon, akıllı saat. Genellikle pil ile çalışır.</div></div>
+    <div class="param"><div class="name">Scanner (Central)</div><div class="desc">Tarama yapan cihaz — akıllı telefon, gateway, Raspberry Pi.</div></div>
+    <div class="param"><div class="name">Advertisement interval</div><div class="desc">Paket yayın aralığı (20ms – 10.24s). Düşük aralık = hızlı keşif ama yüksek güç.</div></div>
+    <div class="param"><div class="name">ADV_IND</div><div class="desc">Bağlantıya izin veren, tüm cihazlara yayın advertisement.</div></div>
+    <div class="param"><div class="name">ADV_NONCONN_IND</div><div class="desc">Bağlantısız sadece veri yayını (beacon, iBeacon).</div></div>
+    <div class="param"><div class="name">SCAN_RSP</div><div class="desc">Scanner'ın aktif tarama isteğine ek veri yanıtı.</div></div>
+  </div>
+
+  <h3>GAP rolleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>BLE bağlantı kurulumu akışı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">Peripheral (sensör)          Central (telefon/Pi)</span>
+      │                              │
+      │── ADV_IND ──────────────────►│  advertising
+      │                              │
+      │◄─ CONNECT_REQ ──────────────│  central bağlanmak istiyor
+      │                              │
+      │══════ Connection ════════════│  bağlantı kuruldu
+      │                              │
+      │◄─ ATT Read Request ─────────│  central veri okuyor
+      │── ATT Read Response ────────►│
+      │                              │
+      │── ATT Handle Value Notification ──►│  peripheral bildirim gönderiyor</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> GATT hiyerarşisi — Profile, Service, Characteristic, Descriptor</h2>
+  <p class="section-lead">GATT, BLE veri modelinin omurgasıdır. Attribute tablosunu hiyerarşik olarak organize eder.</p>
+
+  <div class="flow">
+    <pre>
+  <span class="field">Profile</span>           (koleksiyon — örn: Health Thermometer Profile)
+    └── <span class="field">Service</span>       (işlevsel grup — örn: Temperature Service, 0x1809)
+          ├── <span class="field">Characteristic</span>  (veri birimi — örn: Temperature Measurement, 0x2A1C)
+          │       ├── Value          (ham veri: bytes)
+          │       └── <span class="field">Descriptor</span>    (metadata — örn: CCCD, Unit, Description)
+          └── <span class="field">Characteristic</span>  (örn: Measurement Interval, 0x2A21)
+    </pre>
+  </div>
+
+  <h3>ATT handle ve attribute tablosu</h3>
+
+  <p>Her attribute (service, characteristic, descriptor) bir 16-bit handle'a sahiptir. ATT protokolü bu handle'lar üzerinden çalışır:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>ATT attribute tablosu örneği</span><span class="dot">●</span></div>
+    <pre><code>Handle  Type UUID              Value
+──────  ──────────────────────────────────────────────────────────
+0x0001  2800 (Primary Service)  1809 (Health Thermometer Service)
+0x0002  2803 (Characteristic)   Properties: NOTIFY + READ
+0x0003  2A1C (Temp Measurement) [value bytes]
+0x0004  2902 (CCCD)             [00 00] → notify kapalı / [01 00] → açık
+0x0005  2803 (Characteristic)   Properties: READ
+0x0006  2A21 (Meas. Interval)   [0A 00] → 10 saniye</code></pre>
+  </div>
+
+  <h3>Temel servis UUID'leri (Bluetooth SIG)</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">0x1800</div><div class="desc">Generic Access — cihaz adı, görünüm.</div></div>
+    <div class="param"><div class="name">0x1801</div><div class="desc">Generic Attribute — servis değişikliği bildirimi.</div></div>
+    <div class="param"><div class="name">0x180A</div><div class="desc">Device Information — üretici, model, firmware.</div></div>
+    <div class="param"><div class="name">0x180F</div><div class="desc">Battery Service — pil yüzdesi.</div></div>
+    <div class="param"><div class="name">0x1809</div><div class="desc">Health Thermometer — sıcaklık ölçümü.</div></div>
+    <div class="param"><div class="name">0x181A</div><div class="desc">Environmental Sensing — sıcaklık, nem, basınç.</div></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> BlueZ D-Bus GATT server API</h2>
+  <p class="section-lead">BlueZ, GATT server oluşturmak için uygulama tarafından D-Bus nesneleri export edilmesini bekler. "D-Bus object model" yaklaşımı.</p>
+
+  <div class="flow">
+    <pre>
+  Uygulama (Python)                        bluetoothd
+  ──────────────────────────────────────────────────────
+  D-Bus'a nesne kaydet:                    RegisterApplication() ile
+    /app/service0                    →     GATT nesnelerini keşfeder
+    /app/service0/char0                     ve BLE stack'e ekler
+    /app/service0/char0/desc0
+         ↓
+  org.bluez.GattService1
+  org.bluez.GattCharacteristic1
+  org.bluez.GattDescriptor1
+    </pre>
+  </div>
+
+  <h3>Gerekli D-Bus arayüzleri</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">org.bluez.GattService1</div><div class="desc">UUID (string), Primary (bool). İçerdiği karakteristikler alt path'lerde.</div></div>
+    <div class="param"><div class="name">org.bluez.GattCharacteristic1</div><div class="desc">UUID, Flags (list), Service (path). ReadValue(), WriteValue(), StartNotify(), StopNotify() metodları.</div></div>
+    <div class="param"><div class="name">org.bluez.GattDescriptor1</div><div class="desc">UUID, Characteristic (path). ReadValue(), WriteValue() metodları.</div></div>
+    <div class="param"><div class="name">org.bluez.GattManager1</div><div class="desc">Adapter üzerindedir. RegisterApplication() ve UnregisterApplication() ile GATT app kaydedilir.</div></div>
+    <div class="param"><div class="name">org.bluez.LEAdvertisement1</div><div class="desc">Type, ServiceUUIDs, ManufacturerData, LocalName. Advertising verisi.</div></div>
+    <div class="param"><div class="name">org.bluez.LEAdvertisingManager1</div><div class="desc">RegisterAdvertisement() ile advertisement kaydedilir.</div></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Python ile custom GATT service — sıcaklık sensörü</h2>
+  <p class="section-lead">BlueZ D-Bus GATT API kullanarak sıcaklık değerini BLE üzerinden yayınlayan tam çalışır örnek.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>python — ble_temperature_server.py</span><span class="dot">●</span></div>
+    <pre><code>#!/usr/bin/env python3
+"""BLE GATT Sıcaklık Sensörü — BlueZ D-Bus API ile."""
+
+import dbus
+import dbus.exceptions
+import dbus.mainloop.glib
+import dbus.service
+from gi.repository import GLib
+import struct
+import random
+
+BLUEZ_SERVICE = 'org.bluez'
+GATT_MANAGER_IFACE = 'org.bluez.GattManager1'
+GATT_SERVICE_IFACE = 'org.bluez.GattService1'
+GATT_CHAR_IFACE = 'org.bluez.GattCharacteristic1'
+GATT_DESC_IFACE = 'org.bluez.GattDescriptor1'
+LE_ADV_MANAGER_IFACE = 'org.bluez.LEAdvertisingManager1'
+LE_ADV_IFACE = 'org.bluez.LEAdvertisement1'
+DBUS_OM_IFACE = 'org.freedesktop.DBus.ObjectManager'
+DBUS_PROP_IFACE = 'org.freedesktop.DBus.Properties'
+
+<span class="cmt"># Sıcaklık servisi için UUID'ler (SIG standartları)</span>
+TEMP_SERVICE_UUID = '0000180d-0000-1000-8000-00805f9b34fb'   <span class="cmt"># Heart Rate → örnek</span>
+TEMP_CHAR_UUID   = '00002a37-0000-1000-8000-00805f9b34fb'
+<span class="cmt"># Gerçek Environmental Sensing için:</span>
+ENV_SERVICE_UUID = '0000181a-0000-1000-8000-00805f9b34fb'
+TEMP_MEAS_UUID   = '00002a6e-0000-1000-8000-00805f9b34fb'   <span class="cmt"># Temperature 2A6E</span>
+CCCD_UUID        = '00002902-0000-1000-8000-00805f9b34fb'
+
+
+class InvalidArgsException(dbus.exceptions.DBusException):
+    _dbus_error_name = 'org.freedesktop.DBus.Error.InvalidArgs'
+
+
+class Application(dbus.service.Object):
+    """GATT uygulaması — tüm servislerin kök nesnesi."""
+
+    def __init__(self, bus):
+        self.path = '/'
+        self.services = []
+        dbus.service.Object.__init__(self, bus, self.path)
+        self.add_service(TemperatureService(bus, 0))
+
+    def get_path(self):
+        return dbus.ObjectPath(self.path)
+
+    def add_service(self, service):
+        self.services.append(service)
+
+    @dbus.service.method(DBUS_OM_IFACE, out_signature='a{oa{sa{sv}}}')
+    def GetManagedObjects(self):
+        response = {}
+        for service in self.services:
+            response[service.get_path()] = service.get_properties()
+            chrcs = service.get_characteristics()
+            for chrc in chrcs:
+                response[chrc.get_path()] = chrc.get_properties()
+                descs = chrc.get_descriptors()
+                for desc in descs:
+                    response[desc.get_path()] = desc.get_properties()
+        return response
+
+
+class Service(dbus.service.Object):
+    PATH_BASE = '/org/bluez/example/service'
+
+    def __init__(self, bus, index, uuid, primary):
+        self.path = self.PATH_BASE + str(index)
+        self.bus = bus
+        self.uuid = uuid
+        self.primary = primary
+        self.characteristics = []
+        dbus.service.Object.__init__(self, bus, self.path)
+
+    def get_properties(self):
+        return {
+            GATT_SERVICE_IFACE: {
+                'UUID': self.uuid,
+                'Primary': self.primary,
+                'Characteristics': dbus.Array(
+                    [c.get_path() for c in self.characteristics],
+                    signature='o')
+            }
+        }
+
+    def get_path(self):
+        return dbus.ObjectPath(self.path)
+
+    def add_characteristic(self, characteristic):
+        self.characteristics.append(characteristic)
+
+    def get_characteristics(self):
+        return self.characteristics
+
+    @dbus.service.method(DBUS_PROP_IFACE, in_signature='s',
+                         out_signature='a{sv}')
+    def GetAll(self, interface):
+        if interface != GATT_SERVICE_IFACE:
+            raise InvalidArgsException()
+        return self.get_properties()[GATT_SERVICE_IFACE]
+
+
+class Characteristic(dbus.service.Object):
+
+    def __init__(self, bus, index, uuid, flags, service):
+        self.path = service.path + '/char' + str(index)
+        self.bus = bus
+        self.uuid = uuid
+        self.service = service
+        self.flags = flags
+        self.descriptors = []
+        dbus.service.Object.__init__(self, bus, self.path)
+
+    def get_properties(self):
+        return {
+            GATT_CHAR_IFACE: {
+                'Service': self.service.get_path(),
+                'UUID': self.uuid,
+                'Flags': self.flags,
+                'Descriptors': dbus.Array(
+                    [d.get_path() for d in self.descriptors],
+                    signature='o')
+            }
+        }
+
+    def get_path(self):
+        return dbus.ObjectPath(self.path)
+
+    def add_descriptor(self, descriptor):
+        self.descriptors.append(descriptor)
+
+    def get_descriptors(self):
+        return self.descriptors
+
+    @dbus.service.method(DBUS_PROP_IFACE, in_signature='s',
+                         out_signature='a{sv}')
+    def GetAll(self, interface):
+        if interface != GATT_CHAR_IFACE:
+            raise InvalidArgsException()
+        return self.get_properties()[GATT_CHAR_IFACE]
+
+    @dbus.service.signal(DBUS_PROP_IFACE, signature='sa{sv}as')
+    def PropertiesChanged(self, interface, changed, invalidated):
+        pass
+
+
+class TemperatureService(Service):
+    """Environmental Sensing Service — sıcaklık ölçümü."""
+
+    def __init__(self, bus, index):
+        Service.__init__(self, bus, index, ENV_SERVICE_UUID, True)
+        self.add_characteristic(TemperatureCharacteristic(bus, 0, self))
+
+
+class TemperatureCharacteristic(Characteristic):
+    """Sıcaklık karakteristiği — READ + NOTIFY."""
+
+    def __init__(self, bus, index, service):
+        Characteristic.__init__(
+            self, bus, index, TEMP_MEAS_UUID,
+            ['read', 'notify'], service)
+        self.notifying = False
+        self.add_descriptor(CCCDescriptor(bus, 0, self))
+
+    def get_temperature(self):
+        """Gerçek sistemde DS18B20 veya BME280'den oku."""
+        temp_c = 23.5 + random.uniform(-0.5, 0.5)  <span class="cmt"># Simüle</span>
+        <span class="cmt"># GATT Temperature 2A6E: int16, 0.01 °C çözünürlük</span>
+        raw = int(temp_c * 100)
+        return struct.pack('&lt;h', raw)  <span class="cmt"># little-endian signed 16-bit</span>
+
+    @dbus.service.method(GATT_CHAR_IFACE, in_signature='a{sv}',
+                         out_signature='ay')
+    def ReadValue(self, options):
+        data = self.get_temperature()
+        print(f"Sıcaklık okuma: {struct.unpack('&lt;h', data)[0] / 100:.2f} °C")
+        return dbus.Array(data, signature='y')
+
+    @dbus.service.method(GATT_CHAR_IFACE, in_signature='', out_signature='')
+    def StartNotify(self):
+        if self.notifying:
+            return
+        print("Notify başladı.")
+        self.notifying = True
+        GLib.timeout_add(2000, self._send_notification)  <span class="cmt"># 2 saniyede bir</span>
+
+    @dbus.service.method(GATT_CHAR_IFACE, in_signature='', out_signature='')
+    def StopNotify(self):
+        print("Notify durdu.")
+        self.notifying = False
+
+    def _send_notification(self):
+        if not self.notifying:
+            return False
+        data = self.get_temperature()
+        self.PropertiesChanged(
+            GATT_CHAR_IFACE,
+            {'Value': dbus.Array(data, signature='y')},
+            [])
+        return True  <span class="cmt"># GLib timeout devam etsin</span>
+
+
+class CCCDescriptor(dbus.service.Object):
+    """Client Characteristic Configuration Descriptor (CCCD) — 0x2902."""
+
+    def __init__(self, bus, index, characteristic):
+        self.path = characteristic.path + '/desc' + str(index)
+        self.bus = bus
+        self.characteristic = characteristic
+        dbus.service.Object.__init__(self, bus, self.path)
+
+    def get_properties(self):
+        return {
+            GATT_DESC_IFACE: {
+                'Characteristic': self.characteristic.get_path(),
+                'UUID': CCCD_UUID,
+                'Flags': ['read', 'write'],
+            }
+        }
+
+    def get_path(self):
+        return dbus.ObjectPath(self.path)
+
+    @dbus.service.method(GATT_DESC_IFACE, in_signature='a{sv}',
+                         out_signature='ay')
+    def ReadValue(self, options):
+        notify = self.characteristic.notifying
+        return dbus.Array([0x01 if notify else 0x00, 0x00], signature='y')
+
+    @dbus.service.method(GATT_DESC_IFACE, in_signature='aya{sv}',
+                         out_signature='')
+    def WriteValue(self, value, options):
+        if value[0]:
+            self.characteristic.StartNotify()
+        else:
+            self.characteristic.StopNotify()
+
+    @dbus.service.method(DBUS_PROP_IFACE, in_signature='s',
+                         out_signature='a{sv}')
+    def GetAll(self, interface):
+        return self.get_properties()[GATT_DESC_IFACE]
+
+
+def main():
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+
+    <span class="cmt"># Adapter al</span>
+    adapter_obj = bus.get_object(BLUEZ_SERVICE, '/org/bluez/hci0')
+    gatt_manager = dbus.Interface(adapter_obj, GATT_MANAGER_IFACE)
+
+    app = Application(bus)
+
+    mainloop = GLib.MainLoop()
+
+    def register_ok():
+        print("GATT uygulaması kaydedildi. BLE yayını başladı.")
+
+    def register_err(error):
+        print(f"GATT kaydı hatası: {error}")
+        mainloop.quit()
+
+    gatt_manager.RegisterApplication(
+        app.get_path(), {},
+        reply_handler=register_ok,
+        error_handler=register_err)
+
+    print("Bağlantı bekleniyor... (Ctrl+C ile durdur)")
+    try:
+        mainloop.run()
+    except KeyboardInterrupt:
+        gatt_manager.UnregisterApplication(app.get_path())
+        print("Durduruldu.")
+
+
+if __name__ == '__main__':
+    main()</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> UUID tanımlama — SIG vs özel 128-bit</h2>
+  <p class="section-lead">BLE UUID'leri iki türdür: Bluetooth SIG tarafından atanmış 16-bit UUID'ler ve üreticinin tanımladığı 128-bit özel UUID'ler.</p>
+
+  <h3>SIG UUID'leri (16-bit)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>SIG UUID örnekleri</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 16-bit kısa form</span>
+0x180A   Device Information Service
+0x180F   Battery Service
+0x1809   Health Thermometer Service
+0x181A   Environmental Sensing Service
+
+0x2A29   Manufacturer Name String
+0x2A24   Model Number String
+0x2A19   Battery Level
+0x2A6E   Temperature (0.01 °C çözünürlük, int16)
+0x2A6F   Humidity (0.01 % çözünürlük, uint16)
+0x2A75   Pollen Concentration
+
+<span class="cmt"># 128-bit tam form (Base UUID ile)</span>
+<span class="cmt"># 0x0000XXXX-0000-1000-8000-00805F9B34FB</span>
+<span class="cmt"># Örnek: 0x180F →</span>
+0000180F-0000-1000-8000-00805F9B34FB</code></pre>
+  </div>
+
+  <h3>Özel 128-bit UUID tanımlama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — UUID üretimi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Rastgele UUID üret</span>
+<span class="cmd">uuidgen</span>
+<span class="cmt"># 12345678-1234-5678-1234-567812345678</span>
+
+<span class="cmt"># Python ile</span>
+python3 -c "import uuid; print(uuid.uuid4())"
+<span class="cmt"># a1b2c3d4-e5f6-7890-abcd-ef1234567890</span></code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>python — özel UUID'lerle servis</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Özel bir IoT cihazı için UUID hiyerarşisi tanımla</span>
+
+<span class="cmt"># Ana servis UUID (vendor-specific)</span>
+CUSTOM_SERVICE_UUID  = 'a1b2c3d4-0001-0000-0000-000000000001'
+
+<span class="cmt"># Karakteristikler</span>
+SENSOR_READ_UUID     = 'a1b2c3d4-0001-0000-0000-000000000002'  <span class="cmt"># Oku</span>
+CONFIG_WRITE_UUID    = 'a1b2c3d4-0001-0000-0000-000000000003'  <span class="cmt"># Yaz</span>
+STATUS_NOTIFY_UUID   = 'a1b2c3d4-0001-0000-0000-000000000004'  <span class="cmt"># Bildirim</span>
+
+<span class="cmt"># UUID naming convention önerisi:</span>
+<span class="cmt">#   [vendor_prefix]-[service_id]-[version]-[reserved]-[char_index]</span>
+<span class="cmt"># Bu şekilde çakışma olmadan genişletilebilir.</span></code></pre>
+  </div>
+
+  <h3>UUID'yi Wireshark'ta filtrele</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>wireshark filter</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Bluetooth capture için</span>
+<span class="cmt"># sudo btmon -w /tmp/bt.log</span>
+<span class="cmt"># Wireshark'ta aç: btsnoop formatı</span>
+
+<span class="cmt"># Filtreler:</span>
+btatt.uuid16 == 0x2a6e           <span class="cmt"># Sıcaklık karakteristiği</span>
+btatt.opcode == 0x12             <span class="cmt"># Handle Value Notification</span>
+btle.advertising_header.pdu_type == 0  <span class="cmt"># ADV_IND paketleri</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Characteristic properties — READ, WRITE, NOTIFY</h2>
+  <p class="section-lead">Her karakteristiğin hangi işlemlere izin verdiğini belirleyen özellikler (flags/properties).</p>
+
+  <div class="params">
+    <div class="param"><div class="name">read</div><div class="desc">Client karakteristik değerini okuyabilir (ATT Read Request).</div></div>
+    <div class="param"><div class="name">write</div><div class="desc">Client değer yazabilir (ATT Write Request, yanıt beklenir).</div></div>
+    <div class="param"><div class="name">write-without-response</div><div class="desc">Client değer yazabilir, yanıt gelmez (ATT Write Command, hızlı ama güvenilmez).</div></div>
+    <div class="param"><div class="name">notify</div><div class="desc">Server, CCCD etkinleştirilince client'a değer değişikliğini bildirir. Onay gerekmez.</div></div>
+    <div class="param"><div class="name">indicate</div><div class="desc">notify gibi ama ATT onayı (ACK) gerekir. Kritik veriler için.</div></div>
+    <div class="param"><div class="name">broadcast</div><div class="desc">Değeri advertisement paketine ekle (bağlantısız yayın için).</div></div>
+    <div class="param"><div class="name">extended-properties</div><div class="desc">Ek özellikler için ExtendedProperties descriptor gerektirir.</div></div>
+    <div class="param"><div class="name">encrypt-read</div><div class="desc">Okuma için şifrelenmiş bağlantı gerekir (eşleştirme zorunlu).</div></div>
+    <div class="param"><div class="name">encrypt-write</div><div class="desc">Yazma için şifrelenmiş bağlantı gerekir.</div></div>
+    <div class="param"><div class="name">secure-read / secure-write</div><div class="desc">Kimlik doğrulamalı şifreleme (LESC / Secure Connections).</div></div>
+  </div>
+
+  <h3>Örnek flag kombinasyonları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>python — farklı flag kombinasyonları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Salt okunur sensör verisi</span>
+flags = ['read']
+
+<span class="cmt"># Yazılabilir konfigürasyon (ör: örnekleme aralığı)</span>
+flags = ['read', 'write']
+
+<span class="cmt"># Hızlı akış verisi (titreşim, mikrofon)</span>
+flags = ['read', 'notify']
+
+<span class="cmt"># Kritik komut (aktüatör kontrolü)</span>
+flags = ['write', 'indicate']
+
+<span class="cmt"># Güvenli yönetim kanalı</span>
+flags = ['encrypt-read', 'encrypt-write']
+
+<span class="cmt"># Üretim kalibrasyonu (fabrika erişimi)</span>
+flags = ['secure-read', 'secure-write']</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Notify/Indicate mekanizması ve MTU</h2>
+  <p class="section-lead">Notify, sensör verilerini sürekli polling'e gerek kalmadan push etmenin temel yoludur.</p>
+
+  <h3>Notify akışı</h3>
+
+  <div class="flow">
+    <pre>
+  Client                          Server (sensör)
+    │                                 │
+    │── ATT Write (CCCD = 01 00) ────►│  notify etkinleştir
+    │                                 │
+    │◄── ATT Handle Value Notif. ─────│  sunucu veri gönderir (her 2s)
+    │◄── ATT Handle Value Notif. ─────│
+    │◄── ATT Handle Value Notif. ─────│
+    │                                 │
+    │── ATT Write (CCCD = 00 00) ────►│  notify durdur
+    </pre>
+  </div>
+
+  <h3>Indicate vs Notify</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>python — notify ve indicate farkı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># NOTIFY: tek yönlü, onaysız (hızlı, düşük overhead)</span>
+<span class="cmt"># ATT Opcode: 0x1B (Handle Value Notification)</span>
+self.PropertiesChanged(
+    GATT_CHAR_IFACE,
+    {'Value': dbus.Array(data, signature='y')},
+    [])
+
+<span class="cmt"># INDICATE: onaylı (güvenilir, yüksek overhead)</span>
+<span class="cmt"># ATT Opcode: 0x1D (Handle Value Indication) → client 0x1E (Confirmation) gönderir</span>
+<span class="cmt"># BlueZ D-Bus'ta indicate için flag 'indicate' kullanılır, aynı PropertiesChanged ile tetiklenir</span>
+<span class="cmt"># Konfirmasyon alınana kadar yeni indication gönderilemez</span></code></pre>
+  </div>
+
+  <h3>MTU (Maximum Transmission Unit)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>python — MTU negotiation</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># BLE varsayılan MTU: 23 bayt (3 bayt ATT header = 20 bayt payload)</span>
+<span class="cmt"># Modern cihazlar 256-517 bayt MTU destekler (BLE 4.2+ Data Length Extension)</span>
+
+<span class="cmt"># ReadValue() options içinde negotiated MTU gelir</span>
+@dbus.service.method(GATT_CHAR_IFACE, in_signature='a{sv}', out_signature='ay')
+def ReadValue(self, options):
+    mtu = options.get('mtu', 23)
+    print(f"MTU: {mtu}")
+    <span class="cmt"># Büyük veri için MTU'ya göre parçala (BLE stack otomatik yapar)</span>
+    data = self.get_large_data()
+    return dbus.Array(data[:mtu-3], signature='y')
+
+<span class="cmt"># WriteValue() ile alınan offset (Long Write için)</span>
+@dbus.service.method(GATT_CHAR_IFACE, in_signature='aya{sv}', out_signature='')
+def WriteValue(self, value, options):
+    offset = options.get('offset', 0)
+    data = bytes(value)
+    print(f"Yazılan: offset={offset}, {len(data)} bayt")</code></pre>
+  </div>
+
+  <h3>Notify veri hızı optimizasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>python — hızlı veri akışı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Connection interval, notify throughput'u sınırlar
+# Default: 7.5ms - 4000ms (tipik: 50ms)
+# Yüksek throughput için: iw/hciconfig ile bağlantı param ayarla</span>
+
+<span class="cmt"># BlueZ ile connection parameters (sadece central role'da)</span>
+from pydbus import SystemBus
+
+bus = SystemBus()
+device = bus.get('org.bluez', '/org/bluez/hci0/dev_AA_BB_CC_DD_EE_01')
+<span class="cmt"># Peripheral olarak biz notify ediyoruz, central bağlantı parametrelerini kontrol eder</span>
+<span class="cmt"># GLib timeout aralığını bağlantı interval'a yakın seç</span>
+
+<span class="cmt"># 10ms interval → ~100 notify/saniye teorik maksimum</span>
+GLib.timeout_add(10, send_sensor_data)</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> C ile GATT client — libbluetooth</h2>
+  <p class="section-lead">Düşük seviye C kodu ile BLE cihaza bağlanma ve GATT karakteristiği okuma. libbluetooth (bluez-dev paketi) gerektirir.</p>
+
+  <div class="callout warn">
+    <div class="label">NOT</div>
+    <p>libbluetooth, BlueZ'in alt seviye C kütüphanesidir. Doğrudan HCI soketi açar. Yeni projeler için D-Bus API önerilir — ancak libbluetooth minimal ortamlarda (daemon olmadan) kullanışlıdır.</p>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — libbluetooth kurulum</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">apt-get</span> install libbluetooth-dev
+<span class="cmd">gcc</span> gatt_client.c -o gatt_client -lbluetooth</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — gatt_client.c (L2CAP / ATT ile)</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;string.h&gt;
+#include &lt;bluetooth/bluetooth.h&gt;
+#include &lt;bluetooth/hci.h&gt;
+#include &lt;bluetooth/hci_lib.h&gt;
+#include &lt;bluetooth/l2cap.h&gt;
+
+/* ATT opcodes */
+#define ATT_OP_READ_REQ  0x0A
+#define ATT_OP_READ_RSP  0x0B
+#define ATT_OP_WRITE_CMD 0x52
+
+/* Sıcaklık karakteristiği handle (önceden bilinmeli) */
+#define TEMP_CHAR_HANDLE 0x0003
+
+int att_connect(const char *addr) {
+    int sock;
+    struct sockaddr_l2 sa;
+
+    sock = socket(PF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_L2CAP);
+    if (sock &lt; 0) {
+        perror("socket");
+        return -1;
+    }
+
+    memset(&amp;sa, 0, sizeof(sa));
+    sa.l2_family = AF_BLUETOOTH;
+    sa.l2_psm = 0;        /* ATT için PSM = 0 */
+    sa.l2_cid = htobs(4); /* ATT CID = 4 */
+    sa.l2_bdaddr_type = BDADDR_LE_PUBLIC;
+    str2ba(addr, &amp;sa.l2_bdaddr);
+
+    if (connect(sock, (struct sockaddr *)&amp;sa, sizeof(sa)) &lt; 0) {
+        perror("connect");
+        close(sock);
+        return -1;
+    }
+    return sock;
+}
+
+int att_read(int sock, uint16_t handle, uint8_t *out, int maxlen) {
+    uint8_t req[3];
+    uint8_t rsp[256];
+    ssize_t len;
+
+    /* ATT Read Request */
+    req[0] = ATT_OP_READ_REQ;
+    req[1] = handle &amp; 0xFF;
+    req[2] = (handle &gt;&gt; 8) &amp; 0xFF;
+
+    if (write(sock, req, sizeof(req)) &lt; 0) return -1;
+
+    len = read(sock, rsp, sizeof(rsp));
+    if (len &lt; 1) return -1;
+
+    if (rsp[0] != ATT_OP_READ_RSP) {
+        fprintf(stderr, "Beklenmedik opcode: 0x%02x\n", rsp[0]);
+        return -1;
+    }
+
+    int data_len = len - 1;
+    if (data_len &gt; maxlen) data_len = maxlen;
+    memcpy(out, rsp + 1, data_len);
+    return data_len;
+}
+
+int main(void) {
+    const char *addr = "AA:BB:CC:DD:EE:01";
+    int sock;
+    uint8_t data[32];
+    int len;
+
+    printf("BLE cihazına bağlanılıyor: %s\n", addr);
+    sock = att_connect(addr);
+    if (sock &lt; 0) {
+        fprintf(stderr, "Bağlantı başarısız\n");
+        return 1;
+    }
+    printf("Bağlandı.\n");
+
+    /* Sıcaklık oku */
+    len = att_read(sock, TEMP_CHAR_HANDLE, data, sizeof(data));
+    if (len == 2) {
+        int16_t raw;
+        memcpy(&amp;raw, data, 2);
+        printf("Sıcaklık: %.2f °C\n", raw / 100.0);
+    } else {
+        printf("Okunan veri: %d bayt\n", len);
+    }
+
+    close(sock);
+    return 0;
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Embedded — BlueZ Yocto entegrasyonu ve minimal BLE advertiser</h2>
+  <p class="section-lead">Yocto ile özel imaj oluşturma ve D-Bus/Python'a gerek duymayan minimal BLE advertiser scripti.</p>
+
+  <h3>Yocto'ya BlueZ ekleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Yocto — local.conf / image recipe</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># local.conf veya image recipe'ye ekle</span>
+IMAGE_INSTALL:append = " \
+    bluez5 \
+    bluez5-testtools \
+    python3-pydbus \
+    python3-pygobject \
+    kernel-module-bluetooth \
+    kernel-module-hci-uart \
+    kernel-module-btbcm \
+    kernel-module-rfkill \
+"
+
+<span class="cmt"># BlueZ kernel fragmenti</span>
+<span class="cmt"># meta-custom/recipes-kernel/linux/linux-%.bbappend:</span>
+SRC_URI += "file://bluetooth.cfg"
+
+<span class="cmt"># bluetooth.cfg içeriği:</span>
+<span class="cmt"># CONFIG_BT=y</span>
+<span class="cmt"># CONFIG_BT_LE=y</span>
+<span class="cmt"># CONFIG_BT_RFCOMM=y</span>
+<span class="cmt"># CONFIG_BT_HCIUART=y</span>
+<span class="cmt"># CONFIG_BT_HCIUART_BCM=y  (Raspberry Pi için)</span></code></pre>
+  </div>
+
+  <h3>Minimal BLE Advertiser scripti (btmgmt ile)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — btmgmt ile BLE advertising</span><span class="dot">●</span></div>
+    <pre><code>#!/bin/sh
+# minimal_ble_advertiser.sh
+# Python/D-Bus gerektirmez — btmgmt komut satırı aracı
+
+<span class="cmt"># Adaptörü aç</span>
+<span class="cmd">btmgmt</span> power on
+
+<span class="cmt"># LE advertising etkinleştir</span>
+<span class="cmd">btmgmt</span> le on
+
+<span class="cmt"># Connectable advertising</span>
+<span class="cmd">btmgmt</span> connectable on
+
+<span class="cmt"># Advertising veri ayarla (Local Name: "IoT_Sensor")</span>
+<span class="cmd">btmgmt</span> add-adv \
+    --adv-data 02010602094954535f53656e736f72 \
+    1
+
+<span class="cmt"># 02 01 06     → Flags: LE General Discoverable, BR/EDR Not Supported</span>
+<span class="cmt"># 02 09 ...   → Complete Local Name: bytes of "IoT_Sensor"</span>
+
+echo "BLE advertising başladı."
+echo "hcidump -i hci0 -X ile izleyebilirsin"</code></pre>
+  </div>
+
+  <h3>hcitool / hciconfig ile çok düşük seviye advertiser</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — HCI komutları ile doğrudan advertising</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># HCI komutları ile BLE advertising (bluetoothd gerekmez!)</span>
+
+<span class="cmt"># LE set advertising parameters</span>
+<span class="cmd">hcitool</span> -i hci0 cmd 0x08 0x0006 \
+    A0 00 A0 00 00 00 00 00 00 00 00 00 00 07 00
+
+<span class="cmt"># LE set advertising data (max 31 bayt)</span>
+<span class="cmt"># Payload: 0x02 0x01 0x06 (Flags) + 0x0A 0x09 "IoTSensor"</span>
+<span class="cmd">hcitool</span> -i hci0 cmd 0x08 0x0008 \
+    0F 02 01 06 0A 09 49 6F 54 53 65 6E 73 6F 72 \
+    00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+<span class="cmt"># LE set advertise enable</span>
+<span class="cmd">hcitool</span> -i hci0 cmd 0x08 0x000A 01
+
+echo "BLE advertiser aktif (bluetoothd olmadan)"</code></pre>
+  </div>
+
+  <h3>Buildroot konfigürasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Buildroot .config</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># BlueZ 5 userspace</span>
+BR2_PACKAGE_BLUEZ5_UTILS=y
+BR2_PACKAGE_BLUEZ5_UTILS_CLIENT=y     <span class="cmt"># bluetoothctl</span>
+BR2_PACKAGE_BLUEZ5_UTILS_MONITOR=y    <span class="cmt"># btmon</span>
+BR2_PACKAGE_BLUEZ5_DAEMON=y           <span class="cmt"># bluetoothd</span>
+
+<span class="cmt"># Python GATT için</span>
+BR2_PACKAGE_PYTHON3=y
+BR2_PACKAGE_PYTHON_DBUS=y
+BR2_PACKAGE_PYTHON_PYGOBJECT=y
+
+<span class="cmt"># D-Bus gerekli</span>
+BR2_PACKAGE_DBUS=y
+
+<span class="cmt"># Kernel: BT_HCIUART sürücüsü (UART Bluetooth için)</span>
+<span class="cmt"># Linux kernel .config'e ekle:</span>
+<span class="cmt"># CONFIG_BT_HCIUART=y</span>
+<span class="cmt"># CONFIG_BT_HCIUART_BCM=y  (Broadcom/RPi)</span>
+<span class="cmt"># CONFIG_BT_HCIUART_LL=y   (Texas Instruments)</span></code></pre>
+  </div>
+
+  <div class="callout info">
+    <div class="label">GELİŞTİRME TAVSİYESİ</div>
+    <p>GATT servisi geliştirirken ilk aşamada Raspberry Pi 4 üzerinde test et. Android'de "nRF Connect" uygulaması, iOS'ta "LightBlue" uygulaması ile karakteristikleri anlık izleyebilirsin. Stable olduktan sonra hedef gömülü platforma geç. btmon çıktısı ve Wireshark btsnoop formatı invaluable debug araçlarıdır.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

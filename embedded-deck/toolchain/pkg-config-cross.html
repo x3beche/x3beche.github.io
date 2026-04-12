@@ -1,0 +1,517 @@
+---
+layout: tutorial
+title: "pkg-config Cross Ortamda — Cross-Compilation"
+back_url: "../index.html"
+back_label: "Cross-Compilation & Toolchain"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>CROSS-COMPILATION</span>
+    <span>PKG-CONFIG</span>
+    <span>2026</span>
+  </div>
+  <h1>pkg-config —<br><em>cross ortamda kütüphane bulma.</em></h1>
+  <p class="subtitle">PKG_CONFIG_LIBDIR ile native path sızmasını önle. Wrapper script yaz. libssl, libcurl ve zlib'i cross sysroot'tan otomatik bul.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">pkg-config nedir — .pc dosyası anatomisi</a></li>
+    <li><a href="#s1">PKG_CONFIG_PATH vs PKG_CONFIG_LIBDIR farkı</a></li>
+    <li><a href="#s2">PKG_CONFIG_SYSROOT_DIR — path ön eki</a></li>
+    <li><a href="#s3">pkg-config --cross-compile modu</a></li>
+    <li><a href="#s4">Wrapper script — arm-linux-gnueabihf-pkg-config</a></li>
+    <li><a href="#s5">Ortak sorunlar — native path sızması</a></li>
+    <li><a href="#s6">CMake FIND_PACKAGE ile pkg-config entegrasyonu</a></li>
+    <li><a href="#s7">Pratik: libssl ve libcurl cross .pc dosyası</a></li>
+    <li><a href="#s8">Static linking — --static bayrağı</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> pkg-config nedir — .pc dosyası anatomisi</h2>
+  <p class="section-lead">pkg-config, bir kütüphanenin derleme bayraklarını (include path, link flags) standart bir dosya formatından okur. Build sistemleri doğrudan kütüphane yolunu sabitlemek yerine pkg-config sorgular.</p>
+
+  <h3>Örnek .pc dosyası</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>/usr/lib/pkgconfig/openssl.pc</span><span class="dot">●</span></div>
+    <pre><code>prefix=/usr
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib/arm-linux-gnueabihf
+includedir=${prefix}/include
+
+Name: OpenSSL
+Description: Secure Sockets Layer and cryptography libraries and tools
+Version: 3.0.2
+Requires: libssl libcrypto
+Libs: -L${libdir} -lssl -lcrypto
+Libs.private: -ldl -lpthread
+Cflags: -I${includedir}</code></pre>
+  </div>
+
+  <h3>pkg-config sorgulama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># derleme bayrakları (CFLAGS için)</span>
+pkg-config --cflags openssl
+<span class="cmt"># -I/usr/include</span>
+
+<span class="cmt"># link bayrakları (LDFLAGS için)</span>
+pkg-config --libs openssl
+<span class="cmt"># -lssl -lcrypto</span>
+
+<span class="cmt"># her ikisi birden</span>
+pkg-config --cflags --libs openssl
+<span class="cmt"># -I/usr/include -lssl -lcrypto</span>
+
+<span class="cmt"># sürüm kontrolü</span>
+pkg-config --modversion openssl
+<span class="cmt"># 3.0.2</span>
+
+<span class="cmt"># minimum sürüm kontrolü</span>
+pkg-config --atleast-version=1.1.0 openssl &amp;&amp; echo "OK"
+
+<span class="cmt"># gcc ile doğrudan kullanım</span>
+gcc $(pkg-config --cflags --libs openssl) -o app main.c</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">.pc DOSYASI KONUMU</div>
+    <p>.pc dosyaları genellikle <code class="inline">/usr/lib/pkgconfig/</code>, <code class="inline">/usr/share/pkgconfig/</code> veya <code class="inline">/usr/lib/&lt;arch&gt;/pkgconfig/</code> altında bulunur. Cross ortamda bunların sysroot altındaki karşılıkları okunmalıdır.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> PKG_CONFIG_PATH vs PKG_CONFIG_LIBDIR farkı</h2>
+  <p class="section-lead">Bu iki değişken benzer görünse de cross-compile açısından kritik bir farkları vardır. Yanlış kullanım native kütüphanelerin cross binary'ye karışmasına yol açar.</p>
+
+  <div class="params">
+    <div class="param">
+      <div class="name">PKG_CONFIG_PATH</div>
+      <div class="desc">Varsayılan arama dizinlerine <strong>eklenen</strong> yollar. Yani varsayılan dizinler (<code class="inline">/usr/lib/pkgconfig</code> vb.) hâlâ aranır. Cross ortamda tehlikelidir — host sistemin .pc dosyaları sızmaya devam eder.</div>
+    </div>
+    <div class="param">
+      <div class="name">PKG_CONFIG_LIBDIR</div>
+      <div class="desc">Varsayılan arama dizinlerini <strong>tamamen değiştirir</strong>. Sadece bu dizinler aranır. Cross-compile'da kullanılması gereken değişken budur — host .pc dosyaları devre dışı kalır.</div>
+    </div>
+  </div>
+
+  <h3>Karşılaştırma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code>SYSROOT="${HOME}/x-tools/arm-unknown-linux-gnueabihf/arm-unknown-linux-gnueabihf/sysroot"
+
+<span class="cmt"># YANLIŞ: PKG_CONFIG_PATH host dizinlerini hâlâ arar</span>
+export PKG_CONFIG_PATH="${SYSROOT}/usr/lib/pkgconfig"
+pkg-config --libs openssl
+<span class="cmt"># -lssl -lcrypto  ← hangi openssl? host mu, target mı?</span>
+<span class="cmt"># tehlike: /usr/lib/pkgconfig/openssl.pc de bulunur</span>
+
+<span class="cmt"># DOĞRU: PKG_CONFIG_LIBDIR yalnızca hedef sysroot'u arar</span>
+export PKG_CONFIG_LIBDIR="${SYSROOT}/usr/lib/pkgconfig:${SYSROOT}/usr/share/pkgconfig"
+export PKG_CONFIG_PATH=""   <span class="cmt"># PATH'i boşalt</span>
+pkg-config --libs openssl
+<span class="cmt"># -lssl -lcrypto  ← kesinlikle sysroot'taki openssl</span>
+
+<span class="cmt"># mevcut .pc dosyalarını kontrol et</span>
+ls ${SYSROOT}/usr/lib/pkgconfig/</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> PKG_CONFIG_SYSROOT_DIR — path ön eki</h2>
+  <p class="section-lead">.pc dosyasındaki <code class="inline">prefix=/usr</code> satırı mutlak yol içerir. Cross ortamda bu yolun başına sysroot eklenmesi gerekir — aksi hâlde linker host sistemini arar.</p>
+
+  <h3>Sorun ve çözüm</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code>SYSROOT="${HOME}/x-tools/arm-unknown-linux-gnueabihf/arm-unknown-linux-gnueabihf/sysroot"
+
+<span class="cmt"># PKG_CONFIG_SYSROOT_DIR olmadan</span>
+export PKG_CONFIG_LIBDIR="${SYSROOT}/usr/lib/pkgconfig"
+pkg-config --libs zlib
+<span class="cmt"># -L/usr/lib -lz  ← YANLIŞ: /usr/lib host sistemi</span>
+
+<span class="cmt"># PKG_CONFIG_SYSROOT_DIR ile</span>
+export PKG_CONFIG_SYSROOT_DIR="${SYSROOT}"
+export PKG_CONFIG_LIBDIR="${SYSROOT}/usr/lib/pkgconfig:${SYSROOT}/usr/share/pkgconfig"
+export PKG_CONFIG_PATH=""
+pkg-config --libs zlib
+<span class="cmt"># -L${SYSROOT}/usr/lib -lz  ← DOĞRU: sysroot altındaki lib</span></code></pre>
+  </div>
+
+  <h3>Mekanizma açıklaması</h3>
+
+  <div class="flow">
+    <pre>
+  .pc dosyasında:  prefix=/usr
+                   Libs: -L${prefix}/lib -lz
+
+  PKG_CONFIG_SYSROOT_DIR=/home/user/.../sysroot
+
+  pkg-config çıktısı:
+    -L/home/user/.../sysroot/usr/lib -lz
+          ↑
+    SYSROOT_DIR + /usr/lib
+    </pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> pkg-config --cross-compile modu</h2>
+  <p class="section-lead"><code class="inline">--cross-compile</code> bayrağı pkg-config'e cross ortamda olduğunu bildirir. Bu bayrak bazı güvenlik kontrollerini devre dışı bırakır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code>SYSROOT="${HOME}/x-tools/arm-unknown-linux-gnueabihf/arm-unknown-linux-gnueabihf/sysroot"
+
+export PKG_CONFIG_SYSROOT_DIR="${SYSROOT}"
+export PKG_CONFIG_LIBDIR="${SYSROOT}/usr/lib/pkgconfig"
+export PKG_CONFIG_PATH=""
+
+<span class="cmt"># cross-compile bayrağı ile sorgula</span>
+pkg-config --cross-compile --cflags --libs openssl
+
+<span class="cmt"># Makefile'da kullanım</span>
+CFLAGS += $(shell PKG_CONFIG_SYSROOT_DIR=${SYSROOT} \
+              PKG_CONFIG_LIBDIR=${SYSROOT}/usr/lib/pkgconfig \
+              PKG_CONFIG_PATH= \
+              pkg-config --cross-compile --cflags openssl)
+
+LDFLAGS += $(shell PKG_CONFIG_SYSROOT_DIR=${SYSROOT} \
+               PKG_CONFIG_LIBDIR=${SYSROOT}/usr/lib/pkgconfig \
+               PKG_CONFIG_PATH= \
+               pkg-config --cross-compile --libs openssl)</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p><code class="inline">--cross-compile</code>, pkg-config'in <code class="inline">Libs.private</code> alanındaki <code class="inline">-I</code> ve <code class="inline">-L</code> path'lerindeki doğruluğu kontrol etmesini atlar. Cross ortamda bu kontrolün false positive vermesi engellenir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Wrapper script — arm-linux-gnueabihf-pkg-config</h2>
+  <p class="section-lead">Her sorguda ortam değişkenlerini elle yazmak yerine, cross toolchain için özel bir pkg-config wrapper scripti oluşturmak en temiz çözümdür. Birçok build sistemi <code class="inline">PKG_CONFIG</code> değişkeni ile bu scripti kullanır.</p>
+
+  <h3>Wrapper scripti</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>~/bin/arm-linux-gnueabihf-pkg-config</span><span class="dot">●</span></div>
+    <pre><code>#!/bin/bash
+# pkg-config wrapper — ARM Cortex-A53 cross ortamı
+# Kullanım: PKG_CONFIG=arm-linux-gnueabihf-pkg-config cmake ...
+
+SYSROOT="${HOME}/x-tools/arm-unknown-linux-gnueabihf/arm-unknown-linux-gnueabihf/sysroot"
+
+export PKG_CONFIG_SYSROOT_DIR="${SYSROOT}"
+export PKG_CONFIG_LIBDIR="${SYSROOT}/usr/lib/pkgconfig:${SYSROOT}/usr/share/pkgconfig"
+export PKG_CONFIG_PATH=""
+
+exec pkg-config "$@"</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># çalıştırma izni ver ve PATH'e ekle</span>
+chmod +x ~/bin/arm-linux-gnueabihf-pkg-config
+export PATH="${HOME}/bin:${PATH}"
+
+<span class="cmt"># test</span>
+arm-linux-gnueabihf-pkg-config --libs openssl
+<span class="cmt"># -L/home/.../sysroot/usr/lib -lssl -lcrypto</span>
+
+<span class="cmt"># build sistemlerine bildir</span>
+export PKG_CONFIG=arm-linux-gnueabihf-pkg-config
+
+<span class="cmt"># configure script ile kullanım</span>
+PKG_CONFIG=arm-linux-gnueabihf-pkg-config \
+    ./configure --host=arm-unknown-linux-gnueabihf
+
+<span class="cmt"># CMake ile kullanım</span>
+cmake -DCMAKE_TOOLCHAIN_FILE=toolchain.cmake \
+      -DPKG_CONFIG_EXECUTABLE=$(which arm-linux-gnueabihf-pkg-config) \
+      ..</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Ortak sorunlar — native path sızması</h2>
+  <p class="section-lead">Cross-compile sırasında en sık karşılaşılan sorun, host sistemin kütüphanelerinin hedef binary'ye karışmasıdır. Bu genellikle linker hatası veya çalışma zamanı hatası olarak ortaya çıkar.</p>
+
+  <h3>Teşhis yöntemleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># binary'nin bağlı olduğu kütüphaneleri kontrol et</span>
+arm-linux-gnueabihf-readelf -d ./app | grep NEEDED
+<span class="cmt"># 0x00000001 (NEEDED) Shared library: [libssl.so.3]</span>
+<span class="cmt"># 0x00000001 (NEEDED) Shared library: [libc.so.6]</span>
+
+<span class="cmt"># dynamic interpreter'ı kontrol et (ARM olmalı)</span>
+arm-linux-gnueabihf-readelf -l ./app | grep interpreter
+<span class="cmt"># [Requesting program interpreter: /lib/ld-linux-armhf.so.3]  ← DOĞRU</span>
+<span class="cmt"># [Requesting program interpreter: /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]  ← YANLIŞ</span>
+
+<span class="cmt"># pkg-config hangi .pc dosyasını okuduğunu göster</span>
+PKG_CONFIG_DEBUG_SPEW=1 pkg-config --libs openssl 2>&amp;1 | grep "File"
+
+<span class="cmt"># mevcut tüm .pc dizinlerini listele</span>
+pkg-config --variable pc_path pkg-config</code></pre>
+  </div>
+
+  <h3>Sızma nedenleri ve çözümleri</h3>
+
+  <div class="params">
+    <div class="param">
+      <div class="name">PKG_CONFIG_PATH içinde host dizini</div>
+      <div class="desc">Çözüm: <code class="inline">export PKG_CONFIG_PATH=""</code> — PATH'i tamamen boşalt.</div>
+    </div>
+    <div class="param">
+      <div class="name">PKG_CONFIG_LIBDIR ayarlanmamış</div>
+      <div class="desc">Varsayılan dizinler (<code class="inline">/usr/lib/pkgconfig</code>) aranmaya devam eder. Çözüm: LIBDIR'i sysroot'a ayarla.</div>
+    </div>
+    <div class="param">
+      <div class="name">PKG_CONFIG_SYSROOT_DIR eksik</div>
+      <div class="desc">.pc dosyasındaki mutlak yollar sysroot ön eki almaz. -L/usr/lib host'u işaret eder.</div>
+    </div>
+    <div class="param">
+      <div class="name">CMake'in kendi pkg-config çağrısı</div>
+      <div class="desc">CMake bazen wrapper scripti yok sayar. <code class="inline">PKG_CONFIG_EXECUTABLE</code> değişkeni ile zorla.</div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> CMake FIND_PACKAGE ile pkg-config entegrasyonu</h2>
+  <p class="section-lead">CMake'in <code class="inline">PkgConfig</code> modülü, pkg-config sorgularını CMake target'larına dönüştürür. Cross ortamda toolchain.cmake ile birlikte kullanılır.</p>
+
+  <h3>CMakeLists.txt — pkg-config kullanımı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>CMakeLists.txt</span><span class="dot">●</span></div>
+    <pre><code>cmake_minimum_required(VERSION 3.20)
+project(myapp C)
+
+# pkg-config modülünü yükle
+find_package(PkgConfig REQUIRED)
+
+# openssl bul
+pkg_check_modules(OPENSSL REQUIRED openssl>=1.1.0)
+
+# curl bul
+pkg_check_modules(CURL REQUIRED libcurl>=7.68.0)
+
+add_executable(myapp main.c)
+
+# include ve link bayrakları otomatik eklenir
+target_include_directories(myapp PRIVATE
+    ${OPENSSL_INCLUDE_DIRS}
+    ${CURL_INCLUDE_DIRS}
+)
+
+target_link_libraries(myapp PRIVATE
+    ${OPENSSL_LIBRARIES}
+    ${CURL_LIBRARIES}
+)
+
+# IMPORTED target kullanımı (daha modern)
+pkg_check_modules(ZLIB REQUIRED IMPORTED_TARGET zlib)
+target_link_libraries(myapp PRIVATE PkgConfig::ZLIB)</code></pre>
+  </div>
+
+  <h3>toolchain.cmake — pkg-config ayarları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>toolchain.cmake</span><span class="dot">●</span></div>
+    <pre><code>set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR arm)
+
+set(CROSS_TRIPLE "arm-unknown-linux-gnueabihf")
+set(TOOLCHAIN_DIR "$ENV{HOME}/x-tools/${CROSS_TRIPLE}")
+set(SYSROOT "${TOOLCHAIN_DIR}/${CROSS_TRIPLE}/sysroot")
+
+set(CMAKE_C_COMPILER   "${TOOLCHAIN_DIR}/bin/${CROSS_TRIPLE}-gcc")
+set(CMAKE_CXX_COMPILER "${TOOLCHAIN_DIR}/bin/${CROSS_TRIPLE}-g++")
+set(CMAKE_SYSROOT "${SYSROOT}")
+
+# pkg-config wrapper
+set(PKG_CONFIG_EXECUTABLE "$ENV{HOME}/bin/arm-linux-gnueabihf-pkg-config"
+    CACHE STRING "pkg-config wrapper for ARM cross-compile" FORCE)
+
+# cmake'e sysroot path'i bildir
+set(ENV{PKG_CONFIG_SYSROOT_DIR} "${SYSROOT}")
+set(ENV{PKG_CONFIG_LIBDIR}
+    "${SYSROOT}/usr/lib/pkgconfig:${SYSROOT}/usr/share/pkgconfig")
+set(ENV{PKG_CONFIG_PATH} "")</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Pratik: libssl ve libcurl için cross .pc dosyası</h2>
+  <p class="section-lead">Sysroot'ta .pc dosyası yoksa ya da yanlışsa, elle oluşturmak gerekebilir. Özellikle hedef rootfs'ten kopyalanan kütüphaneler için bu durum yaygındır.</p>
+
+  <h3>Sysroot'a kütüphane kopyalama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code>SYSROOT="${HOME}/x-tools/arm-unknown-linux-gnueabihf/arm-unknown-linux-gnueabihf/sysroot"
+TARGET_ROOT="/mnt/rpi-rootfs"   <span class="cmt"># mount edilmiş hedef rootfs</span>
+
+<span class="cmt"># OpenSSL kütüphane ve başlıklarını kopyala</span>
+mkdir -p ${SYSROOT}/usr/include/openssl
+mkdir -p ${SYSROOT}/usr/lib/pkgconfig
+
+cp -r ${TARGET_ROOT}/usr/include/openssl/ ${SYSROOT}/usr/include/
+cp ${TARGET_ROOT}/usr/lib/arm-linux-gnueabihf/libssl.so* ${SYSROOT}/usr/lib/
+cp ${TARGET_ROOT}/usr/lib/arm-linux-gnueabihf/libcrypto.so* ${SYSROOT}/usr/lib/
+cp ${TARGET_ROOT}/usr/lib/arm-linux-gnueabihf/pkgconfig/openssl.pc ${SYSROOT}/usr/lib/pkgconfig/</code></pre>
+  </div>
+
+  <h3>Manuel .pc dosyası oluşturma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>${SYSROOT}/usr/lib/pkgconfig/openssl.pc</span><span class="dot">●</span></div>
+    <pre><code>prefix=/usr
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: OpenSSL
+Description: Secure Sockets Layer and cryptography libraries
+Version: 3.0.2
+Requires: libssl libcrypto
+Libs: -L${libdir} -lssl -lcrypto
+Cflags: -I${includedir}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>${SYSROOT}/usr/lib/pkgconfig/libcurl.pc</span><span class="dot">●</span></div>
+    <pre><code>prefix=/usr
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: libcurl
+Description: Library to transfer files with ftp, http, etc.
+Version: 7.81.0
+Libs: -L${libdir} -lcurl
+Libs.private: -lssl -lcrypto -lz -lpthread
+Cflags: -I${includedir}</code></pre>
+  </div>
+
+  <h3>Doğrulama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code>export PKG_CONFIG_SYSROOT_DIR="${SYSROOT}"
+export PKG_CONFIG_LIBDIR="${SYSROOT}/usr/lib/pkgconfig"
+export PKG_CONFIG_PATH=""
+
+pkg-config --modversion openssl
+<span class="cmt"># 3.0.2</span>
+
+pkg-config --cflags --libs openssl
+<span class="cmt"># -I${SYSROOT}/usr/include -L${SYSROOT}/usr/lib -lssl -lcrypto</span>
+
+<span class="cmt"># derleme testi</span>
+arm-unknown-linux-gnueabihf-gcc \
+    $(pkg-config --cflags --libs openssl) \
+    -o ssl_test ssl_test.c</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Static linking — --static bayrağı</h2>
+  <p class="section-lead">Bazı embedded sistemlerde dinamik kütüphaneleri dağıtmak yerine statik link tercih edilir. pkg-config, <code class="inline">--static</code> ile statik linking için bayraklar sağlar.</p>
+
+  <h3>--static bayrağı ile sorgulama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># dinamik linking için bayraklar</span>
+pkg-config --libs openssl
+<span class="cmt"># -lssl -lcrypto</span>
+
+<span class="cmt"># statik linking için bayraklar (Libs.private dahil)</span>
+pkg-config --static --libs openssl
+<span class="cmt"># -lssl -lcrypto -ldl -lpthread</span>
+<span class="cmt"># (statik link için tüm bağımlılıklar listelenir)</span></code></pre>
+  </div>
+
+  <h3>Statik binary derleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code>CROSS=arm-unknown-linux-gnueabihf
+SYSROOT="${HOME}/x-tools/${CROSS}/${CROSS}/sysroot"
+
+export PKG_CONFIG_SYSROOT_DIR="${SYSROOT}"
+export PKG_CONFIG_LIBDIR="${SYSROOT}/usr/lib/pkgconfig"
+export PKG_CONFIG_PATH=""
+
+<span class="cmt"># statik bağlantılı binary</span>
+${CROSS}-gcc \
+    --sysroot=${SYSROOT} \
+    -static \
+    $(pkg-config --static --cflags --libs openssl) \
+    -o app_static main.c
+
+<span class="cmt"># dinamik bağımlılık yok mu kontrol et</span>
+${CROSS}-readelf -d app_static | grep NEEDED
+<span class="cmt"># (boş çıktı — bağımlılık yok)</span>
+
+<span class="cmt"># QEMU'da dinamik linker gerektirmeden çalıştır</span>
+qemu-arm-static app_static</code></pre>
+  </div>
+
+  <h3>Yocto sysroot'unu elle kullanmak</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Yocto SDK sysroot'u genellikle bu konumdadır:</span>
+YOCTO_SDK="/opt/poky/4.0.15/sysroots"
+YOCTO_SYSROOT="${YOCTO_SDK}/cortexa53-poky-linux"
+
+<span class="cmt"># pkg-config'i Yocto sysroot'u ile kullan</span>
+export PKG_CONFIG_SYSROOT_DIR="${YOCTO_SYSROOT}"
+export PKG_CONFIG_LIBDIR="${YOCTO_SYSROOT}/usr/lib/pkgconfig:\
+${YOCTO_SYSROOT}/usr/share/pkgconfig"
+export PKG_CONFIG_PATH=""
+
+<span class="cmt"># Yocto'da çapraz derleyici</span>
+export CC="${YOCTO_SDK}/x86_64-pokysdk-linux/usr/bin/aarch64-poky-linux/aarch64-poky-linux-gcc"
+
+pkg-config --list-all | head -20
+<span class="cmt"># Yocto'nun sysroot'undaki tüm kütüphaneler listelenir</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">YOCTO SDK SETUP</div>
+    <p>Yocto SDK kurulum scripti (<code class="inline">environment-setup-cortexa53-poky-linux</code>) tüm bu değişkenleri otomatik ayarlar. <code class="inline">source</code> komutuyla yükle: <code class="inline">source /opt/poky/4.0.15/environment-setup-cortexa53-poky-linux</code>. Kendi toolchain'in için aynı yaklaşımı uygulayabilirsin.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

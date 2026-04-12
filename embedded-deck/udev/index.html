@@ -1,0 +1,982 @@
+---
+layout: tutorial
+title: "udev — Cihaz Yönetimi ve Hotplug Kuralları"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>UDEV</span>
+    <span>2026</span>
+  </div>
+  <h1>udev<br><em>Cihaz Yönetimi ve Hotplug Kuralları</em></h1>
+  <p class="subtitle">Linux'ta cihaz olaylarını yakala, kalıcı isimler ata, script'ler tetikle — USB seri porttan CAN arayüzüne, özel donanımdan otomatik servise kadar.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">udev nedir: kernel'dan udevd'ye akış</a></li>
+    <li><a href="#s1">udevadm ile cihaz keşfi</a></li>
+    <li><a href="#s2">Kural dosyası anatomisi</a></li>
+    <li><a href="#s3">Kalıcı isimler ve sembolik linkler</a></li>
+    <li><a href="#s4">Script tetikleme ve ortam değişkenleri</a></li>
+    <li><a href="#s5">Seri port ve CAN kuralları</a></li>
+    <li><a href="#s6">Kural debug ve yeniden yükleme</a></li>
+    <li><a href="#s7">udev ve systemd entegrasyonu</a></li>
+    <li><a href="#s8">Pratik: özel USB cihazı ve embedded alternatifler</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> udev nedir: kernel'dan udevd'ye akış</h2>
+  <p class="section-lead">udev, Linux çekirdeğinin ürettiği cihaz olaylarını yakalayan, /dev dosya sistemini yöneten ve kullanıcı alanı kurallarını çalıştıran dinamik cihaz yöneticisidir.</p>
+
+  <h3>Genel bakış</h3>
+  <p>Linux'ta her donanım bileşeni çekirdek tarafından soyutlanır ve bir cihaz dosyasıyla temsil edilir. Tarihsel olarak /dev dizini statik bir dosya kümesiydi; her olası cihaz için önceden oluşturulmuş dosyalar içeriyordu. udev bu yaklaşımı değiştirdi: cihazlar fiziksel olarak bağlandığında /dev'de yaratılır, çıkarıldığında silinir.</p>
+
+  <h3>kernel → netlink → udevd → rules akışı</h3>
+  <p>Bir USB cihazı takıldığında çekirdek önce cihazı tanır, gerekli driver'ı yükler ve ardından <strong>netlink</strong> soketi üzerinden bir "uevent" mesajı yayar. <strong>udevd</strong> (veya modern systemd altında <code>systemd-udevd</code>) bu mesajı dinler. Uevent'i aldığında kural dosyalarını tarar, eşleşen kuralları sırayla uygular ve son olarak /dev'de cihaz dosyasını oluşturur.</p>
+
+  <div class="flow">
+    <pre>Donanım takıl → kernel driver probe → uevent (netlink) → udevd → kural eşleşmesi → /dev/cihaz oluştur + RUN çalıştır</pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — udev olaylarını izle</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kernel ve udev olaylarını eş zamanlı izle</span>
+<span class="cmd">udevadm</span> monitor
+
+<span class="cmt"># Yalnızca kernel olayları</span>
+<span class="cmd">udevadm</span> monitor <span class="flag">--kernel</span>
+
+<span class="cmt"># Yalnızca udev olayları (kurallar uygulandıktan sonra)</span>
+<span class="cmd">udevadm</span> monitor <span class="flag">--udev</span>
+
+<span class="cmt"># Örnek çıktı (USB cihaz takıldığında):</span>
+<span class="cmt"># KERNEL[12345.678] add    /devices/pci.../usb1/1-1 (usb)</span>
+<span class="cmt"># KERNEL[12345.680] add    /devices/pci.../usb1/1-1/1-1:1.0 (usb)</span>
+<span class="cmt"># UDEV  [12345.720] add    /devices/pci.../usb1/1-1 (usb)</span>
+<span class="cmt"># UDEV  [12345.730] add    /devices/pci.../ttyUSB0 (tty)</span></code></pre>
+  </div>
+
+  <h3>/dev sanal dosya sistemi</h3>
+  <p>Modern Linux sistemlerinde /dev, <strong>devtmpfs</strong> sanal dosya sistemiyle bağlanır. Çekirdek, driver probe başarılı olduğunda devtmpfs'e cihaz node'u oluşturur; udevd ardından izinleri, sahipliği ve sembolik linkleri ayarlar.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Dosya Sistemi</th><th>Kim yönetir</th><th>Ne zaman</th></tr></thead>
+      <tbody>
+        <tr><td>devtmpfs</td><td>Kernel</td><td>Driver probe'da node oluşturur</td></tr>
+        <tr><td>udevd kuralları</td><td>Userspace (udevd)</td><td>Uevent'ten sonra izin/symlink/script</td></tr>
+        <tr><td>/run/udev/</td><td>udevd</td><td>Cihaz metadata önbelleği</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>udev kural dosyalarının konumu</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">/lib/udev/rules.d/</span><span class="desc">Dağıtım tarafından sağlanan kurallar (örn. bluetooth, optical drive)</span></div>
+    <div class="param"><span class="name">/usr/lib/udev/rules.d/</span><span class="desc">Paket yöneticisi tarafından kurulan kurallar</span></div>
+    <div class="param"><span class="name">/etc/udev/rules.d/</span><span class="desc">Sistem yöneticisi/geliştirici kuralları — bunlar önceliklidir</span></div>
+    <div class="param"><span class="name">/run/udev/rules.d/</span><span class="desc">Geçici çalışma zamanı kuralları</span></div>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Kural dosyaları alfabetik/numerik sırayla işlenir. <code>99-custom.rules</code> gibi yüksek numaralı dosyalar dağıtım kurallarının üzerine yazabilir. Özel kurallar için <strong>/etc/udev/rules.d/</strong> kullanın ve dosyaya <code>50-</code> ile <code>99-</code> arasında bir önek verin.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>udev: dinamik /dev yönetimi; cihaz takılınca oluştur, çıkarılınca sil</li>
+      <li>Akış: kernel uevent → netlink → udevd → kural eşleşmesi → node + symlink + script</li>
+      <li>udevadm monitor: kernel ve udev olaylarını eş zamanlı izler</li>
+      <li>Kural önceliği: /etc/udev/rules.d/ > /usr/lib/udev/rules.d/ > /lib/udev/rules.d/</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> udevadm ile cihaz keşfi</h2>
+  <p class="section-lead">udevadm, udev sistemini incelemek ve test etmek için temel araçtır. Cihaz özelliklerini sorgulama, olay izleme ve kural testi için kullanılır.</p>
+
+  <h3>udevadm info: cihaz özelliklerini sorgulama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — cihaz bilgisi sorgulama</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm özellikleri sorgula (kural yazmak için hangi ATTRS kullanılacağını göster)</span>
+<span class="cmd">udevadm</span> info <span class="flag">--query=all</span> <span class="flag">--name=/dev/ttyUSB0</span>
+
+<span class="cmt"># Örnek çıktı:</span>
+<span class="cmt"># P: /devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/ttyUSB0/tty/ttyUSB0</span>
+<span class="cmt"># N: ttyUSB0</span>
+<span class="cmt"># S: serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_...-if00-port0</span>
+<span class="cmt"># E: DEVLINKS=/dev/serial/by-id/usb-Silicon_Labs_... /dev/serial/by-path/...</span>
+<span class="cmt"># E: DEVNAME=/dev/ttyUSB0</span>
+<span class="cmt"># E: ID_VENDOR_ID=10c4</span>
+<span class="cmt"># E: ID_MODEL_ID=ea60</span>
+<span class="cmt"># E: ID_SERIAL=Silicon_Labs_CP2102_...</span>
+
+<span class="cmt"># Üst cihazlarla birlikte özellik zincirini göster (ATTRS için kritik)</span>
+<span class="cmd">udevadm</span> info <span class="flag">--attribute-walk</span> <span class="flag">--name=/dev/ttyUSB0</span>
+
+<span class="cmt"># Kısaltılmış çıktı: yalnızca özellikler</span>
+<span class="cmd">udevadm</span> info <span class="flag">-q</span> property <span class="flag">-n</span> /dev/ttyUSB0</code></pre>
+  </div>
+
+  <h3>attribute-walk çıktısını okuma</h3>
+  <p>Kural yazarken hangi ATTRS{} anahtarlarını kullanabileceğinizi öğrenmek için <code>--attribute-walk</code> çıktısını dikkatli okuyun. Çıktı hiyerarşik yapıdadır: en alttaki blok cihazın kendisi, üsttekiler ana cihazlardır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — attribute-walk örnek çıktı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">udevadm</span> info <span class="flag">--attribute-walk</span> <span class="flag">--name=/dev/ttyUSB0</span>
+
+<span class="cmt"># Udevadm info starts with the device specified by the devpath and then</span>
+<span class="cmt"># walks up the chain of parent devices...</span>
+
+<span class="cmt"># --- Cihazın kendisi (ttyUSB0) ---</span>
+<span class="cmt">#   looking at device '/devices/.../ttyUSB0/tty/ttyUSB0':</span>
+<span class="cmt">#     KERNEL=="ttyUSB0"</span>
+<span class="cmt">#     SUBSYSTEM=="tty"</span>
+<span class="cmt">#     DRIVER==""</span>
+
+<span class="cmt"># --- Üst USB interface ---</span>
+<span class="cmt">#   looking at parent device '/devices/.../1-2:1.0':</span>
+<span class="cmt">#     ATTRS{bInterfaceClass}=="ff"</span>
+<span class="cmt">#     ATTRS{bInterfaceNumber}=="00"</span>
+<span class="cmt">#     ATTRS{bInterfaceProtocol}=="00"</span>
+
+<span class="cmt"># --- USB cihaz kökü ---</span>
+<span class="cmt">#   looking at parent device '/devices/.../1-2':</span>
+<span class="cmt">#     ATTRS{idVendor}=="10c4"</span>
+<span class="cmt">#     ATTRS{idProduct}=="ea60"</span>
+<span class="cmt">#     ATTRS{manufacturer}=="Silicon Labs"</span>
+<span class="cmt">#     ATTRS{product}=="CP2102 USB to UART Bridge Controller"</span>
+<span class="cmt">#     ATTRS{serial}=="0001"</span></code></pre>
+  </div>
+
+  <h3>udevadm monitor: canlı olay izleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — canlı olay izleme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm olayları izle (USB tak/çıkar denerken)</span>
+<span class="cmd">udevadm</span> monitor <span class="flag">--property</span>
+
+<span class="cmt"># Yalnızca belirli subsystem</span>
+<span class="cmd">udevadm</span> monitor <span class="flag">--subsystem-match=tty</span>
+<span class="cmd">udevadm</span> monitor <span class="flag">--subsystem-match=usb</span>
+<span class="cmd">udevadm</span> monitor <span class="flag">--subsystem-match=net</span>
+
+<span class="cmt"># Örnek çıktı (USB seri cihaz takıldığında):</span>
+<span class="cmt"># KERNEL[...] add /devices/.../ttyUSB0 (tty)</span>
+<span class="cmt"># ACTION=add</span>
+<span class="cmt"># DEVNAME=/dev/ttyUSB0</span>
+<span class="cmt"># SUBSYSTEM=tty</span>
+<span class="cmt"># ID_VENDOR_ID=10c4</span>
+<span class="cmt"># ID_MODEL_ID=ea60</span></code></pre>
+  </div>
+
+  <h3>Sysfs üzerinden doğrudan erişim</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — sysfs sorguları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># USB cihazların vendor/product ID'lerini bul</span>
+<span class="cmd">cat</span> /sys/bus/usb/devices/1-2/idVendor
+<span class="cmd">cat</span> /sys/bus/usb/devices/1-2/idProduct
+<span class="cmd">cat</span> /sys/bus/usb/devices/1-2/manufacturer
+
+<span class="cmt"># tty subsystem cihazlarını listele</span>
+<span class="cmd">ls</span> /sys/class/tty/ | grep USB
+
+<span class="cmt"># Net arayüzleri</span>
+<span class="cmd">ls</span> /sys/class/net/
+
+<span class="cmt"># Belirli bir cihazın sysfs yolunu bul</span>
+<span class="cmd">udevadm</span> info <span class="flag">-q</span> path <span class="flag">-n</span> /dev/ttyUSB0
+<span class="cmt"># /devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/ttyUSB0/tty/ttyUSB0</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>udevadm info --query=all --name=/dev/X: ENV değişkenleri ve sembolik link bilgisi</li>
+      <li>udevadm info --attribute-walk: kural yazmak için ATTRS{} anahtarlarını keşfet</li>
+      <li>udevadm monitor --property: canlı olay akışını izle; kural test için olmazmazı</li>
+      <li>Sysfs: /sys/bus/usb/devices/ ve /sys/class/ üzerinden doğrudan özellik okuma</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Kural dosyası anatomisi</h2>
+  <p class="section-lead">udev kural dosyaları, eşleştirme anahtarları (match keys) ve atama anahtarları (assignment keys) içeren satırlardan oluşur. Bir satırdaki tüm eşleştirmeler doğru olduğunda atamalar uygulanır.</p>
+
+  <h3>Kural satırı yapısı</h3>
+  <p>Her kural satırı virgülle ayrılmış anahtar=değer çiftlerinden oluşur. <strong>Eşleştirme anahtarları</strong> (<code>==</code> veya <code>!=</code>) cihazın özelliklerini sorgular; <strong>atama anahtarları</strong> (<code>=</code>, <code>+=</code>, <code>:=</code>) işlemleri tanımlar.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Operatör</th><th>Tür</th><th>Anlamı</th></tr></thead>
+      <tbody>
+        <tr><td><code>==</code></td><td>Eşleştirme</td><td>Değer eşitse kural geçerli</td></tr>
+        <tr><td><code>!=</code></td><td>Eşleştirme</td><td>Değer eşit değilse kural geçerli</td></tr>
+        <tr><td><code>=</code></td><td>Atama</td><td>Değeri ata (önceki değerleri sil)</td></tr>
+        <tr><td><code>+=</code></td><td>Atama</td><td>Değeri listeye ekle (SYMLINK için)</td></tr>
+        <tr><td><code>:=</code></td><td>Atama</td><td>Değeri ata ve sonraki kuralların değiştirmesini engelle</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Temel eşleştirme anahtarları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>udev rule — eşleştirme anahtarları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># SUBSYSTEM: cihaz alt sistemi</span>
+SUBSYSTEM=="tty"          <span class="cmt"># TTY cihazları</span>
+SUBSYSTEM=="usb"          <span class="cmt"># USB cihazları</span>
+SUBSYSTEM=="net"          <span class="cmt"># Ağ arayüzleri</span>
+SUBSYSTEM=="block"        <span class="cmt"># Blok cihazlar (disk, SD kart)</span>
+
+<span class="cmt"># ACTION: cihaz olayı türü</span>
+ACTION=="add"             <span class="cmt"># Cihaz takıldı / driver yüklendi</span>
+ACTION=="remove"          <span class="cmt"># Cihaz çıkarıldı</span>
+ACTION=="change"          <span class="cmt"># Cihaz durumu değişti</span>
+ACTION=="bind"            <span class="cmt"># Driver cihaza bağlandı</span>
+ACTION=="unbind"          <span class="cmt"># Driver cihazdan ayrıldı</span>
+
+<span class="cmt"># KERNEL: /dev'deki cihaz adı kalıbı</span>
+KERNEL=="ttyUSB*"         <span class="cmt"># ttyUSB0, ttyUSB1, ...</span>
+KERNEL=="sd[a-z]"         <span class="cmt"># sda, sdb, ... (disk)</span>
+KERNEL=="video[0-9]*"     <span class="cmt"># video0, video1, ...</span>
+
+<span class="cmt"># ATTRS{}: üst cihaz özelliği (attribute-walk ile keşfedilir)</span>
+ATTRS{idVendor}=="10c4"   <span class="cmt"># Silicon Labs USB vendor ID</span>
+ATTRS{idProduct}=="ea60"  <span class="cmt"># CP2102 product ID</span>
+ATTRS{manufacturer}=="Silicon Labs"
+ATTRS{serial}=="AB12CD34"
+
+<span class="cmt"># ENV{}: ortam değişkeni</span>
+ENV{ID_VENDOR_ID}=="10c4"
+ENV{ID_BUS}=="usb"
+
+<span class="cmt"># DEVPATH: sysfs yolu</span>
+DEVPATH=="/devices/pci*/usb[0-9]*/1-1/*"</code></pre>
+  </div>
+
+  <h3>Temel atama anahtarları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>udev rule — atama anahtarları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># NAME: /dev'deki cihaz adını değiştir</span>
+NAME="myuart"             <span class="cmt"># /dev/myuart olarak oluşturulur</span>
+
+<span class="cmt"># SYMLINK: sembolik link ekle</span>
+SYMLINK+="sensor_uart"    <span class="cmt"># /dev/sensor_uart → /dev/ttyUSB0</span>
+
+<span class="cmt"># MODE: dosya izinleri</span>
+MODE="0666"               <span class="cmt"># Herkes okuyup yazabilir</span>
+MODE="0660"               <span class="cmt"># Sahip ve grup okuyup yazabilir</span>
+
+<span class="cmt"># OWNER/GROUP: sahip ve grup</span>
+OWNER="root"
+GROUP="dialout"
+
+<span class="cmt"># RUN: shell komutu veya script çalıştır</span>
+RUN+="/usr/local/bin/hotplug.sh"
+RUN+="/bin/sh -c 'echo connected > /tmp/device_status'"
+
+<span class="cmt"># ENV{}: ortam değişkeni ata</span>
+ENV{MY_DEVICE_TYPE}="sensor"
+
+<span class="cmt"># LABEL/GOTO: kural akışı kontrolü</span>
+LABEL="end"
+GOTO="end"</code></pre>
+  </div>
+
+  <h3>Joker karakterler ve değişkenler</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>udev rule — joker ve değişkenler</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Joker karakterler</span>
+<span class="cmt"># *  — sıfır veya daha fazla karakter</span>
+<span class="cmt"># ?  — tam olarak bir karakter</span>
+<span class="cmt"># [] — karakter kümesi</span>
+KERNEL=="ttyUSB*"         <span class="cmt"># ttyUSB0..ttyUSB9...</span>
+KERNEL=="ttyS?"           <span class="cmt"># ttyS0..ttyS9 (tek haneli)</span>
+KERNEL=="sd[a-d][0-9]"   <span class="cmt"># sda1, sdb3, vb.</span>
+
+<span class="cmt"># Yerleşik değişkenler (NAME/SYMLINK/RUN içinde)</span>
+<span class="cmt"># %k  — KERNEL adı (örn. ttyUSB0)</span>
+<span class="cmt"># %n  — cihaz numarası (örn. 0)</span>
+<span class="cmt"># %p  — DEVPATH</span>
+<span class="cmt"># %E{ENV_VAR} — ortam değişkeni değeri</span>
+<span class="cmt"># %s{attr}    — sysfs özelliği</span>
+SYMLINK+="serial-%k"      <span class="cmt"># serial-ttyUSB0</span>
+RUN+="/bin/sh -c 'logger udev: %k bağlandı'"</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>== eşleştirme, = atama, += listeye ekleme, := sabitleyerek atama</li>
+      <li>SUBSYSTEM, ACTION, KERNEL, ATTRS{}, ENV{}: temel eşleştirme anahtarları</li>
+      <li>NAME, SYMLINK, MODE, OWNER, GROUP, RUN: temel atama anahtarları</li>
+      <li>%k, %n, %p, %E{}: kural içi değişkenler; dinamik sembol oluşturmak için</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Kalıcı isimler ve sembolik linkler</h2>
+  <p class="section-lead">USB cihazlarının sırası değişebilir: bugün ttyUSB0 olan yarın ttyUSB1 olabilir. Vendor/Product ID veya seri numarasına dayalı kalıcı isimler bu sorunu çözer.</p>
+
+  <h3>Neden kalıcı isimler gerekir</h3>
+  <p>Linux, USB cihazlara sıralı isimler atar; ama bu sıra takma/çıkarma sırasına göre değişir. Bir üretim ortamında iki USB seri dönüştürücü kullanıyorsanız hangisinin /dev/ttyUSB0, hangisinin /dev/ttyUSB1 olduğunu bilemezsiniz. Seri numarası veya USB port konum bilgisi (DEVPATH) kullanarak her zaman aynı cihazın aynı isimle görünmesi sağlanır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/udev/rules.d/99-serial.rules — kalıcı isimler</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Seri numarasına göre kalıcı symlink</span>
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", \
+  ATTRS{serial}=="AB12CD34", SYMLINK+="sensor_a"
+
+<span class="cmt"># Farklı seri numarası, farklı cihaz</span>
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", \
+  ATTRS{serial}=="EF56GH78", SYMLINK+="sensor_b"
+
+<span class="cmt"># USB port konumuna göre (seri numarası yoksa)</span>
+<span class="cmt"># usb1/1-1.1 = ilk hub, port 1</span>
+SUBSYSTEM=="tty", KERNELS=="1-1.1:1.0", SYMLINK+="gps_uart"
+
+<span class="cmt"># Birden fazla sembolik link</span>
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", \
+  SYMLINK+="ftdi_uart serial/ftdi-%k"</code></pre>
+  </div>
+
+  <h3>NAME direktifi ile cihaz adını değiştirme</h3>
+  <p>SYMLINK yalnızca ek link oluşturur; asıl /dev/ttyUSBX dosyası da varlığını sürdürür. NAME ise asıl adı değiştirir. Ancak NAME değiştirmek bazı araçlarla (örn. ModemManager) uyumsuzluk yaratabilir; SYMLINK tercih edilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>udev rule — NAME kullanımı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Asıl cihaz adını değiştir (dikkatli kullan)</span>
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", \
+  NAME="custom_uart0"
+
+<span class="cmt"># Kullanımdan sonra: /dev/custom_uart0 (ttyUSB0 artık yok)</span>
+<span class="cmd">ls</span> -la /dev/custom_uart0
+<span class="cmt"># crw-rw---- 1 root dialout 188, 0 /dev/custom_uart0</span></code></pre>
+  </div>
+
+  <h3>Ağ arayüzleri için kalıcı isimler</h3>
+  <p>Ağ arayüzlerinde de benzer sorun yaşanır: eth0/eth1 sırası değişebilir. systemd-udevd bunu <code>/lib/udev/rules.d/80-net-setup-link.rules</code> ile MAC adresine göre çözer. Özel kurallar da yazılabilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/udev/rules.d/70-net.rules — kalıcı ağ adı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># MAC adresine göre sabit isim</span>
+SUBSYSTEM=="net", ACTION=="add", ATTR{address}=="aa:bb:cc:dd:ee:ff", \
+  NAME="eth_mgmt"
+
+<span class="cmt"># USB ağ adaptörü için</span>
+SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="0b95", \
+  ATTRS{idProduct}=="1790", NAME="usb_eth0"
+
+<span class="cmt"># Belirli PCI slotundaki kart</span>
+SUBSYSTEM=="net", ACTION=="add", KERNELS=="0000:01:00.0", \
+  NAME="wan0"</code></pre>
+  </div>
+
+  <h3>Mevcut sembolik linkleri görme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — mevcut kalıcı linkler</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Seri cihazlar için udev tarafından oluşturulan kalıcı linkler</span>
+<span class="cmd">ls</span> <span class="flag">-la</span> /dev/serial/by-id/
+<span class="cmt"># lrwxrwxrwx ... usb-Silicon_Labs_CP2102_...-if00-port0 -> ../../ttyUSB0</span>
+
+<span class="cmd">ls</span> <span class="flag">-la</span> /dev/serial/by-path/
+<span class="cmt"># lrwxrwxrwx ... pci-0000:00:14.0-usb-0:2:1.0-port0 -> ../../ttyUSB0</span>
+
+<span class="cmt"># Kendi tanımladığımız linkler</span>
+<span class="cmd">ls</span> <span class="flag">-la</span> /dev/sensor_a /dev/sensor_b</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>SYMLINK+=: kalıcı sembolik link oluşturur; asıl ttyUSBX dosyası korunur</li>
+      <li>ATTRS{serial} veya KERNELS (USB port konum): cihazı benzersiz olarak tanımlar</li>
+      <li>NAME=: asıl cihaz adını değiştirir; dikkatli kullanılmalı, SYMLINK genellikle yeterli</li>
+      <li>/dev/serial/by-id/ ve /dev/serial/by-path/: udev'in varsayılan kalıcı link dizinleri</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Script tetikleme ve ortam değişkenleri</h2>
+  <p class="section-lead">RUN+ direktifi ile cihaz takıldığında veya çıkarıldığında otomatik olarak script veya komut çalıştırılır. Ortam değişkenleri ile bağlam bilgisi script'e aktarılır.</p>
+
+  <h3>RUN direktifi</h3>
+  <p>RUN, kural eşleştiğinde çalıştırılacak programı belirtir. Program, udevd tarafından arka planda yürütülür. Dikkat: udevd zaman aşımına duyarlıdır; uzun süren işlemler için systemd service başlatılmalıdır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/udev/rules.d/90-hotplug.rules — RUN örnekleri</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Basit komut çalıştırma</span>
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ACTION=="add", \
+  RUN+="/usr/local/bin/sensor_connect.sh"
+
+<span class="cmt"># Shell komutları (sh -c ile)</span>
+SUBSYSTEM=="tty", ACTION=="add", KERNEL=="ttyUSB*", \
+  RUN+="/bin/sh -c 'echo %k >> /tmp/plugged_devices'"
+
+<span class="cmt"># Cihaz çıkarılınca farklı script</span>
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ACTION=="remove", \
+  RUN+="/usr/local/bin/sensor_disconnect.sh"
+
+<span class="cmt"># systemd servisi başlat (uzun işlemler için)</span>
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ACTION=="add", \
+  RUN+="/bin/systemctl start sensor-daemon.service"
+
+<span class="cmt"># Birden fazla komut</span>
+SUBSYSTEM=="usb", ACTION=="add", ATTRS{idVendor}=="1234", \
+  RUN+="/usr/local/bin/init_device.sh", \
+  RUN+="/bin/logger 'Custom USB device connected'"</code></pre>
+  </div>
+
+  <h3>Ortam değişkenleri: script'e bağlam aktarma</h3>
+  <p>udevd, RUN script'ini çalıştırırken uevent özelliklerini ortam değişkeni olarak aktarır. Script içinde <code>$ACTION</code>, <code>$DEVNAME</code>, <code>$ID_VENDOR_ID</code> gibi değişkenler kullanılabilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>udev rule — ENV koyma/okuma</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kural içinde ENV set et — script'ten erişilir</span>
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", \
+  ENV{DEVICE_TYPE}="cp2102_uart", \
+  ENV{BAUD_RATE}="115200", \
+  RUN+="/usr/local/bin/configure_uart.sh"</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — /usr/local/bin/configure_uart.sh</span><span class="dot">●</span></div>
+    <pre><code>#!/bin/bash
+# udev tarafından çalıştırılan hotplug script
+
+# udevd'nin aktardığı ortam değişkenleri
+DEVICE="$DEVNAME"          # /dev/ttyUSB0
+ACTION_TYPE="$ACTION"      # add / remove
+VENDOR="$ID_VENDOR_ID"     # 10c4
+PRODUCT="$ID_MODEL_ID"     # ea60
+SERIAL="$ID_SERIAL_SHORT"  # AB12CD34
+BAUD="$BAUD_RATE"          # 115200 (kural içinde set edildi)
+
+# Log yaz
+logger -t udev-hotplug "Action=$ACTION_TYPE Device=$DEVICE Vendor=$VENDOR"
+
+if [ "$ACTION_TYPE" = "add" ]; then
+    # Baud rate ayarla
+    stty -F "$DEVICE" "$BAUD"
+
+    # Servise bildir (FIFO, socket veya dosya üzerinden)
+    echo "CONNECTED:$DEVICE:$SERIAL" > /run/sensor/event_fifo
+
+    # Lock dosyası oluştur
+    touch "/run/sensor/device_${SERIAL}.lock"
+fi
+
+if [ "$ACTION_TYPE" = "remove" ]; then
+    rm -f "/run/sensor/device_${SERIAL}.lock"
+    echo "DISCONNECTED:$DEVICE:$SERIAL" > /run/sensor/event_fifo
+fi</code></pre>
+  </div>
+
+  <h3>ENV değişkenini sonraki kuralda okuma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>udev rule — ENV zinciri</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># İlk kural: cihaz türünü belirle</span>
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", \
+  ENV{MY_UART_TYPE}="ftdi"
+
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", \
+  ENV{MY_UART_TYPE}="cp210x"
+
+<span class="cmt"># İkinci kural: türe göre farklı grup ata</span>
+SUBSYSTEM=="tty", ENV{MY_UART_TYPE}=="ftdi", GROUP="ftdi_users"
+SUBSYSTEM=="tty", ENV{MY_UART_TYPE}=="cp210x", GROUP="sensor_users"
+
+<span class="cmt"># Üçüncü kural: hepsini ortak dizine symlink et</span>
+SUBSYSTEM=="tty", ENV{MY_UART_TYPE}!="", \
+  SYMLINK+="uart/%E{MY_UART_TYPE}/%k"</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>RUN+="/path/script": kural eşleştiğinde çalıştırılır; add/remove eylemine göre farklılaştırılabilir</li>
+      <li>Uzun işlemler için: RUN+="/bin/systemctl start service" — udevd zaman aşımına uğramaz</li>
+      <li>Script içinde $DEVNAME, $ACTION, $ID_VENDOR_ID: udevd'nin aktardığı ortam değişkenleri</li>
+      <li>ENV{KEY}="value": kural zincirinde sonraki kurallara bağlam aktarımı</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Seri port ve CAN kuralları</h2>
+  <p class="section-lead">Embedded geliştirmenin temel ihtiyaçları: USB-seri dönüştürücüler için kalıcı isimler, CAN arayüzleri için otomatik başlatma ve doğru grup izinleri.</p>
+
+  <h3>USB-seri dönüştürücü kuralları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/udev/rules.d/99-usb-serial.rules</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># CP2102 (Silicon Labs) — sensor bağlantısı</span>
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", \
+  ATTRS{serial}=="0001", \
+  SYMLINK+="sensor_uart", \
+  GROUP="dialout", \
+  MODE="0660"
+
+<span class="cmt"># FTDI FT232 — debug konsolu</span>
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", \
+  SYMLINK+="debug_uart", \
+  GROUP="dialout", \
+  MODE="0660"
+
+<span class="cmt"># CH340/CH341 (ucuz USB-UART) — programlama portu</span>
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", \
+  SYMLINK+="prog_uart", \
+  GROUP="dialout", \
+  MODE="0666"
+
+<span class="cmt"># PL2303 (Prolific) — GPS modülü</span>
+SUBSYSTEM=="tty", ATTRS{idVendor}=="067b", ATTRS{idProduct}=="2303", \
+  SYMLINK+="gps_uart", \
+  GROUP="dialout", \
+  MODE="0660", \
+  RUN+="/usr/local/bin/init_gps.sh"</code></pre>
+  </div>
+
+  <h3>CAN arayüzü kuralları</h3>
+  <p>USB-CAN adaptörleri (slcan, gs_usb driver'ı kullanan Canable/PCAN gibi) Linux'ta özel yapılandırma gerektirir. udev kuralı hem sembolik link hem de otomatik <code>ip link set up</code> yapabilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/udev/rules.d/99-can.rules — CAN arayüzleri</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># gs_usb driver (CANable, Canable Pro, STM32 bazlı CAN adaptörleri)</span>
+SUBSYSTEM=="net", ACTION=="add", \
+  ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="606f", \
+  NAME="can_vehicle", \
+  RUN+="/sbin/ip link set can_vehicle type can bitrate 500000"
+RUN+="/sbin/ip link set can_vehicle up"
+
+<span class="cmt"># slcan (Serial Line CAN — UART üzerinden)</span>
+SUBSYSTEM=="tty", ACTION=="add", \
+  ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", \
+  ATTRS{interface}=="SLCAN", \
+  SYMLINK+="can_serial", \
+  RUN+="/usr/local/bin/slcan_init.sh"
+
+<span class="cmt"># KVASER USB CAN</span>
+SUBSYSTEM=="net", ACTION=="add", \
+  ATTRS{idVendor}=="0bfd", \
+  ENV{KVASER_CHANNEL}="%n", \
+  NAME="kvcan%n"</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — /usr/local/bin/slcan_init.sh</span><span class="dot">●</span></div>
+    <pre><code>#!/bin/bash
+# slcan: seri port üzerinden CAN arayüzü başlatma
+UART_DEV="$DEVNAME"
+CAN_IFACE="slcan0"
+BITRATE="500000"
+
+# slcand daemon'u başlat
+/usr/bin/slcand -o -s6 -t hw -S "$BITRATE" "$UART_DEV" "$CAN_IFACE"
+
+# Kısa bekleme
+sleep 0.5
+
+# Arayüzü aç
+/sbin/ip link set "$CAN_IFACE" up
+
+logger -t udev-can "slcan başlatıldı: $UART_DEV -> $CAN_IFACE"</code></pre>
+  </div>
+
+  <h3>OWNER, GROUP ve MODE</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>udev rule — izin yönetimi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Grup izinleri — kullanıcıyı gruba eklemek yeterli</span>
+SUBSYSTEM=="tty", KERNEL=="ttyUSB*", \
+  GROUP="dialout", MODE="0660"
+
+<span class="cmt"># Tüm kullanıcılara izin (geliştirme ortamı için)</span>
+SUBSYSTEM=="tty", KERNEL=="ttyUSB*", \
+  MODE="0666"
+
+<span class="cmt"># Belirli kullanıcıya sahiplik</span>
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", \
+  OWNER="ubuntu", GROUP="ubuntu", MODE="0660"
+
+<span class="cmt"># Kullanıcıyı dialout grubuna ekle (kural değişikliği gerektirmez)</span>
+<span class="cmd">sudo</span> usermod <span class="flag">-aG</span> dialout $USER
+<span class="cmt"># Etkinleştirmek için oturumu yenile veya:</span>
+<span class="cmd">newgrp</span> dialout</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>CP2102/FTDI/CH340: ATTRS{idVendor}+ATTRS{idProduct} ile kalıcı SYMLINK ve GROUP ataması</li>
+      <li>gs_usb CAN: NAME= ile sabit arayüz adı, RUN= ile bitrate ayarı ve ip link up</li>
+      <li>slcan: UART'ı CAN arayüzüne dönüştürme script'i; slcand daemon ile</li>
+      <li>GROUP="dialout" + MODE="0660": kullanıcıyı gruba eklemek yeterli, sudo gerekmez</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Kural debug ve yeniden yükleme</h2>
+  <p class="section-lead">udev kurallarını test etmek, hata ayıklamak ve yeniden yüklemek için gerekli komutlar — sistemi yeniden başlatmadan kural geliştirme döngüsü.</p>
+
+  <h3>udevadm test ile kural simülasyonu</h3>
+  <p><code>udevadm test</code>, gerçekten bir cihaz takılmadan kuralların nasıl çalışacağını simüle eder. /dev'de değişiklik yapmaz ancak hangi kuralların eşleştiğini ve hangi atamaların yapıldığını gösterir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — udevadm test</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Önce sysfs yolunu bul</span>
+<span class="cmd">udevadm</span> info <span class="flag">-q</span> path <span class="flag">-n</span> /dev/ttyUSB0
+<span class="cmt"># /devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/ttyUSB0/tty/ttyUSB0</span>
+
+<span class="cmt"># Kural simülasyonu (gerçek değişiklik yapmaz)</span>
+<span class="cmd">udevadm</span> test /devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/ttyUSB0/tty/ttyUSB0
+
+<span class="cmt"># Örnek çıktı:</span>
+<span class="cmt"># Reading rules file: /lib/udev/rules.d/60-serial.rules</span>
+<span class="cmt"># Reading rules file: /etc/udev/rules.d/99-usb-serial.rules</span>
+<span class="cmt"># LINK '/dev/sensor_uart' /dev/ttyUSB0</span>
+<span class="cmt"># GROUP 'dialout' /dev/ttyUSB0</span>
+<span class="cmt"># MODE '0660' /dev/ttyUSB0</span>
+<span class="cmt"># RUN '/usr/local/bin/sensor_connect.sh'</span>
+
+<span class="cmt"># Kural eşleşmelerini detaylı göster</span>
+<span class="cmd">udevadm</span> test <span class="flag">--action=add</span> /devices/.../ttyUSB0/tty/ttyUSB0 2&gt;&amp;1 | grep -E "IMPORT|RUN|LINK|GROUP"</code></pre>
+  </div>
+
+  <h3>Kuralları yeniden yükleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — kural yenileme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kural dosyalarını yeniden yükle (udevd'ye sinyal gönder)</span>
+<span class="cmd">sudo</span> udevadm control <span class="flag">--reload-rules</span>
+
+<span class="cmt"># Kısaltma</span>
+<span class="cmd">sudo</span> udevadm control <span class="flag">-R</span>
+
+<span class="cmt"># Yeniden yükle + halihazırda bağlı cihazlara kuralları tekrar uygula</span>
+<span class="cmd">sudo</span> udevadm control <span class="flag">--reload-rules</span> &amp;&amp; <span class="cmd">sudo</span> udevadm trigger
+
+<span class="cmt"># Yalnızca belirli subsystem için tetikle</span>
+<span class="cmd">sudo</span> udevadm trigger <span class="flag">--subsystem-match=tty</span>
+<span class="cmd">sudo</span> udevadm trigger <span class="flag">--subsystem-match=usb</span>
+
+<span class="cmt"># Belirli cihaz için tetikle</span>
+<span class="cmd">sudo</span> udevadm trigger <span class="flag">--sysname-match=ttyUSB0</span>
+
+<span class="cmt"># Tamamlanmasını bekle</span>
+<span class="cmd">sudo</span> udevadm settle</code></pre>
+  </div>
+
+  <h3>udevadm ile hata ayıklama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — debug teknikleri</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># udevd'yi debug modunda çalıştır (verbose)</span>
+<span class="cmd">sudo</span> udevadm control <span class="flag">--log-priority=debug</span>
+<span class="cmd">journalctl</span> <span class="flag">-f</span> <span class="flag">-u</span> systemd-udevd
+
+<span class="cmt"># Belirli bir kural dosyasını syntax kontrol</span>
+<span class="cmd">udevadm</span> verify /etc/udev/rules.d/99-custom.rules
+
+<span class="cmt"># Cihaz için hangi kuralların eşleştiğini tam log ile gör</span>
+<span class="cmd">sudo</span> udevadm test <span class="flag">--action=add</span> \
+  $(udevadm info -q path -n /dev/ttyUSB0) 2&gt;&amp;1
+
+<span class="cmt"># RUN script'inin çıktısını görmek için log ekle</span>
+<span class="cmt"># Script içine: logger -t my-udev-script "debug message"</span>
+<span class="cmd">journalctl</span> <span class="flag">-t</span> my-udev-script <span class="flag">-f</span>
+
+<span class="cmt"># Tüm cihaz özelliklerini dump et</span>
+<span class="cmd">udevadm</span> info <span class="flag">--export-db</span> | grep -A5 "ttyUSB0"</code></pre>
+  </div>
+
+  <h3>Yaygın hatalar ve çözümleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Hata</th><th>Sebep</th><th>Çözüm</th></tr></thead>
+      <tbody>
+        <tr><td>Kural eşleşmiyor</td><td>ATTRS{} yanlış hiyerarşide</td><td>--attribute-walk ile doğru seviyeyi bul</td></tr>
+        <tr><td>Symlink oluşmuyor</td><td>SYMLINK yerine NAME kullanılmış</td><td>SYMLINK+= kullan</td></tr>
+        <tr><td>Script çalışmıyor</td><td>Çalıştırma izni yok</td><td>chmod +x /path/script.sh</td></tr>
+        <tr><td>Script çalışmıyor</td><td>Shebang eksik veya yanlış</td><td>#!/bin/bash satırını kontrol et</td></tr>
+        <tr><td>Script timeout</td><td>Uzun süren işlem</td><td>systemctl start service ile at</td></tr>
+        <tr><td>Kural trigger etmiyor</td><td>udevd kuralları yüklenmemiş</td><td>udevadm control --reload-rules</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>udevadm test [sysfs-path]: gerçek değişiklik olmadan kural simülasyonu</li>
+      <li>udevadm control --reload-rules: kural dosyaları değiştikten sonra yenile</li>
+      <li>udevadm trigger: halihazırda bağlı cihazlara kuralları yeniden uygula</li>
+      <li>--log-priority=debug + journalctl: udevd'nin tam log akışını izle</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> udev ve systemd entegrasyonu</h2>
+  <p class="section-lead">systemd, udev'i kendi cihaz yönetim altyapısına entegre eder. Device unit'ler, conditional service başlatma ve socket activation ile donanım-tetiklemeli servisler oluşturulur.</p>
+
+  <h3>Device unit (.device)</h3>
+  <p>systemd, udev'in oluşturduğu her cihaz için otomatik olarak bir <strong>.device unit</strong> oluşturur. Bu unit'in adı, sysfs yolundan türetilir. Diğer unit'ler bu device unit'e bağlı hale getirilebilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — device unit bilgisi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Device unit adını bul</span>
+<span class="cmd">systemctl</span> list-units <span class="flag">--type=device</span> | grep ttyUSB
+<span class="cmt"># dev-ttyUSB0.device  loaded active plugged  /dev/ttyUSB0</span>
+
+<span class="cmt"># Device unit detayı</span>
+<span class="cmd">systemctl</span> status dev-ttyUSB0.device
+
+<span class="cmt"># Adlandırma kuralı: /dev/ttyUSB0 → dev-ttyUSB0.device</span>
+<span class="cmt">#                   /dev/sda1    → dev-sda1.device</span>
+<span class="cmt"># (/ yerine - kullanılır, sonuna .device eklenir)</span></code></pre>
+  </div>
+
+  <h3>SYSTEMD_WANTS: cihaz takılınca servis başlat</h3>
+  <p>udev kuralı içinde ENV{SYSTEMD_WANTS} ile cihaz takıldığında otomatik olarak bir systemd servisi başlatılabilir. Bu yöntem RUN+ ile script çalıştırmaktan daha güvenilirdir çünkü systemd servis yaşam döngüsünü yönetir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/udev/rules.d/90-sensor.rules — SYSTEMD_WANTS</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Cihaz takılınca sensor-daemon servisi başlat</span>
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", \
+  ACTION=="add", \
+  ENV{SYSTEMD_WANTS}="sensor-daemon@%k.service"
+
+<span class="cmt"># Template service: sensor-daemon@ttyUSB0.service</span>
+<span class="cmt"># %k = kernel name (ttyUSB0)</span></code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/systemd/system/sensor-daemon@.service</span><span class="dot">●</span></div>
+    <pre><code>[Unit]
+Description=Sensor Daemon for %I
+BindsTo=dev-%i.device
+After=dev-%i.device
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sensor-daemon /dev/%I
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+  </div>
+
+  <h3>ConditionPathExists ile bağımlılık</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>systemd service — ConditionPathExists</span><span class="dot">●</span></div>
+    <pre><code>[Unit]
+Description=GPS Logger Service
+# /dev/gps_uart mevcut değilse başlama
+ConditionPathExists=/dev/gps_uart
+After=dev-gps_uart.device
+Requires=dev-gps_uart.device
+
+[Service]
+ExecStart=/usr/local/bin/gps-logger --device=/dev/gps_uart
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+  </div>
+
+  <h3>Socket activation ile USB cihaz bekleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — socket activation + device dependency</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># systemd-path ile belirli bir dosya/cihaz görününce servis başlat</span>
+<span class="cmt"># /etc/systemd/system/sensor-watch.path</span>
+cat &lt;&lt;'EOF' | sudo tee /etc/systemd/system/sensor-watch.path
+[Unit]
+Description=Watch for sensor UART
+
+[Path]
+PathExists=/dev/sensor_uart
+Unit=sensor-daemon.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+<span class="cmd">sudo</span> systemctl enable sensor-watch.path
+<span class="cmd">sudo</span> systemctl start  sensor-watch.path
+
+<span class="cmt"># /dev/sensor_uart oluştuğunda sensor-daemon.service otomatik başlar</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>/dev/ttyUSB0 → dev-ttyUSB0.device: systemd her cihaz için otomatik .device unit oluşturur</li>
+      <li>ENV{SYSTEMD_WANTS}: udev kuralından template servis başlatmanın güvenilir yolu</li>
+      <li>BindsTo=dev-%i.device: cihaz çıkarılınca servis de durur</li>
+      <li>PathExists= unit: /dev/sensor_uart gibi bir yol oluşunca servis başlatır</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: özel USB cihazı ve embedded alternatifler</h2>
+  <p class="section-lead">Özel bir USB cihazı için uçtan uca kural yazımı, grup yetkilendirmesi ve kaynak kısıtlı embedded sistemlerde udev alternatifleri: eudev ve mdev.</p>
+
+  <h3>Özel USB cihazı için tam kural seti</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — vendor/product ID öğrenme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># lsusb ile tüm USB cihazları listele</span>
+<span class="cmd">lsusb</span>
+<span class="cmt"># Bus 001 Device 004: ID 1234:5678 MyCompany Custom Device</span>
+
+<span class="cmt"># Detaylı bilgi</span>
+<span class="cmd">lsusb</span> <span class="flag">-v</span> <span class="flag">-d</span> 1234:5678
+
+<span class="cmt"># udevadm ile tam özellik listesi</span>
+<span class="cmd">udevadm</span> info <span class="flag">--attribute-walk</span> <span class="flag">--name=/dev/ttyUSB0</span> | \
+  grep -E "idVendor|idProduct|serial|manufacturer"</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/udev/rules.d/99-mydevice.rules — tam kural seti</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Özel USB cihazı: vendor=1234, product=5678</span>
+<span class="cmt"># Adım 1: Cihazı tanımla, ENV ata</span>
+SUBSYSTEM=="tty", \
+  ATTRS{idVendor}=="1234", ATTRS{idProduct}=="5678", \
+  ENV{MY_DEVICE}="1"
+
+<span class="cmt"># Adım 2: Seri numarasına göre farklılaştır</span>
+SUBSYSTEM=="tty", ENV{MY_DEVICE}=="1", \
+  ATTRS{serial}=="SN001", \
+  SYMLINK+="mydevice/primary", \
+  ENV{MY_DEVICE_ROLE}="primary"
+
+SUBSYSTEM=="tty", ENV{MY_DEVICE}=="1", \
+  ATTRS{serial}=="SN002", \
+  SYMLINK+="mydevice/secondary", \
+  ENV{MY_DEVICE_ROLE}="secondary"
+
+<span class="cmt"># Adım 3: Ortak izinler (seri numarası ne olursa olsun)</span>
+SUBSYSTEM=="tty", ENV{MY_DEVICE}=="1", \
+  GROUP="mydevice_group", \
+  MODE="0660"
+
+<span class="cmt"># Adım 4: Bağlantı bildirimi</span>
+SUBSYSTEM=="tty", ENV{MY_DEVICE}=="1", ACTION=="add", \
+  RUN+="/usr/local/bin/mydevice-init.sh"
+
+SUBSYSTEM=="tty", ENV{MY_DEVICE}=="1", ACTION=="remove", \
+  RUN+="/usr/local/bin/mydevice-cleanup.sh"</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — grup oluşturma ve kullanıcı ekleme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Grup oluştur</span>
+<span class="cmd">sudo</span> groupadd mydevice_group
+
+<span class="cmt"># Kullanıcıyı gruba ekle</span>
+<span class="cmd">sudo</span> usermod <span class="flag">-aG</span> mydevice_group $USER
+
+<span class="cmt"># Kuralı yükle ve tetikle</span>
+<span class="cmd">sudo</span> udevadm control <span class="flag">--reload-rules</span>
+<span class="cmd">sudo</span> udevadm trigger <span class="flag">--subsystem-match=tty</span>
+
+<span class="cmt"># Test et</span>
+<span class="cmd">ls</span> <span class="flag">-la</span> /dev/mydevice/
+<span class="cmt"># lrwxrwxrwx root mydevice_group primary   -> ../../ttyUSB0</span>
+<span class="cmt"># lrwxrwxrwx root mydevice_group secondary -> ../../ttyUSB1</span></code></pre>
+  </div>
+
+  <h3>Embedded alternatifler: eudev ve mdev</h3>
+  <p>Tam udev (systemd-udevd) gömülü sistemler için fazla ağır olabilir. Buildroot ve OpenWrt gibi dağıtımlar daha hafif alternatifler sunar.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Araç</th><th>Boyut</th><th>Kural uyumluluğu</th><th>Kullanım</th></tr></thead>
+      <tbody>
+        <tr><td>systemd-udevd</td><td>~500KB + deps</td><td>Tam udev uyumlu</td><td>Desktop/server Linux</td></tr>
+        <tr><td>eudev</td><td>~200KB</td><td>Tam udev uyumlu</td><td>Systemd olmayan embedded</td></tr>
+        <tr><td>mdev (busybox)</td><td>~20KB</td><td>Basit, sınırlı</td><td>Minimal OpenWrt, initramfs</td></tr>
+        <tr><td>mdevd</td><td>~30KB</td><td>mdev benzeri</td><td>s6-init, runit tabanlı</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Buildroot'ta eudev etkinleştirme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Buildroot menuconfig</span>
+<span class="cmd">make</span> menuconfig
+<span class="cmt"># System configuration → /dev management → Dynamic using eudev</span>
+
+<span class="cmt"># eudev kural dosyaları: normal udev kurallarıyla aynı format</span>
+<span class="cmt"># /etc/udev/rules.d/ dizinine koyulur</span></code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/mdev.conf — mdev kural formatı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># mdev kuralları farklı formattadır:</span>
+<span class="cmt"># regex  owner:group  octal_mode  [=|>|!symlink]  [cmd]</span>
+
+<span class="cmt"># ttyUSB cihazları: root:dialout, 0660</span>
+ttyUSB[0-9]+    root:dialout    0660
+
+<span class="cmt"># Script tetikleme ($MDEV ortam değişkeni cihaz adını içerir)</span>
+ttyUSB[0-9]+    root:dialout    0660    */usr/local/bin/uart_hotplug.sh
+
+<span class="cmt"># Kural sözdizimi: * = her iki yönde, @ = eklenince, $ = kaldırılınca</span>
+ttyUSB[0-9]+    root:dialout    0660    @/bin/sh -c "echo $MDEV connected"
+
+<span class="cmt"># mdev'i hotplug handler olarak kaydet</span>
+<span class="cmd">echo</span> /sbin/mdev > /proc/sys/kernel/hotplug</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Tam kural seti: ENV zinciri → seri no. ayrımı → ortak izin → add/remove script</li>
+      <li>groupadd + usermod -aG: grup temelli yetkilendirme; sudo gerektirmez</li>
+      <li>eudev: systemd olmadan tam udev kural uyumluluğu; Buildroot'ta kolayca etkinleştirilebilir</li>
+      <li>mdev (busybox): minimal /etc/mdev.conf formatı; ~20KB, initramfs için ideal</li>
+    </ul>
+  </div>
+</section>
+
+</main>

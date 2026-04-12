@@ -1,0 +1,1230 @@
+---
+layout: tutorial
+title: "io_uring — Linux Async I/O"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>IO_URING</span>
+    <span>2026</span>
+  </div>
+  <h1>io_uring<br><em>Linux Async I/O</em></h1>
+  <p class="subtitle">Kernel-user paylaşımlı ring buffer ile sıfır syscall overhead'li asenkron I/O — dosya, ağ ve depolama operasyonlarını paralel çalıştır.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">io_uring neden: epoll ve AIO sınırları</a></li>
+    <li><a href="#s1">SQ ve CQ: ring buffer mimarisi</a></li>
+    <li><a href="#s2">liburing ile başlangıç</a></li>
+    <li><a href="#s3">Temel operasyonlar: READ, WRITE, FSYNC</a></li>
+    <li><a href="#s4">Completion: CQE alma ve işleme</a></li>
+    <li><a href="#s5">Gelişmiş özellikler: registered files ve buffers</a></li>
+    <li><a href="#s6">Network I/O: ACCEPT, SEND, RECV</a></li>
+    <li><a href="#s7">io_uring vs epoll karşılaştırması</a></li>
+    <li><a href="#s8">Pratik: async dosya okuma ve echo server</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> io_uring neden: epoll ve AIO sınırları</h2>
+  <p class="section-lead">io_uring, 2019'da Linux 5.1 ile tanıtılan ve geleneksel async I/O mekanizmalarının sorunlarını çözmek için tasarlanmış bir kernel-user arayüzüdür.</p>
+
+  <h3>Geleneksel I/O mekanizmalarının sorunları</h3>
+  <p><strong>Blocking I/O</strong>: en basit yöntemdir; read()/write() tamamlanana kadar thread bloklanır. Eş zamanlı çok bağlantı için çok thread gerekir; thread overhead'i önemlidir. <strong>select/poll</strong>: hangi fd'nin hazır olduğunu bildirir; ama asıl I/O hâlâ blocking'dir. Her çağrıda tüm fd kümesini kernel'a kopyalamak gerekir. <strong>epoll</strong>: edge/level-triggered bildirim sistemi; büyük fd setleri için verimli. Ancak yalnızca network socket ve pipe için çalışır; düzenli dosyalar için değil. <strong>Linux AIO (libaio)</strong>: asenkron dosya I/O desteği; ama yalnızca O_DIRECT modunda, sadece dosyalar için, completion event polling gerektirir ve network socket'leri desteklemez.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Mekanizma</th><th>Dosya</th><th>Ağ</th><th>Syscall overhead</th><th>Sınırı</th></tr></thead>
+      <tbody>
+        <tr><td>Blocking I/O</td><td>Evet</td><td>Evet</td><td>Her op'ta</td><td>Thread başına bir op</td></tr>
+        <tr><td>epoll</td><td>Hayır</td><td>Evet</td><td>Her event'te</td><td>Dosya I/O yok</td></tr>
+        <tr><td>Linux AIO</td><td>O_DIRECT</td><td>Hayır</td><td>io_submit başına</td><td>Tampon I/O yok, ağ yok</td></tr>
+        <tr><td>io_uring</td><td>Evet</td><td>Evet</td><td>Toplu veya sıfır</td><td>Neredeyse yok</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>io_uring tasarım felsefesi</h3>
+  <p>io_uring'in temel yeniliği, kernel ile kullanıcı alanının doğrudan paylaştığı bir çift yönlü ring buffer kullanmasıdır. Uygulama, işlemleri <strong>Submission Queue (SQ)</strong>'ya yazar; kernel bunları tamamladıkça <strong>Completion Queue (CQ)</strong>'ya sonuçları yazar. İki taraf da bu buffer'lara syscall yapmadan doğrudan erişir.</p>
+
+  <div class="flow">
+    <pre>Kullanıcı: SQE yaz → io_uring_submit() [opsiyonel] → CQE bekle → sonuç al
+Kernel:    SQE oku  → I/O yap           → CQE yaz    → kullanıcıya sinyal</pre>
+  </div>
+
+  <h3>Syscall overhead azaltma</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Toplu submit</span><span class="desc">Birden fazla SQE hazırla, tek io_uring_submit() ile gönder — N op için 1 syscall</span></div>
+    <div class="param"><span class="name">SQPOLL modu</span><span class="desc">Kernel thread SQ'yu sürekli polling yapar; submission için hiç syscall gerekmez</span></div>
+    <div class="param"><span class="name">IORING_FEAT_FAST_POLL</span><span class="desc">Ağ I/O için hızlı kernel-side polling; epoll'dan daha düşük latency</span></div>
+    <div class="param"><span class="name">Fixed files/buffers</span><span class="desc">fd ve buffer'lar bir kez register edilir; her op'ta kernel'a kopyalanmaz</span></div>
+  </div>
+
+  <h3>Kernel versiyonu gereksinimleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>Minimum Kernel</th></tr></thead>
+      <tbody>
+        <tr><td>Temel io_uring (dosya I/O)</td><td>5.1</td></tr>
+        <tr><td>IORING_OP_ACCEPT, SEND, RECV</td><td>5.5</td></tr>
+        <tr><td>IORING_OP_OPENAT, STATX</td><td>5.6</td></tr>
+        <tr><td>SQPOLL modu iyileştirmeleri</td><td>5.11</td></tr>
+        <tr><td>Multi-shot accept</td><td>5.19</td></tr>
+        <tr><td>io_uring over io_uring (nesting)</td><td>6.0</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>epoll: ağ için iyi ama dosya I/O yok; Linux AIO: yalnızca O_DIRECT dosya, ağ yok</li>
+      <li>io_uring: hem dosya hem ağ, toplu submit ile syscall overhead'i minimuma indirir</li>
+      <li>SQ/CQ ring buffer: kernel ve kullanıcı alanı paylaşımlı bellek; kopyalama yok</li>
+      <li>Minimum kernel: 5.1 (temel); ağ operasyonları için 5.5+</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> SQ ve CQ: ring buffer mimarisi</h2>
+  <p class="section-lead">io_uring'in kalbi iki ring buffer'dır: Submission Queue (SQ) ve Completion Queue (CQ). Her ikisi de kernel ve kullanıcı alanı tarafından paylaşılan mmap'li bellek bölgelerindedir.</p>
+
+  <h3>io_uring_setup() sistem çağrısı</h3>
+  <p><code>io_uring_setup()</code> kernel'dan bir io_uring instance'ı ister ve geri dönen fd üzerinden ring buffer'lara mmap yapılır. Doğrudan sistem çağrısı kullanmak yerine liburing kütüphanesi bu karmaşıklığı gizler.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — io_uring_setup (düşük seviyeli, liburing olmadan)</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/io_uring.h&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;sys/mman.h&gt;
+
+static inline int io_uring_setup(uint32_t entries,
+                                  struct io_uring_params *p)
+{
+    return (int)syscall(__NR_io_uring_setup, entries, p);
+}
+
+int setup_io_uring_raw(uint32_t sq_entries)
+{
+    struct io_uring_params params;
+    memset(&params, 0, sizeof(params));
+
+    /* Flags:
+     * IORING_SETUP_SQPOLL       — kernel polling thread
+     * IORING_SETUP_IOPOLL       — polling mode (diskler için)
+     * IORING_SETUP_SINGLE_ISSUER — yalnızca tek thread submit
+     */
+
+    int ring_fd = io_uring_setup(sq_entries, &params);
+    if (ring_fd &lt; 0) { perror("io_uring_setup"); return -1; }
+
+    /* SQ ring mmap */
+    size_t sq_ring_size = params.sq_off.array +
+                          params.sq_entries * sizeof(uint32_t);
+    void *sq_ring = mmap(0, sq_ring_size,
+                         PROT_READ | PROT_WRITE,
+                         MAP_SHARED | MAP_POPULATE,
+                         ring_fd, IORING_OFF_SQ_RING);
+
+    /* SQE'ler (entry'ler) ayrı bir offset'te */
+    size_t sqe_size = params.sq_entries * sizeof(struct io_uring_sqe);
+    void *sqes = mmap(0, sqe_size,
+                      PROT_READ | PROT_WRITE,
+                      MAP_SHARED | MAP_POPULATE,
+                      ring_fd, IORING_OFF_SQES);
+
+    /* CQ ring mmap */
+    size_t cq_ring_size = params.cq_off.cqes +
+                          params.cq_entries * sizeof(struct io_uring_cqe);
+    void *cq_ring = mmap(0, cq_ring_size,
+                         PROT_READ | PROT_WRITE,
+                         MAP_SHARED | MAP_POPULATE,
+                         ring_fd, IORING_OFF_CQ_RING);
+
+    return ring_fd;
+}</code></pre>
+  </div>
+
+  <h3>SQE yapısı</h3>
+  <p>Her Submission Queue Entry (SQE), tek bir async I/O operasyonunu tanımlar. Operasyon tipi, fd, offset, buffer pointer ve user_data alanları içerir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — SQE alanları (struct io_uring_sqe)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* struct io_uring_sqe'nin önemli alanları */</span>
+struct io_uring_sqe {
+    __u8   opcode;      /* IORING_OP_READ, WRITE, vb. */
+    __u8   flags;       /* IOSQE_FIXED_FILE, IOSQE_IO_DRAIN, vb. */
+    __u16  ioprio;      /* I/O önceliği */
+    __s32  fd;          /* Dosya tanımlayıcı (veya registered fd index) */
+    union {
+        __u64 off;      /* Dosya offseti */
+        __u64 addr2;    /* Op'a özel */
+    };
+    union {
+        __u64 addr;     /* Buffer adresi (IORING_OP_READ/WRITE) */
+        __u64 splice_off_in;
+    };
+    __u32  len;         /* Buffer uzunluğu veya op'a özel */
+    union {
+        __kernel_rwf_t rw_flags;
+        __u32          fsync_flags;
+        __u16          poll_events;
+        __u32          sync_range_flags;
+        __u32          msg_flags;
+        __u32          timeout_flags;
+        __u32          accept_flags;
+        __u32          cancel_flags;
+        __u32          open_flags;
+        __u32          statx_flags;
+        __u32          fadvise_advice;
+        __u32          splice_flags;
+        __u32          rename_flags;
+        __u32          unlink_flags;
+    };
+    __u64  user_data;   /* CQE'de geri döner — kullanıcı etiket */
+    /* ... padding ... */
+};</code></pre>
+  </div>
+
+  <h3>CQE yapısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — CQE yapısı (struct io_uring_cqe)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Completion Queue Entry: 16 bayt */</span>
+struct io_uring_cqe {
+    __u64 user_data;  /* SQE'deki user_data'nın aynısı */
+    __s32 res;        /* Sonuç: başarıda byte sayısı, hatada -errno */
+    __u32 flags;      /* IORING_CQE_F_MORE (multi-shot vb.) */
+};
+
+<span class="cmt">/* res &lt; 0: hata; errno = -res */</span>
+<span class="cmt">/* res >= 0: başarı; read/write için okunan/yazılan bayt sayısı */</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>io_uring_setup(): SQ/CQ ring buffer'larını oluşturur; geri dönen fd üzerinden mmap edilir</li>
+      <li>SQE: opcode + fd + off + addr + len + user_data; her async operasyon bir SQE</li>
+      <li>CQE: user_data + res + flags; res negatifse -errno, pozitifse işlem sonucu</li>
+      <li>user_data: SQE'yi CQE ile eşleştirmenin tek yolu; pointer, index veya özel etiket kullanılır</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> liburing ile başlangıç</h2>
+  <p class="section-lead">liburing, io_uring sistem çağrılarını saran yüksek seviyeli bir C kütüphanesidir. Ring buffer yönetimini, memory ordering ve submission/completion döngüsünü kolaylaştırır.</p>
+
+  <h3>Kurulum</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — liburing kurulumu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Debian/Ubuntu</span>
+<span class="cmd">sudo</span> apt-get install <span class="flag">-y</span> liburing-dev
+
+<span class="cmt"># Kaynak koddan derleme (embedded için)</span>
+<span class="cmd">git</span> clone https://github.com/axboe/liburing.git
+<span class="cmd">cd</span> liburing
+<span class="cmd">./configure</span> <span class="flag">--prefix=/usr</span>
+<span class="cmd">make</span> <span class="flag">-j$(nproc)</span>
+<span class="cmd">sudo</span> make install
+
+<span class="cmt"># Çapraz derleme (embedded Linux)</span>
+<span class="cmd">./configure</span> <span class="flag">--prefix=/sysroot/usr</span> <span class="flag">CC=arm-linux-gnueabihf-gcc</span>
+<span class="cmd">make</span> <span class="flag">-j$(nproc)</span> ARCH=arm
+
+<span class="cmt"># Derleme bayrağı</span>
+<span class="cmt"># gcc -o myapp myapp.c -luring</span></code></pre>
+  </div>
+
+  <h3>io_uring başlatma ve kapatma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — io_uring_queue_init ve cleanup</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;liburing.h&gt;
+#include &lt;stdio.h&gt;
+
+int main(void)
+{
+    struct io_uring ring;
+
+    /* Ring oluştur: 32 entry'lik SQ */
+    int ret = io_uring_queue_init(32, &ring, 0);
+    if (ret &lt; 0) {
+        fprintf(stderr, "io_uring_queue_init: %s\n", strerror(-ret));
+        return 1;
+    }
+
+    /* Flags ile başlatma seçenekleri */
+    struct io_uring ring2;
+    struct io_uring_params params;
+    memset(&params, 0, sizeof(params));
+
+    /* SQPOLL: kernel polling thread — yüksek throughput için */
+    /* params.flags |= IORING_SETUP_SQPOLL; */
+    /* params.sq_thread_idle = 2000; */  /* 2 saniye sonra uy */
+
+    /* SINGLE_ISSUER: yalnızca bir thread submit eder */
+    params.flags |= IORING_SETUP_SINGLE_ISSUER;
+
+    ret = io_uring_queue_init_params(32, &ring2, &params);
+    if (ret &lt; 0) { perror("init_params"); return 1; }
+
+    /* ... kullan ... */
+
+    /* Temizle */
+    io_uring_queue_exit(&ring);
+    io_uring_queue_exit(&ring2);
+    return 0;
+}</code></pre>
+  </div>
+
+  <h3>Temel liburing fonksiyonları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Fonksiyon</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td><code>io_uring_queue_init(entries, ring, flags)</code></td><td>Ring buffer oluştur</td></tr>
+        <tr><td><code>io_uring_get_sqe(ring)</code></td><td>Boş SQE al (NULL ise kuyruk dolu)</td></tr>
+        <tr><td><code>io_uring_prep_read(sqe, fd, buf, nbytes, offset)</code></td><td>Read operasyonu hazırla</td></tr>
+        <tr><td><code>io_uring_prep_write(sqe, fd, buf, nbytes, offset)</code></td><td>Write operasyonu hazırla</td></tr>
+        <tr><td><code>io_uring_sqe_set_data(sqe, data)</code></td><td>user_data ata (void *)</td></tr>
+        <tr><td><code>io_uring_submit(ring)</code></td><td>SQE'leri kernel'a gönder</td></tr>
+        <tr><td><code>io_uring_wait_cqe(ring, cqe_ptr)</code></td><td>CQE gelene kadar bekle</td></tr>
+        <tr><td><code>io_uring_peek_cqe(ring, cqe_ptr)</code></td><td>Beklemeden CQE al (0 = yok)</td></tr>
+        <tr><td><code>io_uring_cqe_get_data(cqe)</code></td><td>CQE'den user_data al</td></tr>
+        <tr><td><code>io_uring_cqe_seen(ring, cqe)</code></td><td>CQE işlendi, ring'e iade et</td></tr>
+        <tr><td><code>io_uring_queue_exit(ring)</code></td><td>Ring'i kapat, kaynakları serbest bırak</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="code-block">
+    <div name="bash — özellik desteği kontrolü"></div>
+    <div class="code-header"><span>C — kernel özellik desteği kontrolü</span><span class="dot">●</span></div>
+    <pre><code>void check_features(struct io_uring *ring)
+{
+    struct io_uring_probe *probe = io_uring_get_probe_ring(ring);
+    if (!probe) { fprintf(stderr, "probe başarısız\n"); return; }
+
+    printf("IORING_OP_READ:   %s\n",
+        io_uring_opcode_supported(probe, IORING_OP_READ) ? "destekleniyor" : "yok");
+    printf("IORING_OP_ACCEPT: %s\n",
+        io_uring_opcode_supported(probe, IORING_OP_ACCEPT) ? "destekleniyor" : "yok");
+    printf("IORING_OP_SEND:   %s\n",
+        io_uring_opcode_supported(probe, IORING_OP_SEND) ? "destekleniyor" : "yok");
+
+    free(probe);
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>io_uring_queue_init(entries, ring, flags): ring buffer oluşturur; entries = max eş zamanlı op</li>
+      <li>IORING_SETUP_SQPOLL: kernel polling thread; yüksek throughput ama CPU kullanır</li>
+      <li>IORING_SETUP_SINGLE_ISSUER: tek thread submit; kernel optimizasyonu etkinleştirir</li>
+      <li>io_uring_get_probe_ring(): hangi opcode'ların desteklendiğini kernel'a sorar</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Temel operasyonlar: READ, WRITE, FSYNC</h2>
+  <p class="section-lead">io_uring'in en temel operasyonları dosya okuma ve yazma. liburing prep fonksiyonları SQE alanlarını doğru şekilde doldurur.</p>
+
+  <h3>Async read operasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — IORING_OP_READ ile async dosya okuma</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;liburing.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;stdio.h&gt;
+
+int async_read_file(const char *path, char *buf, size_t len)
+{
+    struct io_uring ring;
+    io_uring_queue_init(4, &ring, 0);
+
+    int fd = open(path, O_RDONLY);
+    if (fd &lt; 0) { perror("open"); return -1; }
+
+    /* SQE al ve hazırla */
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    if (!sqe) { fprintf(stderr, "SQ dolu\n"); return -1; }
+
+    io_uring_prep_read(sqe, fd, buf, len, 0 /* offset */);
+
+    /* user_data: bu SQE'yi tanımlamak için kullanılır */
+    io_uring_sqe_set_data(sqe, (void *)(uintptr_t)fd);
+
+    /* Kernel'a gönder */
+    int submitted = io_uring_submit(&ring);
+    printf("Gönderilen SQE sayısı: %d\n", submitted);
+
+    /* CQE bekle */
+    struct io_uring_cqe *cqe;
+    int ret = io_uring_wait_cqe(&ring, &cqe);
+    if (ret &lt; 0) {
+        fprintf(stderr, "wait_cqe: %s\n", strerror(-ret));
+        return -1;
+    }
+
+    if (cqe->res &lt; 0) {
+        fprintf(stderr, "Read hatası: %s\n", strerror(-cqe->res));
+    } else {
+        printf("Okunan bayt: %d\n", cqe->res);
+    }
+
+    /* CQE'yi tüket (ring'e iade et) */
+    io_uring_cqe_seen(&ring, cqe);
+
+    close(fd);
+    io_uring_queue_exit(&ring);
+    return cqe->res;
+}</code></pre>
+  </div>
+
+  <h3>Async write ve scatter/gather</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — READV/WRITEV ile scatter-gather I/O</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;sys/uio.h&gt;
+
+void async_writev_example(int fd, struct io_uring *ring)
+{
+    static char header[] = "HTTP/1.1 200 OK\r\n";
+    static char body[]   = "Hello, World!\r\n";
+
+    /* Scatter-gather: iki ayrı buffer tek write operasyonuyla */
+    static struct iovec iov[2] = {
+        { .iov_base = header, .iov_len = sizeof(header) - 1 },
+        { .iov_base = body,   .iov_len = sizeof(body)   - 1 },
+    };
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    io_uring_prep_writev(sqe, fd, iov, 2, 0 /* offset */);
+    io_uring_sqe_set_data(sqe, iov);  /* CQE'de iov pointer'ı geri alırız */
+}
+
+<span class="cmt">/* READV de aynı şekilde */</span>
+void async_readv_example(int fd, struct io_uring *ring)
+{
+    static char buf1[4096];
+    static char buf2[4096];
+
+    static struct iovec iov[2] = {
+        { .iov_base = buf1, .iov_len = sizeof(buf1) },
+        { .iov_base = buf2, .iov_len = sizeof(buf2) },
+    };
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    io_uring_prep_readv(sqe, fd, iov, 2, 0);
+    io_uring_sqe_set_data(sqe, iov);
+}</code></pre>
+  </div>
+
+  <h3>FSYNC ve fdatasync</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — async fsync</span><span class="dot">●</span></div>
+    <pre><code>void async_fsync(int fd, struct io_uring *ring, bool datasync)
+{
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+
+    io_uring_prep_fsync(sqe, fd,
+        datasync ? IORING_FSYNC_DATASYNC : 0);
+
+    io_uring_sqe_set_data(sqe, (void *)(uintptr_t)fd);
+}
+
+<span class="cmt">/* Toplu gönderim: write + fsync birlikte */</span>
+void write_then_fsync(int fd, const char *data, size_t len,
+                      struct io_uring *ring)
+{
+    /* Write SQE */
+    struct io_uring_sqe *write_sqe = io_uring_get_sqe(ring);
+    io_uring_prep_write(write_sqe, fd, data, len, 0);
+    io_uring_sqe_set_data(write_sqe, (void *)1);
+
+    /* Fsync SQE — write tamamlandıktan sonra çalışsın */
+    struct io_uring_sqe *fsync_sqe = io_uring_get_sqe(ring);
+    io_uring_prep_fsync(fsync_sqe, fd, IORING_FSYNC_DATASYNC);
+    io_uring_sqe_set_data(fsync_sqe, (void *)2);
+
+    /* IO_DRAIN: tüm önceki op'lar tamamlanmadan bu başlamaz */
+    fsync_sqe->flags |= IOSQE_IO_DRAIN;
+
+    io_uring_submit(ring);
+}</code></pre>
+  </div>
+
+  <h3>SQE bayrakları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Bayrak</th><th>Anlamı</th></tr></thead>
+      <tbody>
+        <tr><td>IOSQE_FIXED_FILE</td><td>fd, registered file tablosundan index olarak yorumlanır</td></tr>
+        <tr><td>IOSQE_IO_DRAIN</td><td>Tüm önceki op'lar tamamlanmadan bu başlamaz</td></tr>
+        <tr><td>IOSQE_IO_LINK</td><td>Sonraki SQE, bu tamamlanmadan başlamaz (zincir)</td></tr>
+        <tr><td>IOSQE_IO_HARDLINK</td><td>IO_LINK gibi ama hata durumunda da devam eder</td></tr>
+        <tr><td>IOSQE_ASYNC</td><td>Her zaman async olarak çalıştır (kernel thread'de)</td></tr>
+        <tr><td>IOSQE_BUFFER_SELECT</td><td>Kernel seçilen buffer'ı kullan (buffer group)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>io_uring_prep_read/write: fd + buf + len + offset ile SQE hazırlar</li>
+      <li>io_uring_prep_readv/writev: scatter-gather I/O; iovec dizisiyle birden fazla buffer</li>
+      <li>IOSQE_IO_LINK: SQE zinciri oluşturur; write → fsync sırası garanti edilir</li>
+      <li>IORING_FSYNC_DATASYNC: fdatasync gibi; metadata değil yalnızca veri senkronize</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Completion: CQE alma ve işleme</h2>
+  <p class="section-lead">Completion Queue, tamamlanan operasyonların sonuçlarını tutar. Bekleme, polling ve batch işleme seçenekleri performansı etkiler.</p>
+
+  <h3>Bekleme modları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — CQE alma yöntemleri</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;liburing.h&gt;
+
+/* 1. Blocking wait: en az 1 CQE gelene kadar bekle */
+void wait_and_process(struct io_uring *ring)
+{
+    struct io_uring_cqe *cqe;
+    int ret = io_uring_wait_cqe(ring, &cqe);
+    if (ret &lt; 0) { perror("wait_cqe"); return; }
+
+    void *data = io_uring_cqe_get_data(cqe);
+    printf("CQE: res=%d, data=%p\n", cqe->res, data);
+    io_uring_cqe_seen(ring, cqe);
+}
+
+/* 2. Polling: beklemeden kontrol et */
+void poll_completions(struct io_uring *ring)
+{
+    struct io_uring_cqe *cqe;
+
+    /* Beklemeden bir CQE al (yoksa 0 döner) */
+    while (io_uring_peek_cqe(ring, &cqe) == 0) {
+        if (cqe->res &lt; 0)
+            fprintf(stderr, "I/O hatası: %s\n", strerror(-cqe->res));
+        else
+            printf("Tamamlandı: %d bayt\n", cqe->res);
+
+        io_uring_cqe_seen(ring, cqe);
+    }
+}
+
+/* 3. Wait for N completions: N CQE gelene kadar bekle */
+void wait_for_n(struct io_uring *ring, uint32_t n)
+{
+    struct io_uring_cqe *cqes[64];
+    int count = io_uring_wait_cqes(ring, cqes, n, NULL, NULL);
+
+    for (int i = 0; i &lt; count; i++) {
+        process_cqe(cqes[i]);
+        io_uring_cqe_seen(ring, cqes[i]);
+    }
+}
+
+/* 4. Timeout ile bekleme */
+void wait_with_timeout(struct io_uring *ring, uint64_t timeout_ns)
+{
+    struct __kernel_timespec ts = {
+        .tv_sec  = timeout_ns / 1000000000,
+        .tv_nsec = timeout_ns % 1000000000,
+    };
+    struct io_uring_cqe *cqe;
+    int ret = io_uring_wait_cqe_timeout(ring, &cqe, &ts);
+    if (ret == -ETIME) {
+        printf("Timeout — CQE gelmedi\n");
+    } else if (ret == 0) {
+        process_cqe(cqe);
+        io_uring_cqe_seen(ring, cqe);
+    }
+}</code></pre>
+  </div>
+
+  <h3>Batch completion işleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — io_uring_for_each_cqe ile batch işleme</span><span class="dot">●</span></div>
+    <pre><code>void process_all_completions(struct io_uring *ring)
+{
+    struct io_uring_cqe *cqe;
+    uint32_t head;
+    uint32_t count = 0;
+
+    /* Tüm hazır CQE'leri tek döngüde işle */
+    io_uring_for_each_cqe(ring, head, cqe) {
+        void *user_data = io_uring_cqe_get_data(cqe);
+        int res = cqe->res;
+
+        if (res &lt; 0) {
+            fprintf(stderr, "Op hata: %s\n", strerror(-res));
+        } else {
+            /* user_data'ya göre işlemi tanımla */
+            struct my_request *req = (struct my_request *)user_data;
+            req->bytes_done = res;
+            req->completed  = true;
+        }
+        count++;
+    }
+
+    /* Tüm işlenenleri tek seferde tüket */
+    io_uring_cq_advance(ring, count);
+}</code></pre>
+  </div>
+
+  <h3>Hata yönetimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — CQE hata işleme</span><span class="dot">●</span></div>
+    <pre><code>void handle_cqe_result(struct io_uring_cqe *cqe,
+                        const char *op_name)
+{
+    if (cqe->res &lt; 0) {
+        int err = -cqe->res;
+        switch (err) {
+        case ENOENT:
+            fprintf(stderr, "%s: Dosya bulunamadı\n", op_name);
+            break;
+        case EACCES:
+            fprintf(stderr, "%s: Erişim reddedildi\n", op_name);
+            break;
+        case EAGAIN:
+            /* Non-blocking fd için tekrar dene */
+            fprintf(stderr, "%s: Tekrar dene\n", op_name);
+            break;
+        case ECANCELED:
+            fprintf(stderr, "%s: İptal edildi\n", op_name);
+            break;
+        default:
+            fprintf(stderr, "%s hatası: %s\n", op_name, strerror(err));
+        }
+    } else {
+        printf("%s tamamlandı: %d bayt\n", op_name, cqe->res);
+    }
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>io_uring_wait_cqe: blocking; io_uring_peek_cqe: non-blocking; io_uring_wait_cqe_timeout: zaman sınırlı</li>
+      <li>io_uring_for_each_cqe + io_uring_cq_advance: tüm hazır CQE'leri batch olarak işle</li>
+      <li>io_uring_cqe_seen(): işlenen CQE'yi ring'e iade et; unutulursa CQ dolar</li>
+      <li>cqe->res &lt; 0: hata; -cqe->res errno değeri; 0 veya pozitif: başarı</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Gelişmiş özellikler: registered files ve buffers</h2>
+  <p class="section-lead">Registered files ve buffers, her operasyonda kernel'ın fd tablosunu ve buffer mapping'i sorgulamasını engeller. Yüksek throughput uygulamalarında önemli performans artışı sağlar.</p>
+
+  <h3>Registered files (io_uring_register_files)</h3>
+  <p>Normalde her SQE'de kernel, fd'yi dosya tablosunda arar. Registered files ile fd'ler bir kez kaydedilir; SQE'de index kullanılır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — registered files kullanımı</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;liburing.h&gt;
+
+#define MAX_FILES 64
+
+int fds[MAX_FILES];
+int nfds = 0;
+
+void register_files_example(struct io_uring *ring)
+{
+    /* Dosyaları aç */
+    fds[0] = open("/data/file1.bin", O_RDONLY);
+    fds[1] = open("/data/file2.bin", O_RDONLY);
+    fds[2] = open("/data/output.bin", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    nfds = 3;
+
+    /* Ring'e kaydet */
+    int ret = io_uring_register_files(ring, fds, nfds);
+    if (ret &lt; 0) {
+        fprintf(stderr, "register_files: %s\n", strerror(-ret));
+        return;
+    }
+    printf("%d dosya registered\n", nfds);
+
+    /* Artık SQE'de fd yerine index kullan */
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    io_uring_prep_read(sqe,
+        0,    /* fd yerine index (fds[0] = file1.bin) */
+        buf, sizeof(buf), 0);
+
+    /* FIXED_FILE bayrağı: index modunu etkinleştirir */
+    sqe->flags |= IOSQE_FIXED_FILE;
+    io_uring_submit(ring);
+}
+
+void update_registered_file(struct io_uring *ring, int index, int new_fd)
+{
+    /* Tek bir fd'yi güncelle (tüm tabloyu yeniden kaydetmeden) */
+    io_uring_register_files_update(ring, index, &new_fd, 1);
+}
+
+void unregister(struct io_uring *ring)
+{
+    io_uring_unregister_files(ring);
+    for (int i = 0; i &lt; nfds; i++) close(fds[i]);
+}</code></pre>
+  </div>
+
+  <h3>Registered buffers (io_uring_register_buffers)</h3>
+  <p>Registered buffers ile kullanıcı belleği kernel'a bir kez pin'lenir ve map'lenir. Her read/write'ta buffer'ın DMA-ready hale getirilmesi gerekmez.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — registered buffers kullanımı</span><span class="dot">●</span></div>
+    <pre><code>#define NBUFFERS 8
+#define BUF_SIZE 65536   /* 64 KB */
+
+static char reg_bufs[NBUFFERS][BUF_SIZE];
+static struct iovec iovecs[NBUFFERS];
+
+void setup_registered_buffers(struct io_uring *ring)
+{
+    for (int i = 0; i &lt; NBUFFERS; i++) {
+        iovecs[i].iov_base = reg_bufs[i];
+        iovecs[i].iov_len  = BUF_SIZE;
+    }
+
+    int ret = io_uring_register_buffers(ring, iovecs, NBUFFERS);
+    if (ret &lt; 0) {
+        fprintf(stderr, "register_buffers: %s\n", strerror(-ret));
+        return;
+    }
+    printf("%d buffer registered\n", NBUFFERS);
+}
+
+void read_with_fixed_buffer(struct io_uring *ring, int fd, int buf_idx)
+{
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+
+    /* Fixed buffer ile read: buf_idx = registered buffer index */
+    io_uring_prep_read_fixed(sqe, fd,
+        reg_bufs[buf_idx], BUF_SIZE,
+        0,        /* offset */
+        buf_idx   /* buffer index */);
+
+    io_uring_sqe_set_data(sqe, (void *)(uintptr_t)buf_idx);
+}
+
+<span class="cmt">/* IORING_FEAT_FAST_POLL desteği kontrolü */</span>
+void check_fast_poll(struct io_uring *ring)
+{
+    struct io_uring_params params;
+    if (ring->features & IORING_FEAT_FAST_POLL)
+        printf("FAST_POLL destekleniyor: ağ I/O latency azalır\n");
+    else
+        printf("FAST_POLL yok: eski kernel\n");
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>io_uring_register_files: fd'leri ring'e bir kez kaydet; SQE'de IOSQE_FIXED_FILE + index kullan</li>
+      <li>io_uring_register_buffers: bellek iovec'leri pin'le; io_uring_prep_read_fixed ile kullan</li>
+      <li>Fayda: yüksek QPS'de her op'ta kernel fd/buffer arama overhead'ini ortadan kaldırır</li>
+      <li>IORING_FEAT_FAST_POLL: ağ socket'leri için epoll'dan daha düşük latency; 5.7+ kernelde</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Network I/O: ACCEPT, SEND, RECV</h2>
+  <p class="section-lead">io_uring'in network desteği, epoll + read/write döngüsünün yerini alabilir. ACCEPT, SEND, RECV ve multi-shot ACCEPT ile tam async TCP server yazılabilir.</p>
+
+  <h3>Temel TCP server: async ACCEPT + RECV</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — io_uring tabanlı TCP echo server (iskelet)</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;liburing.h&gt;
+#include &lt;sys/socket.h&gt;
+#include &lt;netinet/in.h&gt;
+#include &lt;string.h&gt;
+#include &lt;stdio.h&gt;
+
+enum req_type { REQ_ACCEPT, REQ_RECV, REQ_SEND };
+
+struct request {
+    enum req_type type;
+    int           fd;
+    char          buf[4096];
+    struct sockaddr_in client_addr;
+    socklen_t          addr_len;
+};
+
+int server_fd;
+
+void add_accept(struct io_uring *ring, struct request *req)
+{
+    req->type    = REQ_ACCEPT;
+    req->addr_len = sizeof(req->client_addr);
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    io_uring_prep_accept(sqe, server_fd,
+                         (struct sockaddr *)&req->client_addr,
+                         &req->addr_len, 0);
+    io_uring_sqe_set_data(sqe, req);
+}
+
+void add_recv(struct io_uring *ring, struct request *req)
+{
+    req->type = REQ_RECV;
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    io_uring_prep_recv(sqe, req->fd, req->buf, sizeof(req->buf), 0);
+    io_uring_sqe_set_data(sqe, req);
+}
+
+void add_send(struct io_uring *ring, struct request *req, int len)
+{
+    req->type = REQ_SEND;
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    io_uring_prep_send(sqe, req->fd, req->buf, len, 0);
+    io_uring_sqe_set_data(sqe, req);
+}
+
+void run_event_loop(struct io_uring *ring)
+{
+    struct io_uring_cqe *cqe;
+
+    while (1) {
+        io_uring_wait_cqe(ring, &cqe);
+
+        struct request *req = io_uring_cqe_get_data(cqe);
+        int res = cqe->res;
+        io_uring_cqe_seen(ring, cqe);
+
+        if (res &lt; 0) {
+            fprintf(stderr, "Hata (type=%d): %s\n", req->type, strerror(-res));
+            free(req);
+            continue;
+        }
+
+        switch (req->type) {
+        case REQ_ACCEPT:
+            req->fd = res;           /* Yeni bağlantı fd'si */
+            add_recv(ring, req);     /* Veri bekle */
+
+            /* Yeni bir ACCEPT SQE ekle (bir sonraki bağlantı için) */
+            struct request *new_req = calloc(1, sizeof(*new_req));
+            add_accept(ring, new_req);
+            io_uring_submit(ring);
+            break;
+
+        case REQ_RECV:
+            if (res == 0) {         /* Bağlantı kapandı */
+                close(req->fd);
+                free(req);
+            } else {
+                add_send(ring, req, res);  /* Echo back */
+                io_uring_submit(ring);
+            }
+            break;
+
+        case REQ_SEND:
+            add_recv(ring, req);    /* Bir sonraki veriyi bekle */
+            io_uring_submit(ring);
+            break;
+        }
+    }
+}</code></pre>
+  </div>
+
+  <h3>Multi-shot ACCEPT (kernel 5.19+)</h3>
+  <p>Normal ACCEPT her bağlantı için yeni bir SQE gerektirir. Multi-shot ACCEPT, tek SQE ile sürekli yeni bağlantıları kabul eder; her accept için yeni CQE üretilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — multi-shot accept</span><span class="dot">●</span></div>
+    <pre><code>void add_multishot_accept(struct io_uring *ring, int server_fd)
+{
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+
+    /* IORING_ACCEPT_MULTISHOT: tek SQE, çok CQE */
+    io_uring_prep_multishot_accept(sqe, server_fd, NULL, NULL, 0);
+    io_uring_sqe_set_data(sqe, (void *)ACCEPT_TOKEN);
+    io_uring_submit(ring);
+}
+
+/* CQE işleme: multi-shot CQE'ler IORING_CQE_F_MORE ile işaretlenir */
+void handle_multishot_cqe(struct io_uring_cqe *cqe)
+{
+    int client_fd = cqe->res;   /* Yeni bağlantı fd'si */
+
+    if (cqe->flags & IORING_CQE_F_MORE) {
+        /* SQE hâlâ aktif, yeni bağlantılar için CQE üretmeye devam eder */
+        printf("Yeni bağlantı: %d (multi-shot devam ediyor)\n", client_fd);
+    } else {
+        /* SQE tükendi veya hata — yeniden ekle */
+        printf("Multi-shot bitti, yeniden ekleniyor\n");
+    }
+}</code></pre>
+  </div>
+
+  <h3>CONNECT ve SEND_ZC (sıfır kopya send)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — async connect ve send_zc</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Async TCP connect */</span>
+void async_connect(struct io_uring *ring, int sockfd,
+                   struct sockaddr *addr, socklen_t addrlen)
+{
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    io_uring_prep_connect(sqe, sockfd, addr, addrlen);
+    io_uring_sqe_set_data(sqe, (void *)(uintptr_t)sockfd);
+}
+
+<span class="cmt">/* Zero-copy send (kernel 6.0+): buffer kernel'da kopyalanmaz */</span>
+void async_send_zc(struct io_uring *ring, int fd,
+                   const void *buf, size_t len)
+{
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    io_uring_prep_send_zc(sqe, fd, buf, len, 0, 0);
+    <span class="cmt">/* Not: buf, send tamamlanana kadar geçerli kalmalı */</span>
+    <span class="cmt">/* CQE: IORING_CQE_F_MORE ile bildirim gelir */</span>
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>io_uring_prep_accept/recv/send: tam async TCP; epoll + blocking I/O döngüsünü değiştirir</li>
+      <li>Olay döngüsü: accept → recv → send → recv zinciri; her adım ayrı SQE/CQE</li>
+      <li>Multi-shot accept (5.19+): tek SQE ile sürekli yeni bağlantı; IORING_CQE_F_MORE ile devam</li>
+      <li>send_zc (6.0+): sıfır kopya send; büyük veri transferlerinde bellek bant genişliği tasarrufu</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> io_uring vs epoll karşılaştırması</h2>
+  <p class="section-lead">io_uring ve epoll farklı kullanım senaryolarında farklı güçlere sahiptir. Her birinin ne zaman tercih edileceğini anlamak kritik mimari kararı doğru vermeyi sağlar.</p>
+
+  <h3>Mimari fark</h3>
+  <p>epoll bir <em>hazır bildirim</em> mekanizmasıdır: fd okumaya/yazmaya hazır olduğunda bildirim gönderir; asıl I/O hâlâ ayrı bir read()/write() sistem çağrısıyla yapılır. io_uring ise <em>operasyon gönderme</em> mekanizmasıdır: I/O operasyonunun kendisi kernel'a gönderilir ve tamamlanınca CQE döner; ayrı sistem çağrısına gerek yoktur.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>epoll</th><th>io_uring</th></tr></thead>
+      <tbody>
+        <tr><td>Dosya I/O</td><td>Hayır (pollable fd'ler)</td><td>Evet (her türlü fd)</td></tr>
+        <tr><td>Network I/O</td><td>Evet</td><td>Evet (5.5+)</td></tr>
+        <tr><td>Syscall/op sayısı</td><td>2 (epoll_wait + read)</td><td>0-1 (SQE+CQE paylaşımlı bellek)</td></tr>
+        <tr><td>Kernel desteği</td><td>2.5.44'ten itibaren</td><td>5.1+</td></tr>
+        <tr><td>Taşınabilirlik</td><td>Linux only, geniş destek</td><td>Linux only, yeni kernel gerekir</td></tr>
+        <tr><td>Kod karmaşıklığı</td><td>Düşük-orta</td><td>Orta-yüksek (liburing ile azalır)</td></tr>
+        <tr><td>Düşük gecikme</td><td>İyi</td><td>Çok iyi (FAST_POLL ile)</td></tr>
+        <tr><td>Yüksek throughput</td><td>İyi</td><td>Çok iyi (SQPOLL ile)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Benchmark yaklaşımı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — basit benchmark karşılaştırması</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># fio ile io_uring dosya I/O benchmark</span>
+<span class="cmd">fio</span> \
+  <span class="flag">--name=uring-rand-read</span> \
+  <span class="flag">--ioengine=io_uring</span> \
+  <span class="flag">--rw=randread</span> \
+  <span class="flag">--bs=4k</span> \
+  <span class="flag">--numjobs=1</span> \
+  <span class="flag">--iodepth=64</span> \
+  <span class="flag">--runtime=30</span> \
+  <span class="flag">--filename=/dev/nvme0n1</span>
+
+<span class="cmt"># fio ile libaio karşılaştırması</span>
+<span class="cmd">fio</span> \
+  <span class="flag">--name=aio-rand-read</span> \
+  <span class="flag">--ioengine=libaio</span> \
+  <span class="flag">--rw=randread</span> \
+  <span class="flag">--bs=4k</span> \
+  <span class="flag">--numjobs=1</span> \
+  <span class="flag">--iodepth=64</span> \
+  <span class="flag">--runtime=30</span> \
+  <span class="flag">--filename=/dev/nvme0n1</span>
+
+<span class="cmt"># wrk ile HTTP server benchmark (io_uring tabanlı server)</span>
+<span class="cmd">wrk</span> <span class="flag">-t4</span> <span class="flag">-c400</span> <span class="flag">-d30s</span> http://localhost:8080/</code></pre>
+  </div>
+
+  <h3>Ne zaman io_uring, ne zaman epoll</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">io_uring tercih et</span><span class="desc">Dosya + ağ I/O karışık; yüksek IOPS gereksinimi; NVMe, SSD; batch işleme; kernel 5.5+ garantili</span></div>
+    <div class="param"><span class="name">epoll tercih et</span><span class="desc">Yalnızca ağ I/O; eski kernel desteği gerekli; basit event loop; inotify/timerfd gibi pollable fd'ler</span></div>
+    <div class="param"><span class="name">Embedded için</span><span class="desc">Kernel 5.1+ garantili ise io_uring; aksi takdirde epoll + blocking file I/O yeterlidir</span></div>
+    <div class="param"><span class="name">SQPOLL dikkat</span><span class="desc">SQPOLL idle dönemde dahi CPU kullanır; bataryalı embedded cihazlarda dikkatli kullanın</span></div>
+  </div>
+
+  <h3>Latency profili</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — io_uring latency ölçümü</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;time.h&gt;
+
+static inline uint64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+void measure_latency(struct io_uring *ring, int fd,
+                     char *buf, size_t len)
+{
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    io_uring_prep_read(sqe, fd, buf, len, 0);
+
+    uint64_t t0 = now_ns();
+    io_uring_submit(ring);
+
+    struct io_uring_cqe *cqe;
+    io_uring_wait_cqe(ring, &cqe);
+    uint64_t t1 = now_ns();
+
+    printf("Latency: %.2f µs\n", (t1 - t0) / 1000.0);
+    io_uring_cqe_seen(ring, cqe);
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>epoll: hazır bildirim (I/O hâlâ ayrı syscall); io_uring: operasyon gönderme (tek syscall veya sıfır)</li>
+      <li>io_uring üstünlüğü: dosya I/O, yüksek IOPS, batch işleme, NVMe direkt erişim</li>
+      <li>epoll üstünlüğü: eski kernel desteği, basitlik, pollable fd ekosistemi (timerfd, signalfd)</li>
+      <li>SQPOLL idle CPU kullanır; pil ömrü kritik embedded cihazlarda dikkatli kullanın</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: async dosya okuma ve echo server</h2>
+  <p class="section-lead">100 dosyayı paralel olarak io_uring ile okuyan uygulama, liburing ile tam echo server ve embedded ARM64 sistemlerde kurulum.</p>
+
+  <h3>100 dosyayı paralel okuma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — parallel_read.c: 100 dosya eş zamanlı</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;liburing.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;string.h&gt;
+#include &lt;time.h&gt;
+
+#define NFILES    100
+#define BUF_SIZE  65536   /* 64 KB */
+#define QUEUE_DEPTH 128
+
+struct file_request {
+    int    fd;
+    int    index;
+    char  *buf;
+    size_t bytes_read;
+    bool   done;
+};
+
+static uint64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+int main(int argc, char *argv[])
+{
+    struct io_uring ring;
+    io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
+
+    struct file_request reqs[NFILES];
+    memset(reqs, 0, sizeof(reqs));
+
+    /* Dosyaları aç ve buffer'ları tahsis et */
+    for (int i = 0; i &lt; NFILES; i++) {
+        char path[256];
+        snprintf(path, sizeof(path), "/data/file_%03d.bin", i);
+        reqs[i].fd    = open(path, O_RDONLY);
+        reqs[i].index = i;
+        reqs[i].buf   = malloc(BUF_SIZE);
+        if (reqs[i].fd &lt; 0) {
+            /* Dosya yoksa /dev/urandom kullan */
+            reqs[i].fd = open("/dev/urandom", O_RDONLY);
+        }
+    }
+
+    uint64_t t0 = now_ns();
+
+    /* Tüm dosyalar için SQE gönder */
+    for (int i = 0; i &lt; NFILES; i++) {
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+        if (!sqe) {
+            /* Kuyruk dolu — ara sıra flush et */
+            io_uring_submit(&ring);
+            sqe = io_uring_get_sqe(&ring);
+        }
+        io_uring_prep_read(sqe, reqs[i].fd, reqs[i].buf, BUF_SIZE, 0);
+        io_uring_sqe_set_data(sqe, &reqs[i]);
+    }
+    io_uring_submit(&ring);
+
+    /* Tüm CQE'leri bekle */
+    int completed = 0;
+    while (completed &lt; NFILES) {
+        struct io_uring_cqe *cqe;
+        io_uring_wait_cqe(&ring, &cqe);
+
+        struct file_request *req = io_uring_cqe_get_data(cqe);
+        if (cqe->res &gt; 0) {
+            req->bytes_read = cqe->res;
+            req->done = true;
+        } else if (cqe->res &lt; 0) {
+            fprintf(stderr, "File %d error: %s\n",
+                    req->index, strerror(-cqe->res));
+        }
+        io_uring_cqe_seen(&ring, cqe);
+        completed++;
+    }
+
+    uint64_t elapsed = now_ns() - t0;
+    size_t total = 0;
+    for (int i = 0; i &lt; NFILES; i++) total += reqs[i].bytes_read;
+
+    printf("Tamamlandı: %d dosya, toplam %zu bayt\n", NFILES, total);
+    printf("Süre: %.2f ms (%.0f MB/s)\n",
+           elapsed / 1e6,
+           (double)total / (elapsed / 1e9) / (1024*1024));
+
+    /* Temizlik */
+    for (int i = 0; i &lt; NFILES; i++) {
+        close(reqs[i].fd);
+        free(reqs[i].buf);
+    }
+    io_uring_queue_exit(&ring);
+    return 0;
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — derleme ve çalıştırma</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Derleme</span>
+<span class="cmd">gcc</span> <span class="flag">-O2</span> <span class="flag">-o</span> parallel_read parallel_read.c <span class="flag">-luring</span>
+
+<span class="cmt"># Test dosyaları oluştur</span>
+<span class="cmd">mkdir</span> -p /data
+for i in $(seq -w 0 99); do
+    dd if=/dev/urandom of="/data/file_${i}.bin" bs=64K count=1 2>/dev/null
+done
+
+<span class="cmt"># Çalıştır</span>
+<span class="cmd">./parallel_read</span>
+<span class="cmt"># Tamamlandı: 100 dosya, toplam 6553600 bayt</span>
+<span class="cmt"># Süre: 12.34 ms (506 MB/s)</span></code></pre>
+  </div>
+
+  <h3>Embedded ARM64: kernel gereksinimleri ve liburing derleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — ARM64 Buildroot entegrasyonu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kernel versiyonu kontrolü</span>
+<span class="cmd">uname</span> <span class="flag">-r</span>
+<span class="cmt"># 5.15.87-v8 — ARM64, io_uring destekli</span>
+
+<span class="cmt"># io_uring kernel config gereksinimleri</span>
+<span class="cmt"># CONFIG_IO_URING=y</span>
+<span class="cmt"># CONFIG_FUTEX=y (wait_cqe için)</span>
+<span class="cmt"># CONFIG_EPOLL=y (FAST_POLL için)</span>
+
+<span class="cmt"># Buildroot ile liburing ekle</span>
+<span class="cmd">make</span> menuconfig
+<span class="cmt"># Target packages → Libraries → Other → liburing</span>
+
+<span class="cmt"># Çapraz derleme (aarch64)</span>
+<span class="cmd">aarch64-linux-gnu-gcc</span> \
+  <span class="flag">-O2</span> \
+  <span class="flag">--sysroot=/path/to/aarch64-sysroot</span> \
+  <span class="flag">-o</span> parallel_read parallel_read.c \
+  <span class="flag">-luring</span>
+
+<span class="cmt"># Kernel config kontrolü</span>
+<span class="cmd">zcat</span> /proc/config.gz | grep CONFIG_IO_URING
+<span class="cmt"># CONFIG_IO_URING=y</span>
+<span class="cmt"># CONFIG_IO_URING_KASAN=n</span>
+
+<span class="cmt"># Çalışma zamanı özellik kontrolü</span>
+<span class="cmd">cat</span> /proc/sys/kernel/io_uring_disabled
+<span class="cmt"># 0  (0=etkin, 1=ayrıcalıklı, 2=devre dışı)</span></code></pre>
+  </div>
+
+  <h3>Güvenlik: io_uring kısıtlamaları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — güvenlik konfigürasyonu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># io_uring bazı güvenlik politikalarında kısıtlanabilir</span>
+
+<span class="cmt"># Konteyner güvenliği: yalnızca root erişimi</span>
+<span class="cmd">echo</span> 1 | sudo tee /proc/sys/kernel/io_uring_disabled
+<span class="cmt"># 1 = yalnızca CAP_SYS_ADMIN yetkisiyle kullanılabilir</span>
+
+<span class="cmt"># Tamamen devre dışı bırak</span>
+<span class="cmd">echo</span> 2 | sudo tee /proc/sys/kernel/io_uring_disabled
+
+<span class="cmt"># Gömülü üretim sistemi: CAP_SYS_ADMIN gereksinimi kaldırılabilir</span>
+<span class="cmd">echo</span> 0 | sudo tee /proc/sys/kernel/io_uring_disabled
+
+<span class="cmt"># seccomp filtreleri io_uring'i etkiler</span>
+<span class="cmt"># io_uring_setup/__NR_io_uring_setup izin verilmeli</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>100 paralel okuma: tüm SQE'leri önce gönder, sonra tüm CQE'leri bekle; sıralı okumadan çok daha hızlı</li>
+      <li>Kuyruk dolu: io_uring_get_sqe() NULL döner; ara sıra io_uring_submit() ile flush et</li>
+      <li>ARM64 Buildroot: menuconfig'te liburing'i etkinleştir; CONFIG_IO_URING=y kernel gereksinin</li>
+      <li>/proc/sys/kernel/io_uring_disabled: 0=herkes, 1=CAP_SYS_ADMIN, 2=tamamen kapalı</li>
+    </ul>
+  </div>
+</section>
+
+</main>

@@ -1,0 +1,1206 @@
+---
+layout: tutorial
+title: "V4L2 & Kamera — Linux Video Capture"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>V4L2</span>
+    <span>2026</span>
+  </div>
+  <h1>V4L2 &amp; Kamera<br><em>Linux Video Capture</em></h1>
+  <p class="subtitle">Video4Linux2 API ile kamera frame yakalama, buffer yönetimi, MIPI CSI pipeline yapılandırması ve sıfır kopya DMA-BUF entegrasyonu.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">V4L2 mimarisi: /dev/videoN ve subdev zinciri</a></li>
+    <li><a href="#s1">v4l2-ctl ile temel kullanım</a></li>
+    <li><a href="#s2">V4L2 ioctl API: temel operasyonlar</a></li>
+    <li><a href="#s3">Buffer yönetimi: MMAP, USERPTR ve DMA-BUF</a></li>
+    <li><a href="#s4">Pixel formatları ve format negotiation</a></li>
+    <li><a href="#s5">Media controller: pipeline yapılandırma</a></li>
+    <li><a href="#s6">ISP ve subdev kontrolü</a></li>
+    <li><a href="#s7">DMA-BUF ve sıfır kopya pipeline</a></li>
+    <li><a href="#s8">Pratik: C ile frame yakalama ve test araçları</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> V4L2 mimarisi: /dev/videoN ve subdev zinciri</h2>
+  <p class="section-lead">Video4Linux2 (V4L2), Linux'un standart video yakalama ve çıkış framework'üdür. Basit bir USB kameradan karmaşık MIPI CSI + ISP pipeline'larına kadar tek bir API ile yönetilir.</p>
+
+  <h3>Temel mimari</h3>
+  <p>V4L2'nin temel nesnesi <strong>/dev/videoN</strong> cihaz dosyasıdır. Bu dosya üzerinden ioctl çağrıları ile kamera formatı ayarlanır, buffer'lar tahsis edilir ve frame'ler yakalanır. Karmaşık donanım pipeline'larında ise birden fazla bileşen <strong>subdev</strong> (alt cihaz) olarak modellenir; her subdev <strong>/dev/v4l-subdevN</strong> dosyasıyla temsil edilir.</p>
+
+  <div class="flow">
+    <pre>MIPI CSI sensör → MIPI CSI-2 alıcı → ISP → Scaler → /dev/video0
+         ↓               ↓              ↓       ↓
+   /dev/v4l-subdev0  /dev/v4l-subdev1  ...  media controller (/dev/mediaX)</pre>
+  </div>
+
+  <h3>V4L2 cihaz türleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Cihaz dosyası</th><th>Tür</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td>/dev/videoN</td><td>Video cihazı</td><td>Frame yakalama/çıkış ana arayüzü</td></tr>
+        <tr><td>/dev/v4l-subdevN</td><td>Subdev</td><td>Sensör, ISP, CSI alıcı, scaler</td></tr>
+        <tr><td>/dev/mediaN</td><td>Media controller</td><td>Pipeline bağlantı yönetimi</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>MIPI CSI pipeline bileşenleri</h3>
+  <p>Gömülü sistemlerde kamera genellikle MIPI CSI-2 arayüzü üzerinden bağlanır. Bu pipeline birkaç ayrı bileşenden oluşur:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Sensör subdev</span><span class="desc">Kamera sensörünün kendisi (OV5640, IMX219 vb.); exposure, gain, format ayarları</span></div>
+    <div class="param"><span class="name">CSI-2 receiver</span><span class="desc">MIPI CSI-2 data lane'lerini alır, D-PHY sinyallerini çözer</span></div>
+    <div class="param"><span class="name">ISP (Image Signal Processor)</span><span class="desc">Demosaic, noise reduction, white balance, tone mapping</span></div>
+    <div class="param"><span class="name">Scaler/Crop</span><span class="desc">Çözünürlük ölçekleme, kırpma işlemleri</span></div>
+    <div class="param"><span class="name">Video node</span><span class="desc">DMA ile belleğe yazma; uygulama bu node'dan okur</span></div>
+  </div>
+
+  <h3>V4L2 kernel mimarisi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — V4L2 cihazlarını listele</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm V4L2 cihazlarını listele</span>
+<span class="cmd">v4l2-ctl</span> <span class="flag">--list-devices</span>
+<span class="cmt"># Integrated Camera: Integrated Camera (usb-0000:00:14.0-6):</span>
+<span class="cmt">#   /dev/video0</span>
+<span class="cmt">#   /dev/video1</span>
+<span class="cmt"># imx219 4-0010: imx219 (platform:fe801000.csi):</span>
+<span class="cmt">#   /dev/video2</span>
+
+<span class="cmt"># Media controller cihazları</span>
+<span class="cmd">ls</span> /dev/media*
+<span class="cmt"># /dev/media0</span>
+
+<span class="cmt"># Subdev'leri listele</span>
+<span class="cmd">ls</span> /dev/v4l-subdev*</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>V4L2: /dev/videoN (frame yakalama) + /dev/v4l-subdevN (bileşen ayarı) + /dev/mediaN (pipeline)</li>
+      <li>MIPI CSI pipeline: sensör → CSI-2 alıcı → ISP → scaler → DMA → /dev/video0</li>
+      <li>v4l2-ctl --list-devices: sistemdeki tüm V4L2 cihazlarını listeler</li>
+      <li>Basit USB kameralar genellikle yalnızca /dev/video0; gömülü kameralar ek subdev ve media controller</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> v4l2-ctl ile temel kullanım</h2>
+  <p class="section-lead">v4l2-ctl, V4L2 cihazlarını komut satırından yönetmek, test etmek ve format ayarlamak için temel araçtır. v4l-utils paketinde gelir.</p>
+
+  <h3>Kurulum ve cihaz bilgisi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — v4l2-ctl kurulum ve bilgi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kurulum</span>
+<span class="cmd">sudo</span> apt-get install <span class="flag">-y</span> v4l-utils
+
+<span class="cmt"># Cihaz kapabilitelerini sorgula</span>
+<span class="cmd">v4l2-ctl</span> <span class="flag">-d</span> /dev/video0 <span class="flag">--all</span>
+
+<span class="cmt"># Kısa kapabilite özeti</span>
+<span class="cmd">v4l2-ctl</span> <span class="flag">-d</span> /dev/video0 <span class="flag">--info</span>
+<span class="cmt"># Driver name   : uvcvideo</span>
+<span class="cmt"># Card type     : HD USB Camera</span>
+<span class="cmt"># Bus info      : usb-0000:00:14.0-6</span>
+<span class="cmt"># Driver version: 6.6.0</span>
+<span class="cmt"># Capabilities  : 0x84a00001</span>
+<span class="cmt">#   Video Capture</span>
+<span class="cmt">#   Streaming</span></code></pre>
+  </div>
+
+  <h3>Desteklenen formatları sorgulama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — format listeleme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Desteklenen piksel formatları ve çözünürlükler</span>
+<span class="cmd">v4l2-ctl</span> <span class="flag">-d</span> /dev/video0 <span class="flag">--list-formats-ext</span>
+<span class="cmt"># ioctl: VIDIOC_ENUM_FMT</span>
+<span class="cmt"># Type: Video Capture</span>
+<span class="cmt">#   [0]: 'YUYV' (YUYV 4:2:2)</span>
+<span class="cmt">#     Size: Discrete 640x480</span>
+<span class="cmt">#       Interval: Discrete 0.033s (30.000 fps)</span>
+<span class="cmt">#     Size: Discrete 1280x720</span>
+<span class="cmt">#       Interval: Discrete 0.033s (30.000 fps)</span>
+<span class="cmt">#   [1]: 'MJPG' (Motion-JPEG)</span>
+<span class="cmt">#     Size: Discrete 1920x1080</span>
+<span class="cmt">#       Interval: Discrete 0.033s (30.000 fps)</span>
+
+<span class="cmt"># Mevcut format ayarı</span>
+<span class="cmd">v4l2-ctl</span> <span class="flag">-d</span> /dev/video0 <span class="flag">--get-fmt-video</span>
+<span class="cmt"># Format Video Capture:</span>
+<span class="cmt">#   Width/Height      : 640/480</span>
+<span class="cmt">#   Pixel Format      : 'YUYV' (YUYV 4:2:2)</span>
+<span class="cmt">#   Bytes per Line    : 1280</span>
+<span class="cmt">#   Size Image        : 614400</span></code></pre>
+  </div>
+
+  <h3>Format ayarlama ve streaming</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — format ayarlama ve frame yakalama</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Video formatını ayarla</span>
+<span class="cmd">v4l2-ctl</span> <span class="flag">-d</span> /dev/video0 \
+  <span class="flag">--set-fmt-video</span>=width=1280,height=720,pixelformat=YUYV
+
+<span class="cmt"># FPS ayarla</span>
+<span class="cmd">v4l2-ctl</span> <span class="flag">-d</span> /dev/video0 \
+  <span class="flag">--set-parm</span>=30
+
+<span class="cmt"># Tek frame yakala (JPEG)</span>
+<span class="cmd">v4l2-ctl</span> <span class="flag">-d</span> /dev/video0 \
+  <span class="flag">--set-fmt-video</span>=width=1920,height=1080,pixelformat=MJPG \
+  <span class="flag">--stream-mmap</span> <span class="flag">--stream-count</span>=1 \
+  <span class="flag">--stream-to</span>=frame.jpg
+
+<span class="cmt"># Sürekli streaming (10 saniye, her frame ayrı dosya)</span>
+<span class="cmd">v4l2-ctl</span> <span class="flag">-d</span> /dev/video0 \
+  <span class="flag">--stream-mmap</span> <span class="flag">--stream-count</span>=300 \
+  <span class="flag">--stream-to</span>=frames/frame-%04d.raw</code></pre>
+  </div>
+
+  <h3>V4L2 kontrolleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — kamera kontrolleri</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm kontrolleri listele</span>
+<span class="cmd">v4l2-ctl</span> <span class="flag">-d</span> /dev/video0 <span class="flag">--list-ctrls</span>
+<span class="cmt"># brightness 0x00980900 (int): min=-64 max=64 step=1 default=0 value=0</span>
+<span class="cmt"># contrast   0x00980901 (int): min=0  max=64 step=1 default=32 value=32</span>
+<span class="cmt"># exposure   0x00980911 (int): min=3  max=2047 step=1 default=250 value=250</span>
+
+<span class="cmt"># Kontrol değeri oku</span>
+<span class="cmd">v4l2-ctl</span> <span class="flag">-d</span> /dev/video0 <span class="flag">--get-ctrl</span>=brightness
+
+<span class="cmt"># Kontrol değeri yaz</span>
+<span class="cmd">v4l2-ctl</span> <span class="flag">-d</span> /dev/video0 <span class="flag">--set-ctrl</span>=brightness=10
+<span class="cmd">v4l2-ctl</span> <span class="flag">-d</span> /dev/video0 <span class="flag">--set-ctrl</span>=exposure_auto=1
+<span class="cmd">v4l2-ctl</span> <span class="flag">-d</span> /dev/video0 <span class="flag">--set-ctrl</span>=exposure=500</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>v4l2-ctl --list-formats-ext: desteklenen piksel formatları, çözünürlükler ve FPS değerleri</li>
+      <li>--set-fmt-video=width=X,height=Y,pixelformat=FOURCC: format ayarlama</li>
+      <li>--stream-mmap --stream-count=N --stream-to=file: frame yakalama (programsız)</li>
+      <li>--list-ctrls / --set-ctrl: brightness, contrast, exposure gibi kamera parametreleri</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> V4L2 ioctl API: temel operasyonlar</h2>
+  <p class="section-lead">V4L2 uygulamaları /dev/videoN dosyası üzerinde ioctl çağrıları yapar. Temel akış: cihazı aç → kapabilitesini sorgula → format ayarla → buffer'lar tahsis et → streaming başlat → frame oku.</p>
+
+  <h3>VIDIOC_QUERYCAP: kapabilite sorgulama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — VIDIOC_QUERYCAP</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;stdio.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;linux/videodev2.h&gt;
+
+int main(void)
+{
+    int fd = open("/dev/video0", O_RDWR);
+    if (fd &lt; 0) { perror("open"); return 1; }
+
+    struct v4l2_capability cap;
+    if (ioctl(fd, VIDIOC_QUERYCAP, &cap) &lt; 0) {
+        perror("VIDIOC_QUERYCAP"); return 1;
+    }
+
+    printf("Driver:  %s\n", cap.driver);
+    printf("Card:    %s\n", cap.card);
+    printf("Bus:     %s\n", cap.bus_info);
+
+    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
+        fprintf(stderr, "Video capture desteklenmiyor\n");
+        return 1;
+    }
+    if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
+        fprintf(stderr, "Streaming desteklenmiyor\n");
+        return 1;
+    }
+    return 0;
+}</code></pre>
+  </div>
+
+  <h3>VIDIOC_S_FMT: format ayarlama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — VIDIOC_S_FMT</span><span class="dot">●</span></div>
+    <pre><code>int set_format(int fd, uint32_t width, uint32_t height, uint32_t pixfmt)
+{
+    struct v4l2_format fmt;
+    memset(&fmt, 0, sizeof(fmt));
+
+    fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width       = width;
+    fmt.fmt.pix.height      = height;
+    fmt.fmt.pix.pixelformat = pixfmt;   /* V4L2_PIX_FMT_YUYV vb. */
+    fmt.fmt.pix.field       = V4L2_FIELD_NONE;  /* Progressive scan */
+
+    if (ioctl(fd, VIDIOC_S_FMT, &fmt) &lt; 0) {
+        perror("VIDIOC_S_FMT");
+        return -1;
+    }
+
+    /* Sürücü istediğimiz formatı değiştirmiş olabilir — gerçek değerleri oku */
+    printf("Ayarlanan format: %dx%d\n",
+           fmt.fmt.pix.width, fmt.fmt.pix.height);
+    printf("Bytes per line: %u\n", fmt.fmt.pix.bytesperline);
+    printf("Size image: %u\n", fmt.fmt.pix.sizeimage);
+
+    return 0;
+}
+
+<span class="cmt">/* VIDIOC_TRY_FMT: format desteklenip desteklenmediğini test et (değişiklik yapmaz) */</span>
+int try_format(int fd, uint32_t width, uint32_t height, uint32_t pixfmt)
+{
+    struct v4l2_format fmt;
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width       = width;
+    fmt.fmt.pix.height      = height;
+    fmt.fmt.pix.pixelformat = pixfmt;
+
+    if (ioctl(fd, VIDIOC_TRY_FMT, &fmt) &lt; 0) {
+        perror("VIDIOC_TRY_FMT");
+        return -1;
+    }
+
+    printf("Desteklenen en yakın: %dx%d\n",
+           fmt.fmt.pix.width, fmt.fmt.pix.height);
+    return 0;
+}</code></pre>
+  </div>
+
+  <h3>VIDIOC_REQBUFS: buffer talep etme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — VIDIOC_REQBUFS</span><span class="dot">●</span></div>
+    <pre><code>int request_buffers(int fd, uint32_t count, uint32_t memory_type)
+{
+    struct v4l2_requestbuffers req;
+    memset(&req, 0, sizeof(req));
+
+    req.count  = count;                  /* İstenen buffer sayısı */
+    req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = memory_type;            /* V4L2_MEMORY_MMAP, USERPTR veya DMABUF */
+
+    if (ioctl(fd, VIDIOC_REQBUFS, &req) &lt; 0) {
+        perror("VIDIOC_REQBUFS");
+        return -1;
+    }
+
+    if (req.count &lt; 2) {
+        fprintf(stderr, "Yetersiz buffer: %u\n", req.count);
+        return -1;
+    }
+
+    printf("Tahsis edilen buffer sayısı: %u\n", req.count);
+    return req.count;
+}
+
+<span class="cmt">/* VIDIOC_QUERYBUF: buffer bilgisini sorgula (MMAP için offset) */</span>
+void query_buffer(int fd, uint32_t index, struct v4l2_buffer *buf)
+{
+    memset(buf, 0, sizeof(*buf));
+    buf->type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf->memory = V4L2_MEMORY_MMAP;
+    buf->index  = index;
+
+    if (ioctl(fd, VIDIOC_QUERYBUF, buf) &lt; 0)
+        perror("VIDIOC_QUERYBUF");
+}
+
+<span class="cmt">/* VIDIOC_QBUF: buffer'ı kuyruğa ekle (sürücüye ver) */</span>
+<span class="cmt">/* VIDIOC_DQBUF: dolu buffer'ı kuyruktan al (uygulama işler) */</span></code></pre>
+  </div>
+
+  <h3>Streaming başlatma ve durdurma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — VIDIOC_STREAMON / STREAMOFF</span><span class="dot">●</span></div>
+    <pre><code>int start_streaming(int fd)
+{
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(fd, VIDIOC_STREAMON, &type) &lt; 0) {
+        perror("VIDIOC_STREAMON");
+        return -1;
+    }
+    return 0;
+}
+
+int stop_streaming(int fd)
+{
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(fd, VIDIOC_STREAMOFF, &type) &lt; 0) {
+        perror("VIDIOC_STREAMOFF");
+        return -1;
+    }
+    return 0;
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>VIDIOC_QUERYCAP: sürücü adı, kart bilgisi, desteklenen kapabiliteler (capture/streaming)</li>
+      <li>VIDIOC_S_FMT: çözünürlük ve piksel formatı ayarla; sürücü en yakın desteklenen değeri döner</li>
+      <li>VIDIOC_TRY_FMT: format test et (değişiklik yapmadan)</li>
+      <li>VIDIOC_REQBUFS → VIDIOC_QUERYBUF → QBUF/DQBUF: buffer yönetim döngüsü</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Buffer yönetimi: MMAP, USERPTR ve DMA-BUF</h2>
+  <p class="section-lead">V4L2 üç farklı bellek yönetimi yöntemi sunar. MMAP en yaygın kullanılandır; USERPTR uygulamanın kendi belleğini kullanır; DMA-BUF sıfır kopya pipeline'lar için kullanılır.</p>
+
+  <h3>MMAP buffer yönetimi</h3>
+  <p>Kernel, buffer'ları tahsis eder. Uygulama <code>mmap()</code> ile bu belleğe erişir. En güvenli ve en yaygın yöntemdir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — MMAP buffer kurulumu ve kullanımı</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;sys/mman.h&gt;
+
+#define BUFFER_COUNT 4
+
+struct buffer {
+    void   *start;
+    size_t  length;
+};
+
+struct buffer buffers[BUFFER_COUNT];
+
+int setup_mmap_buffers(int fd)
+{
+    /* Buffer talep et */
+    struct v4l2_requestbuffers req = {
+        .count  = BUFFER_COUNT,
+        .type   = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        .memory = V4L2_MEMORY_MMAP,
+    };
+    if (ioctl(fd, VIDIOC_REQBUFS, &req) &lt; 0) {
+        perror("VIDIOC_REQBUFS"); return -1;
+    }
+
+    /* Her buffer'ı mmap et */
+    for (uint32_t i = 0; i &lt; req.count; i++) {
+        struct v4l2_buffer buf = {
+            .type   = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+            .memory = V4L2_MEMORY_MMAP,
+            .index  = i,
+        };
+        if (ioctl(fd, VIDIOC_QUERYBUF, &buf) &lt; 0) {
+            perror("VIDIOC_QUERYBUF"); return -1;
+        }
+
+        buffers[i].length = buf.length;
+        buffers[i].start  = mmap(NULL, buf.length,
+                                 PROT_READ | PROT_WRITE,
+                                 MAP_SHARED,
+                                 fd, buf.m.offset);
+        if (buffers[i].start == MAP_FAILED) {
+            perror("mmap"); return -1;
+        }
+
+        /* Buffer'ı kuyruğa ekle (sürücüye ver) */
+        if (ioctl(fd, VIDIOC_QBUF, &buf) &lt; 0) {
+            perror("VIDIOC_QBUF"); return -1;
+        }
+    }
+    return 0;
+}
+
+int capture_frame(int fd, void **data, size_t *size,
+                  struct timeval *timestamp)
+{
+    struct v4l2_buffer buf = {
+        .type   = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        .memory = V4L2_MEMORY_MMAP,
+    };
+
+    /* Dolu buffer al */
+    if (ioctl(fd, VIDIOC_DQBUF, &buf) &lt; 0) {
+        perror("VIDIOC_DQBUF"); return -1;
+    }
+
+    *data      = buffers[buf.index].start;
+    *size      = buf.bytesused;
+    *timestamp = buf.timestamp;  /* Kernel timestamp */
+
+    /* İşle... */
+
+    /* Buffer'ı geri ver */
+    if (ioctl(fd, VIDIOC_QBUF, &buf) &lt; 0) {
+        perror("VIDIOC_QBUF"); return -1;
+    }
+    return 0;
+}
+
+void cleanup_mmap_buffers(uint32_t count)
+{
+    for (uint32_t i = 0; i &lt; count; i++)
+        munmap(buffers[i].start, buffers[i].length);
+}</code></pre>
+  </div>
+
+  <h3>USERPTR buffer yönetimi</h3>
+  <p>Uygulama kendi tahsis ettiği belleği sürücüye verir. DMA scatter-gather uyumlu bellek gerekebilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — USERPTR buffer kurulumu</span><span class="dot">●</span></div>
+    <pre><code>int setup_userptr_buffers(int fd, size_t frame_size)
+{
+    struct v4l2_requestbuffers req = {
+        .count  = BUFFER_COUNT,
+        .type   = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        .memory = V4L2_MEMORY_USERPTR,
+    };
+    if (ioctl(fd, VIDIOC_REQBUFS, &req) &lt; 0) {
+        perror("VIDIOC_REQBUFS"); return -1;
+    }
+
+    for (uint32_t i = 0; i &lt; BUFFER_COUNT; i++) {
+        /* Page-aligned bellek tahsis et */
+        if (posix_memalign(&buffers[i].start, getpagesize(), frame_size)) {
+            return -1;
+        }
+        buffers[i].length = frame_size;
+
+        struct v4l2_buffer buf = {
+            .type      = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+            .memory    = V4L2_MEMORY_USERPTR,
+            .index     = i,
+            .m.userptr = (unsigned long)buffers[i].start,
+            .length    = frame_size,
+        };
+        if (ioctl(fd, VIDIOC_QBUF, &buf) &lt; 0) {
+            perror("VIDIOC_QBUF"); return -1;
+        }
+    }
+    return 0;
+}</code></pre>
+  </div>
+
+  <h3>buf.timestamp: frame zamanlaması</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — timestamp okuma</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* VIDIOC_DQBUF sonrasında buf.timestamp kernel zamanını içerir */</span>
+struct v4l2_buffer buf;
+ioctl(fd, VIDIOC_DQBUF, &buf);
+
+<span class="cmt">/* Saniye ve mikrosaniye */</span>
+printf("Frame timestamp: %ld.%06ld\n",
+       buf.timestamp.tv_sec,
+       buf.timestamp.tv_usec);
+
+<span class="cmt">/* İki frame arası süre (FPS hesaplama) */</span>
+static struct timeval prev_ts = {0};
+double dt = (buf.timestamp.tv_sec  - prev_ts.tv_sec) +
+            (buf.timestamp.tv_usec - prev_ts.tv_usec) * 1e-6;
+printf("FPS: %.1f\n", 1.0 / dt);
+prev_ts = buf.timestamp;</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>MMAP: kernel tahsis eder, uygulama mmap() ile erişir; en yaygın ve taşınabilir yöntem</li>
+      <li>USERPTR: uygulama tahsis eder, page-aligned bellek gerektirir; DMA için dikkat gerekir</li>
+      <li>QBUF/DQBUF döngüsü: boş buffer sürücüye ver → dolu buffer geri al → işle → geri ver</li>
+      <li>buf.timestamp: kernel'ın frame'i aldığı anı CLOCK_MONOTONIC ile ölçer</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Pixel formatları ve format negotiation</h2>
+  <p class="section-lead">V4L2, onlarca piksel formatını destekler. Doğru formatı seçmek hem işlem yükünü hem de bellek bant genişliğini doğrudan etkiler.</p>
+
+  <h3>Yaygın V4L2 piksel formatları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>FourCC</th><th>V4L2 sabiti</th><th>Bit/piksel</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td>YUYV</td><td>V4L2_PIX_FMT_YUYV</td><td>16</td><td>YUV 4:2:2 interleaved; en yaygın USB kamera formatı</td></tr>
+        <tr><td>NV12</td><td>V4L2_PIX_FMT_NV12</td><td>12</td><td>YUV 4:2:0 semi-planar; video codec ve GPU için</td></tr>
+        <tr><td>NV21</td><td>V4L2_PIX_FMT_NV21</td><td>12</td><td>NV12 ile U/V sırası değişik; Android kameralar</td></tr>
+        <tr><td>YU12/I420</td><td>V4L2_PIX_FMT_YUV420</td><td>12</td><td>YUV 4:2:0 fully planar</td></tr>
+        <tr><td>RGB24</td><td>V4L2_PIX_FMT_RGB24</td><td>24</td><td>8:8:8 RGB; OpenCV için hazır</td></tr>
+        <tr><td>BGR24</td><td>V4L2_PIX_FMT_BGR24</td><td>24</td><td>8:8:8 BGR; OpenCV'nin tercih ettiği</td></tr>
+        <tr><td>MJPG</td><td>V4L2_PIX_FMT_MJPEG</td><td>değişken</td><td>Motion JPEG; yüksek çözünürlük için bant genişliği tasarrufu</td></tr>
+        <tr><td>H264</td><td>V4L2_PIX_FMT_H264</td><td>değişken</td><td>H.264 compressed; donanım codec'li kameralar</td></tr>
+        <tr><td>RGGB</td><td>V4L2_PIX_FMT_SRGGB10</td><td>10/16</td><td>Bayer RAW; ISP öncesi ham sensör verisi</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>YUYV'dan RGB'ye dönüşüm</h3>
+  <p>USB kameralar genellikle YUYV formatında veri gönderir. OpenCV veya görüntü işleme için RGB'ye çevirmek gerekir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — YUYV → RGB24 dönüşüm</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* YUYV: Y0 U0 Y1 V0 | Y2 U2 Y3 V2 | ...
+   Her iki Y için bir (U,V) çifti — 4 bayt = 2 piksel */</span>
+void yuyv_to_rgb(const uint8_t *yuyv, uint8_t *rgb,
+                 int width, int height)
+{
+    int npixels = width * height;
+    for (int i = 0; i &lt; npixels / 2; i++) {
+        int y0 = yuyv[4*i + 0];
+        int u  = yuyv[4*i + 1];
+        int y1 = yuyv[4*i + 2];
+        int v  = yuyv[4*i + 3];
+
+        u -= 128; v -= 128;
+
+        /* Piksel 0 */
+        int r = y0 + 1.402   * v;
+        int g = y0 - 0.344   * u - 0.714 * v;
+        int b = y0 + 1.772   * u;
+        rgb[6*i+0] = (uint8_t)(r &lt; 0 ? 0 : r &gt; 255 ? 255 : r);
+        rgb[6*i+1] = (uint8_t)(g &lt; 0 ? 0 : g &gt; 255 ? 255 : g);
+        rgb[6*i+2] = (uint8_t)(b &lt; 0 ? 0 : b &gt; 255 ? 255 : b);
+
+        /* Piksel 1 */
+        r = y1 + 1.402   * v;
+        g = y1 - 0.344   * u - 0.714 * v;
+        b = y1 + 1.772   * u;
+        rgb[6*i+3] = (uint8_t)(r &lt; 0 ? 0 : r &gt; 255 ? 255 : r);
+        rgb[6*i+4] = (uint8_t)(g &lt; 0 ? 0 : g &gt; 255 ? 255 : g);
+        rgb[6*i+5] = (uint8_t)(b &lt; 0 ? 0 : b &gt; 255 ? 255 : b);
+    }
+}</code></pre>
+  </div>
+
+  <h3>Format enumeration ve negotiation</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — VIDIOC_ENUM_FMT ile format listesi</span><span class="dot">●</span></div>
+    <pre><code>void list_formats(int fd)
+{
+    struct v4l2_fmtdesc fmtdesc;
+    memset(&fmtdesc, 0, sizeof(fmtdesc));
+    fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+    for (fmtdesc.index = 0;
+         ioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc) == 0;
+         fmtdesc.index++) {
+
+        printf("[%u] %.4s — %s\n",
+               fmtdesc.index,
+               (char *)&fmtdesc.pixelformat,
+               fmtdesc.description);
+
+        /* Bu format için desteklenen çözünürlükler */
+        struct v4l2_frmsizeenum frmsize = {
+            .pixel_format = fmtdesc.pixelformat,
+            .index = 0,
+        };
+        while (ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) == 0) {
+            if (frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
+                printf("  %ux%u\n",
+                       frmsize.discrete.width,
+                       frmsize.discrete.height);
+            }
+            frmsize.index++;
+        }
+    }
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>YUYV: en yaygın USB kamera formatı; 4 bayt = 2 piksel (YUV 4:2:2)</li>
+      <li>NV12: video codec ve GPU için ideal; YUV 4:2:0 semi-planar</li>
+      <li>VIDIOC_ENUM_FMT + VIDIOC_ENUM_FRAMESIZES: desteklenen tüm format ve çözünürlükleri listeler</li>
+      <li>VIDIOC_TRY_FMT önce test et, VIDIOC_S_FMT ile ayarla; sürücü en yakın değeri döner</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Media controller: pipeline yapılandırma</h2>
+  <p class="section-lead">Media controller, karmaşık video pipeline'larını grafik olarak yönetir. Her bileşen bir entity'dir; entity'ler arasındaki veri akışı pad'ler ve link'ler ile tanımlanır.</p>
+
+  <h3>Media controller kavramları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Entity</span><span class="desc">Pipeline bileşeni: sensör, CSI-2 alıcı, ISP, scaler, video node</span></div>
+    <div class="param"><span class="name">Pad</span><span class="desc">Entity'nin giriş (sink) veya çıkış (source) bağlantı noktası</span></div>
+    <div class="param"><span class="name">Link</span><span class="desc">Bir entity'nin source pad'ini başka entity'nin sink pad'ine bağlar</span></div>
+    <div class="param"><span class="name">Pipeline</span><span class="desc">Sensörden DMA belleğe kadar tüm aktif link zinciri</span></div>
+  </div>
+
+  <h3>media-ctl ile pipeline keşfi ve yapılandırma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — media-ctl kullanımı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kurulum</span>
+<span class="cmd">sudo</span> apt-get install <span class="flag">-y</span> v4l-utils
+
+<span class="cmt"># Media controller pipeline'ını görüntüle</span>
+<span class="cmd">media-ctl</span> <span class="flag">-d</span> /dev/media0 <span class="flag">--print-topology</span>
+
+<span class="cmt"># Örnek çıktı (Raspberry Pi CSI kamera):</span>
+<span class="cmt"># Media controller API version 6.6.31</span>
+<span class="cmt">#</span>
+<span class="cmt"># Media device information</span>
+<span class="cmt"># driver          : rp1-cfe</span>
+<span class="cmt"># model           : rp1-cfe</span>
+<span class="cmt">#</span>
+<span class="cmt"># Entities:</span>
+<span class="cmt"># - imx219 4-0010 (2 pads, 0 links)</span>
+<span class="cmt">#   pad0: Source [fmt:SRGGB10_1X10/3280x2464]</span>
+<span class="cmt"># - fe801000.csi (4 pads, 3 links)</span>
+<span class="cmt">#   pad0: Sink   [fmt:SRGGB10_1X10/3280x2464]</span>
+<span class="cmt">#   pad1: Source</span>
+
+<span class="cmt"># Link etkinleştir: imx219 → CSI alıcı</span>
+<span class="cmd">media-ctl</span> <span class="flag">-d</span> /dev/media0 \
+  <span class="flag">--links</span> '"imx219 4-0010":0->"fe801000.csi":0[1]'
+
+<span class="cmt"># Format ayarla: sensör çözünürlüğü</span>
+<span class="cmd">media-ctl</span> <span class="flag">-d</span> /dev/media0 \
+  <span class="flag">--set-v4l2</span> '"imx219 4-0010":0[fmt:SRGGB10_1X10/1920x1080]'
+
+<span class="cmt"># CSI alıcı çıkışı</span>
+<span class="cmd">media-ctl</span> <span class="flag">-d</span> /dev/media0 \
+  <span class="flag">--set-v4l2</span> '"fe801000.csi":1[fmt:SRGGB10_1X10/1920x1080]'</code></pre>
+  </div>
+
+  <h3>Tam Raspberry Pi kamera pipeline kurulumu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — RPi IMX219 pipeline kurulumu</span><span class="dot">●</span></div>
+    <pre><code>#!/bin/bash
+# rpi_camera_setup.sh — IMX219 MIPI CSI pipeline
+
+MEDIA=/dev/media0
+WIDTH=1920
+HEIGHT=1080
+FORMAT=SRGGB10_1X10
+
+<span class="cmt"># Pipeline link'lerini etkinleştir</span>
+media-ctl -d $MEDIA --links '"imx219 4-0010":0->"fe801000.csi":0[1]'
+media-ctl -d $MEDIA --links '"fe801000.csi":1->"rp1-cfe-csi2_ch0":0[1]'
+
+<span class="cmt"># Sensör formatı</span>
+media-ctl -d $MEDIA \
+  --set-v4l2 "\"imx219 4-0010\":0[fmt:${FORMAT}/${WIDTH}x${HEIGHT}]"
+
+<span class="cmt"># CSI alıcı pad formatları</span>
+media-ctl -d $MEDIA \
+  --set-v4l2 "\"fe801000.csi\":0[fmt:${FORMAT}/${WIDTH}x${HEIGHT}]"
+media-ctl -d $MEDIA \
+  --set-v4l2 "\"fe801000.csi\":1[fmt:${FORMAT}/${WIDTH}x${HEIGHT}]"
+
+<span class="cmt"># Video node formatı</span>
+v4l2-ctl -d /dev/video0 \
+  --set-fmt-video=width=$WIDTH,height=$HEIGHT,pixelformat=pRAA
+
+echo "Pipeline hazır: v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=1 --stream-to=frame.raw"</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Media controller: entity (bileşen) + pad (giriş/çıkış) + link (bağlantı) kavramları</li>
+      <li>media-ctl --print-topology: pipeline'ı ve mevcut link'leri görüntüler</li>
+      <li>--links: entity'ler arası link etkinleştirme; format[1]=etkin, format[0]=pasif</li>
+      <li>--set-v4l2: her entity/pad için format ve çözünürlük ayarı</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> ISP ve subdev kontrolü</h2>
+  <p class="section-lead">MIPI CSI kameralarda sensör ve ISP parametreleri, V4L2 subdev arayüzü üzerinden ayarlanır. VIDIOC_SUBDEV_S_FMT, crop ve kontroller bu arayüzün temel araçlarıdır.</p>
+
+  <h3>VIDIOC_SUBDEV_S_FMT: subdev format ayarı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — subdev format ayarlama</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/v4l2-subdev.h&gt;
+
+int set_subdev_format(int subdev_fd, uint32_t pad,
+                      uint32_t width, uint32_t height,
+                      uint32_t mbus_code)
+{
+    struct v4l2_subdev_format fmt;
+    memset(&fmt, 0, sizeof(fmt));
+
+    fmt.which           = V4L2_SUBDEV_FORMAT_ACTIVE;
+    fmt.pad             = pad;
+    fmt.format.width    = width;
+    fmt.format.height   = height;
+    fmt.format.code     = mbus_code;     /* MEDIA_BUS_FMT_SRGGB10_1X10 vb. */
+    fmt.format.field    = V4L2_FIELD_NONE;
+    fmt.format.colorspace = V4L2_COLORSPACE_RAW;
+
+    if (ioctl(subdev_fd, VIDIOC_SUBDEV_S_FMT, &fmt) &lt; 0) {
+        perror("VIDIOC_SUBDEV_S_FMT");
+        return -1;
+    }
+    return 0;
+}</code></pre>
+  </div>
+
+  <h3>Crop ve compose: seçim bölgeleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — subdev crop ayarı</span><span class="dot">●</span></div>
+    <pre><code>int set_subdev_crop(int subdev_fd, uint32_t pad,
+                    uint32_t left, uint32_t top,
+                    uint32_t width, uint32_t height)
+{
+    struct v4l2_subdev_selection sel;
+    memset(&sel, 0, sizeof(sel));
+
+    sel.which    = V4L2_SUBDEV_FORMAT_ACTIVE;
+    sel.pad      = pad;
+    sel.target   = V4L2_SEL_TGT_CROP;   /* Crop hedefi */
+    sel.r.left   = left;
+    sel.r.top    = top;
+    sel.r.width  = width;
+    sel.r.height = height;
+
+    if (ioctl(subdev_fd, VIDIOC_SUBDEV_S_SELECTION, &sel) &lt; 0) {
+        perror("VIDIOC_SUBDEV_S_SELECTION");
+        return -1;
+    }
+    return 0;
+}</code></pre>
+  </div>
+
+  <h3>Sensör kontrolleri: exposure ve gain</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — V4L2 kontrol API ile sensör parametreleri</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/v4l2-controls.h&gt;
+
+int set_sensor_control(int subdev_fd, uint32_t control_id, int32_t value)
+{
+    struct v4l2_control ctrl = {
+        .id    = control_id,
+        .value = value,
+    };
+    if (ioctl(subdev_fd, VIDIOC_S_CTRL, &ctrl) &lt; 0) {
+        perror("VIDIOC_S_CTRL");
+        return -1;
+    }
+    return 0;
+}
+
+<span class="cmt">/* Kullanım örnekleri */</span>
+void configure_sensor(int subdev_fd)
+{
+    <span class="cmt">/* Manuel exposure modu */</span>
+    set_sensor_control(subdev_fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_MANUAL);
+
+    <span class="cmt">/* Exposure süresi (birim: satır/mikrosaniye, sürücüye göre) */</span>
+    set_sensor_control(subdev_fd, V4L2_CID_EXPOSURE, 1000);
+
+    <span class="cmt">/* Analog gain */</span>
+    set_sensor_control(subdev_fd, V4L2_CID_ANALOGUE_GAIN, 256);
+
+    <span class="cmt">/* Dijital gain */</span>
+    set_sensor_control(subdev_fd, V4L2_CID_DIGITAL_GAIN, 256);
+
+    <span class="cmt">/* White balance sıcaklığı */</span>
+    set_sensor_control(subdev_fd, V4L2_CID_WHITE_BALANCE_TEMPERATURE, 5000);
+
+    <span class="cmt">/* Flip: dikey/yatay */</span>
+    set_sensor_control(subdev_fd, V4L2_CID_VFLIP, 0);
+    set_sensor_control(subdev_fd, V4L2_CID_HFLIP, 0);
+}</code></pre>
+  </div>
+
+  <h3>Genişletilmiş kontroller (v4l2_ext_controls)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — birden fazla kontrol atomik ayar</span><span class="dot">●</span></div>
+    <pre><code>void set_multiple_controls(int fd)
+{
+    struct v4l2_ext_control ctrls[2] = {
+        { .id = V4L2_CID_EXPOSURE,      .value = 1000 },
+        { .id = V4L2_CID_ANALOGUE_GAIN, .value = 256  },
+    };
+    struct v4l2_ext_controls ext = {
+        .ctrl_class  = V4L2_CTRL_CLASS_CAMERA,
+        .count       = 2,
+        .controls    = ctrls,
+    };
+    if (ioctl(fd, VIDIOC_S_EXT_CTRLS, &ext) &lt; 0)
+        perror("VIDIOC_S_EXT_CTRLS");
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>VIDIOC_SUBDEV_S_FMT: subdev pad'inin format ve çözünürlüğünü ayarlar; mbus_code medya veri yolu formatı</li>
+      <li>VIDIOC_SUBDEV_S_SELECTION (V4L2_SEL_TGT_CROP): subdev'de crop bölgesi tanımlar</li>
+      <li>V4L2_CID_EXPOSURE / V4L2_CID_ANALOGUE_GAIN: sensör exposure ve kazanç ayarı</li>
+      <li>VIDIOC_S_EXT_CTRLS: birden fazla kontrol atomik olarak ayarlar; güvenli senkronizasyon</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> DMA-BUF ve sıfır kopya pipeline</h2>
+  <p class="section-lead">DMA-BUF, farklı kernel subsystem'ler arasında bellek tamponu paylaşımının standart mekanizmasıdır. V4L2 → GPU veya V4L2 → Video Decoder gibi sıfır kopya pipeline'lar için kritiktir.</p>
+
+  <h3>DMA-BUF kavramı</h3>
+  <p>Normalde kamera frame'ini işlemek için veriyi V4L2 buffer'ından GPU belleğine kopyalamak gerekir. Bu kopyalama CPU ve bellek bant genişliğini tüketir. DMA-BUF ile kamera frame'i doğrudan GPU'nun erişebileceği bellekte olur; kopyalamaya gerek kalmaz.</p>
+
+  <div class="flow">
+    <pre>Kamera (DMA) → MMAP buffer → CPU kopyalama → GPU belleği     [Kopya yöntemi]
+Kamera (DMA) → DMA-BUF       → GPU import (fd paylaşımı)      [Sıfır kopya]</pre>
+  </div>
+
+  <h3>V4L2 DMA-BUF export</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — V4L2 buffer'ını DMA-BUF olarak dışa aktar</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/videodev2.h&gt;
+
+/* V4L2 buffer'ını DMA-BUF fd'ye dönüştür */
+int export_dmabuf(int v4l2_fd, uint32_t buf_index)
+{
+    struct v4l2_exportbuffer expbuf;
+    memset(&expbuf, 0, sizeof(expbuf));
+
+    expbuf.type  = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    expbuf.index = buf_index;
+    expbuf.plane = 0;    /* Multi-planar için plane numarası */
+    expbuf.flags = O_RDONLY;
+
+    if (ioctl(v4l2_fd, VIDIOC_EXPBUF, &expbuf) &lt; 0) {
+        perror("VIDIOC_EXPBUF");
+        return -1;
+    }
+
+    /* expbuf.fd: DMA-BUF file descriptor
+       Bu fd başka bir driver'a aktarılabilir (GPU, video decoder vb.) */
+    return expbuf.fd;
+}</code></pre>
+  </div>
+
+  <h3>DMA-BUF import: GPU'ya aktarma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — DMA-BUF fd'yi DRM ile GPU'ya import et</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;xf86drm.h&gt;
+#include &lt;drm/drm.h&gt;
+
+/* DMA-BUF fd'yi DRM/GEM handle'a dönüştür */
+uint32_t import_dmabuf_to_drm(int drm_fd, int dmabuf_fd)
+{
+    struct drm_prime_handle prime = {
+        .fd     = dmabuf_fd,
+        .flags  = 0,
+    };
+
+    if (ioctl(drm_fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &prime) &lt; 0) {
+        perror("DRM_IOCTL_PRIME_FD_TO_HANDLE");
+        return 0;
+    }
+
+    /* prime.handle: GPU'nun bu buffer'a erişmesi için GEM handle */
+    return prime.handle;
+}
+
+/* DMA-BUF sıfır kopya pipeline */
+void zero_copy_pipeline(int v4l2_fd, int drm_fd)
+{
+    /* 1. V4L2 MMAP buffer'larını tahsis et */
+    request_buffers(v4l2_fd, 4, V4L2_MEMORY_MMAP);
+
+    /* 2. Her buffer için DMA-BUF fd al */
+    int dmabuf_fds[4];
+    for (int i = 0; i &lt; 4; i++) {
+        dmabuf_fds[i] = export_dmabuf(v4l2_fd, i);
+        /* Bu fd'yi GPU'ya ver — kopyalama yok */
+        uint32_t gem = import_dmabuf_to_drm(drm_fd, dmabuf_fds[i]);
+        printf("Buffer %d: dmabuf_fd=%d, gem=%u\n", i, dmabuf_fds[i], gem);
+    }
+
+    /* 3. Streaming döngüsü — GPU doğrudan kamera buffer'ına erişir */
+    start_streaming(v4l2_fd);
+    /* ... DQBUF → GPU işle → QBUF döngüsü ... */
+}</code></pre>
+  </div>
+
+  <h3>DMA-BUF ile V4L2 import</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — DMA-BUF'u V4L2'ye import (V4L2_MEMORY_DMABUF)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Dışarıdan tahsis edilmiş DMA-BUF'u V4L2'ye ver */</span>
+int setup_dmabuf_import(int fd, int *dmabuf_fds, uint32_t count)
+{
+    struct v4l2_requestbuffers req = {
+        .count  = count,
+        .type   = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        .memory = V4L2_MEMORY_DMABUF,
+    };
+    if (ioctl(fd, VIDIOC_REQBUFS, &req) &lt; 0) {
+        perror("VIDIOC_REQBUFS"); return -1;
+    }
+
+    for (uint32_t i = 0; i &lt; count; i++) {
+        struct v4l2_buffer buf = {
+            .type        = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+            .memory      = V4L2_MEMORY_DMABUF,
+            .index       = i,
+            .m.fd        = dmabuf_fds[i],  /* DMA-BUF fd */
+        };
+        if (ioctl(fd, VIDIOC_QBUF, &buf) &lt; 0) {
+            perror("VIDIOC_QBUF"); return -1;
+        }
+    }
+    return 0;
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>DMA-BUF: kernel subsystem'ler arasında buffer paylaşımı; file descriptor üzerinden</li>
+      <li>VIDIOC_EXPBUF: V4L2 MMAP buffer'ını DMA-BUF fd'ye dönüştürür</li>
+      <li>DRM_IOCTL_PRIME_FD_TO_HANDLE: DMA-BUF fd'yi GPU GEM handle'a çevirir; sıfır kopya GPU erişimi</li>
+      <li>V4L2_MEMORY_DMABUF + VIDIOC_QBUF: dışarıdan gelen DMA-BUF'u V4L2'ye import eder</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: C ile frame yakalama ve test araçları</h2>
+  <p class="section-lead">Tam C uygulaması ile MMAP buffer kullanarak YUYV frame yakalama, PPM dosyasına kaydetme, v4l2-compliance ile driver test ve ffmpeg V4L2 backend.</p>
+
+  <h3>Tam frame yakalama uygulaması</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — v4l2_capture.c: MMAP + YUYV → PPM</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;linux/videodev2.h&gt;
+
+#define WIDTH  640
+#define HEIGHT 480
+#define NBUFS  4
+
+struct buffer { void *start; size_t length; };
+static struct buffer bufs[NBUFS];
+
+static uint8_t clamp(int v) {
+    return (uint8_t)(v &lt; 0 ? 0 : v &gt; 255 ? 255 : v);
+}
+
+static void save_ppm(const uint8_t *yuyv, const char *filename)
+{
+    FILE *f = fopen(filename, "wb");
+    fprintf(f, "P6\n%d %d\n255\n", WIDTH, HEIGHT);
+
+    for (int i = 0; i &lt; WIDTH * HEIGHT / 2; i++) {
+        int y0 = yuyv[4*i],   u = yuyv[4*i+1] - 128;
+        int y1 = yuyv[4*i+2], v = yuyv[4*i+3] - 128;
+        uint8_t p[6] = {
+            clamp(y0 + 1402*v/1000),
+            clamp(y0 - 344*u/1000 - 714*v/1000),
+            clamp(y0 + 1772*u/1000),
+            clamp(y1 + 1402*v/1000),
+            clamp(y1 - 344*u/1000 - 714*v/1000),
+            clamp(y1 + 1772*u/1000),
+        };
+        fwrite(p, 1, 6, f);
+    }
+    fclose(f);
+}
+
+int main(int argc, char *argv[])
+{
+    const char *dev = argc > 1 ? argv[1] : "/dev/video0";
+
+    int fd = open(dev, O_RDWR);
+    if (fd &lt; 0) { perror("open"); return 1; }
+
+    /* Kapabilite kontrolü */
+    struct v4l2_capability cap;
+    ioctl(fd, VIDIOC_QUERYCAP, &cap);
+    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE) ||
+        !(cap.capabilities & V4L2_CAP_STREAMING)) {
+        fprintf(stderr, "Gerekli kapabilite yok\n"); return 1;
+    }
+
+    /* Format ayarla */
+    struct v4l2_format fmt = {
+        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+    };
+    fmt.fmt.pix.width       = WIDTH;
+    fmt.fmt.pix.height      = HEIGHT;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+    fmt.fmt.pix.field       = V4L2_FIELD_NONE;
+    ioctl(fd, VIDIOC_S_FMT, &fmt);
+
+    /* Buffer'ları tahsis et */
+    struct v4l2_requestbuffers req = {
+        .count = NBUFS, .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        .memory = V4L2_MEMORY_MMAP,
+    };
+    ioctl(fd, VIDIOC_REQBUFS, &req);
+
+    for (int i = 0; i &lt; NBUFS; i++) {
+        struct v4l2_buffer b = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+                                 .memory = V4L2_MEMORY_MMAP, .index = i };
+        ioctl(fd, VIDIOC_QUERYBUF, &b);
+        bufs[i].length = b.length;
+        bufs[i].start  = mmap(NULL, b.length, PROT_READ|PROT_WRITE,
+                              MAP_SHARED, fd, b.m.offset);
+        ioctl(fd, VIDIOC_QBUF, &b);
+    }
+
+    /* Streaming başlat */
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    ioctl(fd, VIDIOC_STREAMON, &type);
+
+    /* Frame yakala */
+    struct v4l2_buffer b = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+                              .memory = V4L2_MEMORY_MMAP };
+    ioctl(fd, VIDIOC_DQBUF, &b);
+
+    printf("Frame: %u bytes, ts=%ld.%06ld\n",
+           b.bytesused, b.timestamp.tv_sec, b.timestamp.tv_usec);
+
+    save_ppm(bufs[b.index].start, "frame.ppm");
+    printf("Kaydedildi: frame.ppm\n");
+
+    ioctl(fd, VIDIOC_QBUF, &b);
+    ioctl(fd, VIDIOC_STREAMOFF, &type);
+
+    for (int i = 0; i &lt; NBUFS; i++)
+        munmap(bufs[i].start, bufs[i].length);
+    close(fd);
+    return 0;
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — derleme ve çalıştırma</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Derleme</span>
+<span class="cmd">gcc</span> <span class="flag">-o</span> v4l2_capture v4l2_capture.c
+
+<span class="cmt"># Çalıştırma</span>
+<span class="cmd">./v4l2_capture</span> /dev/video0
+<span class="cmt"># Frame: 614400 bytes, ts=1234567890.123456</span>
+<span class="cmt"># Kaydedildi: frame.ppm</span>
+
+<span class="cmt"># PPM'yi görüntüle</span>
+<span class="cmd">eog</span> frame.ppm        <span class="cmt"># GNOME</span>
+<span class="cmd">display</span> frame.ppm    <span class="cmt"># ImageMagick</span></code></pre>
+  </div>
+
+  <h3>v4l2-compliance ile driver test</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — v4l2-compliance</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm V4L2 uyumluluk testlerini çalıştır</span>
+<span class="cmd">v4l2-compliance</span> <span class="flag">-d</span> /dev/video0
+
+<span class="cmt"># Streaming testlerini de dahil et</span>
+<span class="cmd">v4l2-compliance</span> <span class="flag">-d</span> /dev/video0 <span class="flag">-s</span>
+
+<span class="cmt"># Örnek çıktı:</span>
+<span class="cmt"># Driver Info:</span>
+<span class="cmt">#   Driver name   : uvcvideo</span>
+<span class="cmt"># Compliance test for device /dev/video0:</span>
+<span class="cmt">#   PASS: VIDIOC_QUERYCAP</span>
+<span class="cmt">#   PASS: VIDIOC_G/S_PRIORITY</span>
+<span class="cmt">#   PASS: VIDIOC_ENUM_FMT</span>
+<span class="cmt">#   FAIL: VIDIOC_G_FMT → format mismatch</span>
+<span class="cmt"># Total: 42 tests, 1 failures</span></code></pre>
+  </div>
+
+  <h3>ffmpeg ile V4L2 yakalama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — ffmpeg V4L2 backend</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Cihaz bilgisi</span>
+<span class="cmd">ffmpeg</span> <span class="flag">-f</span> v4l2 <span class="flag">-list_formats</span> all <span class="flag">-i</span> /dev/video0
+
+<span class="cmt"># YUYV yakalama → MP4</span>
+<span class="cmd">ffmpeg</span> \
+  <span class="flag">-f</span> v4l2 \
+  <span class="flag">-framerate</span> 30 \
+  <span class="flag">-video_size</span> 1280x720 \
+  <span class="flag">-input_format</span> yuyv422 \
+  <span class="flag">-i</span> /dev/video0 \
+  <span class="flag">-c:v</span> libx264 \
+  <span class="flag">-preset</span> ultrafast \
+  output.mp4
+
+<span class="cmt"># MJPEG yakalama (CPU daha az kullanır)</span>
+<span class="cmd">ffmpeg</span> \
+  <span class="flag">-f</span> v4l2 \
+  <span class="flag">-input_format</span> mjpeg \
+  <span class="flag">-framerate</span> 30 \
+  <span class="flag">-video_size</span> 1920x1080 \
+  <span class="flag">-i</span> /dev/video0 \
+  <span class="flag">-c:v</span> copy \
+  output.avi
+
+<span class="cmt"># Gerçek zamanlı preview (SDL)</span>
+<span class="cmd">ffplay</span> <span class="flag">-f</span> v4l2 <span class="flag">-framerate</span> 30 /dev/video0</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Tam capture uygulaması: open → QUERYCAP → S_FMT → REQBUFS+mmap → QBUF → STREAMON → DQBUF → işle</li>
+      <li>YUYV → PPM: ITU-R BT.601 dönüşüm formülleriyle RGB çıktı</li>
+      <li>v4l2-compliance -s: sürücünün standarda uygunluğunu test eder; driver geliştirme için zorunlu</li>
+      <li>ffmpeg -f v4l2 -input_format mjpeg: donanım MJPEG codec'ini kullanır; CPU yükü minimum</li>
+    </ul>
+  </div>
+</section>
+
+</main>

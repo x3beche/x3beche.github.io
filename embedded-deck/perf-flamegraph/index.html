@@ -1,0 +1,879 @@
+---
+layout: tutorial
+title: "Perf &amp; Flamegraph — Linux CPU Profiling"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>PERF</span>
+    <span>2026</span>
+  </div>
+  <h1>Perf &amp; Flamegraph<br><em>Linux CPU Profiling</em></h1>
+  <p class="subtitle">PMU donanım sayaçlarından flamegraph görselleştirmesine — perf ile CPU hotspot analizi, cache miss tespiti ve gömülü ARM sistemlerde profiling.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">perf nedir</a></li>
+    <li><a href="#s1">perf stat — temel sayaçlar</a></li>
+    <li><a href="#s2">perf record — örnekleme</a></li>
+    <li><a href="#s3">perf report — analiz</a></li>
+    <li><a href="#s4">perf script + flamegraph</a></li>
+    <li><a href="#s5">perf annotate — assembly analizi</a></li>
+    <li><a href="#s6">Donanım event'leri</a></li>
+    <li><a href="#s7">Geniş ekosistem: sched / lock / mem</a></li>
+    <li><a href="#s8">Pratik: cache miss → optimize → flamegraph</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> perf nedir</h2>
+  <p class="section-lead">perf (perf_events), Linux kernel'ının içine entegre edilmiş performans analiz altyapısıdır. Donanım PMU sayaçlarından yazılım tracepoint'lerine kadar geniş bir ölçüm yelpazesi sunar.</p>
+
+  <h3>PMU — Performance Monitoring Unit</h3>
+  <p>Modern işlemcilerin tamamında PMU (Performance Monitoring Unit) adı verilen özel donanım bloğu bulunur. PMU, cycle sayımı, instruction retire, önbellek isabet/kaçırma, dal tahmini ve çok daha fazlası gibi düşük overhead'lı donanım sayaçlarını tutar. Intel PMU, AMD PMU ve ARM PMU (Cortex-A PMUv3) aynı kavramsal çerçeveyi paylaşır; ancak destekledikleri event'ler platform bağımlıdır.</p>
+
+  <div class="flow">
+    <pre>Uygulama kodu → işlemci → PMU sayaçları → perf_event subsystem → ring buffer → userspace perf aracı</pre>
+  </div>
+
+  <h3>perf_event subsystem</h3>
+  <p>Linux kernel 2.6.31 ile eklenen <code>perf_event</code> subsystem, PMU donanımını bir soyutlama katmanı arkasına saklar. Üç temel ölçüm modu sunar:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Counting modu</span><span class="desc">Belirli bir zaman diliminde event sayısını tutar — <code>perf stat</code> bu modu kullanır, overhead minimumdur</span></div>
+    <div class="param"><span class="name">Sampling modu</span><span class="desc">Event sayacı overflow olduğunda CPU'nun o anki IP (instruction pointer) ve stack'ini kaydeder — <code>perf record</code></span></div>
+    <div class="param"><span class="name">Tracepoint modu</span><span class="desc">Kernel statik tracepoint'lerine veya kprobe/uprobe dinamik noktalara bağlanır — <code>perf trace</code></span></div>
+  </div>
+
+  <h3>Event türleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Tür</th><th>Kaynak</th><th>Örnek event'ler</th></tr></thead>
+      <tbody>
+        <tr><td>Hardware</td><td>PMU donanımı</td><td>cpu-cycles, instructions, cache-misses, branch-misses</td></tr>
+        <tr><td>Software</td><td>Kernel yazılımı</td><td>cpu-clock, task-clock, page-faults, context-switches</td></tr>
+        <tr><td>Tracepoint</td><td>ftrace altyapısı</td><td>sched:sched_switch, kmem:kmalloc, block:block_rq_issue</td></tr>
+        <tr><td>Hardware cache</td><td>PMU önbellek sayaçları</td><td>L1-dcache-load-misses, LLC-load-misses, dTLB-misses</td></tr>
+        <tr><td>PMU raw</td><td>CPU spesifik ham event</td><td>r<code>0xXXXX</code> — Intel/AMD/ARM'a özel event kodu</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Kurulum ve yetki</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — kurulum</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Ubuntu/Debian</span>
+<span class="cmd">sudo</span> apt install linux-tools-$(uname -r) linux-tools-common
+
+<span class="cmt"># Fedora/RHEL</span>
+<span class="cmd">sudo</span> dnf install perf
+
+<span class="cmt"># Sürüm kontrolü</span>
+<span class="cmd">perf</span> version
+<span class="cmt"># perf version 6.1.0</span>
+
+<span class="cmt"># Kernel paranoid seviyesi — perf'e izin ver (kalıcı için /etc/sysctl.conf)</span>
+<span class="cmd">sudo</span> sysctl kernel.perf_event_paranoid=-1
+<span class="cmd">sudo</span> sysctl kernel.kptr_restrict=0
+
+<span class="cmt"># Desteklenen event'leri listele</span>
+<span class="cmd">perf</span> list
+<span class="cmd">perf</span> list hardware
+<span class="cmd">perf</span> list cache</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p><code>kernel.perf_event_paranoid=2</code> (varsayılan) yalnızca root'a izin verir. Değer <code>-1</code> yapıldığında tüm kullanıcılar PMU'ya erişebilir. Üretim sistemlerinde güvenlik açısından değerlendirin; CI/CD ve geliştirme makinelerinde <code>-1</code> pratiktir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>PMU: işlemcide donanım sayaçları — döngü, instruction, cache miss, branch miss</li>
+      <li>perf_event subsystem: PMU'yu soyutlar; counting, sampling, tracepoint modları</li>
+      <li>Event türleri: hardware, software, tracepoint, cache, raw PMU</li>
+      <li>Kurulum: linux-tools paketi; paranoid sysctl ile kullanıcı izni</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> perf stat — temel sayaçlar</h2>
+  <p class="section-lead"><code>perf stat</code>, counting modunda çalışır: program boyunca PMU sayaçlarını toplar ve sonunda özet istatistikleri gösterir. Overhead son derece düşüktür.</p>
+
+  <h3>Temel kullanım</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — perf stat temel</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Bir komutu ölç</span>
+<span class="cmd">perf</span> stat ls -la /usr
+
+<span class="cmt"># Çalışan bir sürece bağlan (PID)</span>
+<span class="cmd">perf</span> stat <span class="flag">-p</span> 1234
+
+<span class="cmt"># N saniye boyunca ölç</span>
+<span class="cmd">perf</span> stat <span class="flag">-p</span> 1234 <span class="flag">-- sleep</span> 10
+
+<span class="cmt"># Çıktı örneği:</span>
+<span class="cmt">#  Performance counter stats for 'ls -la /usr':</span>
+<span class="cmt">#</span>
+<span class="cmt">#        3,241,847      cycles                    #    3.241 GHz</span>
+<span class="cmt">#        4,108,523      instructions              #    1.27  insn per cycle</span>
+<span class="cmt">#          128,491      cache-references</span>
+<span class="cmt">#           12,304      cache-misses              #    9.58% of all cache refs</span>
+<span class="cmt">#           68,423      branch-instructions</span>
+<span class="cmt">#            1,203      branch-misses             #    1.76% of all branches</span>
+<span class="cmt">#</span>
+<span class="cmt">#        0.001063 seconds time elapsed</span></code></pre>
+  </div>
+
+  <h3>IPC hesabı ve anlam</h3>
+  <p>IPC (Instructions Per Cycle), işlemcinin verimliliğinin temel ölçütüdür. Modern out-of-order işlemcilerde ideal IPC 3–5 civarındadır. Düşük IPC'nin üç ana nedeni vardır:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Memory bound (IPC &lt; 1)</span><span class="desc">Cache miss oranı yüksek — veri belleğini bekliyor; veri erişim kalıbını optimize et, önbellek dostu yapılar kullan</span></div>
+    <div class="param"><span class="name">Branch misprediction (IPC 1-2)</span><span class="desc">Şube tahmin birimleri yanlış tahmin yapıyor; pipeline flush oluyor — öngörülemeyen dalları azalt</span></div>
+    <div class="param"><span class="name">Compute bound (IPC &gt; 3)</span><span class="desc">İşlemci kapasitesini kullanıyor — vektörize (SIMD) edilemeyenler için normal; bu aslında iyi bir durum</span></div>
+  </div>
+
+  <h3>Özel event seçimi (-e)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — perf stat -e ile özel event</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Birden fazla event aynı anda</span>
+<span class="cmd">perf</span> stat <span class="flag">-e</span> cycles,instructions,cache-misses,branch-misses ./my_program
+
+<span class="cmt"># L1 ve LLC cache detayları</span>
+<span class="cmd">perf</span> stat <span class="flag">-e</span> L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses ./my_program
+
+<span class="cmt"># TLB miss'leri</span>
+<span class="cmd">perf</span> stat <span class="flag">-e</span> dTLB-loads,dTLB-load-misses,iTLB-loads,iTLB-load-misses ./my_program
+
+<span class="cmt"># Tracepoint ile birlikte (page fault sayısı)</span>
+<span class="cmd">perf</span> stat <span class="flag">-e</span> cycles,page-faults ./my_program
+
+<span class="cmt"># Tüm CPU'lar için sistem geneli (-a)</span>
+<span class="cmd">perf</span> stat <span class="flag">-a</span> <span class="flag">-e</span> cycles,instructions <span class="flag">-- sleep</span> 5
+
+<span class="cmt"># CSV çıktısı — otomasyon için</span>
+<span class="cmd">perf</span> stat <span class="flag">--field-separator</span> , <span class="flag">-e</span> cycles,instructions ./my_program</code></pre>
+  </div>
+
+  <h3>Tekrarlı ölçüm (-r)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — istatistiksel güvenilirlik</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 5 kez çalıştır, ortalama ve standart sapma göster</span>
+<span class="cmd">perf</span> stat <span class="flag">-r</span> 5 ./my_program
+
+<span class="cmt"># Çıktıda varyasyon yüzdesi görülür:</span>
+<span class="cmt">#   3,241,847 +- 0.82%  cycles</span>
+<span class="cmt"># Varyasyon %5'ten büyükse ölçüm güvenilir değil — sistem gürültüsü var</span>
+
+<span class="cmt"># CPU frekans scaling'i kapat (daha kararlı ölçüm)</span>
+<span class="cmd">sudo</span> cpupower frequency-set -g performance
+<span class="cmt"># ya da</span>
+<span class="cmd">echo</span> performance | <span class="cmd">sudo</span> tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">İPUCU</div>
+    <p>Üretim sunucularında veya gömülü hedeflerde ölçüm yaparken CPU frekans yönetimini kontrol edin. ARM Cortex-A işlemcilerde <code>cpufreq</code> driver'ı ve thermal throttling, ölçüm varyansını artırır. Kıyaslama öncesi <code>performance</code> governor'a geçin.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>perf stat</code>: counting modu — düşük overhead, program sonu özeti</li>
+      <li>IPC = instructions / cycles; &lt;1 memory bound, &gt;3 compute bound</li>
+      <li><code>-e event1,event2</code> ile özel sayaç seçimi</li>
+      <li><code>-r N</code> ile tekrarlı ölçüm ve istatistiksel güven aralığı</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> perf record — örnekleme</h2>
+  <p class="section-lead"><code>perf record</code>, sampling modunda çalışır: belirli aralıklarla CPU'nun o anki instruction pointer'ını ve call stack'ini kaydeder. Bu veri hangi fonksiyonların en çok CPU kullandığını ortaya çıkarır.</p>
+
+  <h3>Temel kayıt</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — perf record temel</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Komutu başlat ve kaydet (varsayılan: -F 4000 — saniyede 4000 örnek)</span>
+<span class="cmd">perf</span> record ./my_program
+
+<span class="cmt"># Örnekleme frekansını belirle (-F Hz)</span>
+<span class="cmd">perf</span> record <span class="flag">-F</span> 99 ./my_program          <span class="cmt"># 99 Hz — düşük overhead</span>
+<span class="cmd">perf</span> record <span class="flag">-F</span> 9999 ./my_program        <span class="cmt"># 9999 Hz — yüksek çözünürlük</span>
+
+<span class="cmt"># Çalışan sürece bağlan</span>
+<span class="cmd">perf</span> record <span class="flag">-p</span> 1234 <span class="flag">-F</span> 99 <span class="flag">-- sleep</span> 30
+
+<span class="cmt"># Tüm CPU'lar, sistem geneli</span>
+<span class="cmd">perf</span> record <span class="flag">-a</span> <span class="flag">-F</span> 99 <span class="flag">-- sleep</span> 30
+
+<span class="cmt"># Kayıt perf.data dosyasına yazılır</span>
+<span class="cmd">ls</span> -lh perf.data</code></pre>
+  </div>
+
+  <h3>Call graph kaydı (--call-graph)</h3>
+  <p>Flamegraph oluşturabilmek için <strong>call graph</strong> kaydı şarttır. Üç yöntem mevcuttur:</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Yöntem</th><th>Komut</th><th>Gereksinim</th><th>Artı / Eksi</th></tr></thead>
+      <tbody>
+        <tr><td>Frame Pointer (fp)</td><td><code>--call-graph fp</code></td><td><code>-fno-omit-frame-pointer</code> ile derleme</td><td>Düşük overhead; derleyici optimizasyonuyla uyumsuz olabilir</td></tr>
+        <tr><td>DWARF</td><td><code>--call-graph dwarf</code></td><td>Debug sembolü (<code>-g</code>)</td><td>Doğru stack unwinding; yüksek overhead, büyük perf.data</td></tr>
+        <tr><td>LBR (Last Branch Record)</td><td><code>--call-graph lbr</code></td><td>Intel Haswell+ (LBR donanımı)</td><td>En düşük overhead; sığ call stack (32 frame)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — call graph kayıt örnekleri</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Frame pointer yöntemi — derleme gerektirir</span>
+<span class="cmd">gcc</span> <span class="flag">-O2</span> <span class="flag">-fno-omit-frame-pointer</span> <span class="flag">-o</span> my_program my_program.c
+<span class="cmd">perf</span> record <span class="flag">-F</span> 99 <span class="flag">--call-graph</span> fp <span class="flag">-g</span> ./my_program
+
+<span class="cmt"># DWARF yöntemi — kaynak dizin bilgisiyle</span>
+<span class="cmd">gcc</span> <span class="flag">-O2</span> <span class="flag">-g</span> <span class="flag">-o</span> my_program my_program.c
+<span class="cmd">perf</span> record <span class="flag">-F</span> 99 <span class="flag">--call-graph</span> dwarf ./my_program
+
+<span class="cmt"># LBR (Intel'e özgü)</span>
+<span class="cmd">perf</span> record <span class="flag">-F</span> 99 <span class="flag">--call-graph</span> lbr ./my_program
+
+<span class="cmt"># perf.data dosyasını belirt (-o)</span>
+<span class="cmd">perf</span> record <span class="flag">-o</span> profile_run1.data <span class="flag">-F</span> 99 <span class="flag">--call-graph</span> fp ./my_program
+
+<span class="cmt"># Build-id kaydetme — taşınabilirlik için (varsayılan açık, devre dışı bırakmak)</span>
+<span class="cmd">perf</span> record <span class="flag">--no-buildid</span> <span class="flag">-F</span> 99 ./my_program</code></pre>
+  </div>
+
+  <h3>Event bazlı örnekleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — event-driven sampling</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Cache miss'lerde örnekle (PEBS — Intel Precise Event)</span>
+<span class="cmd">perf</span> record <span class="flag">-e</span> cache-misses:p <span class="flag">--call-graph</span> fp ./my_program
+
+<span class="cmt"># Branch miss'lerde örnekle</span>
+<span class="cmd">perf</span> record <span class="flag">-e</span> branch-misses:p <span class="flag">--call-graph</span> fp ./my_program
+
+<span class="cmt"># Belirli CPU'da çalıştır</span>
+<span class="cmd">perf</span> record <span class="flag">-C</span> 0,1 <span class="flag">-F</span> 99 <span class="flag">--call-graph</span> fp ./my_program
+
+<span class="cmt"># Yalnızca kernel alanını profille</span>
+<span class="cmd">perf</span> record <span class="flag">-F</span> 99 <span class="flag">-k</span> <span class="flag">--call-graph</span> fp <span class="flag">-- sleep</span> 10
+
+<span class="cmt"># Yalnızca kullanıcı alanını profille</span>
+<span class="cmd">perf</span> record <span class="flag">-F</span> 99 <span class="flag">-u</span> <span class="flag">--call-graph</span> fp ./my_program</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>perf record</code>: sampling — her N event'te IP + call stack kaydı</li>
+      <li><code>-F Hz</code>: örnekleme frekansı — 99 Hz hafif, 9999 Hz yüksek çözünürlük</li>
+      <li><code>--call-graph fp|dwarf|lbr</code>: flamegraph için call stack zorunlu</li>
+      <li>fp: düşük overhead, -fno-omit-frame-pointer gerekli; dwarf: doğru ama ağır</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> perf report — analiz</h2>
+  <p class="section-lead"><code>perf report</code>, <code>perf.data</code> dosyasını okur ve hangi fonksiyonların CPU zamanını tükettiğini gösterir. TUI (terminal arayüzü) ve <code>--stdio</code> düz metin modu sunar.</p>
+
+  <h3>TUI — interaktif analiz</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — perf report TUI</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Varsayılan: TUI arayüzü açılır</span>
+<span class="cmd">perf</span> report
+
+<span class="cmt"># Belirli bir dosya için</span>
+<span class="cmd">perf</span> report <span class="flag">-i</span> profile_run1.data
+
+<span class="cmt"># TUI tuş kısayolları:</span>
+<span class="cmt"># Enter  — seçili fonksiyonu genişlet / caller'larını göster</span>
+<span class="cmt"># a      — annotate: assembly ile CPU zamanı dağılımı</span>
+<span class="cmt"># d      — DSO (dynamic shared object) filtrele</span>
+<span class="cmt"># t      — thread filtrele</span>
+<span class="cmt"># /      — regex ile arama</span>
+<span class="cmt"># q      — çıkış</span></code></pre>
+  </div>
+
+  <h3>--stdio modu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — perf report stdio</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Düz metin çıktısı — betik ve CI için ideal</span>
+<span class="cmd">perf</span> report <span class="flag">--stdio</span>
+
+<span class="cmt"># Çıktı örneği:</span>
+<span class="cmt"># Overhead  Command  Shared Object       Symbol</span>
+<span class="cmt"># ........  .......  ..................  ......................................</span>
+<span class="cmt">#   34.21%  my_prog  my_program          [.] process_data</span>
+<span class="cmt">#   18.45%  my_prog  libc.so.6           [.] __memcpy_avx_unaligned</span>
+<span class="cmt">#   12.33%  my_prog  my_program          [.] hash_lookup</span>
+<span class="cmt">#    9.01%  my_prog  [kernel]            [k] copy_user_generic_string</span>
+
+<span class="cmt"># Sıralama kriterini değiştir</span>
+<span class="cmd">perf</span> report <span class="flag">--stdio</span> <span class="flag">--sort</span> dso,symbol
+<span class="cmd">perf</span> report <span class="flag">--stdio</span> <span class="flag">--sort</span> cpu,pid,symbol
+
+<span class="cmt"># Çağıran/çağrılan zinciri göster</span>
+<span class="cmd">perf</span> report <span class="flag">--stdio</span> <span class="flag">--call-graph</span> callee <span class="flag">--max-stack</span> 5
+
+<span class="cmt"># Kernel sembolleri dahil et</span>
+<span class="cmd">perf</span> report <span class="flag">--stdio</span> <span class="flag">-k</span> /path/to/vmlinux</code></pre>
+  </div>
+
+  <h3>Inline fonksiyon görünürlüğü</h3>
+  <p>Compiler optimizasyonuyla <code>inline</code> hale getirilen fonksiyonlar varsayılan raporda görünmez. Debug sembolleriyle bu sorun çözülür:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — inline fonksiyon analizi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># -g ile derleme inline fonksiyonları görünür yapar</span>
+<span class="cmd">gcc</span> <span class="flag">-O2</span> <span class="flag">-g</span> <span class="flag">-fno-omit-frame-pointer</span> <span class="flag">-o</span> my_prog my_prog.c
+
+<span class="cmt"># --inline seçeneği ile satır seviyesi inline bilgisi</span>
+<span class="cmd">perf</span> report <span class="flag">--stdio</span> <span class="flag">--inline</span>
+
+<span class="cmt"># Hotspot fonksiyonu filtrele</span>
+<span class="cmd">perf</span> report <span class="flag">--stdio</span> <span class="flag">--dsos</span> my_program <span class="flag">--symbols</span> process_data</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>TUI: interaktif navigasyon; Enter ile genişlet, 'a' ile annotate</li>
+      <li><code>--stdio</code>: betik dostu düz metin çıktısı</li>
+      <li><code>--sort dso,symbol</code>: kütüphane veya sembol bazlı sıralama</li>
+      <li><code>--inline</code>: derleyici optimize ettiği inline fonksiyonları göster</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> perf script + flamegraph</h2>
+  <p class="section-lead">Flamegraph, call stack örneklerini görsel olarak sunar: en geniş dikdörtgen en çok CPU tüketen fonksiyonu temsil eder. Brendan Gregg'in geliştirdiği araç seti <code>perf script</code> çıktısını SVG'ye çevirir.</p>
+
+  <h3>Araç kurulumu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — flamegraph araçları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># FlameGraph araçlarını indir (Brendan Gregg)</span>
+<span class="cmd">git</span> clone https://github.com/brendangregg/FlameGraph.git
+<span class="cmd">export</span> FLAMEGRAPH_DIR=~/FlameGraph
+
+<span class="cmt"># PATH'e ekle</span>
+<span class="cmd">export</span> PATH=$PATH:$FLAMEGRAPH_DIR</code></pre>
+  </div>
+
+  <h3>Tam iş akışı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — perf → flamegraph iş akışı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Adım 1: call graph ile kaydet</span>
+<span class="cmd">perf</span> record <span class="flag">-F</span> 99 <span class="flag">--call-graph</span> fp <span class="flag">-g</span> ./my_program
+
+<span class="cmt"># Adım 2: perf.data → okunabilir stack trace metni</span>
+<span class="cmd">perf</span> script > out.perf
+
+<span class="cmt"># out.perf formatı (her sample):</span>
+<span class="cmt"># my_program 12345 1234.567890:     10203 cpu-clock:</span>
+<span class="cmt">#         400abc process_data+0x12 (/home/user/my_program)</span>
+<span class="cmt">#         400def main+0x45 (/home/user/my_program)</span>
+
+<span class="cmt"># Adım 3: stack'leri çöz ve say (stackcollapse)</span>
+<span class="cmd">stackcollapse-perf.pl</span> out.perf > out.folded
+
+<span class="cmt"># out.folded formatı (tek satır per stack):</span>
+<span class="cmt"># main;process_data;memcpy 42</span>
+
+<span class="cmt"># Adım 4: SVG oluştur</span>
+<span class="cmd">flamegraph.pl</span> out.folded > flamegraph.svg
+
+<span class="cmt"># Tarayıcıda aç</span>
+<span class="cmd">xdg-open</span> flamegraph.svg</code></pre>
+  </div>
+
+  <h3>Tek komut zinciri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — tek satır pipeline</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kaydet + çevir + görselleştir — her şey bir arada</span>
+<span class="cmd">perf</span> record <span class="flag">-F</span> 99 <span class="flag">--call-graph</span> fp ./my_program && \
+<span class="cmd">perf</span> script | \
+<span class="cmd">stackcollapse-perf.pl</span> | \
+<span class="cmd">flamegraph.pl</span> > flamegraph.svg
+
+<span class="cmt"># CPU türü renkli flamegraph</span>
+<span class="cmd">flamegraph.pl</span> <span class="flag">--color</span> java out.folded > flamegraph.svg
+<span class="cmd">flamegraph.pl</span> <span class="flag">--color</span> io   out.folded > flamegraph_io.svg
+
+<span class="cmt"># Başlık ve genişlik özelleştir</span>
+<span class="cmd">flamegraph.pl</span> \
+  <span class="flag">--title</span> "my_program CPU Profile" \
+  <span class="flag">--width</span> 1600 \
+  <span class="flag">--minwidth</span> 0.5 \
+  out.folded > flamegraph.svg</code></pre>
+  </div>
+
+  <h3>SVG okuma</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">X ekseni (genişlik)</span><span class="desc">Fonksiyonun toplam CPU zamanı oranı — geniş kutu = çok CPU tüketiyor</span></div>
+    <div class="param"><span class="name">Y ekseni (yükseklik)</span><span class="desc">Call stack derinliği — alt = üst fonksiyon (main), üst = yaprak (gerçek iş yapan)</span></div>
+    <div class="param"><span class="name">Renk</span><span class="desc">Varsayılan rastgele (aynı fonksiyon her çalıştırmada farklı renk); --color ile anlamlı renk atanabilir</span></div>
+    <div class="param"><span class="name">Tıklanabilir</span><span class="desc">SVG interaktif — fonksiyona tıklayınca o alt ağaç zoom'lanır; Ctrl+F ile fonksiyon ara</span></div>
+  </div>
+
+  <h3>Diferansiyel flamegraph</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — optimizasyon öncesi/sonrası karşılaştırma</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Optimizasyon öncesi</span>
+<span class="cmd">perf</span> record <span class="flag">-F</span> 99 <span class="flag">--call-graph</span> fp <span class="flag">-o</span> before.data ./v1_program
+<span class="cmd">perf</span> script <span class="flag">-i</span> before.data | <span class="cmd">stackcollapse-perf.pl</span> > before.folded
+
+<span class="cmt"># Optimizasyon sonrası</span>
+<span class="cmd">perf</span> record <span class="flag">-F</span> 99 <span class="flag">--call-graph</span> fp <span class="flag">-o</span> after.data ./v2_program
+<span class="cmd">perf</span> script <span class="flag">-i</span> after.data | <span class="cmd">stackcollapse-perf.pl</span> > after.folded
+
+<span class="cmt"># Diferansiyel SVG — mavi: azalan, kırmızı: artan CPU</span>
+<span class="cmd">difffolded.pl</span> before.folded after.folded | <span class="cmd">flamegraph.pl</span> > diff.svg</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Flamegraph pipeline: perf record → perf script → stackcollapse-perf.pl → flamegraph.pl → SVG</li>
+      <li>X ekseni = CPU zamanı oranı; Y ekseni = call stack derinliği</li>
+      <li>SVG interaktif: tıkla zoom, Ctrl+F ara</li>
+      <li><code>difffolded.pl</code> ile öncesi/sonrası karşılaştırma</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> perf annotate — assembly analizi</h2>
+  <p class="section-lead"><code>perf annotate</code>, kaynak kodu ve assembly satırlarına CPU zamanının nasıl dağıldığını gösterir. Hangi assembly instruction'ın en çok zaman harcadığını bulmak için idealdir.</p>
+
+  <h3>Temel annotate</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — perf annotate</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># perf.data üzerinde annotate (TUI açılır)</span>
+<span class="cmd">perf</span> annotate
+
+<span class="cmt"># Belirli bir fonksiyonu annotate et</span>
+<span class="cmd">perf</span> annotate process_data
+
+<span class="cmt"># Düz metin çıktısı</span>
+<span class="cmd">perf</span> annotate <span class="flag">--stdio</span> process_data
+
+<span class="cmt"># Kaynak + assembly karışık görünüm (-d)</span>
+<span class="cmd">perf</span> annotate <span class="flag">--stdio</span> <span class="flag">-d</span> process_data
+
+<span class="cmt"># Sembol dosyası belirt</span>
+<span class="cmd">perf</span> annotate <span class="flag">--stdio</span> <span class="flag">--symfs</span> /path/to/debug/symbols process_data</code></pre>
+  </div>
+
+  <h3>Assembly çıktısını okuma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>perf annotate çıktı örneği</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">; process_data fonksiyonu assembly görünümü</span>
+<span class="cmt">; Sol sütun: o instruction'a düşen CPU zamanı yüzdesi</span>
+
+         :   void process_data(int *arr, int n) {
+         :       int sum = 0;
+    0.12 :   400abc:  xor    %eax,%eax
+         :       for (int i = 0; i &lt; n; i++) {
+   45.33 :   400abe:  mov    (%rdi,%rcx,4),%edx   &lt;-- L1 cache miss burada!
+    0.45 :   400ac2:  add    %edx,%eax
+    0.08 :   400ac4:  inc    %rcx
+    0.22 :   400ac6:  cmp    %rsi,%rcx
+    0.11 :   400ac9:  jl     400abe
+         :   }</code></pre>
+  </div>
+
+  <p>Yukarıdaki örnekte <code>mov (%rdi,%rcx,4),%edx</code> instruction'ı zamanın %45'ini alıyor — bu bellek erişiminin cache miss'e yol açtığının klasik işaretidir. CPU belleği bekliyor.</p>
+
+  <h3>Cache thrashing tespiti</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — cache miss odaklı profil</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Cache miss event'leriyle örnekle (PEBS precision)</span>
+<span class="cmd">perf</span> record <span class="flag">-e</span> cache-misses:pp <span class="flag">--call-graph</span> fp ./my_program
+
+<span class="cmt"># Annotate: hangi instruction'da cache miss oluyor</span>
+<span class="cmd">perf</span> annotate <span class="flag">--stdio</span>
+
+<span class="cmt"># Daha ayrıntılı: L1 dcache load miss</span>
+<span class="cmd">perf</span> record <span class="flag">-e</span> L1-dcache-load-misses:pp <span class="flag">--call-graph</span> fp ./my_program
+<span class="cmd">perf</span> report <span class="flag">--stdio</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>perf annotate</code>: assembly satır bazında CPU zaman dağılımı</li>
+      <li>Yüksek yüzdeli <code>mov</code> instruction → bellek erişim gecikmesi → cache miss</li>
+      <li><code>-e cache-misses:pp</code> ile precision sampling — PEBS destekli Intel'de daha doğru</li>
+      <li>Kaynak + assembly karışık görünüm için <code>-g</code> ile derleme gerekli</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Donanım event'leri</h2>
+  <p class="section-lead">PMU donanımı çok sayıda granüler event sunar. Doğru event seçimi mikro-mimari darboğazları tespit etmeyi kolaylaştırır.</p>
+
+  <h3>Cache event'leri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — cache analizi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># L1-L2-L3 önbellek hiyerarşisi analizi</span>
+<span class="cmd">perf</span> stat <span class="flag">-e</span> \
+  L1-dcache-loads,L1-dcache-load-misses,\
+  L2-loads,L2-load-misses,\
+  LLC-loads,LLC-load-misses \
+  ./my_program
+
+<span class="cmt"># Instruction cache miss (kod boyutu büyük uygulamalar için önemli)</span>
+<span class="cmd">perf</span> stat <span class="flag">-e</span> L1-icache-load-misses ./my_program
+
+<span class="cmt"># Store miss (write-heavy workload)</span>
+<span class="cmd">perf</span> stat <span class="flag">-e</span> L1-dcache-stores,L1-dcache-store-misses ./my_program</code></pre>
+  </div>
+
+  <h3>Branch event'leri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — branch analizi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Branch prediction analizi</span>
+<span class="cmd">perf</span> stat <span class="flag">-e</span> \
+  branch-instructions,branch-misses,\
+  branches,branch-misses \
+  ./my_program
+
+<span class="cmt"># Branch miss oranını hesapla:</span>
+<span class="cmt"># %miss = branch-misses / branch-instructions * 100</span>
+<span class="cmt"># >5% yüksek kabul edilir</span></code></pre>
+  </div>
+
+  <h3>TLB event'leri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — TLB analizi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># TLB miss — sanal-fiziksel adres çevirisi başarısız</span>
+<span class="cmd">perf</span> stat <span class="flag">-e</span> \
+  dTLB-loads,dTLB-load-misses,\
+  iTLB-loads,iTLB-load-misses \
+  ./my_program
+
+<span class="cmt"># Yüksek TLB miss → hugepage kullanmayı düşün</span>
+<span class="cmd">sudo</span> sysctl vm.nr_hugepages=512
+<span class="cmt"># veya transparent hugepage</span>
+<span class="cmd">echo</span> always > /sys/kernel/mm/transparent_hugepage/enabled</code></pre>
+  </div>
+
+  <h3>Intel PEBS (Precise Event-Based Sampling)</h3>
+  <p>Intel Haswell ve sonrası, PEBS ile instruction-level precision sağlar. Normal sampling'de ±birkaç instruction kayması olabilir; PEBS ile tam instruction yakalanır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — PEBS precision sampling</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># :p — yazılım precise (en iyi çaba)</span>
+<span class="cmd">perf</span> record <span class="flag">-e</span> cycles:p <span class="flag">--call-graph</span> fp ./my_program
+
+<span class="cmt"># :pp — PEBS hardware precise (Intel)</span>
+<span class="cmd">perf</span> record <span class="flag">-e</span> cycles:pp <span class="flag">--call-graph</span> fp ./my_program
+
+<span class="cmt"># :ppp — maximum precision (sadece belirli event'ler)</span>
+<span class="cmd">perf</span> record <span class="flag">-e</span> mem-loads:ppp <span class="flag">--call-graph</span> fp ./my_program
+
+<span class="cmt"># AMD IBS (Instruction-Based Sampling) — AMD eşdeğeri</span>
+<span class="cmd">perf</span> record <span class="flag">-e</span> ibs_op/cnt_ctl=1/ <span class="flag">--call-graph</span> fp ./my_program</code></pre>
+  </div>
+
+  <h3>ARM PMUv3 (Cortex-A)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — ARM PMU event'leri</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ARM Cortex-A PMUv3 desteklenen event'ler</span>
+<span class="cmd">perf</span> list | grep -i arm
+
+<span class="cmt"># ARM ham PMU event'leri (r0x0001 = SW_INCR, r0x0011 = CPU_CYCLES, vb.)</span>
+<span class="cmt"># ARMv8 PMUv3 event tablosu: ARM Architecture Reference Manual bakın</span>
+
+<span class="cmt"># Cortex-A72 üzerinde temel profil</span>
+<span class="cmd">perf</span> stat <span class="flag">-e</span> cycles,instructions,cache-misses ./my_program
+
+<span class="cmt"># ARM özel: L1I cache refill</span>
+<span class="cmd">perf</span> stat <span class="flag">-e</span> r0001 ./my_program   <span class="cmt"># SW_INCR — yazılım artırımı</span>
+<span class="cmd">perf</span> stat <span class="flag">-e</span> r0014 ./my_program   <span class="cmt"># L1I_CACHE_REFILL</span>
+<span class="cmd">perf</span> stat <span class="flag">-e</span> r0003 ./my_program   <span class="cmt"># L1D_CACHE_REFILL</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Cache hierarchy: L1/L2/LLC load-misses — hangi seviyede takılıyor</li>
+      <li>Branch miss %5+ → prediction sorunları; veri bağımlı dallardan kaçın</li>
+      <li>TLB miss yüksekse → hugepage (2M/1G) kullanımını değerlendir</li>
+      <li>Intel PEBS <code>:pp</code> — instruction-accurate sampling; ARM PMUv3 ham event kodu <code>rXXXX</code></li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Geniş ekosistem: sched / lock / mem</h2>
+  <p class="section-lead">perf, CPU profilinin ötesinde zamanlama, kilit çakışması ve bellek erişim analizi gibi spesifik alt sistemler için de araçlar sunar.</p>
+
+  <h3>perf sched — zamanlama analizi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — perf sched</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Zamanlama event'lerini kaydet</span>
+<span class="cmd">perf</span> sched record <span class="flag">-- sleep</span> 10
+
+<span class="cmt"># Özet istatistikler: her task için gecikme</span>
+<span class="cmd">perf</span> sched latency
+
+<span class="cmt"># Çıktı örneği:</span>
+<span class="cmt"># Task              |   Runtime ms  | Switches | Average delay ms | Maximum delay ms</span>
+<span class="cmt"># my_program:1234   |    1234.567   |     892  |         0.123    |        12.456</span>
+
+<span class="cmt"># Timeline görünümü</span>
+<span class="cmd">perf</span> sched timehist
+
+<span class="cmt"># Replay (zamanlama simülasyonu)</span>
+<span class="cmd">perf</span> sched replay</code></pre>
+  </div>
+
+  <h3>perf lock — kilit çakışması</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — perf lock</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kilit event'lerini kaydet (kernel CONFIG_LOCKDEP gerekebilir)</span>
+<span class="cmd">perf</span> lock record <span class="flag">-a</span> <span class="flag">-- sleep</span> 10
+
+<span class="cmt"># Kilit çakışma raporu</span>
+<span class="cmd">perf</span> lock report
+
+<span class="cmt"># Çıktı örneği:</span>
+<span class="cmt">#                      Name   acquired  contended  avg-wait(ns)  max-wait(ns)</span>
+<span class="cmt"># &amp;rq->lock                   123456      4567         234.5        89012.3</span>
+
+<span class="cmt"># Sadece çakışmalı kilitleri göster</span>
+<span class="cmd">perf</span> lock report <span class="flag">--key</span> wait</code></pre>
+  </div>
+
+  <h3>perf mem — bellek erişim analizi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — perf mem</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Bellek load/store örnekleme (PEBS/IBS gerektirir)</span>
+<span class="cmd">perf</span> mem record ./my_program
+
+<span class="cmt"># Rapor: bellek erişim gecikme dağılımı</span>
+<span class="cmd">perf</span> mem report
+
+<span class="cmt"># Sadece yüklemeleri (loads) analiz et</span>
+<span class="cmd">perf</span> mem record <span class="flag">-t</span> load ./my_program
+
+<span class="cmt"># Gecikme bazlı sıralama</span>
+<span class="cmd">perf</span> mem report <span class="flag">--sort</span> local_weight</code></pre>
+  </div>
+
+  <h3>Off-CPU analizi</h3>
+  <p>Off-CPU profiling, CPU'da çalışmayan (engellenmiş, uyuyan) süreleri ölçer. Bu genellikle I/O bekleme, kilit bekleme veya zamanlayıcı gecikmeleridir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — off-CPU profiling</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># sched:sched_switch tracepoint ile off-CPU kayıt</span>
+<span class="cmd">perf</span> record <span class="flag">-e</span> sched:sched_switch <span class="flag">--call-graph</span> dwarf <span class="flag">-p</span> 1234 <span class="flag">-- sleep</span> 30
+
+<span class="cmt"># Off-CPU flamegraph oluştur (offcpufreq.awk ile)</span>
+<span class="cmd">perf</span> script | \
+  <span class="cmd">awk</span> '/sched:sched_switch/ { ... }' | \
+  <span class="cmd">flamegraph.pl</span> <span class="flag">--color</span> io <span class="flag">--title</span> "Off-CPU" > offcpu.svg
+
+<span class="cmt"># Daha kolay: BCC/eBPF offcputime aracı</span>
+<span class="cmd">sudo</span> /usr/share/bcc/tools/offcputime <span class="flag">-p</span> 1234 10 | \
+  <span class="cmd">flamegraph.pl</span> > offcpu.svg</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>perf sched latency</code>: zamanlama gecikmesi — real-time analizi için temel</li>
+      <li><code>perf lock report</code>: en çok çakışan kilit ve ortalama bekleme süresi</li>
+      <li><code>perf mem record</code>: bellek erişim gecikmesi ve önbellek düzeyi dağılımı</li>
+      <li>Off-CPU: sched_switch tracepoint veya BCC offcputime — engellenme nedenlerini bul</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: cache miss → optimize → flamegraph</h2>
+  <p class="section-lead">Gerçek bir optimizasyon senaryosu: cache-unfriendly döngü tespit et, veriyi yeniden düzenle, öncesi/sonrası flamegraph ile farkı gör.</p>
+
+  <h3>Cache-unfriendly örnek program</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — cache_test.c (kötü sürüm)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* cache_test.c — column-major erişim: cache miss yüksek */</span>
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+
+#define N 4096
+
+int matrix[N][N];
+long long sum_columns(void) {
+    long long sum = 0;
+    <span class="cmt">/* Sütun bazlı erişim: her satıra atlarken cache line atlanır */</span>
+    for (int col = 0; col &lt; N; col++)
+        for (int row = 0; row &lt; N; row++)
+            sum += matrix[row][col];    <span class="cmt">/* stride = N * sizeof(int) = 16384 byte */</span>
+    return sum;
+}
+
+int main(void) {
+    for (int i = 0; i &lt; N; i++)
+        for (int j = 0; j &lt; N; j++)
+            matrix[i][j] = i * N + j;
+    printf("sum = %lld\n", sum_columns());
+    return 0;
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — kötü sürümü profille</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">gcc</span> <span class="flag">-O2</span> <span class="flag">-fno-omit-frame-pointer</span> <span class="flag">-g</span> <span class="flag">-o</span> cache_bad cache_test.c
+
+<span class="cmt"># Temel istatistikler</span>
+<span class="cmd">perf</span> stat <span class="flag">-e</span> cycles,instructions,LLC-load-misses,L1-dcache-load-misses ./cache_bad
+
+<span class="cmt"># Flamegraph kayıt</span>
+<span class="cmd">perf</span> record <span class="flag">-F</span> 99 <span class="flag">--call-graph</span> fp ./cache_bad
+<span class="cmd">perf</span> script | <span class="cmd">stackcollapse-perf.pl</span> | <span class="cmd">flamegraph.pl</span> > before.svg</code></pre>
+  </div>
+
+  <h3>Optimize edilmiş sürüm</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — cache_test_opt.c (iyi sürüm)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* cache_test_opt.c — row-major erişim: cache dostu */</span>
+#include &lt;stdio.h&gt;
+#define N 4096
+
+int matrix[N][N];
+
+long long sum_rows(void) {
+    long long sum = 0;
+    <span class="cmt">/* Satır bazlı erişim: ardışık bellek — cache line tam kullanımı */</span>
+    for (int row = 0; row &lt; N; row++)
+        for (int col = 0; col &lt; N; col++)
+            sum += matrix[row][col];    <span class="cmt">/* stride = sizeof(int) = 4 byte */</span>
+    return sum;
+}
+
+int main(void) {
+    for (int i = 0; i &lt; N; i++)
+        for (int j = 0; j &lt; N; j++)
+            matrix[i][j] = i * N + j;
+    printf("sum = %lld\n", sum_rows());
+    return 0;
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — karşılaştırma</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">gcc</span> <span class="flag">-O2</span> <span class="flag">-fno-omit-frame-pointer</span> <span class="flag">-g</span> <span class="flag">-o</span> cache_good cache_test_opt.c
+
+<span class="cmt"># Her iki sürümü ölç</span>
+<span class="cmd">perf</span> stat <span class="flag">-e</span> cycles,instructions,LLC-load-misses ./cache_bad
+<span class="cmd">perf</span> stat <span class="flag">-e</span> cycles,instructions,LLC-load-misses ./cache_good
+
+<span class="cmt"># Beklenen sonuç (yaklaşık):</span>
+<span class="cmt"># cache_bad:  ~8,000,000,000 cycles  ~64,000,000 LLC-misses  ~12 saniye</span>
+<span class="cmt"># cache_good: ~1,200,000,000 cycles     ~200,000 LLC-misses   ~0.8 saniye</span>
+
+<span class="cmt"># Flamegraph karşılaştırma</span>
+<span class="cmd">perf</span> record <span class="flag">-F</span> 99 <span class="flag">--call-graph</span> fp <span class="flag">-o</span> after.data ./cache_good
+<span class="cmd">perf</span> script <span class="flag">-i</span> after.data | <span class="cmd">stackcollapse-perf.pl</span> > after.folded
+
+<span class="cmt"># Diferansiyel flamegraph</span>
+<span class="cmd">perf</span> script <span class="flag">-i</span> before.data | <span class="cmd">stackcollapse-perf.pl</span> > before.folded
+<span class="cmd">difffolded.pl</span> before.folded after.folded | <span class="cmd">flamegraph.pl</span> > diff.svg</code></pre>
+  </div>
+
+  <h3>Kernel thread profiling</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — kernel thread profili</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kernel thread'leri listele</span>
+<span class="cmd">ps</span> aux | grep '\[kworker\|ksoftirqd\|kswapd\]'
+
+<span class="cmt"># kswapd profili (bellek baskısı altında)</span>
+<span class="cmd">sudo</span> perf record <span class="flag">-F</span> 99 <span class="flag">--call-graph</span> fp <span class="flag">-p</span> $(pgrep kswapd0) <span class="flag">-- sleep</span> 30
+<span class="cmd">sudo</span> perf report <span class="flag">--stdio</span> <span class="flag">-k</span> /boot/vmlinux
+
+<span class="cmt"># Sistem geneli kernel profili</span>
+<span class="cmd">sudo</span> perf record <span class="flag">-a</span> <span class="flag">-F</span> 99 <span class="flag">--call-graph</span> fp <span class="flag">-K</span> <span class="flag">-- sleep</span> 30
+<span class="cmd">sudo</span> perf script | <span class="cmd">stackcollapse-perf.pl</span> | <span class="cmd">flamegraph.pl</span> > kernel.svg</code></pre>
+  </div>
+
+  <h3>perf overhead dikkat noktaları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Durum</th><th>Overhead</th><th>Öneri</th></tr></thead>
+      <tbody>
+        <tr><td>perf stat (counting)</td><td>%0–1</td><td>Her zaman güvenli; üretimde de kullanılabilir</td></tr>
+        <tr><td>perf record -F 99</td><td>%1–3</td><td>Geliştirme ve üretim profili için makul</td></tr>
+        <tr><td>perf record -F 9999</td><td>%5–15</td><td>Kısa süreli analiz; üretimde dikkatli kullan</td></tr>
+        <tr><td>--call-graph dwarf</td><td>%10–30</td><td>Büyük stack'ler çok veri yazar; -F düşük tut</td></tr>
+        <tr><td>Tracepoint yoğun</td><td>%5–50+</td><td>Yüksek frekanslı tracepoint (scheduler) overhead'ı gizleyebilir</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Column-major vs row-major: stride erişim LLC miss'i 300x artırabilir</li>
+      <li>perf stat → sorun var mı; perf record + flamegraph → nerede; perf annotate → hangi instruction</li>
+      <li>Kernel thread profili için <code>-k /boot/vmlinux</code> ile sembol dosyası gerekli</li>
+      <li>perf overhead: counting &lt;%1; sampling 99 Hz ~%2; dwarf call-graph %10–30</li>
+    </ul>
+  </div>
+</section>
+
+</main>
