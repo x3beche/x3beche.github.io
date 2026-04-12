@@ -1,0 +1,979 @@
+---
+layout: tutorial
+title: "XDP & AF_XDP — Kernel Bypass Paket İşleme"
+back_url: "../index.html"
+back_label: "embedded-deck"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>LİNUX NETWORK PERFORMANS / XDP</span>
+    <span>KERNEL BYPASS</span>
+    <span>2026</span>
+  </div>
+  <h1>XDP &amp; AF_XDP<br><em>Wire-speed paket işleme, kernel içinden.</em></h1>
+  <p class="subtitle">eXpress Data Path ile NIC sürücüsünde eBPF program çalıştırın, AF_XDP ile zero-copy user-space paket yakalama yapın — DDoS mitigation, load balancer ve 10 Mpps sayaç uygulaması.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">XDP nedir?</a></li>
+    <li><a href="#s1">XDP hook noktaları</a></li>
+    <li><a href="#s2">BPF program yazımı</a></li>
+    <li><a href="#s3">libbpf API</a></li>
+    <li><a href="#s4">eBPF maps</a></li>
+    <li><a href="#s5">AF_XDP — user-space zero-copy</a></li>
+    <li><a href="#s6">XDP uygulamaları</a></li>
+    <li><a href="#s7">XDP performans ölçümü</a></li>
+    <li><a href="#s8">Pratik: 10 Mpps paket sayacı</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> XDP nedir?</h2>
+  <p class="section-lead">XDP (eXpress Data Path), Linux kernel'ının NIC sürücüsünde — sk_buff tahsis edilmeden önce — eBPF programı çalıştırmasına olanak tanıyan yüksek performanslı paket işleme çerçevesidir. Kernel bypass değil, kernel-accelerated yaklaşımı.</p>
+
+  <h3>XDP vs DPDK</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>XDP</th><th>DPDK</th></tr></thead>
+      <tbody>
+        <tr><td>Çalışma ortamı</td><td>Kernel (eBPF VM)</td><td>User-space (kernel bypass)</td></tr>
+        <tr><td>sk_buff</td><td>Gerekmiyor (native XDP)</td><td>Gerekmiyor</td></tr>
+        <tr><td>Linux ağ yığını</td><td>PASS → tam yığın kullanılabilir</td><td>Tamamen bypass</td></tr>
+        <tr><td>CPU izolasyonu</td><td>Gerekmez</td><td>Dedicated core gerekir</td></tr>
+        <tr><td>Programlama</td><td>eBPF C (güvenli, sandbox)</td><td>C/C++ (tam özgürlük)</td></tr>
+        <tr><td>Performans</td><td>~24 Mpps (native)</td><td>~80 Mpps (polling)</td></tr>
+        <tr><td>Kurulum karmaşıklığı</td><td>Düşük</td><td>Yüksek (hugepage, binding)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>XDP hook noktası</h3>
+
+  <div class="flow">
+    <pre>
+  NIC donanım RX
+       │
+  DMA ring (paket bellekte)
+       │
+  ┌────▼──────────────────────────────┐
+  │    XDP hook  ← eBPF programı       │  ← sk_buff YOKTU henüz
+  │    xdp_action:                     │
+  │    XDP_DROP    → paket düşürüldü   │
+  │    XDP_PASS    → sk_buff tahsis →  │
+  │    XDP_TX      → NIC'e geri gönder │
+  │    XDP_REDIRECT → başka NIC/CPU   │
+  └────────────────────────────────────┘
+       │ (yalnızca XDP_PASS için devam)
+  NAPI → netif_receive_skb → Protokol yığını
+    </pre>
+  </div>
+
+  <h3>Neden XDP?</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">DDoS mitigation</span><span class="desc">Saniyede milyonlarca sahte paketi sk_buff oluşturmadan DROP et — sistem geri kalan trafiğe cevap verebilir</span></div>
+    <div class="param"><span class="name">Load balancer</span><span class="desc">XDP_REDIRECT ile paketi başka NIC veya CPU kuyruğuna yönlendir — L4 LB donanım hızında</span></div>
+    <div class="param"><span class="name">Paket izleme</span><span class="desc">AF_XDP ile zero-copy user-space yakalama — tcpdump'tan 10x daha hızlı</span></div>
+    <div class="param"><span class="name">Network monitoring</span><span class="desc">Sayaçlar, histogram ve akış tabloları BPF map'lerde; user-space sorgular</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>XDP = kernel-içi eBPF hook, sk_buff öncesi — kernel bypass değil, kernel-accelerated</li>
+      <li>XDP_DROP: sk_buff tahsis edilmeden paket düşürülür — DDoS için ideal</li>
+      <li>DPDK: daha yüksek ham PPS; XDP: Linux ağ yığını ile kolay entegrasyon</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> XDP hook noktaları</h2>
+  <p class="section-lead">XDP programı üç farklı modda bağlanabilir. Mod seçimi, performans ve donanım desteği arasındaki dengeyi belirler.</p>
+
+  <h3>XDP modları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">XDP_NATIVE (offload'sız en hızlı)</span><span class="desc">NIC sürücüsünde, NAPI poll'dan önce çağrılır. sk_buff tahsis edilmez. En yüksek performans. Sürücü desteği gerektirir: mlx5, i40e, ixgbe, virtio, tun, veth, bonding vb.</span></div>
+    <div class="param"><span class="name">XDP_GENERIC (herhangi sürücü)</span><span class="desc">sk_buff oluşturulduktan sonra çağrılır — sürücü bağımsız, tüm NIC'lerde çalışır. Performans düşük; geliştirme ve test için kullanılır.</span></div>
+    <div class="param"><span class="name">XDP_OFFLOAD (NIC'e offload)</span><span class="desc">eBPF programı NIC donanımına yüklenir, CPU müdahalesi sıfır. Çok sınırlı NIC desteği (Netronome Agilio). En yüksek performans ama eBPF kısıtları çok daha katı.</span></div>
+  </div>
+
+  <h3>Driver desteği kontrolü</h3>
+
+  <pre><code"><span class="cmt"># XDP native desteği olan NIC'leri listele</span>
+<span class="cmt"># ethtool ile sürücü bilgisi</span>
+ethtool -i eth0 | grep driver
+
+<span class="cmt"># XDP programı bağla (native mod)</span>
+ip link set dev eth0 xdp obj xdp_prog.o sec xdp
+<span class="cmt"># Eğer sürücü native desteklemiyorsa generic'e düşer</span>
+
+<span class="cmt"># Sadece native mod zorla — generic'e fallback yok</span>
+ip link set dev eth0 xdpdrv obj xdp_prog.o sec xdp
+
+<span class="cmt"># Generic mod (geliştirme için)</span>
+ip link set dev eth0 xdpgeneric obj xdp_prog.o sec xdp
+
+<span class="cmt"># XDP programını kaldır</span>
+ip link set dev eth0 xdp off
+
+<span class="cmt"># Mevcut XDP programını göster</span>
+ip link show eth0 | grep xdp
+bpftool net show dev eth0
+</code></pre>
+
+  <h3>Native XDP destekleyen sürücüler</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Sürücü</th><th>NIC ailesi</th><th>Max PPS (yaklaşık)</th></tr></thead>
+      <tbody>
+        <tr><td>mlx5_core</td><td>Mellanox ConnectX-4/5/6</td><td>~80 Mpps</td></tr>
+        <tr><td>i40e</td><td>Intel X710/XL710</td><td>~25 Mpps</td></tr>
+        <tr><td>ixgbe</td><td>Intel X540/X550</td><td>~15 Mpps</td></tr>
+        <tr><td>virtio_net</td><td>KVM/QEMU sanal NIC</td><td>~3-5 Mpps</td></tr>
+        <tr><td>veth</td><td>Sanal ethernet çifti</td><td>~10 Mpps</td></tr>
+        <tr><td>tun/tap</td><td>Sanal tünel</td><td>~5 Mpps</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Native: en hızlı, sürücü desteği gerekir; Generic: evrensel ama yavaş</li>
+      <li>ip link set xdpdrv: native modunu zorla; xdpgeneric: geliştirme modu</li>
+      <li>bpftool net show: yüklü XDP programını ve attach modunu göster</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> BPF program yazımı</h2>
+  <p class="section-lead">XDP programı, C dilinde yazılan ve LLVM/Clang ile BPF bytecode'a derlenen küçük kernel fonksiyonudur. <code>struct xdp_md</code> context'i paketin DMA tamponuna erişim sağlar.</p>
+
+  <h3>Minimal XDP programı</h3>
+
+  <pre><code">#include &lt;linux/bpf.h&gt;
+#include &lt;bpf/bpf_helpers.h&gt;
+
+<span class="cmt">/* Her gelen paketi düşür */</span>
+SEC("xdp")
+<span class="keyword">int</span> xdp_drop_all(<span class="keyword">struct</span> xdp_md *ctx) {
+    <span class="keyword">return</span> XDP_DROP;
+}
+
+<span class="cmt">/* Her gelen paketi geçir */</span>
+SEC("xdp_pass")
+<span class="keyword">int</span> xdp_pass_all(<span class="keyword">struct</span> xdp_md *ctx) {
+    <span class="keyword">return</span> XDP_PASS;
+}
+
+char _license[] SEC("license") = "GPL";
+</code></pre>
+
+  <h3>xdp_md context ve paket erişimi</h3>
+
+  <pre><code">#include &lt;linux/bpf.h&gt;
+#include &lt;linux/if_ether.h&gt;
+#include &lt;linux/ip.h&gt;
+#include &lt;linux/tcp.h&gt;
+#include &lt;bpf/bpf_helpers.h&gt;
+#include &lt;bpf/bpf_endian.h&gt;
+
+SEC("xdp")
+<span class="keyword">int</span> xdp_parse_packet(<span class="keyword">struct</span> xdp_md *ctx) {
+    <span class="cmt">/* ctx: paket DMA tamponuna pointer */</span>
+    void *data     = (void *)(long)ctx-&gt;data;
+    void *data_end = (void *)(long)ctx-&gt;data_end;
+
+    <span class="cmt">/* BPF verifier: her pointer erişimi bounds check gerektiriyor */</span>
+
+    <span class="cmt">/* Ethernet header */</span>
+    <span class="keyword">struct</span> ethhdr *eth = data;
+    <span class="keyword">if</span> ((void *)(eth + 1) &gt; data_end)
+        <span class="keyword">return</span> XDP_PASS;   <span class="cmt">/* too short, pass to kernel */</span>
+
+    <span class="cmt">/* Yalnızca IPv4'e bak */</span>
+    <span class="keyword">if</span> (eth-&gt;h_proto != bpf_htons(ETH_P_IP))
+        <span class="keyword">return</span> XDP_PASS;
+
+    <span class="cmt">/* IP header */</span>
+    <span class="keyword">struct</span> iphdr *iph = (void *)(eth + 1);
+    <span class="keyword">if</span> ((void *)(iph + 1) &gt; data_end)
+        <span class="keyword">return</span> XDP_PASS;
+
+    <span class="cmt">/* TCP mı? */</span>
+    <span class="keyword">if</span> (iph-&gt;protocol != IPPROTO_TCP)
+        <span class="keyword">return</span> XDP_PASS;
+
+    <span class="cmt">/* TCP header */</span>
+    <span class="keyword">struct</span> tcphdr *tcph = (void *)iph + (iph-&gt;ihl * 4);
+    <span class="keyword">if</span> ((void *)(tcph + 1) &gt; data_end)
+        <span class="keyword">return</span> XDP_PASS;
+
+    <span class="cmt">/* 80 numaralı porta gelen trafiği düşür */</span>
+    <span class="keyword">if</span> (tcph-&gt;dest == bpf_htons(80))
+        <span class="keyword">return</span> XDP_DROP;
+
+    <span class="keyword">return</span> XDP_PASS;
+}
+
+char _license[] SEC("license") = "GPL";
+</code></pre>
+
+  <h3>Derleme</h3>
+
+  <pre><code"><span class="cmt"># LLVM/Clang ile BPF object üret</span>
+clang -O2 -target bpf \
+    -D__TARGET_ARCH_x86 \
+    -I/usr/include/bpf \
+    -I/usr/include/linux \
+    -c xdp_prog.c -o xdp_prog.o
+
+<span class="cmt"># BTF bilgisini dahil et (CO-RE için)</span>
+clang -O2 -target bpf \
+    -g -D__TARGET_ARCH_x86 \
+    -I/usr/include/bpf \
+    -c xdp_prog.c -o xdp_prog.o
+
+<span class="cmt"># Üretilen BPF object'i incele</span>
+llvm-objdump -S xdp_prog.o
+bpftool prog dump xlated pinned /sys/fs/bpf/xdp_prog
+</code></pre>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>xdp_md: data + data_end pointer'ları — her erişimde bounds check zorunlu</li>
+      <li>Verifier: (ptr + 1) &gt; data_end kontrolü olmadan paket okunamaz</li>
+      <li>clang -target bpf -O2: XDP BPF object derleme komutu</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> libbpf API</h2>
+  <p class="section-lead">libbpf, BPF programlarını yüklemek, map'lere erişmek ve XDP'yi bir arayüze bağlamak için kullanılan C kütüphanesidir. CO-RE (Compile Once, Run Everywhere) desteği ile kernel versiyonlarına taşınabilir.</p>
+
+  <h3>Temel libbpf kullanımı</h3>
+
+  <pre><code">#include &lt;bpf/libbpf.h&gt;
+#include &lt;net/if.h&gt;
+#include &lt;linux/if_link.h&gt;
+
+<span class="keyword">int</span> main(<span class="keyword">int</span> argc, <span class="keyword">char</span> **argv) {
+    <span class="keyword">const char</span> *ifname = argv[1];  <span class="cmt">/* örn: "eth0" */</span>
+    <span class="keyword">int</span> ifindex = if_nametoindex(ifname);
+
+    <span class="cmt">/* BPF object dosyasını aç */</span>
+    <span class="keyword">struct</span> bpf_object *obj = bpf_object__open_file("xdp_prog.o", NULL);
+    <span class="keyword">if</span> (libbpf_get_error(obj)) {
+        perror("bpf_object__open_file");
+        <span class="keyword">return</span> 1;
+    }
+
+    <span class="cmt">/* Kernel'a yükle (verifier + JIT) */</span>
+    <span class="keyword">if</span> (bpf_object__load(obj)) {
+        perror("bpf_object__load");
+        <span class="keyword">return</span> 1;
+    }
+
+    <span class="cmt">/* "xdp" section'ındaki programı bul */</span>
+    <span class="keyword">struct</span> bpf_program *prog = bpf_object__find_program_by_name(obj, "xdp_parse_packet");
+    <span class="keyword">int</span> prog_fd = bpf_program__fd(prog);
+
+    <span class="cmt">/* XDP programını arayüze bağla (native mod) */</span>
+    <span class="keyword">int</span> flags = XDP_FLAGS_DRV_MODE;  <span class="cmt">/* XDP_FLAGS_SKB_MODE = generic */</span>
+    <span class="keyword">if</span> (bpf_xdp_attach(ifindex, prog_fd, flags, NULL) &lt; 0) {
+        perror("bpf_xdp_attach");
+        <span class="keyword">return</span> 1;
+    }
+
+    printf("XDP program attached to %s (fd=%d)\n", ifname, prog_fd);
+
+    <span class="cmt">/* Ctrl+C ile bağlantıyı kes */</span>
+    pause();
+
+    bpf_xdp_detach(ifindex, flags, NULL);
+    bpf_object__close(obj);
+    <span class="keyword">return</span> 0;
+}
+</code></pre>
+
+  <h3>BPF skeleton (libbpf skeleton API)</h3>
+
+  <pre><code"><span class="cmt"># Skeleton üret (bpftool ile — daha modern yaklaşım)</span>
+bpftool gen skeleton xdp_prog.o > xdp_prog.skel.h
+
+<span class="cmt">// Skeleton kullanımı (daha temiz API)</span>
+#include "xdp_prog.skel.h"
+
+<span class="keyword">int</span> main() {
+    <span class="keyword">struct</span> xdp_prog *skel = xdp_prog__open_and_load();
+    <span class="keyword">if</span> (!skel) { perror("open_and_load"); <span class="keyword">return</span> 1; }
+
+    <span class="keyword">int</span> ifindex = if_nametoindex("eth0");
+    <span class="keyword">struct</span> bpf_link *link = bpf_program__attach_xdp(
+        skel-&gt;progs.xdp_parse_packet, ifindex);
+
+    pause();  <span class="cmt">/* çalışmaya devam et */</span>
+
+    bpf_link__destroy(link);
+    xdp_prog__destroy(skel);
+    <span class="keyword">return</span> 0;
+}
+</code></pre>
+
+  <h3>Derleme ve bağlama</h3>
+
+  <pre><code"><span class="cmt"># CMakeLists.txt veya Makefile</span>
+cc -O2 -Wall \
+    -I/usr/include/bpf \
+    xdp_loader.c \
+    -lbpf -lelf -lz \
+    -o xdp_loader
+
+<span class="cmt"># Gerekli paketler</span>
+<span class="cmt"># Debian/Ubuntu: apt install libbpf-dev linux-headers-$(uname -r)</span>
+<span class="cmt"># Fedora/RHEL:   dnf install libbpf-devel kernel-devel</span>
+</code></pre>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>bpf_object__open_file → load → find_program → bpf_xdp_attach: klasik akış</li>
+      <li>bpftool gen skeleton: tip-güvenli otomatik üretilmiş API (önerilen)</li>
+      <li>XDP_FLAGS_DRV_MODE: native; XDP_FLAGS_SKB_MODE: generic</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> eBPF maps</h2>
+  <p class="section-lead">BPF map'ler, kernel (XDP programı) ve user-space arasında paylaşılan veri yapılarıdır. Paket sayaçları, engel listeleri, akış tabloları ve konfigürasyon değerleri burada tutulur.</p>
+
+  <h3>XDP programında map tanımı</h3>
+
+  <pre><code">#include &lt;linux/bpf.h&gt;
+#include &lt;bpf/bpf_helpers.h&gt;
+
+<span class="cmt">/* Per-CPU sayaç array — CPU başına lock yok */</span>
+<span class="keyword">struct</span> {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} pkt_counter SEC(".maps");
+
+<span class="cmt">/* IP engel listesi — hash map */</span>
+<span class="keyword">struct</span> {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key,   __u32);  <span class="cmt">/* IPv4 adresi */</span>
+    __type(value, __u8);   <span class="cmt">/* 1 = engel */</span>
+} blocklist SEC(".maps");
+
+<span class="cmt">/* LRU hash: bağlantı takibi */</span>
+<span class="keyword">struct</span> flow_key {
+    __u32 src_ip, dst_ip;
+    __u16 src_port, dst_port;
+    __u8  protocol;
+};
+
+<span class="keyword">struct</span> {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 1 &lt;&lt; 20);  <span class="cmt">/* 1M akış */</span>
+    __type(key,   <span class="keyword">struct</span> flow_key);
+    __type(value, __u64);          <span class="cmt">/* paket sayısı */</span>
+} flow_table SEC(".maps");
+
+SEC("xdp")
+<span class="keyword">int</span> xdp_counter(<span class="keyword">struct</span> xdp_md *ctx) {
+    __u32 key = 0;
+    __u64 *cnt = bpf_map_lookup_elem(&amp;pkt_counter, &amp;key);
+    <span class="keyword">if</span> (cnt) (*cnt)++;
+
+    <span class="cmt">/* IP engel listesi kontrolu */</span>
+    void *data     = (void *)(long)ctx-&gt;data;
+    void *data_end = (void *)(long)ctx-&gt;data_end;
+    <span class="keyword">struct</span> ethhdr *eth = data;
+    <span class="keyword">if</span> ((void *)(eth + 1) &gt; data_end) <span class="keyword">return</span> XDP_PASS;
+    <span class="keyword">if</span> (eth-&gt;h_proto != bpf_htons(ETH_P_IP)) <span class="keyword">return</span> XDP_PASS;
+
+    <span class="keyword">struct</span> iphdr *iph = (void *)(eth + 1);
+    <span class="keyword">if</span> ((void *)(iph + 1) &gt; data_end) <span class="keyword">return</span> XDP_PASS;
+
+    __u32 src = iph-&gt;saddr;
+    <span class="keyword">if</span> (bpf_map_lookup_elem(&amp;blocklist, &amp;src))
+        <span class="keyword">return</span> XDP_DROP;  <span class="cmt">/* engel listesinde — drop */</span>
+
+    <span class="keyword">return</span> XDP_PASS;
+}
+
+char _license[] SEC("license") = "GPL";
+</code></pre>
+
+  <h3>User-space'ten map okuma/yazma</h3>
+
+  <pre><code">#include &lt;bpf/libbpf.h&gt;
+#include &lt;arpa/inet.h&gt;
+
+<span class="cmt">/* Map fd'yi isimden al */</span>
+<span class="keyword">int</span> map_fd = bpf_object__find_map_fd_by_name(obj, "blocklist");
+
+<span class="cmt">/* IP adresini engel listesine ekle */</span>
+__u32 bad_ip;
+inet_pton(AF_INET, "1.2.3.4", &amp;bad_ip);
+__u8 val = 1;
+bpf_map_update_elem(map_fd, &amp;bad_ip, &amp;val, BPF_ANY);
+
+<span class="cmt">/* Per-CPU sayaçları topla */</span>
+<span class="keyword">int</span> cnt_fd = bpf_object__find_map_fd_by_name(obj, "pkt_counter");
+__u32 key = 0;
+__u64 values[256];  <span class="cmt">/* max CPU sayısı */</span>
+bpf_map_lookup_elem(cnt_fd, &amp;key, values);
+
+__u64 total = 0;
+<span class="keyword">for</span> (<span class="keyword">int</span> i = 0; i &lt; libbpf_num_possible_cpus(); i++)
+    total += values[i];
+printf("Toplam paket: %llu\n", total);
+</code></pre>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Map tipi</th><th>Kullanım</th><th>Özellik</th></tr></thead>
+      <tbody>
+        <tr><td>PERCPU_ARRAY</td><td>Sayaçlar, istatistikler</td><td>CPU başına, lock-free, çok hızlı</td></tr>
+        <tr><td>HASH</td><td>IP engellemesi, konfigürasyon</td><td>O(1) arama, sabit max_entries</td></tr>
+        <tr><td>LRU_HASH</td><td>Akış tablosu, connection tracking</td><td>Otomatik LRU tahliyesi</td></tr>
+        <tr><td>ARRAY</td><td>Konfigürasyon, sabit boyutlu durum</td><td>Index erişimi O(1)</td></tr>
+        <tr><td>RINGBUF</td><td>Event streaming, paket örnekleme</td><td>BPF_MAP_TYPE_RINGBUF — kernel 5.8+</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>PERCPU_ARRAY: sayaçlar için — her CPU bağımsız yazar, lock yok</li>
+      <li>LRU_HASH: bağlantı takibi — max_entries dolduğunda eski girişler otomatik silinir</li>
+      <li>bpf_map_update_elem: user-space'ten dinamik engel listesi yönetimi</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> AF_XDP — user-space zero-copy</h2>
+  <p class="section-lead">AF_XDP, XDP_REDIRECT aracılığıyla paketleri user-space'e aktarmanın zero-copy yöntemidir. UMEM (User MEMory) üzerinde tanımlanan ring buffer'lar sayesinde kernel-userspace arasında kopya yoktur.</p>
+
+  <h3>AF_XDP mimarisi</h3>
+
+  <div class="flow">
+    <pre>
+  NIC RX
+    │
+  XDP program → XDP_REDIRECT → xsk_map
+                                    │
+  ┌─────────────────────────────────▼───────────────────┐
+  │  UMEM (User Memory — mmap ile paylaşılan büyük bellek) │
+  │                                                       │
+  │  Fill Ring      ← user: "bu adresi doldur"            │
+  │  Completion Ring← user: "TX tamamlandı"               │
+  │  RX Ring        → user: paketler burada               │
+  │  TX Ring        ← user: "bu paketi gönder"            │
+  └───────────────────────────────────────────────────────┘
+    </pre>
+  </div>
+
+  <h3>AF_XDP socket oluşturma</h3>
+
+  <pre><code">#include &lt;linux/if_xdp.h&gt;
+#include &lt;xdp/xsk.h&gt;
+#include &lt;sys/mman.h&gt;
+
+#define UMEM_SIZE   (64 * 1024 * 1024)   <span class="cmt">/* 64 MB UMEM */</span>
+#define FRAME_SIZE  XSK_UMEM__DEFAULT_FRAME_SIZE  <span class="cmt">/* 4096 */</span>
+#define NUM_FRAMES  (UMEM_SIZE / FRAME_SIZE)
+
+<span class="keyword">struct</span> xsk_socket_info {
+    <span class="keyword">struct</span> xsk_socket *xsk;
+    <span class="keyword">struct</span> xsk_umem   *umem;
+    <span class="keyword">struct</span> xsk_ring_prod fq;   <span class="cmt">/* fill queue */</span>
+    <span class="keyword">struct</span> xsk_ring_cons cq;   <span class="cmt">/* completion queue */</span>
+    <span class="keyword">struct</span> xsk_ring_cons rx;   <span class="cmt">/* rx queue */</span>
+    <span class="keyword">struct</span> xsk_ring_prod tx;   <span class="cmt">/* tx queue */</span>
+    void  *umem_area;
+};
+
+<span class="keyword">struct</span> xsk_socket_info *create_xsk_socket(<span class="keyword">const char</span> *ifname, __u32 queue_id) {
+    <span class="keyword">struct</span> xsk_socket_info *xsk_info = calloc(1, <span class="keyword">sizeof</span>(*xsk_info));
+
+    <span class="cmt">/* UMEM için mmap */</span>
+    xsk_info-&gt;umem_area = mmap(NULL, UMEM_SIZE,
+                                PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+
+    <span class="cmt">/* UMEM oluştur */</span>
+    <span class="keyword">struct</span> xsk_umem_config umem_cfg = {
+        .fill_size  = XSK_RING_PROD__DEFAULT_NUM_DESCS,
+        .comp_size  = XSK_RING_CONS__DEFAULT_NUM_DESCS,
+        .frame_size = FRAME_SIZE,
+        .frame_headroom = 0,
+    };
+    xsk_umem__create(&amp;xsk_info-&gt;umem, xsk_info-&gt;umem_area, UMEM_SIZE,
+                     &amp;xsk_info-&gt;fq, &amp;xsk_info-&gt;cq, &amp;umem_cfg);
+
+    <span class="cmt">/* XDP socket oluştur */</span>
+    <span class="keyword">struct</span> xsk_socket_config xsk_cfg = {
+        .rx_size    = XSK_RING_CONS__DEFAULT_NUM_DESCS,
+        .tx_size    = XSK_RING_PROD__DEFAULT_NUM_DESCS,
+        .libbpf_flags = 0,
+        .xdp_flags  = XDP_FLAGS_DRV_MODE,
+        .bind_flags = XDP_ZEROCOPY,  <span class="cmt">/* sıfır kopya */</span>
+    };
+    xsk_socket__create(&amp;xsk_info-&gt;xsk, ifname, queue_id,
+                       xsk_info-&gt;umem, &amp;xsk_info-&gt;rx,
+                       &amp;xsk_info-&gt;tx, &amp;xsk_cfg);
+
+    <span class="keyword">return</span> xsk_info;
+}
+</code></pre>
+
+  <h3>RX döngüsü</h3>
+
+  <pre><code"><span class="keyword">void</span> rx_loop(<span class="keyword">struct</span> xsk_socket_info *xsk) {
+    __u32 idx_rx = 0, idx_fq = 0;
+    <span class="keyword">unsigned int</span> rcvd;
+
+    <span class="keyword">while</span> (1) {
+        <span class="cmt">/* NIC'ten alınan paket sayısı */</span>
+        rcvd = xsk_ring_cons__peek(&amp;xsk-&gt;rx, 64, &amp;idx_rx);
+        <span class="keyword">if</span> (!rcvd) {
+            <span class="cmt">/* Kernel'ı yokla (busy-poll yerine poll() kullanılabilir) */</span>
+            <span class="keyword">if</span> (xsk_ring_prod__needs_wakeup(&amp;xsk-&gt;fq))
+                recvfrom(xsk_socket__fd(xsk-&gt;xsk), NULL, 0, MSG_DONTWAIT, NULL, NULL);
+            <span class="keyword">continue</span>;
+        }
+
+        <span class="cmt">/* Her paketi işle */</span>
+        <span class="keyword">for</span> (__u32 i = 0; i &lt; rcvd; i++) {
+            <span class="keyword">const</span> <span class="keyword">struct</span> xdp_desc *desc = xsk_ring_cons__rx_desc(&amp;xsk-&gt;rx, idx_rx++);
+            __u64 addr = desc-&gt;addr;
+            __u32 len  = desc-&gt;len;
+
+            <span class="cmt">/* Zero-copy: UMEM'den doğrudan oku */</span>
+            void *pkt = xsk_umem__get_data(xsk-&gt;umem_area, addr);
+
+            <span class="cmt">/* Paket işle: pkt[0..len] */</span>
+            process_packet(pkt, len);
+        }
+
+        xsk_ring_cons__release(&amp;xsk-&gt;rx, rcvd);
+
+        <span class="cmt">/* Fill queue'ya frame adresleri geri ver */</span>
+        xsk_ring_prod__reserve(&amp;xsk-&gt;fq, rcvd, &amp;idx_fq);
+        <span class="keyword">for</span> (__u32 i = 0; i &lt; rcvd; i++)
+            *xsk_ring_prod__fill_addr(&amp;xsk-&gt;fq, idx_fq++) = i * FRAME_SIZE;
+        xsk_ring_prod__submit(&amp;xsk-&gt;fq, rcvd);
+    }
+}
+</code></pre>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>UMEM: mmap ile oluşturulan büyük bellek havuzu, kernel ile paylaşımlı</li>
+      <li>XDP_ZEROCOPY: kopya yok — paket UMEM'den doğrudan okunur</li>
+      <li>Fill ring: user → kernel; RX ring: kernel → user; paket adresleri paylaşılır</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> XDP uygulamaları</h2>
+  <p class="section-lead">DDoS mitigation, load balancer ve paket mirror — üç temel XDP kullanım senaryosunun BPF program yapıları.</p>
+
+  <h3>DDoS mitigation — DROP loop</h3>
+
+  <pre><code">#include &lt;linux/bpf.h&gt;
+#include &lt;linux/if_ether.h&gt;
+#include &lt;linux/ip.h&gt;
+#include &lt;linux/udp.h&gt;
+#include &lt;bpf/bpf_helpers.h&gt;
+#include &lt;bpf/bpf_endian.h&gt;
+
+<span class="keyword">struct</span> {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);      <span class="cmt">/* CIDR engel listesi */</span>
+    __uint(max_entries, 10000);
+    __type(key, <span class="keyword">struct</span> bpf_lpm_trie_key);
+    __type(value, __u64);                      <span class="cmt">/* düşürülen paket sayısı */</span>
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} ddos_blocklist SEC(".maps");
+
+SEC("xdp")
+<span class="keyword">int</span> xdp_ddos_mitigation(<span class="keyword">struct</span> xdp_md *ctx) {
+    void *data     = (void *)(long)ctx-&gt;data;
+    void *data_end = (void *)(long)ctx-&gt;data_end;
+
+    <span class="keyword">struct</span> ethhdr *eth = data;
+    <span class="keyword">if</span> ((void *)(eth + 1) &gt; data_end) <span class="keyword">return</span> XDP_PASS;
+    <span class="keyword">if</span> (eth-&gt;h_proto != bpf_htons(ETH_P_IP)) <span class="keyword">return</span> XDP_PASS;
+
+    <span class="keyword">struct</span> iphdr *iph = (void *)(eth + 1);
+    <span class="keyword">if</span> ((void *)(iph + 1) &gt; data_end) <span class="keyword">return</span> XDP_PASS;
+
+    <span class="cmt">/* LPM trie: CIDR subnet eşleştirmesi */</span>
+    <span class="keyword">struct</span> {
+        __u32 prefixlen;
+        __u32 data;
+    } key = { .prefixlen = 32, .data = iph-&gt;saddr };
+
+    __u64 *cnt = bpf_map_lookup_elem(&amp;ddos_blocklist, &amp;key);
+    <span class="keyword">if</span> (cnt) {
+        __sync_fetch_and_add(cnt, 1);
+        <span class="keyword">return</span> XDP_DROP;
+    }
+
+    <span class="keyword">return</span> XDP_PASS;
+}
+
+char _license[] SEC("license") = "GPL";
+</code></pre>
+
+  <h3>L4 Load Balancer — REDIRECT</h3>
+
+  <pre><code"><span class="cmt">/* Basit round-robin L4 load balancer */</span>
+<span class="keyword">struct</span> backend_info {
+    __u32 ip;
+    __u8  mac[6];
+};
+
+<span class="keyword">struct</span> {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 8);    <span class="cmt">/* 8 backend */</span>
+    __type(key,   __u32);
+    __type(value, <span class="keyword">struct</span> backend_info);
+} backends SEC(".maps");
+
+<span class="keyword">struct</span> {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key,   __u32);
+    __type(value, __u32);      <span class="cmt">/* round-robin counter */</span>
+} rr_counter SEC(".maps");
+
+SEC("xdp")
+<span class="keyword">int</span> xdp_lb(<span class="keyword">struct</span> xdp_md *ctx) {
+    <span class="cmt">/* ... parse eth/ip/tcp ... */</span>
+
+    <span class="cmt">/* Round-robin backend seç */</span>
+    __u32 key = 0;
+    __u32 *rr = bpf_map_lookup_elem(&amp;rr_counter, &amp;key);
+    <span class="keyword">if</span> (!rr) <span class="keyword">return</span> XDP_PASS;
+
+    __u32 idx = (*rr)++ % 8;
+    <span class="keyword">struct</span> backend_info *backend = bpf_map_lookup_elem(&amp;backends, &amp;idx);
+    <span class="keyword">if</span> (!backend) <span class="keyword">return</span> XDP_PASS;
+
+    <span class="cmt">/* Destination IP ve MAC'i değiştir */</span>
+    <span class="cmt">/* iph->daddr = backend->ip; checksum güncelle */</span>
+    <span class="cmt">/* eth->h_dest = backend->mac; */</span>
+
+    <span class="keyword">return</span> XDP_TX;  <span class="cmt">/* paketi değiştirilmiş haliyle geri gönder */</span>
+}
+</code></pre>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>LPM_TRIE: CIDR subnet eşleştirmesi — /16 /24 /32 engel kuralları</li>
+      <li>XDP_TX: paketi modifiye et ve aynı NIC'ten geri gönder</li>
+      <li>XDP_REDIRECT: bpf_redirect() ile başka NIC/CPU'ya yönlendir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> XDP performans ölçümü</h2>
+  <p class="section-lead">XDP ve AF_XDP uygulamalarının performansını ölçmek için kullanılan araçlar ve yöntemler: xdp-bench, pktgen ve perf stat.</p>
+
+  <h3>xdp-bench ile hız ölçümü</h3>
+
+  <pre><code"><span class="cmt"># xdp-bench: kernel tools/testing içinde</span>
+<span class="cmt"># xdp-bench veya xdp-tutorial/xdp-tools</span>
+
+<span class="cmt"># Basit XDP DROP benchmark</span>
+xdp-bench drop eth0 --mode native
+
+<span class="cmt"># PASS benchmark (tüm paketleri geçir)</span>
+xdp-bench pass eth0 --mode native
+
+<span class="cmt"># Tx reflect benchmark</span>
+xdp-bench tx-push eth0 --mode native
+
+<span class="cmt"># Sonuç örneği:</span>
+<span class="cmt"># Drop:  24,136,512 pps  (native XDP — mlx5)</span>
+<span class="cmt"># Pass:  14,892,441 pps  (sk_buff tahsisi dahil)</span>
+</code></pre>
+
+  <h3>pktgen — yazılım paket üreteci</h3>
+
+  <pre><code"><span class="cmt"># pktgen kernel modülü</span>
+modprobe pktgen
+
+<span class="cmt"># /proc/net/pktgen/pgctrl üzerinden kontrol</span>
+<span class="cmt"># pktgen_sample01.sh scripti (kernel samples/pktgen/)</span>
+
+<span class="cmt"># Temel ayarlar</span>
+echo "add_device eth0" > /proc/net/pktgen/kpktgend_0
+echo "pkt_size 64"     > /proc/net/pktgen/eth0
+echo "count  10000000" > /proc/net/pktgen/eth0
+echo "dst_mac 02:00:00:00:00:00" > /proc/net/pktgen/eth0
+echo "dst 10.0.0.1"    > /proc/net/pktgen/eth0
+
+<span class="cmt"># Gönderimi başlat</span>
+echo "start" > /proc/net/pktgen/pgctrl
+
+<span class="cmt"># Sonuç oku</span>
+cat /proc/net/pktgen/eth0 | grep "pkts-sofar\|errors"
+</code></pre>
+
+  <h3>perf stat ile CPU analizi</h3>
+
+  <pre><code"><span class="cmt"># XDP programı çalışırken CPU sayaçlarını izle</span>
+perf stat -e \
+    cycles,instructions,cache-misses,cache-references,\
+    L1-dcache-load-misses,LLC-load-misses \
+    -p $(pgrep xdp_loader) sleep 10
+
+<span class="cmt"># IRQ affinity — XDP core'larını izole et</span>
+<span class="cmt"># RX queue 0 interrupt'ını CPU 2'ye yönlendir</span>
+cat /proc/interrupts | grep eth0
+echo 4 > /proc/irq/&lt;IRQ_NUM&gt;/smp_affinity  <span class="cmt"># CPU 2 = 0b0100 = 4</span>
+
+<span class="cmt"># XDP core izolasyonu (isolcpus kernel parametresi)</span>
+<span class="cmt"># GRUB_CMDLINE_LINUX="isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3"</span>
+
+<span class="cmt"># Mpps hesabı</span>
+<span class="cmt"># 10 GbE, 64-byte paket = 14.88 Mpps (line rate)</span>
+<span class="cmt"># Formül: wire_rate / (frame_size + IFG + preamble)</span>
+<span class="cmt"># = 10^10 / ((64 + 8 + 12) * 8) = 14,880,952 pps</span>
+</code></pre>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>xdp-bench drop: native XDP DROP baseline — sürücü maksimum DROP PPS'i</li>
+      <li>pktgen: kernel içi paket üretici, harici donanım trafiği yerine kullanılabilir</li>
+      <li>IRQ affinity + isolcpus: XDP CPU'larını izole et, L3 cache özgün tut</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: 10 Mpps paket sayacı</h2>
+  <p class="section-lead">AF_XDP ile zero-copy UDP paket yakalama ve 10 Mpps hedefine ulaşan tam C örneği — XDP programı + user-space sayaç uygulaması.</p>
+
+  <h3>XDP BPF programı (xdp_counter_kern.c)</h3>
+
+  <pre><code">#include &lt;linux/bpf.h&gt;
+#include &lt;linux/if_ether.h&gt;
+#include &lt;linux/ip.h&gt;
+#include &lt;linux/udp.h&gt;
+#include &lt;bpf/bpf_helpers.h&gt;
+#include &lt;bpf/bpf_endian.h&gt;
+
+<span class="cmt">/* PERCPU sayaçlar: paket sayısı ve byte toplamı */</span>
+<span class="keyword">struct</span> pkt_stats {
+    __u64 packets;
+    __u64 bytes;
+};
+
+<span class="keyword">struct</span> {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key,   __u32);
+    __type(value, <span class="keyword">struct</span> pkt_stats);
+} stats_map SEC(".maps");
+
+<span class="cmt">/* AF_XDP socket map — paketleri user-space'e yönlendir */</span>
+<span class="keyword">struct</span> {
+    __uint(type, BPF_MAP_TYPE_XSKMAP);
+    __uint(max_entries, 64);   <span class="cmt">/* max queue sayısı */</span>
+    __type(key,   __u32);
+    __type(value, __u32);
+} xsk_map SEC(".maps");
+
+SEC("xdp")
+<span class="keyword">int</span> xdp_pkt_counter(<span class="keyword">struct</span> xdp_md *ctx) {
+    void *data     = (void *)(long)ctx-&gt;data;
+    void *data_end = (void *)(long)ctx-&gt;data_end;
+    __u32 len = data_end - data;
+
+    <span class="cmt">/* Sayacı güncelle */</span>
+    __u32 key = 0;
+    <span class="keyword">struct</span> pkt_stats *stats = bpf_map_lookup_elem(&amp;stats_map, &amp;key);
+    <span class="keyword">if</span> (stats) {
+        stats-&gt;packets++;
+        stats-&gt;bytes += len;
+    }
+
+    <span class="cmt">/* UDP paketi ise AF_XDP'ye yönlendir */</span>
+    <span class="keyword">struct</span> ethhdr *eth = data;
+    <span class="keyword">if</span> ((void *)(eth + 1) &lt;= data_end &amp;&amp;
+        eth-&gt;h_proto == bpf_htons(ETH_P_IP)) {
+        <span class="keyword">struct</span> iphdr *iph = (void *)(eth + 1);
+        <span class="keyword">if</span> ((void *)(iph + 1) &lt;= data_end &amp;&amp;
+            iph-&gt;protocol == IPPROTO_UDP) {
+            <span class="cmt">/* Paketi queue 0'daki AF_XDP socket'e yönlendir */</span>
+            <span class="keyword">return</span> bpf_redirect_map(&amp;xsk_map, ctx-&gt;rx_queue_index, XDP_PASS);
+        }
+    }
+
+    <span class="keyword">return</span> XDP_PASS;
+}
+
+char _license[] SEC("license") = "GPL";
+</code></pre>
+
+  <h3>User-space AF_XDP sayaç (xdp_counter_user.c)</h3>
+
+  <pre><code">#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;signal.h&gt;
+#include &lt;time.h&gt;
+#include &lt;xdp/xsk.h&gt;
+#include &lt;bpf/libbpf.h&gt;
+#include "xdp_counter_kern.skel.h"
+
+<span class="keyword">static volatile</span> sig_atomic_t stop = 0;
+<span class="keyword">void</span> sig_handler(<span class="keyword">int</span> sig) { stop = 1; }
+
+<span class="keyword">int</span> main(<span class="keyword">int</span> argc, <span class="keyword">char</span> **argv) {
+    <span class="keyword">if</span> (argc &lt; 2) { fprintf(stderr, "Kullanım: %s &lt;ifname&gt;\n", argv[0]); <span class="keyword">return</span> 1; }
+    <span class="keyword">const char</span> *ifname = argv[1];
+
+    signal(SIGINT, sig_handler);
+    signal(SIGTERM, sig_handler);
+
+    <span class="cmt">/* BPF skeleton aç ve yükle */</span>
+    <span class="keyword">struct</span> xdp_counter_kern *skel = xdp_counter_kern__open_and_load();
+    <span class="keyword">if</span> (!skel) { perror("skeleton open_and_load"); <span class="keyword">return</span> 1; }
+
+    <span class="cmt">/* AF_XDP soketi oluştur */</span>
+    <span class="keyword">struct</span> xsk_socket_info *xsk = create_xsk_socket(ifname, 0);
+
+    <span class="cmt">/* xsk_map'e AF_XDP socket fd'yi kaydet */</span>
+    <span class="keyword">int</span> xsk_map_fd = bpf_map__fd(skel-&gt;maps.xsk_map);
+    __u32 queue_id = 0;
+    <span class="keyword">int</span> xsk_fd = xsk_socket__fd(xsk-&gt;xsk);
+    bpf_map_update_elem(xsk_map_fd, &amp;queue_id, &amp;xsk_fd, BPF_ANY);
+
+    <span class="cmt">/* XDP programını arayüze bağla */</span>
+    <span class="keyword">int</span> ifindex = if_nametoindex(ifname);
+    <span class="keyword">struct</span> bpf_link *link = bpf_program__attach_xdp(
+        skel-&gt;progs.xdp_pkt_counter, ifindex);
+
+    <span class="keyword">int</span> stats_fd = bpf_map__fd(skel-&gt;maps.stats_map);
+    __u64 last_pkts = 0;
+    <span class="keyword">struct</span> timespec ts_prev, ts_curr;
+    clock_gettime(CLOCK_MONOTONIC, &amp;ts_prev);
+
+    printf("%-12s %-12s %-10s\n", "Paket/s", "Toplam", "Mbps");
+
+    <span class="keyword">while</span> (!stop) {
+        <span class="cmt">/* AF_XDP RX döngüsü çalıştır */</span>
+        rx_loop_once(xsk);
+
+        <span class="cmt">/* Her saniye istatistik yazdır */</span>
+        clock_gettime(CLOCK_MONOTONIC, &amp;ts_curr);
+        double elapsed = (ts_curr.tv_sec - ts_prev.tv_sec)
+                       + (ts_curr.tv_nsec - ts_prev.tv_nsec) * 1e-9;
+
+        <span class="keyword">if</span> (elapsed &gt;= 1.0) {
+            <span class="keyword">struct</span> pkt_stats total = {0};
+            __u32 key = 0;
+            <span class="keyword">struct</span> pkt_stats percpu[256];
+            bpf_map_lookup_elem(stats_fd, &amp;key, percpu);
+            <span class="keyword">for</span> (<span class="keyword">int</span> i = 0; i &lt; libbpf_num_possible_cpus(); i++) {
+                total.packets += percpu[i].packets;
+                total.bytes   += percpu[i].bytes;
+            }
+
+            double pps  = (total.packets - last_pkts) / elapsed;
+            double mbps = (total.bytes * 8) / elapsed / 1e6;
+            printf("%-12.0f %-12llu %-10.1f\n", pps, total.packets, mbps);
+
+            last_pkts = total.packets;
+            ts_prev = ts_curr;
+        }
+    }
+
+    bpf_link__destroy(link);
+    xdp_counter_kern__destroy(skel);
+    <span class="keyword">return</span> 0;
+}
+</code></pre>
+
+  <h3>Derleme ve çalıştırma</h3>
+
+  <pre><code"><span class="cmt"># BPF kernel programını derle</span>
+clang -O2 -target bpf -g \
+    -I/usr/include/bpf \
+    -c xdp_counter_kern.c -o xdp_counter_kern.o
+
+<span class="cmt"># Skeleton üret</span>
+bpftool gen skeleton xdp_counter_kern.o > xdp_counter_kern.skel.h
+
+<span class="cmt"># User-space programı derle</span>
+gcc -O2 -Wall \
+    xdp_counter_user.c \
+    -lbpf -lxdp -lelf -lz \
+    -o xdp_counter
+
+<span class="cmt"># Çalıştır (root gerekli)</span>
+sudo ./xdp_counter eth0
+
+<span class="cmt"># Beklenen çıktı (10GbE + pktgen 64-byte UDP paketi ile):</span>
+<span class="cmt"># Paket/s       Toplam       Mbps</span>
+<span class="cmt"># 10,245,612    10245612     52.5</span>
+<span class="cmt"># 10,118,907    20364519     51.8</span>
+
+<span class="cmt"># Canlı BPF map izleme (başka terminalde)</span>
+bpftool map dump name stats_map
+watch -n1 "bpftool map dump name stats_map"
+</code></pre>
+
+  <div class="callout">
+    <div class="label">PERFORMANS İPUCU</div>
+    <p>10 Mpps hedefine ulaşmak için: (1) native XDP mod, (2) mlx5/i40e/ixgbe NIC, (3) isolcpus kernel parametresi ile XDP CPU'larını izole et, (4) RX/TX irq affinity ayarla, (5) hugepage ile UMEM tahsis et, (6) NUMA farkındalığı — NIC ve UMEM aynı NUMA node'da olmalı.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>XDP + AF_XDP kombinasyonu: BPF ile say, UDP akışlarını zero-copy user-space'e gönder</li>
+      <li>PERCPU_ARRAY + libbpf_num_possible_cpus: tüm CPU sayaçlarını atomik topla</li>
+      <li>bpf_redirect_map + XSKMAP: paketi AF_XDP socket'e yönlendir</li>
+    </ul>
+  </div>
+</section>
+
+</main>

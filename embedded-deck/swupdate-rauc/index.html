@@ -1,0 +1,1034 @@
+---
+layout: tutorial
+title: "SWUpdate & RAUC — Üretim OTA Güncelleme"
+back_url: "../index.html"
+back_label: "embedded-deck"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>OTA</span>
+    <span>2026</span>
+  </div>
+  <h1>SWUpdate &amp; RAUC<br><em>Üretim OTA Güncelleme</em></h1>
+  <p class="subtitle">Atomik güncelleme, güvenli imzalama ve güç kesintisi güvenli rollback ile endüstriyel düzeyde OTA altyapısı kurun.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Üretim OTA gereksinimleri</a></li>
+    <li><a href="#s1">SWUpdate mimarisi</a></li>
+    <li><a href="#s2">sw-description dosyası</a></li>
+    <li><a href="#s3">SWUpdate Lua handler</a></li>
+    <li><a href="#s4">hawkBit entegrasyonu</a></li>
+    <li><a href="#s5">RAUC mimarisi</a></li>
+    <li><a href="#s6">RAUC bundle oluşturma</a></li>
+    <li><a href="#s7">A/B partition stratejisi</a></li>
+    <li><a href="#s8">Pratik: Yocto + RAUC CI/CD pipeline</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> Üretim OTA Gereksinimleri</h2>
+  <p class="section-lead">Sahada çalışan gömülü Linux cihazlar için güncelleme sistemi, tüketici elektroniğinden çok farklı kısıtlar altında çalışır. Bir güncelleme hatası cihazı kalıcı olarak kullanılamaz hale getirebilir.</p>
+
+  <h3>Üretim OTA'nın kritik gereksinimleri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Atomik güncelleme</span><span class="desc">Güncelleme ya tamamen uygulanır ya da hiç uygulanmaz — yarım kalan güncelleme kabul edilemez</span></div>
+    <div class="param"><span class="name">Güç kesintisi güvenliği</span><span class="desc">Flash yazma sırasında güç kesilebilir; sistem bir sonraki açılışta kurtarılabilir olmalı</span></div>
+    <div class="param"><span class="name">Rollback</span><span class="desc">Güncelleme sonrası sistem açılmazsa veya test başarısız olursa önceki sürüme otomatik dönüş</span></div>
+    <div class="param"><span class="name">İmzalama</span><span class="desc">Güncelleme paketi kriptografik olarak imzalanmış olmalı — yetkisiz güncelleme engellenebilir</span></div>
+    <div class="param"><span class="name">Bütünlük doğrulama</span><span class="desc">SHA-256 / dm-verity ile her dosyanın bütünlüğü güncelleme öncesi ve sonrası doğrulanır</span></div>
+    <div class="param"><span class="name">Delta güncelleme</span><span class="desc">Yalnızca değişen bloklar transfer edilir — bant genişliği ve güncelleme süresi azalır</span></div>
+    <div class="param"><span class="name">Kademeli dağıtım</span><span class="desc">Tüm filoyu aynı anda güncellemek yerine %5, %20, %100 kademeli rollout</span></div>
+  </div>
+
+  <h3>OTA araç karşılaştırması</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>SWUpdate</th><th>RAUC</th><th>Mender</th></tr></thead>
+      <tbody>
+        <tr><td>Lisans</td><td>GPL v2</td><td>LGPL v2.1</td><td>Apache 2.0 (agent) + ticari</td></tr>
+        <tr><td>Format</td><td>CPIO arşiv + sw-description</td><td>SquashFS bundle</td><td>ext4 image</td></tr>
+        <tr><td>Yocto desteği</td><td>meta-swupdate</td><td>meta-rauc</td><td>meta-mender</td></tr>
+        <tr><td>Delta güncelleme</td><td>Desteklemiyor (doğrudan)</td><td>casync ile</td><td>Mender Enterprise</td></tr>
+        <tr><td>Yönetim sunucusu</td><td>hawkBit (açık kaynak)</td><td>Hawkbit / Umbra</td><td>Mender Server (ticari)</td></tr>
+        <tr><td>Custom handler</td><td>Lua + shell + C</td><td>D-Bus handler</td><td>Update module</td></tr>
+        <tr><td>Bootloader</td><td>U-Boot, GRUB, barebox</td><td>U-Boot, GRUB, barebox</td><td>U-Boot</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Atomik güncelleme + güç kesintisi güvenliği + rollback: üretim OTA'nın üç sacayağı</li>
+      <li>SWUpdate: esnek handler sistemi, hawkBit entegrasyonu, Lua scripting</li>
+      <li>RAUC: temiz bundle formatı, casync delta, güçlü Yocto entegrasyonu</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> SWUpdate Mimarisi</h2>
+  <p class="section-lead">SWUpdate, CPIO arşiv formatında bir güncelleme paketi alır ve <code>sw-description</code> dosyasındaki talimatlara göre farklı handler'lar aracılığıyla cihaza uygular.</p>
+
+  <h3>SWUpdate çalışma akışı</h3>
+
+  <div class="flow">
+    <pre>Güncelleme paketi (.swu)
+    │
+    ├── sw-description        (libconfig formatında talimatlar)
+    ├── rootfs.ext4.gz        (yeni root filesystem)
+    ├── kernel.itb            (FIT image — kernel + DTB)
+    ├── u-boot.bin            (bootloader güncellemesi)
+    └── postinstall.lua       (kurulum sonrası script)
+         │
+         ▼
+SWUpdate daemon (swupdate)
+    │
+    ├── sw-description parse
+    ├── İmza doğrula (OpenSSL / GPG)
+    ├── SHA-256 checksum doğrula
+    ├── Handler seç (raw, ubivol, shellscript, lua...)
+    ├── Pasif partition'a yaz
+    ├── Bootloader ortam güncellemesi
+    └── Reboot → yeni sistem açılır</pre>
+  </div>
+
+  <h3>SWUpdate derleme (Yocto dışı)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># Bağımlılıklar</span>
+sudo apt install -y cmake libssl-dev libconfig-dev \
+  libarchive-dev liblua5.3-dev libcurl4-openssl-dev \
+  libmtd-dev libubi-dev libjson-c-dev libzmq3-dev \
+  zlib1g-dev pkg-config
+
+<span class="cmt"># SWUpdate kaynak</span>
+git clone https://github.com/sbabic/swupdate.git
+cd swupdate
+
+<span class="cmt"># Yapılandırma (make menuconfig veya defconfig)</span>
+make swupdate_defconfig
+
+<span class="cmt"># Gerekli özellikleri etkinleştir</span>
+cat &gt;&gt; .config &lt;&lt;'EOF'
+CONFIG_LUA=y
+CONFIG_LUAPKG="lua5.3"
+CONFIG_HASH_VERIFY=y
+CONFIG_SIGNED_IMAGES=y
+CONFIG_SIGALG_RAWRSA=y
+CONFIG_WEBSERVER=y
+CONFIG_SURICATTA=y
+CONFIG_SURICATTA_HAWKBIT=y
+CONFIG_MONGOOSE=y
+EOF
+
+make -j$(nproc)
+sudo make install</code></pre>
+  </div>
+
+  <h3>Handler türleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Handler</th><th>Hedef</th><th>Kullanım</th></tr></thead>
+      <tbody>
+        <tr><td><code>raw</code></td><td>Ham blok cihazı</td><td>/dev/mmcblk0p2 — ext4 rootfs doğrudan yaz</td></tr>
+        <tr><td><code>rawfile</code></td><td>Dosya sistemi üzerinde dosya</td><td>Bireysel dosya güncellemesi</td></tr>
+        <tr><td><code>ubivol</code></td><td>UBI volume (NAND flash)</td><td>NAND flash rootfs güncellemesi</td></tr>
+        <tr><td><code>shellscript</code></td><td>Shell scripti çalıştır</td><td>Özel güncelleme adımları</td></tr>
+        <tr><td><code>lua</code></td><td>Lua scripti çalıştır</td><td>Karmaşık güncelleme mantığı</td></tr>
+        <tr><td><code>bootloader</code></td><td>Bootloader ortamı</td><td>U-Boot fw_setenv çağrısı</td></tr>
+        <tr><td><code>archive</code></td><td>Arşiv açma</td><td>Tar.gz'den dosya dizinine çıkartma</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>SWUpdate paketi: CPIO arşiv içinde sw-description + payload dosyaları</li>
+      <li>Handler sistemi: raw, ubivol, shellscript, lua — farklı depolama ortamları için</li>
+      <li>İmza doğrulama, SHA-256 checksum, pasif partition yazma standart akış</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> sw-description Dosyası</h2>
+  <p class="section-lead"><code>sw-description</code>, SWUpdate paketinin merkezi yapılandırma dosyasıdır. libconfig sözdizimini kullanır ve hangi dosyanın nereye, nasıl yazılacağını tanımlar.</p>
+
+  <h3>Tam örnek sw-description</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>sw-description — A/B bölümlü sistem</span><span class="dot">●</span></div>
+    <pre><code">software = {
+    version = "2.1.0";
+    description = "Production firmware v2.1.0";
+
+    /* Donanım revizyonu kısıtlaması */
+    hardware-compatibility = ["1.0", "1.1", "2.0"];
+
+    /* images bölümü: ne nereye yazılacak */
+    images: (
+        {
+            filename = "rootfs-v2.1.ext4.gz";
+            type     = "raw";
+            device   = "/dev/mmcblk0p3";   /* slot B */
+            sha256   = "a3f9b21c...";       /* SHA-256 checksum */
+            compressed = "zlib";
+            installed-directly = false;
+        },
+        {
+            filename = "kernel-v5.15.itb";
+            type     = "raw";
+            device   = "/dev/mmcblk0p5";   /* kernel B */
+            sha256   = "7e4f23ab...";
+        }
+    );
+
+    /* scripts bölümü: kurulum adımları */
+    scripts: (
+        {
+            filename = "postinstall.lua";
+            type     = "lua";
+            /* 'pre' veya 'post' (varsayılan: post) */
+        },
+        {
+            filename = "set_bootenv.sh";
+            type     = "shellscript";
+        }
+    );
+
+    /* bootloader ortam değişkenleri */
+    bootenv: (
+        {
+            name  = "bootpart";
+            value = "1";         /* pasif partition index güncellendi */
+        },
+        {
+            name  = "upgrade_available";
+            value = "1";         /* U-Boot watchdog değişkeni */
+        }
+    );
+};
+</code></pre>
+  </div>
+
+  <h3>SWUpdate paketi oluşturma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># Tüm dosyaları bir dizinde topla</span>
+mkdir -p swu_package/
+cp sw-description     swu_package/
+cp rootfs-v2.1.ext4.gz swu_package/
+cp kernel-v5.15.itb   swu_package/
+cp postinstall.lua    swu_package/
+cp set_bootenv.sh     swu_package/
+
+<span class="cmt"># sw-description CPIO arşivinin ilk dosyası olmalı!</span>
+cd swu_package/
+echo "sw-description" | cpio -H newc -o &gt; ../update.swu
+echo "rootfs-v2.1.ext4.gz kernel-v5.15.itb postinstall.lua set_bootenv.sh" \
+  | tr ' ' '\n' | cpio -H newc -o --append -F ../update.swu
+
+<span class="cmt"># Otomatik CPIO script</span>
+cat &lt;&lt;'SCRIPT' &gt; mkswu.sh
+#!/bin/bash
+FILES="sw-description sw-description.sig rootfs-v2.1.ext4.gz kernel-v5.15.itb postinstall.lua set_bootenv.sh"
+echo $FILES | tr ' ' '\n' | cpio -H newc -o &gt; update.swu
+echo "SWU boyutu: $(du -sh update.swu | cut -f1)"
+SCRIPT
+chmod +x mkswu.sh
+
+<span class="cmt"># İmzalama (OpenSSL RSA)</span>
+openssl dgst -sha256 -sign private.pem \
+  -out sw-description.sig sw-description</code></pre>
+  </div>
+
+  <h3>Çoklu yazılım sürümü — hardware versiyonlama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>sw-description — hardware revision</span><span class="dot">●</span></div>
+    <pre><code">software = {
+    version = "2.1.0";
+
+    /* hw rev 1.x için görüntü */
+    hardware-rev1x: {
+        hardware-compatibility = ["1.0", "1.1"];
+        images: (
+            {
+                filename = "rootfs-v2.1-rev1.ext4.gz";
+                type     = "raw";
+                device   = "/dev/mmcblk0p3";
+            }
+        );
+    };
+
+    /* hw rev 2.x için farklı görüntü (ekstra sürücüler) */
+    hardware-rev2x: {
+        hardware-compatibility = ["2.0", "2.1"];
+        images: (
+            {
+                filename = "rootfs-v2.1-rev2.ext4.gz";
+                type     = "raw";
+                device   = "/dev/mmcblk0p3";
+            }
+        );
+    };
+};</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>sw-description: libconfig sözdizimi, images + scripts + bootenv bölümleri</li>
+      <li>CPIO paket oluşturma: <code>sw-description</code> ilk dosya olmak zorunda</li>
+      <li>Hardware revision ile aynı paket farklı board sürümlerine farklı görüntü uygular</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> SWUpdate Lua Handler</h2>
+  <p class="section-lead">SWUpdate'in Lua entegrasyonu, güncelleme sürecine özel mantık eklemenizi sağlar: doğrulama kontrolleri, servis durdurma/başlatma, veri taşıma, rollback tetikleme.</p>
+
+  <h3>Lua handler API</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>lua — postinstall.lua</span><span class="dot">●</span></div>
+    <pre><code">-- SWUpdate Lua handler API
+-- swupdate.notify(level, msg) ile log yaz
+-- swupdate.error(msg)   → güncellemeyi iptal et
+-- swupdate.progress(percent, msg) → ilerleme bildir
+
+local function check_disk_space()
+    -- /dev/mmcblk0p3 için yeterli alan var mı?
+    local pipe = io.popen("df -B1 /mnt/passive | tail -1 | awk '{print $4}'")
+    local avail = tonumber(pipe:read("*a"))
+    pipe:close()
+
+    local required = 512 * 1024 * 1024  -- 512 MB
+    if avail and avail &lt; required then
+        swupdate.error(string.format(
+            "Yetersiz disk alanı: %d MB mevcut, %d MB gerekli",
+            avail / (1024*1024), required / (1024*1024)))
+        return false
+    end
+    return true
+end
+
+local function stop_services()
+    swupdate.notify(swupdate.INFOINT, "Servisler durduruluyor...")
+    os.execute("systemctl stop my-sensor-daemon.service")
+    os.execute("systemctl stop my-mqtt-bridge.service")
+end
+
+local function start_services()
+    swupdate.notify(swupdate.INFOINT, "Servisler başlatılıyor...")
+    os.execute("systemctl start my-sensor-daemon.service")
+    os.execute("systemctl start my-mqtt-bridge.service")
+end
+
+local function migrate_config()
+    -- v1 → v2 konfigürasyon taşıma
+    local old_cfg = "/mnt/data/sensor.conf"
+    local new_cfg = "/mnt/data/sensor_v2.conf"
+
+    if not os.rename(old_cfg, new_cfg) then
+        swupdate.notify(swupdate.WARNINT, "Config migration atlandı")
+    end
+end
+
+local function verify_new_rootfs()
+    -- Yeni rootfs bütünlük kontrolü (dm-verity hash)
+    local ret = os.execute(
+        "veritysetup verify /dev/mmcblk0p3 /dev/mmcblk0p7 "
+        .. "$(cat /etc/verity-root-hash)")
+    if ret ~= 0 then
+        swupdate.error("Rootfs verity doğrulama başarısız!")
+    end
+end
+
+-- Ana giriş noktası
+function post_install(img)
+    swupdate.progress(0, "Post-install başladı")
+
+    if not check_disk_space() then return false end
+
+    swupdate.progress(25, "Disk alanı yeterli")
+    migrate_config()
+    swupdate.progress(50, "Config taşıması tamamlandı")
+    verify_new_rootfs()
+    swupdate.progress(75, "Rootfs doğrulandı")
+    stop_services()
+
+    -- Bootloader ortamını ayarla
+    os.execute("fw_setenv upgrade_available 1")
+    os.execute("fw_setenv bootcount 0")
+
+    swupdate.progress(100, "Post-install tamamlandı")
+    swupdate.notify(swupdate.INFOINT, "Güncelleme uygulandı, yeniden başlatılıyor...")
+    return true
+end</code></pre>
+  </div>
+
+  <h3>sw-description'da Lua çağrısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>sw-description (scripts bölümü)</span><span class="dot">●</span></div>
+    <pre><code">scripts: (
+    {
+        filename = "postinstall.lua";
+        type     = "lua";
+        function = "post_install";  /* Lua fonksiyon adı */
+    }
+);</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Lua handler: <code>swupdate.notify/error/progress</code> API ile güncelleme akışı kontrolü</li>
+      <li>Disk alanı kontrolü, config migration, dm-verity doğrulama — tipik handler görevleri</li>
+      <li><code>function = "post_install"</code> ile sw-description'dan Lua fonksiyonu çağrılır</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> hawkBit Entegrasyonu</h2>
+  <p class="section-lead">hawkBit, Eclipse Foundation bünyesindeki açık kaynaklı IoT güncelleme yönetim sunucusudur. SWUpdate'in <code>suricatta</code> modülü ile hawkBit DMF/DDI API üzerinden iletişim kurar.</p>
+
+  <h3>hawkBit mimarisi</h3>
+
+  <div class="flow">
+    <pre>hawkBit Server (Spring Boot — Docker)
+    │
+    ├── DDI API (Device Direct Integration) — cihazlar burayı polling yapar
+    │   └── REST: /controller/v1/{tenantId}/controller/{deviceId}
+    │
+    ├── DMF API (Device Management Federation) — AMQP/RabbitMQ
+    │
+    └── Management API — Web UI, cihaz yönetimi, rollout oluşturma
+         └── REST: /rest/v1/targets, /rest/v1/distributionsets</pre>
+  </div>
+
+  <h3>hawkBit Docker kurulumu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># hawkBit + MySQL Docker Compose</span>
+cat &lt;&lt;'EOF' &gt; docker-compose-hawkbit.yml
+version: "3"
+services:
+  hawkbit:
+    image: hawkbit/hawkbit-update-server:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - SPRING_DATASOURCE_URL=jdbc:mysql://mysql:3306/hawkbit
+      - SPRING_DATASOURCE_USERNAME=hawkbit
+      - SPRING_DATASOURCE_PASSWORD=hawkbit
+    depends_on:
+      - mysql
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      - MYSQL_DATABASE=hawkbit
+      - MYSQL_USER=hawkbit
+      - MYSQL_PASSWORD=hawkbit
+      - MYSQL_ROOT_PASSWORD=root
+    volumes:
+      - hawkbit-mysql:/var/lib/mysql
+
+volumes:
+  hawkbit-mysql:
+EOF
+
+docker compose -f docker-compose-hawkbit.yml up -d
+<span class="cmt"># Web UI: http://localhost:8080 (admin/admin)</span></code></pre>
+  </div>
+
+  <h3>SWUpdate suricatta yapılandırması</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>ini — /etc/swupdate/swupdate.cfg</span><span class="dot">●</span></div>
+    <pre><code">globals :
+{
+        verbose = true;
+        loglevel = 5;
+        syslog   = true;
+};
+
+suricatta :
+{
+        tenant     = "DEFAULT";
+        id         = "device-001";    /* cihaz ID */
+        url        = "http://hawkbit.example.com:8080";
+        polldelay  = 45;              /* saniye */
+        retry      = 3;
+        retrywait  = 10;
+
+        /* hawkBit kimlik doğrulama */
+        targettoken = "GatewayToken-ABC123";
+        /* veya: gatewaytoken = "..."; */
+};
+
+identify :
+{
+        name    = "hw-revision";
+        value   = "2.0";
+};</code></pre>
+  </div>
+
+  <h3>SWUpdate suricatta başlatma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># hawkBit modunda SWUpdate daemon</span>
+swupdate -f /etc/swupdate/swupdate.cfg \
+  -u "-t DEFAULT -u http://hawkbit.example.com:8080 -i device-001" \
+  &amp;
+
+<span class="cmt"># Veya systemd servisi</span>
+cat &lt;&lt;'EOF' | sudo tee /etc/systemd/system/swupdate.service
+[Unit]
+Description=SWUpdate OTA daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/swupdate \
+  -f /etc/swupdate/swupdate.cfg \
+  -u "-t DEFAULT -u http://hawkbit.example.com:8080 -i device-001"
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl enable --now swupdate</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">ROLLOUT YÖNETİMİ</div>
+    <p>hawkBit'te "Rollout" oluşturarak güncellemeyi kademeli uygulayabilirsiniz: cihaz filtresi belirleyin (ör. hw-revision=2.0 olanlar), başlangıç grubu %5 seçin, başarı oranı %95'in üzerindeyse otomatik bir sonraki gruba geç. Bu kademeli güncelleme, sorunlu bir sürümün tüm filoya yayılmasını önler.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>hawkBit: DDI API polling, DMF AMQP push, Management UI — tam OTA yönetimi</li>
+      <li>suricatta modülü SWUpdate'in hawkBit istemcisi — yapılandırma dosyasından kontrol</li>
+      <li>Rollout yönetimi ile kademeli güncelleme — %5 → %20 → %100 aşamalı</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> RAUC Mimarisi</h2>
+  <p class="section-lead">RAUC (Robust Auto-Update Controller), slot tabanlı bir güncelleme framework'üdür. Bundle dosyası, manifest ve imzalama ile temiz, bütünleşik bir yaklaşım sunar.</p>
+
+  <h3>RAUC temel kavramlar</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Bundle</span><span class="desc">SquashFS içinde manifest + görüntü dosyaları — imzalanmış, bütünleşik paket</span></div>
+    <div class="param"><span class="name">Slot</span><span class="desc">Güncellenebilir depolama birimi — bir partition, MTD volume veya dizin</span></div>
+    <div class="param"><span class="name">Slot class</span><span class="desc">Aynı işlevi gören slot'ların grubu (rootfs, kernel, bootloader)</span></div>
+    <div class="param"><span class="name">Bootloader adaptation</span><span class="desc">RAUC'un U-Boot/GRUB/barebox'a boot slot bilgisi yazması</span></div>
+    <div class="param"><span class="name">casync</span><span class="desc">Content-Addressable Chunked Archive — delta güncelleme için</span></div>
+    <div class="param"><span class="name">dm-verity</span><span class="desc">RAUC dm-verity hash tablosu ile rootfs bütünlüğünü garanti eder</span></div>
+  </div>
+
+  <h3>RAUC sistem konfigürasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>ini — /etc/rauc/system.conf</span><span class="dot">●</span></div>
+    <pre><code">[system]
+compatible=MyProduct-v2
+bootloader=uboot
+
+[keyring]
+path=/etc/rauc/keyring.pem   ; Doğrulama sertifikası
+
+[slot.rootfs.0]
+device=/dev/mmcblk0p2
+type=ext4
+bootname=A
+parent=
+
+[slot.rootfs.1]
+device=/dev/mmcblk0p3
+type=ext4
+bootname=B
+parent=
+
+[slot.kernel.0]
+device=/dev/mmcblk0p5
+type=raw
+parent=rootfs.0
+
+[slot.kernel.1]
+device=/dev/mmcblk0p6
+type=raw
+parent=rootfs.1
+
+[slot.bootloader.0]
+device=/dev/mmcblk0p1
+type=raw</code></pre>
+  </div>
+
+  <h3>RAUC komutları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># Güncelleme uygula</span>
+rauc install /path/to/update.raucb
+
+<span class="cmt"># Slot durumlarını göster</span>
+rauc status
+<span class="cmt"># === System Info ===</span>
+<span class="cmt"># Compatible: MyProduct-v2</span>
+<span class="cmt"># Booted from: rootfs.0 (A)</span>
+<span class="cmt"># === Slot States ===</span>
+<span class="cmt"># rootfs.0 (A) [booted]   version=2.0.1</span>
+<span class="cmt"># rootfs.1 (B) [inactive] version=2.1.0</span>
+
+<span class="cmt"># Bundle içeriğini incele</span>
+rauc info update.raucb
+
+<span class="cmt"># Aktif slot'u işaretle (test başarılı)</span>
+rauc mark-good
+
+<span class="cmt"># Rollback: aktif slot'u bad işaretle → reboot sonrası diğerine geç</span>
+rauc mark-bad booted</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>RAUC: slot tabanlı güncelleme — A/B rootfs, kernel, bootloader slot'ları</li>
+      <li><code>system.conf</code> ile slot'lar tanımlanır; <code>rauc install</code> ile güncelleme uygulanır</li>
+      <li><code>rauc mark-good/bad</code> ile bootloader rollback mekanizması tetiklenir</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> RAUC Bundle Oluşturma</h2>
+  <p class="section-lead">RAUC bundle'ı SquashFS formatında imzalanmış bir dosyadır. manifest.raucm güncelleme içeriğini, imzalama ise güvenliği tanımlar.</p>
+
+  <h3>manifest.raucm dosyası</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>ini — manifest.raucm</span><span class="dot">●</span></div>
+    <pre><code">[update]
+compatible=MyProduct-v2
+version=2.1.0
+description=Production firmware v2.1.0
+build=2026-04-12T10:00:00Z
+
+[image.rootfs]
+filename=rootfs.ext4.img
+sha256=b3e8f1c2d4a59678901234567890abcdef123456789012345678901234567890
+size=268435456
+
+[image.kernel]
+filename=kernel.itb
+sha256=7f3a9b1e2c4d5678901234567890fedcba987654321098765432109876543210
+size=8388608
+
+[hooks]
+filename=rauc_hooks.sh</code></pre>
+  </div>
+
+  <h3>Bundle imzalama — sertifika zinciri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — PKI kurulumu</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># CA sertifika oluşturma (bir kez)</span>
+openssl genrsa -out ca.key.pem 4096
+openssl req -new -x509 -days 3650 -key ca.key.pem \
+  -out ca.cert.pem \
+  -subj "/CN=MyProduct CA/O=MyCompany/C=TR"
+
+<span class="cmt"># Signing sertifikası (düzenli yenilenen)</span>
+openssl genrsa -out signing.key.pem 2048
+openssl req -new -key signing.key.pem -out signing.csr \
+  -subj "/CN=RAUC Signing/O=MyCompany/C=TR"
+openssl x509 -req -days 365 -in signing.csr \
+  -CA ca.cert.pem -CAkey ca.key.pem \
+  -CAcreateserial -out signing.cert.pem
+
+<span class="cmt"># Bundle oluştur ve imzala</span>
+mkdir -p bundle_dir/
+cp rootfs.ext4.img bundle_dir/
+cp kernel.itb      bundle_dir/
+cp manifest.raucm  bundle_dir/
+cp rauc_hooks.sh   bundle_dir/
+
+rauc bundle \
+  --cert=signing.cert.pem \
+  --key=signing.key.pem \
+  bundle_dir/ \
+  update-v2.1.0.raucb
+
+<span class="cmt"># Bundle boyutu ve bilgisi</span>
+ls -sh update-v2.1.0.raucb
+rauc info --keyring=ca.cert.pem update-v2.1.0.raucb</code></pre>
+  </div>
+
+  <h3>casync ile delta bundle</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — delta güncelleme</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># casync kurulumu</span>
+sudo apt install casync
+
+<span class="cmt"># v2.0 → v2.1 delta oluştur</span>
+casync make \
+  --store=v2.1.castr \
+  rootfs-v2.1.ext4.img \
+  rootfs-v2.1.caibx        <span class="cmt"># index dosyası</span>
+
+<span class="cmt"># manifest.raucm'da casync referansı</span>
+<span class="cmt"># [image.rootfs]</span>
+<span class="cmt"># filename=rootfs.caibx</span>
+<span class="cmt"># casync-store=http://update.example.com/store/v2.1.castr</span>
+
+<span class="cmt"># Delta güncelleme: sadece değişen chunk'lar indirilir</span>
+<span class="cmt"># Tipik rootfs güncellemesi: 256 MB yerine 20-40 MB (yaklaşık %85 tasarruf)</span></code></pre>
+  </div>
+
+  <h3>dm-verity ile rootfs bütünlük koruması</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># rootfs için verity hash tablosu oluştur</span>
+veritysetup format rootfs.ext4.img rootfs-verity.img
+<span class="cmt"># Root hash: a3f9b21c... (manifest'e ekle)</span>
+
+<span class="cmt"># manifest.raucm'da verity aktivasyonu</span>
+<span class="cmt"># [image.rootfs]</span>
+<span class="cmt"># verity-hash=a3f9b21c...</span>
+
+<span class="cmt"># RAUC kurulum sonrasında cihazda verity etkinleştirir</span>
+<span class="cmt"># /dev/mapper/rootfs-verified cihazından boot edilir</span>
+<span class="cmt"># Herhangi bir bit bozulması dm-verity tarafından tespit edilir</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>manifest.raucm: compatible, version, görüntü dosyaları ve SHA-256 checksum'ları</li>
+      <li>PKI: CA sertifika + imzalama sertifikası — bundle kriptografik imzalanır</li>
+      <li>casync delta: değişen chunk'lar — %70–85 bant genişliği tasarrufu</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> A/B Partition Stratejisi</h2>
+  <p class="section-lead">A/B (veya double-copy) güncelleme stratejisi, çalışan sistemi (aktif slot) hiç dokunmadan pasif slota yeni sürümü yazar ve reboot sonrası atomik geçiş sağlar.</p>
+
+  <h3>Partition düzeni</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Partition</th><th>İçerik</th><th>Boyut</th></tr></thead>
+      <tbody>
+        <tr><td><code>/dev/mmcblk0p1</code></td><td>U-Boot / bootloader</td><td>16 MB</td></tr>
+        <tr><td><code>/dev/mmcblk0p2</code></td><td>rootfs A (aktif)</td><td>512 MB</td></tr>
+        <tr><td><code>/dev/mmcblk0p3</code></td><td>rootfs B (pasif)</td><td>512 MB</td></tr>
+        <tr><td><code>/dev/mmcblk0p4</code></td><td>kernel A</td><td>32 MB</td></tr>
+        <tr><td><code>/dev/mmcblk0p5</code></td><td>kernel B</td><td>32 MB</td></tr>
+        <tr><td><code>/dev/mmcblk0p6</code></td><td>data (kalıcı)</td><td>Kalan alan</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>U-Boot bootcount mekanizması</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — U-Boot ortam</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># U-Boot ortam değişkenleri (fw_printenv / fw_setenv)</span>
+
+<span class="cmt"># Mevcut durum</span>
+fw_printenv BOOT_ORDER BOOT_A_LEFT BOOT_B_LEFT
+<span class="cmt"># BOOT_ORDER=A B</span>
+<span class="cmt"># BOOT_A_LEFT=3</span>
+<span class="cmt"># BOOT_B_LEFT=3</span>
+
+<span class="cmt"># Güncelleme sonrası (B'ye güncelleme yazıldı)</span>
+fw_setenv BOOT_ORDER "B A"
+fw_setenv BOOT_B_LEFT 3
+fw_setenv upgrade_available 1
+
+<span class="cmt"># U-Boot boot scripti (bootcmd)</span>
+<span class="cmt"># Her başarısız boot BOOT_X_LEFT'i 1 azaltır</span>
+<span class="cmt"># Sıfıra düşünce diğer slot'a geçer</span></code></pre>
+  </div>
+
+  <h3>U-Boot boot script — A/B seçimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>uboot — bootcmd (u-boot script)</span><span class="dot">●</span></div>
+    <pre><code"># /boot/boot.scr veya U-Boot ortam bootcmd
+test -n "${BOOT_ORDER}" || setenv BOOT_ORDER "A B"
+test -n "${BOOT_A_LEFT}" || setenv BOOT_A_LEFT 3
+test -n "${BOOT_B_LEFT}" || setenv BOOT_B_LEFT 3
+
+for BOOT_SLOT in "${BOOT_ORDER}"; do
+    if test "${BOOT_SLOT}" = "A"; then
+        if test ${BOOT_A_LEFT} -gt 0; then
+            setexpr BOOT_A_LEFT ${BOOT_A_LEFT} - 1
+            setenv LOADPART 4     # partition 4 = kernel A
+            setenv ROOTPART 2     # partition 2 = rootfs A
+            break
+        fi
+    elif test "${BOOT_SLOT}" = "B"; then
+        if test ${BOOT_B_LEFT} -gt 0; then
+            setexpr BOOT_B_LEFT ${BOOT_B_LEFT} - 1
+            setenv LOADPART 5     # partition 5 = kernel B
+            setenv ROOTPART 3     # partition 3 = rootfs B
+            break
+        fi
+    fi
+done
+
+saveenv
+
+load mmc 0:${LOADPART} ${kernel_addr_r} /boot/fitImage
+bootm ${kernel_addr_r}#conf@${LOADPART}</code></pre>
+  </div>
+
+  <h3>GRUB A/B seçimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>grub — grub.cfg (RAUC + GRUB)</span><span class="dot">●</span></div>
+    <pre><code">load_env
+if [ "${BOOT_ORDER}" = "A B" ]; then
+    set default=0
+elif [ "${BOOT_ORDER}" = "B A" ]; then
+    set default=1
+fi
+
+menuentry "Slot A" {
+    search --no-floppy --label --set=root rootfs-a
+    linux /boot/vmlinuz root=/dev/disk/by-label/rootfs-a rw
+    initrd /boot/initrd.img
+}
+
+menuentry "Slot B" {
+    search --no-floppy --label --set=root rootfs-b
+    linux /boot/vmlinuz root=/dev/disk/by-label/rootfs-b rw
+    initrd /boot/initrd.img
+}</code></pre>
+  </div>
+
+  <h3>RAUC ile otomatik rollback</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — systemd service</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># Sistem açıldıktan sonra sağlık kontrolü ve mark-good</span>
+cat &lt;&lt;'EOF' | sudo tee /etc/systemd/system/rauc-mark-good.service
+[Unit]
+Description=RAUC mark slot good after successful boot
+After=network-online.target myapp.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/rauc mark-good
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl enable rauc-mark-good.service
+
+<span class="cmt"># Uygulama sağlık testi başarısız olursa:</span>
+<span class="cmt"># rauc mark-bad booted → reboot → U-Boot önceki slot'a geçer</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>A/B partition: pasif slota yaz, reboot, başarılı ise mark-good, başarısız ise rollback</li>
+      <li>U-Boot BOOT_A_LEFT/BOOT_B_LEFT sayaçları bootcount mekanizmasını uygular</li>
+      <li><code>rauc-mark-good.service</code> systemd servisi başarılı boot'ta otomatik onay verir</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: Yocto + RAUC CI/CD Pipeline</h2>
+  <p class="section-lead">meta-rauc Yocto layer'ı kullanılarak RAUC destekli bir image oluşturulur ve hawkBit üzerinden otomatik CI/CD pipeline'ına entegre edilir.</p>
+
+  <h3>meta-rauc layer kurulumu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Yocto</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># meta-rauc layer ekle (Scarthgap uyumlu)</span>
+cd poky
+git clone https://github.com/rauc/meta-rauc.git \
+  -b scarthgap ../meta-rauc
+
+<span class="cmt"># bblayers.conf'a ekle</span>
+bitbake-layers add-layer ../meta-rauc
+
+<span class="cmt"># local.conf ayarları</span>
+cat &gt;&gt; conf/local.conf &lt;&lt;'EOF'
+IMAGE_INSTALL:append = " rauc"
+DISTRO_FEATURES:append = " rauc"
+
+# RAUC sistem konfigürasyonu
+RAUC_KEYRING_FILE = "${TOPDIR}/../pki/ca.cert.pem"
+RAUC_COMPATIBLE  = "MyProduct-v2"
+
+# Bundle imzalama
+RAUC_BUNDLE_COMPATIBLE = "MyProduct-v2"
+RAUC_BUNDLE_VERSION    = "${PV}"
+RAUC_BUNDLE_DESCRIPTION= "Production firmware"
+EOF</code></pre>
+  </div>
+
+  <h3>Image recipe — RAUC slot desteği</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bitbake — meta-myproduct/recipes-core/images/myproduct-image.bb</span><span class="dot">●</span></div>
+    <pre><code">require recipes-core/images/core-image-minimal.bb
+
+DESCRIPTION = "MyProduct üretim imajı"
+LICENSE      = "MIT"
+
+IMAGE_INSTALL += " \
+    kernel-image \
+    rauc \
+    swupdate \
+    myapp-daemon \
+    systemd \
+"
+
+# RAUC sistem konfigürasyonu kaynak dosyası
+IMAGE_INSTALL += "rauc-system-conf"
+
+# U-Boot ortam araçları
+IMAGE_INSTALL += "u-boot-fw-utils"
+
+# dm-verity desteği
+DISTRO_FEATURES:append = " dm-verity"
+IMAGE_FEATURES += "read-only-rootfs"</code></pre>
+  </div>
+
+  <h3>RAUC bundle recipe</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bitbake — recipes-core/bundles/myproduct-bundle.bb</span><span class="dot">●</span></div>
+    <pre><code">inherit rauc-bundle
+
+RAUC_BUNDLE_COMPATIBLE = "MyProduct-v2"
+RAUC_BUNDLE_VERSION    = "2.1.0"
+
+RAUC_BUNDLE_SLOTS = "rootfs kernel"
+
+RAUC_SLOT_rootfs[type]     = "image"
+RAUC_SLOT_rootfs[fstype]   = "ext4"
+RAUC_SLOT_rootfs[image]    = "myproduct-image"
+
+RAUC_SLOT_kernel[type]     = "kernel"
+RAUC_SLOT_kernel[fstype]   = "kernel"
+RAUC_SLOT_kernel[image]    = "kernel-image"
+
+# İmzalama
+RAUC_KEY_FILE  = "${TOPDIR}/../pki/signing.key.pem"
+RAUC_CERT_FILE = "${TOPDIR}/../pki/signing.cert.pem"</code></pre>
+  </div>
+
+  <h3>GitHub Actions CI/CD pipeline</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>yaml — .github/workflows/ota-release.yml</span><span class="dot">●</span></div>
+    <pre><code">name: OTA Release Pipeline
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  yocto-build:
+    runs-on: self-hosted   # Yocto büyük; self-hosted runner gerektirir
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Yocto
+        run: |
+          source poky/oe-init-build-env build
+          bitbake myproduct-bundle
+
+      - name: Collect artifacts
+        run: |
+          VERSION=$(echo "${GITHUB_REF#refs/tags/v}")
+          cp build/tmp/deploy/images/*/myproduct-bundle-*.raucb \
+             myproduct-v${VERSION}.raucb
+
+      - name: Upload to hawkBit
+        env:
+          HAWKBIT_URL: ${{ secrets.HAWKBIT_URL }}
+          HAWKBIT_TOKEN: ${{ secrets.HAWKBIT_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          # Distribution set oluştur
+          DS_ID=$(curl -s -X POST "${HAWKBIT_URL}/rest/v1/distributionsets" \
+            -H "Authorization: GatewayToken ${HAWKBIT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "[{\"name\":\"MyProduct\",\"version\":\"${VERSION}\",
+                  \"type\":\"app\"}]" | jq -r '.[0].id')
+
+          # Bundle'ı yükle
+          curl -X POST \
+            "${HAWKBIT_URL}/rest/v1/softwaremodules/${DS_ID}/artifacts" \
+            -H "Authorization: GatewayToken ${HAWKBIT_TOKEN}" \
+            -F "file=@myproduct-${VERSION}.raucb"
+
+          echo "hawkBit DS ID: ${DS_ID}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: myproduct-*.raucb
+          generate_release_notes: true</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">SONUÇ</div>
+    <p>Tamamlanan pipeline: GitHub'a yeni tag push edildiğinde Yocto otomatik build başlar, RAUC bundle imzalanır, hawkBit sunucusuna yüklenir. hawkBit'te rollout oluşturularak %5 → %20 → %100 kademeli dağıtım yapılır. Cihazlar güncellemeyi alır, <code>rauc-mark-good.service</code> başarılı boot'u onaylar; başarısızlıkta U-Boot bootcount sayacı devreye girer ve önceki sürüme döner.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>meta-rauc: <code>inherit rauc-bundle</code> ile Yocto'da RAUC bundle tarifi</li>
+      <li>GitHub Actions: tag push → Yocto build → bundle imzala → hawkBit yükle → release</li>
+      <li>Kademeli rollout hawkBit üzerinden; U-Boot bootcount ile otomatik rollback</li>
+    </ul>
+  </div>
+</section>
+
+</main>

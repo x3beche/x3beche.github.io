@@ -1,0 +1,762 @@
+---
+layout: tutorial
+title: "NVMe Gömülü — M.2 & io_uring"
+back_url: "../index.html"
+back_label: "PCIe & DMA"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>PCIe &amp; DMA</span>
+    <span>DEPOLAMA</span>
+    <span>2026</span>
+  </div>
+  <h1>NVMe Gömülü<br><em>M.2 &amp; io_uring</em></h1>
+  <p class="subtitle">NVMe mimarisini ve gömülü sistemlerde M.2 SSD kullanımını öğren. Linux nvme sürücüsü, namespace yönetimi, io_uring ile ultra-düşük latency ve Raspberry Pi CM4 pratik benchmark.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">NVMe nedir? — PCIe üzerinde depolama</a></li>
+    <li><a href="#s1">NVMe mimarisi — SQ/CQ ve doorbell</a></li>
+    <li><a href="#s2">NVMe komut seti — Read, Write, Identify</a></li>
+    <li><a href="#s3">Gömülü M.2 kullanımı — form factor ve seçim</a></li>
+    <li><a href="#s4">Linux NVMe sürücüsü — nvme-cli ve namespace</a></li>
+    <li><a href="#s5">NVMe performans tuning</a></li>
+    <li><a href="#s6">io_uring + NVMe — sqpoll ve fixed buffers</a></li>
+    <li><a href="#s7">Pratik: Raspberry Pi CM4 + NVMe SSD benchmark</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> NVMe nedir? — PCIe üzerinde depolama</h2>
+  <p class="section-lead">NVM Express (NVMe), PCIe veri yolu üzerinden flash depolama erişimi için tasarlanmış yüksek performanslı bir protokoldür. SATA ve SAS'ın sunduğu depolama protokollerinden çok daha düşük gecikme ve yüksek paralellik sağlar.</p>
+
+  <h3>SATA/SAS'a göre NVMe'nin üstünlükleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>SATA III</th><th>SAS-3</th><th>NVMe (PCIe Gen4)</th></tr></thead>
+      <tbody>
+        <tr><td>Bant genişliği (seq)</td><td>~550 MB/s</td><td>~1.2 GB/s</td><td>~7 GB/s (x4)</td></tr>
+        <tr><td>Okuma IOPS (random 4K)</td><td>~100K</td><td>~200K</td><td>~1.5M</td></tr>
+        <tr><td>Gecikme (ortalama)</td><td>~100 µs</td><td>~50 µs</td><td>~20 µs</td></tr>
+        <tr><td>Max kuyruk derinliği</td><td>32 (NCQ)</td><td>254</td><td>65535 × 65535</td></tr>
+        <tr><td>Kuyruk sayısı</td><td>1</td><td>1</td><td>64K I/O queue</td></tr>
+        <tr><td>Protokol overhead</td><td>Yüksek (ATA)</td><td>Orta (SCSI)</td><td>Düşük (NVMe)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>NVMe tasarım felsefesi</h3>
+  <p>NVMe, flash belleğin özelliklerine göre sıfırdan tasarlandı. SATA ve SAS, dönen manyetik disk için geliştirilen protokollerden türetilmişti — sıralı erişim, tek kuyruk ve yüksek gecikme toleransı bu varsayımların izini taşır. NVMe'nin temel yenilikleri şunlardır:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Çoklu I/O kuyruğu</span><span class="desc">Her CPU çekirdeği için ayrı SQ/CQ çifti — kilit çekişmesi sıfır</span></div>
+    <div class="param"><span class="name">Düşük protokol overhead</span><span class="desc">NVMe komutu 64 bayt; SCSI CDB + SAM overhead'i yok</span></div>
+    <div class="param"><span class="name">PCIe doğrudan erişim</span><span class="desc">Köprü chip yok; SATA kontrolcüsünün getirdiği ek gecikme yok</span></div>
+    <div class="param"><span class="name">Host yönetimli kuyruk</span><span class="desc">CPU, SSD'ye komut göndermek için syscall yapmaz — doorbell yazması yeterli</span></div>
+  </div>
+
+  <h3>NVMe spesifikasyonu</h3>
+  <p>NVMe spesifikasyonu NVM Express, Inc. tarafından yönetilir. 1.0'dan başlayan spec, günümüzde NVMe 2.x serisindedir. Gömülü sistemler için NVMe-oF (over Fabrics) ve NVMe-MI (Management Interface) ek değer sunar.</p>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>NVMe: PCIe üzerinde flash depolama; SATA'ya göre ~12× yüksek bant genişliği</li>
+      <li>64K kuyruk × 65K derinlik: çok çekirdekli sistemlerde tam paralellik</li>
+      <li>20 µs ortalama gecikme: SATA'nın 100 µs'inin beşte biri</li>
+      <li>NVMe 1.0 (2011) → NVMe 2.x (2022+): namespace yönetimi, ZNS, key-value eklendi</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> NVMe mimarisi — SQ/CQ ve doorbell</h2>
+  <p class="section-lead">NVMe, host belleğinde oluşturulan Submission Queue (SQ) ve Completion Queue (CQ) çifti üzerine inşa edilir. SSD bu kuyruklara PCIe DMA ile doğrudan erişir.</p>
+
+  <h3>Kuyruk çifti mimarisi</h3>
+
+  <div class="flow">
+    <pre>
+  Host Belleği (DMA-mapped):
+  ┌────────────────────────────────────────────────────────────┐
+  │  Admin SQ    [cmd0][cmd1][cmd2] ...          head=0, tail=3│
+  │  Admin CQ    [cpl0][cpl1]       ...          head=2, tail=2│
+  ├────────────────────────────────────────────────────────────┤
+  │  I/O SQ[0]   [cmd0][cmd1] ...  (CPU 0 kullanır)            │
+  │  I/O CQ[0]   [cpl0]       ...                              │
+  ├────────────────────────────────────────────────────────────┤
+  │  I/O SQ[1]   [cmd0] ...        (CPU 1 kullanır)            │
+  │  I/O CQ[1]   []                                            │
+  └────────────────────────────────────────────────────────────┘
+
+  NVMe Kontrolcü (SSD tarafı):
+  ┌────────────────────────────────────────────────────────────┐
+  │  BAR0 Register Space:                                       │
+  │  ├─ CAP  (Controller Capabilities)                         │
+  │  ├─ CC   (Controller Configuration)                        │
+  │  ├─ CSTS (Controller Status)                               │
+  │  ├─ AQA  (Admin Queue Attributes)                          │
+  │  ├─ ASQ  (Admin SQ Base Address)                           │
+  │  ├─ ACQ  (Admin CQ Base Address)                           │
+  │  └─ SQ0TDBL, CQ0HDBL, SQ1TDBL, ... (doorbell registers)  │
+  └────────────────────────────────────────────────────────────┘
+    </pre>
+  </div>
+
+  <h3>I/O akışı</h3>
+
+  <div class="flow">
+    <pre>
+  1. Host: NVMe komutu (64 bayt) → SQ[tail]'e yaz
+  2. Host: SQ tail doorbell'a (tail+1) yaz → SSD'ye "yeni komut var" bildir
+  3. SSD:  SQ'yu DMA ile oku (host belleğinden)
+  4. SSD:  flash okuma/yazma işlemini yap
+  5. SSD:  CQ[tail]'e completion entry yaz (16 bayt)
+  6. SSD:  MSI-X interrupt gönder (veya polling modda değil)
+  7. Host: CQ'yu kontrol et, CQ head doorbell'ı güncelle
+    </pre>
+  </div>
+
+  <h3>Admin vs I/O kuyrukları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Kuyruk Türü</th><th>Amaç</th><th>Sayı</th><th>Boyut</th></tr></thead>
+      <tbody>
+        <tr><td>Admin SQ/CQ</td><td>Identify, Create/Delete Queue, Format, Firmware</td><td>1 çift (zorunlu)</td><td>Max 4096 entry</td></tr>
+        <tr><td>I/O SQ/CQ</td><td>Read, Write, Flush, Dataset Management</td><td>Max 65535 çift</td><td>Max 65536 entry</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>SQ: host komut kuyruğu (DMA-mapped, 64 bayt/entry); doorbell yazması ile SSD'yi tetikle</li>
+      <li>CQ: SSD completion kuyruğu (16 bayt/entry); MSI-X interrupt veya polling ile tüket</li>
+      <li>Admin kuyruğu: controller yapılandırması; I/O kuyruğu: gerçek veri transferi</li>
+      <li>CPU başına kuyruk: kilit çekişmesi sıfır — NUMA-aware dağıtım mümkün</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> NVMe komut seti — Read, Write, Identify</h2>
+  <p class="section-lead">NVMe komut seti, Admin ve I/O olmak üzere iki gruba ayrılır. Her komut 64 baytlık Submission Queue Entry (SQE) ile tanımlanır.</p>
+
+  <h3>SQE yapısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>NVMe SQE yapısı (64 bayt)</span><span class="dot">●</span></div>
+    <pre><code>Offset  Boyut  Alan
+0x00    1      Opcode (komut kodu)
+0x01    1      FUSE flags | PSDT (Physical Region Page / SGL)
+0x02    2      Command Identifier (CID) — CQE'de geri döner
+0x04    4      Namespace ID (NSID)
+0x08    8      Reserved / Metadata Pointer
+0x10    16     Data Pointer (PRP1, PRP2 veya SGL)
+0x28    4      CDW10 — komuta özel (örn. starting LBA low)
+0x2C    4      CDW11 — komuta özel (örn. starting LBA high)
+0x30    4      CDW12 — Number of Logical Blocks (NLB-1)
+0x34    4      CDW13
+0x38    4      CDW14
+0x3C    4      CDW15</code></pre>
+  </div>
+
+  <h3>Temel I/O komutları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Komut</th><th>Opcode</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td>Read</td><td>0x02</td><td>LBA aralığını oku; PRP/SGL ile DMA hedefi</td></tr>
+        <tr><td>Write</td><td>0x01</td><td>LBA aralığına yaz; buffered veya FUA (Force Unit Access)</td></tr>
+        <tr><td>Flush</td><td>0x00</td><td>Yazma tamponunu kalıcı ortama boşalt (fsync benzeri)</td></tr>
+        <tr><td>Write Zeroes</td><td>0x08</td><td>LBA aralığını sıfırla (copy olmadan, controller desteklerse)</td></tr>
+        <tr><td>Dataset Mgmt (Trim)</td><td>0x09</td><td>Artık kullanılmayan LBA'ları bildir (TRIM/discard)</td></tr>
+        <tr><td>Compare</td><td>0x05</td><td>LBA içeriğini buffer ile karşılaştır (atomik)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Admin komutları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Komut</th><th>Opcode</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td>Identify</td><td>0x06</td><td>Controller/Namespace bilgisi: model, seri no, özellikler</td></tr>
+        <tr><td>Create I/O SQ</td><td>0x01</td><td>Yeni I/O Submission Queue oluştur</td></tr>
+        <tr><td>Create I/O CQ</td><td>0x05</td><td>Yeni I/O Completion Queue oluştur</td></tr>
+        <tr><td>Get/Set Features</td><td>0x0A/0x09</td><td>Power state, write cache, IRQ coalescing</td></tr>
+        <tr><td>Format NVM</td><td>0x80</td><td>Namespace formatla; LBA boyutu değiştir</td></tr>
+        <tr><td>Firmware Download</td><td>0x11</td><td>Firmware güncelleme</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>PRP vs SGL</h3>
+  <p><strong>PRP</strong> (Physical Region Page): 4 KB hizalı sayfa listesi; basit, yaygın kullanım. <strong>SGL</strong> (Scatter-Gather List): NVMe 1.1'den itibaren; daha esnek, farklı boyutlu parçalar. Linux nvme sürücüsü her ikisini de destekler; SGL büyük transfer için daha verimli.</p>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>SQE 64 bayt: opcode + NSID + DMA pointer (PRP/SGL) + komut-özel CDW10-15</li>
+      <li>Read/Write: CDW10-11 başlangıç LBA; CDW12 blok sayısı (NLB-1)</li>
+      <li>Flush: yazma tamponunu fiziksel ortama yaz; FUA flag ile her Write'ı otomatik flush</li>
+      <li>Dataset Mgmt: TRIM/discard desteği; wear leveling ve SSD ömrü için kritik</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Gömülü M.2 kullanımı — form factor ve seçim</h2>
+  <p class="section-lead">M.2, NVMe SSD'lerin gömülü sistemlerde kullanılması için standart form faktörüdür. PCIe veya SATA arayüzü destekleyebilir; key tipi ve boyutu doğru seçilmelidir.</p>
+
+  <h3>M.2 form faktörleri</h3>
+
+  <div class="flow">
+    <pre>
+  M.2 Boyut Kodları:
+  ┌─────────────────────────────────────────────────────────────┐
+  │  2242: 22 mm genişlik, 42 mm uzunluk  — kompakt, düşük güç │
+  │  2260: 22 mm genişlik, 60 mm uzunluk  — orta              │
+  │  2280: 22 mm genişlik, 80 mm uzunluk  — en yaygın          │
+  │  22110: 22 mm × 110 mm               — server/enterprise   │
+  └─────────────────────────────────────────────────────────────┘
+
+  Key Tipleri:
+  ┌──────────────────────────────────────────────────────────────┐
+  │  Key M: pin 59-66 kesmeli — PCIe x4 + SATA → NVMe için     │
+  │  Key B: pin 12-19 kesmeli — PCIe x2 + SATA              │
+  │  Key B+M: her iki kesme  — SATA veya PCIe x2 (eski SSD)   │
+  └──────────────────────────────────────────────────────────────┘
+    </pre>
+  </div>
+
+  <h3>Gömülü NVMe SSD seçim kriterleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Kriter</th><th>Açıklama</th><th>Öneri</th></tr></thead>
+      <tbody>
+        <tr><td>Form faktör</td><td>Board boyutuna uygun: 2242 veya 2280</td><td>2242 kompakt için; 2280 yüksek kapasiteli</td></tr>
+        <tr><td>PCIe nesli</td><td>Gen3 veya Gen4; platform desteğine bak</td><td>CM4: Gen2 x1; güncel SBC: Gen3 x1</td></tr>
+        <tr><td>Güç tüketimi</td><td>2242: ~1.5W; 2280 yüksek: ~6W</td><td>Batarya uygulamalar: 2242 tercih et</td></tr>
+        <tr><td>Çalışma sıcaklığı</td><td>Commercial: 0-70°C; Industrial: -40–85°C</td><td>Endüstriyel: WD SN520, Kingston OM8PDP3 iTemp</td></tr>
+        <tr><td>Wear leveling</td><td>TLC > QLC endüransta; 3D TLC tercih et</td><td>Yazma yoğun: SLC önbellek büyüklüğüne bak</td></tr>
+        <tr><td>Vibrasyon direnci</td><td>Dönen disk yok; SSD titreşime dayanıklı</td><td>Araç içi uygulama için SSD zorunlu</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Popüler gömülü NVMe seçenekleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — NVMe SSD doğrulama komutları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Bağlı NVMe SSD listesi</span>
+<span class="cmd">sudo</span> nvme list
+<span class="cmt"># Node             SN                   Model           Namespace Usage</span>
+<span class="cmt"># /dev/nvme0n1     xxxxxxxx             WD Blue SN570   1         500.1 GB</span>
+
+<span class="cmt"># Controller detayları</span>
+<span class="cmd">sudo</span> nvme id-ctrl /dev/nvme0
+<span class="cmt"># mn: WD BLUE SN570 500GB</span>
+<span class="cmt"># fr: 234100WD (firmware revision)</span>
+<span class="cmt"># tnvmcap: 500107862016 (toplam NVM kapasitesi)</span>
+
+<span class="cmt"># SMART/Health bilgisi</span>
+<span class="cmd">sudo</span> nvme smart-log /dev/nvme0
+<span class="cmt"># critical_warning: 0</span>
+<span class="cmt"># temperature: 35 C</span>
+<span class="cmt"># available_spare: 100%</span>
+<span class="cmt"># percentage_used: 0%</span>
+<span class="cmt"># data_units_read: 1,234 [631 GB]</span>
+<span class="cmt"># data_units_written: 567 [290 GB]</span>
+
+<span class="cmt"># LBA formatı kontrolü</span>
+<span class="cmd">sudo</span> nvme id-ns /dev/nvme0n1 | grep "lbaf\|in use"
+<span class="cmt"># LBA Format  0 : Metadata Size: 0   bytes - Data Size: 512 bytes</span>
+<span class="cmt"># LBA Format  1 : Metadata Size: 0   bytes - Data Size: 4096 bytes - Relative Performance: Good (recommended)</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Key M: NVMe için zorunlu; PCIe x4 destekler; 2280 en yaygın form faktörü</li>
+      <li>2242: kompakt, düşük güç (~1.5W); endüstriyel -40°C modeller mevcuttur</li>
+      <li>TLC vs QLC: yazma yoğun gömülü için 3D TLC; QLC okuma ağırlıklı uygulamalar için</li>
+      <li>nvme smart-log: available_spare, percentage_used — disk sağlığı izlemede kritik</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Linux NVMe sürücüsü — nvme-cli ve namespace</h2>
+  <p class="section-lead">Linux nvme sürücüsü, NVMe namespace'lerini block cihazı olarak sunar. nvme-cli ile controller ve namespace yönetimi yapılır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — nvme-cli temel komutları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># nvme-cli kurulumu</span>
+<span class="cmd">sudo</span> apt-get install nvme-cli
+
+<span class="cmt"># Cihaz listesi</span>
+<span class="cmd">sudo</span> nvme list
+<span class="cmd">sudo</span> nvme list-subsys
+
+<span class="cmt"># Namespace bilgisi</span>
+<span class="cmd">sudo</span> nvme id-ns /dev/nvme0n1
+<span class="cmt"># nsze: 976773168 (toplam LBA sayısı)</span>
+<span class="cmt"># ncap: 976773168 (kapasite)</span>
+<span class="cmt"># nuse: 976773168 (kullanılan)</span>
+<span class="cmt"># lbaf[0]: bs=512B</span>
+
+<span class="cmt"># 4K LBA formatına geç (performans için)</span>
+<span class="cmd">sudo</span> nvme format /dev/nvme0n1 <span class="flag">--lbaf=1</span>
+<span class="cmt"># Dikkat: mevcut veriyi siler!</span>
+
+<span class="cmt"># Yeni namespace oluştur (NVMe 1.2+)</span>
+<span class="cmd">sudo</span> nvme create-ns /dev/nvme0 \
+    <span class="flag">--nsze=20971520</span> <span class="cmt"># 10 GB (4K blok ile)</span> \
+    <span class="flag">--ncap=20971520</span> \
+    <span class="flag">--flbas=1</span>       <span class="cmt"># 4K LBA format</span>
+
+<span class="cmt"># Namespace'i controller'a ata</span>
+<span class="cmd">sudo</span> nvme attach-ns /dev/nvme0 <span class="flag">--namespace-id=2</span> <span class="flag">--controllers=0x1</span>
+
+<span class="cmt"># Reset (yeni namespace görünmesi için)</span>
+<span class="cmd">sudo</span> nvme reset /dev/nvme0
+<span class="cmt"># → /dev/nvme0n2 oluşur</span>
+
+<span class="cmt"># Hata log</span>
+<span class="cmd">sudo</span> nvme error-log /dev/nvme0
+
+<span class="cmt"># Sanitize (güvenli silme)</span>
+<span class="cmd">sudo</span> nvme sanitize /dev/nvme0 <span class="flag">--sanact=2</span>  <span class="cmt"># Block Erase</span></code></pre>
+  </div>
+
+  <h3>/proc ve /sys NVMe bilgileri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — sysfs NVMe</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># NVMe controller sysfs</span>
+<span class="cmd">ls</span> /sys/class/nvme/nvme0/
+<span class="cmt"># address  firmware_rev  model  numa_node  queue  serial  transport</span>
+
+<span class="cmd">cat</span> /sys/class/nvme/nvme0/model
+<span class="cmt"># WD BLUE SN570 500GB</span>
+
+<span class="cmd">cat</span> /sys/class/nvme/nvme0/queue/rotational
+<span class="cmt"># 0  (SSD: dönen disk değil)</span>
+
+<span class="cmd">cat</span> /sys/class/nvme/nvme0/queue/scheduler
+<span class="cmt"># [none] mq-deadline kyber bfq</span>
+<span class="cmt"># → NVMe için "none" idealdir</span>
+
+<span class="cmt"># Queue derinliği</span>
+<span class="cmd">cat</span> /sys/class/nvme/nvme0/queue/nr_requests
+<span class="cmt"># 1023  — donanım queue derinliği</span>
+
+<span class="cmt"># I/O latency histogramı (debugfs)</span>
+<span class="cmd">cat</span> /sys/kernel/debug/nvme/nvme0/io_stats 2&gt;/dev/null || \
+<span class="cmd">cat</span> /sys/kernel/debug/block/nvme0n1/latency_hist_read</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>/dev/nvme0: controller cihazı; /dev/nvme0n1: namespace block cihazı</li>
+      <li>nvme id-ns: namespace kapasitesi ve LBA formatı; format komutu ile 4K'ya geç</li>
+      <li>Namespace çoğullama: tek fiziksel SSD'yi bağımsız namespace'lere böl</li>
+      <li>rotational=0: scheduler'a "disk değil" bildirir; none scheduler seç</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> NVMe performans tuning</h2>
+  <p class="section-lead">NVMe'nin potansiyelini tam kullanmak için scheduler, queue derinliği, write cache ve power state ayarları kritiktir. Gömülü sistemlerde güç ve performans dengesi önemlidir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — NVMe performans ayarları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">#!/bin/bash</span>
+<span class="cmt"># nvme_tune.sh — NVMe performans optimizasyonu</span>
+
+NVME_DEV="/dev/nvme0n1"
+NVME_CTRL="/dev/nvme0"
+
+echo "=== 1. I/O Scheduler: none (NVMe için ideal) ==="
+<span class="cmd">echo</span> "none" | sudo tee /sys/block/nvme0n1/queue/scheduler
+<span class="cmd">cat</span> /sys/block/nvme0n1/queue/scheduler
+<span class="cmt"># [none] mq-deadline kyber bfq</span>
+
+echo "=== 2. Read-ahead: azalt (random I/O için) ==="
+<span class="cmt"># Sequential: büyük readahead iyi; Random: küçük ya da 0</span>
+<span class="cmd">echo</span> 0 | sudo tee /sys/block/nvme0n1/queue/read_ahead_kb
+<span class="cmt"># Sequential workload için: echo 2048 ...</span>
+
+echo "=== 3. Write cache etkinleştir ==="
+<span class="cmd">sudo</span> nvme set-feature $NVME_CTRL \
+    <span class="flag">--feature-id=0x06</span> \    <span class="cmt"># Volatile Write Cache</span>
+    <span class="flag">--value=1</span>            <span class="cmt"># 1=enable</span>
+<span class="cmd">sudo</span> nvme get-feature $NVME_CTRL \
+    <span class="flag">--feature-id=0x06</span> <span class="flag">--human-readable</span>
+
+echo "=== 4. NVMe Power State ==="
+<span class="cmt"># Power State 0: maksimum performans, yüksek güç</span>
+<span class="cmt"># Power State 4: minimum güç, düşük performans</span>
+<span class="cmd">sudo</span> nvme set-feature $NVME_CTRL \
+    <span class="flag">--feature-id=0x02</span> \    <span class="cmt"># Power Management</span>
+    <span class="flag">--value=0</span>            <span class="cmt"># PS0: max performance</span>
+
+echo "=== 5. IRQ Affinity (CPU0'a sabit) ==="
+<span class="cmt"># NVMe IRQ'larını belirli CPU'ya bağla</span>
+for irq in $(grep nvme /proc/interrupts | awk '{print $1}' | tr -d ':'); do
+    echo 1 | sudo tee /proc/irq/$irq/smp_affinity_list
+done
+
+echo "=== 6. fio hız testi ==="
+<span class="cmd">sudo</span> fio \
+    <span class="flag">--name=randread</span> \
+    <span class="flag">--filename=$NVME_DEV</span> \
+    <span class="flag">--rw=randread</span> \
+    <span class="flag">--bs=4k</span> \
+    <span class="flag">--direct=1</span> \         <span class="cmt"># O_DIRECT: page cache bypass</span>
+    <span class="flag">--numjobs=4</span> \        <span class="cmt"># paralel iş</span>
+    <span class="flag">--iodepth=32</span> \
+    <span class="flag">--runtime=30</span> \
+    <span class="flag">--group_reporting</span></code></pre>
+  </div>
+
+  <h3>Power state ve güç tüketimi karşılaştırması</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Power State</th><th>Performans</th><th>Güç</th><th>Gömülü Kullanım</th></tr></thead>
+      <tbody>
+        <tr><td>PS0 (Active)</td><td>Tam</td><td>3-6W</td><td>Yoğun I/O dönemi</td></tr>
+        <tr><td>PS1</td><td>%80</td><td>2-4W</td><td>Orta yük</td></tr>
+        <tr><td>PS3 (Non-Op)</td><td>Düşük</td><td>~100 mW</td><td>Bekleme modu</td></tr>
+        <tr><td>PS4 (Non-Op)</td><td>Çok düşük</td><td>~5 mW</td><td>Enerji tasarrufu kritiksek</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Scheduler "none": NVMe kendi donanım kuyruğunu yönetir; kernel scheduling overhead'i sıfır</li>
+      <li>read_ahead_kb=0: rastgele erişimde gereksiz önyüklemeyi engeller</li>
+      <li>Write cache enable: güç kaybı riski varsa disable; performans için enable</li>
+      <li>Power state: gömülü bekleme modunda PS3/PS4 ile ~100 mW'a kadar düşür</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> io_uring + NVMe — sqpoll ve fixed buffers</h2>
+  <p class="section-lead">io_uring, NVMe'nin düşük gecikme potansiyelini en iyi kullanan Linux I/O mekanizmasıdır. SQPOLL modu ile NVMe I/O için syscall overhead'i tamamen ortadan kalkar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — io_uring + NVMe SQPOLL modunda okuma</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;liburing.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;time.h&gt;
+
+#define QUEUE_DEPTH  128
+#define BLOCK_SIZE   4096
+#define NUM_REQS     1000
+
+static uint64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+int nvme_io_uring_bench(const char *dev_path)
+{
+    struct io_uring ring;
+    struct io_uring_params params;
+    int ret, fd;
+    char *buf;
+    uint64_t t0, elapsed;
+    long total_bytes = 0;
+
+    /* 1. SQPOLL modu: kernel thread SQ'yu poll eder */
+    memset(&params, 0, sizeof(params));
+    params.flags = IORING_SETUP_SQPOLL;
+    params.sq_thread_idle = 2000;  /* 2 sn boşta → uy */
+
+    ret = io_uring_queue_init_params(QUEUE_DEPTH, &ring, &params);
+    if (ret &lt; 0) {
+        fprintf(stderr, "io_uring_queue_init: %s\n", strerror(-ret));
+        /* SQPOLL başarısız → normal mod */
+        ret = io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
+        if (ret &lt; 0) return ret;
+    }
+
+    /* 2. O_DIRECT ile aç: page cache bypass → gerçek NVMe latency */
+    fd = open(dev_path, O_RDONLY | O_DIRECT);
+    if (fd &lt; 0) { perror("open"); return -1; }
+
+    /* 3. Registered file: fd'yi ring'e bir kez kaydet */
+    int fds[1] = { fd };
+    io_uring_register_files(&ring, fds, 1);
+
+    /* 4. Fixed buffer: belleği kernel'a pin'le */
+    ret = posix_memalign((void **)&buf, BLOCK_SIZE,
+                          BLOCK_SIZE * QUEUE_DEPTH);
+    if (ret) { perror("posix_memalign"); return -1; }
+
+    struct iovec iov = { .iov_base = buf, .iov_len = BLOCK_SIZE * QUEUE_DEPTH };
+    io_uring_register_buffers(&ring, &iov, 1);
+
+    t0 = now_ns();
+
+    /* 5. Batch submit */
+    int submitted = 0, completed = 0;
+    while (completed &lt; NUM_REQS) {
+        /* Mümkün olduğunca SQE doldur */
+        while (submitted - completed &lt; QUEUE_DEPTH &amp;&amp;
+               submitted &lt; NUM_REQS) {
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+            if (!sqe) break;
+
+            int buf_idx = submitted % QUEUE_DEPTH;
+            off_t offset = (off_t)(submitted % 1024) * BLOCK_SIZE;
+
+            /* Fixed file (IOSQE_FIXED_FILE) + fixed buffer (prep_read_fixed) */
+            io_uring_prep_read_fixed(sqe,
+                0,                      /* registered file index */
+                buf + buf_idx * BLOCK_SIZE,
+                BLOCK_SIZE,
+                offset,
+                0);                     /* registered buffer index */
+            sqe->flags |= IOSQE_FIXED_FILE;
+            io_uring_sqe_set_data(sqe, (void *)(uintptr_t)submitted);
+            submitted++;
+        }
+
+        /* SQPOLL modunda submit gerek yok; yoksa: */
+        if (!(params.flags &amp; IORING_SETUP_SQPOLL))
+            io_uring_submit(&ring);
+
+        /* CQE al */
+        struct io_uring_cqe *cqe;
+        if (io_uring_wait_cqe(&ring, &cqe) == 0) {
+            if (cqe->res &gt; 0) total_bytes += cqe->res;
+            io_uring_cqe_seen(&ring, cqe);
+            completed++;
+        }
+    }
+
+    elapsed = now_ns() - t0;
+
+    printf("Tamamlandı: %d okuma, toplam %ld bayt\n",
+           NUM_REQS, total_bytes);
+    printf("Süre: %.2f ms\n", elapsed / 1e6);
+    printf("IOPS: %.0f\n", NUM_REQS / (elapsed / 1e9));
+    printf("Throughput: %.1f MB/s\n",
+           (double)total_bytes / (elapsed / 1e9) / (1024*1024));
+    printf("Ortalama latency: %.1f µs\n",
+           elapsed / 1e3 / NUM_REQS);
+
+    io_uring_unregister_buffers(&ring);
+    io_uring_unregister_files(&ring);
+    io_uring_queue_exit(&ring);
+    close(fd);
+    free(buf);
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    const char *dev = argc &gt; 1 ? argv[1] : "/dev/nvme0n1";
+    printf("NVMe io_uring benchmark: %s\n", dev);
+    return nvme_io_uring_bench(dev);
+}</code></pre>
+  </div>
+
+  <h3>io_uring vs pread karşılaştırması (NVMe üzerinde)</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Yöntem</th><th>Ortalama Latency</th><th>IOPS (4K, QD32)</th><th>CPU kullanımı</th></tr></thead>
+      <tbody>
+        <tr><td>pread (blocking)</td><td>~80 µs</td><td>~12K</td><td>Yüksek</td></tr>
+        <tr><td>libaio (AIO)</td><td>~40 µs</td><td>~50K</td><td>Orta</td></tr>
+        <tr><td>io_uring (normal)</td><td>~25 µs</td><td>~200K</td><td>Düşük</td></tr>
+        <tr><td>io_uring (SQPOLL+fixed)</td><td>~18 µs</td><td>~400K</td><td>En düşük</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>SQPOLL: kernel polling thread ile submission syscall sıfır — en düşük latency</li>
+      <li>O_DIRECT: page cache atlayarak gerçek NVMe latency'yi ölç; sector-aligned buffer zorunlu</li>
+      <li>io_uring_register_files/buffers: her operasyonda fd/buffer kopyasını önler</li>
+      <li>SQPOLL + fixed: pread'e göre 4-5× daha fazla IOPS; latency yarıya iner</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Pratik: Raspberry Pi CM4 + NVMe SSD — fstab, fio, wear leveling</h2>
+  <p class="section-lead">Raspberry Pi CM4 üzerine M.2 HAT ile NVMe SSD takılması, fstab yapılandırması, fio benchmark ve wear leveling izlemesi.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — CM4 NVMe kurulum ve doğrulama</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1. PCIe ve NVMe durumu</span>
+<span class="cmd">sudo</span> lspci
+<span class="cmt"># 0000:00:00.0 PCI bridge: Broadcom Inc. BCM2711 PCIe Bridge</span>
+<span class="cmt"># 0000:01:00.0 Non-Volatile memory controller: WD Blue SN570 500GB</span>
+
+<span class="cmd">sudo</span> nvme list
+<span class="cmt"># Node        Model                 Namespace  Usage</span>
+<span class="cmt"># /dev/nvme0n1 WD BLUE SN570 500GB  1         500.1 GB</span>
+
+<span class="cmt"># 2. Disk hazırlama</span>
+<span class="cmd">sudo</span> parted /dev/nvme0n1 mklabel gpt
+<span class="cmd">sudo</span> parted /dev/nvme0n1 mkpart primary ext4 0% 100%
+<span class="cmd">sudo</span> mkfs.ext4 <span class="flag">-L</span> nvme_data /dev/nvme0n1p1
+
+<span class="cmt"># 3. /etc/fstab yapılandırması</span>
+<span class="cmt"># UUID al</span>
+<span class="cmd">sudo</span> blkid /dev/nvme0n1p1
+<span class="cmt"># /dev/nvme0n1p1: UUID="xxxxxxxx-xxxx" TYPE="ext4"</span>
+
+<span class="cmt"># /etc/fstab'a ekle:</span>
+<span class="cmt"># UUID=xxxxxxxx-xxxx  /mnt/nvme  ext4  defaults,noatime,nodiratime  0  2</span>
+<span class="cmt"># noatime: erişim zamanı güncellemesini devre dışı → gereksiz yazma azalt</span>
+
+<span class="cmd">sudo</span> mkdir -p /mnt/nvme
+<span class="cmd">sudo</span> mount -a
+<span class="cmd">df</span> <span class="flag">-h</span> /mnt/nvme</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — fio benchmark: CM4 NVMe gerçek performans</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># fio kurulumu</span>
+<span class="cmd">sudo</span> apt-get install fio
+
+<span class="cmt"># Sequential Read (büyük dosya okuma)</span>
+<span class="cmd">sudo</span> fio \
+    <span class="flag">--name=seq_read</span> \
+    <span class="flag">--filename=/dev/nvme0n1</span> \
+    <span class="flag">--rw=read</span> \
+    <span class="flag">--bs=1M</span> \
+    <span class="flag">--direct=1</span> \
+    <span class="flag">--numjobs=1</span> \
+    <span class="flag">--iodepth=8</span> \
+    <span class="flag">--runtime=30</span> \
+    <span class="flag">--group_reporting</span>
+<span class="cmt"># READ: bw=491MiB/s (515MB/s)  ← PCIe Gen2 x1 tavanına yakın</span>
+
+<span class="cmt"># Sequential Write</span>
+<span class="cmd">sudo</span> fio \
+    <span class="flag">--name=seq_write</span> \
+    <span class="flag">--filename=/dev/nvme0n1</span> \
+    <span class="flag">--rw=write</span> \
+    <span class="flag">--bs=1M</span> \
+    <span class="flag">--direct=1</span> \
+    <span class="flag">--numjobs=1</span> \
+    <span class="flag">--iodepth=8</span> \
+    <span class="flag">--runtime=30</span> \
+    <span class="flag">--group_reporting</span>
+<span class="cmt"># WRITE: bw=285MiB/s (299MB/s)</span>
+
+<span class="cmt"># Random 4K Read (IOPS testi)</span>
+<span class="cmd">sudo</span> fio \
+    <span class="flag">--name=rand4k_read</span> \
+    <span class="flag">--filename=/dev/nvme0n1</span> \
+    <span class="flag">--rw=randread</span> \
+    <span class="flag">--bs=4k</span> \
+    <span class="flag">--direct=1</span> \
+    <span class="flag">--numjobs=1</span> \
+    <span class="flag">--iodepth=32</span> \
+    <span class="flag">--runtime=30</span> \
+    <span class="flag">--group_reporting</span>
+<span class="cmt"># READ: IOPS=45.2k, BW=176MiB/s</span>
+<span class="cmt"># lat (usec): min=16, max=8940, avg=707.81</span></code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — wear leveling izleme ve TRIM</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Wear leveling durumu</span>
+<span class="cmd">sudo</span> nvme smart-log /dev/nvme0 | grep -E "percentage_used|data_units"
+<span class="cmt"># percentage_used         : 3%</span>
+<span class="cmt"># data_units_read         : 12,345 [6,321 GB]</span>
+<span class="cmt"># data_units_written      : 5,678 [2,907 GB]</span>
+<span class="cmt"># W/A hesapla: written_to_flash / host_written</span>
+<span class="cmt"># → 1.0 idealdir; yüksek W/A wear leveling overhead'ini gösterir</span>
+
+<span class="cmt"># TRIM: artık kullanılmayan blokları bildir</span>
+<span class="cmd">sudo</span> fstrim <span class="flag">-v</span> /mnt/nvme
+<span class="cmt"># /mnt/nvme: 12.5 GiB (13421772800 bytes) trimmed</span>
+
+<span class="cmt"># Otomatik TRIM: fstab'da 'discard' mount seçeneği</span>
+<span class="cmt"># veya systemd-fstrim.timer (haftada bir çalışır)</span>
+<span class="cmd">sudo</span> systemctl enable fstrim.timer
+<span class="cmd">sudo</span> systemctl start fstrim.timer
+
+<span class="cmt"># Periyodik SMART izleme betiği</span>
+cat &lt;&lt;'EOF' | sudo tee /usr/local/bin/nvme_health_check.sh
+#!/bin/bash
+THRESHOLD=90  # % kullanım uyarı eşiği
+USED=$(nvme smart-log /dev/nvme0 | \
+       grep percentage_used | awk '{print $3}' | tr -d '%')
+if [ "${USED:-0}" -ge "$THRESHOLD" ]; then
+    logger -t nvme_health "UYARI: NVMe %$USED kullanım — SSD ömrü azalıyor!"
+fi
+EOF
+<span class="cmd">sudo</span> chmod +x /usr/local/bin/nvme_health_check.sh
+
+<span class="cmt"># Her gün çalıştır</span>
+<span class="cmd">echo</span> "0 6 * * * root /usr/local/bin/nvme_health_check.sh" | \
+    sudo tee /etc/cron.d/nvme-health</code></pre>
+  </div>
+
+  <h3>CM4 NVMe benchmark özeti</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Test</th><th>Sonuç</th><th>Teorik Max (Gen2 x1)</th></tr></thead>
+      <tbody>
+        <tr><td>Sequential Read</td><td>~491 MB/s</td><td>~500 MB/s</td></tr>
+        <tr><td>Sequential Write</td><td>~285 MB/s</td><td>~400 MB/s (write sınırlı)</td></tr>
+        <tr><td>Random 4K Read (QD32)</td><td>~45K IOPS</td><td>PCIe bant genişliği sınırı</td></tr>
+        <tr><td>Random 4K Write</td><td>~35K IOPS</td><td>SLC önbellek dolunca düşer</td></tr>
+        <tr><td>Ortalama latency (4K)</td><td>~700 µs</td><td>—</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>CM4 sequential read: ~490 MB/s — PCIe Gen2 x1 teorik sınırına yakın</li>
+      <li>noatime/nodiratime: erişim zamanı yazmalarını engeller; SSD ömrünü uzatır</li>
+      <li>fstrim periyodik: TRIM ile silinmiş blokları SSD'ye bildir; wear leveling verimini artırır</li>
+      <li>SMART percentage_used: %90'ı geçince disk değişimi planla; izleme betiği kur</li>
+    </ul>
+  </div>
+</section>
+
+</main>
