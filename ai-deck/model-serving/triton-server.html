@@ -1,0 +1,812 @@
+---
+layout: tutorial
+title: "Triton Inference Server — Derinlemesine"
+back_url: "../index.html"
+back_label: "Model Serving Altyapısı"
+---
+
+<header class="header">
+  <div class="meta"><span>Rehber</span><span>Model Serving</span><span>02 · LLM Serving</span></div>
+  <h1>Triton Inference<br><em>Server.</em></h1>
+  <p class="subtitle">NVIDIA Triton ile üretim sınıfı model serving. Model repository, dynamic batching, ensemble pipeline, Python backend ve perf_analyzer ile 10x throughput iyileştirmesi.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçerik</div>
+  <ol>
+    <li><a href="#s0">Triton Mimarisi</a></li>
+    <li><a href="#s1">Model Repository Yapısı</a></li>
+    <li><a href="#s2">Model Konfigürasyonu (config.pbtxt)</a></li>
+    <li><a href="#s3">Dynamic Batching</a></li>
+    <li><a href="#s4">Ensemble Model Pipeline</a></li>
+    <li><a href="#s5">Python Backend ile Custom Logic</a></li>
+    <li><a href="#s6">Model Analyzer ve perf_analyzer</a></li>
+    <li><a href="#s7">GRPC vs HTTP API</a></li>
+    <li><a href="#s8">Shared Memory ve Concurrent Execution</a></li>
+    <li><a href="#s9">Pratik: ONNX BERT + Dynamic Batching</a></li>
+  </ol>
+</nav>
+
+<main>
+
+  <!-- ── S0: Triton Mimarisi ────────────────────────────────── -->
+  <section id="s0">
+    <h2><span class="num">00</span> Triton Mimarisi</h2>
+    <p class="section-lead">NVIDIA Triton Inference Server'ın temel bileşenleri: backend sistemi, model yönetimi ve request lifecycle.</p>
+
+    <p>
+      Triton Inference Server, farklı framework'lerde eğitilmiş modelleri (TensorFlow, TensorRT, ONNX, PyTorch, Python/custom) tek bir HTTP/GRPC endpoint üzerinden servis eden production-grade bir inference sunucusudur. Her model bağımsız olarak yapılandırılır, versiyonlanır ve dinamik olarak yüklenir/boşaltılır.
+    </p>
+
+    <div class="flow">
+      <pre><span class="step-num">İstek  </span> HTTP/GRPC → Frontend (port 8000/8001)
+<span class="step-num">Routing</span> Model adı + versiyon → Backend seçimi
+<span class="step-num">Queue  </span> Dynamic batcher → isteği kuyruğa al
+<span class="step-num">Batch  </span> preferred_batch_size dolana kadar veya max_delay aşılana kadar bekle
+<span class="step-num">İnfer  </span> Backend (TRT/ONNX/PyTorch...) → GPU/CPU'da çalıştır
+<span class="step-num">Yanıt  </span> Sonuçları istemciye gönder</pre>
+    </div>
+
+    <h3>Desteklenen Backend'ler</h3>
+    <table class="file-table">
+      <thead>
+        <tr><th>Backend</th><th>Format</th><th>En İyi Kullanım</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>TensorRT</td><td>.plan, .engine</td><td>NVIDIA GPU, maksimum throughput</td></tr>
+        <tr><td>ONNX Runtime</td><td>.onnx</td><td>Framework-agnostic, cross-platform</td></tr>
+        <tr><td>PyTorch (TorchScript)</td><td>.pt</td><td>PyTorch modelleri</td></tr>
+        <tr><td>TensorFlow</td><td>SavedModel</td><td>TF/Keras modelleri</td></tr>
+        <tr><td>Python</td><td>model.py</td><td>Custom preprocessing, post-processing</td></tr>
+        <tr><td>OpenVINO</td><td>.xml + .bin</td><td>Intel CPU optimizasyonu</td></tr>
+        <tr><td>FIL (Forest)</td><td>.pkl</td><td>XGBoost, RandomForest</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout">
+      <div class="label">MİMARİ NOT</div>
+      <p>Triton'un en güçlü özelliklerinden biri, farklı backend'leri tek bir pipeline içinde ensemble olarak birleştirme yeteneğidir. Örneğin Python backend ile tokenizasyon → ONNX BERT → Python backend ile postprocessing zinciri kurabilirsiniz.</p>
+    </div>
+  </section>
+
+  <!-- ── S1: Model Repository ───────────────────────────────── -->
+  <section id="s1">
+    <h2><span class="num">01</span> Model Repository Yapısı</h2>
+    <p class="section-lead">Triton'un model dosyalarını organize etme kuralları — directory layout ve versiyonlama.</p>
+
+    <p>
+      Triton model repository'si belirli bir dizin yapısı takip eder. Her model kendi alt dizininde yaşar; içinde versiyon numaralı klasörler ve bir <code class="inline">config.pbtxt</code> dosyası bulunur.
+    </p>
+
+    <div class="code-block">
+      <div class="code-label">dizin yapısı</div>
+      <pre><code>model_repository/
+├── bert-onnx/
+│   ├── config.pbtxt           # model konfigürasyonu
+│   ├── 1/                     # versiyon 1
+│   │   └── model.onnx
+│   └── 2/                     # versiyon 2 (güncel)
+│       └── model.onnx
+├── tokenizer/
+│   ├── config.pbtxt
+│   └── 1/
+│       └── model.py           # Python backend
+├── classifier/
+│   ├── config.pbtxt
+│   └── 1/
+│       └── model.plan         # TensorRT engine
+└── nlp-ensemble/
+    ├── config.pbtxt           # ensemble konfigürasyonu
+    └── 1/                     # boş (ensemble'ın model dosyası yok)
+        └── .gitkeep</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">bash — Triton başlat</div>
+      <pre><code">docker run --gpus all -p 8000:8000 -p 8001:8001 -p 8002:8002 \
+  -v /path/to/model_repository:/models \
+  nvcr.io/nvidia/tritonserver:24.01-py3 \
+  tritonserver \
+    --model-repository=/models \
+    --log-verbose=1 \
+    --model-control-mode=poll \
+    --repository-poll-secs=30</code></pre>
+    </div>
+
+    <div class="params">
+      <div class="param-row">
+        <span class="param-name">--model-control-mode</span>
+        <span class="param-desc">none / poll / explicit — model yükleme stratejisi</span>
+      </div>
+      <div class="param-row">
+        <span class="param-name">--repository-poll-secs</span>
+        <span class="param-desc">poll modunda dizin kontrol sıklığı (saniye)</span>
+      </div>
+      <div class="param-row">
+        <span class="param-name">--strict-model-config</span>
+        <span class="param-desc">false: config.pbtxt yoksa auto-detect dene</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── S2: config.pbtxt ───────────────────────────────────── -->
+  <section id="s2">
+    <h2><span class="num">02</span> Model Konfigürasyonu (config.pbtxt)</h2>
+    <p class="section-lead">Her modelin davranışını belirleyen protobuf konfigürasyon dosyası — input/output, batch boyutu, instance grubu.</p>
+
+    <div class="code-block">
+      <div class="code-label">config.pbtxt — BERT ONNX örneği</div>
+      <pre><code>name: "bert-onnx"
+backend: "onnxruntime"
+max_batch_size: 32
+
+input [
+  {
+    name: "input_ids"
+    data_type: TYPE_INT64
+    dims: [ 128 ]    # sequence uzunluğu
+  },
+  {
+    name: "attention_mask"
+    data_type: TYPE_INT64
+    dims: [ 128 ]
+  },
+  {
+    name: "token_type_ids"
+    data_type: TYPE_INT64
+    dims: [ 128 ]
+  }
+]
+
+output [
+  {
+    name: "last_hidden_state"
+    data_type: TYPE_FP32
+    dims: [ 128, 768 ]
+  },
+  {
+    name: "pooler_output"
+    data_type: TYPE_FP32
+    dims: [ 768 ]
+  }
+]
+
+instance_group [
+  {
+    count: 2         # 2 model örneği (concurrent execution)
+    kind: KIND_GPU
+    gpus: [ 0 ]      # GPU 0 kullan
+  }
+]
+
+dynamic_batching {
+  preferred_batch_size: [ 8, 16, 32 ]
+  max_queue_delay_microseconds: 5000
+}</code></pre>
+    </div>
+
+    <h3>Değişken Uzunluklu Input</h3>
+    <div class="code-block">
+      <div class="code-label">config.pbtxt — dinamik dims</div>
+      <pre><code">name: "bert-dynamic"
+backend: "onnxruntime"
+max_batch_size: 64
+
+input [
+  {
+    name: "input_ids"
+    data_type: TYPE_INT64
+    dims: [ -1 ]      # -1 = değişken uzunluk
+  },
+  {
+    name: "attention_mask"
+    data_type: TYPE_INT64
+    dims: [ -1 ]
+  }
+]
+
+output [
+  {
+    name: "logits"
+    data_type: TYPE_FP32
+    dims: [ -1, 2 ]   # batch × num_classes
+  }
+]
+
+# Sequence batcher: dinamik uzunluk için
+sequence_batching {
+  max_sequence_idle_microseconds: 5000000
+  oldest {
+    max_candidate_sequences: 128
+    preferred_batch_size: [ 4, 8 ]
+    max_queue_delay_microseconds: 3000
+  }
+}</code></pre>
+    </div>
+
+    <table class="file-table">
+      <thead>
+        <tr><th>Parametre</th><th>Tür</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>max_batch_size</td><td>int</td><td>Backend'e gönderilecek maksimum batch büyüklüğü</td></tr>
+        <tr><td>dims</td><td>int[]</td><td>Tensor boyutları (-1 dinamik)</td></tr>
+        <tr><td>data_type</td><td>enum</td><td>TYPE_FP32, TYPE_INT64, TYPE_STRING vb.</td></tr>
+        <tr><td>instance_group.count</td><td>int</td><td>Aynı GPU'da paralel model kopyası sayısı</td></tr>
+        <tr><td>instance_group.kind</td><td>enum</td><td>KIND_GPU, KIND_CPU, KIND_MODEL</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ── S3: Dynamic Batching ───────────────────────────────── -->
+  <section id="s3">
+    <h2><span class="num">03</span> Dynamic Batching Konfigürasyonu</h2>
+    <p class="section-lead">Gelen istekleri otomatik grupla — preferred_batch_size ve max_queue_delay_microseconds ayarı.</p>
+
+    <p>
+      Dynamic batching, farklı istemcilerden gelen istekleri tek bir batch'e birleştirir. Bu sayede GPU utilization artar, throughput yükselir. İki kritik parametre denge kurar: <em>preferred_batch_size</em> (hedef batch büyüklüğü) ve <em>max_queue_delay_microseconds</em> (maksimum bekleme süresi).
+    </p>
+
+    <div class="code-block">
+      <div class="code-label">config.pbtxt — dynamic batching detaylı</div>
+      <pre><code">dynamic_batching {
+  # Tercih edilen batch büyüklükleri (küçükten büyüğe)
+  preferred_batch_size: [ 4, 8, 16, 32 ]
+
+  # Batch dolmasa bile bu süreden fazla bekleme
+  max_queue_delay_microseconds: 5000     # 5 ms
+
+  # Priority queue: yüksek öncelik kuyruğu
+  priority_queue_policy {
+    default_priority_level: 2
+    priority_levels: 3
+    1: { default_timeout_microseconds: 1000  allow_timeout_override: true }
+    2: { default_timeout_microseconds: 5000  allow_timeout_override: true }
+    3: { default_timeout_microseconds: 10000 allow_timeout_override: false }
+  }
+
+  # Preserve request ordering (varsayılan: false, daha hızlı)
+  preserve_ordering: false
+}</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — dynamic batching etkisini test et</div>
+      <pre><code">import tritonclient.http as httpclient
+import numpy as np
+import concurrent.futures
+import time
+
+client = httpclient.InferenceServerClient(url="localhost:8000")
+
+def single_request(prompt_ids):
+    input_ids = np.array([prompt_ids], dtype=np.int64)
+    inputs = [httpclient.InferInput("input_ids", input_ids.shape, "INT64")]
+    inputs[0].set_data_from_numpy(input_ids)
+    outputs = [httpclient.InferRequestedOutput("pooler_output")]
+    result = client.infer("bert-onnx", inputs, outputs=outputs)
+    return result.as_numpy("pooler_output")
+
+# 50 eş zamanlı istek gönder
+prompt_ids = [101] + [2054] * 126 + [102]   # dummy BERT input
+start = time.perf_counter()
+with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+    futures = [executor.submit(single_request, prompt_ids) for _ in range(200)]
+    results = [f.result() for f in futures]
+elapsed = time.perf_counter() - start
+print(f"200 istek, 50 concurrent: {elapsed:.2f}s — {200/elapsed:.0f} req/s")</code></pre>
+    </div>
+
+    <div class="callout">
+      <div class="label">AYAR TAVSİYESİ</div>
+      <p>max_queue_delay_microseconds için: etkileşimli uygulamalar (chatbot) → 1-5ms; toplu işleme → 50-200ms. preferred_batch_size GPU belleğine ve model boyutuna göre ayarlayın — genellikle GPU utilization %85+ olana kadar artırın.</p>
+    </div>
+  </section>
+
+  <!-- ── S4: Ensemble Model ──────────────────────────────────── -->
+  <section id="s4">
+    <h2><span class="num">04</span> Ensemble Model Pipeline</h2>
+    <p class="section-lead">Pre-process + model + post-process zincirini tek bir endpoint arkasına gizle.</p>
+
+    <p>
+      Ensemble, birden fazla modeli sıralı veya paralel olarak çalıştıran sanal bir modeldir. İstemci tek bir istek gönderir; Triton dahili olarak tokenizer → encoder → classifier zincirini çalıştırır.
+    </p>
+
+    <div class="code-block">
+      <div class="code-label">config.pbtxt — NLP ensemble</div>
+      <pre><code">name: "nlp-ensemble"
+platform: "ensemble"
+max_batch_size: 32
+
+input [
+  {
+    name: "raw_text"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }
+]
+
+output [
+  {
+    name: "sentiment_label"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  },
+  {
+    name: "confidence"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+  }
+]
+
+ensemble_scheduling {
+  step [
+    # Adım 1: Python tokenizer
+    {
+      model_name: "tokenizer"
+      model_version: -1    # en güncel versiyon
+      input_map {
+        key: "text"
+        value: "raw_text"
+      }
+      output_map {
+        key: "input_ids"
+        value: "token_input_ids"
+      }
+      output_map {
+        key: "attention_mask"
+        value: "token_attention_mask"
+      }
+    },
+    # Adım 2: BERT ONNX
+    {
+      model_name: "bert-onnx"
+      model_version: -1
+      input_map {
+        key: "input_ids"
+        value: "token_input_ids"
+      }
+      input_map {
+        key: "attention_mask"
+        value: "token_attention_mask"
+      }
+      output_map {
+        key: "pooler_output"
+        value: "bert_embedding"
+      }
+    },
+    # Adım 3: Python post-processor
+    {
+      model_name: "classifier-head"
+      model_version: -1
+      input_map {
+        key: "embedding"
+        value: "bert_embedding"
+      }
+      output_map {
+        key: "label"
+        value: "sentiment_label"
+      }
+      output_map {
+        key: "score"
+        value: "confidence"
+      }
+    }
+  ]
+}</code></pre>
+    </div>
+  </section>
+
+  <!-- ── S5: Python Backend ──────────────────────────────────── -->
+  <section id="s5">
+    <h2><span class="num">05</span> Python Backend ile Custom Logic</h2>
+    <p class="section-lead">Herhangi bir Python kütüphanesini Triton backend'i olarak kullan — tokenizer, postprocessor veya tam model.</p>
+
+    <div class="code-block">
+      <div class="code-label">model.py — HuggingFace Tokenizer backend</div>
+      <pre><code">import triton_python_backend_utils as pb_utils
+import numpy as np
+import json
+from transformers import AutoTokenizer
+
+
+class TritonPythonModel:
+    """Triton Python Backend: HuggingFace Tokenizer"""
+
+    def initialize(self, args):
+        """Sunucu başladığında çağrılır — model yükle."""
+        model_config = json.loads(args["model_config"])
+        self.max_length = 128
+
+        # Tokenizer yükle
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            "bert-base-uncased",
+            cache_dir="/models/hf_cache",
+        )
+        pb_utils.Logger.log("Tokenizer yüklendi.", pb_utils.Logger.INFO)
+
+    def execute(self, requests):
+        """Her batch için çağrılır."""
+        responses = []
+
+        for request in requests:
+            # Input tensor'ını al
+            text_tensor = pb_utils.get_input_tensor_by_name(request, "text")
+            texts = [t.decode("utf-8") for t in text_tensor.as_numpy().flatten()]
+
+            # Tokenize
+            encoding = self.tokenizer(
+                texts,
+                max_length=self.max_length,
+                padding="max_length",
+                truncation=True,
+                return_tensors="np",
+            )
+
+            input_ids = encoding["input_ids"].astype(np.int64)
+            attention_mask = encoding["attention_mask"].astype(np.int64)
+
+            # Output tensor oluştur
+            out_input_ids = pb_utils.Tensor("input_ids", input_ids)
+            out_attn_mask = pb_utils.Tensor("attention_mask", attention_mask)
+
+            response = pb_utils.InferenceResponse(
+                output_tensors=[out_input_ids, out_attn_mask]
+            )
+            responses.append(response)
+
+        return responses
+
+    def finalize(self):
+        """Sunucu kapanırken çağrılır."""
+        pb_utils.Logger.log("Tokenizer kapatılıyor.", pb_utils.Logger.INFO)</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">config.pbtxt — Python tokenizer</div>
+      <pre><code">name: "tokenizer"
+backend: "python"
+max_batch_size: 64
+
+input [
+  {
+    name: "text"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }
+]
+
+output [
+  {
+    name: "input_ids"
+    data_type: TYPE_INT64
+    dims: [ 128 ]
+  },
+  {
+    name: "attention_mask"
+    data_type: TYPE_INT64
+    dims: [ 128 ]
+  }
+]
+
+instance_group [{ kind: KIND_CPU count: 4 }]</code></pre>
+    </div>
+  </section>
+
+  <!-- ── S6: Model Analyzer ─────────────────────────────────── -->
+  <section id="s6">
+    <h2><span class="num">06</span> Model Analyzer ve perf_analyzer</h2>
+    <p class="section-lead">Triton'un yerleşik performans araçlarıyla optimal batch boyutu ve concurrency bul.</p>
+
+    <div class="code-block">
+      <div class="code-label">bash — perf_analyzer kullanımı</div>
+      <pre><code"># perf_analyzer: tek yapılandırma için benchmark
+perf_analyzer \
+  -m bert-onnx \
+  -u localhost:8001 \
+  --protocol grpc \
+  --concurrency-range 1:32:2 \
+  --measurement-interval 10000 \
+  --input-data /path/to/test_data.json \
+  --shape input_ids:1,128 \
+  --shape attention_mask:1,128 \
+  --report-file perf_results.csv
+
+# model-analyzer: kapsamlı profiling sweep
+model-analyzer profile \
+  --model-repository /models \
+  --profile-models bert-onnx \
+  --triton-launch-mode docker \
+  --output-model-repository-path /output \
+  --run-config-search-max-concurrency 32 \
+  --run-config-search-max-model-batch-size 64 \
+  --run-config-search-max-instance-count 4</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — perf_analyzer sonuçlarını oku</div>
+      <pre><code">import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+df = pd.read_csv("perf_results.csv")
+print(df[["Concurrency", "Inferences/Second", "Client p95 Latency (ms)"]].to_string())
+
+# Throughput vs Latency grafiği
+fig, ax1 = plt.subplots(figsize=(10, 5))
+ax2 = ax1.twinx()
+ax1.plot(df["Concurrency"], df["Inferences/Second"], "b-o", label="Throughput (req/s)")
+ax2.plot(df["Concurrency"], df["Client p95 Latency (ms)"], "r-s", label="P95 Latency (ms)")
+ax1.set_xlabel("Concurrency")
+ax1.set_ylabel("Throughput (req/s)", color="b")
+ax2.set_ylabel("P95 Latency (ms)", color="r")
+plt.title("Triton BERT: Throughput vs Latency")
+plt.savefig("triton_perf.png", dpi=150, bbox_inches="tight")
+print("Grafik kaydedildi: triton_perf.png")</code></pre>
+    </div>
+
+    <table class="file-table">
+      <thead>
+        <tr><th>Araç</th><th>Amaç</th><th>Çıktı</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>perf_analyzer</td><td>Belirli concurrency aralığını test et</td><td>CSV: throughput, latency percentiles</td></tr>
+        <tr><td>model-analyzer profile</td><td>Tüm konfigürasyon uzayını tara</td><td>Optimal instance_group ve batch</td></tr>
+        <tr><td>model-analyzer report</td><td>Konfigürasyonları karşılaştır</td><td>PDF/HTML raporu</td></tr>
+        <tr><td>/metrics (HTTP)</td><td>Anlık Prometheus metrikleri</td><td>Grafana entegrasyonu</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ── S7: GRPC vs HTTP ────────────────────────────────────── -->
+  <section id="s7">
+    <h2><span class="num">07</span> GRPC vs HTTP API</h2>
+    <p class="section-lead">Triton'un iki transport protokolünü karşılaştır ve Python istemci örneklerini incele.</p>
+
+    <table class="file-table">
+      <thead>
+        <tr><th>Özellik</th><th>HTTP (port 8000)</th><th>GRPC (port 8001)</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Protokol</td><td>REST/JSON</td><td>Protocol Buffers</td></tr>
+        <tr><td>Latency</td><td>Daha yüksek</td><td>Daha düşük (~2-3×)</td></tr>
+        <tr><td>Throughput</td><td>Orta</td><td>Yüksek</td></tr>
+        <tr><td>Streaming</td><td>Sınırlı</td><td>Bidirectional streaming</td></tr>
+        <tr><td>Debug kolaylığı</td><td>curl ile kolay</td><td>Özel araç gerektirir</td></tr>
+        <tr><td>Önerilen kullanım</td><td>Prototip, düşük yük</td><td>Production, yüksek yük</td></tr>
+      </tbody>
+    </table>
+
+    <div class="code-block">
+      <div class="code-label">python — GRPC istemcisi</div>
+      <pre><code">import tritonclient.grpc as grpcclient
+import numpy as np
+
+client = grpcclient.InferenceServerClient(url="localhost:8001", verbose=False)
+
+# Model metadata
+metadata = client.get_model_metadata("bert-onnx")
+print(f"Model: {metadata.name}, inputs: {[i.name for i in metadata.inputs]}")
+
+# Inference isteği
+input_ids = np.random.randint(100, 30000, size=(4, 128), dtype=np.int64)
+attention_mask = np.ones((4, 128), dtype=np.int64)
+
+inputs = [
+    grpcclient.InferInput("input_ids",     input_ids.shape,     "INT64"),
+    grpcclient.InferInput("attention_mask", attention_mask.shape, "INT64"),
+]
+inputs[0].set_data_from_numpy(input_ids)
+inputs[1].set_data_from_numpy(attention_mask)
+
+outputs = [grpcclient.InferRequestedOutput("pooler_output")]
+
+result = client.infer(
+    model_name="bert-onnx",
+    inputs=inputs,
+    outputs=outputs,
+    client_timeout=10.0,
+)
+embedding = result.as_numpy("pooler_output")
+print(f"Embedding shape: {embedding.shape}")  # (4, 768)</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — async GRPC istemcisi</div>
+      <pre><code">import asyncio
+import tritonclient.grpc.aio as grpcclient_async
+import numpy as np
+
+async def async_infer_batch(n=100):
+    client = grpcclient_async.InferenceServerClient(url="localhost:8001")
+
+    async def single_request(req_id):
+        input_ids = np.random.randint(100, 30000, size=(1, 128), dtype=np.int64)
+        attn_mask = np.ones((1, 128), dtype=np.int64)
+        inputs = [
+            grpcclient_async.InferInput("input_ids", input_ids.shape, "INT64"),
+            grpcclient_async.InferInput("attention_mask", attn_mask.shape, "INT64"),
+        ]
+        inputs[0].set_data_from_numpy(input_ids)
+        inputs[1].set_data_from_numpy(attn_mask)
+        outputs = [grpcclient_async.InferRequestedOutput("pooler_output")]
+        return await client.infer("bert-onnx", inputs, outputs=outputs)
+
+    results = await asyncio.gather(*[single_request(i) for i in range(n)])
+    await client.close()
+    return results
+
+asyncio.run(async_infer_batch(100))</code></pre>
+    </div>
+  </section>
+
+  <!-- ── S8: Shared Memory & Concurrent ─────────────────────── -->
+  <section id="s8">
+    <h2><span class="num">08</span> Shared Memory ve Concurrent Model Execution</h2>
+    <p class="section-lead">CPU/GPU shared memory ile veri kopyalama overhead'ini elim et; instance_group ile paralel model çalıştır.</p>
+
+    <div class="code-block">
+      <div class="code-label">python — GPU shared memory kullanımı</div>
+      <pre><code">import tritonclient.grpc as grpcclient
+import tritonclient.utils.cuda_shared_memory as cuda_shm
+import numpy as np
+
+client = grpcclient.InferenceServerClient("localhost:8001")
+
+# GPU shared memory bölgesi oluştur
+shm_name = "bert_input_shm"
+byte_size = 4 * 128 * 8    # 4 sample × 128 tokens × int64 (8 byte)
+
+shm_handle = cuda_shm.create(shm_name, byte_size, gpu_device_id=0)
+client.register_cuda_shared_memory(shm_name, cuda_shm.get_raw_handle(shm_handle), 0, byte_size)
+
+# Veriyi shared memory'ye yaz
+input_data = np.random.randint(100, 30000, (4, 128), dtype=np.int64)
+cuda_shm.set_shared_memory_region(shm_handle, [input_data], [0])
+
+# Shared memory'den okuyarak inference yap
+inputs = [grpcclient.InferInput("input_ids", [4, 128], "INT64")]
+inputs[0].set_shared_memory(shm_name, byte_size, offset=0)
+
+result = client.infer("bert-onnx", inputs,
+    outputs=[grpcclient.InferRequestedOutput("pooler_output")])
+
+# Temizlik
+client.unregister_cuda_shared_memory(shm_name)
+cuda_shm.destroy(shm_handle)</code></pre>
+    </div>
+
+    <h3>Concurrent Model Execution</h3>
+    <p>
+      <code class="inline">instance_group.count</code> ile aynı GPU'da birden fazla model kopyası çalıştırılabilir. Bu, küçük modellerde GPU'nun tam kapasitesini kullanmak için kritiktir.
+    </p>
+
+    <div class="code-block">
+      <div class="code-label">config.pbtxt — multi-instance</div>
+      <pre><code">instance_group [
+  {
+    # GPU 0'da 3 kopya — küçük model için
+    kind: KIND_GPU
+    count: 3
+    gpus: [ 0 ]
+  },
+  {
+    # GPU 1'de 2 kopya
+    kind: KIND_GPU
+    count: 2
+    gpus: [ 1 ]
+  },
+  {
+    # CPU'da 2 kopya — fallback
+    kind: KIND_CPU
+    count: 2
+  }
+]</code></pre>
+    </div>
+
+    <div class="callout">
+      <div class="label">OPTİMİZASYON İPUCU</div>
+      <p>instance_group.count değerini belirlemek için şu formülü kullanın: count = ceil(GPU_memory × 0.85 / model_memory_per_instance). Tipik olarak küçük modeller (BERT-Base: ~400MB) için count=4-6, büyük modeller için count=1-2 uygundur.</p>
+    </div>
+  </section>
+
+  <!-- ── S9: Pratik ─────────────────────────────────────────── -->
+  <section id="s9">
+    <h2><span class="num">09</span> Pratik: ONNX BERT + Dynamic Batching</h2>
+    <p class="section-lead">BERT modelini ONNX'e dönüştür, Triton'a deploy et ve dynamic batching ile 10x throughput iyileştirmesi sağla.</p>
+
+    <div class="code-block">
+      <div class="code-label">python — BERT'i ONNX'e export et</div>
+      <pre><code">from transformers import AutoTokenizer, AutoModel
+import torch
+import numpy as np
+import os
+
+model_name = "bert-base-uncased"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModel.from_pretrained(model_name)
+model.eval()
+
+# Dummy input oluştur
+dummy_input = tokenizer(
+    "Bu bir test cümlesidir.",
+    padding="max_length",
+    max_length=128,
+    truncation=True,
+    return_tensors="pt",
+)
+
+# ONNX export
+os.makedirs("/models/bert-onnx/1", exist_ok=True)
+
+torch.onnx.export(
+    model,
+    (dummy_input["input_ids"], dummy_input["attention_mask"], dummy_input["token_type_ids"]),
+    "/models/bert-onnx/1/model.onnx",
+    input_names=["input_ids", "attention_mask", "token_type_ids"],
+    output_names=["last_hidden_state", "pooler_output"],
+    dynamic_axes={
+        "input_ids":      {0: "batch_size"},
+        "attention_mask": {0: "batch_size"},
+        "token_type_ids": {0: "batch_size"},
+        "last_hidden_state": {0: "batch_size"},
+        "pooler_output":     {0: "batch_size"},
+    },
+    opset_version=14,
+    do_constant_folding=True,
+)
+print("ONNX model hazır: /models/bert-onnx/1/model.onnx")</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">bash — Triton başlat ve benchmark yap</div>
+      <pre><code"># Triton başlat
+docker run --gpus all --rm -p 8000:8000 -p 8001:8001 \
+  -v /models:/models \
+  nvcr.io/nvidia/tritonserver:24.01-py3 \
+  tritonserver --model-repository=/models &amp;
+
+sleep 15   # Triton hazır olana kadar bekle
+curl http://localhost:8000/v2/health/ready
+
+# Baseline: dynamic batching kapalı (default batch_size=1)
+perf_analyzer -m bert-onnx -u localhost:8001 --protocol grpc \
+  --concurrency-range 1:16:2 \
+  --shape input_ids:1,128 --shape attention_mask:1,128 --shape token_type_ids:1,128 \
+  --measurement-interval 5000 --report-file baseline.csv
+
+# Dynamic batching: max_batch=32, delay=5ms
+# config.pbtxt güncellendikten sonra:
+perf_analyzer -m bert-onnx -u localhost:8001 --protocol grpc \
+  --concurrency-range 1:32:2 \
+  --shape input_ids:1,128 --shape attention_mask:1,128 --shape token_type_ids:1,128 \
+  --measurement-interval 5000 --report-file dynbatch.csv</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — sonuçları karşılaştır</div>
+      <pre><code">import pandas as pd
+
+baseline = pd.read_csv("baseline.csv")
+dynbatch = pd.read_csv("dynbatch.csv")
+
+max_base = baseline["Inferences/Second"].max()
+max_dyn  = dynbatch["Inferences/Second"].max()
+
+print(f"Baseline max throughput:       {max_base:.0f} req/s")
+print(f"Dynamic batching max:          {max_dyn:.0f} req/s")
+print(f"İyileştirme:                   {max_dyn/max_base:.1f}x")
+
+# Genellikle beklenen sonuç:
+# Baseline:         45 req/s (no batching)
+# Dynamic batching: 480 req/s (10x+ improvement)</code></pre>
+    </div>
+
+    <div class="callout">
+      <div class="label">BEKLENEN SONUÇ</div>
+      <p>BERT-Base + A100 + dynamic batching (max_batch=32, delay=5ms) kombinasyonu, single-request baseline'a kıyasla genellikle 8-15× throughput artışı sağlar. Concurrency 16-32 arasında optimal çalışma noktası elde edilir. P95 latency ise tek instance ile 8-12ms, dynamic batching ile 15-25ms civarındadır (throughput için kabul edilebilir tradeoff).</p>
+    </div>
+  </section>
+
+</main>

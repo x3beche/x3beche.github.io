@@ -1,0 +1,474 @@
+---
+layout: tutorial
+title: "Streaming ML — Kafka & Online Inference"
+back_url: "../index.html"
+back_label: "Veri Mühendisliği (ML için)"
+---
+
+<header class="header">
+  <div class="meta">
+    <span>Rehber</span>
+    <span>Veri Mühendisliği</span>
+    <span>05 · Streaming</span>
+  </div>
+  <h1>Streaming ML<br><em>Kafka &amp; Online Inference.</em></h1>
+  <p class="subtitle">Kafka ve Flink ile gerçek zamanlı ML pipeline'ları. Online learning, concept drift tespiti ve düşük gecikmeli inference için Lambda/Kappa mimarileri.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçerik</div>
+  <ol>
+    <li><a href="#s0">Batch vs Streaming</a></li>
+    <li><a href="#s1">Kafka Temelleri</a></li>
+    <li><a href="#s2">Flink ile Stateful Stream Processing</a></li>
+    <li><a href="#s3">Bytewax — Python-Native Stream ML</a></li>
+    <li><a href="#s4">Online Learning — River ve Vowpal Wabbit</a></li>
+    <li><a href="#s5">Feature Freshness — Online Feature Store</a></li>
+    <li><a href="#s6">Concept Drift Tespiti</a></li>
+    <li><a href="#s7">Lambda ve Kappa Mimarileri</a></li>
+    <li><a href="#s8">Pratik: Kafka → Flink → Redis Pipeline</a></li>
+  </ol>
+</nav>
+
+<main>
+
+  <section id="s0">
+    <h2><span class="num">00</span> Batch vs Streaming</h2>
+    <p class="section-lead">Batch processing verinin tamamını bekler; streaming ise veri geldiği anda işler. Hangi yaklaşımın ne zaman kullanılacağını belirlemek sistem tasarımının temelidir.</p>
+    <p>Batch işleme, büyük veri kümelerini topluca işler: nightly model retraining, haftalık rapor üretimi, büyük ETL dönüşümleri. Basit, debug edilebilir ve yüksek throughput sunar. Ancak gecikme kaçınılmazdır; en iyi durumda bir sonraki batch'e kadar beklenir.</p>
+    <p>Streaming işleme, olaylar geldiği anda milisaniyeler içinde işler. Gerçek zamanlı fraud detection, canlı öneri sistemleri, IoT sensör anomali tespiti gibi gecikmenin iş sonucunu doğrudan etkilediği senaryolarda zorunludur.</p>
+    <div class="file-table">
+      <div class="ft-header"><span>Boyut</span><span>Batch</span><span>Streaming</span></div>
+      <div class="ft-row"><span>Gecikme</span><span>Dakika–saatler</span><span>Milisaniye–saniyeler</span></div>
+      <div class="ft-row"><span>Throughput</span><span>Çok yüksek (TB/saat)</span><span>Orta (MB/sn)</span></div>
+      <div class="ft-row"><span>Karmaşıklık</span><span>Düşük</span><span>Yüksek (state, windowing)</span></div>
+      <div class="ft-row"><span>Fault tolerance</span><span>Kolay (idempotent)</span><span>Zor (checkpoint, watermark)</span></div>
+      <div class="ft-row"><span>ML kullanım</span><span>Offline training, batch inference</span><span>Online inference, drift detection</span></div>
+    </div>
+    <div class="callout">
+      <div class="label">ALTIN KURAL</div>
+      <p>"Gecikme toleransınız nedir?" sorusu mimari seçimini belirler. Saatler: pure batch. Dakikalar: micro-batch (Spark Structured Streaming). Saniyeler veya altı: gerçek streaming (Flink, Kafka Streams).</p>
+    </div>
+  </section>
+
+  <section id="s1">
+    <h2><span class="num">01</span> Kafka Temelleri</h2>
+    <p class="section-lead">Apache Kafka, dağıtık, yüksek verimli, dayanıklı bir mesaj kuyruğu ve event streaming platformudur.</p>
+    <p>Kafka'nın temel kavramları: <strong>Topic</strong> — mantıksal mesaj kanalı. <strong>Partition</strong> — topic'in paralel bölümü; her partition sıralı, değiştirilemez log'dur. <strong>Consumer Group</strong> — aynı topic'i farklı bölümlerden okuyan consumer koleksiyonu; paralel okuma sağlar. <strong>Offset</strong> — partition içindeki mesaj konumu; consumer'ın nerede kaldığını belirler.</p>
+    <div class="code-block">
+      <div class="code-header"><span>terminal — Kafka başlatma</span><span class="dot">●</span></div>
+      <pre><code><span class="cmt"># Docker Compose ile hızlı kurulum</span>
+cat &gt; docker-compose.yml &lt;&lt; EOF
+version: "3"
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on: [zookeeper]
+    ports: ["9092:9092"]
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+EOF
+docker-compose up -d
+
+<span class="cmt"># Topic oluştur</span>
+docker exec kafka kafka-topics --create \
+  --bootstrap-server localhost:9092 \
+  --topic ml-events \
+  --partitions 6 \
+  --replication-factor 1</code></pre>
+    </div>
+    <div class="code-block">
+      <div class="code-header"><span>kafka_producer_consumer.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">from</span> kafka <span class="keyword">import</span> KafkaProducer, KafkaConsumer
+<span class="keyword">import</span> json, time
+
+<span class="cmt"># Producer: ML olaylarını Kafka'ya gönder</span>
+producer = <span class="cmd">KafkaProducer</span>(
+    bootstrap_servers=[<span class="str">"localhost:9092"</span>],
+    value_serializer=<span class="keyword">lambda</span> v: json.<span class="cmd">dumps</span>(v).<span class="cmd">encode</span>(<span class="str">"utf-8"</span>),
+    key_serializer=<span class="keyword">lambda</span> k: k.<span class="cmd">encode</span>(<span class="str">"utf-8"</span>) <span class="keyword">if</span> k <span class="keyword">else</span> <span class="keyword">None</span>
+)
+
+<span class="keyword">for</span> i <span class="keyword">in</span> <span class="cmd">range</span>(<span class="str">100</span>):
+    event = {
+        <span class="str">"user_id"</span>: f<span class="str">"user_{i % 20}"</span>,
+        <span class="str">"features"</span>: [i * <span class="str">0.1</span>, i * <span class="str">0.2</span>, i * <span class="str">0.3</span>],
+        <span class="str">"timestamp"</span>: time.<span class="cmd">time</span>()
+    }
+    producer.<span class="cmd">send</span>(<span class="str">"ml-events"</span>, key=event[<span class="str">"user_id"</span>], value=event)
+
+producer.<span class="cmd">flush</span>()
+<span class="cmd">print</span>(<span class="str">"100 olay gönderildi"</span>)
+
+<span class="cmt"># Consumer: olayları oku ve işle</span>
+consumer = <span class="cmd">KafkaConsumer</span>(
+    <span class="str">"ml-events"</span>,
+    bootstrap_servers=[<span class="str">"localhost:9092"</span>],
+    group_id=<span class="str">"ml-inference-group"</span>,
+    value_deserializer=<span class="keyword">lambda</span> v: json.<span class="cmd">loads</span>(v.<span class="cmd">decode</span>(<span class="str">"utf-8"</span>)),
+    auto_offset_reset=<span class="str">"earliest"</span>,
+    enable_auto_commit=<span class="str">True</span>
+)
+
+<span class="keyword">for</span> msg <span class="keyword">in</span> consumer:
+    event = msg.value
+    <span class="cmt"># Gerçek uygulamada: model.predict(event["features"])</span>
+    <span class="cmd">print</span>(f<span class="str">"Partition:{msg.partition} Offset:{msg.offset} user:{event['user_id']}"</span>)</code></pre>
+    </div>
+  </section>
+
+  <section id="s2">
+    <h2><span class="num">02</span> Flink ile Stateful Stream Processing</h2>
+    <p class="section-lead">Apache Flink, tam olarak bir kez işleme semantiği ve zengin windowing desteğiyle üretim sınıfı stateful streaming sağlar.</p>
+    <p>Flink'in ML kullanım senaryoları: (1) Feature engineering — window aggregations ile rolling mean, std, count. (2) Anomali tespiti — öğrenilen modellerle gerçek zamanlı puanlama. (3) Model outputs'u sink'e yazma — Redis, Elasticsearch, veritabanı. (4) Concept drift tespiti — istatistik pencerelerinin karşılaştırılması.</p>
+    <div class="code-block">
+      <div class="code-header"><span>flink_ml_pipeline.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">from</span> pyflink.datastream <span class="keyword">import</span> StreamExecutionEnvironment
+<span class="keyword">from</span> pyflink.datastream.connectors.kafka <span class="keyword">import</span> (
+    KafkaSource, KafkaOffsetsInitializer)
+<span class="keyword">from</span> pyflink.common.serialization <span class="keyword">import</span> SimpleStringSchema
+<span class="keyword">from</span> pyflink.common.watermark_strategy <span class="keyword">import</span> WatermarkStrategy
+<span class="keyword">from</span> pyflink.datastream.functions <span class="keyword">import</span> MapFunction
+<span class="keyword">import</span> json
+
+<span class="keyword">class</span> <span class="cmd">MLInferenceMap</span>(MapFunction):
+    <span class="str">"""Her Kafka mesajı için model inference uygular."""</span>
+    <span class="keyword">def</span> <span class="cmd">open</span>(self, runtime_context):
+        <span class="cmt"># Model yükleme — her task worker'da bir kez yapılır</span>
+        <span class="keyword">import</span> pickle
+        <span class="keyword">with</span> <span class="cmd">open</span>(<span class="str">"model.pkl"</span>, <span class="str">"rb"</span>) <span class="keyword">as</span> f:
+            self.model = pickle.<span class="cmd">load</span>(f)
+
+    <span class="keyword">def</span> <span class="cmd">map</span>(self, value):
+        event   = json.<span class="cmd">loads</span>(value)
+        feats   = event[<span class="str">"features"</span>]
+        score   = self.model.<span class="cmd">predict_proba</span>([feats])[<span class="str">0</span>][<span class="str">1</span>]
+        result  = {**event, <span class="str">"score"</span>: float(score)}
+        <span class="keyword">return</span> json.<span class="cmd">dumps</span>(result)
+
+
+<span class="keyword">def</span> <span class="cmd">build_pipeline</span>():
+    env = StreamExecutionEnvironment.<span class="cmd">get_execution_environment</span>()
+    env.<span class="cmd">set_parallelism</span>(<span class="str">4</span>)
+
+    source = KafkaSource.<span class="cmd">builder</span>() \
+        .<span class="cmd">set_bootstrap_servers</span>(<span class="str">"localhost:9092"</span>) \
+        .<span class="cmd">set_topics</span>(<span class="str">"ml-events"</span>) \
+        .<span class="cmd">set_group_id</span>(<span class="str">"flink-ml-group"</span>) \
+        .<span class="cmd">set_starting_offsets</span>(KafkaOffsetsInitializer.<span class="cmd">latest</span>()) \
+        .<span class="cmd">set_value_only_deserializer</span>(<span class="cmd">SimpleStringSchema</span>()) \
+        .<span class="cmd">build</span>()
+
+    stream = env.<span class="cmd">from_source</span>(
+        source, WatermarkStrategy.<span class="cmd">no_watermarks</span>(), <span class="str">"kafka-source"</span>)
+
+    scored_stream = stream.<span class="cmd">map</span>(<span class="cmd">MLInferenceMap</span>())
+
+    <span class="cmt"># Sonuçları stdout'a yaz (prod'da Kafka sink veya Redis)</span>
+    scored_stream.<span class="cmd">print</span>()
+    env.<span class="cmd">execute</span>(<span class="str">"ML Inference Pipeline"</span>)
+
+<span class="keyword">if</span> __name__ == <span class="str">"__main__"</span>:
+    <span class="cmd">build_pipeline</span>()</code></pre>
+    </div>
+  </section>
+
+  <section id="s3">
+    <h2><span class="num">03</span> Bytewax — Python-Native Stream ML</h2>
+    <p class="section-lead">Bytewax, Rust çekirdeği üzerine inşa edilmiş Python-native stream processing kütüphanesidir; ML pipeline'ları için Flink'e göre çok daha düşük giriş eşiği sunar.</p>
+    <p>Flink güçlü ama JVM ekosistemi gerektirir; Python ile çalışmak ek boilerplate ve sınırlı performans demektir. Bytewax tamamen Python'da yazılır, Rust ile hızlandırılır ve dataflow API'si ML pipeline'ları için optimize edilmiştir.</p>
+    <div class="code-block">
+      <div class="code-header"><span>terminal — kurulum</span><span class="dot">●</span></div>
+      <pre><code>pip install bytewax kafka-python</code></pre>
+    </div>
+    <div class="code-block">
+      <div class="code-header"><span>bytewax_pipeline.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">from</span> bytewax.dataflow <span class="keyword">import</span> Dataflow
+<span class="keyword">from</span> bytewax.inputs <span class="keyword">import</span> KafkaInputConfig
+<span class="keyword">from</span> bytewax.outputs <span class="keyword">import</span> StdOutputConfig
+<span class="keyword">from</span> bytewax.execution <span class="keyword">import</span> run_main
+<span class="keyword">import</span> json, numpy <span class="keyword">as</span> np
+
+<span class="cmt"># Basit anomali skoru: z-score tabanlı</span>
+running_stats = {<span class="str">"mean"</span>: <span class="str">0.0</span>, <span class="str">"var"</span>: <span class="str">1.0</span>, <span class="str">"count"</span>: <span class="str">0</span>}
+
+<span class="keyword">def</span> <span class="cmd">parse_event</span>(key_bytes, value_bytes):
+    <span class="keyword">return</span> <span class="str">"all"</span>, json.<span class="cmd">loads</span>(value_bytes)
+
+<span class="keyword">def</span> <span class="cmd">score_event</span>(event):
+    feats = np.<span class="cmd">array</span>(event[<span class="str">"features"</span>])
+    val   = feats.<span class="cmd">mean</span>()
+    <span class="cmt"># Online Welford mean/var güncelleme</span>
+    running_stats[<span class="str">"count"</span>] += <span class="str">1</span>
+    n     = running_stats[<span class="str">"count"</span>]
+    delta = val - running_stats[<span class="str">"mean"</span>]
+    running_stats[<span class="str">"mean"</span>] += delta / n
+    running_stats[<span class="str">"var"</span>]  = (running_stats[<span class="str">"var"</span>] * (n-<span class="str">1</span>) + delta**<span class="str">2</span>) / n
+    z_score = (val - running_stats[<span class="str">"mean"</span>]) / (running_stats[<span class="str">"var"</span>]**<span class="str">0.5</span> + <span class="str">1e-9</span>)
+    <span class="keyword">return</span> {**event, <span class="str">"z_score"</span>: round(float(z_score), <span class="str">3</span>)}
+
+<span class="keyword">def</span> <span class="cmd">filter_anomaly</span>(event):
+    <span class="keyword">return</span> abs(event[<span class="str">"z_score"</span>]) &gt; <span class="str">2.5</span>  <span class="cmt"># 2.5σ anomali eşiği</span>
+
+flow = <span class="cmd">Dataflow</span>()
+flow.<span class="cmd">input</span>(<span class="str">"kafka-in"</span>, <span class="cmd">KafkaInputConfig</span>(
+    brokers=[<span class="str">"localhost:9092"</span>], topic=<span class="str">"ml-events"</span>))
+flow.<span class="cmd">map</span>(<span class="keyword">lambda</span> x: <span class="cmd">parse_event</span>(*x))
+flow.<span class="cmd">map</span>(<span class="keyword">lambda</span> kv: (kv[<span class="str">0</span>], <span class="cmd">score_event</span>(kv[<span class="str">1</span>])))
+flow.<span class="cmd">filter</span>(<span class="keyword">lambda</span> kv: <span class="cmd">filter_anomaly</span>(kv[<span class="str">1</span>]))
+flow.<span class="cmd">map</span>(<span class="keyword">lambda</span> kv: (kv[<span class="str">0</span>], json.<span class="cmd">dumps</span>(kv[<span class="str">1</span>])))
+flow.<span class="cmd">output</span>(<span class="str">"stdout"</span>, <span class="cmd">StdOutputConfig</span>())
+
+<span class="cmd">run_main</span>(flow)</code></pre>
+    </div>
+  </section>
+
+  <section id="s4">
+    <h2><span class="num">04</span> Online Learning — River ve Vowpal Wabbit</h2>
+    <p class="section-lead">Online learning algoritmaları, her veri noktasını gördükten hemen sonra modeli günceller; sürekli değişen dağılımlar için batch retraining döngüsünden kaçınır.</p>
+    <p><strong>River:</strong> Python'da online ML için kapsamlı kütüphane. Incremental decision tree, Hoeffding Tree, online linear modeller, drift detector'lar — hepsi tek API ile. Her örnek: model.learn_one(x, y) ile güncellenir, model.predict_one(x) ile tahmin döner.</p>
+    <p><strong>Vowpal Wabbit (VW):</strong> Microsoft Research'ün online learning kütüphanesi. Milyarlarca örnekle çalışabilir, hashing trick ile çok yüksek boyutlu feature'ları işler. Reklam tıklama tahmini gibi large-scale online senaryolarda endüstri standardıdır.</p>
+    <div class="code-block">
+      <div class="code-header"><span>river_online_clf.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">from</span> river <span class="keyword">import</span> linear_model, preprocessing, metrics, stream, datasets
+
+<span class="cmt"># Phishing website detection — online binary classification</span>
+dataset = datasets.<span class="cmd">Phishing</span>()
+
+model = preprocessing.<span class="cmd">StandardScaler</span>() | linear_model.<span class="cmd">LogisticRegression</span>(
+    optimizer=<span class="cmd">__import__</span>(<span class="str">"river.optim"</span>, fromlist=[<span class="str">"SGD"</span>]).<span class="cmd">SGD</span>(lr=<span class="str">0.01</span>))
+
+metric = metrics.<span class="cmd">Accuracy</span>()
+rolling = metrics.<span class="cmd">Rolling</span>(metrics.<span class="cmd">Accuracy</span>(), window_size=<span class="str">500</span>)
+
+<span class="keyword">for</span> i, (x, y) <span class="keyword">in</span> <span class="cmd">enumerate</span>(dataset):
+    y_pred = model.<span class="cmd">predict_one</span>(x)
+    metric.<span class="cmd">update</span>(y, y_pred)
+    rolling.<span class="cmd">update</span>(y, y_pred)
+    model.<span class="cmd">learn_one</span>(x, y)   <span class="cmt"># önce predict, sonra learn (prequential evaluation)</span>
+
+    <span class="keyword">if</span> (i + <span class="str">1</span>) % <span class="str">500</span> == <span class="str">0</span>:
+        <span class="cmd">print</span>(f<span class="str">"[{i+1:5d}] Kümülatif:{metric.get():.3f}  Rolling-500:{rolling.get():.3f}"</span>)
+
+<span class="cmd">print</span>(f<span class="str">"Final accuracy: {metric.get():.4f}"</span>)</code></pre>
+    </div>
+  </section>
+
+  <section id="s5">
+    <h2><span class="num">05</span> Feature Freshness — Online Feature Store</h2>
+    <p class="section-lead">Feature freshness, bir modelin inference sırasında kullandığı feature'ların ne kadar güncel olduğunu tanımlar; stale feature'lar prediction kalitesini doğrudan düşürür.</p>
+    <p>Klasik offline feature store'lar (Hive, S3) saatlik veya günlük batch güncellemelerle çalışır. Gerçek zamanlı uygulamalar için bu gecikme kabul edilemez. Online feature store, streaming pipeline'dan gelen güncel feature'ları milisaniyeler içinde sunabilmelidir.</p>
+    <div class="file-table">
+      <div class="ft-header"><span>Bileşen</span><span>Teknoloji</span><span>Rol</span></div>
+      <div class="ft-row"><span>Streaming ingest</span><span>Kafka + Flink/Bytewax</span><span>Ham olaylardan feature türetme</span></div>
+      <div class="ft-row"><span>Online store</span><span>Redis / DynamoDB / Cassandra</span><span>Düşük gecikme okuma (p99 &lt; 5ms)</span></div>
+      <div class="ft-row"><span>Offline store</span><span>S3 + Parquet / Delta Lake</span><span>Eğitim için tarihsel feature</span></div>
+      <div class="ft-row"><span>Feature registry</span><span>Feast / Hopsworks / Tecton</span><span>Metadata, schema, lineage</span></div>
+    </div>
+    <div class="code-block">
+      <div class="code-header"><span>redis_feature_store.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> redis, json, time
+<span class="keyword">from</span> typing <span class="keyword">import</span> Dict, Any
+
+<span class="keyword">class</span> <span class="cmd">OnlineFeatureStore</span>:
+    <span class="str">"""Redis tabanlı online feature store. TTL ile otomatik stale temizleme."""</span>
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, host=<span class="str">"localhost"</span>, port=<span class="str">6379</span>, default_ttl=<span class="str">3600</span>):
+        self.r         = redis.<span class="cmd">Redis</span>(host=host, port=port, decode_responses=<span class="str">True</span>)
+        self.default_ttl = default_ttl
+
+    <span class="keyword">def</span> <span class="cmd">write</span>(self, entity_id: str, features: Dict[str, Any], ttl: int = <span class="keyword">None</span>):
+        key     = f<span class="str">"feat:{entity_id}"</span>
+        payload = {**features, <span class="str">"_ts"</span>: time.<span class="cmd">time</span>()}
+        self.r.<span class="cmd">setex</span>(key, ttl <span class="keyword">or</span> self.default_ttl, json.<span class="cmd">dumps</span>(payload))
+
+    <span class="keyword">def</span> <span class="cmd">read</span>(self, entity_id: str) -&gt; Dict[str, Any]:
+        key  = f<span class="str">"feat:{entity_id}"</span>
+        data = self.r.<span class="cmd">get</span>(key)
+        <span class="keyword">if</span> data <span class="keyword">is</span> <span class="keyword">None</span>:
+            <span class="keyword">return</span> {}
+        <span class="keyword">return</span> json.<span class="cmd">loads</span>(data)
+
+    <span class="keyword">def</span> <span class="cmd">freshness_seconds</span>(self, entity_id: str) -&gt; float:
+        feat = self.<span class="cmd">read</span>(entity_id)
+        <span class="keyword">if</span> <span class="keyword">not</span> feat: <span class="keyword">return</span> float(<span class="str">"inf"</span>)
+        <span class="keyword">return</span> time.<span class="cmd">time</span>() - feat[<span class="str">"_ts"</span>]
+
+<span class="cmt"># Kullanım örneği</span>
+fs = <span class="cmd">OnlineFeatureStore</span>()
+fs.<span class="cmd">write</span>(<span class="str">"user_123"</span>, {<span class="str">"age"</span>: <span class="str">28</span>, <span class="str">"avg_spend_7d"</span>: <span class="str">142.5</span>, <span class="str">"session_count"</span>: <span class="str">7</span>})
+feats = fs.<span class="cmd">read</span>(<span class="str">"user_123"</span>)
+<span class="cmd">print</span>(f<span class="str">"Feature freshness: {fs.freshness_seconds('user_123'):.2f}s"</span>)
+<span class="cmd">print</span>(f<span class="str">"Features: {feats}"</span>)</code></pre>
+    </div>
+  </section>
+
+  <section id="s6">
+    <h2><span class="num">06</span> Concept Drift Tespiti</h2>
+    <p class="section-lead">Concept drift, veri dağılımı veya hedef ilişkisinin zamanla değişmesidir; tespit edilmezse model performansı sessizce bozulur.</p>
+    <p>Drift türleri: <strong>Data drift (covariate shift)</strong> — girdi dağılımı P(X) değişir; model aynı ama input farklı. <strong>Concept drift</strong> — P(Y|X) değişir; aynı özellikler artık farklı sonuçla ilişkilidir. <strong>Label drift</strong> — P(Y) değişir; sınıf dengesizliği kayar.</p>
+    <div class="code-block">
+      <div class="code-header"><span>drift_detection.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">from</span> river <span class="keyword">import</span> drift
+<span class="keyword">import</span> numpy <span class="keyword">as</span> np
+
+<span class="cmt"># ADWIN (Adaptive Windowing) — hızlı drift tespiti</span>
+adwin = drift.<span class="cmd">ADWIN</span>(delta=<span class="str">0.002</span>)
+
+<span class="cmt"># Page-Hinkley — gradual drift için</span>
+ph = drift.<span class="cmd">PageHinkley</span>(min_instances=<span class="str">30</span>, delta=<span class="str">0.005</span>, threshold=<span class="str">50</span>)
+
+<span class="cmt"># DDM (Drift Detection Method) — hata oranı tabanlı</span>
+ddm = drift.<span class="cmd">DDM</span>(warm_start=<span class="str">500</span>)
+
+<span class="cmt"># Simüle edilmiş stream: ilk 500 normal, sonra drift</span>
+rng = np.random.<span class="cmd">default_rng</span>(<span class="str">42</span>)
+errors = []
+
+<span class="keyword">for</span> i <span class="keyword">in</span> <span class="cmd">range</span>(<span class="str">1000</span>):
+    <span class="cmt"># 500. adımdan sonra hata oranı artar (concept drift simülasyonu)</span>
+    error_prob = <span class="str">0.1</span> <span class="keyword">if</span> i &lt; <span class="str">500</span> <span class="keyword">else</span> <span class="str">0.4</span>
+    error = int(rng.<span class="cmd">random</span>() &lt; error_prob)
+    errors.<span class="cmd">append</span>(error)
+
+    adwin.<span class="cmd">update</span>(error)
+    ddm.<span class="cmd">update</span>(error)
+
+    <span class="keyword">if</span> adwin.drift_detected:
+        <span class="cmd">print</span>(f<span class="str">"[ADWIN] Drift tespit edildi! Adım: {i}"</span>)
+    <span class="keyword">if</span> ddm.drift_detected:
+        <span class="cmd">print</span>(f<span class="str">"[DDM]   Drift tespit edildi! Adım: {i}"</span>)
+
+<span class="cmd">print</span>(f<span class="str">"İlk 500 adım hata oranı: {sum(errors[:500])/500:.3f}"</span>)
+<span class="cmd">print</span>(f<span class="str">"Son 500 adım hata oranı: {sum(errors[500:])/500:.3f}"</span>)</code></pre>
+    </div>
+  </section>
+
+  <section id="s7">
+    <h2><span class="num">07</span> Lambda ve Kappa Mimarileri</h2>
+    <p class="section-lead">Lambda ve Kappa, büyük ölçekli veri sistemlerinin nasıl organize edilmesi gerektiğine dair iki farklı mimari paradigmadır.</p>
+    <p><strong>Lambda Mimarisi:</strong> Batch layer + Speed layer + Serving layer. Batch layer tüm veriyi yeniden işleyerek doğruluk sağlar; speed layer en son verileri düşük gecikmeyle işler; serving layer ikisini birleştirir. Güçlü ama iki farklı kod tabanı yönetimi gerektirir (batch + stream).</p>
+    <p><strong>Kappa Mimarisi (Jay Kreps):</strong> Speed layer yeterlidir — her şeyi streaming ile işle, yeniden işleme gerektiğinde aynı pipeline'ı baştan çalıştır. Tek kod tabanı, daha basit operasyon. Ancak Kafka'da uzun süreli saklama veya başka bir immutable log gerektirir.</p>
+    <div class="file-table">
+      <div class="ft-header"><span>Boyut</span><span>Lambda</span><span>Kappa</span></div>
+      <div class="ft-row"><span>Karmaşıklık</span><span>Yüksek — 2 sistem</span><span>Düşük — 1 sistem</span></div>
+      <div class="ft-row"><span>Doğruluk</span><span>Çok yüksek (batch recompute)</span><span>Yüksek (replay)</span></div>
+      <div class="ft-row"><span>Gecikme</span><span>Düşük (speed layer)</span><span>Düşük (streaming)</span></div>
+      <div class="ft-row"><span>Yeniden işleme</span><span>Batch layer ile kolay</span><span>Kafka retention + replay</span></div>
+      <div class="ft-row"><span>İdeal kullanım</span><span>Farklı SLA gereksinimleri</span><span>Tek pipeline, basitlik öncelik</span></div>
+    </div>
+    <div class="callout">
+      <div class="label">MODERNLEŞTİRME</div>
+      <p>Modern sistemlerde Lambda ve Kappa ayrımı bulanıklaşıyor. Apache Flink'in unified batch+stream API'si, Delta Lake ve Iceberg'ün ACID stream ingestion desteği ile "streaming-first" yaklaşımı ön plana çıkıyor; batch recompute bir Flink job ile de yapılabiliyor.</p>
+    </div>
+  </section>
+
+  <section id="s8">
+    <h2><span class="num">08</span> Pratik: Kafka → Flink → Redis Online Inference Pipeline</h2>
+    <p class="section-lead">Uçtan uca örnek: Kafka'dan gelen olayları Flink ile işleyip skorlayarak Redis'e yazma.</p>
+    <div class="code-block">
+      <div class="code-header"><span>terminal — ortam hazırlık</span><span class="dot">●</span></div>
+      <pre><code><span class="cmt"># Servisler</span>
+docker-compose up -d    <span class="cmt"># kafka + zookeeper</span>
+docker run -d -p 6379:6379 redis:7-alpine
+
+<span class="cmt"># Python bağımlılıkları</span>
+pip install kafka-python redis bytewax river scikit-learn</code></pre>
+    </div>
+    <div class="code-block">
+      <div class="code-header"><span>pipeline_e2e.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> threading, json, time, random
+<span class="keyword">from</span> kafka <span class="keyword">import</span> KafkaProducer, KafkaConsumer
+<span class="keyword">import</span> redis
+<span class="keyword">from</span> sklearn.linear_model <span class="keyword">import</span> SGDClassifier
+<span class="keyword">from</span> sklearn.preprocessing <span class="keyword">import</span> StandardScaler
+<span class="keyword">import</span> numpy <span class="keyword">as</span> np
+
+<span class="cmt"># ── Global bileşenler ─────────────────────────────────────</span>
+rds    = redis.<span class="cmd">Redis</span>(host=<span class="str">"localhost"</span>, port=<span class="str">6379</span>, decode_responses=<span class="str">True</span>)
+clf    = <span class="cmd">SGDClassifier</span>(loss=<span class="str">"log_loss"</span>, warm_start=<span class="str">True</span>)
+scaler = <span class="cmd">StandardScaler</span>()
+rng    = np.random.<span class="cmd">default_rng</span>(<span class="str">42</span>)
+
+<span class="cmt"># Modeli önceden ısıt</span>
+X_init = rng.<span class="cmd">normal</span>(<span class="str">0</span>, <span class="str">1</span>, (<span class="str">200</span>, <span class="str">4</span>))
+y_init = rng.<span class="cmd">integers</span>(<span class="str">0</span>, <span class="str">2</span>, <span class="str">200</span>)
+scaler.<span class="cmd">fit</span>(X_init)
+clf.<span class="cmd">fit</span>(scaler.<span class="cmd">transform</span>(X_init), y_init)
+
+<span class="cmt"># ── 1. Producer Thread ───────────────────────────────────</span>
+<span class="keyword">def</span> <span class="cmd">produce_events</span>(n=<span class="str">500</span>, interval=<span class="str">0.05</span>):
+    p = <span class="cmd">KafkaProducer</span>(
+        bootstrap_servers=[<span class="str">"localhost:9092"</span>],
+        value_serializer=<span class="keyword">lambda</span> v: json.<span class="cmd">dumps</span>(v).<span class="cmd">encode</span>())
+    <span class="keyword">for</span> i <span class="keyword">in</span> <span class="cmd">range</span>(n):
+        event = {
+            <span class="str">"user_id"</span>: f<span class="str">"u{i % 50}"</span>,
+            <span class="str">"features"</span>: rng.<span class="cmd">normal</span>(<span class="str">0</span>, <span class="str">1</span>, <span class="str">4</span>).<span class="cmd">tolist</span>(),
+            <span class="str">"label"</span>: int(rng.<span class="cmd">integers</span>(<span class="str">0</span>, <span class="str">2</span>)),
+            <span class="str">"ts"</span>: time.<span class="cmd">time</span>()
+        }
+        p.<span class="cmd">send</span>(<span class="str">"ml-events"</span>, event)
+        time.<span class="cmd">sleep</span>(interval)
+    p.<span class="cmd">flush</span>(); <span class="cmd">print</span>(<span class="str">"Producer tamamlandı"</span>)
+
+<span class="cmt"># ── 2. Consumer / Inference Thread ───────────────────────</span>
+<span class="keyword">def</span> <span class="cmd">consume_and_score</span>():
+    c = <span class="cmd">KafkaConsumer</span>(
+        <span class="str">"ml-events"</span>,
+        bootstrap_servers=[<span class="str">"localhost:9092"</span>],
+        group_id=<span class="str">"online-inference"</span>,
+        value_deserializer=<span class="keyword">lambda</span> v: json.<span class="cmd">loads</span>(v.<span class="cmd">decode</span>()),
+        auto_offset_reset=<span class="str">"earliest"</span>
+    )
+    processed = <span class="str">0</span>
+    <span class="keyword">for</span> msg <span class="keyword">in</span> c:
+        event  = msg.value
+        X      = np.<span class="cmd">array</span>(event[<span class="str">"features"</span>]).<span class="cmd">reshape</span>(<span class="str">1</span>, -<span class="str">1</span>)
+        Xs     = scaler.<span class="cmd">transform</span>(X)
+        score  = clf.<span class="cmd">predict_proba</span>(Xs)[<span class="str">0</span>][<span class="str">1</span>]
+
+        <span class="cmt"># Sonucu Redis'e yaz (TTL: 5 dakika)</span>
+        key    = f<span class="str">"score:{event['user_id']}"</span>
+        rds.<span class="cmd">setex</span>(key, <span class="str">300</span>, json.<span class="cmd">dumps</span>({
+            <span class="str">"score"</span>: round(float(score), <span class="str">4</span>),
+            <span class="str">"ts"</span>: event[<span class="str">"ts"</span>]
+        }))
+
+        <span class="cmt"># Online güncelleme (partial_fit)</span>
+        clf.<span class="cmd">partial_fit</span>(Xs, [event[<span class="str">"label"</span>]], classes=[<span class="str">0</span>, <span class="str">1</span>])
+
+        processed += <span class="str">1</span>
+        <span class="keyword">if</span> processed % <span class="str">50</span> == <span class="str">0</span>:
+            <span class="cmd">print</span>(f<span class="str">"İşlendi: {processed} | Son skor: {score:.3f}"</span>)
+        <span class="keyword">if</span> processed >= <span class="str">500</span>: <span class="keyword">break</span>
+    <span class="cmd">print</span>(<span class="str">"Consumer tamamlandı"</span>)
+
+<span class="cmt"># Pipeline'ı başlat</span>
+t_prod = threading.<span class="cmd">Thread</span>(target=produce_events)
+t_cons = threading.<span class="cmd">Thread</span>(target=consume_and_score)
+t_prod.<span class="cmd">start</span>(); t_cons.<span class="cmd">start</span>()
+t_prod.<span class="cmd">join</span>();  t_cons.<span class="cmd">join</span>()
+
+<span class="cmt"># Redis'ten bir kullanıcı skoru oku</span>
+sample = rds.<span class="cmd">get</span>(<span class="str">"score:u0"</span>)
+<span class="keyword">if</span> sample:
+    <span class="cmd">print</span>(f<span class="str">"u0 son skoru: {json.loads(sample)}"</span>)</code></pre>
+    </div>
+    <div class="callout">
+      <div class="label">BEKLENEN SONUÇ</div>
+      <p>Pipeline çalıştırıldığında producer 0.05s aralıklarla olay gönderir, consumer her olayı skorlar, Redis'e yazar ve modeli partial_fit ile günceller. 500 olay sonunda Redis'te her kullanıcı için güncel skor bulunur. Gerçek production'da Flink veya Bytewax consumer yerine kullanılır; bu örnek end-to-end kavramı gösterir.</p>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

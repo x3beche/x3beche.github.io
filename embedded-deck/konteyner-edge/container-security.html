@@ -1,0 +1,662 @@
+---
+layout: tutorial
+title: "Konteyner Güvenliği — Cosign, Trivy & Distroless"
+back_url: "../index.html"
+back_label: "Konteyner Orkestrasyon (Edge)"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>KONTEYNER</span>
+    <span>GÜVENLİK</span>
+    <span>2026</span>
+  </div>
+  <h1>Konteyner Güvenliği —<br><em>Cosign, Trivy &amp; Distroless.</em></h1>
+  <p class="subtitle">Gömülü ve edge sistemlerde konteyner güvenliği: Sigstore Cosign ile image imzalama ve doğrulama, Trivy ile CVE tarama, distroless ve scratch image yapıları, çok aşamalı Dockerfile, seccomp ve AppArmor profili — üretim odaklı sertleştirme rehberi.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Konteyner güvenlik tehdit modeli</a></li>
+    <li><a href="#s1">Cosign ile image imzalama</a></li>
+    <li><a href="#s2">Cosign ile image doğrulama ve policy</a></li>
+    <li><a href="#s3">Trivy ile CVE tarama</a></li>
+    <li><a href="#s4">Trivy CI/CD entegrasyonu</a></li>
+    <li><a href="#s5">Distroless ve scratch image</a></li>
+    <li><a href="#s6">Çok aşamalı Dockerfile (multi-stage)</a></li>
+    <li><a href="#s7">seccomp profili ile sistem çağrı kısıtlama</a></li>
+    <li><a href="#s8">AppArmor profili ile konteyner sınırlandırma</a></li>
+    <li><a href="#s9">Güvenlik kontrol listesi ve araç zinciri özeti</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Konteyner güvenlik tehdit modeli</h2>
+  <p class="section-lead">Konteynerler, izolasyon sağlarken saldırı yüzeyini tamamen ortadan kaldırmaz. Tehdit modeli, yazılım tedarik zincirinden çalışma zamanı kaçışlarına kadar birçok katmanı kapsar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>Tehdit Katmanları</span><span class="dot">●</span></div>
+    <pre><code">Kaynak Kodu
+  ├── Tedarik zinciri saldırısı (bağımlılık zehirleme)
+  ↓
+Dockerfile / Build
+  ├── Güvensiz base image (CVE'li paketler)
+  ├── Gizli bilgi sızıntısı (secret leak)
+  ↓
+Container Registry
+  ├── İmaj değiştirme / sahte imaj (MITM)
+  ├── İmza eksikliği
+  ↓
+Runtime (containerd / crun)
+  ├── Ayrıcalık yükseltme (privilege escalation)
+  ├── Kernel exploit (container kaçışı)
+  ├── Yetki dışı sistem çağrısı
+  └── Ağ izolasyon ihlali</code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><div class="name">Image güveni</div><div class="desc">Cosign imzalama + Policy Controller (Connaisseur, Kyverno) ile yalnızca imzalı image'lar çalıştırılır.</div></div>
+    <div class="param"><div class="name">CVE yönetimi</div><div class="desc">Trivy, Grype veya Snyk ile her build'de tarama. CVSS &gt;= 7.0 kritik bulgu varsa pipeline durur.</div></div>
+    <div class="param"><div class="name">Minimum saldırı yüzeyi</div><div class="desc">Distroless veya scratch image; shell, paket yöneticisi, geliştirme araçları yok. Exploit edilebilir bileşenler azalır.</div></div>
+    <div class="param"><div class="name">Çalışma zamanı sınırlandırma</div><div class="desc">seccomp profili, AppArmor/SELinux, non-root user, read-only filesystem, capability drop ile kapsamlı sertleştirme.</div></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Cosign ile image imzalama</h2>
+  <p class="section-lead">Cosign, Sigstore projesi kapsamındaki açık kaynaklı konteyner imzalama aracıdır. OCI registry'ye şeffaf bir imza ekler; private key, Fulcio (keyless) veya KMS destekler.</p>
+
+  <h3>Cosign kurulum</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code">## Linux AMD64
+curl -L -o cosign \
+  https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+chmod +x cosign && sudo mv cosign /usr/local/bin/
+
+## ARM64 (edge cihaz)
+curl -L -o cosign \
+  https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-arm64
+chmod +x cosign && sudo mv cosign /usr/local/bin/
+
+cosign version</code></pre>
+  </div>
+
+  <h3>Anahtar çifti ile imzalama</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — private key ile imzalama</span><span class="dot">●</span></div>
+    <pre><code">## Anahtar çifti oluştur
+cosign generate-key-pair
+# Enter password for private key: ****
+# Private key written to cosign.key
+# Public key written to cosign.pub
+
+## Image build ve push
+docker build -t registry.example.com/myapp:v1.2.3 .
+docker push registry.example.com/myapp:v1.2.3
+
+## Image'ı imzala (digest ile — tag değişse bile güvenli)
+cosign sign --key cosign.key \
+    registry.example.com/myapp:v1.2.3
+
+## Veya digest doğrudan:
+IMAGE_DIGEST=$(docker inspect --format='&#123;&#123;index .RepoDigests 0&#125;&#125;' \
+    registry.example.com/myapp:v1.2.3)
+cosign sign --key cosign.key "$IMAGE_DIGEST"</code></pre>
+  </div>
+
+  <h3>Keyless imzalama (OIDC — GitHub Actions)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — keyless (Fulcio + Rekor)</span><span class="dot">●</span></div>
+    <pre><code">## GitHub Actions CI ortamında (OIDC token mevcut)
+cosign sign \
+    --yes \
+    --oidc-issuer=https://token.actions.githubusercontent.com \
+    registry.example.com/myapp:v1.2.3
+
+## İmza Rekor şeffaflık günlüğüne kaydedilir
+## Doğrulama sırasında kimlik (email/OIDC) kontrol edilir</code></pre>
+  </div>
+
+  <h3>Ek bilgi (annotations) ile imzalama</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — metadata ekle</span><span class="dot">●</span></div>
+    <pre><code">cosign sign --key cosign.key \
+    -a "repo=github.com/org/myapp" \
+    -a "workflow=ci-build" \
+    -a "git_sha=$(git rev-parse HEAD)" \
+    registry.example.com/myapp:v1.2.3</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Cosign ile image doğrulama ve policy</h2>
+  <p class="section-lead">İmzalı image'ların yalnızca yetkili anahtarla imzalandığını deployment öncesi veya admission webhook ile doğrulayın.</p>
+
+  <h3>Manuel doğrulama</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — cosign verify</span><span class="dot">●</span></div>
+    <pre><code">## Public key ile doğrula
+cosign verify --key cosign.pub \
+    registry.example.com/myapp:v1.2.3
+
+# Verification for registry.example.com/myapp:v1.2.3 --
+# The following checks were performed on each of these signatures:
+#   - The cosign claims were validated
+#   - The signatures were verified against the specified public key
+# [{"critical":{"identity":{"docker-reference":"..."},...}]
+
+## Keyless doğrulama (GitHub Actions kimliği)
+cosign verify \
+    --certificate-identity-regexp="https://github.com/org/.*" \
+    --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+    registry.example.com/myapp:v1.2.3</code></pre>
+  </div>
+
+  <h3>Kyverno ile Kubernetes admission policy</h3>
+  <div class="code-block">
+    <div class="code-header"><span>kyverno-policy.yaml</span><span class="dot">●</span></div>
+    <pre><code">apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-signed-images
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+  - name: check-image-signature
+    match:
+      any:
+      - resources:
+          kinds: [Pod]
+    verifyImages:
+    - imageReferences:
+      - "registry.example.com/*"
+      attestors:
+      - count: 1
+        entries:
+        - keys:
+            publicKeys: |-
+              -----BEGIN PUBLIC KEY-----
+              MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE...
+              -----END PUBLIC KEY-----</code></pre>
+  </div>
+
+  <h3>containerd ile policy (cri-o / gVisor)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — containerd policy plugin</span><span class="dot">●</span></div>
+    <pre><code">## /etc/containerd/config.toml
+## image_policy plugin (containerd 2.x)
+[plugins."io.containerd.transfer.v1.local".unpack_config]
+  [plugins."io.containerd.image.v1".signer]
+    disable_partial_content = true
+
+## Cosign Connaisseur ile Helm deploy
+helm repo add connaisseur https://sse-secure-systems.github.io/connaisseur/charts
+helm install connaisseur connaisseur/connaisseur \
+    --set validators[0].name=default \
+    --set validators[0].type=cosign \
+    --set validators[0].trust_roots[0].name=default \
+    --set validators[0].trust_roots[0].key="$(cat cosign.pub)"</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Trivy ile CVE tarama</h2>
+  <p class="section-lead">Trivy, Aqua Security tarafından geliştirilen açık kaynaklı güvenlik açığı tarayıcısıdır. Container image, dosya sistemi, kod deposu ve Kubernetes cluster'larını tarayabilir.</p>
+
+  <h3>Trivy kurulum</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code">## Ubuntu / Debian
+sudo apt install wget apt-transport-https gnupg
+wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
+  | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] \
+  https://aquasecurity.github.io/trivy-repo/deb generic main" \
+  | sudo tee /etc/apt/sources.list.d/trivy.list
+sudo apt update && sudo apt install trivy
+
+## ARM64 (binary)
+wget https://github.com/aquasecurity/trivy/releases/latest/download/\
+trivy_Linux_ARM64.tar.gz
+tar xf trivy_Linux_ARM64.tar.gz && sudo mv trivy /usr/local/bin/</code></pre>
+  </div>
+
+  <h3>Image tarama</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — trivy image</span><span class="dot">●</span></div>
+    <pre><code">## Temel tarama
+trivy image registry.example.com/myapp:v1.2.3
+
+## Yalnızca kritik ve yüksek severity
+trivy image --severity HIGH,CRITICAL \
+    registry.example.com/myapp:v1.2.3
+
+## JSON çıktısı (CI/CD için)
+trivy image --format json \
+    --output trivy-report.json \
+    registry.example.com/myapp:v1.2.3
+
+## Belirli CVE'leri yoksay (.trivyignore)
+cat .trivyignore
+# CVE-2023-44487    # HTTP/2 rapid reset — mitigated by LB
+# CVE-2024-0001     # not applicable to ARM
+
+trivy image --ignorefile .trivyignore myapp:v1.2.3</code></pre>
+  </div>
+
+  <h3>Dosya sistemi ve Dockerfile tarama</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — fs ve config tarama</span><span class="dot">●</span></div>
+    <pre><code">## Yerel dizin tarama
+trivy fs --scanners vuln,secret,misconfig .
+
+## Secret leak tespiti (kaynak kodda API key, password)
+trivy fs --scanners secret . 2>&1 | grep -A3 "CRITICAL\|HIGH"
+
+## Dockerfile misconfig
+trivy config Dockerfile
+# Dockerfile (docker)
+# MEDIUM: Specify a non-root user in the last USER directive
+# MEDIUM: Do not expose sensitive ports</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Trivy CI/CD entegrasyonu</h2>
+  <p class="section-lead">Trivy'yi CI pipeline'ına entegre ederek her build'de otomatik güvenlik taraması yapılır. Kritik CVE bulunursa pipeline durdurulur.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>GitHub Actions — trivy-scan.yml</span><span class="dot">●</span></div>
+    <pre><code">name: Security Scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  trivy-scan:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build image
+      run: docker build -t myapp:&#36;&#123;&#123; github.sha &#125;&#125; .
+
+    - name: Trivy scan (CRITICAL/HIGH → fail)
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: myapp:&#36;&#123;&#123; github.sha &#125;&#125;
+        format: sarif
+        output: trivy-results.sarif
+        severity: CRITICAL,HIGH
+        exit-code: 1
+
+    - name: Upload SARIF to GitHub Security
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: trivy-results.sarif</code></pre>
+  </div>
+
+  <h3>Threshold ile esnek politika</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — CVSS eşiği ile tarama</span><span class="dot">●</span></div>
+    <pre><code">## CVSS >= 7.0 bulgu varsa çık kodu 1 döner
+trivy image \
+    --exit-code 1 \
+    --severity CRITICAL,HIGH \
+    --ignore-unfixed \        # düzeltme yok CVE'leri atla
+    --vuln-type os,library \
+    myapp:latest
+
+echo "Trivy çıkış kodu: $?"
+# 0 → temiz veya yalnızca LOW/MEDIUM bulgu
+# 1 → HIGH/CRITICAL bulgu var → pipeline dur</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Distroless ve scratch image</h2>
+  <p class="section-lead">Distroless image'lar (Google tarafından sağlanan), shell, paket yöneticisi ve işletim sistemi araçları içermez; yalnızca çalışma zamanı bağımlılıkları bulunur. Bu, saldırı yüzeyini dramatik biçimde azaltır.</p>
+
+  <h3>Distroless image seçenekleri</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Distroless Image Tablosu</span><span class="dot">●</span></div>
+    <pre><code">Image                              Boyut   Kabuk  glibc   Dil
+──────────────────────────────────────────────────────────────────
+scratch                              0 KB   -       -      ham binary
+gcr.io/distroless/static:nonroot     2 MB   -       -      Go static
+gcr.io/distroless/base:nonroot      20 MB   -       ✓      C/C++
+gcr.io/distroless/cc:nonroot        21 MB   -       ✓      C++ (libstdc++)
+gcr.io/distroless/python3          ~50 MB   -       ✓      Python3
+gcr.io/distroless/java17:nonroot   ~200MB   -       ✓      Java 17
+debian:12-slim                     ~80 MB   ✓       ✓      Genel amaç
+alpine:3.20                        ~7 MB    ash     musl   Genel amaç</code></pre>
+  </div>
+
+  <h3>Go uygulaması için scratch image</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Dockerfile — Go scratch</span><span class="dot">●</span></div>
+    <pre><code">FROM golang:1.22-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+# CGO_ENABLED=0: statik binary, glibc bağımlılığı yok
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+    go build -ldflags="-s -w" -o /server ./cmd/server
+
+# Final: scratch — sıfır boyut, sadece binary
+FROM scratch
+COPY --from=builder /server /server
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt \
+                    /etc/ssl/certs/
+EXPOSE 8080
+USER 65534:65534  # nobody
+ENTRYPOINT ["/server"]</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — boyut karşılaştırma</span><span class="dot">●</span></div>
+    <pre><code">## Scratch image
+docker build -t myapp:scratch -f Dockerfile.scratch .
+docker image ls myapp:scratch
+# myapp   scratch   abc123   5.2MB
+
+## golang:alpine base kullansaydık:
+# myapp   alpine-base  def456  310MB
+
+## Trivy tarama — scratch'te sıfır CVE beklenir
+trivy image myapp:scratch
+# Total: 0 (UNKNOWN: 0, LOW: 0, MEDIUM: 0, HIGH: 0, CRITICAL: 0)</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Çok aşamalı Dockerfile (multi-stage)</h2>
+  <p class="section-lead">Multi-stage build, build araçlarını final image'a dahil etmeden küçük ve güvenli image üretir. Her aşama bağımsız bir FROM ile başlar; yalnızca seçilen artifactlar kopyalanır.</p>
+
+  <h3>C++ edge uygulaması — multi-stage</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Dockerfile — C++ distroless</span><span class="dot">●</span></div>
+    <pre><code">## Aşama 1: Bağımlılık derleme
+FROM debian:12-slim AS deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake ninja-build gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+    libssl-dev && rm -rf /var/lib/apt/lists/*
+WORKDIR /deps
+COPY vcpkg.json .
+RUN vcpkg install --triplet arm64-linux-release
+
+## Aşama 2: Uygulama derleme
+FROM deps AS builder
+WORKDIR /app
+COPY CMakeLists.txt .
+COPY src/ src/
+RUN cmake -B build -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_TOOLCHAIN_FILE=/deps/vcpkg/scripts/buildsystems/vcpkg.cmake
+RUN ninja -C build
+
+## Aşama 3: Final — distroless C++ runtime
+FROM gcr.io/distroless/cc:nonroot
+COPY --from=builder /app/build/edge_app /usr/local/bin/edge_app
+# Konfigürasyon
+COPY --from=builder /app/config/default.json /etc/edge_app/config.json
+USER nonroot:nonroot
+ENTRYPOINT ["/usr/local/bin/edge_app"]</code></pre>
+  </div>
+
+  <h3>Python ML servisi — multi-stage</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Dockerfile — Python distroless</span><span class="dot">●</span></div>
+    <pre><code">## Aşama 1: Bağımlılık kurulumu
+FROM python:3.12-slim AS builder
+WORKDIR /install
+COPY requirements.txt .
+RUN pip install --user --no-cache-dir -r requirements.txt
+
+## Aşama 2: Runtime
+FROM gcr.io/distroless/python3:nonroot
+COPY --from=builder /root/.local /root/.local
+COPY app/ /app/
+ENV PYTHONPATH="/root/.local/lib/python3.12/site-packages"
+WORKDIR /app
+USER nonroot
+CMD ["/app/main.py"]</code></pre>
+  </div>
+
+  <h3>BuildKit ile gizli bilgi güvenliği</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Dockerfile — BuildKit secret mount</span><span class="dot">●</span></div>
+    <pre><code">## --mount=type=secret: derleme zamanında gizli bilgiye erişim
+## Final image'a dahil edilmez
+RUN --mount=type=secret,id=npmrc,target=/root/.npmrc \
+    npm install --production
+
+## Kullanımı:
+docker build --secret id=npmrc,src=$HOME/.npmrc -t myapp .</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> seccomp profili ile sistem çağrı kısıtlama</h2>
+  <p class="section-lead">seccomp (Secure Computing Mode), bir sürecin yapabileceği sistem çağrılarını beyaz liste ile kısıtlar. Konteyner kaçışı ve privilege escalation saldırılarını önemli ölçüde zorlaştırır.</p>
+
+  <h3>Özel seccomp profili oluşturma</h3>
+  <div class="code-block">
+    <div class="code-header"><span>seccomp-edge-app.json</span><span class="dot">●</span></div>
+    <pre><code">{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "defaultErrnoRet": 1,
+  "architectures": ["SCMP_ARCH_AARCH64", "SCMP_ARCH_X86_64"],
+  "syscalls": [
+    {
+      "names": [
+        "read", "write", "open", "close", "stat", "fstat",
+        "poll", "lseek", "mmap", "mprotect", "munmap",
+        "brk", "rt_sigaction", "rt_sigprocmask", "ioctl",
+        "access", "socket", "connect", "accept", "sendto",
+        "recvfrom", "bind", "listen", "getsockname",
+        "getpeername", "setsockopt", "getsockopt",
+        "clone", "fork", "execve", "exit", "wait4",
+        "getpid", "getuid", "getgid", "gettimeofday",
+        "epoll_create", "epoll_ctl", "epoll_wait",
+        "signalfd4", "timerfd_create", "timerfd_settime",
+        "eventfd2", "futex", "set_robust_list",
+        "openat", "getdents64", "newfstatat",
+        "nanosleep", "clock_gettime", "clock_nanosleep",
+        "exit_group", "prctl", "arch_prctl", "set_tid_address"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    }
+  ]
+}</code></pre>
+  </div>
+
+  <h3>Docker / Podman ile seccomp uygulama</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code">## Docker
+docker run --security-opt seccomp=seccomp-edge-app.json \
+    myapp:latest
+
+## Podman
+podman run --security-opt seccomp=seccomp-edge-app.json \
+    myapp:latest
+
+## Kubernetes pod spec
+# securityContext:
+#   seccompProfile:
+#     type: Localhost
+#     localhostProfile: profiles/seccomp-edge-app.json</code></pre>
+  </div>
+
+  <h3>oci-seccomp-bpf-hook ile otomatik profil üretme</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — profil otomatik keşif</span><span class="dot">●</span></div>
+    <pre><code">## Uygulama çalışırken kullanılan syscall'ları yakala
+sudo apt install oci-seccomp-bpf-hook
+
+## Test ortamında çalıştır
+podman run --annotation io.containers.trace-syscall=of:profile.json \
+    myapp:latest /bin/sh -c "uygulama_testi.sh"
+
+## Üretilen profili düzenle ve uygula
+cat profile.json | jq '.syscalls[0].names | sort' | head -20</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> AppArmor profili ile konteyner sınırlandırma</h2>
+  <p class="section-lead">AppArmor, seccomp'u tamamlayan zorunlu erişim kontrolü (MAC) sistemidir. Dosya erişimi, ağ işlemleri ve capability kullanımını profil tabanlı kısıtlar.</p>
+
+  <h3>AppArmor profili yazma</h3>
+  <div class="code-block">
+    <div class="code-header"><span>/etc/apparmor.d/docker-edge-app</span><span class="dot">●</span></div>
+    <pre><code">#include &lt;tunables/global&gt;
+
+profile docker-edge-app flags=(attach_disconnected, mediate_deleted) {
+  #include &lt;abstractions/base&gt;
+
+  ## Binary çalıştırma
+  /usr/local/bin/edge_app rix,
+
+  ## Konfigürasyon dosyaları (salt okunur)
+  /etc/edge_app/** r,
+
+  ## Veri dizini (okuma/yazma)
+  /var/lib/edge_app/** rw,
+
+  ## Ağ (TCP/UDP)
+  network tcp,
+  network udp,
+
+  ## /proc okuma (health check için)
+  /proc/sys/kernel/hostname r,
+  /proc/self/** r,
+
+  ## Loglar
+  /dev/null rw,
+  /dev/urandom r,
+
+  ## YASAK: shell çalıştırma, /etc/passwd yazma, vs.
+  deny /bin/sh x,
+  deny /bin/bash x,
+  deny /etc/passwd w,
+  deny /etc/shadow rw,
+  deny /root/** rw,
+}</code></pre>
+  </div>
+
+  <h3>Profili yükle ve Docker'a uygula</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code">## Profili yükle
+sudo apparmor_parser -r -W /etc/apparmor.d/docker-edge-app
+
+## Aktif profiller
+sudo aa-status | grep docker-edge-app
+
+## Docker konteynerine uygula
+docker run --security-opt apparmor=docker-edge-app \
+    myapp:latest
+
+## Podman
+podman run --security-opt apparmor=docker-edge-app \
+    myapp:latest</code></pre>
+  </div>
+
+  <h3>aa-complain modu ile profil geliştirme</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — complain → enforce akışı</span><span class="dot">●</span></div>
+    <pre><code">## Önce complain modunda çalıştır (engelleme yok, log var)
+sudo aa-complain /etc/apparmor.d/docker-edge-app
+
+## Uygulama çalıştır, logları topla
+docker run --security-opt apparmor=docker-edge-app myapp:latest
+
+## Loglardaki redleri profil kuralına dönüştür
+sudo aa-logprof
+# Öneri: allow /dev/tty rw → onay ver veya reddet
+
+## Enforce moduna geç
+sudo aa-enforce /etc/apparmor.d/docker-edge-app</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 09 ═══════════════════ -->
+<section id="s9">
+  <h2><span class="num">09</span> Güvenlik kontrol listesi ve araç zinciri özeti</h2>
+  <p class="section-lead">Üretim konteyner ortamı için kapsamlı güvenlik kontrol listesi ve araç zincirleri.</p>
+
+  <h3>Image güvenlik kontrol listesi</h3>
+  <div class="params">
+    <div class="param"><div class="name">Non-root kullanıcı</div><div class="desc">Dockerfile'da USER direktifi ile root dışı kullanıcı ayarlanmalı (UID &gt;= 1000). distroless:nonroot otomatik sağlar.</div></div>
+    <div class="param"><div class="name">Read-only filesystem</div><div class="desc">docker run --read-only ile dosya sistemi salt okunur yapılır. Yazılabilir dizinler --tmpfs ile eklenir.</div></div>
+    <div class="param"><div class="name">Capability drop</div><div class="desc">--cap-drop=ALL --cap-add=NET_BIND_SERVICE ile minimum capability. Çoğu uygulama hiçbir capability gerektirmez.</div></div>
+    <div class="param"><div class="name">No new privileges</div><div class="desc">--security-opt no-new-privileges=true ile setuid/setgid binary'lerin privilege yükseltmesi engellenir.</div></div>
+    <div class="param"><div class="name">Resource limits</div><div class="desc">--memory, --cpus, --pids-limit ile kaynak tüketim saldırıları engellenir.</div></div>
+  </div>
+
+  <h3>Tam güvenli çalıştırma örneği</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — sertleştirilmiş container çalıştırma</span><span class="dot">●</span></div>
+    <pre><code">docker run \
+    --name edge-app \
+    --read-only \
+    --tmpfs /tmp:size=64m,noexec,nosuid \
+    --cap-drop=ALL \
+    --cap-add=NET_BIND_SERVICE \
+    --security-opt no-new-privileges=true \
+    --security-opt seccomp=seccomp-edge-app.json \
+    --security-opt apparmor=docker-edge-app \
+    --user 1000:1000 \
+    --memory 256m \
+    --cpus 0.5 \
+    --pids-limit 100 \
+    --network app-net \
+    --restart unless-stopped \
+    registry.example.com/myapp:v1.2.3</code></pre>
+  </div>
+
+  <h3>Araç zinciri özeti</h3>
+  <div class="code-block">
+    <div class="code-header"><span>DevSecOps Pipeline</span><span class="dot">●</span></div>
+    <pre><code">Kod Yazma
+  └── Trivy fs --scanners secret  (gizli bilgi tespiti)
+       │
+Build (docker buildx)
+  └── Multi-stage Dockerfile → distroless/scratch image
+       │
+Test
+  └── Trivy image --severity CRITICAL,HIGH
+      │ (CRITICAL bulgu → pipeline dur)
+       │
+Sign
+  └── Cosign sign --key cosign.key image:tag
+       │
+Push → Registry
+  └── Cosign verify (admission webhook / Kyverno)
+       │
+Deploy (Kubernetes / k3s)
+  └── seccomp + AppArmor + non-root + read-only</code></pre>
+  </div>
+</section>
+
+</main>

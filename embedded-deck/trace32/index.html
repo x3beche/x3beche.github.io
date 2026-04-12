@@ -1,0 +1,792 @@
+---
+layout: tutorial
+title: "Lauterbach Trace32 — Hardware Tracing & Debugging"
+back_url: "../index.html"
+back_label: "embedded-deck"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>ARAÇLAR</span>
+    <span>TRACE / DEBUG</span>
+    <span>2026</span>
+  </div>
+  <h1>Lauterbach Trace32<br><em>Hardware tracing &amp; debugging.</em></h1>
+  <p class="subtitle">CoreSight ETM trace altyapısından Lauterbach donanımına, PRACTICE script dilinden Linux kernel awareness'a kadar profesyonel gömülü sistem hata ayıklama rehberi.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Hardware tracing temelleri</a></li>
+    <li><a href="#s1">Trace32 araç ailesi</a></li>
+    <li><a href="#s2">Trace32 IDE ve PRACTICE script</a></li>
+    <li><a href="#s3">ETM instruction trace</a></li>
+    <li><a href="#s4">Data trace</a></li>
+    <li><a href="#s5">Performance Analysis</a></li>
+    <li><a href="#s6">OS awareness</a></li>
+    <li><a href="#s7">Automated testing</a></li>
+    <li><a href="#s8">Pratik: STM32 ETM trace &amp; hotspot</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Hardware tracing temelleri</h2>
+  <p class="section-lead">Yazılım tabanlı debug araçları (printf, GDB) hedef sistemde çalışan kodu durdurur ve davranışı değiştirebilir (Heisenbug). Hardware tracing ise işlemciyi hiç durdurmadan çalışma zamanı bilgisini yakalar — sıfır intrüsivite.</p>
+
+  <h3>CoreSight mimarisi</h3>
+  <p>ARM CoreSight, SoC içindeki debug ve trace bileşenlerini standartlaştıran bir mimaridir. Her bileşen APB (Advanced Peripheral Bus) üzerinden erişilebilir debug register'larına sahiptir.</p>
+
+  <div class="flow">
+    <pre>
+  ┌─────────────────────────────────────────────────────┐
+  │  CPU Core (Cortex-A/M/R)                            │
+  │  ├── ETM (Embedded Trace Macrocell)                 │
+  │  │   instruction + data trace üretir                │
+  │  └── DWT (Data Watchpoint and Trace)                │
+  │      veri erişimlerini izler                        │
+  └────────────────────┬────────────────────────────────┘
+                       │ ATB (Advanced Trace Bus)
+  ┌────────────────────▼────────────────────────────────┐
+  │  Trace Funnel (çok çekirdekli sistemlerde birleşim) │
+  └────────────────────┬────────────────────────────────┘
+                       │
+          ┌────────────┴────────────┐
+          ▼                         ▼
+  ┌──────────────┐         ┌──────────────────┐
+  │  ETB / ETF   │         │  TPIU            │
+  │  (dahili RAM │         │  (harici trace   │
+  │   buffer)    │         │   portuna çıkış) │
+  └──────────────┘         └──────┬───────────┘
+                                  │
+                           Lauterbach probe
+    </pre>
+  </div>
+
+  <h3>ETM — Embedded Trace Macrocell</h3>
+  <p>ETM, işlemci çekirdeklerine gömülü donanım birimidir. Her çalıştırılan komutun adresini (instruction trace) ve isteğe bağlı olarak bellek erişimlerini (data trace) sıkıştırılmış biçimde ATB veri yoluna gönderir.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Bileşen</th><th>Açıklama</th><th>Kapasite</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>ETM v3</code></td><td>Cortex-A8/A9/R4</td><td>Instruction + data trace, address filtering</td></tr>
+        <tr><td><code>ETMv4 / ETE</code></td><td>Cortex-A55/A78/X1</td><td>Branch prediction aware, memory-mapped register</td></tr>
+        <tr><td><code>MTB</code></td><td>Cortex-M0+/M23</td><td>Micro Trace Buffer — dahili SRAM, 256B-4KB</td></tr>
+        <tr><td><code>ETB (4KB)</code></td><td>Çoğu Cortex-A/R</td><td>On-chip trace RAM, harici probe olmadan kullanılabilir</td></tr>
+        <tr><td><code>ETF</code></td><td>Büyük SoC'lar</td><td>Embedded Trace FIFO — daha büyük buffer, flush modları</td></tr>
+        <tr><td><code>TPIU</code></td><td>SoC çıkış katmanı</td><td>SWO (1-bit) veya paralel trace (4/8/16-bit port)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Cortex-M serisi için çoğunlukla yeterli olan <strong>SWO (Single Wire Output)</strong> trace, ETM yerine ITM (Instrumentation Trace Macrocell) üzerinden çalışır ve yalnızca yazılım tarafından üretilen printf-tarzı trace verisini aktarır. Tam ETM instruction trace için daha pahalı trace probe donanımı ve çip üzerinde TPIU gerekir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Trace32 araç ailesi</h2>
+  <p class="section-lead">Lauterbach, farklı bant genişliği ve form faktörü ihtiyaçları için geniş bir ürün ailesi sunar. Doğru probeyi seçmek, trace bant genişliği gereksinimlerine ve hedef donanımın fiziksel kısıtlamalarına bağlıdır.</p>
+
+  <h3>Probe kategorileri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Ürün ailesi</th><th>Bağlantı</th><th>Trace kapasitesi</th><th>Kullanım senaryosu</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>LA-7728E</code></td><td>USB 3.0</td><td>4GB trace RAM, 800 MHz</td><td>Yüksek hızlı SoC, Linux trace</td></tr>
+        <tr><td><code>LA-3505</code></td><td>USB 2.0</td><td>128MB trace RAM</td><td>Orta seviye gömülü sistem</td></tr>
+        <tr><td><code>Combiprobe</code></td><td>USB 2.0</td><td>JTAG/SWD only (trace yok)</td><td>Sadece JTAG debug</td></tr>
+        <tr><td><code>µTrace (Cortex-M)</code></td><td>USB 2.0</td><td>SWO + SWD</td><td>Cortex-M geliştirme</td></tr>
+        <tr><td><code>PowerDebug Pro</code></td><td>Ethernet/USB</td><td>4GB, çok çekirdekli</td><td>Otomotiv, kurumsal CI</td></tr>
+        <tr><td><code>AutoFocus II</code></td><td>Ethernet</td><td>1GB</td><td>Araç içi debug altyapısı</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>JTAG ve SWD karşılaştırması</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">JTAG (IEEE 1149.1)</span><span class="desc">5 pin (TDI, TDO, TCK, TMS, TRST) — daisy-chain destekli, eski standart, yavaş</span></div>
+    <div class="param"><span class="name">SWD (Serial Wire Debug)</span><span class="desc">2 pin (SWDIO, SWDCLK) — ARM özel, kompakt PCB tasarımı için ideal</span></div>
+    <div class="param"><span class="name">SWO (Serial Wire Output)</span><span class="desc">SWD'ye ek 1 trace pin — ITM/DWT trace verisi için, ETM trace için yetersiz</span></div>
+    <div class="param"><span class="name">Trace port (4-bit)</span><span class="desc">TRACECLK + TRACEDATA[0..3] — ETM full trace için gerekli, PCB gereksinimleri yüksek</span></div>
+  </div>
+
+  <h3>Lisans yapısı</h3>
+  <p>Trace32 yazılımı ücretsiz indirilir ancak donanım probe'u aktif olmadan çalışmaz. Demo lisansı (training mode) sınırlı işlevsellik sunar. Kurumsal sürümde <code>t32license.t32</code> dosyası probe donanımına bağlıdır.</p>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Trace32 IDE ve PRACTICE script</h2>
+  <p class="section-lead">Trace32 GUI (t32marm, t32mqdsp6 vb.) hem etkileşimli debugging hem de PRACTICE betik dili ile tam otomasyon sağlar. PRACTICE, Trace32'ye özgü yüksek seviyeli bir script dilidir.</p>
+
+  <h3>Trace32 başlatma</h3>
+
+  <pre><code class="language-bash"># Linux'ta Trace32 başlatma
+cd /opt/t32
+./bin/pc_linux64/t32marm -c config.t32
+
+# config.t32 örneği:
+cat config.t32</code></pre>
+
+  <div class="code-block">
+    <div class="code-header"><span>config.t32</span><span class="dot">●</span></div>
+    <pre><code class="language-text">; Trace32 konfigürasyon dosyası
+PBI=USB               ; Probe bağlantı tipi (USB/ETH)
+USB=                  ; Otomatik USB tanıma
+
+; Ana pencere boyutu
+SCREEN=
+HEADER=Trace32 ARM Debug
+
+; Başlangıç scripti
+STARTUPFILE=init.cmm</code></pre>
+  </div>
+
+  <h3>PRACTICE script temelleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>init.cmm</span><span class="dot">●</span></div>
+    <pre><code class="language-text">; PRACTICE script — STM32H743 başlatma
+
+; CPU seçimi
+SYStem.CPU STM32H743ZI
+
+; JTAG hızı
+SYStem.JtagClock 10MHz
+
+; Debug porta bağlan
+SYStem.Up
+
+; ELF sembol dosyasını yükle
+Data.LOAD.Elf /path/to/firmware.elf /GNU
+
+; Adres ve hafıza haritası
+MAP.Reset
+MAP.BoDual 0x08000000--0x081FFFFF  ; Flash
+
+; Başlangıç breakpoint'i
+Break.Set main /Program
+
+; Çalıştır
+Go</code></pre>
+  </div>
+
+  <h3>PRACTICE temel komutlar</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Komut</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>SYStem.Up</code></td><td>Hedefle bağlantı kur, CPU'yu reset ve halt et</td></tr>
+        <tr><td><code>Go</code></td><td>Serbest çalıştır (resume)</td></tr>
+        <tr><td><code>Break</code></td><td>Mevcut konumda durdur</td></tr>
+        <tr><td><code>Step</code></td><td>Tek adım (step into)</td></tr>
+        <tr><td><code>Break.Set &lt;addr&gt;</code></td><td>Breakpoint koy</td></tr>
+        <tr><td><code>Register.view</code></td><td>CPU register penceresini aç</td></tr>
+        <tr><td><code>Data.dump &lt;addr&gt;</code></td><td>Bellek içeriğini hex göster</td></tr>
+        <tr><td><code>Var.view &lt;var&gt;</code></td><td>Değişkeni izle</td></tr>
+        <tr><td><code>PRINT</code></td><td>Mesaj yazdır (PRINT "değer: " Var.VALUE(x))</td></tr>
+        <tr><td><code>IF / WHILE / GOSUB</code></td><td>PRACTICE akış kontrolü</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> ETM instruction trace</h2>
+  <p class="section-lead">ETM instruction trace, işlemcinin her çalıştırdığı komutu gerçek zamanlı olarak kaydeder. Bu kayıt sayesinde bir crash'e giden tam çalışma yolu, fonksiyon çağrı sırası ve dal davranışı sıfır intrüsivite ile incelenebilir.</p>
+
+  <h3>Trace konfigürasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>etm_trace.cmm</span><span class="dot">●</span></div>
+    <pre><code class="language-text">; ETM trace başlatma scripti
+
+SYStem.CPU CortexA53
+SYStem.JtagClock 20MHz
+SYStem.Up
+
+; ELF yükle
+Data.LOAD.Elf /path/to/app.elf /GNU
+
+; Trace konfigürasyonu
+Trace.Init
+
+; ETM trace'i etkinleştir
+ETM.ON
+ETM.ContextID OFF      ; Process ID bilgisi (Linux'ta açılabilir)
+ETM.DataTrace OFF      ; Sadece instruction trace
+ETM.Cycle ON           ; Cycle-accurate mod
+
+; Trace buffer — ETB (internal) kullan
+Trace.Method Onchip
+Trace.Size 0x10000     ; 64KB
+
+; Trace filtresi: belirli adres aralığı
+; ETM.RANGE 0x08000000 0x0800FFFF  ; sadece Flash
+
+; Tüm flash'ı trace et
+ETM.RANGE OFF
+
+; Hedefi çalıştır
+Go</code></pre>
+  </div>
+
+  <h3>Trace kaydetme ve analiz</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>analyze_trace.cmm</span><span class="dot">●</span></div>
+    <pre><code class="language-text">; Trace'i durdur ve analiz et
+Break
+
+; Trace verisini çöz (decode)
+Trace.List                    ; Instruction listesi penceresi
+Trace.Chart.Func              ; Fonksiyon zaman çizelgesi
+
+; En son N talimatı listele
+Trace.List LAST 1000.
+
+; Belirli bir fonksiyona gidişi bul
+Trace.Find main               ; main() çağrısını bul
+
+; Assembly seviyesinde akış görüntüleme
+List.Mix                      ; C/assembly mix listesi açar
+
+; Trace verisini dosyaya aktar
+Trace.Export /tmp/trace.txt ASCII
+
+; Trace istatistikleri
+Trace.Statistics</code></pre>
+  </div>
+
+  <h3>Crash analizi</h3>
+
+  <pre><code class="language-text">; Crash öncesi son 500 talimatı incele
+; (ETB circular buffer ile otomatik yakalanır)
+Trace.List LAST 500.
+
+; Çöküş anındaki PC değerini bul
+; Register değerleri otomatik kaydedilir
+Register.view
+
+; Geri sararak çöküşe giden yolu izle
+; PRACTICE: trace'i tersine oynat
+Trace.List REVERSE</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Data trace</h2>
+  <p class="section-lead">Data trace, belirli bellek adreslerine yapılan okuma ve yazma işlemlerini zamanlamayla birlikte kaydeder. Bellek bozulmaları, yarış koşulları ve beklenmedik değişken değişimleri için kritik bir araçtır.</p>
+
+  <h3>DWT — Data Watchpoint and Trace</h3>
+  <p>Cortex-M serisinde DWT (Data Watchpoint and Trace), donanımsal veri izleme için kullanılır. Cortex-A serisinde ise ETMv4 data trace veya PMU (Performance Monitoring Unit) kullanılır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>data_trace.cmm</span><span class="dot">●</span></div>
+    <pre><code class="language-text">; Data trace konfigürasyonu (Cortex-M)
+
+SYStem.CPU STM32F429
+SYStem.Up
+Data.LOAD.Elf firmware.elf /GNU
+
+; DWT veri izleyicisi — global değişkeni izle
+; g_sensor_data değişkeninin adresini bul
+Var.view g_sensor_data
+; Sembolden adres al: V.ADDRESS(g_sensor_data)
+
+; Belirli adres aralığında yazma izle
+Break.Set V.ADDRESS(g_sensor_data) /Write /TraceEnable
+
+; Data trace etkinleştir
+ETM.DataTrace Address     ; Sadece adres kaydet
+; ETM.DataTrace AddressData ; Adres + değer kaydet (daha yavaş)
+
+Trace.Init
+ETM.ON
+Go
+
+; Program çalışırken g_sensor_data değişimlerini gör:
+Trace.List ALL
+; Her write işlemini zaman damgasıyla gösterir</code></pre>
+  </div>
+
+  <h3>Bellek bozulması tespiti</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>corruption_detect.cmm</span><span class="dot">●</span></div>
+    <pre><code class="language-text">; Stack overflow ve bellek bozulması tespiti
+
+; Stack koruma bölgesi — stack sonu adresinde izleyici
+LOCAL &stack_guard
+&stack_guard=V.ADDRESS(_stack_end)+0x10
+
+; Watchpoint: stack guard alanı yazılırsa dur
+Break.Set &stack_guard /Write /HardwareBased
+
+; Heap üzerine yazma tespiti — malloc sınırı
+; Heap bölgesini izle
+Break.Set 0x20010000--0x20020000 /Write \
+          /TraceEnable /Task "heap_monitor"
+
+Go
+
+; Tetiklenince:
+; Trace.List LAST 100.   — bozulmadan önceki son 100 komut
+; Register.view           — PC/LR/SP durumu
+; Data.dump &stack_guard  — guard değerini göster</code></pre>
+  </div>
+
+  <h3>Veri erişim istatistikleri</h3>
+
+  <pre><code class="language-text">; Belirli değişkene kaç kez erişildi?
+Trace.Statistics.sYmbol g_sensor_data
+
+; Tüm global değişkenlerin erişim sayısı
+Trace.Statistics.Var
+
+; En çok erişilen adresler (hotspot)
+Trace.Statistics.Address</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Performance Analysis</h2>
+  <p class="section-lead">Trace32'nin performans analizi araçları, fonksiyon bazında çalışma sürelerini, cache miss oranlarını, pipeline stall'larını ve interrupt gecikmelerini donanım tracing ile tespit eder.</p>
+
+  <h3>Fonksiyon profili (hotspot)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>profile.cmm</span><span class="dot">●</span></div>
+    <pre><code class="language-text">; Fonksiyon bazında profil çıkarma
+
+SYStem.CPU CortexA72
+SYStem.Up
+Data.LOAD.Elf application.elf /GNU
+
+; Cycle-accurate trace
+ETM.ON
+ETM.Cycle ON
+Trace.Init
+Trace.Size 0x100000   ; 1MB trace buffer
+Trace.Method Onchip
+
+Go
+
+; 5 saniye çalıştır
+WAIT 5.s
+Break
+
+; Fonksiyon profili
+Trace.Statistics.Func
+
+; Sonuç: her fonksiyon için
+; - Toplam çağrı sayısı
+; - Min / Ortalama / Max çalışma süresi
+; - Toplam CPU zamanı %
+
+; En yavaş 10 fonksiyon
+; Trace.Statistics.Func /Max 10.</code></pre>
+  </div>
+
+  <h3>Interrupt gecikme ölçümü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>irq_latency.cmm</span><span class="dot">●</span></div>
+    <pre><code class="language-text">; IRQ giriş gecikmesi ölçümü
+
+; IRQ handler giriş adresini bul
+LOCAL &irq_entry
+&irq_entry=V.ADDRESS(UART1_IRQHandler)
+
+; Trigger: IRQ acknowledge anından handler girişine süre
+Trace.Init
+ETM.ON
+ETM.Cycle ON
+
+; Performans sayacı: IRQ latency
+PerfCounters.RESET
+PerfCounters.Set 0. IRQ_LATENCY
+
+Go
+
+; Test uyaranını üret (dışarıdan UART verisi gönder)
+WAIT 2.s
+Break
+
+; IRQ gecikme istatistikleri
+PerfCounters.view
+
+; Trace üzerinden elle ölçüm:
+; IRQ assert → handler giriş arası cycle sayısı
+Trace.Find &irq_entry
+Trace.List BACK 20.   ; Handler öncesi 20 komut</code></pre>
+  </div>
+
+  <h3>Cache miss analizi</h3>
+
+  <pre><code class="language-text">; Cortex-A için L1/L2 cache miss oranı
+; PMU (Performance Monitoring Unit) sayaçları
+
+; ETM + PMU birlikte kullan
+ETM.ON
+PMU.Reset
+PMU.Set 0. L1I_CACHE_REFILL   ; I-cache miss
+PMU.Set 1. L1D_CACHE_REFILL   ; D-cache miss
+PMU.Set 2. L2D_CACHE_REFILL   ; L2 miss
+PMU.Set 3. CPU_CYCLES
+
+Go
+WAIT 3.s
+Break
+
+PMU.view
+; Çıktı örneği:
+; Cycle count     : 450,000,000
+; I-cache miss    : 12,500  (2.7%)
+; D-cache miss    : 45,000  (10%)
+; L2 miss         : 8,200   (1.8%)</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> OS awareness</h2>
+  <p class="section-lead">Trace32'nin OS awareness özelliği, çalışan işletim sisteminin (Linux, FreeRTOS, Zephyr vb.) iç yapısını — görev listesi, bellek haritaları, semaphore'lar, mutex'ler — kernel sembolleri aracılığıyla Trace32 GUI'de görüntüler.</p>
+
+  <h3>Linux kernel awareness</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>linux_awareness.cmm</span><span class="dot">●</span></div>
+    <pre><code class="language-text">; Linux kernel awareness kurulumu
+
+SYStem.CPU CortexA53
+SYStem.Up
+
+; Kernel ELF ve semboller
+Data.LOAD.Elf vmlinux /GNU /NOCODE
+; NOCODE: sadece semboller — belleği doldurmaz
+
+; KASLR (Kernel Address Space Layout Randomization) desteği
+; Kernel base adresini bul:
+; /proc/kallsyms veya JTAG üzerinden text_offset okuyarak
+
+; Linux awareness etkinleştir
+TASK.CONFIG linux       ; Lauterbach Linux plugin
+
+; Kernel'in symbol offset'ini ayarla (KASLR varsa)
+; TASK.OFFSET 0xFFFF800000000000 - &__start_kernel
+
+; OS awareness pencerelerini aç
+TASK.List               ; Tüm görevler / process'ler
+TASK.Stack              ; Her görevin stack durumu
+TASK.Module             ; Yüklü kernel modülleri</code></pre>
+  </div>
+
+  <h3>Görev listesi ve process bellek haritası</h3>
+
+  <pre><code class="language-text">; Tüm çalışan process'leri listele
+TASK.List.Task
+
+; Belirli process'in bellek haritası
+TASK.List.VMMaps "myapp"
+
+; Process'in tüm thread'leri
+TASK.List.Threads "myapp"
+
+; Belirli görevin stack'ini incele
+TASK.Stack.View "init"
+
+; Kernel semaphore / mutex durumu
+TASK.List.Mutex
+TASK.List.Semaphore
+
+; Bekleyen (blocked) görevler
+TASK.List.Task /STATE "waiting"</code></pre>
+
+  <h3>Kernel breakpoint — syscall izleme</h3>
+
+  <pre><code class="language-text">; sys_open() çağrısında dur
+Break.Set do_sys_openat2 /Program
+
+; write() syscall'ını izle
+Break.Set sys_write /Program /TraceEnable
+
+; Belirli process'te breakpoint (process-aware)
+Break.Set 0x400500 /Program /TASK "myapp"
+
+; Kernel panic trace — panic() fonksiyonunda dur
+Break.Set panic /Program
+Go</code></pre>
+
+  <h3>FreeRTOS awareness</h3>
+
+  <pre><code class="language-text">; FreeRTOS görev izleme
+TASK.CONFIG freertos
+
+; FreeRTOS görev listesi
+TASK.List.Task
+
+; Context switch geçmişi (trace ile)
+; Her görev değişiminde PC değeri
+Trace.List.Task
+
+; Task execution timeline
+Trace.Chart.Task</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Automated testing</h2>
+  <p class="section-lead">PRACTICE script dili, CI/CD pipeline'larıyla entegre otomatik test altyapısı oluşturmak için yeterince güçlüdür. Regression test, code coverage ölçümü ve otomatik raporlama Trace32 komut satırı üzerinden yönetilebilir.</p>
+
+  <h3>Headless / komut satırı modu</h3>
+
+  <pre><code class="language-bash"># Trace32'yi headless (GUI olmadan) başlat
+/opt/t32/bin/pc_linux64/t32marm \
+    -c config.t32 \
+    -s test_suite.cmm \
+    -exit
+
+# Dönüş kodu: 0 = başarı, 1 = hata</code></pre>
+
+  <h3>Test betiği iskelet</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>test_suite.cmm</span><span class="dot">●</span></div>
+    <pre><code class="language-text">; Otomatik test suite — PRACTICE script
+
+LOCAL &test_pass &test_fail
+&test_pass=0
+&test_fail=0
+
+; ─── Yardımcı fonksiyonlar ────────────────────
+GOSUB setup
+
+; ─── Test 1: LED toggle işlevi ────────────────
+PRINT "Test 1: LED_Toggle..."
+Break.Set LED_Toggle /Program /OnchipBreak
+Go
+WAIT 0:0:5.         ; 5 saniye bekle
+
+IF STATE.RUN()
+(
+  PRINT "HATA: LED_Toggle 5s içinde çağrılmadı"
+  &test_fail=&test_fail+1
+)
+ELSE
+(
+  PRINT "BAŞARILI: LED_Toggle çağrıldı"
+  &test_pass=&test_pass+1
+)
+
+; ─── Test 2: Değişken değer kontrolü ──────────
+GOSUB reset_target
+Break.Set update_sensor /Program /OnchipBreak
+Go
+WAIT 0:0:2.
+
+IF !STATE.RUN()
+(
+  LOCAL &sensor_val
+  &sensor_val=Var.VALUE(g_sensor_value)
+  IF &sensor_val>100.&&amp;&amp;&sensor_val&lt;200.
+  (
+    PRINT "BAŞARILI: sensor değeri aralıkta: " &sensor_val
+    &test_pass=&test_pass+1
+  )
+  ELSE
+  (
+    PRINT "HATA: sensor değeri hatalı: " &sensor_val
+    &test_fail=&test_fail+1
+  )
+)
+
+; ─── Sonuç raporu ─────────────────────────────
+GOSUB print_report
+ENDDO
+
+; ─── Alt rutinler ─────────────────────────────
+setup:
+  SYStem.CPU STM32H743ZI
+  SYStem.Up
+  Data.LOAD.Elf firmware.elf /GNU
+  RETURN
+
+reset_target:
+  SYStem.Down
+  SYStem.Up
+  Data.LOAD.Elf firmware.elf /GNU
+  RETURN
+
+print_report:
+  PRINT "============================="
+  PRINT "Toplam: " (&test_pass+&test_fail)
+  PRINT "Başarılı: " &test_pass
+  PRINT "Başarısız: " &test_fail
+  IF &test_fail>0.
+  (
+    PRINT "SONUÇ: BAŞARISIZ"
+    ENDDO 1.       ; hata kodu ile çık
+  )
+  PRINT "SONUÇ: BAŞARILI"
+  RETURN</code></pre>
+  </div>
+
+  <h3>CI/CD entegrasyonu (GitLab örneği)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>.gitlab-ci.yml (trace32 test aşaması)</span><span class="dot">●</span></div>
+    <pre><code class="language-yaml">hardware_test:
+  stage: test
+  tags:
+    - trace32-runner      # Bu runner'da Trace32 + donanım mevcut
+  script:
+    - make firmware.elf
+    - /opt/t32/bin/pc_linux64/t32marm
+        -c /etc/t32/config.t32
+        -s ci/test_suite.cmm
+        -exit
+  artifacts:
+    when: always
+    paths:
+      - ci/test_report.txt
+    reports:
+      junit: ci/junit_report.xml</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: STM32 ETM trace &amp; hotspot analizi</h2>
+  <p class="section-lead">Bu bölümde STM32H743 üzerinde ETM trace kurulumu yapacak, fonksiyon hotspot analizi gerçekleştirecek ve Linux kernel debug için OS awareness kullanacağız.</p>
+
+  <h3>Donanım bağlantısı</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">STM32H743ZI Nucleo board</span><span class="desc">20-pin JTAG + 4-bit trace port (PE2..PE6)</span></div>
+    <div class="param"><span class="name">LA-3505 veya LA-7728E</span><span class="desc">4-bit trace port destekleyen Lauterbach probe</span></div>
+    <div class="param"><span class="name">20-pin MIPI kablo</span><span class="desc">Probe'dan Nucleo'nun debug konnektörüne</span></div>
+  </div>
+
+  <h3>STM32 ETM trace başlatma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>stm32h7_etm.cmm</span><span class="dot">●</span></div>
+    <pre><code class="language-text">; STM32H743 ETM instruction trace
+
+SYStem.CPU STM32H743ZI
+SYStem.JtagClock 20MHz
+SYStem.Up
+
+Data.LOAD.Elf build/firmware.elf /GNU
+
+; Trace portunu etkinleştir (4-bit)
+; STM32H7'de DBGMCU_CR trace pini aktifleştirmesi gerekir
+Data.Set 0xE0042004 %Long 0x00700000  ; DBGMCU_CR: trace IO on
+
+; Trace konfigürasyonu
+Trace.Init
+ETM.ON
+ETM.Cycle ON
+ETM.PortSize 4.           ; 4-bit trace port
+Trace.Method Onchip       ; ETB (8KB) kullan
+
+; Filtre: sadece uygulama kodu (Flash)
+ETM.RANGE 0x08000000 0x0807FFFF
+
+; Döngüsel buffer mod
+Trace.Mode Wrap
+
+Go
+PRINT "ETM trace başladı — 10s sonra analiz..."
+WAIT 0:0:10.
+Break
+
+; Fonksiyon profili çıkar
+Trace.Statistics.Func /Max 20.
+
+; Sonuçları dosyaya yaz
+PRINT.OPEN /tmp/hotspot.txt
+Trace.Statistics.Func
+PRINT.CLOSE
+
+PRINT "Hotspot analizi tamamlandı: /tmp/hotspot.txt"</code></pre>
+  </div>
+
+  <h3>Beklenen hotspot çıktısı</h3>
+
+  <pre><code class="language-text">; Trace32 Trace.Statistics.Func çıktısı örneği:
+;
+; Function             Calls   Min[ns]  Avg[ns]  Max[ns]  Total[%]
+; ─────────────────────────────────────────────────────────────────
+; DSP_filter()         1024    2450     3120     8900     45.2%
+; sensor_read()        512     1200     1350     2100     18.7%
+; uart_transmit()      2048    450      510      1200     13.4%
+; main_loop()          1024    8900     9200     12000    12.1%
+; HAL_Delay()          128     999000   1000200  1001500   5.3%
+; ...
+;
+; → DSP_filter() toplam CPU zamanının %45'ini alıyor
+;   CMSIS-DSP kütüphanesi ile optimize edin veya
+;   FPU kullanımını kontrol edin</code></pre>
+
+  <h3>Linux kernel debug (QEMU + Trace32)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>linux_kernel_debug.cmm</span><span class="dot">●</span></div>
+    <pre><code class="language-text">; QEMU ARM64 üzerinde Linux kernel debug
+; (QEMU -s flag ile 1234 portunda GDB stub açar)
+
+SYStem.CPU CortexA53
+SYStem.Mode.Attach   ; Çalışan sisteme bağlan (reset yok)
+
+; QEMU TCP/IP üzerinden bağlan
+SYStem.CONFIG.SLAVE TCP:localhost:1234
+
+Data.LOAD.Elf vmlinux /GNU /NOCODE
+TASK.CONFIG linux
+TASK.OFFSET stext    ; Kernel yükleme adresi
+
+; Çalışan sisteme bağlan
+SYStem.Attach
+
+; Tüm process'leri listele
+TASK.List.Task
+
+; Kernel panic'te dur
+Break.Set panic /Program
+Go
+
+; Process context'ini değiştir (user-space debug)
+TASK.Select "myapp"   ; myapp process'ine geç
+List.Mix              ; Kaynak + assembly</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">SONUÇ</div>
+    <p>ETM instruction trace, zamanlama hassasiyetiyle birlikte tam çalışma geçmişi sağlar. Fonksiyon bazında hotspot analizi, profil tabanlı optimizasyon için altın veridir. Linux OS awareness ise kernel debug'ını geliştiriciye tanıdık bir "proses tabanlı" görünümde sunar — tek bir araçla hem firmware hem Linux kernel hem de kullanıcı uygulaması debug edilebilir.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

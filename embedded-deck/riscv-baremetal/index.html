@@ -1,0 +1,981 @@
+---
+layout: tutorial
+title: "RISC-V Bare-Metal — Startup & Peripheral"
+back_url: "../index.html"
+back_label: "embedded-deck"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ</span>
+    <span>RISC-V / BARE-METAL</span>
+    <span>2026</span>
+  </div>
+  <h1>RISC-V Bare-Metal<br><em>Startup &amp; peripheral programlama.</em></h1>
+  <p class="subtitle">Reset vektöründen UART interrupt'a, linker script'ten SBI çağrısına — RISC-V mikrodenetleyicide sıfırdan yazılım geliştirmenin tam yol haritası.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">RISC-V ISA özeti</a></li>
+    <li><a href="#s1">Startup assembly</a></li>
+    <li><a href="#s2">CSR programlama</a></li>
+    <li><a href="#s3">Interrupt ve exception handling</a></li>
+    <li><a href="#s4">Timer (CLINT)</a></li>
+    <li><a href="#s5">UART bare-metal</a></li>
+    <li><a href="#s6">Linker script</a></li>
+    <li><a href="#s7">SBI — Supervisor Binary Interface</a></li>
+    <li><a href="#s8">Pratik: HiFive1 Rev B / QEMU</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> RISC-V ISA özeti</h2>
+  <p class="section-lead">RISC-V, telif hakkı ve lisans ücreti olmayan açık kaynaklı bir Komut Seti Mimarisidir (ISA). Bare-metal programlama için önemli olan temel ISA özellikleri; modüler extension yapısı, privilege mod sistemi ve CSR register seti.</p>
+
+  <h3>RV32 / RV64 ve extension harfleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Extension</th><th>Anlam</th><th>Bare-metal önemi</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>I</code></td><td>Integer Base</td><td>Zorunlu — tamsayı, load/store, branch</td></tr>
+        <tr><td><code>M</code></td><td>Multiply/Divide</td><td>MUL, DIV, REM — yazılım divide olmadan</td></tr>
+        <tr><td><code>A</code></td><td>Atomic</td><td>LR/SC, AMO — mutex için zorunlu</td></tr>
+        <tr><td><code>F</code></td><td>Single Float</td><td>FPU — kayan nokta birimi</td></tr>
+        <tr><td><code>D</code></td><td>Double Float</td><td>64-bit FPU — F gerektirir</td></tr>
+        <tr><td><code>C</code></td><td>Compressed</td><td>16-bit komutlar — %25 kod yoğunluğu</td></tr>
+        <tr><td><code>Zicsr</code></td><td>CSR Instructions</td><td>csrr/csrw/csrrs — CSR erişimi için</td></tr>
+        <tr><td><code>Zifencei</code></td><td>Fence.I</td><td>Instruction fetch barrier</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Privilege modları</h3>
+
+  <div class="flow">
+    <pre>
+  ┌───────────────────────────────────────────────┐
+  │  M-mode (Machine)   — En yüksek ayrıcalık    │
+  │  Firmware / bare-metal program burada çalışır │
+  ├───────────────────────────────────────────────┤
+  │  S-mode (Supervisor) — Opsiyonel              │
+  │  OS kernel (Linux, Zephyr SMP)                │
+  ├───────────────────────────────────────────────┤
+  │  U-mode (User)       — Opsiyonel              │
+  │  Kullanıcı uygulaması, MMU gerektirir         │
+  └───────────────────────────────────────────────┘
+
+  Bare-metal → sadece M-mode yeterlidir
+  FreeRTOS  → M-mode (PMP ile izolasyon)
+  Linux     → M-mode (OpenSBI) + S-mode (kernel)
+    </pre>
+  </div>
+
+  <h3>Önemli CSR'lar (M-mode)</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">mstatus</span><span class="desc">Global interrupt enable (MIE bit 3), privilege durumu, FPU durumu</span></div>
+    <div class="param"><span class="name">mtvec</span><span class="desc">Trap vector base adresi — direct (bit 0=0) veya vectored (bit 0=1) mod</span></div>
+    <div class="param"><span class="name">mepc</span><span class="desc">Machine Exception PC — trap öncesi PC; mret ile geri dönüş adresi</span></div>
+    <div class="param"><span class="name">mcause</span><span class="desc">Trap nedeni — bit[XLEN-1]=1 interrupt, bit[XLEN-1]=0 exception; alt bitler kod</span></div>
+    <div class="param"><span class="name">mtval</span><span class="desc">Trap değeri — illegal inst için kodlama, misaligned için adres</span></div>
+    <div class="param"><span class="name">mie / mip</span><span class="desc">Interrupt Enable / Pending maskeleri — MSIE, MTIE, MEIE bitleri</span></div>
+    <div class="param"><span class="name">mhartid</span><span class="desc">Donanım thread ID — SMP'de hangi çekirdek olduğu</span></div>
+    <div class="param"><span class="name">mscratch</span><span class="desc">Scratch register — trap handler'da geçici saklama</span></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Startup assembly</h2>
+  <p class="section-lead">RISC-V bare-metal programı, reset vektöründen başlar. Çalışmadan önce C ortamı hazırlanmalıdır: stack pointer kurulumu, .bss sıfırlama, .data kopyalama ve mtvec ayarı.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>start.S</span><span class="dot">●</span></div>
+    <pre><code class="language-asm">.section .text.start
+.global _start
+.extern _stack_top      /* linker script'ten */
+.extern _bss_start
+.extern _bss_end
+.extern _data_load      /* Flash'taki .data başlangıcı */
+.extern _data_start     /* RAM'daki .data başlangıcı */
+.extern _data_end
+.extern trap_handler
+
+_start:
+    /* ── 1. Stack pointer kur ── */
+    la   sp, _stack_top
+
+    /* ── 2. mtvec — trap handler adresini yükle ── */
+    la   t0, trap_handler
+    csrw mtvec, t0
+
+    /* ── 3. .bss sıfırla ── */
+    la   t0, _bss_start
+    la   t1, _bss_end
+bss_loop:
+    bge  t0, t1, bss_done
+    sw   zero, 0(t0)
+    addi t0, t0, 4
+    j    bss_loop
+bss_done:
+
+    /* ── 4. .data'yı Flash'tan RAM'a kopyala ── */
+    la   t0, _data_load    /* kaynak (Flash) */
+    la   t1, _data_start   /* hedef (RAM) */
+    la   t2, _data_end
+data_loop:
+    bge  t1, t2, data_done
+    lw   t3, 0(t0)
+    sw   t3, 0(t1)
+    addi t0, t0, 4
+    addi t1, t1, 4
+    j    data_loop
+data_done:
+
+    /* ── 5. SMP: sadece hart 0 devam etsin ── */
+    csrr t0, mhartid
+    bnez t0, secondary_hart
+
+    /* ── 6. main() çağır ── */
+    call main
+
+    /* main() dönerse sonsuz döngü */
+halt:
+    wfi
+    j halt
+
+secondary_hart:
+    /* Diğer hart'lar bekle veya göreve başla */
+    wfi
+    j secondary_hart</code></pre>
+  </div>
+
+  <h3>Minimal C main()</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.c</span><span class="dot">●</span></div>
+    <pre><code class="language-c">#include &lt;stdint.h&gt;
+#include "uart.h"
+#include "timer.h"
+
+/* .bss: sıfırla */
+static volatile uint32_t tick_count;
+
+/* .data: başlangıç değeri olan değişken */
+static uint32_t magic = 0xDEADBEEF;
+
+int main(void)
+{
+    uart_init(115200);
+    timer_init();
+
+    uart_puts("RISC-V bare-metal başladı\r\n");
+
+    /* Global interrupt enable: mstatus.MIE = 1 */
+    __asm__ volatile("csrsi mstatus, 0x8");
+
+    while (1) {
+        uart_puts("tick: ");
+        uart_putnum(tick_count);
+        uart_puts("\r\n");
+        delay_ms(1000);
+    }
+
+    return 0; /* ulaşılamaz */
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> CSR programlama</h2>
+  <p class="section-lead">CSR (Control and Status Register) erişimi, RISC-V'de özel assembly komutları ile yapılır. GCC inline assembly veya platform kütüphanelerindeki makrolar aracılığıyla C kodundan da erişilebilir.</p>
+
+  <h3>CSR komut özeti</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Komut</th><th>Sözdizimi</th><th>İşlev</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>csrr</code></td><td>csrr rd, csr</td><td>rd = CSR değeri (read)</td></tr>
+        <tr><td><code>csrw</code></td><td>csrw csr, rs1</td><td>CSR = rs1 (write)</td></tr>
+        <tr><td><code>csrrs</code></td><td>csrrs rd, csr, rs1</td><td>rd = CSR; CSR |= rs1 (read-set)</td></tr>
+        <tr><td><code>csrrc</code></td><td>csrrc rd, csr, rs1</td><td>rd = CSR; CSR &amp;= ~rs1 (read-clear)</td></tr>
+        <tr><td><code>csrrwi</code></td><td>csrrwi rd, csr, imm</td><td>Anlık değerle CSR write (5-bit imm)</td></tr>
+        <tr><td><code>csrrsi</code></td><td>csrrsi rd, csr, imm</td><td>Anlık set (mstatus.MIE = 0x8)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>C inline assembly ile CSR erişimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>csr.h</span><span class="dot">●</span></div>
+    <pre><code class="language-c">#pragma once
+#include &lt;stdint.h&gt;
+
+/* CSR okuma makrosu */
+#define csr_read(csr)                           \
+({                                              \
+    unsigned long __val;                        \
+    __asm__ volatile ("csrr %0, " #csr          \
+                      : "=r"(__val)             \
+                      :                         \
+                      : "memory");              \
+    __val;                                      \
+})
+
+/* CSR yazma makrosu */
+#define csr_write(csr, val)                     \
+({                                              \
+    __asm__ volatile ("csrw " #csr ", %0"       \
+                      :                         \
+                      : "rK"(val)               \
+                      : "memory");              \
+})
+
+/* CSR set bits */
+#define csr_set(csr, bits)                      \
+({                                              \
+    unsigned long __val = (bits);               \
+    __asm__ volatile ("csrrs x0, " #csr ", %0"  \
+                      :                         \
+                      : "rK"(__val)             \
+                      : "memory");              \
+})
+
+/* CSR clear bits */
+#define csr_clear(csr, bits)                    \
+({                                              \
+    unsigned long __val = (bits);               \
+    __asm__ volatile ("csrrc x0, " #csr ", %0"  \
+                      :                         \
+                      : "rK"(__val)             \
+                      : "memory");              \
+})
+
+/* mstatus bit tanımları */
+#define MSTATUS_MIE   (1UL << 3)  /* Machine Interrupt Enable */
+#define MSTATUS_MPIE  (1UL << 7)  /* Previous Interrupt Enable */
+#define MSTATUS_MPP   (3UL << 11) /* Previous Privilege mode */
+
+/* mie bit tanımları */
+#define MIE_MSIE  (1UL << 3)  /* Software interrupt enable */
+#define MIE_MTIE  (1UL << 7)  /* Timer interrupt enable */
+#define MIE_MEIE  (1UL << 11) /* External interrupt enable */
+
+/* Kullanım örnekleri */
+static inline void irq_enable(void)  { csr_set(mstatus, MSTATUS_MIE); }
+static inline void irq_disable(void) { csr_clear(mstatus, MSTATUS_MIE); }
+static inline uint64_t get_mtime(void) { return csr_read(time); }</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Interrupt ve exception handling</h2>
+  <p class="section-lead">RISC-V'de her interrupt ve exception (trap) mtvec'te kayıtlı handler'a yönlendirilir. Handler, mcause'u okuyarak olayın türünü belirler ve uygun şekilde tepki verir.</p>
+
+  <h3>mcause değerleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>mcause</th><th>Tür</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>0x80000003</code></td><td>Interrupt</td><td>Machine Software Interrupt</td></tr>
+        <tr><td><code>0x80000007</code></td><td>Interrupt</td><td>Machine Timer Interrupt</td></tr>
+        <tr><td><code>0x8000000B</code></td><td>Interrupt</td><td>Machine External Interrupt (PLIC)</td></tr>
+        <tr><td><code>0x00000000</code></td><td>Exception</td><td>Instruction Address Misaligned</td></tr>
+        <tr><td><code>0x00000002</code></td><td>Exception</td><td>Illegal Instruction</td></tr>
+        <tr><td><code>0x00000005</code></td><td>Exception</td><td>Load Access Fault</td></tr>
+        <tr><td><code>0x00000007</code></td><td>Exception</td><td>Store/AMO Access Fault</td></tr>
+        <tr><td><code>0x0000000B</code></td><td>Exception</td><td>Environment Call from M-mode (ecall)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>C trap handler</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>trap.c</span><span class="dot">●</span></div>
+    <pre><code class="language-c">#include &lt;stdint.h&gt;
+#include "csr.h"
+#include "uart.h"
+#include "timer.h"
+#include "plic.h"
+
+/* __attribute__((interrupt)) GCC'nin register kaydetmesini sağlar */
+void __attribute__((interrupt("machine"))) trap_handler(void)
+{
+    unsigned long cause  = csr_read(mcause);
+    unsigned long mepc   = csr_read(mepc);
+    unsigned long mtval  = csr_read(mtval);
+
+    /* Bit[XLEN-1] = 1 ise interrupt */
+    if (cause & (1UL << (sizeof(unsigned long)*8 - 1))) {
+        /* Interrupt kodu: alt bitler */
+        unsigned long code = cause & ~(1UL << (sizeof(unsigned long)*8 - 1));
+
+        switch (code) {
+        case 3: /* Machine Software Interrupt */
+            /* MSIP temizle */
+            *(volatile uint32_t *)CLINT_MSIP(0) = 0;
+            break;
+
+        case 7: /* Machine Timer Interrupt */
+            timer_isr();
+            break;
+
+        case 11: /* Machine External Interrupt (PLIC) */
+            plic_handle_irq();
+            break;
+
+        default:
+            uart_puts("[TRAP] Bilinmeyen interrupt\r\n");
+            break;
+        }
+    } else {
+        /* Exception */
+        uart_puts("[EXCEPTION] cause=0x");
+        uart_puthex(cause);
+        uart_puts(" mepc=0x");
+        uart_puthex(mepc);
+        uart_puts(" mtval=0x");
+        uart_puthex(mtval);
+        uart_puts("\r\n");
+
+        /* Illegal instruction: bir sonraki komuta geç */
+        if (cause == 2) {
+            csr_write(mepc, mepc + 4);
+        } else {
+            /* Diğer exception'larda halt */
+            while (1) __asm__ volatile("wfi");
+        }
+    }
+}
+
+/* PLIC harici interrupt servisi */
+void plic_handle_irq(void)
+{
+    /* PLIC claim register — hangi IRQ geldi? */
+    uint32_t irq = plic_claim();
+
+    switch (irq) {
+    case IRQ_UART0:
+        uart_isr();
+        break;
+    case IRQ_GPIO:
+        gpio_isr();
+        break;
+    }
+
+    /* PLIC complete */
+    plic_complete(irq);
+}</code></pre>
+  </div>
+
+  <h3>PLIC yapılandırması</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>plic.c</span><span class="dot">●</span></div>
+    <pre><code class="language-c">#define PLIC_BASE       0x0C000000UL
+#define PLIC_PRIORITY(n) (*(volatile uint32_t *)(PLIC_BASE + (n)*4))
+#define PLIC_ENABLE(h)   (*(volatile uint32_t *)(PLIC_BASE + 0x2000 + (h)*0x80))
+#define PLIC_THRESHOLD(h)(*(volatile uint32_t *)(PLIC_BASE + 0x200000 + (h)*0x1000))
+#define PLIC_CLAIM(h)    (*(volatile uint32_t *)(PLIC_BASE + 0x200004 + (h)*0x1000))
+
+void plic_init(void)
+{
+    /* UART0 interrupt (IRQ 1) önceliğini ayarla */
+    PLIC_PRIORITY(1) = 1;
+
+    /* Hart 0 için UART0 interrupt'ı etkinleştir */
+    PLIC_ENABLE(0) |= (1U &lt;&lt; 1);
+
+    /* Eşik: 0 = tüm interrupt'lar geçer */
+    PLIC_THRESHOLD(0) = 0;
+
+    /* mie.MEIE bitini set et */
+    csr_set(mie, MIE_MEIE);
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Timer (CLINT)</h2>
+  <p class="section-lead">RISC-V platformlarında temel timer, CLINT (Core Local Interruptor) üzerindeki <code>mtime</code> ve <code>mtimecmp</code> register'larıyla uygulanır. Timer interrupt, Machine Timer Interrupt (MTI) kanalıyla gelir.</p>
+
+  <h3>CLINT register haritası</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Adres (offset)</th><th>Register</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>0x0000</code></td><td>MSIP[0]</td><td>Hart 0 software interrupt pending</td></tr>
+        <tr><td><code>0x4000</code></td><td>MTIMECMP[0]</td><td>Hart 0 timer compare — 64-bit</td></tr>
+        <tr><td><code>0xBFF8</code></td><td>MTIME</td><td>Gerçek zamanlı sayaç — 64-bit, paylaşılan</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>timer.c</span><span class="dot">●</span></div>
+    <pre><code class="language-c">#include &lt;stdint.h&gt;
+#include "csr.h"
+#include "timer.h"
+
+#define CLINT_BASE      0x02000000UL
+#define CLINT_MSIP(h)   (*(volatile uint32_t *)(CLINT_BASE + 0x0000 + (h)*4))
+#define CLINT_MTIMECMP  (*(volatile uint64_t *)(CLINT_BASE + 0x4000))
+#define CLINT_MTIME     (*(volatile uint64_t *)(CLINT_BASE + 0xBFF8))
+
+/* SiFive HiFive1: 32.768 kHz RTC clock */
+#define RTC_FREQ_HZ     32768UL
+
+volatile uint64_t g_tick_ms = 0;  /* .bss — sıfırlanır */
+
+void timer_init(void)
+{
+    /* İlk timeout: 1ms sonra */
+    CLINT_MTIMECMP = CLINT_MTIME + (RTC_FREQ_HZ / 1000);
+
+    /* mie.MTIE bitini set et */
+    csr_set(mie, MIE_MTIE);
+}
+
+/* trap_handler'dan çağrılır */
+void timer_isr(void)
+{
+    g_tick_ms++;
+
+    /* Bir sonraki interrupt: 1ms sonra */
+    CLINT_MTIMECMP += (RTC_FREQ_HZ / 1000);
+}
+
+uint64_t get_tick_ms(void)
+{
+    return g_tick_ms;
+}
+
+void delay_ms(uint32_t ms)
+{
+    uint64_t target = g_tick_ms + ms;
+    while (g_tick_ms &lt; target) {
+        /* wfi: interrupt gelene kadar uyku (güç tasarrufu) */
+        __asm__ volatile("wfi");
+    }
+}
+
+/* Doğrudan mtime okuyarak yüksek çözünürlüklü gecikme */
+void delay_us(uint32_t us)
+{
+    uint64_t target = CLINT_MTIME + (uint64_t)us * RTC_FREQ_HZ / 1000000UL;
+    while (CLINT_MTIME &lt; target)
+        __asm__ volatile("nop");
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> UART bare-metal</h2>
+  <p class="section-lead">UART, gömülü sistemlerde printf hata ayıklama ve seri iletişim için temel çevre birimidir. SiFive UART denetleyicisini hem polling hem de interrupt-driven modda implement edeceğiz.</p>
+
+  <h3>SiFive UART register haritası</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Offset</th><th>Register</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>0x00</code></td><td>txdata</td><td>Bit[7:0]: karakter; bit[31]: TX FIFO dolu</td></tr>
+        <tr><td><code>0x04</code></td><td>rxdata</td><td>Bit[7:0]: karakter; bit[31]: RX FIFO boş</td></tr>
+        <tr><td><code>0x08</code></td><td>txctrl</td><td>Bit0: TX enable; bit[18:16]: tx FIFO su seviyesi</td></tr>
+        <tr><td><code>0x0C</code></td><td>rxctrl</td><td>Bit0: RX enable; bit[18:16]: rx FIFO su seviyesi</td></tr>
+        <tr><td><code>0x10</code></td><td>ie</td><td>Interrupt enable: bit0=TXWM, bit1=RXWM</td></tr>
+        <tr><td><code>0x14</code></td><td>ip</td><td>Interrupt pending: bit0=TXWM, bit1=RXWM</td></tr>
+        <tr><td><code>0x18</code></td><td>div</td><td>Baud rate bölücü: div = (f_clk / baud) - 1</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>uart.c</span><span class="dot">●</span></div>
+    <pre><code class="language-c">#include &lt;stdint.h&gt;
+#include &lt;stdarg.h&gt;
+#include "uart.h"
+
+#define UART0_BASE      0x10013000UL
+#define UART_TXDATA     (*(volatile uint32_t *)(UART0_BASE + 0x00))
+#define UART_RXDATA     (*(volatile uint32_t *)(UART0_BASE + 0x04))
+#define UART_TXCTRL     (*(volatile uint32_t *)(UART0_BASE + 0x08))
+#define UART_RXCTRL     (*(volatile uint32_t *)(UART0_BASE + 0x0C))
+#define UART_IE         (*(volatile uint32_t *)(UART0_BASE + 0x10))
+#define UART_IP         (*(volatile uint32_t *)(UART0_BASE + 0x14))
+#define UART_DIV        (*(volatile uint32_t *)(UART0_BASE + 0x18))
+
+#define CPU_FREQ_HZ     16000000UL   /* 16 MHz */
+#define UART_TXDATA_FULL (1U &lt;&lt; 31)
+#define UART_RXDATA_EMPTY(1U &lt;&lt; 31)
+
+void uart_init(uint32_t baud)
+{
+    /* Baud rate bölen hesapla */
+    UART_DIV    = (CPU_FREQ_HZ / baud) - 1;
+    /* TX ve RX etkinleştir */
+    UART_TXCTRL = (1U &lt;&lt; 0) | (1U &lt;&lt; 16); /* txen + 1 stop bit */
+    UART_RXCTRL = (1U &lt;&lt; 0);               /* rxen */
+}
+
+/* Polling ile karakter gönder */
+void uart_putc(char c)
+{
+    /* TX FIFO dolu değilken yaz */
+    while (UART_TXDATA &amp; UART_TXDATA_FULL)
+        ;
+    UART_TXDATA = (uint8_t)c;
+}
+
+void uart_puts(const char *s)
+{
+    while (*s) {
+        if (*s == '\n') uart_putc('\r');
+        uart_putc(*s++);
+    }
+}
+
+/* Polling ile karakter al — engelleme (blocking) */
+int uart_getc(void)
+{
+    uint32_t val;
+    do {
+        val = UART_RXDATA;
+    } while (val &amp; UART_RXDATA_EMPTY);
+    return (int)(val &amp; 0xFF);
+}
+
+/* printf yönlendirme */
+int _write(int fd, const char *buf, int len)
+{
+    (void)fd;
+    for (int i = 0; i &lt; len; i++)
+        uart_putc(buf[i]);
+    return len;
+}
+
+/* Interrupt-driven RX — ring buffer */
+#define RX_BUF_SIZE 256
+static volatile char  rx_buf[RX_BUF_SIZE];
+static volatile int   rx_head = 0, rx_tail = 0;
+
+void uart_rx_irq_enable(void)
+{
+    UART_IE |= (1U &lt;&lt; 1); /* RXWM interrupt enable */
+}
+
+/* PLIC'ten çağrılan UART ISR */
+void uart_isr(void)
+{
+    while (!(UART_RXDATA &amp; UART_RXDATA_EMPTY)) {
+        char c = (char)(UART_RXDATA &amp; 0xFF);
+        int next = (rx_head + 1) % RX_BUF_SIZE;
+        if (next != rx_tail) {
+            rx_buf[rx_head] = c;
+            rx_head = next;
+        }
+    }
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Linker script</h2>
+  <p class="section-lead">Linker script, programın bellekteki fiziksel yerleşimini tanımlar. RISC-V bare-metal için minimum gereksinimler: Flash ve RAM bölgelerini belirlemek, kesim başlangıç noktasını tanımlamak ve BSS/data bölümlerini doğru yerleştirmek.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>link.ld</span><span class="dot">●</span></div>
+    <pre><code class="language-ld">/* SiFive HiFive1 Rev B linker script */
+
+OUTPUT_ARCH(riscv)
+ENTRY(_start)
+
+MEMORY {
+    /* SPI Flash — execute in place */
+    FLASH (rx)  : ORIGIN = 0x20010000, LENGTH = 4M
+    /* SRAM */
+    RAM   (rwx) : ORIGIN = 0x80000000, LENGTH = 16K
+}
+
+SECTIONS {
+
+    /* ── Kod bölümü (Flash) ──────────────────── */
+    .text : {
+        KEEP(*(.text.start))   /* _start — ilk gelen */
+        *(.text .text.*)
+        *(.rodata .rodata.*)
+        . = ALIGN(4);
+        _etext = .;
+    } > FLASH
+
+    /* ── Başlatılmış veri (Flash'ta taşınan) ─── */
+    _data_load = LOADADDR(.data);
+
+    .data : AT(_data_load) {
+        _data_start = .;
+        *(.data .data.*)
+        . = ALIGN(4);
+        _data_end = .;
+    } > RAM
+
+    /* ── BSS (RAM, sıfırlanır) ─────────────────── */
+    .bss : {
+        _bss_start = .;
+        *(.bss .bss.*)
+        *(COMMON)
+        . = ALIGN(4);
+        _bss_end = .;
+    } > RAM
+
+    /* ── Stack (RAM sonu) ──────────────────────── */
+    .stack : {
+        . = ALIGN(16);
+        _stack_bottom = .;
+        . += 2048;         /* 2KB stack */
+        . = ALIGN(16);
+        _stack_top = .;
+    } > RAM
+
+    /* ── Heap (stack sonrası) ──────────────────── */
+    .heap : {
+        _heap_start = .;
+        . += 1024;         /* 1KB heap */
+        _heap_end = .;
+    } > RAM
+
+    /* ── Debug bilgileri (silinebilir) ─────────── */
+    /DISCARD/ : {
+        *(.eh_frame)
+        *(.note.*)
+    }
+}</code></pre>
+  </div>
+
+  <h3>Derleme ve bağlama</h3>
+
+  <pre><code class="language-bash"># Araç zinciri
+CROSS = riscv32-unknown-elf
+
+# Derleme bayrakları (HiFive1: rv32imac)
+CFLAGS = -march=rv32imac_zicsr -mabi=ilp32 \
+         -Os -g -Wall -ffreestanding -nostdlib
+
+# Derleme
+${CROSS}-gcc ${CFLAGS} -c start.S -o start.o
+${CROSS}-gcc ${CFLAGS} -c main.c  -o main.o
+${CROSS}-gcc ${CFLAGS} -c uart.c  -o uart.o
+${CROSS}-gcc ${CFLAGS} -c timer.c -o timer.o
+${CROSS}-gcc ${CFLAGS} -c trap.c  -o trap.o
+
+# Bağlama
+${CROSS}-gcc ${CFLAGS} \
+    -T link.ld \
+    start.o main.o uart.o timer.o trap.o \
+    -o firmware.elf
+
+# İnceleme
+${CROSS}-size firmware.elf
+${CROSS}-objdump -d firmware.elf | head -60
+${CROSS}-nm firmware.elf | sort | grep -E "_stack|_bss|_data"
+
+# Binary çıkarma
+${CROSS}-objcopy -O binary firmware.elf firmware.bin</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> SBI — Supervisor Binary Interface</h2>
+  <p class="section-lead">SBI, M-mode'daki firmware ile S-mode'daki işletim sistemi çekirdeği arasındaki standart çağrı arabirimidir. OpenSBI referans implementasyonudur. Bare-metal uygulamalar için bile SBI, console output ve timer gibi temel servisleri temiz bir API ile sağlar.</p>
+
+  <h3>SBI ecall mekanizması</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>sbi.h</span><span class="dot">●</span></div>
+    <pre><code class="language-c">#pragma once
+#include &lt;stdint.h&gt;
+
+struct sbi_ret {
+    long error;
+    long value;
+};
+
+/* SBI extension ID'leri */
+#define SBI_EXT_BASE    0x10
+#define SBI_EXT_TIME    0x54494D45  /* "TIME" */
+#define SBI_EXT_DBCN    0x4442434E  /* Debug Console */
+#define SBI_EXT_SRST    0x53525354  /* System Reset */
+#define SBI_EXT_LEGACY_PUTCHAR  0x01
+
+/* Genel SBI ecall yardımcısı */
+static inline struct sbi_ret sbi_ecall(int ext, int fid,
+                                        unsigned long a0,
+                                        unsigned long a1,
+                                        unsigned long a2,
+                                        unsigned long a3,
+                                        unsigned long a4,
+                                        unsigned long a5)
+{
+    struct sbi_ret ret;
+    register unsigned long _a0 __asm__("a0") = a0;
+    register unsigned long _a1 __asm__("a1") = a1;
+    register unsigned long _a2 __asm__("a2") = a2;
+    register unsigned long _a3 __asm__("a3") = a3;
+    register unsigned long _a4 __asm__("a4") = a4;
+    register unsigned long _a5 __asm__("a5") = a5;
+    register unsigned long _a6 __asm__("a6") = fid;
+    register unsigned long _a7 __asm__("a7") = ext;
+
+    __asm__ volatile("ecall"
+        : "+r"(_a0), "+r"(_a1)
+        : "r"(_a2), "r"(_a3), "r"(_a4),
+          "r"(_a5), "r"(_a6), "r"(_a7)
+        : "memory");
+
+    ret.error = _a0;
+    ret.value = _a1;
+    return ret;
+}
+
+/* Console karakter yaz (legacy) */
+static inline void sbi_console_putchar(int ch)
+{
+    sbi_ecall(SBI_EXT_LEGACY_PUTCHAR, 0,
+              ch, 0, 0, 0, 0, 0);
+}
+
+/* Timer ayarla (TIME extension) */
+static inline long sbi_set_timer(uint64_t stime_value)
+{
+    struct sbi_ret r = sbi_ecall(SBI_EXT_TIME, 0,
+                                  stime_value, 0, 0, 0, 0, 0);
+    return r.error;
+}
+
+/* Sistem resetleme */
+static inline long sbi_system_reset(uint32_t type, uint32_t reason)
+{
+    struct sbi_ret r = sbi_ecall(SBI_EXT_SRST, 0,
+                                  type, reason, 0, 0, 0, 0);
+    return r.error;
+}</code></pre>
+  </div>
+
+  <h3>SBI ile timer (S-mode)</h3>
+
+  <pre><code class="language-c">/* S-mode kernel timer kurulumu (OpenSBI üzerinden) */
+void setup_timer_via_sbi(void)
+{
+    /* CSR time register'ını oku */
+    uint64_t now;
+    __asm__ volatile("csrr %0, time" : "=r"(now));
+
+    /* 10ms sonrasına timer koy (QEMU: 10MHz time freq) */
+    uint64_t target = now + 100000UL;  /* 10ms @ 10MHz */
+    sbi_set_timer(target);
+
+    /* sie.STIE = 1 (supervisor timer interrupt enable) */
+    __asm__ volatile("csrsi sie, 0x20");
+}</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: HiFive1 Rev B / QEMU bare-metal</h2>
+  <p class="section-lead">Bu bölümde UART, timer interrupt ve LED kontrolünü birleştiren tam bir bare-metal program yazacağız. Hem SiFive HiFive1 Rev B donanımında hem de QEMU sifive_e makinesinde çalışır.</p>
+
+  <h3>Proje dizin yapısı</h3>
+
+  <div class="flow">
+    <pre>
+  riscv-baremetal/
+  ├── src/
+  │   ├── start.S       — reset vektörü, BSS/data init
+  │   ├── main.c        — uygulama mantığı
+  │   ├── uart.c / .h   — UART sürücüsü
+  │   ├── timer.c / .h  — CLINT timer
+  │   ├── trap.c        — interrupt/exception handler
+  │   ├── plic.c / .h   — PLIC external interrupt
+  │   └── csr.h         — CSR makroları
+  ├── link.ld           — linker script
+  └── Makefile
+    </pre>
+  </div>
+
+  <h3>Makefile</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Makefile</span><span class="dot">●</span></div>
+    <pre><code class="language-makefile">CROSS   := riscv32-unknown-elf
+CC      := $(CROSS)-gcc
+OBJCOPY := $(CROSS)-objcopy
+SIZE    := $(CROSS)-size
+
+# HiFive1 Rev B: rv32imac, Freedom E300 SoC
+ARCH    := rv32imac_zicsr
+ABI     := ilp32
+CPU_HZ  := 16000000
+
+CFLAGS  := -march=$(ARCH) -mabi=$(ABI) \
+            -DCPU_FREQ_HZ=$(CPU_HZ) \
+            -Os -g3 -Wall -Wextra \
+            -ffreestanding -nostdlib \
+            -ffunction-sections -fdata-sections
+
+LDFLAGS := -T link.ld \
+            -Wl,--gc-sections \
+            -Wl,-Map=firmware.map
+
+SRCS    := src/start.S src/main.c src/uart.c \
+            src/timer.c src/trap.c src/plic.c
+
+OBJS    := $(SRCS:.c=.o)
+OBJS    := $(OBJS:.S=.o)
+
+all: firmware.elf firmware.bin
+
+firmware.elf: $(OBJS)
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@
+	$(SIZE) $@
+
+firmware.bin: firmware.elf
+	$(OBJCOPY) -O binary $&lt; $@
+
+clean:
+	rm -f src/*.o firmware.elf firmware.bin firmware.map
+
+# QEMU ile çalıştır
+qemu: firmware.elf
+	qemu-system-riscv32 \
+	    -machine sifive_e \
+	    -nographic \
+	    -bios none \
+	    -kernel firmware.elf</code></pre>
+  </div>
+
+  <h3>main.c — Entegre uygulama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>src/main.c</span><span class="dot">●</span></div>
+    <pre><code class="language-c">#include &lt;stdio.h&gt;
+#include "uart.h"
+#include "timer.h"
+#include "plic.h"
+#include "csr.h"
+
+/* GPIO: SiFive HiFive1 LED */
+#define GPIO_BASE       0x10012000UL
+#define GPIO_OUTPUT_EN  (*(volatile uint32_t *)(GPIO_BASE + 0x08))
+#define GPIO_OUTPUT_VAL (*(volatile uint32_t *)(GPIO_BASE + 0x0C))
+#define LED_RED_PIN     22  /* HiFive1 kırmızı LED */
+#define LED_GREEN_PIN   19  /* HiFive1 yeşil LED */
+
+static void gpio_init(void)
+{
+    GPIO_OUTPUT_EN  |= (1U &lt;&lt; LED_RED_PIN) | (1U &lt;&lt; LED_GREEN_PIN);
+    GPIO_OUTPUT_VAL &amp;= ~((1U &lt;&lt; LED_RED_PIN) | (1U &lt;&lt; LED_GREEN_PIN));
+}
+
+static void led_toggle(uint8_t pin)
+{
+    GPIO_OUTPUT_VAL ^= (1U &lt;&lt; pin);
+}
+
+int main(void)
+{
+    uart_init(115200);
+    gpio_init();
+    plic_init();
+    timer_init();
+
+    /* Global interrupt enable */
+    csr_set(mstatus, MSTATUS_MIE);
+
+    printf("RISC-V HiFive1 bare-metal\r\n");
+    printf("CPU: rv32imac @ %lu Hz\r\n", (unsigned long)CPU_FREQ_HZ);
+
+    uint64_t last_tick = 0;
+    uint32_t count     = 0;
+
+    while (1) {
+        uint64_t now = get_tick_ms();
+
+        /* Her 500ms'de bir LED toggle ve mesaj */
+        if (now - last_tick &gt;= 500) {
+            last_tick = now;
+            count++;
+            led_toggle(count % 2 ? LED_RED_PIN : LED_GREEN_PIN);
+            printf("[%4lu ms] tick=%lu\r\n",
+                   (unsigned long)now, (unsigned long)count);
+        }
+
+        /* UART'tan gelen karakterleri echo et */
+        /* (interrupt-driven rx buffer üzerinden) */
+        wfi();  /* interrupt gelene kadar bekle */
+    }
+}</code></pre>
+  </div>
+
+  <h3>QEMU ile çalıştırma ve doğrulama</h3>
+
+  <pre><code class="language-bash"># Derle
+make
+
+# QEMU ile çalıştır (seri konsol terminale gelir)
+make qemu
+
+# Beklenen çıktı:
+# RISC-V HiFive1 bare-metal
+# CPU: rv32imac @ 16000000 Hz
+# [   0 ms] tick=1
+# [ 500 ms] tick=2
+# [1000 ms] tick=3
+# ...
+
+# HiFive1 donanımı için flash
+riscv32-unknown-elf-gdb firmware.elf \
+    -ex "target extended-remote :3333" \
+    -ex "load" \
+    -ex "continue"
+
+# Ya da OpenOCD ile:
+openocd -f board/sifive-hifive1-revb.cfg \
+        -c "program firmware.elf verify reset exit"</code></pre>
+
+  <div class="callout">
+    <div class="label">SONUÇ</div>
+    <p>Bu bare-metal projede sıfırdan çalışan bir RISC-V sistemi inşa ettik: startup assembly, CSR yönetimi, trap handler, CLINT timer interrupt, UART sürücüsü ve GPIO LED kontrolü. Tüm bileşenler ~2KB Flash kullanır. Bir sonraki adım olarak FreeRTOS portunu ekleyebilir veya SBI desteğiyle OpenSBI üzerinden S-mode uygulamaya geçebilirsiniz.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

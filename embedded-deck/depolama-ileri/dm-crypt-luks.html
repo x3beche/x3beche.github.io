@@ -1,0 +1,781 @@
+---
+layout: tutorial
+title: "dm-crypt / LUKS — Disk Şifreleme"
+back_url: "../index.html"
+back_label: "Depolama İleri Düzey"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>DEPOLAMA İLERİ</span>
+    <span>DM-CRYPT / LUKS</span>
+    <span>2026</span>
+  </div>
+  <h1>dm-crypt / LUKS<br><em>Disk Şifreleme.</em></h1>
+  <p class="subtitle">LUKS2 ile AES-XTS tam disk şifreleme, TPM2 key sealing, initramfs unlock, dm-verity entegrasyonu ve gömülü cihaz key management best practices.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">dm-crypt / LUKS mimarisi</a></li>
+    <li><a href="#s1">cryptsetup kurulum ve temel kullanım</a></li>
+    <li><a href="#s2">LUKS container oluşturma</a></li>
+    <li><a href="#s3">initramfs ile şifreli root unlock</a></li>
+    <li><a href="#s4">TPM2 ile key sealing</a></li>
+    <li><a href="#s5">Key rotation ve slot yönetimi</a></li>
+    <li><a href="#s6">dm-verity ile birlikte kullanım</a></li>
+    <li><a href="#s7">Performans etkisi ve AES-NI</a></li>
+    <li><a href="#s8">Pratik: RPi eMMC şifreleme + TPM2 unlock</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> dm-crypt / LUKS mimarisi</h2>
+  <p class="section-lead">dm-crypt, Linux kernel'ın device mapper altyapısı üzerine kurulu saydam disk şifreleme katmanıdır. LUKS (Linux Unified Key Setup) ise dm-crypt için standart header ve anahtar yönetimi formatını tanımlar.</p>
+
+  <h3>Katmanlı mimari</h3>
+  <div class="flow">
+    <pre>
+Uygulama / Dosya Sistemi (ext4, F2FS, Btrfs...)
+         ↓  ↑
+   /dev/mapper/sifreliyol   ←  device mapper sanal blok
+         ↓  ↑
+   dm-crypt kernel modülü   ←  AES-XTS şifreleme/çözme
+         ↓  ↑
+   /dev/mmcblk0p3           ←  fiziksel LUKS partition
+    ┌─────────────────────────────────────────────┐
+    │  LUKS2 Header (4 MB)                        │
+    │  ├── PBKDF2 / Argon2id parametre alanı      │
+    │  ├── Keyslot 0..31 (master key şifreli)     │
+    │  └── JSON metadata alanı                    │
+    ├─────────────────────────────────────────────┤
+    │  Şifreli veri alanı (sektör 0'dan itibaren) │
+    └─────────────────────────────────────────────┘
+    </pre>
+  </div>
+
+  <h3>Temel kavramlar</h3>
+  <div class="params">
+    <div class="param"><span class="name">Master Key (Volume Key)</span><span class="desc">Rastgele üretilen 256/512-bit anahtar. Asla diskte düz metin saklanmaz; her keyslot'ta PBKDF türetilmiş anahtar ile şifreli tutulur</span></div>
+    <div class="param"><span class="name">Passphrase / Keyfile</span><span class="desc">Kullanıcının bildiği parola veya keyfile. PBKDF (Argon2id) aracılığıyla master key'i açan ara anahtarı türetir</span></div>
+    <div class="param"><span class="name">Keyslot</span><span class="desc">LUKS1'de 8, LUKS2'de 32 bağımsız slot. Her slot farklı parola/keyfile ile aynı master key'i açabilir</span></div>
+    <div class="param"><span class="name">AES-XTS</span><span class="desc">XTS (XEX-based Tweaked-codebook mode with ciphertext Stealing) — disk şifreleme için standart mod; her sektör bağımsız şifrelenir</span></div>
+    <div class="param"><span class="name">LUKS2 JSON Header</span><span class="desc">4 MB başlık; token, segment, keyslot ve integrity (dm-integrity) bilgisini içerir. LUKS1'e göre çok daha esnek</span></div>
+  </div>
+
+  <h3>LUKS1 vs LUKS2 karşılaştırması</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Özellik</th><th>LUKS1</th><th>LUKS2</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Header boyutu</td><td>1 MB</td><td>4 MB (yedekli)</td></tr>
+        <tr><td>Keyslot sayısı</td><td>8</td><td>32</td></tr>
+        <tr><td>PBKDF</td><td>PBKDF2</td><td>Argon2id (varsayılan)</td></tr>
+        <tr><td>Token desteği</td><td>Yok</td><td>Var (TPM2, clevis, fido2)</td></tr>
+        <tr><td>Integrity</td><td>Yok</td><td>dm-integrity entegrasyonu</td></tr>
+        <tr><td>Detached header</td><td>Yok</td><td>Var (harici header dosyası)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">GÜVENLİK NOTU</div>
+    <p>dm-crypt yalnızca <strong>dinlenme halindeki veriyi</strong> (data at rest) korur. Çalışan sistem mount edilmiş disk üzerindeyken anahtar bellekte bulunur. Boot-time unlock için fiziksel güvenlik ve güvenli boot zinciri (Secure Boot + dm-verity) gereklidir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>dm-crypt = kernel device mapper + AES-XTS katmanı</li>
+      <li>LUKS header, master key'i keyslot'larda şifreli saklar</li>
+      <li>LUKS2, Argon2id PBKDF ve TPM2 token desteğiyle öne çıkar</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> cryptsetup kurulum ve temel kullanım</h2>
+  <p class="section-lead"><code>cryptsetup</code>, dm-crypt ve LUKS yönetiminin birincil kullanıcı alanı aracıdır. Debian/Ubuntu, Yocto ve Buildroot'ta kolayca kurulur.</p>
+
+  <h3>Kurulum</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — paket kurulumu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Debian/Ubuntu</span>
+<span class="cmd">apt-get</span> install cryptsetup cryptsetup-initramfs
+
+<span class="cmt"># Buildroot — menuconfig</span>
+<span class="cmt"># Target packages → Filesystem and flash utilities → cryptsetup</span>
+<span class="cmt"># Kernel — enable dm-crypt:</span>
+<span class="cmt"># Device Drivers → Multiple devices driver support → Device mapper support</span>
+<span class="cmt"># → Crypt target support</span>
+
+<span class="cmt"># Yocto — local.conf veya layer recipe'ye ekle</span>
+<span class="cmt">IMAGE_INSTALL:append = " cryptsetup"</span>
+<span class="cmt">KERNEL_FEATURES:append = " features/cryptsetup/cryptsetup.scc"</span>
+
+<span class="cmt"># Sürüm doğrula</span>
+<span class="cmd">cryptsetup</span> --version
+<span class="cmt"># cryptsetup 2.7.2</span></code></pre>
+  </div>
+
+  <h3>Temel komutlar</h3>
+  <div class="params">
+    <div class="param"><span class="name">luksFormat</span><span class="desc">Yeni LUKS container oluştur ve ilk parolayı kaydet</span></div>
+    <div class="param"><span class="name">luksOpen / open</span><span class="desc">LUKS container'ı açıp /dev/mapper/ altında sanal blok oluştur</span></div>
+    <div class="param"><span class="name">luksClose / close</span><span class="desc">Sanal blok cihazını kaldır ve anahtarı bellekten sil</span></div>
+    <div class="param"><span class="name">luksDump</span><span class="desc">LUKS header bilgilerini (keyslot durumu, UUID, cipher) görüntüle</span></div>
+    <div class="param"><span class="name">luksAddKey</span><span class="desc">Mevcut container'a yeni parola/keyfile ekle (yeni keyslot)</span></div>
+    <div class="param"><span class="name">luksKillSlot</span><span class="desc">Belirtilen keyslot'u kalıcı olarak sil</span></div>
+    <div class="param"><span class="name">benchmark</span><span class="desc">Sistemin AES-XTS hızını ölç</span></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — temel işlem akışı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Mevcut LUKS cihazları listele</span>
+<span class="cmd">cryptsetup</span> luksDump /dev/mmcblk0p3
+
+<span class="cmt"># Şifreli diski aç</span>
+<span class="cmd">cryptsetup</span> open /dev/mmcblk0p3 veri_disk
+
+<span class="cmt"># Artık /dev/mapper/veri_disk kullanılabilir</span>
+<span class="cmd">mount</span> /dev/mapper/veri_disk /mnt/veri
+
+<span class="cmt"># Kapat</span>
+<span class="cmd">umount</span> /mnt/veri
+<span class="cmd">cryptsetup</span> close veri_disk
+
+<span class="cmt"># Hızlı durum sorgulama</span>
+<span class="cmd">cryptsetup</span> status veri_disk</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>cryptsetup, Yocto/Buildroot/Debian üçünde de kolayca kurulur</li>
+      <li>luksOpen → /dev/mapper/ sanal blok → mount zinciri standart akıştır</li>
+      <li>luksDump ile header bilgisi, benchmark ile AES hızı ölçülür</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> LUKS container oluşturma</h2>
+  <p class="section-lead">Yeni bir LUKS2 container oluşturmak için <code>luksFormat</code> kullanılır. Algoritma, anahtar boyutu ve PBKDF parametreleri bu adımda belirlenir.</p>
+
+  <h3>luksFormat seçenekleri</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — LUKS2 container oluşturma</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Minimum — varsayılan ayarlarla LUKS2 oluştur</span>
+<span class="cmd">cryptsetup</span> luksFormat /dev/mmcblk0p3
+
+<span class="cmt"># Üretim için önerilen: AES-256-XTS + Argon2id</span>
+<span class="cmd">cryptsetup</span> luksFormat \
+  --type luks2 \
+  --cipher aes-xts-plain64 \
+  --key-size 512 \
+  --hash sha256 \
+  --pbkdf argon2id \
+  --pbkdf-memory 65536 \
+  --pbkdf-parallel 4 \
+  --pbkdf-force-iterations 4 \
+  --label "rootfs-enc" \
+  /dev/mmcblk0p3
+
+<span class="cmt"># Parola yerine keyfile kullan (otomasyon için)</span>
+<span class="cmd">dd</span> if=/dev/urandom bs=64 count=1 of=/tmp/luks.key
+<span class="cmd">cryptsetup</span> luksFormat \
+  --type luks2 \
+  --key-file /tmp/luks.key \
+  /dev/mmcblk0p3
+
+<span class="cmt"># Formatlandıktan sonra aç ve dosya sistemi oluştur</span>
+<span class="cmd">cryptsetup</span> open --key-file /tmp/luks.key /dev/mmcblk0p3 enc_root
+<span class="cmd">mkfs.ext4</span> -L rootfs /dev/mapper/enc_root
+<span class="cmd">cryptsetup</span> close enc_root</code></pre>
+  </div>
+
+  <h3>Keyslot parametresi seçimi</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Parametre</th><th>Gömülü (düşük RAM)</th><th>Masaüstü / Sunucu</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>--pbkdf-memory</td><td>16384 (16 MB)</td><td>1048576 (1 GB)</td><td>Argon2id bellek tüketimi — brute force maliyetini artırır</td></tr>
+        <tr><td>--pbkdf-parallel</td><td>1–2</td><td>4–8</td><td>Paralel thread sayısı</td></tr>
+        <tr><td>--pbkdf-force-iterations</td><td>4</td><td>auto</td><td>Sabit iteration — boot hızı için kısıtlı kaynaklarda kullanılır</td></tr>
+        <tr><td>--key-size</td><td>256 (AES-128-XTS)</td><td>512 (AES-256-XTS)</td><td>XTS modunda key-size 2× etkili anahtar uzunluğudur</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">DİKKAT</div>
+    <p>Gömülü sistemlerde 256 MB RAM ile Argon2id 65536 KB bellek parametresi sistemi kitleyebilir. Boot sırasında anahtar türetimi için kullanılabilir RAM'i göz önünde bulundurun; gerekirse <code>--pbkdf-memory 16384</code> kullanın.</p>
+  </div>
+
+  <h3>LUKS header yedekleme</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — header yedek</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Header'ı harici dosyaya yedekle — ZORUNLU!</span>
+<span class="cmd">cryptsetup</span> luksHeaderBackup /dev/mmcblk0p3 \
+  --header-backup-file /secure/backup/mmcblk0p3_luks_header.bin
+
+<span class="cmt"># Header geri yükle (acil durum)</span>
+<span class="cmd">cryptsetup</span> luksHeaderRestore /dev/mmcblk0p3 \
+  --header-backup-file /secure/backup/mmcblk0p3_luks_header.bin
+
+<span class="cmt"># Yedek header bilgisini doğrula</span>
+<span class="cmd">cryptsetup</span> luksDump \
+  --header /secure/backup/mmcblk0p3_luks_header.bin \
+  /dev/mmcblk0p3</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>luksFormat parametreleri kaynakla orantılı seçilmeli (RAM, CPU)</li>
+      <li>AES-256-XTS için --key-size 512 gerekir (XTS çift anahtar kullanır)</li>
+      <li>Header yedeği olmadan LUKS partition kurtarılamaz — her zaman yedekleyin</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> initramfs ile şifreli root unlock</h2>
+  <p class="section-lead">Şifreli bir root partition, kernel başlamadan önce initramfs aşamasında açılmalıdır. cryptsetup-initramfs (Debian) veya Dracut/mkinitcpio ile bu otomasyon sağlanır.</p>
+
+  <h3>Debian/Ubuntu — cryptsetup-initramfs</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — /etc/crypttab yapılandırması</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># /etc/crypttab — format: &lt;name&gt; &lt;device&gt; &lt;keyfile&gt; &lt;options&gt;</span>
+<span class="cmt"># Parola ile açmak için</span>
+enc_root  UUID=a1b2c3d4-e5f6-7890-abcd-ef1234567890  none  luks,discard
+
+<span class="cmt"># Keyfile ile açmak için (keyfile initramfs'e gömülür)</span>
+enc_root  UUID=a1b2c3d4-e5f6-7890-abcd-ef1234567890  /etc/keys/luks.key  luks,discard
+
+<span class="cmt"># /etc/fstab — mapper cihazını root olarak mount et</span>
+/dev/mapper/enc_root  /  ext4  defaults,noatime  0  1
+
+<span class="cmt"># initramfs'i güncelle</span>
+<span class="cmd">update-initramfs</span> -u -k all
+
+<span class="cmt"># GRUB kernel parametrelerine cryptdevice ekle</span>
+<span class="cmt"># /etc/default/grub</span>
+<span class="cmt">GRUB_CMDLINE_LINUX="cryptdevice=UUID=a1b2c3d4...:enc_root root=/dev/mapper/enc_root"</span>
+<span class="cmd">update-grub</span></code></pre>
+  </div>
+
+  <h3>Yocto — özel initramfs unlock scripti</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — initramfs init hook</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">#!/bin/sh</span>
+<span class="cmt"># /etc/initramfs-tools/scripts/local-top/unlock-luks</span>
+
+PREREQ="cryptroot"
+prereqs() { echo "$PREREQ"; }
+case $1 in prereqs) prereqs; exit 0;; esac
+
+. /scripts/functions
+
+DEVICE="/dev/mmcblk0p3"
+MAPPER_NAME="enc_root"
+KEY_DEVICE="/dev/mmcblk0p4"   <span class="cmt"># ayrı key partition</span>
+KEY_FILE="/key.bin"
+
+<span class="cmt"># Key partition'ı monte et</span>
+mkdir -p /mnt/keystore
+mount -t vfat "$KEY_DEVICE" /mnt/keystore 2>/dev/null
+
+if [ -f "/mnt/keystore${KEY_FILE}" ]; then
+    <span class="cmt"># Keyfile ile otomatik aç</span>
+    cryptsetup open --key-file "/mnt/keystore${KEY_FILE}" \
+        "$DEVICE" "$MAPPER_NAME"
+else
+    <span class="cmt"># Fallback: parola sor</span>
+    cryptsetup open "$DEVICE" "$MAPPER_NAME"
+fi
+
+umount /mnt/keystore 2>/dev/null</code></pre>
+  </div>
+
+  <h3>U-Boot ile unlock parametresi</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — U-Boot bootargs</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># U-Boot ortam değişkeni — kernel'a cryptdevice parametre ilet</span>
+<span class="cmt">setenv bootargs "console=ttyS0,115200 root=/dev/mapper/enc_root \</span>
+<span class="cmt">  cryptdevice=/dev/mmcblk0p3:enc_root ro quiet"</span>
+
+<span class="cmt"># veya FIT imajı ile:</span>
+<span class="cmt">setenv bootargs "${bootargs} dm-mod.create=\</span>
+<span class="cmt">'enc_root,,0,rw, 0 $(blockdev --getsz /dev/mmcblk0p3) crypt aes-xts-plain64 \</span>
+<span class="cmt">:64:logon:cryptsetup:UUID 0 /dev/mmcblk0p3 0 1 allow_discards'"</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">GÜVENLİ BOOT ZİNCİRİ</div>
+    <p>initramfs kendisi şifrelenmemişse saldırgan initramfs'i değiştirip parola ele geçirebilir. Bunu engellemek için initramfs'i Secure Boot ile imzalamalı veya dm-verity ile koruma altına almalısınız.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>/etc/crypttab + update-initramfs ile Debian'da otomatik unlock kurulur</li>
+      <li>Yocto'da özel init hook ile keyfile/parola akışı yazılır</li>
+      <li>initramfs koruması için Secure Boot + dm-verity zorunludur</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> TPM2 ile key sealing</h2>
+  <p class="section-lead">TPM2, sistemin güvenilir bir durumda olduğu doğrulandığında (PCR değerleri eşleştiğinde) anahtarı otomatik açabilen donanım güvenlik bileşenidir. <code>systemd-cryptenroll</code> ve <code>clevis</code> bu işlemi basitleştirir.</p>
+
+  <h3>TPM2 PCR kavramı</h3>
+  <div class="params">
+    <div class="param"><span class="name">PCR0</span><span class="desc">BIOS/UEFI firmware ölçümü — firmware değişirse anahtar açılmaz</span></div>
+    <div class="param"><span class="name">PCR1</span><span class="desc">BIOS/UEFI konfigürasyonu</span></div>
+    <div class="param"><span class="name">PCR7</span><span class="desc">Secure Boot durumu — boot politikası değişirse anahtar açılmaz</span></div>
+    <div class="param"><span class="name">PCR9</span><span class="desc">initramfs imajı — initramfs değiştirilirse anahtar açılmaz</span></div>
+    <div class="param"><span class="name">PCR11</span><span class="desc">systemd-stub EFI değerleri</span></div>
+  </div>
+
+  <h3>systemd-cryptenroll ile TPM2 kayıt</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — systemd-cryptenroll</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Gerekli paket</span>
+<span class="cmd">apt-get</span> install systemd tpm2-tools
+
+<span class="cmt"># Mevcut keyslotları görüntüle</span>
+<span class="cmd">systemd-cryptenroll</span> /dev/mmcblk0p3
+
+<span class="cmt"># TPM2 ile PCR 0+7 bind ederek kayıt</span>
+<span class="cmt"># Mevcut LUKS parolası ile kimlik doğrulama yapılır</span>
+<span class="cmd">systemd-cryptenroll</span> \
+  --tpm2-device=auto \
+  --tpm2-pcrs=0+7 \
+  /dev/mmcblk0p3
+
+<span class="cmt"># PCR 0+7+9 ile (initramfs da ölçüme katılır)</span>
+<span class="cmd">systemd-cryptenroll</span> \
+  --tpm2-device=auto \
+  --tpm2-pcrs=0+7+9 \
+  --tpm2-with-pin=yes \
+  /dev/mmcblk0p3
+
+<span class="cmt"># /etc/crypttab'ı TPM2 token kullanacak şekilde güncelle</span>
+<span class="cmt">enc_root UUID=... none luks,tpm2-device=auto,discard</span>
+
+<span class="cmt"># TPM2 enrollment'ı kaldır (belirli slot)</span>
+<span class="cmd">systemd-cryptenroll</span> --wipe-slot=tpm2 /dev/mmcblk0p3</code></pre>
+  </div>
+
+  <h3>clevis ile Tang network unlock</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — clevis + Tang kurulumu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tang sunucusu kur (anahtar sunucusu — ayrı cihazda)</span>
+<span class="cmd">apt-get</span> install tang
+<span class="cmd">systemctl</span> enable --now tangd.socket
+
+<span class="cmt"># Cihazda clevis kur</span>
+<span class="cmd">apt-get</span> install clevis clevis-luks clevis-initramfs
+
+<span class="cmt"># Tang sunucusuna bind et</span>
+<span class="cmd">clevis</span> luks bind -d /dev/mmcblk0p3 tang \
+  '{"url":"http://192.168.1.10","thp":"ABC123..."}'
+
+<span class="cmt"># TPM2 + Tang birlikte (shamir — her ikisi de gerekli)</span>
+<span class="cmd">clevis</span> luks bind -d /dev/mmcblk0p3 sss \
+  '{"t":2,"pins":{"tpm2":{"pcr_ids":"0,7"},"tang":{"url":"http://192.168.1.10"}}}'
+
+<span class="cmt"># initramfs güncelle</span>
+<span class="cmd">update-initramfs</span> -u -k all
+
+<span class="cmt"># Test: manuel clevis unlock</span>
+<span class="cmd">clevis</span> luks unlock -d /dev/mmcblk0p3 -n enc_root</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>TPM2 PCR binding, sistem durumu değişince otomatik kilitleme sağlar</li>
+      <li>systemd-cryptenroll en basit TPM2 entegrasyonudur — systemd 248+</li>
+      <li>clevis ile Tang network unlock veya Shamir kombinasyonu mümkündür</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Key rotation ve slot yönetimi</h2>
+  <p class="section-lead">Anahtar rotasyonu güvenlik politikasının kritik parçasıdır. LUKS'un çok keyslotlu yapısı, sıfır kesintili parola değişimine olanak tanır.</p>
+
+  <h3>Keyslot yönetimi komutları</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — keyslot işlemleri</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Mevcut keyslot durumunu görüntüle</span>
+<span class="cmd">cryptsetup</span> luksDump /dev/mmcblk0p3 | grep -E "Keyslot|State"
+
+<span class="cmt"># Yeni parola ekle (slot 1'e) — önce mevcut parolayla doğrulama</span>
+<span class="cmd">cryptsetup</span> luksAddKey \
+  --key-slot 1 \
+  /dev/mmcblk0p3
+
+<span class="cmt"># Yeni keyfile ekle (slot 2)</span>
+<span class="cmd">cryptsetup</span> luksAddKey \
+  --key-slot 2 \
+  --new-keyfile /etc/keys/new_luks.key \
+  /dev/mmcblk0p3
+
+<span class="cmt"># Eski parolayı kaldır (slot 0)</span>
+<span class="cmd">cryptsetup</span> luksKillSlot /dev/mmcblk0p3 0
+
+<span class="cmt"># Acil durum: tüm keyslotları sil (veri erişilemez olur!)</span>
+<span class="cmd">cryptsetup</span> erase /dev/mmcblk0p3</code></pre>
+  </div>
+
+  <h3>Sıfır kesintili key rotation prosedürü</h3>
+  <div class="flow">
+    <pre>
+1. Yeni anahtarı yeni bir slot'a ekle
+   cryptsetup luksAddKey --key-slot 1 /dev/mmcblk0p3
+
+2. Yeni anahtarın çalıştığını doğrula
+   cryptsetup open --key-slot 1 --test-passphrase /dev/mmcblk0p3
+
+3. initramfs / sistemleri yeni anahtarla güncelle
+   update-initramfs -u -k all
+
+4. Yeniden başlat ve yeni anahtarla boot et
+
+5. Eski slot'u sil
+   cryptsetup luksKillSlot /dev/mmcblk0p3 0
+    </pre>
+  </div>
+
+  <h3>LUKS2 re-encrypt (master key değişimi)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — online re-encryption (LUKS2)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># LUKS2 online re-encryption — disk mount'luyken bile çalışır</span>
+<span class="cmt"># Yeni cipher ve key-size ile master key yeniden oluşturulur</span>
+<span class="cmd">cryptsetup</span> reencrypt \
+  --cipher aes-xts-plain64 \
+  --key-size 512 \
+  --pbkdf argon2id \
+  --resume-only \
+  /dev/mmcblk0p3
+
+<span class="cmt"># İlerlemeyi takip et</span>
+<span class="cmd">cryptsetup</span> reencrypt --resume-only --verbose /dev/mmcblk0p3
+
+<span class="cmt"># Kesinti durumunda devam et</span>
+<span class="cmd">cryptsetup</span> reencrypt --resume-only /dev/mmcblk0p3</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">BEST PRACTICE</div>
+    <p>Üretim cihazlarında her cihaz için benzersiz LUKS key kullanın. Master key'i cihaz UUID veya seri numarasından türetin ve merkezi bir anahtar kasasında (HashiCorp Vault, AWS KMS) saklayın. Aynı anahtarın tüm filolara yayılması, tek anahtar ifşasının tüm filoya zarar vermesi anlamına gelir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Yeni slot ekle → doğrula → eski sil zinciri kesintisiz rotasyonu sağlar</li>
+      <li>LUKS2 online re-encryption, master key değişimini çalışırken yapar</li>
+      <li>Her cihaza özgü anahtar politikası üretim güvenliğinin temelidir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> dm-verity ile birlikte kullanım</h2>
+  <p class="section-lead">dm-crypt şifreleme sağlarken dm-verity bütünlük sağlar. İkisi birlikte kullanıldığında hem dinlenme halindeki veri korunur hem de değiştirme saldırıları tespit edilir.</p>
+
+  <h3>Katman mimarisi</h3>
+  <div class="flow">
+    <pre>
+Root Filesystem (read-only squashfs)
+         ↓
+   dm-verity (bütünlük — hash tree doğrulama)
+         ↓
+   dm-crypt (şifreleme — AES-XTS)
+         ↓
+   Fiziksel depolama (eMMC partition)
+    </pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">SIRA ÖNEMLİ</div>
+    <p>dm-verity her zaman dm-crypt'in <strong>üstünde</strong> konumlanmalıdır. dm-crypt şifreli bloğu çözdükten sonra dm-verity hash'leri doğrular. Ters sıra hem güvenlik hem de performans açısından yanlıştır.</p>
+  </div>
+
+  <h3>dm-verity + dm-crypt stack kurulumu</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — kombinasyon kurulum</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1. Root filesystem imajı oluştur (squashfs)</span>
+<span class="cmd">mksquashfs</span> rootfs/ rootfs.squashfs -comp zstd
+
+<span class="cmt"># 2. LUKS2 container oluştur (imaj boyutu + biraz fazla)</span>
+<span class="cmd">truncate</span> -s 512M enc_rootfs.img
+<span class="cmd">cryptsetup</span> luksFormat --type luks2 enc_rootfs.img
+
+<span class="cmt"># 3. LUKS aç ve squashfs'i içine yaz</span>
+<span class="cmd">cryptsetup</span> open enc_rootfs.img enc_root
+<span class="cmd">dd</span> if=rootfs.squashfs of=/dev/mapper/enc_root bs=4M status=progress
+<span class="cmd">cryptsetup</span> close enc_root
+
+<span class="cmt"># 4. Kapalıyken verity hash hesapla (şifreli bloğa karşı değil, </span>
+<span class="cmt">#    açık veri üzerinde — dolayısıyla önce aç)</span>
+<span class="cmd">cryptsetup</span> open enc_rootfs.img enc_root_tmp
+<span class="cmd">veritysetup</span> format /dev/mapper/enc_root_tmp verity_hash.bin \
+  | tee verity_params.txt
+<span class="cmd">cryptsetup</span> close enc_root_tmp
+
+<span class="cmt"># 5. Boot zamanında stack:</span>
+<span class="cmt">#    a. LUKS aç</span>
+<span class="cmd">cryptsetup</span> open /dev/mmcblk0p3 enc_root
+
+<span class="cmt">#    b. dm-verity üstüne ekle</span>
+ROOT_HASH=$(grep "Root hash:" verity_params.txt | awk '{print $3}')
+<span class="cmd">veritysetup</span> open /dev/mapper/enc_root verity_root \
+  /dev/mapper/enc_root "$ROOT_HASH"
+
+<span class="cmt">#    c. Mount et (read-only!)</span>
+<span class="cmd">mount</span> -o ro /dev/mapper/verity_root /
+
+<span class="cmt"># Bütünlük ihlalinde verity EIO döndürür, sistem panik yapar</span></code></pre>
+  </div>
+
+  <h3>Kernel dm-crypt + dm-verity parametreleri</h3>
+  <div class="code-block">
+    <div class="code-header"><span>kconfig — kernel seçenekleri</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Device mapper</span>
+CONFIG_BLK_DEV_DM=y
+CONFIG_DM_CRYPT=y
+CONFIG_DM_VERITY=y
+CONFIG_DM_VERITY_VERIFY_ROOTHASH_SIG=y  <span class="cmt"># root hash imza doğrulama</span>
+
+<span class="cmt"># AES donanım hızlandırma</span>
+CONFIG_CRYPTO_AES_ARM64_CE=y
+CONFIG_CRYPTO_SHA256_ARM64=y</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>dm-crypt (şifreleme) + dm-verity (bütünlük) birlikte tam at-rest koruma sağlar</li>
+      <li>Sıra: fiziksel disk → dm-crypt → dm-verity → filesystem</li>
+      <li>dm-verity ihlali EIO → kernel panic ile sistemi durdurur</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Performans etkisi ve AES-NI</h2>
+  <p class="section-lead">dm-crypt performans etkisi AES-NI donanım hızlandırması ile minimize edilebilir. Modern ARM SoC'ların büyük çoğunluğu AES-CE (Cryptography Extensions) içerir.</p>
+
+  <h3>AES-NI desteğini kontrol et</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — donanım şifreleme desteği</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># x86 — AES-NI</span>
+<span class="cmd">grep</span> aes /proc/cpuinfo | head -1
+
+<span class="cmt"># ARM64 — AES-CE (Cortex-A53/A72/A55...)</span>
+<span class="cmd">grep</span> aes /proc/cpuinfo
+<span class="cmt"># Features: fp asimd evtstrm aes pmull sha1 sha2 crc32 ...</span>
+
+<span class="cmt"># Kernel crypto listesi</span>
+<span class="cmd">cat</span> /proc/crypto | grep -A4 "aes"
+
+<span class="cmt"># Aktif şifreleme modülü</span>
+<span class="cmd">lsmod</span> | grep aes</code></pre>
+  </div>
+
+  <h3>cryptsetup benchmark</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — şifreleme benchmark</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm algoritmaları test et</span>
+<span class="cmd">cryptsetup</span> benchmark
+
+<span class="cmt"># Örnek çıktı (Cortex-A72 @ 1.8 GHz, AES-CE etkin):</span>
+<span class="cmt"># #  Algorithm |       Key |      Encryption |      Decryption</span>
+<span class="cmt">#     aes-cbc   128b       943.2 MiB/s      3168.0 MiB/s</span>
+<span class="cmt">#     aes-cbc   256b       720.7 MiB/s      2432.9 MiB/s</span>
+<span class="cmt">#     aes-xts   256b      1024.3 MiB/s      1008.7 MiB/s</span>
+<span class="cmt">#     aes-xts   512b       775.2 MiB/s       775.8 MiB/s</span>
+
+<span class="cmt"># Belirli algoritmayı test et</span>
+<span class="cmd">cryptsetup</span> benchmark --cipher aes-xts --key-size 512
+
+<span class="cmt"># fio ile gerçek disk I/O benchmark (LUKS açıkken)</span>
+<span class="cmd">fio</span> --filename=/dev/mapper/enc_root \
+  --rw=randread \
+  --bs=4k \
+  --direct=1 \
+  --numjobs=4 \
+  --iodepth=32 \
+  --name=luks_randread \
+  --runtime=30 \
+  --output-format=json</code></pre>
+  </div>
+
+  <h3>Performans karşılaştırması</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Platform</th><th>AES-CE</th><th>Seq Write (ham)</th><th>LUKS AES-256-XTS</th><th>Ek yük</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>RPi 4 (A72)</td><td>Var</td><td>230 MB/s</td><td>215 MB/s</td><td>~7%</td></tr>
+        <tr><td>RPi Zero (A6)</td><td>Yok (yazılımsal)</td><td>22 MB/s</td><td>8 MB/s</td><td>~64%</td></tr>
+        <tr><td>i.MX8M (A53)</td><td>Var</td><td>280 MB/s</td><td>258 MB/s</td><td>~8%</td></tr>
+        <tr><td>AM6254 (A53)</td><td>Var + TRNG</td><td>200 MB/s</td><td>188 MB/s</td><td>~6%</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>AES-CE olan ARM64 SoC'larda dm-crypt ek yükü %6–8 düzeyindedir</li>
+      <li>AES-CE olmayan eski ARM'larda yazılımsal AES %40–60 performans kaybı yaratır</li>
+      <li>fio ile gerçek iş yükü benchmark her zaman sentetik testten üstündür</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: RPi eMMC şifreleme + TPM2 unlock</h2>
+  <p class="section-lead">Raspberry Pi CM4'ün eMMC'sini LUKS2 ile şifreleyin ve TPM2 (Infineon SLB9670 SPI modülü) ile otomatik unlock kurun.</p>
+
+  <h3>Gereksinimler</h3>
+  <div class="params">
+    <div class="param"><span class="name">Donanım</span><span class="desc">Raspberry Pi CM4 (eMMC modeli), Infineon SLB9670 SPI TPM2 modülü, harici PC (ilk kurulum için)</span></div>
+    <div class="param"><span class="name">Yazılım</span><span class="desc">Raspberry Pi OS Lite (64-bit), cryptsetup 2.6+, tpm2-tools, clevis veya systemd-cryptenroll</span></div>
+  </div>
+
+  <h3>Adım 1 — eMMC'yi imajla ve bölümle</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — harici PC'de hazırlık</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># rpiboot ile eMMC'yi PC'ye bağla</span>
+<span class="cmd">rpiboot</span>
+<span class="cmt"># /dev/sdb olarak görünür</span>
+
+<span class="cmt"># GPT bölümleme</span>
+<span class="cmd">sgdisk</span> --zap-all /dev/sdb
+<span class="cmd">sgdisk</span> --new=1:2048:526335   --typecode=1:0700 --change-name=1:"boot"    /dev/sdb
+<span class="cmd">sgdisk</span> --new=2:526336:0      --typecode=2:8300 --change-name=2:"root-enc" /dev/sdb
+
+<span class="cmt"># Boot partition (FAT32 — şifresiz)</span>
+<span class="cmd">mkfs.vfat</span> -F32 -n BOOT /dev/sdb1
+
+<span class="cmt"># LUKS2 root partition</span>
+<span class="cmd">cryptsetup</span> luksFormat \
+  --type luks2 \
+  --cipher aes-xts-plain64 \
+  --key-size 512 \
+  --pbkdf argon2id \
+  --pbkdf-memory 32768 \
+  --label "rpi-root-enc" \
+  /dev/sdb2
+
+<span class="cmt"># Geçici parolayla aç ve ext4 kur</span>
+<span class="cmd">cryptsetup</span> open /dev/sdb2 rpi_root
+<span class="cmd">mkfs.ext4</span> -L rootfs /dev/mapper/rpi_root
+
+<span class="cmt"># Raspberry Pi OS rootfs'ini kopyala</span>
+<span class="cmd">mount</span> /dev/mapper/rpi_root /mnt/rpi
+<span class="cmt"># ... rsync veya tar ile kopyala ...</span>
+<span class="cmd">umount</span> /mnt/rpi
+<span class="cmd">cryptsetup</span> close rpi_root</code></pre>
+  </div>
+
+  <h3>Adım 2 — TPM2 SPI modülü bağlantısı</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — TPM2 device tree overlay</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># /boot/config.txt</span>
+dtoverlay=tpm-slb9670
+
+<span class="cmt"># TPM2 cihazını doğrula</span>
+<span class="cmd">ls</span> /dev/tpm0 /dev/tpmrm0
+
+<span class="cmt"># tpm2-tools ile temel test</span>
+<span class="cmd">tpm2_getcap</span> properties-fixed | grep -i vendor
+<span class="cmd">tpm2_pcrread</span> sha256:0,7</code></pre>
+  </div>
+
+  <h3>Adım 3 — systemd-cryptenroll ile TPM2 kayıt</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — cihaz üzerinde (ilk boot)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># İlk boot'ta parolayla giriş yap</span>
+<span class="cmt"># Ardından TPM2'ye kaydet</span>
+
+<span class="cmd">systemd-cryptenroll</span> \
+  --tpm2-device=/dev/tpmrm0 \
+  --tpm2-pcrs=0+7 \
+  /dev/mmcblk0p2
+
+<span class="cmt"># /etc/crypttab güncelle</span>
+<span class="cmt">rpi_root UUID=$(blkid -s UUID -o value /dev/mmcblk0p2) \</span>
+<span class="cmt">  none luks,tpm2-device=auto,discard</span>
+
+<span class="cmt"># initramfs güncelle</span>
+<span class="cmd">update-initramfs</span> -u -k all
+
+<span class="cmt"># Yeniden başlat — TPM2 ile otomatik unlock</span>
+<span class="cmd">reboot</span>
+
+<span class="cmt"># Header yedeği al</span>
+<span class="cmd">cryptsetup</span> luksHeaderBackup /dev/mmcblk0p2 \
+  --header-backup-file /boot/luks_header_backup.bin</code></pre>
+  </div>
+
+  <h3>Adım 4 — Doğrulama ve izleme</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — doğrulama komutları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># LUKS durumunu kontrol et</span>
+<span class="cmd">cryptsetup</span> status rpi_root
+<span class="cmd">cryptsetup</span> luksDump /dev/mmcblk0p2 | grep -E "Keyslot|Token|State"
+
+<span class="cmt"># TPM2 token listesi</span>
+<span class="cmd">systemd-cryptenroll</span> /dev/mmcblk0p2
+
+<span class="cmt"># TPM2 PCR değerlerini kaydet (baseline)</span>
+<span class="cmd">tpm2_pcrread</span> sha256:0,1,7,9 > /secure/pcr_baseline.txt
+
+<span class="cmt"># Kernel güncelleme sonrası TPM2 enrollment yenile</span>
+<span class="cmt"># (PCR9 değişecek)</span>
+<span class="cmd">systemd-cryptenroll</span> --wipe-slot=tpm2 /dev/mmcblk0p2
+<span class="cmd">systemd-cryptenroll</span> --tpm2-device=auto --tpm2-pcrs=0+7 /dev/mmcblk0p2</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>CM4 eMMC LUKS2 şifreleme + SPI TPM2 ile otomatik unlock kuruldu</li>
+      <li>PCR 0+7 binding — firmware veya Secure Boot değişirse disk kilitlenir</li>
+      <li>Kernel güncellemelerinde TPM2 enrollment yenilenmesi unutulmamalı</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

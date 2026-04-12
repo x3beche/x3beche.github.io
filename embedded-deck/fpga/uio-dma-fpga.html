@@ -1,0 +1,747 @@
+---
+layout: tutorial
+title: "UIO & AXI-DMA — Kullanıcı Alanı Sürücüsü"
+back_url: "../index.html"
+back_label: "FPGA & Linux"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>FPGA &amp; LINUX</span>
+    <span>SÜRÜCÜ</span>
+    <span>2026</span>
+  </div>
+  <h1>UIO &amp; AXI-DMA<br><em>Kullanıcı Alanı Sürücüsü</em></h1>
+  <p class="subtitle">UIO (Userspace I/O) çerçevesi, /dev/uio0 ile mmap register erişimi, kesme yönetimi, AXI-DMA sürücüsü, scatter-gather tanımlayıcıları, CMA bellek ayırıcısı ve PS DDR↔FPGA veri transferi.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">UIO (Userspace I/O) sürücü çerçevesi</a></li>
+    <li><a href="#s1">/dev/uio0 — mmap ile register erişimi</a></li>
+    <li><a href="#s2">UIO ile kesme yönetimi</a></li>
+    <li><a href="#s3">AXI-DMA sürücüsü (xilinx-dma)</a></li>
+    <li><a href="#s4">Coherent vs streaming DMA — FPGA için seçim</a></li>
+    <li><a href="#s5">Scatter-gather DMA tanımlayıcıları</a></li>
+    <li><a href="#s6">libxdma kullanıcı alanı kütüphanesi</a></li>
+    <li><a href="#s7">CMA ve dma_alloc_coherent — bellek ayırıcısı</a></li>
+    <li><a href="#s8">Pratik: PS DDR ↔ FPGA AXI-DMA tam transfer programı</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> UIO (Userspace I/O) sürücü çerçevesi</h2>
+  <p class="section-lead">UIO, periferalin I/O register haritası ve kesme yönetimini kullanıcı alanına taşıyan bir Linux kernel çerçevesidir. Kernel'e minimal bir stub sürücü yazılır; asıl sürücü mantığı güvenli bir kullanıcı alanı programında uygulanır.</p>
+
+  <h3>UIO mimarisi</h3>
+  <div class="flow">
+    <pre>
+  Kullanıcı alanı uygulama
+       │
+       │  open("/dev/uio0")
+       │  mmap() → register'lar
+       │  read() → kesme bekleme
+       │  write() → kesme etkinleştir/temizle
+       ↓
+  ─────────────── Kernel sınırı ───────────────
+       ↓
+  UIO çekirdeği (drivers/uio/uio.c)
+       │
+       │  uio_register_device()
+       ↓
+  Minimal platform stub sürücüsü
+  (uio_pdrv_genirq.c veya özel)
+       │
+       ↓
+  Donanım: FPGA AXI periferali</pre>
+  </div>
+
+  <h3>UIO'nun avantajları ve sınırlamaları</h3>
+  <div class="params">
+    <div class="param"><span class="name">Avantaj: hız</span><span class="desc">Sistem çağrısı yokken doğrudan mmap bellekten register okuma/yazma — düşük gecikme</span></div>
+    <div class="param"><span class="name">Avantaj: basitlik</span><span class="desc">Kernel modülü yazmak yerine C/C++/Python ile kullanıcı alanında sürücü; kolay debug</span></div>
+    <div class="param"><span class="name">Avantaj: yeniden başlatma güvenliği</span><span class="desc">Kullanıcı programı çöküse donanım zarar görmez; kernel kodu kararlı kalır</span></div>
+    <div class="param"><span class="name">Sınırlama: DMA</span><span class="desc">Büyük DMA transferleri için ek mekanizma (VFIO, CMA, /dev/mem) gerekir</span></div>
+    <div class="param"><span class="name">Sınırlama: güvenlik</span><span class="desc">root erişimi veya uio grubuna üyelik gerekir; üretimde ACL ile kısıtla</span></div>
+  </div>
+
+  <h3>Kernel minimal stub: uio_pdrv_genirq</h3>
+  <p>Özel bir kernel modülü yazmak gerekmez; <code>uio_pdrv_genirq</code> sürücüsü Device Tree'deki <code>compatible = "generic-uio"</code> node'larını otomatik olarak UIO cihazına dönüştürür.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>DTS — UIO node tanımı</span><span class="dot">●</span></div>
+    <pre><code>my_uio_periph: my-periph&#64;40000000 {
+    compatible = <span class="str">"generic-uio"</span>, <span class="str">"ui_pdrv"</span>;
+    reg = &lt;0x40000000 0x10000&gt;;     <span class="cmt">/* base adres, boyut */</span>
+    interrupts = &lt;0 29 4&gt;;          <span class="cmt">/* IRQ tanımı */</span>
+    interrupt-parent = &lt;&amp;gic&gt;;
+};</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>cmdline / modprobe — UIO sürücüsünü etkinleştir</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kernel parametresi (U-Boot'ta)</span>
+<span class="cmt"># setenv bootargs ... uio_pdrv_genirq.of_id="generic-uio"</span>
+
+<span class="cmt"># veya modprobe ile yükleme</span>
+modprobe uio_pdrv_genirq of_id=<span class="str">"generic-uio"</span>
+
+<span class="cmt"># Cihaz oluşturuldu mu?</span>
+ls /dev/uio*
+<span class="cmt"># → /dev/uio0</span>
+
+<span class="cmt"># UIO cihaz bilgisi</span>
+cat /sys/class/uio/uio0/name
+cat /sys/class/uio/uio0/maps/map0/addr
+cat /sys/class/uio/uio0/maps/map0/size</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>UIO: minimal kernel stub + kullanıcı alanı sürücü mantığı</li>
+      <li>uio_pdrv_genirq + compatible="generic-uio": sıfır kernel kodu</li>
+      <li>mmap: register erişimi; read: kesme bekleme; write: kesme temizle</li>
+      <li>Avantaj: hız + basitlik; Sınırlama: büyük DMA için ek mekanizma</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> /dev/uio0 — mmap ile register erişimi</h2>
+  <p class="section-lead">/dev/uio0 cihaz dosyası üzerinden mmap çağrısı yaparak FPGA periferalinin register haritası doğrudan işlem adres uzayına eşlenir. Bu sayede register'lara pointer erişimi gibi yazılabilir.</p>
+
+  <h3>Temel UIO mmap şablonu</h3>
+  <div class="code-block">
+    <div class="code-header"><span>uio_mmap.c — tam şablon</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;string.h&gt;
+
+#define UIO_DEV      "/dev/uio0"
+#define UIO_MAP_SZ_PATH "/sys/class/uio/uio0/maps/map0/size"
+
+<span class="keyword">static</span> size_t get_uio_map_size(<span class="keyword">const</span> <span class="keyword">char</span> *path)
+{
+    FILE *f = fopen(path, <span class="str">"r"</span>);
+    <span class="keyword">if</span> (!f) return 0;
+    size_t size;
+    fscanf(f, <span class="str">"0x%zx"</span>, &amp;size);
+    fclose(f);
+    <span class="keyword">return</span> size;
+}
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>)
+{
+    int fd = open(UIO_DEV, O_RDWR | O_SYNC);
+    <span class="keyword">if</span> (fd &lt; 0) {
+        fprintf(stderr, <span class="str">"open %s: %s\n"</span>, UIO_DEV, strerror(errno));
+        <span class="keyword">return</span> EXIT_FAILURE;
+    }
+
+    <span class="cmt">/* map0 boyutunu sysfs'ten oku */</span>
+    size_t map_size = get_uio_map_size(UIO_MAP_SZ_PATH);
+    <span class="keyword">if</span> (!map_size) map_size = 0x10000;  <span class="cmt">/* fallback 64 KB */</span>
+
+    <span class="cmt">/* map0 → mmap offset = 0 * getpagesize() */</span>
+    <span class="keyword">volatile</span> uint32_t *regs = mmap(NULL, map_size,
+                                   PROT_READ | PROT_WRITE,
+                                   MAP_SHARED, fd, 0 * getpagesize());
+    <span class="keyword">if</span> (regs == MAP_FAILED) {
+        perror(<span class="str">"mmap"</span>);
+        close(fd);
+        <span class="keyword">return</span> EXIT_FAILURE;
+    }
+
+    <span class="cmt">/* Register erişimi */</span>
+    printf(<span class="str">"ID register: 0x%08X\n"</span>, regs[0x00 / 4]);
+    printf(<span class="str">"STATUS:      0x%08X\n"</span>, regs[0x04 / 4]);
+
+    <span class="cmt">/* Kontrol register'ına yaz */</span>
+    regs[0x08 / 4] = 0x01;   <span class="cmt">/* enable */</span>
+
+    munmap((<span class="keyword">void</span> *)regs, map_size);
+    close(fd);
+    <span class="keyword">return</span> EXIT_SUCCESS;
+}</code></pre>
+  </div>
+
+  <h3>Birden fazla bellek bölgesi (map1, map2...)</h3>
+  <p>Bir UIO cihazı birden fazla bellek bölgesine sahip olabilir. Her bölge ayrı bir mmap çağrısıyla eşlenir; offset = bölge_indeksi × getpagesize() olarak hesaplanır. Örneğin bir DMA denetleyicisinin register haritası map0'da, DMA tampon alanı map1'de olabilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>Çoklu map — map1 erişimi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* map1 için offset = 1 * page_size */</span>
+<span class="keyword">volatile</span> uint32_t *dma_buf = mmap(NULL, dma_size,
+    PROT_READ | PROT_WRITE, MAP_SHARED,
+    fd, 1 * getpagesize());   <span class="cmt">/* map1 */</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>mmap(fd, 0*pagesize): map0 eşlemesi; volatile uint32_t pointer ile register erişimi</li>
+      <li>Map boyutu: /sys/class/uio/uio0/maps/map0/size sysfs'ten okunur</li>
+      <li>Çoklu map: offset = N × pagesize; her bölge bağımsız mmap</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> UIO ile kesme yönetimi</h2>
+  <p class="section-lead">UIO üzerinden kesme bekleme, /dev/uio0'ı read() ile okumakla gerçekleşir. Kernel, donanım kesmesi geldiğinde read()'i döndürür; dönen değer kesme sayacıdır.</p>
+
+  <h3>Kesme bekleme ve temizleme döngüsü</h3>
+  <div class="code-block">
+    <div class="code-header"><span>uio_irq.c — UIO interrupt yönetimi</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;poll.h&gt;
+
+<span class="keyword">int</span> uio_wait_irq(int uio_fd, int timeout_ms)
+{
+    <span class="keyword">struct</span> pollfd pfd = {
+        .fd     = uio_fd,
+        .events = POLLIN,
+    };
+    int ret = poll(&amp;pfd, 1, timeout_ms);
+    <span class="keyword">if</span> (ret &lt; 0)  { perror(<span class="str">"poll"</span>); <span class="keyword">return</span> -1; }
+    <span class="keyword">if</span> (ret == 0) { <span class="keyword">return</span> 0; }   <span class="cmt">/* zaman aşımı */</span>
+
+    <span class="cmt">/* Kesme sayacını oku (bu kesmeden önce gelenleri temizler) */</span>
+    uint32_t irq_count;
+    read(uio_fd, &amp;irq_count, <span class="keyword">sizeof</span>(irq_count));
+    <span class="keyword">return</span> (int)irq_count;
+}
+
+<span class="keyword">void</span> uio_enable_irq(int uio_fd)
+{
+    <span class="cmt">/* 1 yaz → kernel IRQ'yu yeniden etkinleştirir (unmask) */</span>
+    uint32_t enable = 1;
+    write(uio_fd, &amp;enable, <span class="keyword">sizeof</span>(enable));
+}
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>)
+{
+    int fd = open(<span class="str">"/dev/uio0"</span>, O_RDWR);
+    <span class="cmt">/* ... mmap regs ... */</span>
+
+    uio_enable_irq(fd);         <span class="cmt">/* IRQ etkinleştir */</span>
+
+    <span class="keyword">for</span> (;;) {
+        int cnt = uio_wait_irq(fd, 1000);  <span class="cmt">/* 1 sn timeout */</span>
+        <span class="keyword">if</span> (cnt &lt;= 0) <span class="keyword">continue</span>;
+
+        printf(<span class="str">"IRQ #%d alındı\n"</span>, cnt);
+
+        <span class="cmt">/* Donanım kesme bayrağını temizle (register'a yaz) */</span>
+        <span class="cmt">/* regs[IRQ_STATUS / 4] = 0x1; */</span>
+
+        uio_enable_irq(fd);     <span class="cmt">/* Bir sonraki kesme için unmask */</span>
+    }
+    close(fd);
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>UIO read() çağrısı, kesmeyi kernel seviyesinde mask eder. Bir sonraki read()'den önce write(fd, 1) ile unmask yapılmazsa sonraki donanım kesmesi asla gelmiyor gibi görünür. Uygulama döngüsü: wait_irq → işle → donanım bayrağını temizle → enable_irq.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>read(uio_fd): bloklar ve kesme gelince döner — dönen değer kesme sayacı</li>
+      <li>write(uio_fd, 1): IRQ'yu unmask eder — zorunlu her kesme sonrası</li>
+      <li>poll() ile timeout: bloksuz bekleme — birden fazla FD izleme</li>
+      <li>Döngü: wait → işle → hw bayrağı temizle → unmask → döngü</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> AXI-DMA sürücüsü (xilinx-dma)</h2>
+  <p class="section-lead">Xilinx AXI-DMA IP bloğu için Linux kernel sürücüsü <code>drivers/dma/xilinx/xilinx_dma.c</code>'dedir. Bu sürücü, DMA Engine API üzerinden kullanılır ve hem doğrudan mod hem scatter-gather modunu destekler.</p>
+
+  <h3>AXI-DMA blok diyagramı</h3>
+  <div class="flow">
+    <pre>
+  PS DDR ←─────────────────────────────── AXI-DMA ───── PL İşlemci
+            S2MM (Stream-to-Memory)          │
+            AXI4 (HP port)                   │ MM2S (Memory-to-Stream)
+                                             │ AXI4 (HP port)
+  PS DDR ──────────────────────────────────→ AXI-DMA ──→ PL İşlemci
+
+  AXI-DMA → AXI4 master (HP port) → DDR: yüksek bant genişliği
+  AXI-DMA → AXI4-Stream: PL işleme hattına bağlantı</pre>
+  </div>
+
+  <h3>Device Tree — AXI-DMA</h3>
+  <div class="code-block">
+    <div class="code-header"><span>AXI-DMA DTS tanımı</span><span class="dot">●</span></div>
+    <pre><code>axi_dma_0: dma&#64;40400000 {
+    compatible = <span class="str">"xlnx,axi-dma-1.00.a"</span>;
+    reg = &lt;0x40400000 0x10000&gt;;
+    #dma-cells = &lt;1&gt;;
+    xlnx,addrwidth = &lt;32&gt;;
+
+    dma-channel&#64;40400000 {
+        compatible = <span class="str">"xlnx,axi-dma-mm2s-channel"</span>;
+        interrupts = &lt;0 29 4&gt;;
+        interrupt-parent = &lt;&amp;gic&gt;;
+        xlnx,datawidth = &lt;32&gt;;
+        xlnx,device-id = &lt;0&gt;;
+    };
+
+    dma-channel&#64;40400030 {
+        compatible = <span class="str">"xlnx,axi-dma-s2mm-channel"</span>;
+        interrupts = &lt;0 30 4&gt;;
+        interrupt-parent = &lt;&amp;gic&gt;;
+        xlnx,datawidth = &lt;32&gt;;
+        xlnx,device-id = &lt;0&gt;;
+    };
+};</code></pre>
+  </div>
+
+  <h3>DMA Engine API — kanal alma</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Kernel sürücüsü — DMA Engine API (C)</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/dmaengine.h&gt;
+
+<span class="keyword">struct</span> dma_chan *tx_chan, *rx_chan;
+
+<span class="cmt">/* TX (MM2S) kanalı al */</span>
+tx_chan = dma_request_chan(&amp;pdev-&gt;dev, <span class="str">"axidma0"</span>);
+<span class="keyword">if</span> (IS_ERR(tx_chan)) {
+    dev_err(&amp;pdev-&gt;dev, <span class="str">"MM2S kanalı alınamadı\n"</span>);
+    <span class="keyword">return</span> PTR_ERR(tx_chan);
+}
+
+<span class="cmt">/* RX (S2MM) kanalı al */</span>
+rx_chan = dma_request_chan(&amp;pdev-&gt;dev, <span class="str">"axidma1"</span>);
+
+<span class="cmt">/* Transfer hazırlama */</span>
+<span class="keyword">struct</span> dma_async_tx_descriptor *desc;
+dma_addr_t dma_src = dma_map_single(&amp;pdev-&gt;dev,
+                                     src_buf, buf_size,
+                                     DMA_TO_DEVICE);
+desc = dmaengine_prep_slave_single(tx_chan, dma_src,
+                                   buf_size, DMA_MEM_TO_DEV,
+                                   DMA_PREP_INTERRUPT);
+desc-&gt;callback = tx_callback;
+dmaengine_submit(desc);
+dma_async_issue_pending(tx_chan);</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>xilinx_dma.c: MM2S + S2MM kanalları; DMA Engine API ile erişim</li>
+      <li>dma_request_chan(): DT'deki kanal adıyla kanalı al</li>
+      <li>dmaengine_prep_slave_single(): tek parça transfer; DMA_MEM_TO_DEV / DMA_DEV_TO_MEM</li>
+      <li>dmaengine_submit() + dma_async_issue_pending(): transferi başlat</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Coherent vs streaming DMA — FPGA için seçim</h2>
+  <p class="section-lead">Linux DMA API iki temel model sunar: coherent (tutarlı) ve streaming. FPGA uygulamalarında her birinin avantajları farklıdır.</p>
+
+  <h3>Coherent DMA</h3>
+  <p>dma_alloc_coherent() ile ayrılan bellek hem CPU hem DMA için her zaman tutarlıdır (önbellek bypass veya hardware snoop). Yazılan veri doğrudan görülür, flush/invalidate gerekmez. Ancak bellek ayrımı pahalıdır ve küçük, sık erişilen tamponlar için uygundur.</p>
+
+  <h3>Streaming DMA</h3>
+  <p>dma_map_single() / dma_map_sg() ile eşlenen bellek, CPU ve DMA kullanımı arasında sahiplik değiştirilir. Her yönde önbellek sync gerekir. Büyük tek seferlik transferler için daha verimlidir.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>Coherent</th><th>Streaming</th></tr></thead>
+      <tbody>
+        <tr><td>Önbellek sync</td><td>Gerekmiyor (otomatik)</td><td>Manuel: dma_sync_*</td></tr>
+        <tr><td>Bellek ayrımı</td><td>Pahalı (önyükleme/setup)</td><td>Ucuz (herhangi bellek)</td></tr>
+        <tr><td>Tekrar kullanım</td><td>Uzun yaşam tamponu</td><td>Her transfer için</td></tr>
+        <tr><td>Tipik FPGA kullanımı</td><td>DMA tanımlayıcıları, halka tamponu</td><td>Büyük video/ADC blokları</td></tr>
+        <tr><td>Zynq ACP portu</td><td>Doğal: L2 önbellek tutarlı</td><td>HP portunda snoop gerekir</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout info">
+    <div class="label">NOT</div>
+    <p>Zynq'de ACP portu (Accelerator Coherency Port) üzerinden erişen PL, doğal olarak L2 önbellek tutarlılığına sahiptir. Bu sayede dma_alloc_coherent() gereksiz hale gelebilir. Ancak ACP portu bant genişliği HP portlarından daha düşüktür; büyük transferler için HP0–HP3 + streaming DMA tercih edilir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Coherent: dma_alloc_coherent — önbellek sync yok; descriptor/ring için</li>
+      <li>Streaming: dma_map_single/sg — büyük tek seferlik transferler için</li>
+      <li>Zynq ACP: doğal önbellek tutarlılık; HP0–HP3: yüksek bant streamin DMA</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Scatter-gather DMA tanımlayıcıları</h2>
+  <p class="section-lead">Scatter-gather (SG) DMA, birden fazla fiziksel olarak ardışık olmayan bellek parçasının tek bir DMA transfer zinciri olarak işlenmesini sağlar. Xilinx AXI-DMA, SG modu destekler.</p>
+
+  <h3>SG tanımlayıcı yapısı (Xilinx AXI-DMA)</h3>
+  <div name="code-block" class="code-block">
+    <div class="code-header"><span>AXI-DMA SG tanımlayıcı (donanım formatı)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Xilinx AXI-DMA SG Tanımlayıcı (16 byte hizalı) */</span>
+<span class="keyword">struct</span> xilinx_sg_desc {
+    uint32_t next_desc;     <span class="cmt">/* Sonraki tanımlayıcı PA (4 byte hizalı) */</span>
+    uint32_t reserved0;
+    uint32_t buf_addr;      <span class="cmt">/* Transfer tampon fiziksel adresi */</span>
+    uint32_t reserved1;
+    uint32_t control;       <span class="cmt">/* bit[26]: TXSOF, bit[25]: TXEOF, bit[22:0]: uzunluk */</span>
+    uint32_t status;        <span class="cmt">/* bit[31]: tamamlandı, bit[22:0]: transfer edilen byte */</span>
+    uint32_t app[5];        <span class="cmt">/* Uygulama alanları (isteğe bağlı) */</span>
+} __attribute__((packed, aligned(64)));   <span class="cmt">/* 64-byte hizalama zorunlu */</span>
+
+<span class="cmt">/* Control register bit tanımları */</span>
+#define XILINX_DMA_BD_SOP  (1 &lt;&lt; 27)   <span class="cmt">/* Start of Packet */</span>
+#define XILINX_DMA_BD_EOP  (1 &lt;&lt; 26)   <span class="cmt">/* End of Packet */</span></code></pre>
+  </div>
+
+  <h3>SG zinciri oluşturma (Linux DMA Engine)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>dmaengine_prep_slave_sg — scatter-gather transfer</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/scatterlist.h&gt;
+
+<span class="keyword">struct</span> scatterlist sg[4];
+sg_init_table(sg, 4);
+
+<span class="cmt">/* Her parça için fiziksel adres ve uzunluk */</span>
+sg_set_buf(&amp;sg[0], buf0, 4096);
+sg_set_buf(&amp;sg[1], buf1, 4096);
+sg_set_buf(&amp;sg[2], buf2, 4096);
+sg_set_buf(&amp;sg[3], buf3, 4096);
+
+<span class="cmt">/* DMA adresi haritala */</span>
+int nents = dma_map_sg(&amp;pdev-&gt;dev, sg, 4, DMA_TO_DEVICE);
+
+<span class="cmt">/* SG transfer hazırla */</span>
+<span class="keyword">struct</span> dma_async_tx_descriptor *desc;
+desc = dmaengine_prep_slave_sg(tx_chan, sg, nents,
+                               DMA_MEM_TO_DEV,
+                               DMA_PREP_INTERRUPT);
+desc-&gt;callback = sg_tx_done;
+dmaengine_submit(desc);
+dma_async_issue_pending(tx_chan);
+
+<span class="cmt">/* Transfer sonrası haritayı kaldır */</span>
+dma_unmap_sg(&amp;pdev-&gt;dev, sg, 4, DMA_TO_DEVICE);</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>SG: fiziksel olarak parçalı bellek → tek DMA zinciri</li>
+      <li>Xilinx BD: 64-byte hizalı; SOP/EOP bitleri paket sınırları</li>
+      <li>dma_map_sg → dmaengine_prep_slave_sg → submit → dma_unmap_sg</li>
+      <li>status[31]: tamamlama biti; DMA kesme callback'te kontrol edilir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> libxdma kullanıcı alanı kütüphanesi</h2>
+  <p class="section-lead">Xilinx XDMA sürücüsü (PCIe tabanlı sistemlerde) ve ilgili kullanıcı alanı kütüphanesi, FPGA ile DDR arasında yüksek verimli DMA transferi sağlar. Zynq-bazlı sistemlerde alternatif UIO+CMA yaklaşımı kullanılır.</p>
+
+  <h3>XDMA vs UIO+CMA karşılaştırması</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>XDMA (PCIe)</th><th>UIO + CMA (Zynq)</th></tr></thead>
+      <tbody>
+        <tr><td>Bağlantı</td><td>PCIe Endpoint (XDMA IP)</td><td>AXI-DMA (PS-PL AXI)</td></tr>
+        <tr><td>Sürücü</td><td>xdma.ko (Xilinx sağlar)</td><td>xilinx_dma.ko veya UIO</td></tr>
+        <tr><td>Kullanıcı API</td><td>/dev/xdma0_h2c_0, _c2h_0</td><td>mmap + CMA tampon</td></tr>
+        <tr><td>Bant genişliği</td><td>PCIe Gen3 x8: ~8 GB/s</td><td>HP0–HP3: ~4 GB/s</td></tr>
+        <tr><td>Tipik kullanım</td><td>FPGA PCIe akseleratör</td><td>Zynq SoC gömülü uygulama</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Zynq UIO tabanlı kullanıcı DMA kütüphanesi</h3>
+  <div class="code-block">
+    <div class="code-header"><span>udma_lib.h — minimal UIO+CMA DMA kütüphanesi</span><span class="dot">●</span></div>
+    <pre><code>#pragma once
+#include &lt;stdint.h&gt;
+#include &lt;stddef.h&gt;
+
+<span class="keyword">typedef</span> <span class="keyword">struct</span> udma_buf {
+    int          fd;           <span class="cmt">/* /dev/udmabuf0 fd */</span>
+    <span class="keyword">void</span>        *virt;         <span class="cmt">/* sanal adres */</span>
+    uint64_t     phys;         <span class="cmt">/* fiziksel adres (FPGA için) */</span>
+    size_t       size;         <span class="cmt">/* tampon boyutu */</span>
+} udma_buf_t;
+
+udma_buf_t *udma_alloc(size_t size);
+<span class="keyword">void</span>        udma_free(udma_buf_t *buf);
+<span class="keyword">void</span>        udma_sync_for_device(udma_buf_t *buf);
+<span class="keyword">void</span>        udma_sync_for_cpu(udma_buf_t *buf);</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>udma-buf (u-dma-buf kernel modülü) kullanımı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># u-dma-buf kernel modülü ile CMA tampon tahsis</span>
+<span class="cmt"># https://github.com/ikwzm/udmabuf</span>
+
+<span class="cmt"># 64 MB CMA tampon oluştur</span>
+insmod u-dma-buf.ko udmabuf0=67108864
+
+<span class="cmt"># Fiziksel adres</span>
+cat /sys/class/u-dma-buf/udmabuf0/phys_addr
+<span class="cmt"># → 0x1f000000</span>
+
+<span class="cmt"># Kullanıcı alanı C'de:</span>
+<span class="cmt"># int fd = open("/dev/udmabuf0", O_RDWR);</span>
+<span class="cmt"># void *buf = mmap(NULL, size, PROT_RW, MAP_SHARED, fd, 0);</span>
+<span class="cmt"># uint64_t phys = read_phys_addr("/sys/.../phys_addr");</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>XDMA: PCIe FPGA için; /dev/xdma0_h2c_0 + _c2h_0 arayüzü</li>
+      <li>u-dma-buf: Zynq için kullanıcı alanı CMA tampon — fiziksel adres sysfs'ten</li>
+      <li>mmap → virt; sysfs → phys; FPGA DMA motoru phys adresi kullanır</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> CMA ve dma_alloc_coherent — bellek ayırıcısı</h2>
+  <p class="section-lead">CMA (Contiguous Memory Allocator), kernel çalışma sırasında büyük fiziksel olarak ardışık DMA tamponlarının ayrılmasını sağlar. dma_alloc_coherent(), bu havuzdan önbellek tutarlı bellek ayırır.</p>
+
+  <h3>CMA yapılandırması</h3>
+  <div class="code-block">
+    <div class="code-header"><span>CMA boyut yapılandırması</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kernel command line (U-Boot bootargs)</span>
+<span class="cmt"># 128 MB CMA alanı rezerve et</span>
+setenv bootargs <span class="str">"... cma=128M"</span>
+
+<span class="cmt"># Veya Device Tree'de (reserved-memory):</span>
+reserved-memory {
+    #address-cells = &lt;1&gt;;
+    #size-cells    = &lt;1&gt;;
+    ranges;
+
+    cma_region: cma&#64;1e000000 {
+        compatible    = <span class="str">"shared-dma-pool"</span>;
+        reusable;
+        size          = &lt;0x8000000&gt;;   <span class="cmt">/* 128 MB */</span>
+        alignment     = &lt;0x2000&gt;;      <span class="cmt">/* 8 KB */</span>
+        linux,cma-default;
+    };
+};</code></pre>
+  </div>
+
+  <h3>dma_alloc_coherent kullanımı (kernel)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>dma_alloc_coherent — kernel sürücüsünde</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/dma-mapping.h&gt;
+
+#define DMA_BUF_SIZE  (4 * 1024 * 1024)   <span class="cmt">/* 4 MB */</span>
+
+dma_addr_t dma_handle;
+<span class="keyword">void</span> *cpu_addr;
+
+<span class="cmt">/* Önbellek tutarlı DMA tamponu ayır */</span>
+cpu_addr = dma_alloc_coherent(&amp;pdev-&gt;dev, DMA_BUF_SIZE,
+                               &amp;dma_handle, GFP_KERNEL);
+<span class="keyword">if</span> (!cpu_addr) {
+    dev_err(&amp;pdev-&gt;dev, <span class="str">"DMA tampon ayrılamadı\n"</span>);
+    <span class="keyword">return</span> -ENOMEM;
+}
+
+<span class="cmt">/* cpu_addr: CPU pointer (virtual)
+   dma_handle: FPGA'nın kullanacağı fiziksel adres */</span>
+memset(cpu_addr, 0, DMA_BUF_SIZE);
+
+<span class="cmt">/* FPGA AXI-DMA'ya fiziksel adresi ver */</span>
+iowrite32(dma_handle, dma_regs + AXI_DMA_SA);
+iowrite32(DMA_BUF_SIZE, dma_regs + AXI_DMA_LENGTH);
+
+<span class="cmt">/* Serbest bırakma */</span>
+dma_free_coherent(&amp;pdev-&gt;dev, DMA_BUF_SIZE,
+                  cpu_addr, dma_handle);</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>CMA: cma=128M cmdline veya reserved-memory DTS — ardışık fiziksel havuz</li>
+      <li>dma_alloc_coherent: cpu_addr (sanal) + dma_handle (fiziksel) döndürür</li>
+      <li>FPGA DMA motoru dma_handle adresini kullanır; CPU cpu_addr ile erişir</li>
+      <li>Önbellek sync yok: coherent bellek, otomatik tutarlı</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: PS DDR ↔ FPGA AXI-DMA tam transfer programı</h2>
+  <p class="section-lead">Bu bölümde kullanıcı alanından UIO + u-dma-buf kullanılarak PS DDR ile FPGA arasında tam bir AXI-DMA transfer döngüsü uygulanmaktadır. Örnek, MM2S ve S2MM kanallarını aynı anda kullanır.</p>
+
+  <h3>Donanım yapılandırması (Vivado BD)</h3>
+  <p>Vivado Block Design'da: Zynq PS + AXI-DMA (SG modu, 32-bit) + AXI-Stream passthrough (loopback). AXI-DMA'nın M_AXI_SG ve M_AXI_MM2S portları HP0'a, S_AXI_LITE portu GP0'a bağlı. IRQ'lar IRQ_F2P[0:1]'e bağlı.</p>
+
+  <h3>Tam transfer programı (C)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>axidma_loopback.c — tam çalışan program</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;string.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;poll.h&gt;
+
+<span class="cmt">/* AXI-DMA register ofsetleri */</span>
+#define DMA_MM2S_CR    0x00   <span class="cmt">/* MM2S Control */</span>
+#define DMA_MM2S_SR    0x04   <span class="cmt">/* MM2S Status */</span>
+#define DMA_MM2S_SA    0x18   <span class="cmt">/* MM2S Source Address */</span>
+#define DMA_MM2S_LEN   0x28   <span class="cmt">/* MM2S Transfer Length */</span>
+#define DMA_S2MM_CR    0x30   <span class="cmt">/* S2MM Control */</span>
+#define DMA_S2MM_SR    0x34   <span class="cmt">/* S2MM Status */</span>
+#define DMA_S2MM_DA    0x48   <span class="cmt">/* S2MM Dest Address */</span>
+#define DMA_S2MM_LEN   0x58   <span class="cmt">/* S2MM Transfer Length */</span>
+
+<span class="cmt">/* AXI-DMA Control register bitleri */</span>
+#define DMA_CR_RUN     (1 &lt;&lt; 0)
+#define DMA_CR_RESET   (1 &lt;&lt; 2)
+#define DMA_CR_IOC_IRQ (1 &lt;&lt; 12)  <span class="cmt">/* Completion interrupt enable */</span>
+
+<span class="cmt">/* Parametreler */</span>
+#define DMA_BASE    0x40400000UL
+#define DMA_MAP_SZ  0x10000UL
+#define BUF_SIZE    (1024 * 1024)    <span class="cmt">/* 1 MB */</span>
+
+<span class="keyword">static</span> <span class="keyword">volatile</span> uint32_t *dma;   <span class="cmt">/* AXI-DMA register haritası */</span>
+<span class="keyword">static</span> int uio_mm2s_fd, uio_s2mm_fd;
+
+<span class="keyword">static</span> uint64_t read_phys_addr(<span class="keyword">const</span> <span class="keyword">char</span> *path)
+{
+    FILE *f = fopen(path, <span class="str">"r"</span>);
+    uint64_t addr = 0;
+    <span class="keyword">if</span> (f) { fscanf(f, <span class="str">"0x%lx"</span>, &amp;addr); fclose(f); }
+    <span class="keyword">return</span> addr;
+}
+
+<span class="keyword">static</span> <span class="keyword">void</span> dma_write(<span class="keyword">int</span> off, uint32_t val) { dma[off/4] = val; }
+<span class="keyword">static</span> uint32_t dma_read(<span class="keyword">int</span> off)            { <span class="keyword">return</span> dma[off/4]; }
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>)
+{
+    <span class="cmt">/* 1. AXI-DMA register'larını eşle (UIO0 = AXI-DMA) */</span>
+    uio_mm2s_fd = open(<span class="str">"/dev/uio0"</span>, O_RDWR);   <span class="cmt">/* MM2S IRQ */</span>
+    uio_s2mm_fd = open(<span class="str">"/dev/uio1"</span>, O_RDWR);   <span class="cmt">/* S2MM IRQ */</span>
+    int dma_fd  = open(<span class="str">"/dev/uio2"</span>, O_RDWR);   <span class="cmt">/* DMA reg */</span>
+
+    dma = mmap(NULL, DMA_MAP_SZ, PROT_RW, MAP_SHARED, dma_fd, 0);
+
+    <span class="cmt">/* 2. CMA tamponlarını al (u-dma-buf) */</span>
+    int src_fd = open(<span class="str">"/dev/udmabuf0"</span>, O_RDWR);
+    int dst_fd = open(<span class="str">"/dev/udmabuf1"</span>, O_RDWR);
+
+    uint8_t *src = mmap(NULL, BUF_SIZE, PROT_RW, MAP_SHARED, src_fd, 0);
+    uint8_t *dst = mmap(NULL, BUF_SIZE, PROT_RW, MAP_SHARED, dst_fd, 0);
+
+    uint64_t src_phys = read_phys_addr(
+        <span class="str">"/sys/class/u-dma-buf/udmabuf0/phys_addr"</span>);
+    uint64_t dst_phys = read_phys_addr(
+        <span class="str">"/sys/class/u-dma-buf/udmabuf1/phys_addr"</span>);
+
+    <span class="cmt">/* 3. Test verisi hazırla */</span>
+    <span class="keyword">for</span> (int i = 0; i &lt; BUF_SIZE; i++) src[i] = (uint8_t)(i &amp; 0xFF);
+    memset(dst, 0, BUF_SIZE);
+
+    <span class="cmt">/* 4. DMA reset */</span>
+    dma_write(DMA_MM2S_CR, DMA_CR_RESET);
+    dma_write(DMA_S2MM_CR, DMA_CR_RESET);
+    usleep(1000);
+
+    <span class="cmt">/* 5. Kesme etkinleştir ve çalıştır */</span>
+    dma_write(DMA_MM2S_CR, DMA_CR_RUN | DMA_CR_IOC_IRQ);
+    dma_write(DMA_S2MM_CR, DMA_CR_RUN | DMA_CR_IOC_IRQ);
+
+    <span class="cmt">/* 6. S2MM hedef adres + uzunluk (önce başlat) */</span>
+    dma_write(DMA_S2MM_DA,  (uint32_t)dst_phys);
+    dma_write(DMA_S2MM_LEN, BUF_SIZE);
+
+    <span class="cmt">/* 7. MM2S kaynak adres + uzunluk (transfer başlar) */</span>
+    dma_write(DMA_MM2S_SA,  (uint32_t)src_phys);
+    dma_write(DMA_MM2S_LEN, BUF_SIZE);
+
+    <span class="cmt">/* 8. Kesme bekle (poll) */</span>
+    <span class="keyword">struct</span> pollfd pfds[2] = {
+        { uio_mm2s_fd, POLLIN, 0 },
+        { uio_s2mm_fd, POLLIN, 0 },
+    };
+    poll(pfds, 2, 5000);   <span class="cmt">/* 5 saniye timeout */</span>
+
+    uint32_t n;
+    read(uio_mm2s_fd, &amp;n, 4);
+    read(uio_s2mm_fd, &amp;n, 4);
+
+    <span class="cmt">/* 9. Sonucu doğrula */</span>
+    int ok = (memcmp(src, dst, BUF_SIZE) == 0);
+    printf(<span class="str">"Transfer %s (%d KB)\n"</span>,
+           ok ? <span class="str">"BAŞARILI"</span> : <span class="str">"BAŞARISIZ"</span>, BUF_SIZE/1024);
+
+    printf(<span class="str">"MM2S SR: 0x%08X\n"</span>, dma_read(DMA_MM2S_SR));
+    printf(<span class="str">"S2MM SR: 0x%08X\n"</span>, dma_read(DMA_S2MM_SR));
+
+    munmap(src, BUF_SIZE); close(src_fd);
+    munmap(dst, BUF_SIZE); close(dst_fd);
+    munmap((<span class="keyword">void</span>*)dma, DMA_MAP_SZ); close(dma_fd);
+    close(uio_mm2s_fd); close(uio_s2mm_fd);
+    <span class="keyword">return</span> ok ? 0 : 1;
+}</code></pre>
+  </div>
+
+  <div class="callout tip">
+    <div class="label">İPUCU</div>
+    <p>DMA_S2MM_LEN yazmadan önce DMA_MM2S_LEN yazılırsa S2MM tamponu hazır olmadan transfer başlar; TLAST almadan önce S2MM durabilir. Güvenli sıra: S2MM_DA → S2MM_LEN → MM2S_SA → MM2S_LEN. Bu sayede veri alıcı hazır olduğunda gönderilir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>UIO: AXI-DMA register erişimi + IRQ bekleme; u-dma-buf: CMA tamponlar</li>
+      <li>Güvenli DMA sırası: RESET → S2MM_DA/LEN → MM2S_SA/LEN → poll IRQ</li>
+      <li>DMA_MM2S_SR / DMA_S2MM_SR: tamamlanma ve hata bitlerini kontrol et</li>
+      <li>memcmp loopback doğrulama: FPGA passthrough doğru çalışıyorsa eşleşmeli</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

@@ -1,0 +1,872 @@
+---
+layout: tutorial
+title: "GPIO &amp; Pinctrl — libgpiod v2"
+back_url: "../index.html"
+back_label: "embedded-deck"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>GPIO / PINCTRL</span>
+    <span>2026</span>
+  </div>
+  <h1>GPIO &amp; Pinctrl<br><em>libgpiod v2.</em></h1>
+  <p class="subtitle">Sysfs GPIO deprecation'dan chardev mimarisine, libgpiod v2 C API'sinden output/input/event handling'e, gpiotools CLI'den pinctrl subsystem'e ve Python binding'den RPi4 üzerinde button debounce + LED daemon kurulumuna kadar modern Linux GPIO programlamanın eksiksiz rehberi.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Eski sysfs GPIO vs chardev</a></li>
+    <li><a href="#s1">libgpiod v2 API</a></li>
+    <li><a href="#s2">Output operasyonları</a></li>
+    <li><a href="#s3">Input ve polling</a></li>
+    <li><a href="#s4">Event handling</a></li>
+    <li><a href="#s5">gpiotools CLI</a></li>
+    <li><a href="#s6">Pinctrl subsystem</a></li>
+    <li><a href="#s7">Python bindings</a></li>
+    <li><a href="#s8">Pratik: button debounce + LED daemon</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Eski sysfs GPIO vs chardev</h2>
+  <p class="section-lead">Linux'un eski <code>/sys/class/gpio</code> arayüzü, kernel 4.8'den itibaren <code>deprecated</code> olarak işaretlenmiş ve yerine character device (<code>/dev/gpiochipN</code>) tabanlı yeni API gelmiştir.</p>
+
+  <h3>Sysfs GPIO'nun sorunları</h3>
+  <div class="params">
+    <div class="param"><span class="name">Global numara sistemi</span><span class="desc">/sys/class/gpio/gpio42 — donanım değişince numara değişir, taşınabilir değil</span></div>
+    <div class="param"><span class="name">Poll/interrupt eksikliği</span><span class="desc">Edge detection ancak sysfs poll() ile mümkündü, gecikme ve CPU kullanımı yüksekti</span></div>
+    <div class="param"><span class="name">Sahiplik yokluğu</span><span class="desc">export edilen GPIO başka process tarafından çalınabilir, güvenlik açığı</span></div>
+    <div class="param"><span class="name">Bulk operasyon yok</span><span class="desc">Birden fazla GPIO'yu atomik okumak/yazmak imkansız</span></div>
+    <div class="param"><span class="name">Timestamp yok</span><span class="desc">Edge event'ın ne zaman oluştuğu bilinemez</span></div>
+  </div>
+
+  <h3>Chardev avantajları</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Özellik</th><th>sysfs (/sys/class/gpio)</th><th>chardev (/dev/gpiochipN)</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>GPIO tanımlama</td><td>Global sayısal ID</td><td>chip + offset (taşınabilir)</td></tr>
+        <tr><td>Sahiplik</td><td>Yok</td><td>fd sahipliği — process ölünce serbest</td></tr>
+        <tr><td>Edge detection</td><td>poll() hack</td><td>Kernel event queue, nanosaniye timestamp</td></tr>
+        <tr><td>Bulk işlem</td><td>Yok</td><td>Atomik çoklu GPIO okuma/yazma</td></tr>
+        <tr><td>Active low</td><td>Manuel</td><td>FLAG_ACTIVE_LOW ile kernel düzeyinde</td></tr>
+        <tr><td>Open drain</td><td>Yok</td><td>LINE_DRIVE_OPEN_DRAIN</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Chardev arayüzü</h3>
+  <pre><code class="language-bash"># GPIO chip'leri listele
+ls -la /dev/gpiochip*
+# crw-rw---- 1 root gpio 254, 0 Jan 15 10:00 /dev/gpiochip0
+# crw-rw---- 1 root gpio 254, 1 Jan 15 10:00 /dev/gpiochip1
+
+# Chip bilgisi
+gpiodetect
+# gpiochip0 [pinctrl-bcm2711] (58 lines)
+# gpiochip1 [raspberrypi-exp-gpio] (8 lines)
+
+# Kullanıcıyı gpio grubuna ekle
+sudo usermod -aG gpio $USER</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> libgpiod v2 API</h2>
+  <p class="section-lead">libgpiod v2 (2.x), v1'e göre tamamen yeniden tasarlanmış bir C API sunar. Temel nesne hiyerarşisi: chip → line_info → request → line_config şeklindedir.</p>
+
+  <h3>Kurulum</h3>
+  <pre><code class="language-bash"># Debian/Ubuntu (v2.x)
+sudo apt install libgpiod-dev gpiod
+
+# Sürüm kontrolü
+pkg-config --modversion libgpiod
+# 2.1.3
+
+# Derleme
+gcc -o myapp myapp.c $(pkg-config --cflags --libs libgpiod)
+# veya
+gcc -o myapp myapp.c -lgpiod</code></pre>
+
+  <h3>Temel nesne hiyerarşisi</h3>
+  <div class="params">
+    <div class="param"><span class="name">gpiod_chip</span><span class="desc">Bir GPIO chip'ini temsil eder — /dev/gpiochip0 açılır, chip bilgisi sorgulanır</span></div>
+    <div class="param"><span class="name">gpiod_line_info</span><span class="desc">Bir GPIO hattının statik bilgisi — isim, consumer, flags, yön</span></div>
+    <div class="param"><span class="name">gpiod_line_settings</span><span class="desc">Request için hat konfigürasyonu — yön, active_low, bias, edge detection</span></div>
+    <div class="param"><span class="name">gpiod_line_config</span><span class="desc">Birden fazla hattın settings koleksiyonu</span></div>
+    <div class="param"><span class="name">gpiod_request_config</span><span class="desc">Request metadata — consumer string</span></div>
+    <div class="param"><span class="name">gpiod_line_request</span><span class="desc">Aktif GPIO talebi — değer okuma/yazma, event bekleme buradan yapılır</span></div>
+  </div>
+
+  <h3>Chip açma ve line_info sorgulama</h3>
+  <pre><code class="language-c">#include &lt;gpiod.h&gt;
+#include &lt;stdio.h&gt;
+
+int main(void) {
+    /* Chip aç */
+    struct gpiod_chip *chip = gpiod_chip_open("/dev/gpiochip0");
+    if (!chip) {
+        perror("gpiod_chip_open");
+        return 1;
+    }
+
+    /* Chip bilgisi */
+    struct gpiod_chip_info *info = gpiod_chip_get_info(chip);
+    printf("Chip: %s (%s) — %u lines\n",
+           gpiod_chip_info_get_name(info),
+           gpiod_chip_info_get_label(info),
+           gpiod_chip_info_get_num_lines(info));
+    gpiod_chip_info_free(info);
+
+    /* Hat bilgisi */
+    struct gpiod_line_info *linfo = gpiod_chip_get_line_info(chip, 18);
+    printf("Line 18: name=%s consumer=%s direction=%d\n",
+           gpiod_line_info_get_name(linfo),
+           gpiod_line_info_get_consumer(linfo),
+           gpiod_line_info_get_direction(linfo));
+    gpiod_line_info_free(linfo);
+
+    gpiod_chip_close(chip);
+    return 0;
+}</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Output operasyonları</h2>
+  <p class="section-lead">GPIO hatlarını çıkış olarak yapılandırmak ve değer yazmak için libgpiod v2'nin request mekanizması kullanılır. Tek hat veya atomik çoklu hat çıkışı desteklenir.</p>
+
+  <h3>Tek GPIO çıkışı</h3>
+  <pre><code class="language-c">#include &lt;gpiod.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;unistd.h&gt;
+
+int main(void) {
+    struct gpiod_chip *chip = gpiod_chip_open("/dev/gpiochip0");
+
+    /* Line settings: çıkış, başlangıç değeri LOW */
+    struct gpiod_line_settings *settings = gpiod_line_settings_new();
+    gpiod_line_settings_set_direction(settings,
+        GPIOD_LINE_DIRECTION_OUTPUT);
+    gpiod_line_settings_set_output_value(settings,
+        GPIOD_LINE_VALUE_INACTIVE);  /* LOW */
+
+    /* Line config: offset 18 için settings uygula */
+    struct gpiod_line_config *lconfig = gpiod_line_config_new();
+    unsigned int offset = 18;
+    gpiod_line_config_add_line_settings(lconfig, &amp;offset, 1, settings);
+
+    /* Request config: consumer adı */
+    struct gpiod_request_config *rconfig = gpiod_request_config_new();
+    gpiod_request_config_set_consumer(rconfig, "led-control");
+
+    /* Hat'ı talep et */
+    struct gpiod_line_request *request =
+        gpiod_chip_request_lines(chip, rconfig, lconfig);
+
+    /* LED yanıp söndür */
+    for (int i = 0; i &lt; 10; i++) {
+        gpiod_line_request_set_value(request, 18,
+            (i % 2) ? GPIOD_LINE_VALUE_ACTIVE
+                    : GPIOD_LINE_VALUE_INACTIVE);
+        usleep(500000);  /* 500 ms */
+    }
+
+    /* Temizlik */
+    gpiod_line_request_release(request);
+    gpiod_line_config_free(lconfig);
+    gpiod_line_settings_free(settings);
+    gpiod_request_config_free(rconfig);
+    gpiod_chip_close(chip);
+    return 0;
+}</code></pre>
+
+  <h3>Çoklu GPIO atomik çıkış</h3>
+  <pre><code class="language-c">/* 3 LED'i aynı anda kontrol et — atomik bulk write */
+unsigned int offsets[] = {17, 18, 27};  /* RGB LED */
+enum gpiod_line_value values[] = {
+    GPIOD_LINE_VALUE_ACTIVE,    /* R: on  */
+    GPIOD_LINE_VALUE_INACTIVE,  /* G: off */
+    GPIOD_LINE_VALUE_ACTIVE     /* B: on  */
+};
+
+/* Settings — tüm hatlar için aynı */
+struct gpiod_line_settings *settings = gpiod_line_settings_new();
+gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_OUTPUT);
+
+struct gpiod_line_config *lconfig = gpiod_line_config_new();
+gpiod_line_config_add_line_settings(lconfig, offsets, 3, settings);
+
+struct gpiod_line_request *request =
+    gpiod_chip_request_lines(chip, rconfig, lconfig);
+
+/* Atomik yazma */
+gpiod_line_request_set_values_subset(request, 3, offsets, values);</code></pre>
+
+  <h3>Active low ve open drain</h3>
+  <pre><code class="language-c">/* Active-low çıkış (ör: aktif LOW röle) */
+gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_OUTPUT);
+gpiod_line_settings_set_active_low(settings, true);
+/* ACTIVE → LOW, INACTIVE → HIGH */
+
+/* Open-drain çıkış (I2C benzeri wired-AND) */
+gpiod_line_settings_set_drive(settings,
+    GPIOD_LINE_DRIVE_OPEN_DRAIN);
+
+/* Open-source (wired-OR) */
+gpiod_line_settings_set_drive(settings,
+    GPIOD_LINE_DRIVE_OPEN_SOURCE);</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Input ve polling</h2>
+  <p class="section-lead">GPIO hatlarını giriş olarak yapılandırmak, anlık değer okumak ve edge detection ile değişimleri beklemek için input API'si.</p>
+
+  <h3>Giriş konfigürasyonu</h3>
+  <pre><code class="language-c">#include &lt;gpiod.h&gt;
+
+/* Buton girişi — pull-up, rising edge */
+struct gpiod_line_settings *settings = gpiod_line_settings_new();
+
+/* Yön: giriş */
+gpiod_line_settings_set_direction(settings,
+    GPIOD_LINE_DIRECTION_INPUT);
+
+/* Pull-up bias */
+gpiod_line_settings_set_bias(settings,
+    GPIOD_LINE_BIAS_PULL_UP);
+
+/* Edge detection: her iki kenar */
+gpiod_line_settings_set_edge_detection(settings,
+    GPIOD_LINE_EDGE_BOTH);
+
+/* Debounce period: 5 ms (kernel düzeyinde) */
+gpiod_line_settings_set_debounce_period_us(settings, 5000);
+
+/* Bias sabitleri:
+ * GPIOD_LINE_BIAS_PULL_UP    — pull-up direnci
+ * GPIOD_LINE_BIAS_PULL_DOWN  — pull-down direnci
+ * GPIOD_LINE_BIAS_DISABLED   — floating (yüksek empedans)
+ * GPIOD_LINE_BIAS_AS_IS      — mevcut durumu koru */</code></pre>
+
+  <h3>Anlık değer okuma</h3>
+  <pre><code class="language-c">/* Tek hat okuma */
+enum gpiod_line_value val =
+    gpiod_line_request_get_value(request, offset);
+
+if (val == GPIOD_LINE_VALUE_ACTIVE)
+    printf("HIGH\n");
+else if (val == GPIOD_LINE_VALUE_INACTIVE)
+    printf("LOW\n");
+else
+    printf("Error: %d\n", val);
+
+/* Çoklu hat okuma (atomik) */
+unsigned int offsets[] = {4, 5, 6};
+enum gpiod_line_value values[3];
+
+int ret = gpiod_line_request_get_values_subset(
+    request, 3, offsets, values);
+if (ret &lt; 0)
+    perror("get_values");</code></pre>
+
+  <h3>Blocking wait — edge detection</h3>
+  <pre><code class="language-c">#include &lt;gpiod.h&gt;
+#include &lt;stdio.h&gt;
+
+/* Edge event bekle (blocking) */
+struct gpiod_edge_event_buffer *buf =
+    gpiod_edge_event_buffer_new(64);  /* 64 event kapasitesi */
+
+/* Blokla: event gelene kadar bekle */
+int n = gpiod_line_request_read_edge_events(request, buf, 1);
+if (n &lt; 0) {
+    perror("read_edge_events");
+    return -1;
+}
+
+struct gpiod_edge_event *event =
+    gpiod_edge_event_buffer_get_event(buf, 0);
+
+printf("Event: %s on offset %u at %llu ns\n",
+    gpiod_edge_event_get_event_type(event) ==
+        GPIOD_EDGE_EVENT_RISING_EDGE ? "RISING" : "FALLING",
+    gpiod_edge_event_get_line_offset(event),
+    (unsigned long long)gpiod_edge_event_get_timestamp_ns(event));
+
+gpiod_edge_event_buffer_free(buf);</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Event handling</h2>
+  <p class="section-lead">Gerçek zamanlı edge event işleme için <code>gpiod_edge_event_buffer</code> ve <code>poll()</code>/select() ile event loop kurulumu. Nanosaniye hassasiyetinde timestamp.</p>
+
+  <h3>Event loop — poll() ile</h3>
+  <pre><code class="language-c">#include &lt;gpiod.h&gt;
+#include &lt;poll.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;signal.h&gt;
+
+static volatile int running = 1;
+
+static void sighandler(int sig) { running = 0; }
+
+int main(void) {
+    struct gpiod_chip *chip = gpiod_chip_open("/dev/gpiochip0");
+
+    struct gpiod_line_settings *settings = gpiod_line_settings_new();
+    gpiod_line_settings_set_direction(settings,
+        GPIOD_LINE_DIRECTION_INPUT);
+    gpiod_line_settings_set_bias(settings,
+        GPIOD_LINE_BIAS_PULL_UP);
+    gpiod_line_settings_set_edge_detection(settings,
+        GPIOD_LINE_EDGE_BOTH);
+    gpiod_line_settings_set_debounce_period_us(settings, 3000);
+
+    struct gpiod_line_config *lconfig = gpiod_line_config_new();
+    unsigned int offset = 17;
+    gpiod_line_config_add_line_settings(lconfig, &amp;offset, 1, settings);
+
+    struct gpiod_request_config *rconfig = gpiod_request_config_new();
+    gpiod_request_config_set_consumer(rconfig, "button-monitor");
+
+    struct gpiod_line_request *request =
+        gpiod_chip_request_lines(chip, rconfig, lconfig);
+
+    /* Request fd'sini al — poll() için */
+    int fd = gpiod_line_request_get_fd(request);
+
+    struct gpiod_edge_event_buffer *evbuf =
+        gpiod_edge_event_buffer_new(16);
+
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+
+    signal(SIGINT, sighandler);
+    printf("Buton izleniyor (Ctrl+C ile çık)...\n");
+
+    while (running) {
+        int ret = poll(&amp;pfd, 1, 1000);  /* 1 sn timeout */
+        if (ret &lt; 0) break;
+        if (ret == 0) continue;  /* timeout */
+
+        int n = gpiod_line_request_read_edge_events(request, evbuf, 16);
+        for (int i = 0; i &lt; n; i++) {
+            struct gpiod_edge_event *ev =
+                gpiod_edge_event_buffer_get_event(evbuf, i);
+            uint64_t ts = gpiod_edge_event_get_timestamp_ns(ev);
+            int type = gpiod_edge_event_get_event_type(ev);
+            printf("[%llu ns] %s\n", (unsigned long long)ts,
+                type == GPIOD_EDGE_EVENT_RISING_EDGE ?
+                    "RISING (buton bırakıldı)" :
+                    "FALLING (buton basıldı)");
+        }
+    }
+
+    gpiod_edge_event_buffer_free(evbuf);
+    gpiod_line_request_release(request);
+    gpiod_line_config_free(lconfig);
+    gpiod_line_settings_free(settings);
+    gpiod_request_config_free(rconfig);
+    gpiod_chip_close(chip);
+    return 0;
+}</code></pre>
+
+  <h3>Birden fazla GPIO'dan event toplama</h3>
+  <pre><code class="language-c">/* 3 buton için ayrı request'ler → 3 fd → poll */
+unsigned int btn_offsets[] = {17, 22, 27};
+
+struct pollfd pfds[3];
+struct gpiod_line_request *requests[3];
+
+for (int i = 0; i &lt; 3; i++) {
+    /* Her buton için ayrı request */
+    struct gpiod_line_config *cfg = gpiod_line_config_new();
+    gpiod_line_config_add_line_settings(cfg,
+        &amp;btn_offsets[i], 1, settings);
+    requests[i] = gpiod_chip_request_lines(chip, rconfig, cfg);
+    pfds[i].fd = gpiod_line_request_get_fd(requests[i]);
+    pfds[i].events = POLLIN;
+    gpiod_line_config_free(cfg);
+}
+
+/* Hepsini aynı anda bekle */
+poll(pfds, 3, -1);</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> gpiotools CLI</h2>
+  <p class="section-lead"><code>gpiod</code> paketi ile gelen komut satırı araçları, GPIO'ları shell script ve hızlı test için kullanmanızı sağlar.</p>
+
+  <h3>gpiodetect ve gpioinfo</h3>
+  <pre><code class="language-bash"># Tüm GPIO chip'leri listele
+gpiodetect
+# gpiochip0 [pinctrl-bcm2711] (58 lines)
+# gpiochip1 [raspberrypi-exp-gpio] (8 lines)
+
+# Chip'teki tüm hatları listele
+gpioinfo gpiochip0
+# gpiochip0 - 58 lines:
+#  line   0:      "ID_SDA"         unused  input active-high
+#  line   1:      "ID_SCL"         unused  input active-high
+#  line   2:        "SDA1"         unused  input active-high
+#  line  17:      unnamed         unused  input active-high
+#  line  18:      unnamed         unused  input active-high
+
+# Belirli hat
+gpioinfo --chip gpiochip0 17
+
+# JSON çıktısı (gpiod 2.x)
+gpioinfo --json | python3 -m json.tool</code></pre>
+
+  <h3>gpioget — değer okuma</h3>
+  <pre><code class="language-bash"># Hat 17'yi oku
+gpioget --chip gpiochip0 17
+# 1   (HIGH)
+
+# Çoklu hat
+gpioget --chip gpiochip0 17 18 22
+# 1 0 1
+
+# Active-low
+gpioget --active-low --chip gpiochip0 17
+
+# Bias
+gpioget --bias=pull-up --chip gpiochip0 17
+gpioget --bias=pull-down --chip gpiochip0 17</code></pre>
+
+  <h3>gpioset — değer yazma</h3>
+  <pre><code class="language-bash"># Hat 18'i HIGH yap
+gpioset --chip gpiochip0 18=1
+
+# LOW yap
+gpioset --chip gpiochip0 18=0
+
+# Çoklu
+gpioset --chip gpiochip0 17=1 18=0 27=1
+
+# Belirli süre HIGH tut, sonra serbest bırak
+gpioset --mode=time --sec=2 --chip gpiochip0 18=1
+
+# Tek sinyal darbesi (toggle)
+gpioset --mode=signal --chip gpiochip0 18=1
+# Ctrl+C = serbest bırak</code></pre>
+
+  <h3>gpiomon — edge event izleme</h3>
+  <pre><code class="language-bash"># Hat 17'deki edge event'leri izle
+gpiomon --chip gpiochip0 17
+# 2026-01-15T14:23:10.123456789Z  rising  gpiochip0 17
+# 2026-01-15T14:23:10.987654321Z falling  gpiochip0 17
+
+# Sadece rising edge
+gpiomon --rising-edge --chip gpiochip0 17
+
+# Falling edge, 5 event'den sonra çık
+gpiomon --falling-edge --num-events=5 --chip gpiochip0 17
+
+# Birden fazla hat
+gpiomon --chip gpiochip0 17 22 27
+
+# Debounce period
+gpiomon --debounce-period=5ms --chip gpiochip0 17</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Pinctrl subsystem</h2>
+  <p class="section-lead">Pinctrl, GPIO dışında pin multiplexing (pin'in UART mı, SPI mi, GPIO mu olacağı) ve pull-up/down, drive-strength gibi elektriksel parametreleri Device Tree üzerinden yapılandırır.</p>
+
+  <h3>Pinctrl temel kavramlar</h3>
+  <div class="params">
+    <div class="param"><span class="name">Pin group</span><span class="desc">Birlikte yapılandırılan pinlerin kümesi — UART0 group: {TX, RX, CTS, RTS}</span></div>
+    <div class="param"><span class="name">Function</span><span class="desc">Pin grubunun kullandığı donanım işlevi — uart0, spi0, gpio, i2c1</span></div>
+    <div class="param"><span class="name">State</span><span class="desc">Named pin konfigürasyonu — "default", "sleep", "idle" durumları</span></div>
+    <div class="param"><span class="name">pinctrl-names</span><span class="desc">DT'de state isimleri listesi — ilk entry "default" state'e karşılık gelir</span></div>
+  </div>
+
+  <h3>Device Tree binding</h3>
+  <pre><code class="language-bash">/* Pinctrl driver tanımı (SoC DTSI içinde) */
+pinctrl: pinctrl@30330000 {
+    compatible = "fsl,imx8mp-iomuxc";
+    reg = &lt;0x30330000 0x10000&gt;;
+
+    /* UART2 pinleri için group tanımı */
+    uart2_pins_default: uart2grp {
+        fsl,pins = &lt;
+            MX8MP_IOMUXC_UART2_RXD  0x140   /* pull-up, 100k */
+            MX8MP_IOMUXC_UART2_TXD  0x140
+        &gt;;
+    };
+
+    uart2_pins_sleep: uart2grp_sleep {
+        fsl,pins = &lt;
+            MX8MP_IOMUXC_UART2_RXD  0x100   /* floating */
+            MX8MP_IOMUXC_UART2_TXD  0x100
+        &gt;;
+    };
+};
+
+/* UART2 cihaz node'u — pinctrl state'lerini kullanır */
+&amp;uart2 {
+    pinctrl-names = "default", "sleep";
+    pinctrl-0 = &lt;&amp;uart2_pins_default&gt;;  /* state 0 = "default" */
+    pinctrl-1 = &lt;&amp;uart2_pins_sleep&gt;;    /* state 1 = "sleep" */
+    status = "okay";
+};</code></pre>
+
+  <h3>Pinctrl debugfs ile inceleme</h3>
+  <pre><code class="language-bash"># Pinctrl debugfs (CONFIG_DEBUG_FS gerekli)
+ls /sys/kernel/debug/pinctrl/
+# 30330000.pinctrl
+
+cat /sys/kernel/debug/pinctrl/30330000.pinctrl/pins | head -20
+# pin 0 (GPIO1_IO00)
+# pin 1 (GPIO1_IO01)
+# ...
+
+cat /sys/kernel/debug/pinctrl/30330000.pinctrl/pingroups
+# group: uart2grp
+#  pin 100 (UART2_RXD)
+#  pin 101 (UART2_TXD)
+
+cat /sys/kernel/debug/pinctrl/30330000.pinctrl/pinmux-functions
+
+# Aktif state'leri gör
+cat /sys/kernel/debug/pinctrl/30330000.pinctrl/pinmux-pins | head -30
+
+# GPIO sysfs'den pin mux durumu
+cat /sys/kernel/debug/gpio | grep -A 5 "gpiochip0"</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Python bindings</h2>
+  <p class="section-lead">python3-libgpiod, libgpiod'un Pythonic sarmalayıcısıdır. asyncio ile event-driven GPIO uygulamaları yazmayı kolaylaştırır.</p>
+
+  <h3>Kurulum</h3>
+  <pre><code class="language-bash"># Debian/Ubuntu
+sudo apt install python3-libgpiod
+
+# veya pip (libgpiod C kütüphanesi kurulu olmalı)
+pip3 install gpiod
+
+# Sürüm kontrolü
+python3 -c "import gpiod; print(gpiod.__version__)"</code></pre>
+
+  <h3>Temel kullanım — output ve input</h3>
+  <pre><code class="language-python">import gpiod
+import time
+
+# Chip aç
+chip = gpiod.Chip("/dev/gpiochip0")
+
+# LED output (GPIO 18)
+led_request = chip.request_lines(
+    config={
+        18: gpiod.LineSettings(
+            direction=gpiod.line.Direction.OUTPUT,
+            output_value=gpiod.line.Value.INACTIVE
+        )
+    },
+    consumer="python-led"
+)
+
+# Buton input (GPIO 17, pull-up)
+btn_request = chip.request_lines(
+    config={
+        17: gpiod.LineSettings(
+            direction=gpiod.line.Direction.INPUT,
+            bias=gpiod.line.Bias.PULL_UP,
+            edge_detection=gpiod.line.Edge.BOTH,
+            debounce_period=datetime.timedelta(milliseconds=5)
+        )
+    },
+    consumer="python-button"
+)
+
+# LED yanıp söndür
+for i in range(6):
+    led_request.set_value(18,
+        gpiod.line.Value.ACTIVE if i % 2 else gpiod.line.Value.INACTIVE)
+    time.sleep(0.5)
+
+led_request.release()
+btn_request.release()
+chip.close()</code></pre>
+
+  <h3>asyncio ile event loop</h3>
+  <pre><code class="language-python">import asyncio
+import gpiod
+import datetime
+
+async def monitor_button(chip_path: str, offset: int):
+    chip = gpiod.Chip(chip_path)
+    request = chip.request_lines(
+        config={
+            offset: gpiod.LineSettings(
+                direction=gpiod.line.Direction.INPUT,
+                bias=gpiod.line.Bias.PULL_UP,
+                edge_detection=gpiod.line.Edge.BOTH,
+                debounce_period=datetime.timedelta(milliseconds=5)
+            )
+        },
+        consumer="asyncio-button"
+    )
+
+    fd = request.fd
+    loop = asyncio.get_event_loop()
+
+    print(f"GPIO {offset} izleniyor...")
+    try:
+        while True:
+            # asyncio event loop'una entegre et
+            future = loop.create_future()
+            loop.add_reader(fd, future.set_result, None)
+            await future
+            loop.remove_reader(fd)
+
+            # Event'leri oku
+            events = request.read_edge_events()
+            for ev in events:
+                edge = "RISING" if ev.event_type == \
+                    gpiod.EdgeEvent.Type.RISING_EDGE else "FALLING"
+                ts_ns = ev.timestamp_ns
+                print(f"[{ts_ns} ns] GPIO {ev.line_offset}: {edge}")
+    finally:
+        request.release()
+        chip.close()
+
+async def main():
+    await asyncio.gather(
+        monitor_button("/dev/gpiochip0", 17),
+        monitor_button("/dev/gpiochip0", 22)
+    )
+
+asyncio.run(main())</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: RPi4 button debounce + LED control daemon</h2>
+  <p class="section-lead">Raspberry Pi 4 üzerinde libgpiod v2 ile buton debounce + LED kontrol yapan, systemd servis olarak çalışan tam bir daemon uygulaması.</p>
+
+  <h3>Donanım bağlantıları</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Bileşen</th><th>RPi4 GPIO</th><th>Pin</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Buton</td><td>GPIO 17</td><td>Pin 11</td><td>Pull-up, GND'ye bağlı — basınca LOW</td></tr>
+        <tr><td>LED (kırmızı)</td><td>GPIO 18</td><td>Pin 12</td><td>330Ω dirençle 3.3V</td></tr>
+        <tr><td>LED (yeşil)</td><td>GPIO 27</td><td>Pin 13</td><td>330Ω dirençle 3.3V</td></tr>
+        <tr><td>GND</td><td>GND</td><td>Pin 9</td><td>Ortak toprak</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>gpio-daemon.c — tam daemon kodu</h3>
+  <pre><code class="language-c">/* gpio-daemon.c — buton + LED kontrol daemon */
+#include &lt;gpiod.h&gt;
+#include &lt;signal.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;poll.h&gt;
+#include &lt;syslog.h&gt;
+#include &lt;unistd.h&gt;
+
+#define CHIP_PATH   "/dev/gpiochip0"
+#define BTN_OFFSET  17
+#define LED_R       18
+#define LED_G       27
+#define DEBOUNCE_US 10000   /* 10 ms debounce */
+
+static volatile int running = 1;
+
+static void sighandler(int sig) {
+    syslog(LOG_INFO, "gpio-daemon: signal %d, stopping\n", sig);
+    running = 0;
+}
+
+int main(void) {
+    openlog("gpio-daemon", LOG_PID | LOG_CONS, LOG_DAEMON);
+    syslog(LOG_INFO, "gpio-daemon başlatılıyor");
+
+    signal(SIGTERM, sighandler);
+    signal(SIGINT,  sighandler);
+
+    struct gpiod_chip *chip = gpiod_chip_open(CHIP_PATH);
+    if (!chip) {
+        syslog(LOG_ERR, "Chip açılamadı: %s", CHIP_PATH);
+        return EXIT_FAILURE;
+    }
+
+    /* ── LED output request ── */
+    struct gpiod_line_settings *led_s = gpiod_line_settings_new();
+    gpiod_line_settings_set_direction(led_s,
+        GPIOD_LINE_DIRECTION_OUTPUT);
+    gpiod_line_settings_set_output_value(led_s,
+        GPIOD_LINE_VALUE_INACTIVE);
+
+    struct gpiod_line_config *led_cfg = gpiod_line_config_new();
+    unsigned int led_offsets[] = {LED_R, LED_G};
+    gpiod_line_config_add_line_settings(led_cfg, led_offsets, 2, led_s);
+
+    struct gpiod_request_config *rc = gpiod_request_config_new();
+    gpiod_request_config_set_consumer(rc, "gpio-daemon-led");
+
+    struct gpiod_line_request *led_req =
+        gpiod_chip_request_lines(chip, rc, led_cfg);
+    if (!led_req) {
+        syslog(LOG_ERR, "LED request başarısız");
+        return EXIT_FAILURE;
+    }
+
+    /* ── Buton input request ── */
+    struct gpiod_line_settings *btn_s = gpiod_line_settings_new();
+    gpiod_line_settings_set_direction(btn_s,
+        GPIOD_LINE_DIRECTION_INPUT);
+    gpiod_line_settings_set_bias(btn_s,
+        GPIOD_LINE_BIAS_PULL_UP);
+    gpiod_line_settings_set_edge_detection(btn_s,
+        GPIOD_LINE_EDGE_FALLING);
+    gpiod_line_settings_set_debounce_period_us(btn_s, DEBOUNCE_US);
+
+    struct gpiod_line_config *btn_cfg = gpiod_line_config_new();
+    unsigned int btn_offset = BTN_OFFSET;
+    gpiod_line_config_add_line_settings(btn_cfg, &amp;btn_offset, 1, btn_s);
+
+    gpiod_request_config_set_consumer(rc, "gpio-daemon-btn");
+    struct gpiod_line_request *btn_req =
+        gpiod_chip_request_lines(chip, rc, btn_cfg);
+    if (!btn_req) {
+        syslog(LOG_ERR, "Buton request başarısız");
+        return EXIT_FAILURE;
+    }
+
+    int fd = gpiod_line_request_get_fd(btn_req);
+    struct gpiod_edge_event_buffer *evbuf =
+        gpiod_edge_event_buffer_new(8);
+
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    int led_state = 0;   /* 0=kırmızı, 1=yeşil, 2=off */
+
+    /* Başlangıç: kırmızı LED */
+    gpiod_line_request_set_value(led_req, LED_R,
+        GPIOD_LINE_VALUE_ACTIVE);
+
+    syslog(LOG_INFO, "Hazır — buton bekleniyor");
+
+    while (running) {
+        int ret = poll(&amp;pfd, 1, 2000);
+        if (ret &lt; 0 &amp;&amp; running) {
+            syslog(LOG_ERR, "poll hatası");
+            break;
+        }
+        if (ret == 0) continue;  /* timeout, döngüye devam */
+
+        int n = gpiod_line_request_read_edge_events(
+            btn_req, evbuf, 8);
+
+        for (int i = 0; i &lt; n; i++) {
+            led_state = (led_state + 1) % 3;
+            /* Tüm LED'leri kapat */
+            gpiod_line_request_set_value(led_req, LED_R,
+                GPIOD_LINE_VALUE_INACTIVE);
+            gpiod_line_request_set_value(led_req, LED_G,
+                GPIOD_LINE_VALUE_INACTIVE);
+            /* Yeni duruma göre aç */
+            if (led_state == 0) {
+                gpiod_line_request_set_value(led_req, LED_R,
+                    GPIOD_LINE_VALUE_ACTIVE);
+                syslog(LOG_DEBUG, "LED: KIRMIZI");
+            } else if (led_state == 1) {
+                gpiod_line_request_set_value(led_req, LED_G,
+                    GPIOD_LINE_VALUE_ACTIVE);
+                syslog(LOG_DEBUG, "LED: YEŞİL");
+            } else {
+                syslog(LOG_DEBUG, "LED: KAPALI");
+            }
+        }
+    }
+
+    /* Temizlik */
+    gpiod_line_request_set_value(led_req, LED_R,
+        GPIOD_LINE_VALUE_INACTIVE);
+    gpiod_line_request_set_value(led_req, LED_G,
+        GPIOD_LINE_VALUE_INACTIVE);
+
+    gpiod_edge_event_buffer_free(evbuf);
+    gpiod_line_request_release(btn_req);
+    gpiod_line_request_release(led_req);
+    gpiod_line_config_free(led_cfg);
+    gpiod_line_config_free(btn_cfg);
+    gpiod_line_settings_free(led_s);
+    gpiod_line_settings_free(btn_s);
+    gpiod_request_config_free(rc);
+    gpiod_chip_close(chip);
+
+    syslog(LOG_INFO, "gpio-daemon durduruldu");
+    closelog();
+    return EXIT_SUCCESS;
+}</code></pre>
+
+  <h3>Derleme ve systemd servisi</h3>
+  <pre><code class="language-bash"># Derleme
+gcc -o gpio-daemon gpio-daemon.c \
+    $(pkg-config --cflags --libs libgpiod) \
+    -Wall -Wextra -O2
+
+# Test
+./gpio-daemon
+
+# systemd servis dosyası
+cat > /etc/systemd/system/gpio-daemon.service &lt;&lt;'EOF'
+[Unit]
+Description=GPIO Button+LED Daemon
+After=multi-user.target
+
+[Service]
+Type=simple
+User=pi
+Group=gpio
+ExecStart=/usr/local/bin/gpio-daemon
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Servisi etkinleştir
+sudo systemctl daemon-reload
+sudo systemctl enable --now gpio-daemon
+
+# Logları izle
+journalctl -u gpio-daemon -f</code></pre>
+
+  <div class="callout">
+    <div class="label">ÖZET</div>
+    <p>libgpiod v2, sysfs GPIO'nun tüm eksikliklerini giderir: güvenli sahiplik, atomik bulk operasyon, kernel düzeyinde debounce, nanosaniye timestamp ve asyncio entegrasyonu. Daemon geliştirme için C API, hızlı prototipleme ve otomasyon için Python binding, shell scriptler için gpiotools CLI idealdir. Pinctrl DT binding ile multiplexing konfigürasyonu kernel boot zamanında otomatik uygulanır.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

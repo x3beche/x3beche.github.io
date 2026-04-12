@@ -1,0 +1,564 @@
+---
+layout: tutorial
+title: "A/B Test & Canary Deployment — LLM'de Güvenli Yayın"
+back_url: "../index.html"
+back_label: "Model Serving Altyapısı"
+---
+
+<header class="header">
+  <div class="meta">
+    <span>Rehber</span>
+    <span>Model Serving</span>
+    <span>05 · Deployment</span>
+  </div>
+  <h1>A/B Test &amp; Canary<br><em>LLM'de Güvenli Yayın.</em></h1>
+  <p class="subtitle">Blue/green, canary ve shadow deployment stratejileri. İstatistiksel anlamlılık, LLM'e özgü metrikler ve FastAPI + NGINX ile production-grade canary kurulumu.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçerik</div>
+  <ol>
+    <li><a href="#s0">Model Deployment Stratejileri</a></li>
+    <li><a href="#s1">Traffic Splitting — Ağırlıklı Yönlendirme</a></li>
+    <li><a href="#s2">İstatistiksel Anlamlılık</a></li>
+    <li><a href="#s3">LLM-Specific Metrikler</a></li>
+    <li><a href="#s4">Shadow Mode</a></li>
+    <li><a href="#s5">Feature Flags — Model Gating</a></li>
+    <li><a href="#s6">Rollback Stratejisi</a></li>
+    <li><a href="#s7">Online A/B Test için Logging ve Analiz</a></li>
+    <li><a href="#s8">Pratik: FastAPI + NGINX ile Canary Deployment</a></li>
+  </ol>
+</nav>
+
+<main>
+
+  <section id="s0">
+    <h2><span class="num">00</span> Model Deployment Stratejileri</h2>
+    <p class="section-lead">Yeni bir model versiyonunu production'a almak, tam geçiş yapılmadan önce riskin kontrollü biçimde test edilmesini gerektirir.</p>
+    <p>Her deployment stratejisinin farklı risk/hız tradeoff'u vardır:</p>
+    <div class="file-table">
+      <div class="ft-header"><span>Strateji</span><span>Nasıl Çalışır</span><span>Risk</span><span>İdeal Senaryo</span></div>
+      <div class="ft-row"><span>Recreate</span><span>Eski kapat, yeni aç — downtime var</span><span>Çok yüksek</span><span>Dev/test ortamı</span></div>
+      <div class="ft-row"><span>Rolling Update</span><span>Podları birer birer değiştir</span><span>Orta</span><span>Stateless servisler</span></div>
+      <div class="ft-row"><span>Blue/Green</span><span>İki ortam; switch anında</span><span>Düşük — hızlı rollback</span><span>Kritik servisler</span></div>
+      <div class="ft-row"><span>Canary</span><span>Küçük yüzde trafiği yeni versiyona</span><span>Çok düşük</span><span>Yüksek riskli model değişikliği</span></div>
+      <div class="ft-row"><span>Shadow</span><span>Yeni model paralel çalışır, response kullanılmaz</span><span>Sıfır</span><span>Tahmin kalitesi ön validasyon</span></div>
+    </div>
+    <div class="callout">
+      <div class="label">ML İÇİN CANARY ÖNEMİ</div>
+      <p>Yazılım deploymentlarında bug'lar determinisktir — test edilince bulunur. ML modellerinde ise production drift, distribution shift veya edge case failure'lar yalnızca canlı trafik üzerinde ortaya çıkabilir. Bu yüzden canary deployment ML servisleri için yazılım deploymentından çok daha kritiktir.</p>
+    </div>
+  </section>
+
+  <section id="s1">
+    <h2><span class="num">01</span> Traffic Splitting — Ağırlıklı Yönlendirme</h2>
+    <p class="section-lead">NGINX veya Envoy ile gelen trafiğin belirli bir yüzdesi yeni model versiyonuna yönlendirilir.</p>
+    <p>Traffic splitting için iki temel yaklaşım vardır: (1) <strong>Stochastic splitting</strong> — her istek bağımsız olarak olasılıkla yönlendirilir; istatistiksel olarak doğru ama aynı kullanıcı farklı versiyonları görebilir. (2) <strong>User-based splitting</strong> — user_id hash'ine göre kullanıcı kalıcı olarak bir versiyona atanır; tutarlı deneyim sağlar, A/B analizi temizdir.</p>
+    <div class="code-block">
+      <div class="code-header"><span>nginx_canary.conf</span><span class="dot">●</span></div>
+      <pre><code>upstream model_v1 {
+    server model-v1:8000 weight=90;   # %90 traffic → stable
+}
+
+upstream model_v2 {
+    server model-v2:8000 weight=10;   # %10 traffic → canary
+}
+
+# Ağırlıklı upstream split
+upstream model_backend {
+    server model-v1:8000 weight=90;
+    server model-v2:8000 weight=10;
+}
+
+server {
+    listen 80;
+
+    location /v1/inference {
+        proxy_pass http://model_backend;
+        proxy_set_header X-Request-ID $request_id;
+        proxy_set_header Host $host;
+
+        # Hangi backend'e gittiğini header'a ekle
+        add_header X-Model-Version $upstream_addr always;
+    }
+}</code></pre>
+    </div>
+    <div class="code-block">
+      <div class="code-header"><span>user_hash_splitter.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> hashlib
+
+<span class="keyword">def</span> <span class="cmd">get_model_version</span>(user_id: str, canary_pct: float = <span class="str">0.1</span>) -&gt; str:
+    <span class="str">"""
+    Kullanıcıyı deterministic olarak bir model versiyonuna ata.
+    Aynı user_id her zaman aynı versiyonu görür.
+    canary_pct: 0.0–1.0 arasında canary yüzdesi
+    """</span>
+    h     = int(hashlib.<span class="cmd">md5</span>(user_id.<span class="cmd">encode</span>()).<span class="cmd">hexdigest</span>(), <span class="str">16</span>)
+    bucket = (h % <span class="str">100</span>) / <span class="str">100.0</span>   <span class="cmt"># 0.00 – 0.99</span>
+    <span class="keyword">return</span> <span class="str">"v2-canary"</span> <span class="keyword">if</span> bucket &lt; canary_pct <span class="keyword">else</span> <span class="str">"v1-stable"</span>
+
+<span class="cmt"># Test: 1000 kullanıcı</span>
+users   = [f<span class="str">"user_{i}"</span> <span class="keyword">for</span> i <span class="keyword">in</span> <span class="cmd">range</span>(<span class="str">1000</span>)]
+canary  = <span class="cmd">sum</span>(<span class="str">1</span> <span class="keyword">for</span> u <span class="keyword">in</span> users <span class="keyword">if</span> <span class="cmd">get_model_version</span>(u) == <span class="str">"v2-canary"</span>)
+<span class="cmd">print</span>(f<span class="str">"Canary yüzdesi: {canary/1000:.1%}"</span>)  <span class="cmt"># ~%10</span></code></pre>
+    </div>
+  </section>
+
+  <section id="s2">
+    <h2><span class="num">02</span> İstatistiksel Anlamlılık</h2>
+    <p class="section-lead">A/B test sonuçlarının güvenilir olabilmesi için istatistiksel anlamlılık, güç analizi ve yeterli örnek büyüklüğü gerekir.</p>
+    <p>A/B test değerlendirmesinin temel kavramları:</p>
+    <div class="params">
+      <div class="param-row"><span class="param-name">p-value</span><span class="param-desc">H₀ (fark yok) varsayımı altında gözlemlenen etkinin olasılığı. p &lt; 0.05 genellikle anlamlı kabul edilir; ML servislerde p &lt; 0.01 daha güvenli.</span></div>
+      <div class="param-row"><span class="param-name">MDE (Minimum Detectable Effect)</span><span class="param-desc">Tespit etmek istediğimiz en küçük fark. %0.5'lik iyileşme tespit için %5'lik iyileşmeden çok daha fazla veri gerekir.</span></div>
+      <div class="param-row"><span class="param-name">Güç (Power)</span><span class="param-desc">Gerçek bir etkiyi tespit etme olasılığı. Genellikle 0.80 (yani %20 false negative riski) hedeflenir.</span></div>
+      <div class="param-row"><span class="param-name">Örnek büyüklüğü</span><span class="param-desc">MDE, α (significance level) ve β (power) verildiğinde hesaplanır. statsmodels ile otomatik hesap mümkün.</span></div>
+    </div>
+    <div class="code-block">
+      <div class="code-header"><span>ab_stats.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">from</span> scipy <span class="keyword">import</span> stats
+<span class="keyword">import</span> numpy <span class="keyword">as</span> np
+<span class="keyword">from</span> statsmodels.stats.power <span class="keyword">import</span> TTestIndPower
+
+<span class="keyword">def</span> <span class="cmd">required_sample_size</span>(mde=<span class="str">0.02</span>, baseline=<span class="str">0.5</span>, alpha=<span class="str">0.05</span>, power=<span class="str">0.80</span>):
+    <span class="str">"""
+    A/B test için gerekli örnek büyüklüğü.
+    mde     : minimum tespit edilebilir etki (oran farkı)
+    baseline: kontrol grubu dönüşüm oranı
+    """</span>
+    effect_size = mde / np.<span class="cmd">sqrt</span>(baseline * (<span class="str">1</span> - baseline))
+    analysis    = <span class="cmd">TTestIndPower</span>()
+    n = analysis.<span class="cmd">solve_power</span>(
+        effect_size=effect_size, alpha=alpha, power=power, ratio=<span class="str">1.0</span>)
+    <span class="keyword">return</span> int(np.<span class="cmd">ceil</span>(n))
+
+<span class="keyword">def</span> <span class="cmd">run_ab_test</span>(control_conversions, control_n,
+               treatment_conversions, treatment_n, alpha=<span class="str">0.05</span>):
+    <span class="str">"""İki oranlı z-test ile A/B test anlamlılığı."""</span>
+    p_c = control_conversions / control_n
+    p_t = treatment_conversions / treatment_n
+    p_pool = (control_conversions + treatment_conversions) / (control_n + treatment_n)
+    se    = np.<span class="cmd">sqrt</span>(p_pool * (<span class="str">1</span> - p_pool) * (<span class="str">1</span>/control_n + <span class="str">1</span>/treatment_n))
+    z     = (p_t - p_c) / se
+    p_val = <span class="str">2</span> * (<span class="str">1</span> - stats.norm.<span class="cmd">cdf</span>(abs(z)))
+    uplift = (p_t - p_c) / p_c * <span class="str">100</span>
+
+    <span class="cmd">print</span>(f<span class="str">"Control  : {p_c:.4f} ({control_n} örnek)"</span>)
+    <span class="cmd">print</span>(f<span class="str">"Treatment: {p_t:.4f} ({treatment_n} örnek)"</span>)
+    <span class="cmd">print</span>(f<span class="str">"Uplift   : {uplift:+.2f}%"</span>)
+    <span class="cmd">print</span>(f<span class="str">"z-score  : {z:.3f}   p-value: {p_val:.4f}"</span>)
+    <span class="cmd">print</span>(f<span class="str">"Anlamlı  : {'EVET' if p_val < alpha else 'HAYIR'} (α={alpha})"</span>)
+    <span class="keyword">return</span> p_val &lt; alpha
+
+<span class="cmt"># Gerekli örnek büyüklüğü</span>
+n = <span class="cmd">required_sample_size</span>(mde=<span class="str">0.02</span>, baseline=<span class="str">0.30</span>)
+<span class="cmd">print</span>(f<span class="str">"Her grup için gerekli n: {n}"</span>)
+
+<span class="cmt"># Simüle edilmiş sonuç analizi</span>
+<span class="cmd">run_ab_test</span>(
+    control_conversions=<span class="str">300</span>, control_n=<span class="str">1000</span>,
+    treatment_conversions=<span class="str">330</span>, treatment_n=<span class="str">1000</span>)</code></pre>
+    </div>
+  </section>
+
+  <section id="s3">
+    <h2><span class="num">03</span> LLM-Specific Metrikler</h2>
+    <p class="section-lead">LLM deployment'larında klasik web metriklerinin yanı sıra dil modeline özgü performans göstergeleri izlenmelidir.</p>
+    <div class="file-table">
+      <div class="ft-header"><span>Metrik</span><span>Tanım</span><span>Hedef</span></div>
+      <div class="ft-row"><span>TTFT (Time to First Token)</span><span>İstek gönderiminden ilk token çıkışına kadar geçen süre</span><span>&lt; 500ms (interactive)</span></div>
+      <div class="ft-row"><span>TPS (Tokens/sec)</span><span>Saniyede üretilen token sayısı — generation hızı</span><span>&gt; 30 t/s (kullanılabilir UX)</span></div>
+      <div class="ft-row"><span>E2E Latency P99</span><span>99. yüzdelik uçtan uca yanıt süresi</span><span>SLA'ya göre, genellikle &lt; 5s</span></div>
+      <div class="ft-row"><span>Token/s throughput</span><span>Sistem genelinde saniyede toplam token üretimi</span><span>Maliyet optimizasyonu için maksimize</span></div>
+      <div class="ft-row"><span>Error rate</span><span>Timeout, OOM, model hatası oranı</span><span>&lt; 0.1%</span></div>
+      <div class="ft-row"><span>Output quality</span><span>ROUGE, BERTScore veya LLM-as-judge skoru</span><span>Yeni model eskiden düşük olmamalı</span></div>
+    </div>
+    <div class="code-block">
+      <div class="code-header"><span>llm_metrics_collector.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> time, statistics
+<span class="keyword">from</span> dataclasses <span class="keyword">import</span> dataclass, field
+<span class="keyword">from</span> typing <span class="keyword">import</span> List
+<span class="keyword">from</span> collections <span class="keyword">import</span> deque
+
+@dataclass
+<span class="keyword">class</span> <span class="cmd">LLMRequestMetrics</span>:
+    ttft_ms: float         <span class="cmt"># time to first token</span>
+    tps: float             <span class="cmt"># tokens per second</span>
+    e2e_ms: float          <span class="cmt"># end-to-end latency</span>
+    n_tokens: int          <span class="cmt"># generated token sayısı</span>
+    model_version: str     <span class="cmt"># "v1" veya "v2"</span>
+    success: bool = <span class="keyword">True</span>
+
+<span class="keyword">class</span> <span class="cmd">MetricsAggregator</span>:
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, window=<span class="str">1000</span>):
+        self.window   = window
+        self.by_model = {}   <span class="cmt"># version → deque</span>
+
+    <span class="keyword">def</span> <span class="cmd">record</span>(self, m: LLMRequestMetrics):
+        v = m.model_version
+        <span class="keyword">if</span> v <span class="keyword">not</span> <span class="keyword">in</span> self.by_model:
+            self.by_model[v] = <span class="cmd">deque</span>(maxlen=self.window)
+        self.by_model[v].<span class="cmd">append</span>(m)
+
+    <span class="keyword">def</span> <span class="cmd">summary</span>(self, version: str):
+        data = <span class="cmd">list</span>(self.by_model.<span class="cmd">get</span>(version, []))
+        <span class="keyword">if</span> <span class="keyword">not</span> data: <span class="keyword">return</span> {}
+        ttfts = [m.ttft_ms <span class="keyword">for</span> m <span class="keyword">in</span> data <span class="keyword">if</span> m.success]
+        tpss  = [m.tps      <span class="keyword">for</span> m <span class="keyword">in</span> data <span class="keyword">if</span> m.success]
+        e2es  = [m.e2e_ms   <span class="keyword">for</span> m <span class="keyword">in</span> data <span class="keyword">if</span> m.success]
+        errs  = <span class="cmd">sum</span>(<span class="str">1</span> <span class="keyword">for</span> m <span class="keyword">in</span> data <span class="keyword">if</span> <span class="keyword">not</span> m.success)
+        <span class="keyword">return</span> {
+            <span class="str">"n"</span>          : <span class="cmd">len</span>(data),
+            <span class="str">"error_rate"</span> : errs / <span class="cmd">len</span>(data),
+            <span class="str">"ttft_p50"</span>   : statistics.<span class="cmd">median</span>(ttfts) <span class="keyword">if</span> ttfts <span class="keyword">else</span> <span class="keyword">None</span>,
+            <span class="str">"ttft_p99"</span>   : sorted(ttfts)[int(<span class="cmd">len</span>(ttfts)*<span class="str">0.99</span>)-<span class="str">1</span>] <span class="keyword">if</span> ttfts <span class="keyword">else</span> <span class="keyword">None</span>,
+            <span class="str">"tps_mean"</span>   : statistics.<span class="cmd">mean</span>(tpss) <span class="keyword">if</span> tpss <span class="keyword">else</span> <span class="keyword">None</span>,
+            <span class="str">"e2e_p99"</span>    : sorted(e2es)[int(<span class="cmd">len</span>(e2es)*<span class="str">0.99</span>)-<span class="str">1</span>] <span class="keyword">if</span> e2es <span class="keyword">else</span> <span class="keyword">None</span>,
+        }</code></pre>
+    </div>
+  </section>
+
+  <section id="s4">
+    <h2><span class="num">04</span> Shadow Mode</h2>
+    <p class="section-lead">Shadow mode, yeni modeli gerçek trafiğe paralel olarak çalıştırır ama kullanıcıya yeni modelin yanıtını göndermez.</p>
+    <p>Shadow mode, zero-risk validation için idealdir: tüm production trafiği yeni modele iletilir, yanıtlar kaydedilir ve analiz edilir, ancak kullanıcı yalnızca eski modelden yanıt alır. Bu sayede yeni modelin kalitesi, latency'si ve hata oranı production koşullarında ölçülür.</p>
+    <div class="code-block">
+      <div class="code-header"><span>shadow_mode_proxy.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> asyncio, httpx, json, time
+<span class="keyword">from</span> fastapi <span class="keyword">import</span> FastAPI, Request
+<span class="keyword">from</span> fastapi.responses <span class="keyword">import</span> JSONResponse
+
+app = <span class="cmd">FastAPI</span>()
+
+MODEL_V1  = <span class="str">"http://model-v1:8000"</span>  <span class="cmt"># production model</span>
+MODEL_V2  = <span class="str">"http://model-v2:8000"</span>  <span class="cmt"># shadow model</span>
+shadow_log: list = []
+
+
+<span class="keyword">async</span> <span class="keyword">def</span> <span class="cmd">call_shadow</span>(client, path, payload):
+    <span class="str">"""Shadow modele fire-and-forget çağrı; yanıt loglanır."""</span>
+    t0 = time.<span class="cmd">perf_counter</span>()
+    <span class="keyword">try</span>:
+        resp = <span class="keyword">await</span> client.<span class="cmd">post</span>(MODEL_V2 + path, json=payload, timeout=<span class="str">30.0</span>)
+        shadow_log.<span class="cmd">append</span>({
+            <span class="str">"status"</span> : resp.status_code,
+            <span class="str">"latency"</span>: (time.<span class="cmd">perf_counter</span>() - t0) * <span class="str">1000</span>,
+            <span class="str">"body"</span>   : resp.<span class="cmd">json</span>() <span class="keyword">if</span> resp.status_code == <span class="str">200</span> <span class="keyword">else</span> <span class="keyword">None</span>,
+        })
+    <span class="keyword">except</span> Exception <span class="keyword">as</span> e:
+        shadow_log.<span class="cmd">append</span>({<span class="str">"status"</span>: <span class="str">"error"</span>, <span class="str">"error"</span>: <span class="cmd">str</span>(e)})
+
+
+@app.<span class="cmd">post</span>(<span class="str">"/{path:path}"</span>)
+<span class="keyword">async</span> <span class="keyword">def</span> <span class="cmd">proxy</span>(path: str, request: Request):
+    payload = <span class="keyword">await</span> request.<span class="cmd">json</span>()
+
+    <span class="keyword">async</span> <span class="keyword">with</span> httpx.<span class="cmd">AsyncClient</span>() <span class="keyword">as</span> client:
+        <span class="cmt"># 1. Production model — kullanıcıya dönen yanıt</span>
+        prod_resp = <span class="keyword">await</span> client.<span class="cmd">post</span>(
+            MODEL_V1 + <span class="str">"/"</span> + path, json=payload, timeout=<span class="str">30.0</span>)
+
+        <span class="cmt"># 2. Shadow model — fire-and-forget, yanıt kullanılmaz</span>
+        asyncio.<span class="cmd">create_task</span>(<span class="cmd">call_shadow</span>(client, <span class="str">"/"</span> + path, payload))
+
+    <span class="keyword">return</span> <span class="cmd">JSONResponse</span>(content=prod_resp.<span class="cmd">json</span>(), status_code=prod_resp.status_code)
+
+
+@app.<span class="cmd">get</span>(<span class="str">"/shadow/stats"</span>)
+<span class="keyword">def</span> <span class="cmd">shadow_stats</span>():
+    <span class="keyword">if</span> <span class="keyword">not</span> shadow_log: <span class="keyword">return</span> {<span class="str">"count"</span>: <span class="str">0</span>}
+    ok      = [l <span class="keyword">for</span> l <span class="keyword">in</span> shadow_log <span class="keyword">if</span> l.<span class="cmd">get</span>(<span class="str">"status"</span>) == <span class="str">200</span>]
+    lats    = [l[<span class="str">"latency"</span>] <span class="keyword">for</span> l <span class="keyword">in</span> ok]
+    <span class="keyword">return</span> {
+        <span class="str">"total"</span>      : <span class="cmd">len</span>(shadow_log),
+        <span class="str">"success_pct"</span>: <span class="cmd">len</span>(ok) / <span class="cmd">len</span>(shadow_log) * <span class="str">100</span>,
+        <span class="str">"lat_p50_ms"</span> : sorted(lats)[<span class="cmd">len</span>(lats)//2] <span class="keyword">if</span> lats <span class="keyword">else</span> <span class="keyword">None</span>,
+        <span class="str">"lat_p99_ms"</span> : sorted(lats)[int(<span class="cmd">len</span>(lats)*<span class="str">0.99</span>)] <span class="keyword">if</span> lats <span class="keyword">else</span> <span class="keyword">None</span>,
+    }</code></pre>
+    </div>
+  </section>
+
+  <section id="s5">
+    <h2><span class="num">05</span> Feature Flags — Model Gating</h2>
+    <p class="section-lead">Feature flag'ler, model değişikliklerini code deployment'tan bağımsız olarak kontrol eder; gerçek zamanlı açma/kapama ve gradual rollout imkânı sunar.</p>
+    <p>Feature flag'ler (feature toggle) ile model switching, deployment pipeline'ını değiştirmek yerine bir API çağrısı veya config güncellemesiyle yapılır. Örneğin <strong>LaunchDarkly</strong> ve <strong>Unleash</strong> açık kaynaklı alternatifleri ile tüm kullanıcılar için anında açma/kapama, belirli kullanıcı segmentleri için targeting ve percentage rollout mümkündür.</p>
+    <div class="code-block">
+      <div class="code-header"><span>feature_flag_router.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> redis, json, hashlib
+<span class="keyword">from</span> fastapi <span class="keyword">import</span> FastAPI, Header
+<span class="keyword">from</span> typing <span class="keyword">import</span> Optional
+
+app = <span class="cmd">FastAPI</span>()
+rds = redis.<span class="cmd">Redis</span>(host=<span class="str">"localhost"</span>, port=<span class="str">6379</span>, decode_responses=<span class="str">True</span>)
+
+<span class="keyword">def</span> <span class="cmd">get_flag</span>(flag_name: str) -&gt; dict:
+    <span class="str">"""Redis'ten flag konfigürasyonunu oku."""</span>
+    raw = rds.<span class="cmd">get</span>(f<span class="str">"flag:{flag_name}"</span>)
+    <span class="keyword">if</span> <span class="keyword">not</span> raw: <span class="keyword">return</span> {<span class="str">"enabled"</span>: <span class="keyword">False</span>, <span class="str">"pct"</span>: <span class="str">0</span>}
+    <span class="keyword">return</span> json.<span class="cmd">loads</span>(raw)
+
+<span class="keyword">def</span> <span class="cmd">user_in_rollout</span>(user_id: str, flag_name: str) -&gt; bool:
+    <span class="str">"""Kullanıcı canary rollout yüzdesine dahil mi?"""</span>
+    flag = <span class="cmd">get_flag</span>(flag_name)
+    <span class="keyword">if</span> <span class="keyword">not</span> flag[<span class="str">"enabled"</span>]: <span class="keyword">return</span> <span class="keyword">False</span>
+    seed    = f<span class="str">"{user_id}:{flag_name}"</span>
+    bucket  = (int(hashlib.<span class="cmd">md5</span>(seed.<span class="cmd">encode</span>()).<span class="cmd">hexdigest</span>(), <span class="str">16</span>) % <span class="str">100</span>)
+    <span class="keyword">return</span> bucket &lt; flag.<span class="cmd">get</span>(<span class="str">"pct"</span>, <span class="str">0</span>)
+
+@app.<span class="cmd">post</span>(<span class="str">"/predict"</span>)
+<span class="keyword">async</span> <span class="keyword">def</span> <span class="cmd">predict</span>(payload: dict, x_user_id: Optional[str] = <span class="cmd">Header</span>(<span class="keyword">None</span>)):
+    use_v2 = user_id <span class="keyword">and</span> <span class="cmd">user_in_rollout</span>(x_user_id, <span class="str">"model_v2_rollout"</span>)
+    version = <span class="str">"v2"</span> <span class="keyword">if</span> use_v2 <span class="keyword">else</span> <span class="str">"v1"</span>
+    <span class="cmt"># model_registry[version].predict(payload)</span>
+    <span class="keyword">return</span> {<span class="str">"version"</span>: version, <span class="str">"result"</span>: <span class="str">"..."</span>}
+
+<span class="cmt"># Flag ayarlama: %5 canary başlat</span>
+<span class="cmt"># rds.set("flag:model_v2_rollout", json.dumps({"enabled": True, "pct": 5}))</span></code></pre>
+    </div>
+  </section>
+
+  <section id="s6">
+    <h2><span class="num">06</span> Rollback Stratejisi</h2>
+    <p class="section-lead">Otomatik rollback, model degradation'ını insan müdahalesi olmadan tespit edip önceki versiyona döner.</p>
+    <p>Rollback tetikleyicileri: error rate ani artışı, latency P99 eşik aşımı, model output kalite skorunun düşmesi (LLM-as-judge), iş metriği regresyonu (dönüşüm oranı, tıklama oranı).</p>
+    <div class="code-block">
+      <div class="code-header"><span>auto_rollback.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> time, statistics, redis, json
+<span class="keyword">from</span> collections <span class="keyword">import</span> deque
+
+<span class="keyword">class</span> <span class="cmd">AutoRollbackGuard</span>:
+    <span class="str">"""
+    Canary model için otomatik rollback guard.
+    Metrikler eşiği aşarsa traffic splitting geri alınır.
+    """</span>
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, rds_client,
+                 error_threshold=<span class="str">0.02</span>,
+                 p99_threshold_ms=<span class="str">3000</span>,
+                 window=<span class="str">200</span>):
+        self.rds             = rds_client
+        self.error_threshold = error_threshold
+        self.p99_threshold   = p99_threshold_ms
+        self.errors          = <span class="cmd">deque</span>(maxlen=window)
+        self.latencies       = <span class="cmd">deque</span>(maxlen=window)
+        self.rolled_back     = <span class="keyword">False</span>
+
+    <span class="keyword">def</span> <span class="cmd">record</span>(self, success: bool, latency_ms: float):
+        self.errors.<span class="cmd">append</span>(<span class="str">0</span> <span class="keyword">if</span> success <span class="keyword">else</span> <span class="str">1</span>)
+        self.latencies.<span class="cmd">append</span>(latency_ms)
+        self.<span class="cmd">_check</span>()
+
+    <span class="keyword">def</span> <span class="cmd">_check</span>(self):
+        <span class="keyword">if</span> self.rolled_back <span class="keyword">or</span> <span class="cmd">len</span>(self.errors) &lt; <span class="str">50</span>: <span class="keyword">return</span>
+
+        error_rate = <span class="cmd">sum</span>(self.errors) / <span class="cmd">len</span>(self.errors)
+        lats_sorted = sorted(self.latencies)
+        p99 = lats_sorted[int(<span class="cmd">len</span>(lats_sorted) * <span class="str">0.99</span>)]
+
+        <span class="keyword">if</span> error_rate &gt; self.error_threshold:
+            self.<span class="cmd">_rollback</span>(f<span class="str">"Error rate {error_rate:.2%} > {self.error_threshold:.2%}"</span>)
+        <span class="keyword">elif</span> p99 &gt; self.p99_threshold:
+            self.<span class="cmd">_rollback</span>(f<span class="str">"P99 latency {p99:.0f}ms > {self.p99_threshold}ms"</span>)
+
+    <span class="keyword">def</span> <span class="cmd">_rollback</span>(self, reason: str):
+        self.rolled_back = <span class="keyword">True</span>
+        <span class="cmt"># NGINX ağırlığını sıfırla</span>
+        self.rds.<span class="cmd">set</span>(<span class="str">"canary:weight"</span>, <span class="str">"0"</span>)
+        self.rds.<span class="cmd">set</span>(<span class="str">"canary:status"</span>, <span class="str">"rolled_back"</span>)
+        event = {<span class="str">"ts"</span>: time.<span class="cmd">time</span>(), <span class="str">"reason"</span>: reason}
+        self.rds.<span class="cmd">lpush</span>(<span class="str">"rollback:log"</span>, json.<span class="cmd">dumps</span>(event))
+        <span class="cmd">print</span>(f<span class="str">"ROLLBACK: {reason}"</span>)</code></pre>
+    </div>
+  </section>
+
+  <section id="s7">
+    <h2><span class="num">07</span> Online A/B Test için Logging ve Analiz</h2>
+    <p class="section-lead">A/B test'in geçerliliği, hangi kullanıcının hangi versiyonu gördüğünü ve sonuçlarını eksiksiz kayıt altına almaya bağlıdır.</p>
+    <p>İyi bir A/B test logging'i şunları içermelidir: request_id (istek), user_id (kullanıcı), model_version (hangi model), timestamp, response latency, output quality score, downstream conversion event (kullanıcı aksiyonu).</p>
+    <div class="code-block">
+      <div class="code-header"><span>ab_logger.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> json, time, uuid
+<span class="keyword">from</span> dataclasses <span class="keyword">import</span> dataclass, asdict
+<span class="keyword">from</span> typing <span class="keyword">import</span> Optional
+<span class="keyword">import</span> pandas <span class="keyword">as</span> pd
+
+@dataclass
+<span class="keyword">class</span> <span class="cmd">ABEvent</span>:
+    request_id    : str
+    user_id       : str
+    model_version : str
+    latency_ms    : float
+    output_tokens : int
+    quality_score : Optional[float] = <span class="keyword">None</span>  <span class="cmt"># LLM-as-judge skoru</span>
+    converted     : Optional[bool]  = <span class="keyword">None</span>  <span class="cmt"># downstream conversion</span>
+    ts            : float = <span class="str">0.0</span>
+    <span class="keyword">def</span> <span class="cmd">__post_init__</span>(self):
+        <span class="keyword">if</span> <span class="keyword">not</span> self.ts: self.ts = time.<span class="cmd">time</span>()
+
+<span class="keyword">class</span> <span class="cmd">ABAnalyzer</span>:
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self):
+        self.events = []
+
+    <span class="keyword">def</span> <span class="cmd">log</span>(self, event: ABEvent):
+        self.events.<span class="cmd">append</span>(asdict(event))
+
+    <span class="keyword">def</span> <span class="cmd">report</span>(self):
+        <span class="keyword">if</span> <span class="keyword">not</span> self.events: <span class="keyword">return</span>
+        df = pd.<span class="cmd">DataFrame</span>(self.events)
+        summary = df.<span class="cmd">groupby</span>(<span class="str">"model_version"</span>).<span class="cmd">agg</span>({
+            <span class="str">"latency_ms"</span>    : [<span class="str">"mean"</span>, <span class="keyword">lambda</span> x: x.<span class="cmd">quantile</span>(<span class="str">0.99</span>)],
+            <span class="str">"output_tokens"</span> : <span class="str">"mean"</span>,
+            <span class="str">"quality_score"</span> : <span class="str">"mean"</span>,
+            <span class="str">"converted"</span>     : <span class="str">"mean"</span>,
+            <span class="str">"request_id"</span>    : <span class="str">"count"</span>
+        })
+        summary.columns = [<span class="str">"lat_mean"</span>,<span class="str">"lat_p99"</span>,<span class="str">"tokens_mean"</span>,
+                           <span class="str">"quality"</span>,<span class="str">"conv_rate"</span>,<span class="str">"n"</span>]
+        <span class="cmd">print</span>(summary.<span class="cmd">to_string</span>())
+        <span class="keyword">return</span> summary
+
+<span class="cmt"># Simüle edilmiş kullanım</span>
+analyzer = <span class="cmd">ABAnalyzer</span>()
+<span class="keyword">import</span> random, numpy <span class="keyword">as</span> np
+rng = np.random.<span class="cmd">default_rng</span>(<span class="str">0</span>)
+
+<span class="keyword">for</span> i <span class="keyword">in</span> <span class="cmd">range</span>(<span class="str">500</span>):
+    ver = <span class="str">"v2"</span> <span class="keyword">if</span> i % <span class="str">5</span> == <span class="str">0</span> <span class="keyword">else</span> <span class="str">"v1"</span>
+    ev  = <span class="cmd">ABEvent</span>(
+        request_id    = str(uuid.<span class="cmd">uuid4</span>()),
+        user_id       = f<span class="str">"u{i%100}"</span>,
+        model_version = ver,
+        latency_ms    = rng.<span class="cmd">normal</span>(<span class="str">400</span> <span class="keyword">if</span> ver==<span class="str">"v1"</span> <span class="keyword">else</span> <span class="str">380</span>, <span class="str">80</span>),
+        output_tokens = int(rng.<span class="cmd">normal</span>(<span class="str">120</span>, <span class="str">30</span>)),
+        quality_score = float(rng.<span class="cmd">uniform</span>(<span class="str">0.7</span>, <span class="str">0.95</span>)),
+        converted     = bool(rng.<span class="cmd">random</span>() &lt; (<span class="str">0.12</span> <span class="keyword">if</span> ver==<span class="str">"v1"</span> <span class="keyword">else</span> <span class="str">0.15</span>))
+    )
+    analyzer.<span class="cmd">log</span>(ev)
+
+analyzer.<span class="cmd">report</span>()</code></pre>
+    </div>
+  </section>
+
+  <section id="s8">
+    <h2><span class="num">08</span> Pratik: FastAPI + NGINX ile Canary Deployment</h2>
+    <p class="section-lead">İki FastAPI model servisini Docker Compose'da başlatıp NGINX ile ağırlıklı traffic splitting yapılandırması.</p>
+    <div class="code-block">
+      <div class="code-header"><span>docker-compose.yml</span><span class="dot">●</span></div>
+      <pre><code>version: "3.9"
+services:
+
+  model-v1:
+    image: python:3.11-slim
+    volumes: ["./app:/app"]
+    working_dir: /app
+    command: uvicorn model_v1:app --host 0.0.0.0 --port 8000
+    environment:
+      MODEL_VERSION: v1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      retries: 3
+
+  model-v2:
+    image: python:3.11-slim
+    volumes: ["./app:/app"]
+    working_dir: /app
+    command: uvicorn model_v2:app --host 0.0.0.0 --port 8000
+    environment:
+      MODEL_VERSION: v2
+
+  nginx:
+    image: nginx:alpine
+    ports: ["80:80"]
+    volumes: ["./nginx.conf:/etc/nginx/nginx.conf:ro"]
+    depends_on: [model-v1, model-v2]
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]</code></pre>
+    </div>
+    <div class="code-block">
+      <div class="code-header"><span>app/model_v1.py (ve model_v2.py)</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> os, time
+<span class="keyword">from</span> fastapi <span class="keyword">import</span> FastAPI
+<span class="keyword">from</span> pydantic <span class="keyword">import</span> BaseModel
+
+app = <span class="cmd">FastAPI</span>()
+VERSION = os.<span class="cmd">getenv</span>(<span class="str">"MODEL_VERSION"</span>, <span class="str">"v1"</span>)
+
+<span class="keyword">class</span> <span class="cmd">InferenceRequest</span>(BaseModel):
+    text: str
+    user_id: str = <span class="str">"anon"</span>
+
+@app.<span class="cmd">get</span>(<span class="str">"/health"</span>)
+<span class="keyword">def</span> <span class="cmd">health</span>(): <span class="keyword">return</span> {<span class="str">"status"</span>: <span class="str">"ok"</span>, <span class="str">"version"</span>: VERSION}
+
+@app.<span class="cmd">post</span>(<span class="str">"/predict"</span>)
+<span class="keyword">def</span> <span class="cmd">predict</span>(req: InferenceRequest):
+    t0 = time.<span class="cmd">perf_counter</span>()
+    <span class="cmt"># Gerçek uygulamada: model.generate(req.text)</span>
+    result = f<span class="str">"[{VERSION}] '{req.text}' için yanıt"</span>
+    lat    = (time.<span class="cmd">perf_counter</span>() - t0) * <span class="str">1000</span>
+    <span class="keyword">return</span> {
+        <span class="str">"version"</span> : VERSION,
+        <span class="str">"result"</span>  : result,
+        <span class="str">"latency"</span> : round(lat, <span class="str">2</span>)
+    }</code></pre>
+    </div>
+    <div class="code-block">
+      <div class="code-header"><span>nginx.conf — canary split (%10 v2)</span><span class="dot">●</span></div>
+      <pre><code>events { worker_connections 1024; }
+
+http {
+    upstream backend {
+        server model-v1:8000 weight=90;   # %90 → stable
+        server model-v2:8000 weight=10;   # %10 → canary
+    }
+
+    log_format ab_log '$remote_addr "$request" $status '
+                      '$upstream_addr $request_time';
+
+    server {
+        listen 80;
+        access_log /var/log/nginx/ab.log ab_log;
+
+        location /predict {
+            proxy_pass         http://backend;
+            proxy_set_header   X-Real-IP $remote_addr;
+            add_header         X-Served-By $upstream_addr always;
+        }
+
+        location /health {
+            proxy_pass http://backend;
+        }
+    }
+}</code></pre>
+    </div>
+    <div class="code-block">
+      <div class="code-header"><span>terminal — test ve oran doğrulama</span><span class="dot">●</span></div>
+      <pre><code><span class="cmt"># Servisleri başlat</span>
+docker-compose up -d
+
+<span class="cmt"># 100 istek gönder ve hangi versiyondan kaç tane geldiğini say</span>
+for i in $(seq 1 100); do
+  curl -s -X POST http://localhost/predict \
+    -H "Content-Type: application/json" \
+    -d '{"text":"test","user_id":"u1"}' | grep -o '"version":"v[12]"'
+done | sort | uniq -c
+
+<span class="cmt"># Beklenen çıktı: ~90 adet v1, ~10 adet v2</span>
+
+<span class="cmt"># NGINX log'dan hangi backend'in çağrıldığını gör</span>
+docker exec nginx tail -20 /var/log/nginx/ab.log</code></pre>
+    </div>
+    <div class="callout">
+      <div class="label">BEKLENEN SONUÇ</div>
+      <p>100 istekte yaklaşık 90'ı model-v1'den, 10'u model-v2'den yanıt alır. NGINX weight düzenlenerek canary yüzdesi artırılır: 10 → 25 → 50 → 100 şeklinde kademeli rollout yapılır. Her aşama en az birkaç saat izlenir; metrikler stabil kalırsa bir sonraki aşamaya geçilir.</p>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

@@ -1,0 +1,595 @@
+---
+layout: tutorial
+title: "Linux Memory Management — Derin Bakış"
+back_url: "../index.html"
+back_label: "embedded-deck"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>MEMORY MANAGEMENT</span>
+    <span>2026</span>
+  </div>
+  <h1>Linux Memory Management<br><em>Derin Bakış.</em></h1>
+  <p class="subtitle">Sanal adres uzayından fiziksel sayfa tablolarına, slab allocator'dan OOM killer'a, huge pages'ten NUMA politikalarına ve embedded cihazlarda memory leak tespitine kadar Linux bellek yönetiminin eksiksiz rehberi.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Linux VM mimarisi</a></li>
+    <li><a href="#s1">/proc/meminfo anatomisi</a></li>
+    <li><a href="#s2">Page cache</a></li>
+    <li><a href="#s3">Slab allocator</a></li>
+    <li><a href="#s4">OOM killer</a></li>
+    <li><a href="#s5">Huge pages</a></li>
+    <li><a href="#s6">Memory pressure ve PSI</a></li>
+    <li><a href="#s7">NUMA</a></li>
+    <li><a href="#s8">Pratik: embedded cihazda memory leak bulma</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Linux VM mimarisi</h2>
+  <p class="section-lead">Linux, her process için bağımsız bir sanal adres uzayı sunar. ARM64 mimarisinde 4 seviyeli sayfa tablosu (4-level paging), 48-bit sanal adres uzayı sağlar.</p>
+
+  <h3>Sanal adres uzayı düzeni (ARM64)</h3>
+  <div class="flow">
+    <pre>
+0xFFFF_FFFF_FFFF_FFFF ┐
+        Kernel Space   │  128 TB (TTBR1_EL1)
+        (tüm process   │  Kernel kodu, veri, modul
+         paylaşır)     │  vmalloc, ioremap, kasan
+0xFFFF_0000_0000_0000 ┘
+          [Boşluk — erişim → SIGSEGV]
+0x0000_FFFF_FFFF_FFFF ┐
+        User Space     │  128 TB (TTBR0_EL1)
+        (her process   │  Stack (yüksek adres)
+         izole)        │  mmap / shared libs
+                       │  Heap (brk büyür)
+                       │  BSS / Data / Text
+0x0000_0000_0000_0000 ┘
+    </pre>
+  </div>
+
+  <h3>4-level paging (ARM64 / x86-64)</h3>
+  <div class="params">
+    <div class="param"><span class="name">PGD (Page Global Dir)</span><span class="desc">Seviye 0 — 48-bit VA'nın [47:39] bitleri, TTBR register'ı işaret eder</span></div>
+    <div class="param"><span class="name">PUD (Page Upper Dir)</span><span class="desc">Seviye 1 — [38:30] bitleri, 1 GB'lık blok haritalama mümkün (huge page)</span></div>
+    <div class="param"><span class="name">PMD (Page Middle Dir)</span><span class="desc">Seviye 2 — [29:21] bitleri, 2 MB'lık blok haritalama (THP için kullanılır)</span></div>
+    <div class="param"><span class="name">PTE (Page Table Entry)</span><span class="desc">Seviye 3 — [20:12] bitleri, 4 KB'lık fiziksel sayfa adresi + izin bitleri</span></div>
+    <div class="param"><span class="name">Page offset</span><span class="desc">[11:0] bitleri — 4 KB sayfa içinde byte ofseti</span></div>
+  </div>
+
+  <h3>TLB (Translation Lookaside Buffer)</h3>
+  <p>Her VA → PA çevirisi sayfa tablosunda 4 bellek erişimi gerektirir. TLB bu çevirileri önbellekler. Context switch'te TLB flush (ASID tagging ile kısmen kaçınılabilir) gecikmeye yol açar.</p>
+  <pre><code class="language-bash"># TLB istatistiklerini perf ile izle
+perf stat -e dTLB-load-misses,iTLB-load-misses ./myapp
+
+# ARM64 ASID tagging — TLB flush olmadan context switch
+# kernel/arch/arm64/mm/context.c içinde asid_generation
+
+# Sayfa tablosunu bir process için incele
+cat /proc/$(pgrep myapp)/smaps | grep -E "Size|Rss|Pss|Dirty"</code></pre>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>ARM64'te 4 KB, 16 KB ve 64 KB sayfa boyutları desteklenir. Raspberry Pi (BCM2837/BCM2711) 4 KB granule kullanır. Büyük sayfa granule TLB miss sayısını düşürür fakat daha fazla bellek israfına yol açabilir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> /proc/meminfo anatomisi</h2>
+  <p class="section-lead"><code>/proc/meminfo</code>, sistemdeki bellek kullanımının anlık fotoğrafını sunar. Her satırın ne anlama geldiğini bilmek, bellek sorunlarını teşhis etmek için kritiktir.</p>
+
+  <h3>Temel alanlar</h3>
+  <pre><code class="language-bash">cat /proc/meminfo
+# MemTotal:        8057072 kB   ← Toplam fiziksel RAM (kernel + user)
+# MemFree:          312548 kB   ← Hiç kullanılmayan RAM
+# MemAvailable:    3214088 kB   ← Yeni proses için kullanılabilir tahmin
+# Buffers:          184736 kB   ← Blok cihaz metadata önbelleği
+# Cached:          2891220 kB   ← Page cache (dosya içerikleri)
+# SwapCached:        12340 kB   ← Swap'ta ama aynı zamanda RAM'de
+# Active:          3104568 kB   ← Son kullanılan sayfalar (LRU head)
+# Inactive:        1892340 kB   ← Uzun süredir kullanılmayan (LRU tail)
+# Active(anon):    1284000 kB   ← Anonim aktif (heap, stack)
+# Inactive(anon):   384000 kB   ← Anonim inaktif (swap adayı)
+# Active(file):    1820568 kB   ← Dosya aktif page cache
+# Inactive(file):  1508340 kB   ← Dosya inaktif page cache
+# SwapTotal:       2097148 kB   ← Toplam swap alanı
+# SwapFree:        1843200 kB   ← Kullanılmayan swap
+# Dirty:             14528 kB   ← Değiştirilmiş ama henüz yazılmamış
+# Writeback:             0 kB   ← Aktif olarak diske yazılan
+# SReclaimable:     452000 kB   ← Slab'ın geri alınabilir kısmı (cache)
+# SUnreclaim:        89000 kB   ← Slab'ın zorunlu (kernel struct) kısmı
+# KernelStack:       24576 kB   ← Kernel stack sayfaları
+# PageTables:        48000 kB   ← Sayfa tablosu belleği
+# HugePages_Total:       0      ← Statik huge page sayısı
+# HugePages_Free:        0</code></pre>
+
+  <h3>MemAvailable formülü</h3>
+  <div class="callout">
+    <div class="label">ÖNEMLİ</div>
+    <p><code>MemAvailable</code>, <code>MemFree + reclaimable Cached + reclaimable Slab</code> değerinden hesaplanır. <code>MemFree</code> sıfıra yakın olsa bile yüzlerce MB Cached geri alınabildiği için sistem normalde çalışmaya devam eder. Gerçek baskı <code>MemAvailable</code> çok düşük olduğunda başlar.</p>
+  </div>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Alan</th><th>Tanım</th><th>Kritik Eşik</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>MemFree</td><td>Tamamen boş sayfa</td><td>Tek başına anlamsız</td></tr>
+        <tr><td>MemAvailable</td><td>Gerçek kullanılabilir tahmin</td><td>&lt;%10 → baskı başlar</td></tr>
+        <tr><td>Dirty</td><td>Yazılmamış page cache</td><td>Çok yüksek → I/O latency</td></tr>
+        <tr><td>SUnreclaim</td><td>Serbest bırakılamaz kernel bellek</td><td>Sürekli artarsa → leak</td></tr>
+        <tr><td>SwapFree → 0</td><td>Swap doldu</td><td>OOM killer yaklaşıyor</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Page cache</h2>
+  <p class="section-lead">Page cache, disk I/O'yu hızlandırmak için dosya içeriklerini RAM'de tutar. Linux mevcut boş belleği agresif biçimde page cache'e atar; gerektiğinde geri verir.</p>
+
+  <h3>Dosya okuma akışı</h3>
+  <div class="flow">
+    <pre>
+read() syscall
+    |
+  VFS Layer
+    |
+  Page Cache kontrol ── HIT ──→ doğrudan kullanıcıya kopyala
+    |
+   MISS
+    |
+  Block Layer (bio submit)
+    |
+  Disk / eMMC / NVMe
+    |
+  Veri sayfa cachee yüklenir
+    |
+  Kullanıcıya kopyalanır
+    </pre>
+  </div>
+
+  <h3>Dirty page ve writeback</h3>
+  <pre><code class="language-bash"># Dirty page kontrolü
+cat /proc/sys/vm/dirty_ratio          # %10 → toplam RAM'in %10'u → sync writeback
+cat /proc/sys/vm/dirty_background_ratio # %5 → arka plan writeback başlar
+cat /proc/sys/vm/dirty_writeback_centisecs # 500 = 5 sn writeback periyodu
+cat /proc/sys/vm/dirty_expire_centisecs    # 3000 = 30 sn sonra dirty page zorunlu flush
+
+# Anlık dirty/writeback miktarı
+grep -E "Dirty|Writeback" /proc/meminfo
+
+# Tüm dirty page'leri zorla flush et
+sync
+
+# kswapd ve writeback thread durumu
+ps aux | grep -E "kswapd|writeback|kworker"</code></pre>
+
+  <h3>Page cache temizleme</h3>
+  <pre><code class="language-bash"># Page cache'i temizle (test/benchmark öncesi)
+sync
+echo 1 > /proc/sys/vm/drop_caches   # sadece page cache
+
+# Slab + page cache
+sync
+echo 2 > /proc/sys/vm/drop_caches   # sadece slab
+echo 3 > /proc/sys/vm/drop_caches   # slab + page cache
+
+# UYARI: production'da kullanmayın — I/O spike'ına yol açar!</code></pre>
+
+  <h3>vmstat ile page cache izleme</h3>
+  <pre><code class="language-bash"># 1 sn aralıklı bellek istatistikleri
+vmstat 1 10
+# procs  --------memory--------  ---swap-- -----io---- -system-- ----cpu----
+#  r  b  swpd   free   buff  cache   si  so    bi    bo   in   cs  us sy id wa
+#  1  0     0 312548 184736 2891220  0   0    12     8  245 891   5  2 93  0
+
+# si/so: swap in/out — sıfır değilse bellek baskısı var
+# bi/bo: block in/out — sayfa yükleme I/O
+# buff: buffer cache  cache: page cache</code></pre>
+
+  <div class="callout">
+    <div class="label">EMBEDDED NOT</div>
+    <p>Embedded sistemlerde RAM kısıtlı olduğu için <code>dirty_ratio</code> ve <code>dirty_background_ratio</code>'yu düşürmek beklenmedik I/O spike'larını azaltır. eMMC flash için sık writeback ömrü kısaltabileceğinden denge kurulmalıdır.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Slab allocator</h2>
+  <p class="section-lead">Slab allocator, kernel içindeki küçük ve sık kullanılan nesnelerin (inode, dentry, task_struct...) verimli tahsisini sağlar. Parçalanmayı önler, önbellekleme ile tahsis hızını artırır.</p>
+
+  <h3>Allocator varyantları</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Allocator</th><th>Açıklama</th><th>Kullanım Durumu</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>SLAB</td><td>Orijinal tasarım, debug dostu, karmaşık</td><td>Büyük sunucular, eski kernellar</td></tr>
+        <tr><td>SLUB</td><td>Varsayılan (2.6.23+), basit, hızlı, düşük overhead</td><td>Modern Linux (ARM/x86)</td></tr>
+        <tr><td>SLOB</td><td>Çok küçük footprint, minimal overhead</td><td>Çok kısıtlı embedded (&lt;32 MB)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>kmalloc / kfree</h3>
+  <pre><code class="language-c">/* Kernel modülünde bellek tahsisi */
+#include &lt;linux/slab.h&gt;
+
+/* Küçük tahsis (slab önbelleğinden) */
+void *buf = kmalloc(256, GFP_KERNEL);
+if (!buf)
+    return -ENOMEM;
+/* ... kullan ... */
+kfree(buf);
+
+/* Sıfırlanmış tahsis */
+void *zbuf = kzalloc(sizeof(struct mydata), GFP_KERNEL);
+
+/* Array tahsisi — overflow-safe */
+void *arr = kcalloc(count, sizeof(struct item), GFP_KERNEL);
+
+/* GFP bayrakları:
+ * GFP_KERNEL  — uyku izinli, normal context
+ * GFP_ATOMIC  — interrupt/atomic context, uyku yok
+ * GFP_DMA     — DMA erişilebilir bölge (< 16 MB)
+ * __GFP_ZERO  — sıfırla */</code></pre>
+
+  <h3>/proc/slabinfo ve slabtop</h3>
+  <pre><code class="language-bash"># Slab önbelleklerini listele
+cat /proc/slabinfo | head -20
+# slabinfo - version: 2.1
+# # name       &lt;active_objs&gt; &lt;num_objs&gt; &lt;objsize&gt; &lt;objperslab&gt; &lt;pagesperslab&gt;
+# kmalloc-256      4096       4096       256         16          1
+# kmalloc-128      8192       8192       128         32          1
+# dentry           25000      30000      192         21          1
+# inode_cache      12000      15000      608          6          1
+
+# Gerçek zamanlı izleme (htop benzeri)
+slabtop
+
+# Belirli cache'i filtrele
+cat /proc/slabinfo | awk '/dentry/ {print $1, $2, $3, $4}'
+
+# SLUB debug (CONFIG_SLUB_DEBUG)
+cat /sys/kernel/slab/kmalloc-256/alloc_calls 2>/dev/null</code></pre>
+
+  <h3>Bellek parçalanması</h3>
+  <pre><code class="language-bash"># Harici fragmentation durumu
+cat /proc/buddyinfo
+# Node 0, zone   Normal    120  95  64  38  20  8  4  2  1  0  0
+# Sütunlar: order 0 (4KB) → order 10 (4MB) blok sayısı
+
+# Compaction tetikle (fragmentasyonu azalt)
+echo 1 > /proc/sys/vm/compact_memory
+
+# Kernel memory fragmentation istatistikleri
+grep -E "compact|pgmigrate" /proc/vmstat</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> OOM killer</h2>
+  <p class="section-lead">Out-Of-Memory killer, kullanılabilir bellek tükendiğinde sistemi kurtarmak için bir veya daha fazla process'i sonlandırır. Hangi process'in öldürüleceği <code>oom_score</code> ile belirlenir.</p>
+
+  <h3>oom_score hesaplama</h3>
+  <pre><code class="language-bash"># Bir process'in OOM skoru (0-1000)
+cat /proc/$(pgrep myapp)/oom_score
+# 742  ← yüksek = öldürülme olasılığı yüksek
+
+# OOM skoru ayarlama (-1000 = asla öldürme, +1000 = önce öldür)
+echo -900 > /proc/$(pgrep sshd)/oom_score_adj
+echo 500  > /proc/$(pgrep myapp)/oom_score_adj
+
+# Systemd servis için OOM ayarı:
+# /etc/systemd/system/myapp.service
+# [Service]
+# OOMScoreAdjust=-500</code></pre>
+
+  <h3>Overcommit politikası</h3>
+  <div class="params">
+    <div class="param"><span class="name">overcommit_memory=0</span><span class="desc">Varsayılan — sezgisel kontrol: saçma istekler reddedilir, normal aşırı commit kabul edilir</span></div>
+    <div class="param"><span class="name">overcommit_memory=1</span><span class="desc">Her zaman kabul et — malloc asla NULL dönemez, OOM olasılığı yüksek</span></div>
+    <div class="param"><span class="name">overcommit_memory=2</span><span class="desc">Kesin sınır — swap + RAM*ratio kadar toplam commit, aşınca malloc başarısız olur</span></div>
+  </div>
+
+  <pre><code class="language-bash"># Mevcut overcommit politikası
+cat /proc/sys/vm/overcommit_memory
+cat /proc/sys/vm/overcommit_ratio   # mode=2 için RAM yüzdesi (varsayılan 50)
+
+# Toplam commit limiti ve kullanımı
+grep -E "Committed_AS|CommitLimit" /proc/meminfo</code></pre>
+
+  <h3>dmesg OOM log analizi</h3>
+  <pre><code class="language-bash"># OOM killer tetiklenmiş mi?
+dmesg | grep -i "oom\|killed process\|out of memory"
+
+# Tipik OOM log örneği:
+# [12345.678] Out of memory: Kill process 1234 (myapp) score 742 or sacrifice child
+# [12345.679] Killed process 1234 (myapp) total-vm:524288kB, anon-rss:498688kB
+# [12345.680]  oom_kill_process+0x...
+
+# oom_kill_process çağrıldığında kernel şunu basar:
+# - Tüm processlerin anlık bellek kullanımı (task dump)
+# - vm stats, oom_score, oom_score_adj değerleri</code></pre>
+
+  <div class="callout">
+    <div class="label">EMBEDDED STRATEJİ</div>
+    <p>Embedded sistemlerde kritik daemon'lara (udhcpd, sshd, watchdog) <code>OOMScoreAdjust=-1000</code> verin. Ana uygulama process'i varsayılan bırakın ya da +100..+300 verin. <code>overcommit_memory=2</code> ile deterministik davranış sağlanabilir fakat tüm bellek taleplerinin peşin hesaplanması gerekir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Huge pages</h2>
+  <p class="section-lead">Huge pages, TLB miss sayısını dramatik şekilde azaltarak büyük bellek kullanan uygulamalarda (veritabanı, ML inference, DSP) performans kazanımı sağlar.</p>
+
+  <h3>Statik huge pages</h3>
+  <pre><code class="language-bash"># Mevcut huge page durumu
+cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages   # 2 MB
+cat /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages # 1 GB (ARM64)
+
+grep Huge /proc/meminfo
+# HugePages_Total:   128   ← ayrılan sayfa sayısı
+# HugePages_Free:    112   ← kullanılmayan
+# HugePages_Rsvd:      4   ← rezerve edilmiş
+# Hugepagesize:     2048 kB
+
+# Kernel parametresi ile ayarla
+echo 64 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+# veya boot parametresi:
+# hugepages=128 hugepagesz=2M
+
+# hugetlbfs mount et
+mkdir /mnt/huge
+mount -t hugetlbfs nodev /mnt/huge</code></pre>
+
+  <h3>THP (Transparent Huge Pages)</h3>
+  <pre><code class="language-bash"># THP modu kontrol
+cat /sys/kernel/mm/transparent_hugepage/enabled
+# [always] madvise never
+
+# Modlar:
+# always   = agresif, tüm anonim bellek için dene
+# madvise  = sadece madvise(MADV_HUGEPAGE) ile işaretlenmiş
+# never    = THP kapalı
+
+# Embedded sistemlerde genellikle kapalı tutulur:
+echo madvise > /sys/kernel/mm/transparent_hugepage/enabled
+
+# THP istatistikleri
+grep -i huge /proc/vmstat | grep -v "nr_anon\|file"</code></pre>
+
+  <h3>madvise ile THP kullanımı (C)</h3>
+  <pre><code class="language-c">#include &lt;sys/mman.h&gt;
+
+/* Büyük buffer için huge page iste */
+void *buf = mmap(NULL, 256 * 1024 * 1024,   /* 256 MB */
+                 PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+/* THP kullan — 2 MB bloklar olarak haritalansın */
+madvise(buf, 256 * 1024 * 1024, MADV_HUGEPAGE);
+
+/* İşlem bitince geri ver */
+madvise(buf, 256 * 1024 * 1024, MADV_NOHUGEPAGE);
+munmap(buf, 256 * 1024 * 1024);</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Memory pressure ve PSI</h2>
+  <p class="section-lead">PSI (Pressure Stall Information), Linux 4.20'den itibaren CPU, memory ve I/O kaynaklarının ne kadar zamanda baskı altında olduğunu ölçer. Memory pressure, OOM olmadan önce erken uyarı sağlar.</p>
+
+  <h3>/proc/pressure/memory</h3>
+  <pre><code class="language-bash">cat /proc/pressure/memory
+# some avg10=0.52 avg60=0.18 avg300=0.06 total=1234567
+# full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+
+# "some": En az bir task memory bekliyor (stall)
+#   avg10  = son 10 saniye ortalama % stall süresi
+#   avg60  = son 60 saniye ortalama
+#   avg300 = son 5 dakika ortalama
+#   total  = toplam microsaniye (monotonic)
+#
+# "full": TÜM runnable task'lar memory bekliyor (sistem donuk)
+#   full &gt; 0 → ciddi bellek baskısı
+
+# Diğer PSI dosyaları
+cat /proc/pressure/cpu
+cat /proc/pressure/io</code></pre>
+
+  <h3>cgroup memory.pressure</h3>
+  <pre><code class="language-bash"># cgroup v2 ile konteyner/servis düzeyinde PSI
+cat /sys/fs/cgroup/system.slice/myservice.service/memory.pressure
+# some avg10=1.23 avg60=0.45 avg300=0.12 total=5678900
+
+# cgroup memory limiti ayarla
+echo "512M" > /sys/fs/cgroup/myapp/memory.max
+echo "400M" > /sys/fs/cgroup/myapp/memory.high   # soft limit
+
+# memory.stat — detaylı cgroup bellek istatistikleri
+cat /sys/fs/cgroup/myapp/memory.stat</code></pre>
+
+  <h3>PSI threshold trigger (event notification)</h3>
+  <pre><code class="language-bash"># PSI tabanlı bellek baskı monitörü scripti
+#!/bin/bash
+THRESHOLD="some 200000 1000000"   # 200ms / 1 sn window
+
+# PSI poll ile trigger (kernel 5.2+)
+exec 3&lt;&gt; /proc/pressure/memory
+echo "$THRESHOLD" &gt;&amp;3
+
+while true; do
+    if read -t 5 -u 3 line; then
+        echo "$(date): MEMORY PRESSURE TRIGGER: $line"
+        # uyarı gönder, cache temizle, vs.
+    fi
+done</code></pre>
+
+  <div class="callout">
+    <div class="label">KULLANIM</div>
+    <p>systemd, PSI'yi cgroup bazlı hafıza baskısı tespiti için kullanır. <code>MemoryPressureWatch=yes</code> ile bir servis, kendi memory baskısına göre hafıza düşürme (memory.reclaim) yapabilir. Embedded sistemlerde özel bir watchdog daemon PSI'yi izleyerek kritik süreçleri yeniden başlatabilir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> NUMA</h2>
+  <p class="section-lead">NUMA (Non-Uniform Memory Access), çok işlemcili sistemlerde her CPU'nun kendi yerel belleğine daha hızlı eriştiği mimaridir. Doğru NUMA politikası belirgin performans farkı yaratır.</p>
+
+  <h3>NUMA topolojisi</h3>
+  <pre><code class="language-bash"># NUMA node'larını listele
+numactl --hardware
+# available: 2 nodes (0-1)
+# node 0 cpus: 0 1 2 3 4 5 6 7
+# node 0 size: 32128 MB
+# node 0 free: 18234 MB
+# node 1 cpus: 8 9 10 11 12 13 14 15
+# node 1 size: 32128 MB
+# node 1 free: 20100 MB
+# node distances:
+# node   0   1
+#   0:  10  21
+#   1:  21  10
+
+# NUMA istatistikleri
+numastat
+numastat -p $(pgrep myapp)</code></pre>
+
+  <h3>NUMA bellek politikaları</h3>
+  <div class="params">
+    <div class="param"><span class="name">default</span><span class="desc">Yerel node tercih edilir — process nerede çalışıyorsa oradan tahsis</span></div>
+    <div class="param"><span class="name">bind</span><span class="desc">Sadece belirtilen node'lardan tahsis — başka node kullanılmaz, OOM olur</span></div>
+    <div class="param"><span class="name">preferred</span><span class="desc">Tercih edilen node, dolunca diğerlerine geç</span></div>
+    <div class="param"><span class="name">interleave</span><span class="desc">Belleği node'lara round-robin dağıt — bant genişliği kazanımı</span></div>
+  </div>
+
+  <pre><code class="language-bash"># Node 0 CPU'da, node 0 RAM'inde çalıştır
+numactl --cpunodebind=0 --membind=0 ./myapp
+
+# Node 0 ve 1 arası interleave
+numactl --interleave=0,1 ./myapp
+
+# Tercih: node 1, dolunca node 0'a geç
+numactl --preferred=1 ./myapp
+
+# Process'in numa_maps'ini incele
+cat /proc/$(pgrep myapp)/numa_maps | head -20
+# 7f8a00000000 default anon=1024 dirty=1024 N0=800 N1=224 kernelpagesize_kB=4
+
+# numad — otomatik NUMA optimizasyon daemon
+systemctl start numad</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: embedded cihazda memory leak bulma</h2>
+  <p class="section-lead">Embedded Linux'ta memory leak tespiti — valgrind, /proc/PID/smaps analizi, OOM tuning ve page cache monitoring için adım adım pipeline.</p>
+
+  <h3>Adım 1: /proc/PID/smaps ile leak izleme</h3>
+  <pre><code class="language-bash">#!/bin/bash
+# memory_watch.sh — process bellek büyümesini izle
+PID=$(pgrep myapp)
+INTERVAL=10
+LOG=/tmp/mem_watch.log
+
+while kill -0 $PID 2>/dev/null; do
+    TIMESTAMP=$(date +%s)
+    RSS=$(grep VmRSS /proc/$PID/status | awk '{print $2}')
+    HEAP=$(grep "\[heap\]" /proc/$PID/maps | awk '{print $1}')
+    ANON=$(awk '/^Anonymous:/ {sum+=$2} END {print sum}' /proc/$PID/smaps)
+    echo "$TIMESTAMP RSS=${RSS}kB Heap=$HEAP Anon=${ANON}kB" >> $LOG
+    sleep $INTERVAL
+done
+
+echo "Process $PID sonlandı, log: $LOG"</code></pre>
+
+  <h3>Adım 2: valgrind ile heap analizi</h3>
+  <pre><code class="language-bash"># Valgrind memcheck (cross-compile için valgrind ARM64 binary)
+valgrind \
+    --tool=memcheck \
+    --leak-check=full \
+    --show-leak-kinds=all \
+    --track-origins=yes \
+    --log-file=/tmp/valgrind.log \
+    ./myapp --test-mode
+
+# Valgrind çıktısı örneği:
+# ==1234== 4096 bytes in 1 blocks are definitely lost in loss record 2 of 3
+# ==1234==    at 0x4C2FB0F: malloc (vg_replace_malloc.c:309)
+# ==1234==    by 0x10856B: init_buffer (myapp.c:142)
+# ==1234==    by 0x10899F: main (myapp.c:87)
+
+# Massif ile heap profiling
+valgrind --tool=massif --pages-as-heap=yes ./myapp
+ms_print massif.out.* | head -50</code></pre>
+
+  <h3>Adım 3: smaps_rollup ile hızlı özet</h3>
+  <pre><code class="language-bash"># Kernel 4.14+ — smaps_rollup tüm sayfaların toplamı
+cat /proc/$(pgrep myapp)/smaps_rollup
+# Rss:              248576 kB  ← gerçek fiziksel kullanım
+# Pss:              210234 kB  ← orantılı paylaşımlı
+# Private_Clean:     12800 kB  ← paylaşılmayan temiz
+# Private_Dirty:    198400 kB  ← paylaşılmayan kirli (heap/stack)
+# Shared_Clean:      32000 kB  ← paylaşılan (SO dosyaları)
+# Anonymous:        198400 kB  ← dosya arkası olmayan (heap)
+
+# Private_Dirty artıyorsa → heap leak şüpheli</code></pre>
+
+  <h3>Adım 4: OOM tuning — embedded sistemde</h3>
+  <pre><code class="language-bash"># /etc/sysctl.d/99-memory.conf
+vm.overcommit_memory = 2
+vm.overcommit_ratio  = 80        # RAM'in %80'i + swap
+vm.panic_on_oom      = 0         # OOM killer çalışsın, kernel paniklik etme
+vm.oom_dump_tasks    = 1         # OOM sırasında tüm task bellek dökümü
+vm.dirty_ratio       = 20
+vm.dirty_background_ratio = 5
+vm.swappiness        = 10        # swap'ı azalt, page cache tercih et
+
+sysctl -p /etc/sysctl.d/99-memory.conf</code></pre>
+
+  <h3>Adım 5: page cache monitoring scripti</h3>
+  <pre><code class="language-bash">#!/bin/bash
+# page_cache_monitor.sh
+while true; do
+    FREE=$(grep MemFree /proc/meminfo | awk '{print $2}')
+    AVAIL=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
+    CACHED=$(grep "^Cached:" /proc/meminfo | awk '{print $2}')
+    DIRTY=$(grep "^Dirty:" /proc/meminfo | awk '{print $2}')
+    PSI_SOME=$(awk '/^some/ {print $2}' /proc/pressure/memory | cut -d= -f2)
+
+    printf "[%s] Free:%6d kB  Avail:%7d kB  Cache:%7d kB  Dirty:%6d kB  PSI:%.2f%%\n" \
+        "$(date +%H:%M:%S)" $FREE $AVAIL $CACHED $DIRTY $PSI_SOME
+
+    if (( AVAIL < 51200 )); then   # &lt; 50 MB kullanılabilir
+        echo "UYARI: Kritik bellek baskısı! MemAvailable=$AVAIL kB" >&amp;2
+        sync &amp;&amp; echo 1 > /proc/sys/vm/drop_caches
+    fi
+    sleep 5
+done</code></pre>
+
+  <div class="callout">
+    <div class="label">ÖZET</div>
+    <p>Embedded Linux'ta bellek yönetimi; VM mimarisi, page cache writeback, slab allocator, OOM killer tuning ve NUMA politikalarının bütüncül anlaşılmasını gerektirir. Memory leak tespiti için <code>smaps_rollup</code> periyodik izleme + valgrind kombinasyonu en güvenilir yöntemdir. PSI ile proaktif bellek baskısı tespiti, OOM'dan önce önlem almayı sağlar.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

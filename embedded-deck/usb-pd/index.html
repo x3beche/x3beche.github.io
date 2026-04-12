@@ -1,0 +1,698 @@
+---
+layout: tutorial
+title: "USB-C Power Delivery — Type-C & PD"
+back_url: "../index.html"
+back_label: "embedded-deck"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ</span>
+    <span>USB / GÜÇ YÖNETİMİ</span>
+    <span>2026</span>
+  </div>
+  <h1>USB-C Power Delivery<br><em>Type-C &amp; PD protokolü.</em></h1>
+  <p class="subtitle">USB Type-C konnektörünün fiziksel katmanından Power Delivery müzakere protokolüne, Linux sürücü mimarisinden Alt Mode DP aktifleştirmesine kadar eksiksiz rehber.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">USB-C fiziksel arayüz</a></li>
+    <li><a href="#s1">USB Power Delivery protokolü</a></li>
+    <li><a href="#s2">Linux USB Type-C subsystem</a></li>
+    <li><a href="#s3">PD controller sürücüleri</a></li>
+    <li><a href="#s4">Role switching</a></li>
+    <li><a href="#s5">Alt Mode</a></li>
+    <li><a href="#s6">PDPHY ve PD stack</a></li>
+    <li><a href="#s7">Power Budget yönetimi</a></li>
+    <li><a href="#s8">Pratik: i.MX8 USB-C PD</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> USB-C fiziksel arayüz</h2>
+  <p class="section-lead">USB Type-C, 24 pinli reversible konnektörüdür. Tek konnektör ile USB 3.2, USB4, Thunderbolt, DisplayPort, güç iletimi ve diğer protokolleri destekler. Oryantasyon bağımsızlığı ve yüksek güç kapasitesi onu modern cihazlar için tercih edilen standart yapar.</p>
+
+  <h3>Pin haritası</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Pin grubu</th><th>Pinler</th><th>İşlev</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>VBUS</code></td><td>A4, A9, B4, B9</td><td>Güç hattı — 5-48V, maks 5A (PD ile)</td></tr>
+        <tr><td><code>GND</code></td><td>A1, A12, B1, B12</td><td>Toprak</td></tr>
+        <tr><td><code>CC1, CC2</code></td><td>A5, B5</td><td>Configuration Channel — yön belirleme, PD iletişimi</td></tr>
+        <tr><td><code>D+/D-</code></td><td>A6, A7, B6, B7</td><td>USB 2.0 data</td></tr>
+        <tr><td><code>TX/RX</code></td><td>A2, A3, A10, A11, B2, B3, B10, B11</td><td>USB 3.2 / USB4 SuperSpeed çiftleri</td></tr>
+        <tr><td><code>SBU1, SBU2</code></td><td>A8, B8</td><td>Sideband Use — Alt Mode sinyalleri (DP AUX, Thunderbolt)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>CC pin mekanizması</h3>
+  <p>CC (Configuration Channel) pinleri USB-C'nin en kritik sinyalleridir. Bağlantı algılama, oryantasyon belirleme, rol müzakeresi ve PD mesajlaşması CC pinleri üzerinden yapılır.</p>
+
+  <div class="flow">
+    <pre>
+  Host (DFP)                    Device (UFP)
+  CC1 ──── Rp (pull-up) ────── Rd (pull-down) ──── GND
+  CC2 ──── Rp (pull-up) ────── (açık — oryantasyon)
+
+  Oryantasyon:
+    CC1'de gerilim düşümü varsa → düz bağlantı
+    CC2'de gerilim düşümü varsa → ters bağlantı
+
+  Ra direnci (800Ω): kablo aktif VCONN gerektirir
+    </pre>
+  </div>
+
+  <h3>Alt Mode kableti</h3>
+  <p>Type-C kablolar <strong>pasif</strong> (Re-timer yok, USB 3.2 Gen1/2) veya <strong>aktif</strong> (Re-timer var, USB 3.2 Gen2x2 / USB4) olabilir. DP Alt Mode ve Thunderbolt için aktif kablo veya en az Gen2 sertifikalı pasif kablo gerekir. Kablo tipi VDM (Vendor Defined Message) Discovery mekanizması ile sorgulanır.</p>
+
+  <div class="callout">
+    <div class="label">DİKKAT</div>
+    <p>Tüm USB-C kablolar Power Delivery desteklemez. Yalnızca <strong>E-Marked</strong> kablolar (aktif kablolar dahil) 3A üzeri akım ve 20V üzeri gerilim taşıyabilir. 100W (20V × 5A) için E-Marked kablo zorunludur. Kalitesiz kablolar CC pin dirençlerini doğru uygulamayabilir ve güç müzakeresi başarısız olabilir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> USB Power Delivery protokolü</h2>
+  <p class="section-lead">USB Power Delivery (USB PD), CC pinleri üzerinden BMC (Biphase Mark Coding) ile iletilen bir mesajlaşma protokolüdür. Güç kaynağı ile tüketici arasında dinamik müzakere yaparak 5W'tan 240W'a (PD 3.1 EPR) kadar güç dağıtımına olanak tanır.</p>
+
+  <h3>PDO — Power Data Object</h3>
+  <p>PDO'lar, bir güç kaynağının sunabileceği veya bir cihazın talep edebileceği güç profillerini tanımlar. Her PDO 32 bitlik bir veri nesnesidir.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>PDO Tipi</th><th>Açıklama</th><th>Kullanım</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>Fixed PDO</code></td><td>Sabit voltaj, max akım</td><td>5V@3A, 9V@3A, 20V@5A gibi standart profiller</td></tr>
+        <tr><td><code>Variable PDO</code></td><td>Voltaj aralığı, max akım</td><td>Eski şarj adaptörleri ile uyumluluk</td></tr>
+        <tr><td><code>Battery PDO</code></td><td>Güç üst sınırı (watt)</td><td>Batarya sistemleri</td></tr>
+        <tr><td><code>APDO (PPS)</code></td><td>Programlanabilir voltaj + akım</td><td>USB PD 3.0 PPS — telefon hızlı şarj</td></tr>
+        <tr><td><code>AVS (EPR)</code></td><td>28-48V aralığı</td><td>USB PD 3.1 EPR — dizüstü, monitör</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Mesajlaşma akışı</h3>
+
+  <div class="flow">
+    <pre>
+  Source (Kaynak)                    Sink (Tüketici)
+       │                                   │
+       │ ── Source_Capabilities ──────────&gt;│  PDO listesi gönder
+       │                                   │
+       │ &lt;─── Request ─────────────────────│  İstenen PDO seç
+       │                                   │
+       │ ── Accept ───────────────────────&gt;│  Kabul
+       │                                   │
+       │ ── PS_RDY ───────────────────────&gt;│  Güç hazır
+       │                                   │
+       │               (müzakere tamamlandı)│
+    </pre>
+  </div>
+
+  <h3>Mesaj tipleri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">GoodCRC</span><span class="desc">Her mesajın alınmasını onaylar — kayıpsız iletişim</span></div>
+    <div class="param"><span class="name">Source_Capabilities</span><span class="desc">Kaynak sunduğu PDO listesini yayınlar</span></div>
+    <div class="param"><span class="name">Request</span><span class="desc">Sink bir PDO seçer ve talep eder</span></div>
+    <div class="param"><span class="name">Accept / Reject / Wait</span><span class="desc">Kaynak talebi değerlendirir</span></div>
+    <div class="param"><span class="name">PS_RDY</span><span class="desc">Güç hattı yeni voltaj/akıma geçti, tüketici başlayabilir</span></div>
+    <div class="param"><span class="name">Get_Source_Cap / Get_Sink_Cap</span><span class="desc">Karşı tarafın kapasitelerini sorgula</span></div>
+    <div class="param"><span class="name">DR_Swap / PR_Swap / VCONN_Swap</span><span class="desc">Rol değiştirme talepleri</span></div>
+    <div class="param"><span class="name">VDM (Vendor Defined Message)</span><span class="desc">Alt Mode keşif ve aktivasyonu</span></div>
+    <div class="param"><span class="name">Soft_Reset / Hard_Reset</span><span class="desc">PD state machine sıfırlama</span></div>
+  </div>
+
+  <h3>BMC kodlama</h3>
+  <p>PD mesajları CC hattı üzerinden 300 kbps hızında BMC ile kodlanır. Başlangıç sırası: Preamble (64 bit) → SOP* → Header → Data → CRC32 → EOP. <code>fusb302</code> ve benzeri TCPC'ler bu kodlama/çözme işlemini donanımda yapar.</p>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Linux USB Type-C subsystem</h2>
+  <p class="section-lead">Linux kernel 4.12'den itibaren USB Type-C için kapsamlı bir sysfs arayüzü ve sürücü çerçevesi bulunur. <code>/sys/class/typec/</code> hiyerarşisi port durumunu, partner bilgilerini ve alt modları user-space'e sunar.</p>
+
+  <h3>Sysfs hiyerarşisi</h3>
+
+  <pre><code class="language-bash">/sys/class/typec/
+├── port0/                    # İlk Type-C port
+│   ├── data_role             # host / device / none
+│   ├── power_role            # source / sink / dual
+│   ├── vconn_source          # yes / no
+│   ├── preferred_role        # tercih edilen rol
+│   ├── supported_accessory_modes
+│   ├── uevent
+│   └── port0-partner/        # Bağlı cihaz bilgisi
+│       ├── type              # cable / audio-adapter / ...
+│       ├── usb_power_delivery/
+│       │   ├── capabilities/
+│       │   │   ├── 1:fixed_supply/
+│       │   │   │   ├── voltage
+│       │   │   │   └── maximum_current
+│       │   │   └── 2:fixed_supply/
+│       │   └── requests/
+│       └── alt_modes/
+│           └── port0-partner.0/  # DP Alt Mode
+│               ├── svid      # 0xff01 (DP)
+│               └── active</code></pre>
+
+  <pre><code class="language-bash"># Port durumunu kontrol et
+cat /sys/class/typec/port0/power_role
+# source
+
+cat /sys/class/typec/port0/data_role
+# host
+
+# Partner PDO'larını oku
+for f in /sys/class/typec/port0-partner/usb_power_delivery/capabilities/*/; do
+    echo "PDO: $f"
+    cat "$f/voltage" 2>/dev/null && cat "$f/maximum_current" 2>/dev/null
+done
+
+# udevadm ile Type-C olaylarını izle
+udevadm monitor --property --subsystem-match=typec</code></pre>
+
+  <h3>USB Type-C notifier sistemi</h3>
+  <p>Kernel içinde Type-C port değişiklikleri, <code>struct usb_typec_cable</code> ve <code>typec_port_register_notifier()</code> mekanizmasıyla sürücülere iletilir. Display alt mode sürücüleri, şarj sürücüleri ve ağ sürücüleri bu notifier'a abone olarak bağlantı olaylarına tepki verir.</p>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> PD controller sürücüleri</h2>
+  <p class="section-lead">USB PD fiziksel katmanını (BMC kodlama, CC pin yönetimi) uygulayan entegre devreler TCPC (Type-C Port Controller) olarak adlandırılır. Linux'ta bunlar <code>drivers/usb/typec/tcpm/</code> altındaki TCPM (Type-C Port Manager) çerçevesi üzerinden kontrol edilir.</p>
+
+  <h3>Yaygın TCPC'ler</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Çip</th><th>Üretici</th><th>Linux sürücüsü</th><th>Özellikler</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>FUSB302</code></td><td>onsemi</td><td>fusb302.c</td><td>Yaygın, açık kaynak PD stack</td></tr>
+        <tr><td><code>STUSB1600</code></td><td>STMicro</td><td>stusb160x.c</td><td>Dahili PD state machine</td></tr>
+        <tr><td><code>PTN5110</code></td><td>NXP</td><td>tcpci.c</td><td>TCPCI uyumlu, sade</td></tr>
+        <tr><td><code>FUSB307</code></td><td>onsemi</td><td>fusb307.c</td><td>USB4 / Thunderbolt desteği</td></tr>
+        <tr><td><code>MAX77759</code></td><td>Maxim</td><td>max77759-tcpc.c</td><td>Dahili şarj kontrolörü</td></tr>
+        <tr><td><code>RT1711H</code></td><td>Richtek</td><td>tcpci_rt1711h.c</td><td>TCPCI, gömülü ürünlerde yaygın</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>FUSB302 Device Tree</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>board.dts (fusb302 örneği)</span><span class="dot">●</span></div>
+    <pre><code class="language-c">&i2c1 {
+    status = "okay";
+    clock-frequency = &lt;400000&gt;;
+
+    fusb302: typec@22 {
+        compatible = "fcs,fusb302";
+        reg = &lt;0x22&gt;;
+
+        interrupt-parent = &lt;&amp;gpio3&gt;;
+        interrupts = &lt;3 IRQ_TYPE_LEVEL_LOW&gt;;
+
+        pinctrl-names = "default";
+        pinctrl-0 = &lt;&amp;pinctrl_fusb302&gt;;
+
+        /* TCPM port bağlantısı */
+        connector {
+            compatible = "usb-c-connector";
+            label = "USB-C";
+            data-role = "dual";
+            power-role = "dual";
+            try-power-role = "sink";
+            source-pdos = &lt;PDO_FIXED(5000, 900,
+                           PDO_FIXED_USB_COMM)&gt;;
+            sink-pdos   = &lt;PDO_FIXED(5000, 3000,
+                           PDO_FIXED_USB_COMM)
+                           PDO_VAR(5000, 20000, 3000)&gt;;
+            op-sink-microwatt = &lt;10000000&gt;; /* 10W */
+
+            ports {
+                #address-cells = &lt;1&gt;;
+                #size-cells = &lt;0&gt;;
+
+                port@0 { /* USB 3.1 */
+                    reg = &lt;0&gt;;
+                    endpoint {
+                        remote-endpoint = &lt;&amp;usb3_ep&gt;;
+                    };
+                };
+                port@1 { /* DP Alt Mode */
+                    reg = &lt;1&gt;;
+                    endpoint {
+                        remote-endpoint = &lt;&amp;dp_ep&gt;;
+                    };
+                };
+            };
+        };
+    };
+};</code></pre>
+  </div>
+
+  <h3>TCPM çerçevesi</h3>
+  <p>TCPM (<code>drivers/usb/typec/tcpm/tcpm.c</code>) PD state machine'ini uygular. Sürücüler yalnızca donanıma özgü <code>tcpc_ops</code> yapısını doldurmak zorundadır; PD protokol mantığı TCPM tarafından yönetilir.</p>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Role switching</h2>
+  <p class="section-lead">USB Type-C bağlantısında her port DFP (Downstream Facing Port — host), UFP (Upstream Facing Port — device) veya DRP (Dual Role Port — ikisi de) rolünde olabilir. Rol değişikliği PD protokolü aracılığıyla dinamik olarak yapılır.</p>
+
+  <h3>Rol tipleri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">DFP (Data Role)</span><span class="desc">USB host — downstream portlara veri gönderir, hub veya cihaz bağlar</span></div>
+    <div class="param"><span class="name">UFP (Data Role)</span><span class="desc">USB device — host'a bağlanan taraf (telefon, flash bellek)</span></div>
+    <div class="param"><span class="name">Source (Power Role)</span><span class="desc">VBUS güç sağlar — genellikle şarj adaptörü veya host</span></div>
+    <div class="param"><span class="name">Sink (Power Role)</span><span class="desc">VBUS güç tüketir — şarj olan cihaz</span></div>
+    <div class="param"><span class="name">VCONN Source</span><span class="desc">E-Marked kablo veya aktif adaptör için 5V sağlar</span></div>
+  </div>
+
+  <h3>Sysfs ile rol değişikliği</h3>
+
+  <pre><code class="language-bash"># Mevcut rolleri göster
+cat /sys/class/typec/port0/data_role
+# [host] device
+
+cat /sys/class/typec/port0/power_role
+# [source] sink dual
+
+# Data rolünü değiştir (DR_Swap gönderir)
+echo "device" > /sys/class/typec/port0/data_role
+
+# Power rolünü değiştir (PR_Swap gönderir)
+echo "sink" > /sys/class/typec/port0/power_role
+
+# Tercih edilen rolü ayarla (bağlantıda otomatik müzakere)
+echo "sink" > /sys/class/typec/port0/preferred_role</code></pre>
+
+  <h3>Kernel API ile programatik rol değişikliği</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>typec_role_swap.c (kernel sürücü örneği)</span><span class="dot">●</span></div>
+    <pre><code class="language-c">#include &lt;linux/usb/typec.h&gt;
+
+/* Power Role Swap isteği gönder */
+static int request_power_role_swap(struct typec_port *port,
+                                    enum typec_role role)
+{
+    int ret;
+
+    /* Partner'ın PR_Swap destekleyip desteklemediğini kontrol et */
+    if (!typec_port_is_partner_pd_capable(port)) {
+        dev_warn(dev, "Partner PD desteklemiyor\n");
+        return -EOPNOTSUPP;
+    }
+
+    ret = typec_set_pwr_role(port, role);
+    if (ret) {
+        dev_err(dev, "PR_Swap başarısız: %d\n", ret);
+        return ret;
+    }
+
+    dev_info(dev, "Power role değiştirildi: %s\n",
+             role == TYPEC_SOURCE ? "source" : "sink");
+    return 0;
+}
+
+/* Type-C notifier callback */
+static int typec_event_cb(struct notifier_block *nb,
+                          unsigned long event, void *data)
+{
+    struct typec_connector_data *conn_data = data;
+
+    switch (event) {
+    case TYPEC_ATTACHED:
+        dev_info(dev, "Type-C bağlandı: partner=%s\n",
+                 typec_partner_get_identity(conn_data->partner));
+        break;
+    case TYPEC_DETACHED:
+        dev_info(dev, "Type-C ayrıldı\n");
+        break;
+    }
+    return NOTIFY_OK;
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Alt Mode</h2>
+  <p class="section-lead">USB Type-C, SuperSpeed data pinlerini alternatif protokoller için kullanmasına izin veren Alt Mode mekanizmasını destekler. DisplayPort, Thunderbolt/USB4 ve HDMI en yaygın Alt Mode'lardır.</p>
+
+  <h3>VDM — Vendor Defined Message</h3>
+  <p>Alt Mode keşfi ve aktivasyonu PD VDM (Vendor Defined Message) mesajları ile yapılır. Her Alt Mode üreticisi SVID (Standard or Vendor ID) ile tanımlanır.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Alt Mode</th><th>SVID</th><th>Pin konfigürasyonu</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>DisplayPort</td><td><code>0xFF01</code></td><td>C/D (2 lane DP + USB3) veya E/F (4 lane DP)</td></tr>
+        <tr><td>Thunderbolt 3</td><td><code>0x8087</code></td><td>40 Gbps, Intel özel</td></tr>
+        <tr><td>USB4</td><td>(USB-IF)</td><td>TX1/RX1 + TX2/RX2 tüm 4 şerit</td></tr>
+        <tr><td>MHL</td><td><code>0xFF10</code></td><td>Mobil HD Link</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>DP Alt Mode aktivasyonu</h3>
+
+  <pre><code class="language-bash"># DP Alt Mode durumunu kontrol et
+ls /sys/class/typec/port0-partner/alt_modes/
+# port0-partner.0
+
+cat /sys/class/typec/port0-partner/alt_modes/port0-partner.0/svid
+# 0xff01  (DisplayPort)
+
+cat /sys/class/typec/port0-partner/alt_modes/port0-partner.0/active
+# yes
+
+# Port'un desteklediği Alt Mode'ları göster
+cat /sys/class/typec/port0/supported_accessory_modes
+
+# DP çıkışının bağlandığını doğrula
+cat /sys/kernel/debug/dri/0/state | grep -A5 connector</code></pre>
+
+  <h3>DP Alt Mode sürücüsü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dp_altmode.c (özet)</span><span class="dot">●</span></div>
+    <pre><code class="language-c">#include &lt;linux/usb/typec_dp.h&gt;
+
+static const struct typec_altmode_ops dp_altmode_ops = {
+    .attention = dp_altmode_attention,
+    .vdm       = dp_altmode_vdm,
+};
+
+static int dp_altmode_probe(struct typec_altmode *alt)
+{
+    struct dp_altmode *dp;
+
+    /* SVID 0xFF01 (DisplayPort) kontrolü */
+    if (alt->svid != USB_TYPEC_DP_SID)
+        return -ENODEV;
+
+    dp = devm_kzalloc(&alt->dev, sizeof(*dp), GFP_KERNEL);
+    if (!dp)
+        return -ENOMEM;
+
+    dp->alt = alt;
+    typec_altmode_set_drvdata(alt, dp);
+
+    /* Alt Mode'u aktifleştir */
+    return typec_altmode_enter(alt, NULL);
+}
+
+/* Attention VDM mesajını işle */
+static void dp_altmode_attention(struct typec_altmode *alt,
+                                  u32 vdo)
+{
+    struct dp_altmode *dp = typec_altmode_get_drvdata(alt);
+    bool hpd = (vdo >> 7) & 1; /* HPD (Hot Plug Detect) */
+
+    if (hpd)
+        drm_connector_helper_hpd_notify(&dp->connector);
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> PDPHY ve PD stack</h2>
+  <p class="section-lead">Linux PD stack'i TCPM çerçevesi, TCPCI soyutlama katmanı ve PDPHY (Physical Layer) sürücülerinden oluşur. State machine TCPM'de, donanım erişimi ise TCPCI veya özel PDPHY sürücüsünde yer alır.</p>
+
+  <h3>Stack katmanları</h3>
+
+  <div class="flow">
+    <pre>
+  Kullanıcı alanı (sysfs / udev / typec_mux)
+         │
+  ┌──────▼─────────────────────────────────────┐
+  │  TCPM — Type-C Port Manager                │
+  │  (drivers/usb/typec/tcpm/tcpm.c)           │
+  │  • PD state machine                        │
+  │  • Role management                         │
+  │  • Alt Mode coordination                   │
+  └──────┬──────────────────────────────────────┘
+         │ tcpc_ops
+  ┌──────▼──────────────────────────────────────┐
+  │  TCPCI — Type-C Port Controller Interface   │
+  │  (tcpci.c veya özel: fusb302.c, stusb160x)  │
+  │  • CC pin yönetimi                          │
+  │  • BMC encoding/decoding                    │
+  │  • VBUS kontrol                             │
+  └──────┬──────────────────────────────────────┘
+         │ I2C / SPI
+  ┌──────▼──────────────────────────────────────┐
+  │  TCPC Donanım (FUSB302, PTN5110, vb.)       │
+  └──────────────────────────────────────────────┘
+    </pre>
+  </div>
+
+  <h3>tcpc_ops yapısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>tcpc_ops tanımı (kernel)</span><span class="dot">●</span></div>
+    <pre><code class="language-c">struct tcpc_ops {
+    int  (*init)(struct tcpc_dev *dev, bool comms_suspended);
+    int  (*get_vbus)(struct tcpc_dev *dev);
+    int  (*set_vbus)(struct tcpc_dev *dev, bool on, bool charge);
+    int  (*set_cc)(struct tcpc_dev *dev, enum typec_cc_status cc);
+    int  (*get_cc)(struct tcpc_dev *dev,
+                   enum typec_cc_status *cc1,
+                   enum typec_cc_status *cc2);
+    int  (*set_polarity)(struct tcpc_dev *dev,
+                         enum typec_cc_polarity polarity);
+    int  (*set_vconn)(struct tcpc_dev *dev, bool on);
+    int  (*set_current_limit)(struct tcpc_dev *dev,
+                               u32 max_ma, u32 mv);
+    int  (*set_pd_rx)(struct tcpc_dev *dev, bool on);
+    int  (*set_roles)(struct tcpc_dev *dev, bool attached,
+                      enum typec_role pwr, enum typec_data_role data);
+    int  (*start_toggling)(struct tcpc_dev *dev,
+                            enum typec_port_type port_type,
+                            enum typec_cc_status cc);
+    int  (*pd_transmit)(struct tcpc_dev *dev,
+                        enum tcpm_transmit_type type,
+                        const struct pd_message *msg,
+                        unsigned int negotiated_rev);
+};</code></pre>
+  </div>
+
+  <h3>PD mesaj izleme</h3>
+
+  <pre><code class="language-bash"># TCPM debug trace (kernel debug fs)
+mount -t debugfs none /sys/kernel/debug
+cat /sys/kernel/debug/usb/port0/log
+
+# Gerçek zamanlı PD mesajlarını izle
+trace-cmd record -e "typec:*" &amp;
+sleep 5
+trace-cmd stop
+trace-cmd report | grep -E "PD_MSG|CC_CHANGE|ROLE"</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Power Budget yönetimi</h2>
+  <p class="section-lead">Birden fazla USB-C portu olan sistemlerde güç bütçesi yönetimi kritiktir. Linux'taki USB Charging ve Power Supply sysfs arayüzleri, şarj akımını ve güç politikalarını yazılımdan kontrol etmeye olanak tanır.</p>
+
+  <h3>Sink politikası</h3>
+  <p>Bir cihaz birden fazla PDO sunan bir şarj adaptörüne bağlandığında, en uygun PDO'yu seçmek programlanabilir bir politika meselesidir. TCPM bu kararı <code>sink-pdos</code> DTS özelliği veya <code>usb_power_delivery_desc</code> ile verilen PDO listesine göre alır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>sink_policy.c (PDO seçim örneği)</span><span class="dot">●</span></div>
+    <pre><code class="language-c">#include &lt;linux/usb/pd.h&gt;
+
+/* En yüksek watt PDO'yu seç */
+static u32 select_best_pdo(const u32 *src_pdos, int nr_pdos,
+                            int max_ma, int max_mv)
+{
+    u32 best_pdo = 0;
+    int best_mw  = 0;
+
+    for (int i = 0; i &lt; nr_pdos; i++) {
+        u32 pdo  = src_pdos[i];
+        int type = pdo_type(pdo);
+
+        if (type == PDO_TYPE_FIXED) {
+            int mv = pdo_fixed_voltage(pdo);   /* mV */
+            int ma = pdo_max_current(pdo);     /* mA */
+
+            /* Cihaz sınırlarını aşmayan en yüksek güç */
+            if (mv &lt;= max_mv &amp;&amp; ma &lt;= max_ma) {
+                int mw = (mv / 1000) * (ma / 1000);
+                if (mw &gt; best_mw) {
+                    best_mw  = mw;
+                    best_pdo = pdo;
+                }
+            }
+        }
+    }
+    return best_pdo;
+}</code></pre>
+  </div>
+
+  <h3>Power supply sysfs — şarj izleme</h3>
+
+  <pre><code class="language-bash"># Güç kaynağı bilgilerini listele
+ls /sys/class/power_supply/
+# BAT0  AC0  USB0  tcpm-source-psy-port0
+
+# Şarj durumunu kontrol et
+cat /sys/class/power_supply/tcpm-source-psy-port0/voltage_now
+# 9000000  (9V in µV)
+cat /sys/class/power_supply/tcpm-source-psy-port0/current_max
+# 3000000  (3A in µA)
+
+# Aktif şarj akımını ayarla (programatik sınırlandırma)
+echo 2000000 > /sys/class/power_supply/BAT0/current_now
+
+# USB PD kapasitesini göster
+cat /sys/class/power_supply/tcpm-source-psy-port0/online
+# 1
+
+udevadm monitor --subsystem-match=power_supply</code></pre>
+
+  <h3>Çok portlu güç bütçesi</h3>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Birden fazla USB-C portu olan dizüstü veya dok istasyonu tasarımında toplam güç bütçesi sabit (örn. 100W adaptör). Port başına güç paylaştırma için kullanıcı alanı güç bütçesi daemon'u gerekir; bu daemon tüm port PDO'larını okur, toplam watt'ı hesaplar ve <code>/sys/class/typec/portN/usb_power_delivery/requests/</code> üzerinden güç kısıtlaması uygular.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: i.MX8 üzerinde USB-C PD</h2>
+  <p class="section-lead">Bu bölümde NXP i.MX8M Plus SoM üzerinde FUSB302 PD kontrolcüsünü yapılandıracak, DisplayPort Alt Mode'u etkinleştirecek ve programatik power role swap gerçekleştireceğiz.</p>
+
+  <h3>Donanım yapılandırması</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">i.MX8M Plus SoM</span><span class="desc">USB3.0 OTG controller + HDMI/DP çıkışı</span></div>
+    <div class="param"><span class="name">FUSB302BMPX</span><span class="desc">I2C (0x22) TCPC, 4.3-15V, INT pini GPIO3_IO03</span></div>
+    <div class="param"><span class="name">SN74CB3T3245</span><span class="desc">SuperSpeed mux — DP/USB3 yol seçimi</span></div>
+    <div class="param"><span class="name">USB-C konnektör</span><span class="desc">24-pin, full-featured (SBU pinleri bağlı)</span></div>
+  </div>
+
+  <h3>Kernel konfigürasyonu</h3>
+
+  <pre><code class="language-bash"># .config için gerekli seçenekler
+CONFIG_TYPEC=y
+CONFIG_TYPEC_TCPM=y
+CONFIG_TYPEC_FUSB302=y
+CONFIG_TYPEC_TCPCI=y
+CONFIG_TYPEC_DP_ALTMODE=y
+CONFIG_USB_ROLE_SWITCH=y
+CONFIG_USB_DWC3=y
+CONFIG_USB_DWC3_IMX8MP=y
+
+# menuconfig üzerinden:
+make menuconfig
+# Device Drivers → USB support → USB Type-C Support → FUSB302</code></pre>
+
+  <h3>DP Alt Mode etkinleştirme</h3>
+
+  <pre><code class="language-bash"># DP monitör bağla, Alt Mode durumunu kontrol et
+cat /sys/class/typec/port0-partner/alt_modes/port0-partner.0/svid
+# 0xff01
+
+cat /sys/class/typec/port0-partner/alt_modes/port0-partner.0/active
+# yes
+
+# DRM connector durumunu doğrula
+cat /sys/class/drm/card0/card0-DP-1/status
+# connected
+
+# EDID oku
+cat /sys/class/drm/card0/card0-DP-1/edid | edid-decode
+
+# Çözünürlük ayarla (wayland)
+wlr-randr --output DP-1 --mode 1920x1080@60</code></pre>
+
+  <h3>Power Role Swap prosedürü</h3>
+
+  <pre><code class="language-bash"># Senaryo: dizüstü olarak şarj edilirken (sink),
+# bir cihazı şarj etmek için source rolüne geç
+
+# Mevcut rol
+cat /sys/class/typec/port0/power_role
+# [sink] source dual
+
+# Source'a geç (PR_Swap gönderir)
+echo "source" > /sys/class/typec/port0/power_role
+
+# Kernel log'unda beklenen mesajlar:
+dmesg | tail -20
+# [  123.456] typec port0: PD partner agrees to power role swap
+# [  123.678] tcpm: cc1: OPEN cc2: Rd -> source, DFP
+# [  124.012] typec port0: power_role changed: sink -> source
+
+# Başarısız olursa (partner desteklemiyorsa):
+# [  123.456] tcpm: Power role swap rejected by partner
+
+# Rol değişikliğini doğrula
+cat /sys/class/typec/port0/power_role
+# source [sink] dual</code></pre>
+
+  <h3>Test betiği</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>test_usbc_pd.sh</span><span class="dot">●</span></div>
+    <pre><code class="language-bash">#!/bin/bash
+# i.MX8 USB-C PD test betiği
+
+PORT_BASE="/sys/class/typec/port0"
+PSY_BASE="/sys/class/power_supply/tcpm-source-psy-port0"
+
+echo "=== USB-C PD Durum Testi ==="
+echo "Data role   : $(cat $PORT_BASE/data_role)"
+echo "Power role  : $(cat $PORT_BASE/power_role)"
+echo "VCONN source: $(cat $PORT_BASE/vconn_source)"
+
+if [ -d "$PORT_BASE/port0-partner" ]; then
+    echo "=== Partner Bilgisi ==="
+    echo "Partner type: $(cat $PORT_BASE/port0-partner/type 2>/dev/null)"
+
+    for pdo_dir in $PORT_BASE/port0-partner/usb_power_delivery/capabilities/*/; do
+        volt=$(cat "$pdo_dir/voltage" 2>/dev/null)
+        curr=$(cat "$pdo_dir/maximum_current" 2>/dev/null)
+        [ -n "$volt" ] && echo "PDO: ${volt}mV @ ${curr}mA ($(( volt * curr / 1000000 ))W)"
+    done
+fi
+
+if [ -r "$PSY_BASE/voltage_now" ]; then
+    echo "=== Güç ==="
+    v=$(cat $PSY_BASE/voltage_now)
+    i=$(cat $PSY_BASE/current_max)
+    echo "Voltaj: $((v/1000))mV  Akım: $((i/1000))mA"
+fi</code></pre>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

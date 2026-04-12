@@ -1,0 +1,609 @@
+---
+layout: tutorial
+title: "Öneri Sistemleri — Two-Tower & Ranking"
+back_url: "../index.html"
+back_label: "Tüm rehberler"
+---
+
+<header class="header">
+  <div class="meta">
+    <span>Rehber</span>
+    <span>Yapay Zeka</span>
+    <span>Öneri Sistemleri</span>
+  </div>
+  <h1>Öneri Sistemleri —<br><em>Two-Tower &amp; Ranking.</em></h1>
+  <p class="subtitle">Retrieval + Ranking + Reranking mimarisi. Matrix factorization, Two-Tower model, FAISS ile ANN, Wide&amp;Deep, BPR/LambdaRank ve NVIDIA Merlin ile GPU hızlandırmalı üretim pipeline.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçerik</div>
+  <ol>
+    <li><a href="#s0">Öneri Sistemi Mimarisi</a></li>
+    <li><a href="#s1">Collaborative Filtering — Matrix Factorization</a></li>
+    <li><a href="#s2">Content-Based Filtering</a></li>
+    <li><a href="#s3">Two-Tower Modeli</a></li>
+    <li><a href="#s4">ANN Retrieval — FAISS &amp; HNSW</a></li>
+    <li><a href="#s5">Feature Crossing &amp; Wide&amp;Deep</a></li>
+    <li><a href="#s6">Pointwise/Pairwise/Listwise Ranking</a></li>
+    <li><a href="#s7">NVIDIA Merlin</a></li>
+    <li><a href="#s8">A/B Test &amp; Online Learning</a></li>
+    <li><a href="#s9">Üretim Pipeline</a></li>
+  </ol>
+</nav>
+
+<main>
+
+  <!-- ── s0 ──────────────────────────────────────────────────── -->
+  <section id="s0">
+    <h2><span class="num">00</span> Öneri Sistemi Mimarisi — Retrieval + Ranking + Reranking</h2>
+    <p class="section-lead">Modern öneri sistemleri üç aşamalı bir huni (funnel) mimarisi kullanır: milyonlarca item'dan başlayarak sırasıyla yüzlerce, onlarca öneriye indirilir.</p>
+
+    <p>Brüt katalog milyonlarca item içeriyorken her kullanıcıya gerçek zamanlı olarak ranking modeli çalıştırmak pratik değildir. Bu yüzden aşamalı eleme kullanılır. <em>Retrieval (Geri Çağırma)</em>: Approximate Nearest Neighbor (ANN) veya inverted index ile milyonlarca item'dan ~1000 aday seçilir; bu aşama çok hızlı olmalıdır (1-10 ms). <em>Ranking</em>: 1000 aday üzerinde daha zengin özelliklerle ağır model çalıştırılır, top-100 seçilir. <em>Reranking</em>: iş kuralları (çeşitlilik, sponsorlu, yasaklı içerikler) uygulanır ve final liste oluşturulur.</p>
+
+    <div class="flow">
+      <pre><span class="step-num">01</span> Kullanıcı isteği → <span class="accent">Retrieval</span>: 10M item → 1000 aday (ANN/Two-Tower)
+<span class="step-num">02</span> 1000 aday → <span class="accent">Ranking</span>: 1000 → 100 (Wide&amp;Deep / DLRM / xDeepFM)
+<span class="step-num">03</span> 100 aday → <span class="accent">Reranking</span>: 100 → 10-20 (çeşitlilik, iş kuralları)
+<span class="step-num">04</span> 10-20 öneri → kullanıcı arayüzü → <span class="accent">feedback</span> → online learning</pre>
+    </div>
+
+    <table class="file-table">
+      <thead>
+        <tr><th>Aşama</th><th>Input</th><th>Output</th><th>Gecikme</th><th>Model</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Retrieval</td><td>10M item</td><td>~1000 aday</td><td>&lt;10 ms</td><td>Two-Tower + FAISS</td></tr>
+        <tr><td>Ranking</td><td>1000 aday</td><td>~100 sıralı</td><td>&lt;50 ms</td><td>Wide&amp;Deep, DLRM</td></tr>
+        <tr><td>Reranking</td><td>100 aday</td><td>~20 final</td><td>&lt;5 ms</td><td>Kural tabanlı + MMR</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ── s1 ──────────────────────────────────────────────────── -->
+  <section id="s1">
+    <h2><span class="num">01</span> Collaborative Filtering — Matrix Factorization &amp; Implicit Feedback</h2>
+    <p class="section-lead">Collaborative filtering, benzer kullanıcıların benzer item'ları sevdiği varsayımıyla çalışır; matrix factorization latent faktörleri öğrenir.</p>
+
+    <p>Explicit feedback (1-5 puan) nadiren mevcuttur; gerçek dünyada genellikle <em>implicit feedback</em> vardır: tıklama, satın alma, izleme süresi. <em>ALS</em> (Alternating Least Squares), implicit feedback için tercih edilen MF algoritmasıdır; kullanıcı ve item matrislerini sırayla optimize eder. <em>BPR</em> (Bayesian Personalized Ranking), gözlemlenen item'ın gözlemlenmeyenden daha yüksek sıralanmasını öğrenir. <code class="inline">implicit</code> kütüphanesi CPU/GPU hızlandırmalı ALS sunar.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>matrix_factorization.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> numpy <span class="keyword">as</span> np
+<span class="keyword">import</span> pandas <span class="keyword">as</span> pd
+<span class="keyword">import</span> scipy.sparse <span class="keyword">as</span> sp
+<span class="keyword">import</span> implicit
+
+<span class="cmt"># ── Veri hazırlama ───────────────────────────────────────────</span>
+<span class="cmt"># Kullanıcı-item etkileşim verisi (implicit)</span>
+interactions = pd.<span class="cmd">read_csv</span>(<span class="str">"interactions.csv"</span>)
+<span class="cmt"># Columns: user_id, item_id, count (tıklama/satın alma sayısı)</span>
+
+user_enc = {u: i <span class="keyword">for</span> i, u <span class="keyword">in</span> <span class="cmd">enumerate</span>(interactions.<span class="cmd">user_id.unique</span>())}
+item_enc = {v: i <span class="keyword">for</span> i, v <span class="keyword">in</span> <span class="cmd">enumerate</span>(interactions.<span class="cmd">item_id.unique</span>())}
+
+rows = interactions.<span class="cmd">user_id.map</span>(user_enc)
+cols = interactions.<span class="cmd">item_id.map</span>(item_enc)
+vals = interactions[<span class="str">"count"</span>].<span class="cmd">values</span>.<span class="cmd">astype</span>(<span class="cmd">float</span>)
+
+<span class="cmt"># item × user sparse matrix (implicit kütüphanesi formatı)</span>
+ui_matrix = sp.<span class="cmd">csr_matrix</span>((vals, (cols, rows)),
+                             shape=(<span class="cmd">len</span>(item_enc), <span class="cmd">len</span>(user_enc)))
+
+<span class="cmt"># ── ALS modeli ───────────────────────────────────────────────</span>
+model = implicit.als.<span class="cmd">AlternatingLeastSquares</span>(
+    factors=<span class="str">128</span>,
+    regularization=<span class="str">0.01</span>,
+    iterations=<span class="str">50</span>,
+    use_gpu=<span class="keyword">False</span>,
+)
+model.<span class="cmd">fit</span>(ui_matrix)
+
+<span class="cmt"># ── Öneri üretme ─────────────────────────────────────────────</span>
+user_id = <span class="str">"u_12345"</span>
+user_idx = user_enc[user_id]
+
+item_indices, scores = model.<span class="cmd">recommend</span>(
+    user_idx, ui_matrix.T[user_idx],
+    N=<span class="str">10</span>, filter_already_liked_items=<span class="keyword">True</span>
+)
+<span class="keyword">for</span> idx, score <span class="keyword">in</span> <span class="cmd">zip</span>(item_indices, scores):
+    item_id = [k <span class="keyword">for</span> k, v <span class="keyword">in</span> item_enc.<span class="cmd">items</span>() <span class="keyword">if</span> v == idx][<span class="str">0</span>]
+    <span class="cmd">print</span>(<span class="str">f"Item: {item_id:20s} Score: {score:.4f}"</span>)
+
+<span class="cmt"># ── Benzer item bulma ─────────────────────────────────────────</span>
+item_idx = item_enc[<span class="str">"i_678"</span>]
+similar_items, sim_scores = model.<span class="cmd">similar_items</span>(item_idx, N=<span class="str">5</span>)
+<span class="cmd">print</span>(<span class="str">"\nBenzer itemlar:"</span>)
+<span class="keyword">for</span> idx, s <span class="keyword">in</span> <span class="cmd">zip</span>(similar_items, sim_scores):
+    <span class="cmd">print</span>(<span class="str">f"  {idx}: {s:.4f}"</span>)</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s2 ──────────────────────────────────────────────────── -->
+  <section id="s2">
+    <h2><span class="num">02</span> Content-Based Filtering — Item Embeddings &amp; Similarity</h2>
+    <p class="section-lead">Content-based filtering, item özelliklerinden embedding üretir ve kullanıcı profilini sevdiği item'ların özelliklerinden oluşturur.</p>
+
+    <p>Collaborative filtering, cold-start probleminden muzdariptir: yeni item veya yeni kullanıcı için etkileşim verisi yoktur. Content-based filtering bu sorunu çözer: item özellikleri (metin, kategori, görsel) kullanılarak embedding üretilir ve kullanıcının geçmiş eğilimlerine göre benzer item'lar önerilir. Metin tabanlı item'lar için SentenceTransformer veya TF-IDF, görsel item'lar için CLIP veya ResNet feature extraction kullanılır.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>content_based.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> numpy <span class="keyword">as</span> np
+<span class="keyword">import</span> pandas <span class="keyword">as</span> pd
+<span class="keyword">from</span> sentence_transformers <span class="keyword">import</span> SentenceTransformer
+<span class="keyword">from</span> sklearn.metrics.pairwise <span class="keyword">import</span> cosine_similarity
+
+<span class="cmt"># ── Item embeddingleri ────────────────────────────────────────</span>
+model = <span class="cmd">SentenceTransformer</span>(<span class="str">"paraphrase-multilingual-MiniLM-L12-v2"</span>)
+
+items_df = pd.<span class="cmd">DataFrame</span>({
+    <span class="str">"item_id"</span>: [<span class="str">"i001"</span>, <span class="str">"i002"</span>, <span class="str">"i003"</span>],
+    <span class="str">"description"</span>: [
+        <span class="str">"Kuzey İtalya turu, 7 gece, 4 yıldızlı otel"</span>,
+        <span class="str">"Paris gezi paketi, Eyfel Kulesi, müze kartı dahil"</span>,
+        <span class="str">"İstanbul weekend, Boğaz turu, Topkapı Sarayı"</span>,
+    ],
+})
+
+item_embeddings = model.<span class="cmd">encode</span>(
+    items_df[<span class="str">"description"</span>].<span class="cmd">tolist</span>(),
+    normalize_embeddings=<span class="keyword">True</span>
+)
+<span class="cmd">print</span>(<span class="str">f"Item embedding boyutu: {item_embeddings.shape}"</span>)
+
+<span class="cmt"># ── Kullanıcı profili ─────────────────────────────────────────</span>
+user_history = [<span class="str">"i001"</span>, <span class="str">"i003"</span>]  <span class="cmt"># kullanıcının sevdiği itemlar</span>
+user_item_idx = [items_df[items_df[<span class="str">"item_id"</span>] == iid].index[<span class="str">0</span>]
+                 <span class="keyword">for</span> iid <span class="keyword">in</span> user_history]
+user_profile = item_embeddings[user_item_idx].<span class="cmd">mean</span>(axis=<span class="str">0</span>, keepdims=<span class="keyword">True</span>)
+
+<span class="cmt"># ── Benzerlik skorları ────────────────────────────────────────</span>
+scores = <span class="cmd">cosine_similarity</span>(user_profile, item_embeddings)[<span class="str">0</span>]
+ranked = np.<span class="cmd">argsort</span>(scores)[::-<span class="str">1</span>]
+
+<span class="keyword">for</span> rank, idx <span class="keyword">in</span> <span class="cmd">enumerate</span>(ranked, <span class="str">1</span>):
+    item = items_df.<span class="cmd">iloc</span>[idx]
+    <span class="cmd">print</span>(<span class="str">f"#{rank} {item.item_id}: {item.description[:50]}... ({scores[idx]:.3f})"</span>)
+
+<span class="cmt"># ── Cold-start: yeni kullanıcı tercih anketi ─────────────────</span>
+<span class="keyword">def</span> <span class="cmd">cold_start_profile</span>(preferences: list, item_embeddings, items_df) -> np.ndarray:
+    <span class="str">"""Kullanıcı tercihlerinden başlangıç profili oluştur."""</span>
+    pref_embs = model.<span class="cmd">encode</span>(preferences, normalize_embeddings=<span class="keyword">True</span>)
+    <span class="keyword">return</span> pref_embs.<span class="cmd">mean</span>(axis=<span class="str">0</span>, keepdims=<span class="keyword">True</span>)
+
+new_user_prefs = [<span class="str">"tarihî yerler"</span>, <span class="str">"müze gezisi"</span>, <span class="str">"Avrupa seyahati"</span>]
+new_user_profile = <span class="cmd">cold_start_profile</span>(new_user_prefs, item_embeddings, items_df)
+scores_new = <span class="cmd">cosine_similarity</span>(new_user_profile, item_embeddings)[<span class="str">0</span>]</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s3 ──────────────────────────────────────────────────── -->
+  <section id="s3">
+    <h2><span class="num">03</span> Two-Tower Modeli — User Tower, Item Tower, Dot Product</h2>
+    <p class="section-lead">Two-Tower (Dual Encoder), kullanıcı ve item için ayrı embedding ağları kurar; dot product benzerliğiyle retrieval için optimize edilir.</p>
+
+    <p>Two-Tower modeli, retrieval aşamasının baskın mimarisidir. <em>User tower</em>, kullanıcı ID ve özelliklerini embedding vektörüne dönüştürür. <em>Item tower</em>, item ID ve özelliklerini benzer boyutlu embedding'e dönüştürür. Benzerlik skoru iki embedding'in dot product'ı (veya cosine) ile hesaplanır. Eğitim sırasında in-batch negative sampling kullanılır: aynı batch'teki diğer item'lar negatif örnek olur.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>two_tower.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> torch
+<span class="keyword">import</span> torch.nn <span class="keyword">as</span> nn
+<span class="keyword">import</span> torch.nn.functional <span class="keyword">as</span> F
+
+<span class="keyword">class</span> <span class="cmd">UserTower</span>(nn.Module):
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, n_users, n_cats, embed_dim=<span class="str">128</span>):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>()
+        self.user_emb  = nn.<span class="cmd">Embedding</span>(n_users, embed_dim)
+        self.cat_emb   = nn.<span class="cmd">Embedding</span>(n_cats, <span class="str">32</span>)
+        self.fc = nn.<span class="cmd">Sequential</span>(
+            nn.<span class="cmd">Linear</span>(embed_dim + <span class="str">32</span>, <span class="str">256</span>), nn.<span class="cmd">ReLU</span>(),
+            nn.<span class="cmd">Linear</span>(<span class="str">256</span>, embed_dim),
+        )
+
+    <span class="keyword">def</span> <span class="cmd">forward</span>(self, user_ids, cat_ids):
+        u = self.<span class="cmd">user_emb</span>(user_ids)
+        c = self.<span class="cmd">cat_emb</span>(cat_ids)
+        out = self.<span class="cmd">fc</span>(torch.<span class="cmd">cat</span>([u, c], dim=-<span class="str">1</span>))
+        <span class="keyword">return</span> F.<span class="cmd">normalize</span>(out, dim=-<span class="str">1</span>)
+
+<span class="keyword">class</span> <span class="cmd">ItemTower</span>(nn.Module):
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, n_items, n_genres, embed_dim=<span class="str">128</span>):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>()
+        self.item_emb  = nn.<span class="cmd">Embedding</span>(n_items, embed_dim)
+        self.genre_emb = nn.<span class="cmd">Embedding</span>(n_genres, <span class="str">32</span>)
+        self.fc = nn.<span class="cmd">Sequential</span>(
+            nn.<span class="cmd">Linear</span>(embed_dim + <span class="str">32</span>, <span class="str">256</span>), nn.<span class="cmd">ReLU</span>(),
+            nn.<span class="cmd">Linear</span>(<span class="str">256</span>, embed_dim),
+        )
+
+    <span class="keyword">def</span> <span class="cmd">forward</span>(self, item_ids, genre_ids):
+        v = self.<span class="cmd">item_emb</span>(item_ids)
+        g = self.<span class="cmd">genre_emb</span>(genre_ids)
+        out = self.<span class="cmd">fc</span>(torch.<span class="cmd">cat</span>([v, g], dim=-<span class="str">1</span>))
+        <span class="keyword">return</span> F.<span class="cmd">normalize</span>(out, dim=-<span class="str">1</span>)
+
+<span class="keyword">class</span> <span class="cmd">TwoTowerModel</span>(nn.Module):
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, n_users, n_items, n_cats, n_genres, embed_dim=<span class="str">128</span>):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>()
+        self.user_tower = <span class="cmd">UserTower</span>(n_users, n_cats, embed_dim)
+        self.item_tower = <span class="cmd">ItemTower</span>(n_items, n_genres, embed_dim)
+        self.temperature = nn.<span class="cmd">Parameter</span>(torch.<span class="cmd">tensor</span>(<span class="str">0.07</span>))
+
+    <span class="keyword">def</span> <span class="cmd">forward</span>(self, user_ids, cat_ids, item_ids, genre_ids):
+        u = self.user_tower(user_ids, cat_ids)         <span class="cmt"># (B, D)</span>
+        v = self.item_tower(item_ids, genre_ids)        <span class="cmt"># (B, D)</span>
+        <span class="cmt"># In-batch softmax loss</span>
+        logits = (u @ v.T) / self.temperature           <span class="cmt"># (B, B)</span>
+        labels = torch.<span class="cmd">arange</span>(<span class="cmd">len</span>(u), device=u.device)
+        loss = F.<span class="cmd">cross_entropy</span>(logits, labels)
+        <span class="keyword">return</span> loss, u, v
+
+<span class="cmt"># ── Eğitim ───────────────────────────────────────────────────</span>
+model = <span class="cmd">TwoTowerModel</span>(<span class="str">10000</span>, <span class="str">50000</span>, <span class="str">50</span>, <span class="str">20</span>)
+optimizer = torch.optim.<span class="cmd">Adam</span>(model.<span class="cmd">parameters</span>(), lr=<span class="str">1e-3</span>)
+
+<span class="keyword">for</span> batch <span class="keyword">in</span> train_loader:
+    loss, _, _ = <span class="cmd">model</span>(**batch)
+    optimizer.<span class="cmd">zero_grad</span>()
+    loss.<span class="cmd">backward</span>()
+    optimizer.<span class="cmd">step</span>()</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s4 ──────────────────────────────────────────────────── -->
+  <section id="s4">
+    <h2><span class="num">04</span> ANN Retrieval — FAISS, ScaNN &amp; HNSW ile Milyonlarca Item</h2>
+    <p class="section-lead">Milyonlarca item embedding'ini yönetmek ve milisaniyeler içinde en yakın komşuları bulmak için Approximate Nearest Neighbor (ANN) indexleri gereklidir.</p>
+
+    <p><em>FAISS</em> (Facebook AI Similarity Search), GPU/CPU destekli ANN kütüphanesidir. Index tipleri: <code class="inline">IndexFlatL2</code> (tam arama, küçük setler), <code class="inline">IndexIVFFlat</code> (inverted file, büyük setler), <code class="inline">IndexHNSWFlat</code> (grafik tabanlı, yüksek recall). <em>HNSW</em> (Hierarchical Navigable Small World), günümüzde en yüksek recall/speed oranı için tercih edilir. <em>ScaNN</em> (Google), quantization ile çok büyük setlerde FAISS'ten hızlı olabilir.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>ann_retrieval.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> faiss, numpy <span class="keyword">as</span> np, time
+
+<span class="cmt"># ── Item embedding'lerini oluştur (önceden hesaplanmış) ───────</span>
+D = <span class="str">128</span>           <span class="cmt"># embedding boyutu</span>
+N = <span class="str">1_000_000</span>   <span class="cmt"># 1M item</span>
+
+<span class="keyword">import</span> torch
+model = <span class="cmd">TwoTowerModel</span>(<span class="str">10000</span>, N, <span class="str">50</span>, <span class="str">20</span>)
+model.<span class="cmd">eval</span>()
+<span class="keyword">with</span> torch.<span class="cmd">no_grad</span>():
+    all_item_ids  = torch.<span class="cmd">arange</span>(N)
+    all_genre_ids = torch.<span class="cmd">zeros</span>(N, dtype=torch.long)
+    item_embs = model.item_tower(all_item_ids, all_genre_ids)
+    item_embs = item_embs.<span class="cmd">numpy</span>()
+
+<span class="cmt"># ── FAISS IVF Index ──────────────────────────────────────────</span>
+n_centroids = <span class="str">1024</span>
+
+quantizer = faiss.<span class="cmd">IndexFlatIP</span>(D)  <span class="cmt"># inner product (cosine için normalize gerekli)</span>
+index_ivf = faiss.<span class="cmd">IndexIVFFlat</span>(quantizer, D, n_centroids, faiss.METRIC_INNER_PRODUCT)
+index_ivf.<span class="cmd">train</span>(item_embs)
+index_ivf.<span class="cmd">add</span>(item_embs)
+index_ivf.nprobe = <span class="str">50</span>  <span class="cmt"># daha yüksek recall için</span>
+
+<span class="cmt"># ── FAISS HNSW Index (üretim tercihi) ────────────────────────</span>
+index_hnsw = faiss.<span class="cmd">IndexHNSWFlat</span>(D, <span class="str">32</span>, faiss.METRIC_INNER_PRODUCT)
+index_hnsw.<span class="cmd">add</span>(item_embs)
+
+<span class="cmt"># ── Arama ─────────────────────────────────────────────────────</span>
+query_user_emb = np.random.<span class="cmd">randn</span>(<span class="str">1</span>, D).<span class="cmd">astype</span>(<span class="str">"float32"</span>)
+query_user_emb /= np.<span class="cmd">linalg.norm</span>(query_user_emb, axis=<span class="str">1</span>, keepdims=<span class="keyword">True</span>)
+
+t0 = time.<span class="cmd">perf_counter</span>()
+scores, item_indices = index_hnsw.<span class="cmd">search</span>(query_user_emb, k=<span class="str">100</span>)
+dt = (time.<span class="cmd">perf_counter</span>() - t0) * <span class="str">1000</span>
+<span class="cmd">print</span>(<span class="str">f"HNSW search: {dt:.2f} ms | Top item: {item_indices[0][0]}"</span>)
+
+<span class="cmt"># ── Index kaydetme/yükleme ───────────────────────────────────</span>
+faiss.<span class="cmd">write_index</span>(index_hnsw, <span class="str">"item_index.faiss"</span>)
+loaded_index = faiss.<span class="cmd">read_index</span>(<span class="str">"item_index.faiss"</span>)
+
+<span class="cmt"># ── GPU FAISS ────────────────────────────────────────────────</span>
+<span class="keyword">if</span> faiss.<span class="cmd">get_num_gpus</span>() &gt; <span class="str">0</span>:
+    res = faiss.<span class="cmd">StandardGpuResources</span>()
+    gpu_index = faiss.<span class="cmd">index_cpu_to_gpu</span>(res, <span class="str">0</span>, index_hnsw)
+    _, gpu_result = gpu_index.<span class="cmd">search</span>(query_user_emb, k=<span class="str">100</span>)</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s5 ──────────────────────────────────────────────────── -->
+  <section id="s5">
+    <h2><span class="num">05</span> Feature Crossing &amp; Wide&amp;Deep — Memorization + Generalization</h2>
+    <p class="section-lead">Wide&amp;Deep modeli, geniş (lineer) ve derin (neural) bileşenleri birleştirerek hem pattern ezberlemeyi hem genellemeyi başarır.</p>
+
+    <p>Cheng et al. 2016 (Google Play) tarafından önerilen <em>Wide&amp;Deep</em>: <em>Wide kısım</em> (lineer model), yüksek boyutlu sparse özellik etkileşimlerini (kullanıcı × uygulama, vb.) ezberler; <em>Deep kısım</em> (DNN), dense embedding'lerden genel pattern öğrenir. İkisi birlikte joint training yapılır. Bu mimari, büyük e-ticaret platformlarında tıklama tahmininde standart haline gelmiştir.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>wide_and_deep.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> torch, torch.nn <span class="keyword">as</span> nn, torch.nn.functional <span class="keyword">as</span> F
+
+<span class="keyword">class</span> <span class="cmd">WideAndDeep</span>(nn.Module):
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, n_users, n_items, n_user_cats,
+                 n_item_cats, embed_dim=<span class="str">32</span>):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>()
+        <span class="cmt"># ── Wide: crossed features ────────────────────────────</span>
+        <span class="cmt"># user_id × item_id hash crossing (sparse)</span>
+        self.wide = nn.<span class="cmd">EmbeddingBag</span>(n_users * n_items, <span class="str">1</span>, mode=<span class="str">"sum"</span>)
+
+        <span class="cmt"># ── Deep: embedding + MLP ─────────────────────────────</span>
+        self.user_emb     = nn.<span class="cmd">Embedding</span>(n_users, embed_dim)
+        self.item_emb     = nn.<span class="cmd">Embedding</span>(n_items, embed_dim)
+        self.user_cat_emb = nn.<span class="cmd">Embedding</span>(n_user_cats, <span class="str">16</span>)
+        self.item_cat_emb = nn.<span class="cmd">Embedding</span>(n_item_cats, <span class="str">16</span>)
+
+        deep_input = <span class="str">2</span> * embed_dim + <span class="str">2</span> * <span class="str">16</span>
+        self.deep = nn.<span class="cmd">Sequential</span>(
+            nn.<span class="cmd">Linear</span>(deep_input, <span class="str">256</span>), nn.<span class="cmd">ReLU</span>(), nn.<span class="cmd">Dropout</span>(<span class="str">0.3</span>),
+            nn.<span class="cmd">Linear</span>(<span class="str">256</span>, <span class="str">128</span>), nn.<span class="cmd">ReLU</span>(), nn.<span class="cmd">Dropout</span>(<span class="str">0.3</span>),
+            nn.<span class="cmd">Linear</span>(<span class="str">128</span>, <span class="str">1</span>),
+        )
+
+    <span class="keyword">def</span> <span class="cmd">forward</span>(self, user_ids, item_ids, user_cat_ids, item_cat_ids):
+        <span class="cmt"># Wide: crossed ID feature</span>
+        cross = (user_ids * <span class="str">50000</span> + item_ids).<span class="cmd">unsqueeze</span>(-<span class="str">1</span>)  <span class="cmt"># hashing trick</span>
+        wide_out = self.<span class="cmd">wide</span>(cross % (self.wide.num_embeddings))
+
+        <span class="cmt"># Deep: embedding concat</span>
+        u = self.<span class="cmd">user_emb</span>(user_ids)
+        v = self.<span class="cmd">item_emb</span>(item_ids)
+        uc = self.<span class="cmd">user_cat_emb</span>(user_cat_ids)
+        ic = self.<span class="cmd">item_cat_emb</span>(item_cat_ids)
+        deep_out = self.<span class="cmd">deep</span>(torch.<span class="cmd">cat</span>([u, v, uc, ic], dim=-<span class="str">1</span>))
+
+        <span class="keyword">return</span> torch.<span class="cmd">sigmoid</span>(wide_out + deep_out).<span class="cmd">squeeze</span>(-<span class="str">1</span>)
+
+model = <span class="cmd">WideAndDeep</span>(<span class="str">100000</span>, <span class="str">500000</span>, <span class="str">100</span>, <span class="str">200</span>)
+optimizer = torch.optim.<span class="cmd">Adam</span>(model.<span class="cmd">parameters</span>(), lr=<span class="str">1e-3</span>)
+criterion = nn.<span class="cmd">BCELoss</span>()</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s6 ──────────────────────────────────────────────────── -->
+  <section id="s6">
+    <h2><span class="num">06</span> Pointwise / Pairwise / Listwise Ranking — BPR &amp; LambdaRank</h2>
+    <p class="section-lead">Ranking öğrenmesinde kayıp fonksiyonu kritiktir: pointwise sınıflandırma gibi, pairwise çift karşılaştırma, listwise liste metriğini doğrudan optimize eder.</p>
+
+    <p><em>Pointwise</em>: her örnek bağımsız, BCEloss veya MSEloss — kolay ama ranking için yetersiz. <em>Pairwise (BPR)</em>: Bayesian Personalized Ranking, gözlemlenen item'ın gözlemlenmeyenden daha yüksek skorlanmasını öğrenir: <code class="inline">L = -log σ(x_ui - x_uj)</code>. <em>Listwise (LambdaRank)</em>: NDCG gibi liste metriklerinin gradyanını doğrudan hesaplar; LightGBM'in built-in lambdarank desteği vardır.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>bpr_ranking.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> torch, torch.nn <span class="keyword">as</span> nn, torch.nn.functional <span class="keyword">as</span> F
+
+<span class="cmt"># ── BPR Loss ─────────────────────────────────────────────────</span>
+<span class="keyword">def</span> <span class="cmd">bpr_loss</span>(pos_scores: torch.Tensor,
+             neg_scores: torch.Tensor,
+             reg_lambda: float = <span class="str">1e-4</span>) -> torch.Tensor:
+    <span class="str">"""
+    pos_scores: model skoru (u, i+)
+    neg_scores: model skoru (u, i-)
+    """</span>
+    diff = pos_scores - neg_scores
+    loss = -F.<span class="cmd">logsigmoid</span>(diff).<span class="cmd">mean</span>()
+    <span class="keyword">return</span> loss
+
+<span class="cmt"># ── BPR ile MF eğitimi ────────────────────────────────────────</span>
+<span class="keyword">class</span> <span class="cmd">MF</span>(nn.Module):
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, n_users, n_items, dim=<span class="str">64</span>):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>()
+        self.user_emb = nn.<span class="cmd">Embedding</span>(n_users, dim)
+        self.item_emb = nn.<span class="cmd">Embedding</span>(n_items, dim)
+        nn.init.<span class="cmd">normal_</span>(self.user_emb.weight, std=<span class="str">0.01</span>)
+        nn.init.<span class="cmd">normal_</span>(self.item_emb.weight, std=<span class="str">0.01</span>)
+
+    <span class="keyword">def</span> <span class="cmd">forward</span>(self, users, items):
+        u = self.<span class="cmd">user_emb</span>(users)
+        v = self.<span class="cmd">item_emb</span>(items)
+        <span class="keyword">return</span> (u * v).<span class="cmd">sum</span>(dim=-<span class="str">1</span>)
+
+<span class="keyword">def</span> <span class="cmd">train_bpr</span>(model, interactions, n_items, epochs=<span class="str">20</span>, batch_size=<span class="str">1024</span>):
+    optimizer = torch.optim.<span class="cmd">Adam</span>(model.<span class="cmd">parameters</span>(), lr=<span class="str">0.001</span>)
+    <span class="keyword">for</span> epoch <span class="keyword">in</span> <span class="cmd">range</span>(epochs):
+        total_loss = <span class="str">0</span>
+        <span class="keyword">for</span> batch_start <span class="keyword">in</span> <span class="cmd">range</span>(<span class="str">0</span>, <span class="cmd">len</span>(interactions), batch_size):
+            batch = interactions[batch_start:batch_start + batch_size]
+            users    = torch.<span class="cmd">tensor</span>(batch[:, <span class="str">0</span>], dtype=torch.long)
+            pos_items = torch.<span class="cmd">tensor</span>(batch[:, <span class="str">1</span>], dtype=torch.long)
+            <span class="cmt"># Rastgele negatif örnekler</span>
+            neg_items = torch.<span class="cmd">randint</span>(<span class="str">0</span>, n_items, (batch_size,))
+
+            pos_scores = <span class="cmd">model</span>(users, pos_items)
+            neg_scores = <span class="cmd">model</span>(users, neg_items)
+            loss = <span class="cmd">bpr_loss</span>(pos_scores, neg_scores)
+
+            optimizer.<span class="cmd">zero_grad</span>()
+            loss.<span class="cmd">backward</span>()
+            optimizer.<span class="cmd">step</span>()
+            total_loss += <span class="cmd">float</span>(loss)
+        <span class="cmd">print</span>(<span class="str">f"Epoch {epoch+1:3d} | Loss: {total_loss:.4f}"</span>)
+
+<span class="cmt"># ── LightGBM LambdaRank ──────────────────────────────────────</span>
+<span class="keyword">import</span> lightgbm <span class="keyword">as</span> lgb
+<span class="keyword">import</span> numpy <span class="keyword">as</span> np
+
+<span class="cmt"># group: her sorgu için kaç item var</span>
+train_data = lgb.<span class="cmd">Dataset</span>(X_train, label=y_relevance,
+                          group=group_sizes_train)
+valid_data = lgb.<span class="cmd">Dataset</span>(X_valid, label=y_val_rel,
+                          group=group_sizes_valid)
+
+params = {
+    <span class="str">"objective"</span>: <span class="str">"lambdarank"</span>,
+    <span class="str">"metric"</span>: <span class="str">"ndcg"</span>,
+    <span class="str">"ndcg_eval_at"</span>: [<span class="str">5</span>, <span class="str">10</span>],
+    <span class="str">"num_leaves"</span>: <span class="str">31</span>,
+    <span class="str">"learning_rate"</span>: <span class="str">0.05</span>,
+    <span class="str">"n_estimators"</span>: <span class="str">500</span>,
+}
+ranker = lgb.<span class="cmd">train</span>(params, train_data,
+                   valid_sets=[valid_data],
+                   callbacks=[lgb.<span class="cmd">early_stopping</span>(<span class="str">50</span>)])</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s7 ──────────────────────────────────────────────────── -->
+  <section id="s7">
+    <h2><span class="num">07</span> NVIDIA Merlin — GPU Hızlandırmalı Öneri Sistemi</h2>
+    <p class="section-lead">NVIDIA Merlin, end-to-end öneri sistemi için GPU optimize edilmiş veri işleme, model eğitimi ve inference kütüphanesi sunar.</p>
+
+    <p>Merlin ekosistemi üç katmandan oluşur: <em>NVTabular</em> — GPU tabanlı ETL ve özellik mühendisliği (categorify, normalize, embedding bag); <em>Merlin Models</em> — DLRM, Two-Tower, Wide&amp;Deep gibi modellerin kuyruktan çıkan implementasyonları; <em>Merlin Systems</em> — Triton Inference Server ile üretim deployment. GPU üzerinde feature preprocessing, CPU'ya göre 10-100x hız artışı sağlar.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>merlin_pipeline.py</span><span class="dot">●</span></div>
+      <pre><code><span class="cmt"># pip install merlin-core nvtabular merlin-models</span>
+<span class="keyword">import</span> nvtabular <span class="keyword">as</span> nvt
+<span class="keyword">from</span> nvtabular.ops <span class="keyword">import</span> (
+    Categorify, Normalize, FillMissing, HashBucket, AddMetadata
+)
+<span class="keyword">import</span> merlin.models.tf <span class="keyword">as</span> mm
+<span class="keyword">from</span> merlin.schema <span class="keyword">import</span> Tags
+
+<span class="cmt"># ── NVTabular preprocessing workflow ─────────────────────────</span>
+cat_features = [<span class="str">"user_id"</span>, <span class="str">"item_id"</span>, <span class="str">"category"</span>] >> <span class="cmd">Categorify</span>()
+cont_features = [<span class="str">"price"</span>, <span class="str">"rating_count"</span>] >> <span class="cmd">Normalize</span>()
+label = [<span class="str">"click"</span>] >> <span class="cmd">AddMetadata</span>(tags=[Tags.TARGET])
+
+workflow = nvt.<span class="cmd">Workflow</span>(cat_features + cont_features + label)
+<span class="cmt"># workflow.fit_transform(dataset).to_parquet("processed/")</span>
+
+<span class="cmt"># ── Merlin Two-Tower modeli ──────────────────────────────────</span>
+<span class="keyword">from</span> merlin.io <span class="keyword">import</span> Dataset
+<span class="keyword">from</span> merlin.schema <span class="keyword">import</span> Schema
+
+schema = Schema().<span class="cmd">from_parquet</span>(<span class="str">"processed/train.parquet"</span>)
+
+two_tower = mm.<span class="cmd">TwoTowerModel</span>(
+    schema,
+    query_tower=mm.<span class="cmd">MLPBlock</span>([<span class="str">256</span>, <span class="str">128</span>]),
+    candidate_tower=mm.<span class="cmd">MLPBlock</span>([<span class="str">256</span>, <span class="str">128</span>]),
+    samplers=[mm.<span class="cmd">InBatchSampler</span>()],
+    embedding_dim_default=<span class="str">64</span>,
+)
+
+two_tower.<span class="cmd">compile</span>(
+    optimizer=<span class="str">"adam"</span>,
+    run_eagerly=<span class="keyword">False</span>,
+    metrics=[mm.<span class="cmd">RecallAt</span>(<span class="str">10</span>), mm.<span class="cmd">NDCGAt</span>(<span class="str">10</span>)],
+)
+two_tower.<span class="cmd">fit</span>(
+    <span class="cmd">Dataset</span>(<span class="str">"processed/train.parquet"</span>),
+    validation_data=<span class="cmd">Dataset</span>(<span class="str">"processed/valid.parquet"</span>),
+    batch_size=<span class="str">4096</span>,
+    epochs=<span class="str">10</span>,
+)</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s8 ──────────────────────────────────────────────────── -->
+  <section id="s8">
+    <h2><span class="num">08</span> A/B Test &amp; Online Learning — Bandit Algoritmaları</h2>
+    <p class="section-lead">Çevrimiçi ortamda model performansını ölçmek ve sürekli öğrenmek için A/B test istatistiği ve bandit algoritmaları gereklidir.</p>
+
+    <p>Öneri sistemi değerlendirmesi çevrimdışı metriklerde (NDCG, Recall@K, MRR) başlar; ancak asıl gerçek ölçüm çevrimiçi A/B test ile yapılır. <em>A/B test</em>: kullanıcılar rastgele bölünür, istatistiksel anlamlılık için yeterli örnek beklenir. <em>Multi-armed bandit</em>, A/B test'i online optimize eder: düşük performanslı varyantlara daha az trafik yönlendirir. Thompson Sampling ve UCB1 en yaygın algoritmalardır.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>bandit.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> numpy <span class="keyword">as</span> np
+
+<span class="keyword">class</span> <span class="cmd">ThompsonSamplingBandit</span>:
+    <span class="str">"""Beta-Binomial Thompson Sampling."""</span>
+
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, n_arms: int):
+        self.n_arms = n_arms
+        self.alpha  = np.<span class="cmd">ones</span>(n_arms)  <span class="cmt"># başarılar + 1</span>
+        self.beta_  = np.<span class="cmd">ones</span>(n_arms)  <span class="cmt"># başarısızlıklar + 1</span>
+
+    <span class="keyword">def</span> <span class="cmd">select</span>(self) -> int:
+        <span class="str">"""Her kol için Beta dağılımından örnek çek."""</span>
+        samples = np.random.<span class="cmd">beta</span>(self.alpha, self.beta_)
+        <span class="keyword">return</span> <span class="cmd">int</span>(np.<span class="cmd">argmax</span>(samples))
+
+    <span class="keyword">def</span> <span class="cmd">update</span>(self, arm: int, reward: int) -> None:
+        <span class="str">"""reward: 1 (tıklama) veya 0 (tıklamama)."""</span>
+        self.alpha[arm]  += reward
+        self.beta_[arm]  += <span class="str">1</span> - reward
+
+    <span class="keyword">def</span> <span class="cmd">best_arm</span>(self) -> int:
+        rates = self.alpha / (self.alpha + self.beta_)
+        <span class="keyword">return</span> <span class="cmd">int</span>(np.<span class="cmd">argmax</span>(rates))
+
+<span class="cmt"># ── Simülasyon ────────────────────────────────────────────────</span>
+TRUE_CTR = [<span class="str">0.05</span>, <span class="str">0.10</span>, <span class="str">0.07</span>, <span class="str">0.12</span>]  <span class="cmt"># gerçek tıklama oranları</span>
+bandit = <span class="cmd">ThompsonSamplingBandit</span>(n_arms=<span class="str">4</span>)
+
+total_reward = <span class="str">0</span>
+<span class="keyword">for</span> t <span class="keyword">in</span> <span class="cmd">range</span>(<span class="str">10_000</span>):
+    arm = bandit.<span class="cmd">select</span>()
+    reward = int(np.random.<span class="cmd">random</span>() &lt; TRUE_CTR[arm])
+    bandit.<span class="cmd">update</span>(arm, reward)
+    total_reward += reward
+
+<span class="cmd">print</span>(<span class="str">f"Best arm: {bandit.best_arm()} (CTR: {TRUE_CTR[bandit.best_arm()]})"</span>)
+<span class="cmd">print</span>(<span class="str">f"Toplam tıklama: {total_reward} / 10000"</span>)
+<span class="cmd">print</span>(<span class="str">f"Tahmini CTR'ler: {bandit.alpha / (bandit.alpha + bandit.beta_)}"</span>)</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s9 ──────────────────────────────────────────────────── -->
+  <section id="s9">
+    <h2><span class="num">09</span> Üretim Pipeline — Feature Store, Embedding Cache, Serving</h2>
+    <p class="section-lead">Düşük gecikme ve yüksek throughput gerektiren öneri sistemi üretim pipeline'ı, feature store, embedding cache ve özel serving katmanı gerektirir.</p>
+
+    <p><em>Feature store</em>, gerçek zamanlı ve batch özelliklerini tutarlı şekilde sunar; Feast, Tecton veya Redis tabanlı custom implementasyonlar yaygındır. <em>Embedding cache</em>, milyonlarca item embedding'ini belleğe alır; sorgu başına yeniden hesaplama yapmak çok yavaştır. <em>Model serving</em>: Triton Inference Server, TorchServe veya özel REST API. Tüm pipeline, eşzamanlı erişim ve güncelleme sırasında tutarlılığı korumalıdır.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>production_pipeline.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> redis, numpy <span class="keyword">as</span> np, faiss, pickle, time
+<span class="keyword">from</span> typing <span class="keyword">import</span> List
+
+<span class="keyword">class</span> <span class="cmd">RecSysServer</span>:
+    <span class="str">"""Basit üretim öneri servisi."""</span>
+
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, index_path: str, redis_url: str):
+        <span class="cmt"># FAISS index yükle</span>
+        self.faiss_index = faiss.<span class="cmd">read_index</span>(index_path)
+        self.faiss_index.nprobe = <span class="str">64</span>
+        <span class="cmt"># Redis bağlantısı (feature store / cache)</span>
+        self.redis = redis.<span class="cmd">from_url</span>(redis_url)
+
+    <span class="keyword">def</span> <span class="cmd">get_user_embedding</span>(self, user_id: str) -> np.ndarray:
+        <span class="str">"""Redis'ten kullanıcı embedding'i çek."""</span>
+        key = <span class="str">f"user_emb:{user_id}"</span>
+        raw = self.redis.<span class="cmd">get</span>(key)
+        <span class="keyword">if</span> raw:
+            <span class="keyword">return</span> np.<span class="cmd">frombuffer</span>(raw, dtype=np.float32).<span class="cmd">reshape</span>(<span class="str">1</span>, -<span class="str">1</span>)
+        <span class="cmt"># Cache miss: hesapla ve cache'e yaz</span>
+        emb = self.<span class="cmd">compute_user_embedding</span>(user_id)
+        self.redis.<span class="cmd">setex</span>(key, <span class="str">3600</span>, emb.<span class="cmd">tobytes</span>())  <span class="cmt"># 1 saat TTL</span>
+        <span class="keyword">return</span> emb.<span class="cmd">reshape</span>(<span class="str">1</span>, -<span class="str">1</span>)
+
+    <span class="keyword">def</span> <span class="cmd">compute_user_embedding</span>(self, user_id: str) -> np.ndarray:
+        <span class="cmt"># Gerçek implementasyonda model inference</span>
+        <span class="keyword">return</span> np.random.<span class="cmd">randn</span>(<span class="str">128</span>).<span class="cmd">astype</span>(np.float32)
+
+    <span class="keyword">def</span> <span class="cmd">recommend</span>(self, user_id: str, k: int = <span class="str">50</span>) -> List[int]:
+        t0 = time.<span class="cmd">perf_counter</span>()
+        user_emb = self.<span class="cmd">get_user_embedding</span>(user_id)
+        <span class="cmt"># Normalize</span>
+        user_emb = user_emb / (np.<span class="cmd">linalg.norm</span>(user_emb) + <span class="str">1e-8</span>)
+        <span class="cmt"># FAISS retrieval</span>
+        scores, item_ids = self.faiss_index.<span class="cmd">search</span>(user_emb, k)
+        dt = (time.<span class="cmd">perf_counter</span>() - t0) * <span class="str">1000</span>
+        <span class="cmd">print</span>(<span class="str">f"Öneri süresi: {dt:.2f} ms"</span>)
+        <span class="keyword">return</span> item_ids[<span class="str">0</span>].<span class="cmd">tolist</span>()
+
+server = <span class="cmd">RecSysServer</span>(<span class="str">"item_index.faiss"</span>, <span class="str">"redis://localhost:6379"</span>)
+recs = server.<span class="cmd">recommend</span>(<span class="str">"user_42"</span>, k=<span class="str">50</span>)
+<span class="cmd">print</span>(<span class="str">f"Önerilen {len(recs)} item"</span>)</code></pre>
+    </div>
+
+    <div class="callout">
+      <div class="label">ÜRETIM</div>
+      <p>Öneri sistemi gecikme bütçesi: toplam &lt;100 ms. Dağılım: feature lookup 5-10 ms, retrieval 5-15 ms, ranking 30-50 ms, reranking &lt;5 ms, network overhead &lt;20 ms. Her aşama için SLA belirleyin ve P99 metriklerini izleyin.</p>
+    </div>
+  </section>
+
+</main>
+
+<footer>◆ EMİRHAN PEHLEVAN ◆<br>emirpehlevan@outlook.com</footer>

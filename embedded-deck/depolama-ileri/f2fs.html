@@ -1,0 +1,746 @@
+---
+layout: tutorial
+title: "F2FS — Flash-Friendly File System"
+back_url: "../index.html"
+back_label: "Depolama İleri Düzey"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>DEPOLAMA İLERİ</span>
+    <span>F2FS</span>
+    <span>2026</span>
+  </div>
+  <h1>F2FS<br><em>Flash-Friendly File System.</em></h1>
+  <p class="subtitle">Samsung tarafından geliştirilen log-structured dosya sistemi. NAND flash ve eMMC'nin doğal yazma modeliyle uyumlu; GC tuning, TRIM entegrasyonu ve wear leveling optimizasyonu ile maksimum flash ömrü.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">F2FS tasarım felsefesi</a></li>
+    <li><a href="#s1">Node / segment / section / zone hiyerarşisi</a></li>
+    <li><a href="#s2">mkfs.f2fs ve mount options</a></li>
+    <li><a href="#s3">Garbage collection — GC tuning</a></li>
+    <li><a href="#s4">Discard / TRIM entegrasyonu</a></li>
+    <li><a href="#s5">Wear leveling yaklaşımı</a></li>
+    <li><a href="#s6">F2FS vs ext4 vs UBIFS karşılaştırması</a></li>
+    <li><a href="#s7">f2fs-tools — fsck, dump, defrag</a></li>
+    <li><a href="#s8">Pratik: BeagleBone eMMC'de F2FS + GC tuning</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> F2FS tasarım felsefesi</h2>
+  <p class="section-lead">F2FS (Flash-Friendly File System), Samsung tarafından 2012 yılında geliştirilen ve 2012 sonunda mainline Linux kernel'a kabul edilen log-structured dosya sistemidir. Geleneksel blok cihaz odaklı dosya sistemlerinin flash ortamında yarattığı sorunları adresler.</p>
+
+  <h3>Neden yeni bir dosya sistemi?</h3>
+  <p>ext4 ve diğer geleneksel dosya sistemleri HDD'nin rastgele erişim ve yerinde güncelleme (in-place update) modeline göre tasarlanmıştır. NAND flash bu modele uymaz:</p>
+  <ul>
+    <li>NAND yazmadan önce silme gerektirir — silme birimi (erase block) yazma biriminden (sayfa) çok daha büyüktür</li>
+    <li>Yerinde güncelleme mümkün değildir — mevcut sayfayı güncellemek için erase block silinip yeniden yazılmalıdır</li>
+    <li>Yazma güçlendirmesi (write amplification) artışı wear leveling'i bozar</li>
+    <li>Küçük rastgele yazmalar özellikle zararlıdır — her küçük yazma büyük erase block'u tetikler</li>
+  </ul>
+
+  <h3>F2FS'in temel öncülleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">Log-structured yazma</span><span class="desc">Tüm yazma işlemleri sıralı log akışında gerçekleşir. Yerinde güncelleme yoktur; eski veri geçersiz (stale) işaretlenir, yeni veri log sonuna eklenir</span></div>
+    <div class="param"><span class="name">Multi-stream logging</span><span class="desc">6 farklı yazma akışı (hot/warm/cold × node/data) — benzer ömür süreli verileri bir arada tutar, GC etkinliğini artırır</span></div>
+    <div class="param"><span class="name">Checkpoint</span><span class="desc">Güç kesintisine karşı tutarlılık noktaları. F2FS, checkpoint'ler arasındaki log alanını kurtarabilir</span></div>
+    <div class="param"><span class="name">Node Address Table (NAT)</span><span class="desc">İnode → fiziksel adres çevirme tablosu. Yerinde güncelleme simülasyonu sağlar; üst katmanlar adres değişimini görmez</span></div>
+  </div>
+
+  <h3>Genel mimari</h3>
+  <div class="flow">
+    <pre>
+Flash Aygıt (eMMC / UFS / NVMe)
+┌──────────────────────────────────────────────┐
+│ Superblock (SB)  │ CP Area │ SIT │ NAT │ SSA │
+│  (metadata)       (2 kopy) │ (segment bilgisi) │
+├──────────────────────────────────────────────┤
+│               Main Area                       │
+│  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐         │
+│  │Seg 0 │ │Seg 1 │ │Seg 2 │ │Seg N │  ...    │
+│  │ 2MB  │ │ 2MB  │ │ 2MB  │ │ 2MB  │         │
+│  └──────┘ └──────┘ └──────┘ └──────┘         │
+└──────────────────────────────────────────────┘
+SB: SuperBlock  CP: CheckPoint  SIT: Segment Info Table
+NAT: Node Address Table  SSA: Segment Summary Area
+    </pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">KULLANIM ALANI</div>
+    <p>F2FS, eMMC ve UFS tabanlı Android cihazlarda ve gömülü Linux'ta yaygındır. Ext4'ün yerini almaz; düzenli güncellemeli, sıkça yazılan bölümler (data partition, /var, /tmp) için idealdir. Read-only rootfs için squashfs hâlâ üstündür.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>F2FS log-structured yapısı NAND flash'ın yazma modeliyle örtüşür</li>
+      <li>Multi-stream logging benzer ömürlü verileri bir arada tutarak GC'yi iyileştirir</li>
+      <li>NAT tablosu yerinde güncelleme simülasyonu yaparak üst katmanlara saydam çalışır</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Node / segment / section / zone hiyerarşisi</h2>
+  <p class="section-lead">F2FS verisi dört seviyeli hiyerarşik yapıda düzenlenir. Bu yapıyı anlamak GC stratejisi ve performans optimizasyonu için kritiktir.</p>
+
+  <h3>Hiyerarşi açıklaması</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Seviye</th><th>Boyut (varsayılan)</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Block</td><td>4 KB</td><td>En küçük I/O birimi. Bir sayfa (page) eşdeğeri</td></tr>
+        <tr><td>Segment</td><td>2 MB (512 block)</td><td>Temel yönetim birimi. SIT her segment için valid block sayısını izler</td></tr>
+        <tr><td>Section</td><td>Varsayılan 1 segment</td><td>GC birimi — tüm section bir arada temizlenir</td></tr>
+        <tr><td>Zone</td><td>Varsayılan 1 section</td><td>Flash cihazın fiziksel erase block grubuyla hizalama birimi</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Node ve Data ayrımı</h3>
+  <div class="params">
+    <div class="param"><span class="name">Data Block</span><span class="desc">Gerçek dosya verisi veya dizin girdileri. Hot/warm/cold sınıflandırmasına göre farklı segmentlere yazılır</span></div>
+    <div class="param"><span class="name">Node Block</span><span class="desc">İnode, direct node (doğrudan blok işaretçileri), indirect node. Veri bloğunun adresini tutar</span></div>
+    <div class="param"><span class="name">Hot Data</span><span class="desc">Sıkça değişen veriler: dizin girdileri, aktif dosya verileri</span></div>
+    <div class="param"><span class="name">Warm Data</span><span class="desc">Orta sıklıkta değişen veriler: normal dosyalar</span></div>
+    <div class="param"><span class="name">Cold Data</span><span class="desc">Nadiren değişen veriler: GC ile taşınan bloklar, multimedia dosyaları</span></div>
+  </div>
+
+  <h3>6 yazma akışı (active log)</h3>
+  <div class="flow">
+    <pre>
+Yazma Akışları:
+┌───────────────────────────────────────────────┐
+│  Hot Node Log   │  Warm Node Log  │  Cold Node │
+│  (inode'lar)    │  (direct node)  │  (indirect)│
+├─────────────────┼─────────────────┼────────────┤
+│  Hot Data Log   │  Warm Data Log  │  Cold Data │
+│  (directory)    │  (normal write) │  (GC moved)│
+└───────────────────────────────────────────────┘
+Her akış = bağımsız aktif segment
+    </pre>
+  </div>
+
+  <h3>Checkpoint yapısı</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — checkpoint alanını sorgula</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># F2FS superblock ve checkpoint bilgisi</span>
+<span class="cmd">dump.f2fs</span> -d 1 /dev/mmcblk1p2
+
+<span class="cmt"># Örnek çıktı (önemli alanlar):</span>
+<span class="cmt"># Info: checkpoint state = 5 : crc consistent unmount</span>
+<span class="cmt"># Info: current valid block count = 52428</span>
+<span class="cmt"># Info: BIO count = 0</span>
+
+<span class="cmt"># sysfs üzerinden anlık istatistik</span>
+<span class="cmd">cat</span> /sys/fs/f2fs/mmcblk1p2/stat</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Segment (2 MB) temel yönetim birimidir; section GC birimidir</li>
+      <li>6 akışlı logging hot/warm/cold ayrımı ile GC etkinliğini artırır</li>
+      <li>Node ve Data blokları ayrı segmentlerde tutulur — korelasyon azalır</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> mkfs.f2fs ve mount options</h2>
+  <p class="section-lead"><code>mkfs.f2fs</code> ile F2FS formatlanır ve <code>mount</code> seçenekleriyle çalışma zamanı davranışı ayarlanır.</p>
+
+  <h3>mkfs.f2fs — format seçenekleri</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — format komutları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Temel format</span>
+<span class="cmd">mkfs.f2fs</span> /dev/mmcblk1p2
+
+<span class="cmt"># Tüm seçeneklerle (üretim)</span>
+<span class="cmd">mkfs.f2fs</span> \
+  -l "data-part" \
+  -O encrypt \
+  -O extra_attr \
+  -O compression \
+  -t 1 \
+  /dev/mmcblk1p2
+<span class="cmt"># -l : etiket</span>
+<span class="cmt"># -O encrypt : dosya bazlı şifreleme desteği (fscrypt)</span>
+<span class="cmt"># -O extra_attr : genişletilmiş inode attribute</span>
+<span class="cmt"># -O compression : dosya bazlı sıkıştırma (LZ4/zstd)</span>
+<span class="cmt"># -t 1 : trim (discard) desteği etkin</span>
+
+<span class="cmt"># eMMC provision üretim scripti</span>
+<span class="cmd">mkfs.f2fs</span> \
+  -a 1 \
+  -s 1 \
+  -z 1 \
+  -l "userdata" \
+  -O encrypt,extra_attr,compression \
+  /dev/mmcblk0p5
+<span class="cmt"># -a : segs_per_sec (1 = segment=section)</span>
+<span class="cmt"># -s : secs_per_zone</span>
+<span class="cmt"># -z : zone sayısı</span></code></pre>
+  </div>
+
+  <h3>Önemli mount seçenekleri</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Seçenek</th><th>Açıklama</th><th>Tavsiye</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>discard / nodiscard</td><td>Mount sırasında sürekli TRIM — erase block anlık serbest bırakılır</td><td>Destekleyen eMMC'de etkin</td></tr>
+        <tr><td>nobarrier</td><td>Write barrier devre dışı — güç kesilirse veri kaybı riski</td><td>UPS olan sistemlerde</td></tr>
+        <tr><td>lazytime</td><td>Zaman damgası güncellemelerini belleğe topla, bellekten yaz</td><td>Her zaman önerilir</td></tr>
+        <tr><td>background_gc=off/on/sync</td><td>Arkaplan GC modu</td><td>on varsayılan, sync acil durum</td></tr>
+        <tr><td>gc_merge</td><td>Foreground/background GC birleştir</td><td>Yüksek yazma baskısında</td></tr>
+        <tr><td>compress_algorithm=lz4</td><td>Dosya bazlı LZ4 sıkıştırma</td><td>Log/metin dosyaları için</td></tr>
+        <tr><td>active_logs=6</td><td>6 yazma akışı (varsayılan)</td><td>Her zaman 6</td></tr>
+        <tr><td>alloc_mode=default/reuse</td><td>Segment tahsis modu</td><td>default genelde iyi</td></tr>
+        <tr><td>extent_cache</td><td>Extent önbellekle sıralı okuma hızlandır</td><td>Büyük dosyalarda</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — /etc/fstab girişi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># /etc/fstab — üretim gömülü sistem için</span>
+UUID=1234abcd  /data  f2fs  defaults,discard,lazytime,nodiratime,background_gc=on  0  2
+
+<span class="cmt"># /tmp için tmpfs ile birlikte (F2FS'i korur)</span>
+tmpfs  /tmp  tmpfs  defaults,noatime,mode=1777,size=64M  0  0
+
+<span class="cmt"># Anlık mount test</span>
+<span class="cmd">mount</span> -t f2fs -o discard,lazytime,background_gc=on \
+  /dev/mmcblk1p2 /data
+
+<span class="cmt"># Mevcut mount seçeneklerini göster</span>
+<span class="cmd">cat</span> /proc/mounts | grep f2fs</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>mkfs.f2fs -O encrypt,compression ile fscrypt ve inline sıkıştırma aktifleşir</li>
+      <li>discard + lazytime kombinasyonu günlük kullanım için önerilen temel settir</li>
+      <li>/tmp için tmpfs F2FS wear'ı azaltır — flash ömrünü korur</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Garbage collection — GC tuning</h2>
+  <p class="section-lead">F2FS'in log-structured yapısı zamanla geçersiz (stale) bloklar biriktirir. GC bu blokları temizleyerek boş segment sağlar. GC stratejisi performans ve ömür dengesini doğrudan etkiler.</p>
+
+  <h3>GC türleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">Background GC (kthread)</span><span class="desc">Sistem boştayken arka planda çalışan kthread. gc_min_sleep ve gc_max_sleep parametreleriyle uyku aralığı ayarlanır. Normal koşulda tercih edilen mod</span></div>
+    <div class="param"><span class="name">Foreground GC</span><span class="desc">Boş segment sayısı kritik eşiğin altına düşünce uygulama yazmaları doğrudan GC tetikler. Gecikme spike'larına yol açar</span></div>
+    <div class="param"><span class="name">gc_urgent mod</span><span class="desc">Background GC'yi agresif çalıştırır — uyku aralıkları minimize edilir. Kritik düşük boş alan senaryoları için</span></div>
+  </div>
+
+  <h3>GC sysfs parametreleri</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — GC parametrelerini görüntüle ve ayarla</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># F2FS sysfs dizini (mmcblk1p2 mount edilmiş)</span>
+<span class="cmd">ls</span> /sys/fs/f2fs/mmcblk1p2/
+
+<span class="cmt"># GC ayarları</span>
+<span class="cmd">cat</span> /sys/fs/f2fs/mmcblk1p2/gc_min_sleep_time     <span class="cmt"># ms cinsinden</span>
+<span class="cmd">cat</span> /sys/fs/f2fs/mmcblk1p2/gc_max_sleep_time
+<span class="cmd">cat</span> /sys/fs/f2fs/mmcblk1p2/gc_idle_interval
+
+<span class="cmt"># Agresif GC etkinleştir (boş alan kritik)</span>
+<span class="cmd">echo</span> 1 > /sys/fs/f2fs/mmcblk1p2/gc_urgent
+<span class="cmd">echo</span> 50  > /sys/fs/f2fs/mmcblk1p2/gc_min_sleep_time
+<span class="cmd">echo</span> 500 > /sys/fs/f2fs/mmcblk1p2/gc_max_sleep_time
+
+<span class="cmt"># Normal mod (düşük yazma baskısı)</span>
+<span class="cmd">echo</span> 0    > /sys/fs/f2fs/mmcblk1p2/gc_urgent
+<span class="cmd">echo</span> 10000 > /sys/fs/f2fs/mmcblk1p2/gc_min_sleep_time
+<span class="cmd">echo</span> 30000 > /sys/fs/f2fs/mmcblk1p2/gc_max_sleep_time
+
+<span class="cmt"># Manuel GC tetikle (maintenance penceresi)</span>
+<span class="cmd">echo</span> 1 > /sys/fs/f2fs/mmcblk1p2/gc_urgent
+<span class="cmd">sleep</span> 30
+<span class="cmd">echo</span> 0 > /sys/fs/f2fs/mmcblk1p2/gc_urgent</code></pre>
+  </div>
+
+  <h3>GC algoritmaları</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Algoritma</th><th>Seçim kriteri</th><th>Avantaj</th><th>Dezavantaj</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Greedy</td><td>En az valid block içeren segment</td><td>En az taşıma, düşük gecikme</td><td>Kötü locality, parçalanma</td></tr>
+        <tr><td>Cost-Benefit</td><td>Age + utilization skoru</td><td>Wear leveling daha iyi</td><td>Daha yüksek CPU</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — GC istatistikleri</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># GC istatistiklerini izle</span>
+<span class="cmd">cat</span> /sys/fs/f2fs/mmcblk1p2/stat | grep -i gc
+
+<span class="cmt"># dump.f2fs ile detaylı istatistik</span>
+<span class="cmd">dump.f2fs</span> -s /dev/mmcblk1p2
+
+<span class="cmt"># Seçili segment bilgisi</span>
+<span class="cmd">dump.f2fs</span> -S /dev/mmcblk1p2 | head -50
+
+<span class="cmt"># iostat ile GC sırasında I/O izle</span>
+<span class="cmd">iostat</span> -x mmcblk1 1 30</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Background GC tercih edilmeli — foreground GC gecikme spike'larına yol açar</li>
+      <li>gc_urgent=1 kritik düşük boş alan için acil modudur</li>
+      <li>GC parametreleri sysfs üzerinden çalışma zamanında ayarlanabilir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Discard / TRIM entegrasyonu</h2>
+  <p class="section-lead">TRIM (ATA TRIM / eMMC Discard), dosya silindiğinde blokların artık kullanılmadığını depolama denetleyicisine bildirir. Bu bildirim wear leveling ve GC etkinliğini artırır.</p>
+
+  <h3>TRIM çalışma mekanizması</h3>
+  <div class="flow">
+    <pre>
+Uygulama dosyayı siler
+        ↓
+F2FS: blokları "geçersiz" işaretler
+        ↓
+     ┌──────────┬────────────────┐
+     │  discard  │    fstrim      │
+     │  (mount   │  (periyodik    │
+     │  seçeneği)│   komut)       │
+     └──────────┴────────────────┘
+        ↓ her iki yol da eMMC DISCARD CMD38 gönderir
+eMMC Denetleyici: blok havuzuna geri al
+        ↓
+Sonraki yazma daha temiz erase block üzerinden
+    </pre>
+  </div>
+
+  <h3>Discard modları</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — discard yapılandırması</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1. Mount-time discard (anlık — her silmede TRIM gönderir)</span>
+<span class="cmd">mount</span> -t f2fs -o discard /dev/mmcblk1p2 /data
+
+<span class="cmt"># 2. Periyodik fstrim (batch — daha az overhead)</span>
+<span class="cmt"># /etc/cron.d/fstrim veya systemd timer ile</span>
+<span class="cmd">fstrim</span> -av   <span class="cmt"># tüm mount edilmiş FS'lere TRIM gönder</span>
+<span class="cmd">fstrim</span> -v /data   <span class="cmt"># sadece /data</span>
+
+<span class="cmt"># Systemd weekly timer (fstrim.timer)</span>
+<span class="cmd">systemctl</span> enable --now fstrim.timer
+<span class="cmd">systemctl</span> status fstrim.timer
+
+<span class="cmt"># 3. F2FS background discard (önerilen — batch)</span>
+<span class="cmt"># /sys/fs/f2fs parametreleri</span>
+<span class="cmd">cat</span> /sys/fs/f2fs/mmcblk1p2/discard_granularity
+<span class="cmd">echo</span> 4 > /sys/fs/f2fs/mmcblk1p2/discard_granularity  <span class="cmt"># 4*segment = 8MB</span>
+
+<span class="cmt"># eMMC discard desteğini kontrol et</span>
+<span class="cmd">cat</span> /sys/block/mmcblk1/queue/discard_max_bytes
+<span class="cmd">cat</span> /sys/block/mmcblk1/queue/discard_granularity</code></pre>
+  </div>
+
+  <h3>fstrim periyodik timer</h3>
+  <div class="code-block">
+    <div class="code-header"><span>systemd — fstrim.service + timer</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># /etc/systemd/system/fstrim-data.service</span>
+[Unit]
+Description=F2FS veri partisyon TRIM
+After=data.mount
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/fstrim -v /data
+ExecStart=/sbin/fstrim -v /var
+
+<span class="cmt"># /etc/systemd/system/fstrim-data.timer</span>
+[Unit]
+Description=Haftalık F2FS TRIM
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+
+[Install]
+WantedBy=timers.target</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">PERFORMANS NOTU</div>
+    <p>Anlık <code>discard</code> mount seçeneği her silme işleminde eMMC komut göndererek gecikme yaratır. Batch discard (fstrim.timer) genel olarak daha iyi throughput sağlar. Ancak düşük boş alan durumunda anlık discard eMMC'nin daha hızlı yer açmasına yardımcı olur.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>discard mount seçeneği anlık TRIM, fstrim.timer batch TRIM sağlar</li>
+      <li>eMMC discard desteği /sys/block/mmcblk*/queue/ üzerinden doğrulanmalı</li>
+      <li>Background discard + haftalık fstrim kombinasyonu genelde en dengelisidir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Wear leveling yaklaşımı</h2>
+  <p class="section-lead">F2FS, yazmaları tüm flash alanına yayarak her erase block'un eşit oranda yıpranmasını sağlar. Bu dinamik wear leveling, flash ömrünü doğrudan etkiler.</p>
+
+  <h3>F2FS'te wear leveling mekanizması</h3>
+  <div class="params">
+    <div class="param"><span class="name">Log-structured yazma</span><span class="desc">Her yazma işlemi bir sonraki boş segmentten yapılır. Hiçbir segment art arda yazılmaz — doğal dağılım</span></div>
+    <div class="param"><span class="name">Section seçim algoritması</span><span class="desc">GC sırasında en yaşlı (en çok silinen) section'lar öncelikli temizlenir. Bu, yeni sectionların erken yıpranmasını engeller</span></div>
+    <div class="param"><span class="name">Cold data yerleşimi</span><span class="desc">GC tarafından taşınan soğuk (seyrek değişen) veriler özel cold segmentlerde tutulur — sıcak veri ile karışmaz</span></div>
+    <div class="param"><span class="name">Static wear leveling</span><span class="desc">F2FS kendisi statik WL yapmaz — bu eMMC kontrolcüsünün sorumluluğundadır. F2FS'in görevi write amplification'ı minimize etmektir</span></div>
+  </div>
+
+  <h3>Write amplification faktörü (WAF)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — WAF ölçümü</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># eMMC write counter (JEDEC Health registers)</span>
+<span class="cmd">mmc</span> extcsd read /dev/mmcblk0 | grep -i life
+
+<span class="cmt"># F2FS istatistiklerinden WAF tahmini</span>
+<span class="cmd">cat</span> /sys/fs/f2fs/mmcblk1p2/stat
+<span class="cmt"># GC: data segs written vs user data written</span>
+
+<span class="cmt"># fio ile gerçekçi WAF testi</span>
+<span class="cmd">fio</span> --filename=/data/waf_test \
+  --rw=randwrite \
+  --bs=4k \
+  --ioengine=libaio \
+  --iodepth=32 \
+  --size=256M \
+  --numjobs=4 \
+  --time_based \
+  --runtime=300 \
+  --name=waf_randwrite \
+  --group_reporting</code></pre>
+  </div>
+
+  <h3>WAF minimizasyon stratejileri</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Strateji</th><th>Yöntem</th><th>Beklenen Etki</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Küçük yazmaları topla</td><td>Uygulama buffering veya tmpfs kullan</td><td>WAF %30–50 azalır</td></tr>
+        <tr><td>Sıralı yazma zorla</td><td>O_DIRECT + büyük blok boyutu</td><td>WAF ~1.0 hedefe yaklaşır</td></tr>
+        <tr><td>Log dosyası rotasyonu</td><td>Sabit boyutlu log, döngüsel yaz</td><td>Sıcak alan sınırlanır</td></tr>
+        <tr><td>/tmp için tmpfs</td><td>mount -t tmpfs tmpfs /tmp</td><td>Flash yazma tamamen ortadan kalkar</td></tr>
+        <tr><td>fsync azalt</td><td>Uygulama fsync politikasını gözden geçir</td><td>GC baskısı azalır</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>F2FS log-structured yazma ile doğal dinamik wear leveling sağlar</li>
+      <li>Statik wear leveling eMMC kontrolcüsünün görevidir — F2FS WAF'ı minimize eder</li>
+      <li>Küçük rastgele yazmaları toplamak WAF'ı en çok azaltan stratejidir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> F2FS vs ext4 vs UBIFS karşılaştırması</h2>
+  <p class="section-lead">Gömülü storage için doğru dosya sistemi seçimi kullanım senaryosuna bağlıdır. Üç ana alternatifi karşılaştırıyoruz.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Özellik</th><th>F2FS</th><th>ext4</th><th>UBIFS</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Hedef depolama</td><td>Yönetilen flash (eMMC, UFS, NVMe, SD)</td><td>Yönetilen flash, HDD, SSD</td><td>Ham NAND flash (MTD)</td></tr>
+        <tr><td>Yazma modeli</td><td>Log-structured (append-only)</td><td>Journal (in-place update)</td><td>Log-structured</td></tr>
+        <tr><td>Rastgele yazma</td><td>Mükemmel (append → sıralı)</td><td>Orta (journal overhead)</td><td>İyi</td></tr>
+        <tr><td>Sıralı okuma</td><td>Çok iyi</td><td>Çok iyi</td><td>İyi</td></tr>
+        <tr><td>Wear leveling</td><td>Dinamik (log + GC)</td><td>Yok (kontrolcüye bırakır)</td><td>LEB tahsis + WL</td></tr>
+        <tr><td>Güç kesintisi</td><td>Checkpoint + rollback</td><td>Journal replay</td><td>Journal + WB</td></tr>
+        <tr><td>GC</td><td>Background/foreground</td><td>Yok (trimle)</td><td>Background GC</td></tr>
+        <tr><td>Compression</td><td>Dosya bazlı (LZ4/zstd)</td><td>Yok (btrfs'e bak)</td><td>LZO/zlib dahili</td></tr>
+        <tr><td>TRIM desteği</td><td>Var (discard/fstrim)</td><td>Var (discard/fstrim)</td><td>Yok (ham NAND)</td></tr>
+        <tr><td>Kernel maturity</td><td>Mainline 3.8+, kararlı</td><td>Çok kararlı</td><td>Mainline, kararlı</td></tr>
+        <tr><td>MTD desteği</td><td>Yok</td><td>Yok</td><td>Sadece MTD</td></tr>
+        <tr><td>Snapshot</td><td>Yok (Btrfs'e bak)</td><td>Yok</td><td>Yok</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Seçim rehberi</h3>
+  <div class="params">
+    <div class="param"><span class="name">eMMC / UFS veri partisyonu</span><span class="desc">F2FS — log-structured yapısı eMMC'nin doğal modeline uygundur. En iyi wear + random write performansı</span></div>
+    <div class="param"><span class="name">eMMC root (read-only)</span><span class="desc">squashfs — read-only ve çok iyi sıkıştırma. F2FS overkill olur</span></div>
+    <div class="param"><span class="name">Ham NAND flash (NOR/NAND MTD)</span><span class="desc">UBIFS — tek gerçek seçenek; MTD katmanı gerektirir</span></div>
+    <div class="param"><span class="name">Genel amaç, kararlılık öncelikli</span><span class="desc">ext4 — en geniş ekosistem desteği, en olgun kod tabanı</span></div>
+    <div class="param"><span class="name">Snapshot + CoW gereksinimi</span><span class="desc">Btrfs — ancak CPU/RAM maliyeti yüksektir</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>F2FS yönetilen flash (eMMC/UFS) için ext4'ten belirgin şekilde üstündür</li>
+      <li>Ham NAND için UBIFS tek geçerli seçenektir — eMMC ile çalışmaz</li>
+      <li>Read-only root için squashfs en verimli çözümdür</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> f2fs-tools — fsck, dump, defrag</h2>
+  <p class="section-lead">f2fs-tools paketi, F2FS dosya sistemi bakım araçlarını içerir: <code>fsck.f2fs</code>, <code>dump.f2fs</code>, <code>defrag.f2fs</code>, <code>resize.f2fs</code> ve <code>sload.f2fs</code>.</p>
+
+  <h3>fsck.f2fs — tutarlılık denetimi</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — fsck.f2fs kullanımı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Temel kontrol (read-only)</span>
+<span class="cmd">fsck.f2fs</span> /dev/mmcblk1p2
+
+<span class="cmt"># Onarım modunda çalıştır</span>
+<span class="cmd">fsck.f2fs</span> -f -y /dev/mmcblk1p2
+<span class="cmt"># -f : zorla kontrol</span>
+<span class="cmt"># -y : tüm soruları evet cevapla (otomatik onarım)</span>
+
+<span class="cmt"># Verbose çıktı</span>
+<span class="cmd">fsck.f2fs</span> -v /dev/mmcblk1p2
+
+<span class="cmt"># Hızlı mod (sadece metadata)</span>
+<span class="cmd">fsck.f2fs</span> -q /dev/mmcblk1p2
+
+<span class="cmt"># Boot öncesi initramfs'te (systemd-fsck yerine)</span>
+<span class="cmt"># /etc/fstab'da son alan 2 (nonzero = fsck etkin)</span></code></pre>
+  </div>
+
+  <h3>dump.f2fs — istatistik ve analiz</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — dump.f2fs kullanımı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Superblock bilgisi</span>
+<span class="cmd">dump.f2fs</span> -d 1 /dev/mmcblk1p2
+
+<span class="cmt"># Segment bilgisi</span>
+<span class="cmd">dump.f2fs</span> -s /dev/mmcblk1p2 | head -30
+
+<span class="cmt"># Node bilgisi (ino numarası ver)</span>
+<span class="cmd">dump.f2fs</span> -n 3 /dev/mmcblk1p2
+
+<span class="cmt"># Tüm inode listesi</span>
+<span class="cmd">dump.f2fs</span> -i /dev/mmcblk1p2 | head -20
+
+<span class="cmt"># Checkpoint bilgisi</span>
+<span class="cmd">dump.f2fs</span> -c /dev/mmcblk1p2</code></pre>
+  </div>
+
+  <h3>defrag.f2fs ve resize.f2fs</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — defrag ve resize</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Disk birleştirme (online — mount edilmişken)</span>
+<span class="cmd">defrag.f2fs</span> /dev/mmcblk1p2
+
+<span class="cmt"># Spesifik bir dosyayı birleştir</span>
+<span class="cmd">defrag.f2fs</span> -f /data/büyük_dosya.img /dev/mmcblk1p2
+
+<span class="cmt"># Boyut küçültme (offline — mount edilmemişken)</span>
+<span class="cmd">resize.f2fs</span> -t /dev/mmcblk1p2     <span class="cmt"># hedef boyutu yazdır</span>
+<span class="cmd">resize.f2fs</span> /dev/mmcblk1p2        <span class="cmt"># maksimum boyuta büyüt</span>
+
+<span class="cmt"># sload.f2fs — host'ta imaj içine dosya kopyala</span>
+<span class="cmt"># (üretim imaj oluşturma için)</span>
+<span class="cmd">sload.f2fs</span> -f /path/to/rootfs -t / /dev/loop0
+
+<span class="cmt"># mkfs + sload ile imaj oluşturma</span>
+<span class="cmd">dd</span> if=/dev/zero bs=1M count=512 of=data.img
+<span class="cmd">mkfs.f2fs</span> data.img
+<span class="cmd">sload.f2fs</span> -f /path/to/data -t / data.img</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>fsck.f2fs -f -y ile otomatik onarım, boot öncesi script'e eklenebilir</li>
+      <li>dump.f2fs segment analizi GC verimliliğini izlemek için kullanılır</li>
+      <li>sload.f2fs üretim imaj oluşturmada host-side dosya yerleşimi sağlar</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: BeagleBone eMMC'de F2FS + GC tuning</h2>
+  <p class="section-lead">BeagleBone Black'in 4 GB eMMC'sinde veri partisyonunu F2FS olarak formatla, GC parametrelerini optimize et ve wear izleme scripti yaz.</p>
+
+  <h3>Hedef bölüm düzeni</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Partition</th><th>Boyut</th><th>FS</th><th>Amaç</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>mmcblk1p1</td><td>64 MB</td><td>FAT32</td><td>Boot (MLO, u-boot, uImage, dtb)</td></tr>
+        <tr><td>mmcblk1p2</td><td>1.5 GB</td><td>ext4 (ro)</td><td>Root filesystem (squashfs yerine ext4 ro)</td></tr>
+        <tr><td>mmcblk1p3</td><td>2 GB</td><td>F2FS</td><td>Data (log, config, user data)</td></tr>
+        <tr><td>mmcblk1p4</td><td>kalan</td><td>F2FS</td><td>/var + /tmp overlay</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Adım 1 — F2FS formatla</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — BeagleBone F2FS kurulumu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># eMMC bölümle (sgdisk)</span>
+<span class="cmd">sgdisk</span> --zap-all /dev/mmcblk1
+<span class="cmd">sgdisk</span> --new=1:2048:133119   --typecode=1:0700 --change-name=1:"boot"  /dev/mmcblk1
+<span class="cmd">sgdisk</span> --new=2:133120:3278847 --typecode=2:8300 --change-name=2:"rootfs" /dev/mmcblk1
+<span class="cmd">sgdisk</span> --new=3:3278848:7472127 --typecode=3:8300 --change-name=3:"data"  /dev/mmcblk1
+<span class="cmd">sgdisk</span> --new=4:7472128:0     --typecode=4:8300 --change-name=4:"var"   /dev/mmcblk1
+
+<span class="cmt"># F2FS formatla</span>
+<span class="cmd">mkfs.f2fs</span> -l "bbb-data" -O encrypt,extra_attr,compression -t 1 /dev/mmcblk1p3
+<span class="cmd">mkfs.f2fs</span> -l "bbb-var"  -O extra_attr -t 1 /dev/mmcblk1p4
+
+<span class="cmt"># Mount test</span>
+<span class="cmd">mount</span> -t f2fs -o discard,lazytime,background_gc=on /dev/mmcblk1p3 /data
+<span class="cmd">df</span> -h /data</code></pre>
+  </div>
+
+  <h3>Adım 2 — /etc/fstab ve systemd mount</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — fstab yapılandırması</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># /etc/fstab</span>
+UUID=$(blkid -s UUID -o value /dev/mmcblk1p3)
+<span class="cmt">$UUID  /data  f2fs  defaults,discard,lazytime,nodiratime,background_gc=on  0  2</span>
+
+UUID=$(blkid -s UUID -o value /dev/mmcblk1p4)
+<span class="cmt">$UUID  /var   f2fs  defaults,discard,lazytime,nodiratime,background_gc=on  0  2</span>
+
+<span class="cmt"># tmpfs /tmp</span>
+<span class="cmt">tmpfs  /tmp  tmpfs  defaults,noatime,mode=1777,size=32M  0  0</span></code></pre>
+  </div>
+
+  <h3>Adım 3 — GC tuning scripti</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — /usr/local/sbin/f2fs-gc-tune.sh</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">#!/bin/bash</span>
+<span class="cmt"># F2FS GC parametrelerini disk doluluk oranına göre ayarla</span>
+set -e
+
+F2FS_MOUNTS=( /data /var )
+
+tune_gc() {
+    local mountpoint="$1"
+    local dev
+    dev=$(findmnt -n -o SOURCE "$mountpoint" | sed 's|/dev/||')
+    local sysfs="/sys/fs/f2fs/${dev}"
+
+    [ -d "$sysfs" ] || return
+
+    <span class="cmt"># Kullanım yüzdesi</span>
+    local usage
+    usage=$(df "$mountpoint" | awk 'NR==2{gsub(/%/,""); print $5}')
+
+    if [ "$usage" -ge 85 ]; then
+        <span class="cmt"># Kritik — agresif GC</span>
+        echo 1 > "$sysfs/gc_urgent"
+        echo 100  > "$sysfs/gc_min_sleep_time"
+        echo 1000  > "$sysfs/gc_max_sleep_time"
+        logger "F2FS GC: $mountpoint %$usage dolu — agresif GC modu"
+    elif [ "$usage" -ge 70 ]; then
+        <span class="cmt"># Uyarı — orta GC</span>
+        echo 0 > "$sysfs/gc_urgent"
+        echo 1000  > "$sysfs/gc_min_sleep_time"
+        echo 10000  > "$sysfs/gc_max_sleep_time"
+        logger "F2FS GC: $mountpoint %$usage dolu — orta GC modu"
+    else
+        <span class="cmt"># Normal — yavaş GC</span>
+        echo 0 > "$sysfs/gc_urgent"
+        echo 10000  > "$sysfs/gc_min_sleep_time"
+        echo 30000  > "$sysfs/gc_max_sleep_time"
+    fi
+}
+
+for mp in "&#123;&#123;F2FS_MOUNTS[@]&#125;&#125;"; do
+    tune_gc "$mp"
+done</code></pre>
+  </div>
+
+  <h3>Adım 4 — Wear izleme</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — wear monitoring scripti</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">#!/bin/bash</span>
+<span class="cmt"># /usr/local/sbin/emmc-health-check.sh</span>
+
+DEVICE="/dev/mmcblk1"
+LOGFILE="/data/logs/emmc-health.log"
+
+check_health() {
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+
+    <span class="cmt"># eMMC yaşam süresi tahminleri</span>
+    local life_a life_b eol
+    life_a=$(mmc extcsd read "$DEVICE" 2>/dev/null | \
+        grep "DEVICE_LIFE_TIME_EST_TYP_A" | awk '{print $NF}')
+    life_b=$(mmc extcsd read "$DEVICE" 2>/dev/null | \
+        grep "DEVICE_LIFE_TIME_EST_TYP_B" | awk '{print $NF}')
+    eol=$(mmc extcsd read "$DEVICE" 2>/dev/null | \
+        grep "PRE_EOL_INFO" | awk '{print $NF}')
+
+    echo "$ts LIFE_A=$life_a LIFE_B=$life_b EOL=$eol" >> "$LOGFILE"
+
+    <span class="cmt"># EOL uyarısı</span>
+    if [ "$eol" = "0x02" ]; then
+        logger -p user.warning "eMMC EOL UYARI: $DEVICE yıpranma uyarısı!"
+    elif [ "$eol" = "0x03" ]; then
+        logger -p user.crit "eMMC EOL KRİTİK: $DEVICE acil değişim!"
+    fi
+}
+
+check_health</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>BeagleBone eMMC data partisyonu F2FS ile formatlandı ve optimize edildi</li>
+      <li>GC tuning scripti disk doluluk oranına göre dinamik parametre ayarlar</li>
+      <li>eMMC health script, mmc extcsd ile JEDEC ömür tahminlerini izler</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

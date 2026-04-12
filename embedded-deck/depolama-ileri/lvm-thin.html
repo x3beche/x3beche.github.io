@@ -1,0 +1,524 @@
+---
+layout: tutorial
+title: "LVM Thin Provisioning — Snapshot & dm-verity"
+back_url: "../index.html"
+back_label: "Depolama İleri Düzey"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>DEPOLAMA</span>
+    <span>LVM THIN PROVISIONING</span>
+    <span>2026</span>
+  </div>
+  <h1>LVM Thin Provisioning —<br><em>Snapshot &amp; dm-verity.</em></h1>
+  <p class="subtitle">Gömülü ve sunucu sistemlerde gelişmiş depolama yönetimi: LVM thin pool oluşturma, thin LV, anlık görüntüler (snapshot), yeniden boyutlandırma, Docker depolama sürücüsü, dm-verity ile bütünlük zinciri ve üretim en iyi pratikleri.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">LVM mimarisi — PV, VG, LV, thin pool</a></li>
+    <li><a href="#s1">Thin pool oluşturma ve yapılandırma</a></li>
+    <li><a href="#s2">Thin LV oluşturma ve kullanım</a></li>
+    <li><a href="#s3">Snapshot — anlık görüntü alma ve geri yükleme</a></li>
+    <li><a href="#s4">Thin LV ve pool yeniden boyutlandırma</a></li>
+    <li><a href="#s5">Docker storage driver olarak LVM thin</a></li>
+    <li><a href="#s6">dm-verity — blok cihaz bütünlük doğrulama</a></li>
+    <li><a href="#s7">dm-verity ile salt okunur rootfs</a></li>
+    <li><a href="#s8">LVM metadata yönetimi ve izleme</a></li>
+    <li><a href="#s9">Üretim en iyi pratikleri ve sorun giderme</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> LVM mimarisi — PV, VG, LV, thin pool</h2>
+  <p class="section-lead">LVM (Logical Volume Manager), blok cihaz yönetiminde esneklik katmanı sağlar. Thin provisioning, fiziksel disk alanı talep esasına (on-demand) tahsis ederek aşırı commit sağlar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>LVM Katman Mimarisi</span><span class="dot">●</span></div>
+    <pre><code>Fiziksel Disk (HDD/SSD/NVMe)
+       │
+       ▼
+PV (Physical Volume) — pvcreate ile işaretlenir
+       │  (/dev/sda2, /dev/nvme0n1p3 ...)
+       ▼
+VG (Volume Group) — bir veya birden fazla PV'yi birleştirir
+       │
+       ├── Thick LV — klasik, alan hemen tahsis edilir
+       │
+       └── Thin Pool LV — havuz (metadata LV + data LV)
+                 │
+                 ├── Thin LV 1 — sanal boyut ≥ gerçek kullanım
+                 ├── Thin LV 2
+                 └── Thin LV N (snapshot dahil)</code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><div class="name">Physical Volume (PV)</div><div class="desc">Blok cihazın (disk bölümü, disk, SSD) LVM'e tanıtılmış hali. pvcreate ile oluşturulur, LVM metadata'sı PV başlığına yazılır.</div></div>
+    <div class="param"><div class="name">Volume Group (VG)</div><div class="desc">Bir veya birden fazla PV'yi tek depolama havuzunda birleştirir. PE (Physical Extent, varsayılan 4 MB) birimleriyle adresler.</div></div>
+    <div class="param"><div class="name">Thin Pool</div><div class="desc">Gerçek veri ve metadata için iki LV içerir. Thin LV'lerin talep ettikçe kullanacağı fiziksel alanı barındırır.</div></div>
+    <div class="param"><div class="name">Thin LV</div><div class="desc">Beyan edilen boyuttan büyük sanal birim. İlk yazıya kadar disk alanı tahsis edilmez (lazy allocation). Snapshot'lar da thin LV'dir.</div></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Thin pool oluşturma ve yapılandırma</h2>
+  <p class="section-lead">Thin pool'u doğru boyutlandırmak kritiktir: metadata LV'si toplam thin LV boyutuna göre hesaplanmalıdır. Aşırı tahsis (overcommit) dikkatli izleme gerektirir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — sıfırdan thin pool kurulumu</span><span class="dot">●</span></div>
+    <pre><code">## 1. Physical Volume oluştur
+pvcreate /dev/sdb
+# Physical volume "/dev/sdb" successfully created.
+
+## 2. Volume Group oluştur
+vgcreate vg_data /dev/sdb
+# Volume group "vg_data" successfully created
+
+## 3. Thin pool LV oluştur
+# Toplam 100 GB pool, metadata için %1 = 1 GB
+lvcreate --type thin-pool \
+         --size 100G \
+         --poolmetadatasize 1G \
+         --name pool0 \
+         vg_data
+
+# Veya tek komutla (lvm2 >= 2.02.112)
+lvcreate -L 100G --thinpool vg_data/pool0
+
+## 4. Chunk size ve zero mode ayarla
+lvchange --zero n vg_data/pool0     # yeni yazımda sıfırlama yapma
+lvchange --discards passdown vg_data/pool0  # TRIM/DISCARD SSD'ye ilet</code></pre>
+  </div>
+
+  <h3>Pool metadata boyutlandırma formülü</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Metadata Boyut Hesabı</span><span class="dot">●</span></div>
+    <pre><code">Metadata boyutu = (2 × chunk_count × 64 byte) + 128 MB
+
+Chunk size varsayılan: 64 KB
+100 GB pool için chunk sayısı = 100 × 1024 × 1024 KB / 64 KB = 1.638.400
+
+Metadata = (2 × 1.638.400 × 64 byte) + 128 MB
+          = 200 MB + 128 MB = 328 MB → 512 MB tahsis etmek güvenli
+
+# Metadata kullanımını kontrol et:
+lvs -o+metadata_percent vg_data/pool0</code></pre>
+  </div>
+
+  <h3>/etc/lvm/lvm.conf — otomatik genişleme</h3>
+  <div class="code-block">
+    <div class="code-header"><span>lvm.conf</span><span class="dot">●</span></div>
+    <pre><code">activation {
+    thin_pool_autoextend_threshold = 80  # %80 dolunca tetikle
+    thin_pool_autoextend_percent   = 20  # %20 büyüt
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Thin LV oluşturma ve kullanım</h2>
+  <p class="section-lead">Thin LV, pool'dan sanal alan tahsis eder. Fiziksel boyutu başlangıçta 0'dır; yazıldıkça chunk'lar tahsis edilir. Bu davranış SSD ve flash tabanlı depolamada avantajlıdır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — thin LV oluşturma ve kullanım</span><span class="dot">●</span></div>
+    <pre><code">## Thin LV oluştur (sanal boyut: 50 GB, gerçek tahsis: 0)
+lvcreate --thin --name lv_app \
+         --virtualsize 50G \
+         vg_data/pool0
+
+## Dosya sistemi oluştur
+mkfs.ext4 /dev/vg_data/lv_app
+
+## Mount et
+mkdir -p /mnt/app
+mount /dev/vg_data/lv_app /mnt/app
+
+## /etc/fstab kaydı
+echo "/dev/vg_data/lv_app  /mnt/app  ext4  defaults,discard  0 2" \
+  >> /etc/fstab
+
+## Gerçek kullanımı göster
+lvs -o name,vg_name,lv_size,data_percent,pool_lv vg_data
+# LV     VG       LSize  Data%  Pool
+# lv_app vg_data  50.00g  8.00  pool0
+# pool0  vg_data 100.00g 12.00</code></pre>
+  </div>
+
+  <h3>Aşırı tahsis (overcommit) senaryosu</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — 100 GB pool'da 300 GB sanal LV</span><span class="dot">●</span></div>
+    <pre><code">## 100 GB fiziksel pool, toplam 300 GB sanal tahsis
+lvcreate --thin -n lv_prod   -V 100G vg_data/pool0
+lvcreate --thin -n lv_test   -V 100G vg_data/pool0
+lvcreate --thin -n lv_backup -V 100G vg_data/pool0
+
+## Gerçek yazım yapılmadıkça fiziksel yer tüketilmez
+lvs -o name,lv_size,data_percent vg_data
+# lv_prod   100.00g  0.00
+# lv_test   100.00g  0.00
+# lv_backup 100.00g  0.00
+# pool0     100.00g  0.00</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Snapshot — anlık görüntü alma ve geri yükleme</h2>
+  <p class="section-lead">LVM thin snapshot'ları, kaynak LV ile aynı veri bloklarını paylaşır (Copy-on-Write). Alınması neredeyse anlık olup disk alanı yalnızca değişen bloklar için tüketilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — snapshot alma ve yönetimi</span><span class="dot">●</span></div>
+    <pre><code">## Snapshot al (kaynak: lv_app)
+lvcreate --snapshot --name lv_app_snap1 \
+         /dev/vg_data/lv_app
+# Thin snapshot: ek alan gerekmez, anında oluşur
+
+## Snapshot listesi
+lvs -o name,origin,lv_size,data_percent vg_data | grep snap
+
+## Snapshot'ı mount et (salt okunur veya yazılabilir)
+mkdir -p /mnt/snap1
+mount -o ro /dev/vg_data/lv_app_snap1 /mnt/snap1
+
+## Snapshot'ı birleştir (geri yükle) — kaynak mount'u çıkar
+umount /mnt/app
+lvconvert --merge /dev/vg_data/lv_app_snap1
+# Eğer LV kullanımdaysa birleştirme sonraki mount'ta otomatik gerçekleşir
+
+## Anlık görüntü kaldır
+lvremove /dev/vg_data/lv_app_snap1</code></pre>
+  </div>
+
+  <h3>Otomatik düzenli snapshot (systemd timer)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>/etc/systemd/system/lvm-snapshot.service</span><span class="dot">●</span></div>
+    <pre><code">[Unit]
+Description=LVM Thin Snapshot — lv_app
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c '\
+  SNAP="lv_app_$(date +%%Y%%m%%d_%%H%%M)"; \
+  lvcreate --snapshot --name "$SNAP" /dev/vg_data/lv_app; \
+  echo "Snapshot alındı: $SNAP"; \
+  # 7 günden eski snapshot'ları sil: \
+  lvs --noheadings -o lv_name vg_data | \
+    grep lv_app_snap | sort | head -n -7 | \
+    xargs -r -I {} lvremove -f /dev/vg_data/{}'</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/systemd/system/lvm-snapshot.timer</span><span class="dot">●</span></div>
+    <pre><code">[Unit]
+Description=Günlük LVM snapshot
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code">systemctl enable --now lvm-snapshot.timer</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Thin LV ve pool yeniden boyutlandırma</h2>
+  <p class="section-lead">Thin LV boyutu çevrimiçi (online) olarak artırılabilir. Pool kapasitesi dolmaya yaklaştığında yeni PV ekleyerek genişletme yapılır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — yeniden boyutlandırma</span><span class="dot">●</span></div>
+    <pre><code">## Thin LV sanal boyutunu artır (çevrimiçi)
+lvextend -L +20G /dev/vg_data/lv_app
+resize2fs /dev/vg_data/lv_app    # ext4 için
+# veya: xfs_growfs /mnt/app      # XFS için
+
+## Pool'a fiziksel disk ekle
+pvcreate /dev/sdc
+vgextend vg_data /dev/sdc
+lvextend -L +50G vg_data/pool0   # pool'u genişlet
+
+## Thin LV küçültme (dikkat: çevrimdışı gerektirebilir)
+umount /mnt/app
+e2fsck -f /dev/vg_data/lv_app
+resize2fs /dev/vg_data/lv_app 30G
+lvreduce -L 30G /dev/vg_data/lv_app</code></pre>
+  </div>
+
+  <h3>Otomatik genişleme izleme script'i</h3>
+  <div class="code-block">
+    <div class="code-header"><span>pool_monitor.sh</span><span class="dot">●</span></div>
+    <pre><code">#!/bin/bash
+POOL="vg_data/pool0"
+THRESHOLD=85  # %85 eşiği
+EXTEND_GB=20
+
+while true; do
+    DATA_PCT=$(lvs --noheadings -o data_percent "$POOL" | tr -d ' ')
+    DATA_PCT=${DATA_PCT%.*}  # ondalık kısım at
+
+    if [ "${DATA_PCT:-0}" -ge "$THRESHOLD" ]; then
+        echo "UYARI: Pool doluluk $DATA_PCT% — genişletiliyor"
+        lvextend -L "+${EXTEND_GB}G" /dev/vg_data/pool0
+        logger -t lvm-monitor "Pool genişletildi +${EXTEND_GB}GB (was ${DATA_PCT}%)"
+    fi
+    sleep 60
+done</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Docker storage driver olarak LVM thin</h2>
+  <p class="section-lead">Docker'ın devicemapper sürücüsü, LVM thin provisioning üzerine inşa edilmiştir. Her container ve image, ayrı thin LV olarak depolanır. Özellikle RHEL/CentOS tabanlı sistemlerde tercih edilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Docker LVM thin kurulumu</span><span class="dot">●</span></div>
+    <pre><code">## Docker için ayrı VG
+pvcreate /dev/sdd
+vgcreate docker_vg /dev/sdd
+
+## /etc/docker/daemon.json
+cat > /etc/docker/daemon.json &lt;&lt;'EOF'
+{
+  "storage-driver": "devicemapper",
+  "storage-opts": [
+    "dm.thinpooldev=/dev/mapper/docker_vg-thinpool",
+    "dm.use_deferred_removal=true",
+    "dm.use_deferred_deletion=true",
+    "dm.fs=ext4",
+    "dm.basesize=20G"
+  ]
+}
+EOF
+
+## Thin pool oluştur (Docker için)
+lvcreate --type thin-pool \
+         --size 80G \
+         --poolmetadatasize 512M \
+         --zero n \
+         -n thinpool docker_vg
+
+systemctl restart docker
+docker info | grep -A5 "Storage Driver"</code></pre>
+  </div>
+
+  <h3>devicemapper performans notları</h3>
+  <div class="params">
+    <div class="param"><div class="name">direct-lvm modu</div><div class="desc">loop-lvm (geliştirme) yerine her zaman direct-lvm (gerçek disk) kullanın. loop-lvm üretim için desteklenmez.</div></div>
+    <div class="param"><div class="name">Chunk size</div><div class="desc">Varsayılan 64 KB container iş yükleri için uygundur. Büyük dosyalar için 512 KB daha iyi olabilir.</div></div>
+    <div class="param"><div class="name">DISCARD etkin</div><div class="desc">dm.use_deferred_removal + dm.use_deferred_deletion ile silinen container'ların alanı geri verilir.</div></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> dm-verity — blok cihaz bütünlük doğrulama</h2>
+  <p class="section-lead">dm-verity, bir blok cihazın her bloğunu okuma sırasında hash ile doğrular. Android, Chrome OS ve gömülü Linux'ta rootfs değişmezliği garantisi için kullanılır. Merkle ağacı (hash tree) yapısı üzerine kuruludur.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>dm-verity Yapısı</span><span class="dot">●</span></div>
+    <pre><code">Veri Bloğu 0   Veri Bloğu 1  ...  Veri Bloğu N
+     │               │                   │
+     ▼               ▼                   ▼
+  Hash(0)         Hash(1)   ...      Hash(N)        — Level 0
+     │               │                   │
+     └───────┬────────────────────────────┘
+             ▼
+       Hash(Hash(0..K))  ...  Hash(Hash(...))       — Level 1
+             │
+             └─── ... ─── Root Hash (32 byte, SHA-256)
+
+Root hash → kernel komut satırında veya bootloader'da sabit tutulur
+Her okumada: veri hash == beklenen hash → ERR veya panic</code></pre>
+  </div>
+
+  <h3>veritysetup ile dm-verity hash ağacı oluşturma</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — veritysetup</span><span class="dot">●</span></div>
+    <pre><code">## veritysetup kurulum
+sudo apt install cryptsetup-bin
+
+## 1. Salt okunur dosya sistemi görüntüsü oluştur
+# (önceden ext4/squashfs ile doldurulmuş)
+dd if=/dev/zero of=rootfs.img bs=1M count=512
+mkfs.ext4 rootfs.img
+# ... rootfs içeriğini kopyala ...
+
+## 2. Hash ağacını oluştur
+veritysetup format rootfs.img verity_hash.img
+# VERITY header information for rootfs.img
+#   UUID:                   a1b2c3d4-...
+#   Hash type:              1
+#   Data block size:        4096
+#   Hash block size:        4096
+#   Data blocks:            131072
+#   Salt:                   aabbccdd...
+#   Root hash:              7f3e2a1b...  ← bu hash kritik
+
+ROOT_HASH=$(veritysetup format rootfs.img verity_hash.img | \
+            grep "Root hash:" | awk '{print $3}')
+echo "Root hash: $ROOT_HASH"</code></pre>
+  </div>
+
+  <h3>dm-verity cihazını aktifleştir</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code">## dm-verity cihazını oluştur
+veritysetup open rootfs.img verity_root \
+    verity_hash.img "$ROOT_HASH"
+# /dev/mapper/verity_root oluştu
+
+## Salt okunur mount et
+mount -o ro /dev/mapper/verity_root /mnt/rootfs
+
+## Bütünlük doğrulama (manuel)
+veritysetup verify rootfs.img verity_hash.img "$ROOT_HASH"
+# Verification is successful.</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> dm-verity ile salt okunur rootfs</h2>
+  <p class="section-lead">Gömülü sistemlerde rootfs'i dm-verity ile korumak, fiziksel erişim olan saldırganların bile dosya sistemi değiştirmesini imkansız kılar. Kernel panigi yerine yazılabilir overlay ile üretim esnekliği sağlanabilir.</p>
+
+  <h3>Kernel komut satırı ile dm-verity</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bootloader/extlinux.conf</span><span class="dot">●</span></div>
+    <pre><code">LABEL linux
+  KERNEL /boot/Image
+  FDT /boot/imx8qm.dtb
+  APPEND console=ttyLP0,115200 \
+         root=/dev/mapper/verity_rootfs ro \
+         rootfstype=ext4 \
+         dm-mod.create="verity_rootfs,,,ro,\
+           0 1048576 verity \
+           1 /dev/mmcblk0p2 /dev/mmcblk0p3 \
+           4096 4096 131072 131072 sha256 \
+           7f3e2a1b4c5d6e7f8a9b0c1d2e3f4a5b \
+           aabbccdd1122334455667788"</code></pre>
+  </div>
+
+  <h3>Overlay ile yazılabilir katman</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — overlayfs üst katman</span><span class="dot">●</span></div>
+    <pre><code">## tmpfs veya ayrı bölümde üst katman
+mount -t tmpfs tmpfs /overlay
+mkdir -p /overlay/upper /overlay/work
+
+## overlayfs: dm-verity (salt okunur) + tmpfs (yazılabilir)
+mount -t overlay overlay \
+    -o lowerdir=/mnt/verity_root,\
+       upperdir=/overlay/upper,\
+       workdir=/overlay/work \
+    /newroot
+
+## /tmp, /var, /etc gibi yazılabilir alanlar upperdir'de saklanır
+## Yeniden başlatmada upperdir temizlenir → deterministik durum</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> LVM metadata yönetimi ve izleme</h2>
+  <p class="section-lead">LVM thin pool'da metadata LV dolması, data LV dolmasından daha kritiktir. Metadata dolduğunda tüm I/O durdurulur; proaktif izleme zorunludur.</p>
+
+  <h3>İzleme komutları</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — LVM izleme</span><span class="dot">●</span></div>
+    <pre><code">## Detaylı LV durumu
+lvs -o name,lv_size,data_percent,metadata_percent,\
+       pool_lv,origin,lv_attr vg_data
+
+## Pool ve thin LV özeti
+lvdisplay /dev/vg_data/pool0
+# --- Logical volume ---
+# LV Size               100.00 GiB
+# Allocated pool data   45.23%
+# Allocated metadata    12.07%
+
+## Sürekli izleme (her 5 saniyede)
+watch -n5 "lvs -o name,data_percent,metadata_percent vg_data"
+
+## dmeventd ile otomatik izleme aktif et
+lvchange --monitor y vg_data/pool0</code></pre>
+  </div>
+
+  <h3>Prometheus ile LVM metrik toplama</h3>
+  <div class="code-block">
+    <div class="code-header"><span>lvm_exporter.sh — textfile collector için</span><span class="dot">●</span></div>
+    <pre><code">#!/bin/bash
+# /etc/prometheus/node_exporter_textfile/lvm.prom
+
+OUTPUT="/var/lib/node_exporter/textfile_collector/lvm.prom"
+TMPFILE=$(mktemp)
+
+echo "# HELP lvm_thin_data_percent LVM thin pool data percent" > "$TMPFILE"
+echo "# TYPE lvm_thin_data_percent gauge" >> "$TMPFILE"
+
+lvs --noheadings -o vg_name,lv_name,data_percent \
+    --select 'lv_is_thin_pool=1' | while read vg lv pct; do
+    pct=${pct:-0}
+    echo "lvm_thin_data_percent{vg=\"$vg\",lv=\"$lv\"} $pct" >> "$TMPFILE"
+done
+
+mv "$TMPFILE" "$OUTPUT"</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 09 ═══════════════════ -->
+<section id="s9">
+  <h2><span class="num">09</span> Üretim en iyi pratikleri ve sorun giderme</h2>
+  <p class="section-lead">LVM thin provisioning güçlü bir araçtır; yanlış yapılandırılmış pool'lar veri kaybına yol açabilir. Aşağıdaki pratikler üretim ortamı için temel rehberdir.</p>
+
+  <h3>Üretim kontrol listesi</h3>
+  <div class="params">
+    <div class="param"><div class="name">Metadata büyüklüğü</div><div class="desc">Metadata LV'si toplam thin LV boyutunun en az %0.5'i olmalıdır. Küçük metadata = veri kaybı riski.</div></div>
+    <div class="param"><div class="name">Overcommit sınırı</div><div class="desc">Toplam thin LV boyutu pool kapasitesinin %150'sini geçmemeli. Ani dolma durumunda I/O suspend oluşur.</div></div>
+    <div class="param"><div class="name">Pool doluluk alarmı</div><div class="desc">%80 data, %70 metadata dolulukta alarm üretilmeli. dmeventd veya Prometheus alertmanager ile yapılandırın.</div></div>
+    <div class="param"><div class="name">Yedekleme stratejisi</div><div class="desc">Snapshot alıp vg_data'yı yedeğe transfer edin. lvmpolld hizmetinin çalıştığından emin olun.</div></div>
+    <div class="param"><div class="name">fstrim zamanlaması</div><div class="desc">SSD tabanlı ortamda haftalık fstrim ile thin pool'a geri DISCARD bildirin.</div></div>
+  </div>
+
+  <h3>Yaygın sorunlar ve çözümler</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Sorun Giderme</span><span class="dot">●</span></div>
+    <pre><code">## Sorun: "No space left" hatası (pool doldu)
+# Hızlı çözüm: yeni PV ekle
+pvcreate /dev/sde
+vgextend vg_data /dev/sde
+lvextend -l +100%FREE vg_data/pool0
+
+## Sorun: Metadata %100 (KRİTİK)
+# Cihazlar askıya alınır. Acil genişletme:
+lvextend --poolmetadatasize +512M vg_data/pool0
+
+## Sorun: Thin LV "error" durumunda
+lvs -o name,lv_health_status vg_data
+# eğer "partial" → bazı PE'ler kayıp
+# Yedekten geri yükleme gerekebilir
+
+## Pool sağlık kontrolü
+lvdisplay vg_data/pool0 | grep -E "health|active|status"
+
+## Metadata dump (teşhis amaçlı)
+dmsetup status vg_data-pool0
+# 0 204800000 thin-pool 0/20480 408/4096 - rw no_discard_passdown queue_if_no_space</code></pre>
+  </div>
+</section>
+
+</main>

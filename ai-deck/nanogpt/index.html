@@ -1,0 +1,732 @@
+---
+layout: tutorial
+title: "LLM from Scratch — nanoGPT & Pretraining"
+back_url: "../index.html"
+back_label: "Tüm rehberler"
+---
+
+<header class="header">
+  <div class="meta">
+    <span>Rehber</span>
+    <span>Yapay Zeka</span>
+    <span>LLM Mimarisi</span>
+  </div>
+  <h1>LLM from Scratch —<br><em>nanoGPT &amp; Pretraining.</em></h1>
+  <p class="subtitle">Bigram'dan Transformer'a, BPE tokenization'dan RoPE'ye. Karpathy'nin nanoGPT kodunu satır satır anlayın. Weight tying, AdamW grad clipping ve TinyShakespeare hyperparametre sweep.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçerik</div>
+  <ol>
+    <li><a href="#s0">Neden Sıfırdan? — GPT-2'nin Anatomy'si</a></li>
+    <li><a href="#s1">Bigram Language Model</a></li>
+    <li><a href="#s2">Self-Attention Sıfırdan</a></li>
+    <li><a href="#s3">Multi-head Attention &amp; Causal Mask</a></li>
+    <li><a href="#s4">Transformer Block</a></li>
+    <li><a href="#s5">Tokenization — BPE &amp; tiktoken</a></li>
+    <li><a href="#s6">Pozisyonel Encoding — Learned vs RoPE</a></li>
+    <li><a href="#s7">Training Loop — CrossEntropy, AdamW, Grad Clipping</a></li>
+    <li><a href="#s8">Weight Tying</a></li>
+    <li><a href="#s9">nanoGPT Kodu Satır Satır</a></li>
+    <li><a href="#s10">Ölçekleme Deneyleri — Hyperparametre Sweep</a></li>
+  </ol>
+</nav>
+
+<main>
+
+  <!-- ── s0 ──────────────────────────────────────────────────── -->
+  <section id="s0">
+    <h2><span class="num">00</span> Neden Sıfırdan? — GPT-2'nin Anatomy'si</h2>
+    <p class="section-lead">Sıfırdan LLM oluşturmak, hangi mimarinin neden işe yaradığını gerçekten anlamanın tek yoludur. GPT-2, bu yolculuk için ideal başlangıç noktasıdır.</p>
+
+    <p>GPT-2 (Radford et al., 2019), kausal dil modeli (next-token prediction) olarak eğitilmiş bir Transformer'dır. GPT-4 gibi büyük modeller de aynı temel prensipleri kullanır; fark ölçek ve fine-tuning aşamalarındadır. Sıfırdan uygulama, şu soruların cevabını somutlaştırır: Attention neden çalışıyor? LayerNorm neden önemli? Weight tying ne anlama geliyor? Residual bağlantılar olmasa ne olur?</p>
+
+    <p>GPT-2'nin bileşenleri: (1) Token Embedding tablosu. (2) Pozisyonel Encoding. (3) N adet Transformer block (attention + FFN + LayerNorm + residual). (4) Final LayerNorm. (5) LM head (embedding boyutundan vocab'a lineer projeksiyon). GPT-2 small: 12 katman, 12 başlık, 768 gizli boyut, 124M parametre.</p>
+
+    <table class="file-table">
+      <thead>
+        <tr><th>Model</th><th>Katman</th><th>Başlık</th><th>d_model</th><th>Parametre</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>GPT-2 small</td><td>12</td><td>12</td><td>768</td><td>124M</td></tr>
+        <tr><td>GPT-2 medium</td><td>24</td><td>16</td><td>1024</td><td>355M</td></tr>
+        <tr><td>GPT-2 large</td><td>36</td><td>20</td><td>1280</td><td>774M</td></tr>
+        <tr><td>GPT-2 XL</td><td>48</td><td>25</td><td>1600</td><td>1.5B</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ── s1 ──────────────────────────────────────────────────── -->
+  <section id="s1">
+    <h2><span class="num">01</span> Bigram Language Model — Karakter Düzeyinde Tahmin</h2>
+    <p class="section-lead">En basit dil modeli olan bigram, her karakterin yalnızca bir önceki karaktere bağlı olduğunu varsayar ve attention'ı anlamak için sezgisel temel oluşturur.</p>
+
+    <p>Bigram modeli, karakter düzeyinde frekans istatistiğidir: <code class="inline">P(c_t | c_{t-1})</code>. Derin öğrenme versiyonunda bu tablo bir embedding lookup ile öğrenilir. Karmaşıklık metriği <em>cross-entropy loss</em>: düzgün seçilmiş rastgele başlangıçta log(vocab_size) (Türkçe karakterler için ~4.0). Eğitim sonrası bu değer düşer; ne kadar düşerse model o kadar iyi.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>bigram.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> torch
+<span class="keyword">import</span> torch.nn <span class="keyword">as</span> nn
+<span class="keyword">import</span> torch.nn.functional <span class="keyword">as</span> F
+
+<span class="cmt"># ── Veri hazırlama ───────────────────────────────────────────</span>
+<span class="keyword">with</span> <span class="cmd">open</span>(<span class="str">"shakespeare.txt"</span>, <span class="str">"r"</span>, encoding=<span class="str">"utf-8"</span>) <span class="keyword">as</span> f:
+    text = f.<span class="cmd">read</span>()
+
+chars = <span class="cmd">sorted</span>(<span class="cmd">set</span>(text))
+vocab_size = <span class="cmd">len</span>(chars)
+stoi = {ch: i <span class="keyword">for</span> i, ch <span class="keyword">in</span> <span class="cmd">enumerate</span>(chars)}
+itos = {i: ch <span class="keyword">for</span> ch, i <span class="keyword">in</span> stoi.<span class="cmd">items</span>()}
+
+<span class="cmd">encode</span> = <span class="keyword">lambda</span> s: [stoi[c] <span class="keyword">for</span> c <span class="keyword">in</span> s]
+<span class="cmd">decode</span> = <span class="keyword">lambda</span> l: <span class="str">""</span>.<span class="cmd">join</span>([itos[i] <span class="keyword">for</span> i <span class="keyword">in</span> l])
+
+data = torch.<span class="cmd">tensor</span>(<span class="cmd">encode</span>(text), dtype=torch.long)
+n = <span class="cmd">int</span>(<span class="str">0.9</span> * <span class="cmd">len</span>(data))
+train_data, val_data = data[:n], data[n:]
+
+<span class="cmt"># ── Batch üretici ────────────────────────────────────────────</span>
+block_size = <span class="str">8</span>
+batch_size = <span class="str">32</span>
+
+<span class="keyword">def</span> <span class="cmd">get_batch</span>(split):
+    d = train_data <span class="keyword">if</span> split == <span class="str">"train"</span> <span class="keyword">else</span> val_data
+    ix = torch.<span class="cmd">randint</span>(<span class="cmd">len</span>(d) - block_size, (batch_size,))
+    x = torch.<span class="cmd">stack</span>([d[i:i+block_size] <span class="keyword">for</span> i <span class="keyword">in</span> ix])
+    y = torch.<span class="cmd">stack</span>([d[i+<span class="str">1</span>:i+block_size+<span class="str">1</span>] <span class="keyword">for</span> i <span class="keyword">in</span> ix])
+    <span class="keyword">return</span> x, y
+
+<span class="cmt"># ── Bigram modeli ────────────────────────────────────────────</span>
+<span class="keyword">class</span> <span class="cmd">BigramLM</span>(nn.Module):
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, vocab_size):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>()
+        self.token_embedding = nn.<span class="cmd">Embedding</span>(vocab_size, vocab_size)
+
+    <span class="keyword">def</span> <span class="cmd">forward</span>(self, idx, targets=<span class="keyword">None</span>):
+        logits = self.<span class="cmd">token_embedding</span>(idx)  <span class="cmt"># (B, T, C)</span>
+        <span class="keyword">if</span> targets <span class="keyword">is</span> <span class="keyword">None</span>:
+            <span class="keyword">return</span> logits, <span class="keyword">None</span>
+        B, T, C = logits.shape
+        loss = F.<span class="cmd">cross_entropy</span>(logits.<span class="cmd">view</span>(B*T, C),
+                                 targets.<span class="cmd">view</span>(B*T))
+        <span class="keyword">return</span> logits, loss
+
+    <span class="keyword">def</span> <span class="cmd">generate</span>(self, idx, max_new_tokens):
+        <span class="keyword">for</span> _ <span class="keyword">in</span> <span class="cmd">range</span>(max_new_tokens):
+            logits, _ = self(idx)
+            logits = logits[:, -<span class="str">1</span>, :]  <span class="cmt"># son token (B, C)</span>
+            probs = F.<span class="cmd">softmax</span>(logits, dim=-<span class="str">1</span>)
+            next_token = torch.<span class="cmd">multinomial</span>(probs, num_samples=<span class="str">1</span>)
+            idx = torch.<span class="cmd">cat</span>([idx, next_token], dim=<span class="str">1</span>)
+        <span class="keyword">return</span> idx
+
+model = <span class="cmd">BigramLM</span>(vocab_size)
+optimizer = torch.optim.<span class="cmd">AdamW</span>(model.<span class="cmd">parameters</span>(), lr=<span class="str">1e-3</span>)
+
+<span class="keyword">for</span> step <span class="keyword">in</span> <span class="cmd">range</span>(<span class="str">3000</span>):
+    xb, yb = <span class="cmd">get_batch</span>(<span class="str">"train"</span>)
+    _, loss = <span class="cmd">model</span>(xb, yb)
+    optimizer.<span class="cmd">zero_grad</span>()
+    loss.<span class="cmd">backward</span>()
+    optimizer.<span class="cmd">step</span>()
+    <span class="keyword">if</span> step % <span class="str">500</span> == <span class="str">0</span>:
+        <span class="cmd">print</span>(<span class="str">f"step {step}: loss={loss.item():.4f}"</span>)</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s2 ──────────────────────────────────────────────────── -->
+  <section id="s2">
+    <h2><span class="num">02</span> Self-Attention Sıfırdan — Q, K, V, Scaled Dot Product</h2>
+    <p class="section-lead">Self-attention, her tokenun tüm geçmiş tokenlerle ilişki kurmasına izin vererek bigram'ın sınırlı bağlamını ortadan kaldırır.</p>
+
+    <p>Attention mekanizması: <code class="inline">Attention(Q,K,V) = softmax(QK^T / √d_k) × V</code>. <em>Query (Q)</em>: "ne arıyorum?", <em>Key (K)</em>: "ne sunuyorum?", <em>Value (V)</em>: "ne biliyorum?". Ölçekleme faktörü √d_k, büyük boyutlarda dot product değerlerinin çok büyümesini ve gradyanların vanish olmasını önler. Kausal maskeleme (üçgen maske), gelecek tokenların görülmesini engeller.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>self_attention.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> torch
+<span class="keyword">import</span> torch.nn <span class="keyword">as</span> nn
+<span class="keyword">import</span> torch.nn.functional <span class="keyword">as</span> F
+
+<span class="cmt"># ── Matematiksel sezgi: ağırlıklı ortalama ───────────────────</span>
+<span class="cmt"># Naif yol: her token, tüm geçmiş tokenların ortalamasını alır</span>
+B, T, C = <span class="str">4</span>, <span class="str">8</span>, <span class="str">32</span>
+x = torch.<span class="cmd">randn</span>(B, T, C)
+
+<span class="cmt"># Kümülatif ortalama (attention öncesi baseline)</span>
+xbow = torch.<span class="cmd">zeros</span>(B, T, C)
+<span class="keyword">for</span> b <span class="keyword">in</span> <span class="cmd">range</span>(B):
+    <span class="keyword">for</span> t <span class="keyword">in</span> <span class="cmd">range</span>(T):
+        xbow[b, t] = x[b, :<span class="str">t</span>+<span class="str">1</span>].<span class="cmd">mean</span>(dim=<span class="str">0</span>)
+
+<span class="cmt"># Vektörleştirilmiş: alt üçgen maske ile</span>
+tril = torch.<span class="cmd">tril</span>(torch.<span class="cmd">ones</span>(T, T))
+wei = tril / tril.<span class="cmd">sum</span>(dim=<span class="str">1</span>, keepdim=<span class="keyword">True</span>)
+xbow_fast = wei @ x   <span class="cmt"># (T,T) @ (B,T,C) → (B,T,C) via broadcasting</span>
+<span class="cmd">print</span>(<span class="cmd">torch.allclose</span>(xbow, xbow_fast, atol=<span class="str">1e-7</span>))  <span class="cmt"># True</span>
+
+<span class="cmt"># ── Gerçek Self-Attention ─────────────────────────────────────</span>
+<span class="keyword">class</span> <span class="cmd">SelfAttentionHead</span>(nn.Module):
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, d_model, head_size):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>()
+        self.key   = nn.<span class="cmd">Linear</span>(d_model, head_size, bias=<span class="keyword">False</span>)
+        self.query = nn.<span class="cmd">Linear</span>(d_model, head_size, bias=<span class="keyword">False</span>)
+        self.value = nn.<span class="cmd">Linear</span>(d_model, head_size, bias=<span class="keyword">False</span>)
+        <span class="cmt"># Kausal maske — eğitimde değişmez (register_buffer ile)</span>
+        self.<span class="cmd">register_buffer</span>(<span class="str">"tril"</span>,
+            torch.<span class="cmd">tril</span>(torch.<span class="cmd">ones</span>(block_size, block_size)))
+        self.dropout = nn.<span class="cmd">Dropout</span>(<span class="str">0.1</span>)
+
+    <span class="keyword">def</span> <span class="cmd">forward</span>(self, x):
+        B, T, C = x.shape
+        k = self.<span class="cmd">key</span>(x)    <span class="cmt"># (B, T, hs)</span>
+        q = self.<span class="cmd">query</span>(x)  <span class="cmt"># (B, T, hs)</span>
+        <span class="cmt"># Scaled dot product</span>
+        scale = k.shape[-<span class="str">1</span>] ** -<span class="str">0.5</span>
+        wei = q @ k.<span class="cmd">transpose</span>(-<span class="str">2</span>, -<span class="str">1</span>) * scale  <span class="cmt"># (B, T, T)</span>
+        <span class="cmt"># Kausal maskeleme: gelecek pozisyonları -inf yap</span>
+        wei = wei.<span class="cmd">masked_fill</span>(self.tril[:T, :T] == <span class="str">0</span>, float(<span class="str">"-inf"</span>))
+        wei = F.<span class="cmd">softmax</span>(wei, dim=-<span class="str">1</span>)
+        wei = self.<span class="cmd">dropout</span>(wei)
+        v = self.<span class="cmd">value</span>(x)   <span class="cmt"># (B, T, hs)</span>
+        out = wei @ v         <span class="cmt"># (B, T, hs)</span>
+        <span class="keyword">return</span> out</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s3 ──────────────────────────────────────────────────── -->
+  <section id="s3">
+    <h2><span class="num">03</span> Multi-head Attention &amp; Causal Mask</h2>
+    <p class="section-lead">Çok başlı dikkat, farklı başların farklı ilişki türlerini yakaladığı zengin bir temsil uzayı oluşturur.</p>
+
+    <p>Multi-head attention, H adet bağımsız attention başını paralel çalıştırır ve çıktıları birleştirir: <code class="inline">MHA(Q,K,V) = Concat(head_1,...,head_H) W^O</code>. Her başın boyutu <code class="inline">d_head = d_model / H</code> olacak şekilde ayarlanır; bu sayede toplam hesaplama maliyeti tek başlıkla aynı kalır. <em>Flash Attention</em> (Dao et al. 2022), attention matrisini bellekte somutlaştırmadan hesaplayarak hem bellek hem hız açısından büyük kazanım sağlar.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>multihead_attention.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> torch
+<span class="keyword">import</span> torch.nn <span class="keyword">as</span> nn
+<span class="keyword">import</span> torch.nn.functional <span class="keyword">as</span> F
+
+<span class="keyword">class</span> <span class="cmd">MultiHeadAttention</span>(nn.Module):
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, d_model, n_heads, block_size, dropout=<span class="str">0.1</span>):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>()
+        <span class="keyword">assert</span> d_model % n_heads == <span class="str">0</span>
+        self.n_heads = n_heads
+        self.d_head  = d_model // n_heads
+
+        self.qkv_proj = nn.<span class="cmd">Linear</span>(d_model, <span class="str">3</span> * d_model, bias=<span class="keyword">False</span>)
+        self.out_proj  = nn.<span class="cmd">Linear</span>(d_model, d_model, bias=<span class="keyword">False</span>)
+        self.dropout   = nn.<span class="cmd">Dropout</span>(dropout)
+
+        self.<span class="cmd">register_buffer</span>(
+            <span class="str">"causal_mask"</span>,
+            torch.<span class="cmd">tril</span>(torch.<span class="cmd">ones</span>(block_size, block_size))
+                  .<span class="cmd">view</span>(<span class="str">1</span>, <span class="str">1</span>, block_size, block_size)
+        )
+
+    <span class="keyword">def</span> <span class="cmd">forward</span>(self, x):
+        B, T, C = x.shape
+        H, D = self.n_heads, self.d_head
+
+        qkv = self.<span class="cmd">qkv_proj</span>(x)                       <span class="cmt"># (B, T, 3C)</span>
+        q, k, v = qkv.<span class="cmd">split</span>(C, dim=-<span class="str">1</span>)              <span class="cmt"># her biri (B,T,C)</span>
+        <span class="cmt"># Başlara böl: (B, H, T, D)</span>
+        q = q.<span class="cmd">view</span>(B, T, H, D).<span class="cmd">transpose</span>(<span class="str">1</span>, <span class="str">2</span>)
+        k = k.<span class="cmd">view</span>(B, T, H, D).<span class="cmd">transpose</span>(<span class="str">1</span>, <span class="str">2</span>)
+        v = v.<span class="cmd">view</span>(B, T, H, D).<span class="cmd">transpose</span>(<span class="str">1</span>, <span class="str">2</span>)
+
+        <span class="cmt"># Scaled dot product + causal mask</span>
+        scale = D ** -<span class="str">0.5</span>
+        att = (q @ k.<span class="cmd">transpose</span>(-<span class="str">2</span>, -<span class="str">1</span>)) * scale   <span class="cmt"># (B,H,T,T)</span>
+        att = att.<span class="cmd">masked_fill</span>(self.causal_mask[:, :, :T, :T] == <span class="str">0</span>,
+                               float(<span class="str">"-inf"</span>))
+        att = F.<span class="cmd">softmax</span>(att, dim=-<span class="str">1</span>)
+        att = self.<span class="cmd">dropout</span>(att)
+
+        <span class="cmt"># Birleştir: (B,H,T,D) → (B,T,C)</span>
+        out = (att @ v).<span class="cmd">transpose</span>(<span class="str">1</span>, <span class="str">2</span>).<span class="cmd">contiguous</span>().<span class="cmd">view</span>(B, T, C)
+        <span class="keyword">return</span> self.<span class="cmd">out_proj</span>(out)
+
+<span class="cmt"># ── Flash Attention (PyTorch 2.0+) ───────────────────────────</span>
+<span class="cmt"># Aynı sonucu bellek açısından verimli üretir:</span>
+<span class="cmt"># out = F.scaled_dot_product_attention(q, k, v, is_causal=True)</span></code></pre>
+    </div>
+  </section>
+
+  <!-- ── s4 ──────────────────────────────────────────────────── -->
+  <section id="s4">
+    <h2><span class="num">04</span> Transformer Block — Attention + FFN + LayerNorm + Residual</h2>
+    <p class="section-lead">Transformer block, attention ve feed-forward ağını residual bağlantılar ve pre-normalization ile birleştiren temel yapı taşıdır.</p>
+
+    <p>GPT bloğu <em>Pre-LN</em> tasarımı kullanır (orijinal Transformer'dan farklı olarak): normalizasyon alt katmandan önce uygulanır, bu daha stabil gradyan akışı sağlar. <em>Residual bağlantılar</em> (skip connections), gradyanların derinlere akmasını sağlar; olmadan derin ağlar eğitilemez. <em>FFN</em>, genellikle 4× büyütme faktörü kullanır: <code class="inline">d_model → 4×d_model → d_model</code> ve GELU aktivasyonu. <em>LayerNorm</em>, her örneği bağımsız normalize eder (BatchNorm aksine).</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>transformer_block.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> torch
+<span class="keyword">import</span> torch.nn <span class="keyword">as</span> nn
+
+<span class="keyword">class</span> <span class="cmd">FeedForward</span>(nn.Module):
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, d_model, dropout=<span class="str">0.1</span>):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>()
+        self.net = nn.<span class="cmd">Sequential</span>(
+            nn.<span class="cmd">Linear</span>(d_model, <span class="str">4</span> * d_model),
+            nn.<span class="cmd">GELU</span>(),
+            nn.<span class="cmd">Linear</span>(<span class="str">4</span> * d_model, d_model),
+            nn.<span class="cmd">Dropout</span>(dropout),
+        )
+
+    <span class="keyword">def</span> <span class="cmd">forward</span>(self, x): <span class="keyword">return</span> self.<span class="cmd">net</span>(x)
+
+<span class="keyword">class</span> <span class="cmd">TransformerBlock</span>(nn.Module):
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, d_model, n_heads, block_size, dropout=<span class="str">0.1</span>):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>()
+        self.ln1 = nn.<span class="cmd">LayerNorm</span>(d_model)
+        self.ln2 = nn.<span class="cmd">LayerNorm</span>(d_model)
+        self.attn = <span class="cmd">MultiHeadAttention</span>(d_model, n_heads, block_size, dropout)
+        self.ffn  = <span class="cmd">FeedForward</span>(d_model, dropout)
+
+    <span class="keyword">def</span> <span class="cmd">forward</span>(self, x):
+        <span class="cmt"># Pre-LN residual: x + sublayer(LN(x))</span>
+        x = x + self.attn(self.<span class="cmd">ln1</span>(x))  <span class="cmt"># Attention + residual</span>
+        x = x + self.ffn(self.<span class="cmd">ln2</span>(x))   <span class="cmt"># FFN + residual</span>
+        <span class="keyword">return</span> x
+
+<span class="cmt"># ── GPT modeli: tüm bloklar ───────────────────────────────────</span>
+<span class="keyword">class</span> <span class="cmd">GPT</span>(nn.Module):
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, vocab_size, d_model, n_heads, n_layers,
+                 block_size, dropout=<span class="str">0.1</span>):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>()
+        self.block_size = block_size
+        self.tok_emb = nn.<span class="cmd">Embedding</span>(vocab_size, d_model)
+        self.pos_emb = nn.<span class="cmd">Embedding</span>(block_size, d_model)
+        self.drop    = nn.<span class="cmd">Dropout</span>(dropout)
+        self.blocks  = nn.<span class="cmd">Sequential</span>(*[
+            <span class="cmd">TransformerBlock</span>(d_model, n_heads, block_size, dropout)
+            <span class="keyword">for</span> _ <span class="keyword">in</span> <span class="cmd">range</span>(n_layers)
+        ])
+        self.ln_f   = nn.<span class="cmd">LayerNorm</span>(d_model)
+        self.lm_head = nn.<span class="cmd">Linear</span>(d_model, vocab_size, bias=<span class="keyword">False</span>)
+        <span class="cmt"># Weight tying: s5'te açıklanıyor</span>
+        self.tok_emb.weight = self.lm_head.weight
+
+    <span class="keyword">def</span> <span class="cmd">forward</span>(self, idx, targets=<span class="keyword">None</span>):
+        B, T = idx.shape
+        tok = self.<span class="cmd">tok_emb</span>(idx)
+        pos = self.<span class="cmd">pos_emb</span>(torch.<span class="cmd">arange</span>(T, device=idx.device))
+        x = self.<span class="cmd">drop</span>(tok + pos)
+        x = self.<span class="cmd">blocks</span>(x)
+        x = self.<span class="cmd">ln_f</span>(x)
+        logits = self.<span class="cmd">lm_head</span>(x)
+        loss = <span class="keyword">None</span>
+        <span class="keyword">if</span> targets <span class="keyword">is</span> <span class="keyword">not</span> <span class="keyword">None</span>:
+            B, T, C = logits.shape
+            <span class="keyword">import</span> torch.nn.functional <span class="keyword">as</span> F
+            loss = F.<span class="cmd">cross_entropy</span>(logits.<span class="cmd">view</span>(B*T, C), targets.<span class="cmd">view</span>(B*T))
+        <span class="keyword">return</span> logits, loss</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s5 ──────────────────────────────────────────────────── -->
+  <section id="s5">
+    <h2><span class="num">05</span> Tokenization — BPE Algoritması &amp; tiktoken</h2>
+    <p class="section-lead">Karakter düzeyinden kelime düzeyine geçişin ortası olan BPE, hem kelime içi bilgiyi hem sözcük sınırlarını yakalar ve tiktoken GPT modellerinde kullanılır.</p>
+
+    <p><em>BPE</em> (Byte Pair Encoding), 1994'te veri sıkıştırma için önerilen ancak NLP'de tokenization için benimsenen bir algoritmdır. Adımlar: (1) Her karakter ayrı token. (2) En sık görülen bitişik çifti yeni token olarak birleştir. (3) İstenilen vocab_size'a ulaşana dek tekrarla. GPT-4 modelleri <code class="inline">cl100k_base</code> tokenizer kullanır: ~100K token. OpenAI'nin <code class="inline">tiktoken</code> kütüphanesi bunu Rust ile implement eder — Python tokenizers'tan 3-6x hızlı.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>bpe.py</span><span class="dot">●</span></div>
+      <pre><code><span class="cmt"># ── Minimal BPE implementasyonu ──────────────────────────────</span>
+<span class="keyword">from</span> collections <span class="keyword">import</span> Counter
+<span class="keyword">from</span> typing <span class="keyword">import</span> List, Dict, Tuple
+
+<span class="keyword">def</span> <span class="cmd">get_pair_counts</span>(vocab: Dict[str, int]) -> Counter:
+    pairs = <span class="cmd">Counter</span>()
+    <span class="keyword">for</span> word, freq <span class="keyword">in</span> vocab.<span class="cmd">items</span>():
+        symbols = word.<span class="cmd">split</span>()
+        <span class="keyword">for</span> i <span class="keyword">in</span> <span class="cmd">range</span>(<span class="cmd">len</span>(symbols) - <span class="str">1</span>):
+            pairs[(symbols[i], symbols[i+<span class="str">1</span>])] += freq
+    <span class="keyword">return</span> pairs
+
+<span class="keyword">def</span> <span class="cmd">merge_pair</span>(vocab: Dict, pair: Tuple) -> Dict:
+    bigram = <span class="str">" "</span>.<span class="cmd">join</span>(pair)
+    replacement = <span class="str">""</span>.<span class="cmd">join</span>(pair)
+    new_vocab = {}
+    <span class="keyword">for</span> word, freq <span class="keyword">in</span> vocab.<span class="cmd">items</span>():
+        new_word = word.<span class="cmd">replace</span>(bigram, replacement)
+        new_vocab[new_word] = freq
+    <span class="keyword">return</span> new_vocab
+
+<span class="keyword">def</span> <span class="cmd">train_bpe</span>(corpus: str, num_merges: int = <span class="str">100</span>):
+    <span class="cmt"># Her kelimeyi karakterlere böl + </w> son ek</span>
+    words = corpus.<span class="cmd">split</span>()
+    vocab = <span class="cmd">Counter</span>()
+    <span class="keyword">for</span> word <span class="keyword">in</span> words:
+        vocab[<span class="str">" "</span>.<span class="cmd">join</span>(<span class="cmd">list</span>(word)) + <span class="str">" </w>"</span>] += <span class="str">1</span>
+
+    merges = []
+    <span class="keyword">for</span> i <span class="keyword">in</span> <span class="cmd">range</span>(num_merges):
+        pairs = <span class="cmd">get_pair_counts</span>(vocab)
+        <span class="keyword">if</span> <span class="keyword">not</span> pairs: <span class="keyword">break</span>
+        best = pairs.<span class="cmd">most_common</span>(<span class="str">1</span>)[<span class="str">0</span>][<span class="str">0</span>]
+        vocab = <span class="cmd">merge_pair</span>(vocab, best)
+        merges.<span class="cmd">append</span>(best)
+        <span class="keyword">if</span> i % <span class="str">10</span> == <span class="str">0</span>:
+            <span class="cmd">print</span>(<span class="str">f"Merge {i}: {best[0]!r} + {best[1]!r}"</span>)
+
+    <span class="keyword">return</span> vocab, merges
+
+<span class="cmt"># ── tiktoken kullanımı ───────────────────────────────────────</span>
+<span class="keyword">import</span> tiktoken
+
+enc = tiktoken.<span class="cmd">get_encoding</span>(<span class="str">"cl100k_base"</span>)  <span class="cmt"># GPT-4</span>
+text = <span class="str">"Büyük dil modelleri her yerde karşımıza çıkıyor."</span>
+tokens = enc.<span class="cmd">encode</span>(text)
+<span class="cmd">print</span>(<span class="str">f"Token sayısı: {len(tokens)}"</span>)
+<span class="cmd">print</span>(<span class="str">f"Geri çözme: {enc.decode(tokens)!r}"</span>)
+
+<span class="cmt"># Token görselleştirme</span>
+<span class="keyword">for</span> t <span class="keyword">in</span> tokens:
+    <span class="cmd">print</span>(<span class="str">f"  {t:6d}: {enc.decode([t])!r}"</span>)</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s6 ──────────────────────────────────────────────────── -->
+  <section id="s6">
+    <h2><span class="num">06</span> Pozisyonel Encoding — Learned vs RoPE</h2>
+    <p class="section-lead">Transformer'ın attention mekanizması sıraya duyarsızdır; pozisyonel encoding bu bilgiyi modele ekler. Öğrenilmiş encoding veya RoPE (Rotary Position Embedding) modern tercih.</p>
+
+    <p><em>Learned PE</em>, GPT-2'nin kullandığı yaklaşımdır: pozisyon indeksi için ayrı bir embedding tablosu öğrenilir. Avantaj: basit. Dezavantaj: eğitimde görülmeyen uzun dizilere genelleme yapamaz. <em>Sinusoidal PE</em> (orijinal Transformer), formül tabanlıdır ve genellenebilir ama performans açısından öğrenilmiş PE'den genellikle zayıftır. <em>RoPE</em> (Su et al. 2021), query ve key vektörlerini relative pozisyona göre döndürür; hem long context'e iyi genellenebilir hem relative position encoding sağlar; Llama ve modern LLM'lerin standardı.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>rope.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> torch
+<span class="keyword">import</span> torch.nn <span class="keyword">as</span> nn
+
+<span class="cmt"># ── RoPE implementasyonu ──────────────────────────────────────</span>
+<span class="keyword">def</span> <span class="cmd">precompute_freqs_cis</span>(dim: int, max_seq: int = <span class="str">2048</span>,
+                          theta: float = <span class="str">10000.0</span>) -> torch.Tensor:
+    <span class="str">"""
+    Çift sayıda boyut için frekans vektörleri ön hesaplaması.
+    dim: head_dim (çift olmalı)
+    """</span>
+    freqs = <span class="str">1.0</span> / (theta ** (
+        torch.<span class="cmd">arange</span>(<span class="str">0</span>, dim, <span class="str">2</span>).<span class="cmd">float</span>() / dim
+    ))
+    t = torch.<span class="cmd">arange</span>(max_seq)
+    freqs = torch.<span class="cmd">outer</span>(t, freqs)   <span class="cmt"># (max_seq, dim/2)</span>
+    <span class="keyword">return</span> torch.<span class="cmd">polar</span>(torch.<span class="cmd">ones_like</span>(freqs), freqs)  <span class="cmt"># kompleks</span>
+
+<span class="keyword">def</span> <span class="cmd">apply_rotary_emb</span>(x: torch.Tensor,
+                      freqs_cis: torch.Tensor) -> torch.Tensor:
+    <span class="str">"""
+    x: (B, T, n_heads, head_dim)
+    """</span>
+    xc = torch.<span class="cmd">view_as_complex</span>(x.<span class="cmd">float</span>().<span class="cmd">reshape</span>(*x.shape[:-<span class="str">1</span>], -<span class="str">1</span>, <span class="str">2</span>))
+    freqs = freqs_cis[:<span class="cmd">x.shape</span>[<span class="str">1</span>]].<span class="cmd">unsqueeze</span>(<span class="str">0</span>).<span class="cmd">unsqueeze</span>(<span class="str">2</span>)
+    xr = torch.<span class="cmd">view_as_real</span>(xc * freqs).<span class="cmd">flatten</span>(<span class="str">3</span>)
+    <span class="keyword">return</span> xr.<span class="cmd">type_as</span>(x)
+
+<span class="cmt"># ── Kullanım ─────────────────────────────────────────────────</span>
+head_dim = <span class="str">64</span>
+freqs_cis = <span class="cmd">precompute_freqs_cis</span>(head_dim, max_seq=<span class="str">2048</span>)
+
+<span class="cmt"># Query ve Key'e RoPE uygula</span>
+B, T, H, D = <span class="str">2</span>, <span class="str">128</span>, <span class="str">8</span>, head_dim
+q = torch.<span class="cmd">randn</span>(B, T, H, D)
+k = torch.<span class="cmd">randn</span>(B, T, H, D)
+q_rot = <span class="cmd">apply_rotary_emb</span>(q, freqs_cis)
+k_rot = <span class="cmd">apply_rotary_emb</span>(k, freqs_cis)
+
+<span class="cmt"># ── Learned PE (GPT-2 stili, referans) ───────────────────────</span>
+<span class="keyword">class</span> <span class="cmd">LearnedPE</span>(nn.Module):
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, block_size, d_model):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>()
+        self.pos_emb = nn.<span class="cmd">Embedding</span>(block_size, d_model)
+
+    <span class="keyword">def</span> <span class="cmd">forward</span>(self, seq_len):
+        positions = torch.<span class="cmd">arange</span>(seq_len)
+        <span class="keyword">return</span> self.<span class="cmd">pos_emb</span>(positions)  <span class="cmt"># (T, d_model)</span></code></pre>
+    </div>
+  </section>
+
+  <!-- ── s7 ──────────────────────────────────────────────────── -->
+  <section id="s7">
+    <h2><span class="num">07</span> Training Loop — Cross-Entropy Loss, AdamW, Grad Clipping</h2>
+    <p class="section-lead">LLM eğitiminin üç kritik unsuru: cross-entropy language modeling kaybı, AdamW optimizer ve gradient clipping ile stabil eğitim.</p>
+
+    <p>Cross-entropy language modeling kaybı: modelin bir sonraki tokeni doğru tahmin etme negatif log olasılığı. Perplexity = e^loss; daha düşük = daha iyi. <em>AdamW</em>, Adam optimizer'da weight decay'i düzgün uygular (gradyan ile değil parametreyle doğrudan): L2 regularization'ın düzgün formu. <em>Gradient clipping</em> (max_norm=1.0), büyük gradyan patlamalarını önler; LLM eğitiminde özellikle önemli. <em>Learning rate schedule</em>: warmup + cosine decay nanoGPT'in tercihidir.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>training_loop.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> torch, math
+
+<span class="cmt"># ── Model konfigürasyonu ─────────────────────────────────────</span>
+config = {
+    <span class="str">"vocab_size"</span>:  vocab_size,
+    <span class="str">"d_model"</span>:     <span class="str">384</span>,
+    <span class="str">"n_heads"</span>:     <span class="str">6</span>,
+    <span class="str">"n_layers"</span>:    <span class="str">6</span>,
+    <span class="str">"block_size"</span>:  <span class="str">256</span>,
+    <span class="str">"dropout"</span>:     <span class="str">0.2</span>,
+}
+model = <span class="cmd">GPT</span>(**config)
+device = <span class="str">"cuda"</span> <span class="keyword">if</span> torch.cuda.<span class="cmd">is_available</span>() <span class="keyword">else</span> <span class="str">"cpu"</span>
+model = model.<span class="cmd">to</span>(device)
+<span class="cmd">print</span>(<span class="str">f"Parametre: {sum(p.numel() for p in model.parameters())/1e6:.2f}M"</span>)
+
+<span class="cmt"># ── AdamW: weight decay yalnızca 2D+ tensörlere ──────────────</span>
+decay_params    = [p <span class="keyword">for</span> n, p <span class="keyword">in</span> model.<span class="cmd">named_parameters</span>()
+                    <span class="keyword">if</span> p.<span class="cmd">requires_grad</span> <span class="keyword">and</span> p.<span class="cmd">dim</span>() >= <span class="str">2</span>]
+no_decay_params = [p <span class="keyword">for</span> n, p <span class="keyword">in</span> model.<span class="cmd">named_parameters</span>()
+                    <span class="keyword">if</span> p.<span class="cmd">requires_grad</span> <span class="keyword">and</span> p.<span class="cmd">dim</span>() < <span class="str">2</span>]
+optimizer = torch.optim.<span class="cmd">AdamW</span>([
+    {<span class="str">"params"</span>: decay_params,    <span class="str">"weight_decay"</span>: <span class="str">0.1</span>},
+    {<span class="str">"params"</span>: no_decay_params, <span class="str">"weight_decay"</span>: <span class="str">0.0</span>},
+], lr=<span class="str">3e-4</span>, betas=(<span class="str">0.9</span>, <span class="str">0.95</span>))
+
+<span class="cmt"># ── Cosine LR schedule ────────────────────────────────────────</span>
+max_iters  = <span class="str">5000</span>
+warmup_its = <span class="str">100</span>
+min_lr     = <span class="str">3e-5</span>
+max_lr     = <span class="str">3e-4</span>
+
+<span class="keyword">def</span> <span class="cmd">get_lr</span>(it: int) -> float:
+    <span class="keyword">if</span> it &lt; warmup_its:
+        <span class="keyword">return</span> max_lr * it / warmup_its
+    t = (it - warmup_its) / (max_iters - warmup_its)
+    coeff = <span class="str">0.5</span> * (<span class="str">1.0</span> + math.<span class="cmd">cos</span>(math.pi * t))
+    <span class="keyword">return</span> min_lr + coeff * (max_lr - min_lr)
+
+<span class="cmt"># ── Eğitim döngüsü ───────────────────────────────────────────</span>
+<span class="keyword">for</span> it <span class="keyword">in</span> <span class="cmd">range</span>(max_iters):
+    lr = <span class="cmd">get_lr</span>(it)
+    <span class="keyword">for</span> param_group <span class="keyword">in</span> optimizer.param_groups:
+        param_group[<span class="str">"lr"</span>] = lr
+
+    model.<span class="cmd">train</span>()
+    xb, yb = <span class="cmd">get_batch</span>(<span class="str">"train"</span>)
+    xb, yb = xb.<span class="cmd">to</span>(device), yb.<span class="cmd">to</span>(device)
+
+    _, loss = <span class="cmd">model</span>(xb, yb)
+    optimizer.<span class="cmd">zero_grad</span>(set_to_none=<span class="keyword">True</span>)
+    loss.<span class="cmd">backward</span>()
+
+    <span class="cmt"># Gradient clipping</span>
+    torch.nn.utils.<span class="cmd">clip_grad_norm_</span>(model.<span class="cmd">parameters</span>(), max_norm=<span class="str">1.0</span>)
+
+    optimizer.<span class="cmd">step</span>()
+
+    <span class="keyword">if</span> it % <span class="str">200</span> == <span class="str">0</span>:
+        model.<span class="cmd">eval</span>()
+        <span class="keyword">with</span> torch.<span class="cmd">no_grad</span>():
+            xv, yv = <span class="cmd">get_batch</span>(<span class="str">"val"</span>)
+            _, val_loss = <span class="cmd">model</span>(xv.<span class="cmd">to</span>(device), yv.<span class="cmd">to</span>(device))
+        <span class="cmd">print</span>(<span class="str">f"iter {it:5d} | lr={lr:.2e} | train={loss:.4f} | val={val_loss:.4f}"</span>)</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s8 ──────────────────────────────────────────────────── -->
+  <section id="s8">
+    <h2><span class="num">08</span> Weight Tying — Embedding ve LM Head Paylaşımı</h2>
+    <p class="section-lead">Token embedding tablosu ile dil modeli kafasının ağırlıklarını paylaşmak parametre sayısını düşürür ve teorik olarak da anlamlıdır.</p>
+
+    <p><em>Weight tying</em>, Press &amp; Wolf (2017) tarafından önerilmiştir: input embedding ve output projection (LM head) matrislerinin aynı ağırlıkları paylaşması. Mantığı şudur: her iki matris de token'ları benzer vektör uzayında temsil etmeli. GPT-2, GPT-NeoX, Llama dahil neredeyse tüm modern LLM'ler bunu uygular. Etki: GPT-2 small için ~39M parametre tasarrufu (vocab_size × d_model = 50257 × 768).</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>weight_tying.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> torch
+<span class="keyword">import</span> torch.nn <span class="keyword">as</span> nn
+
+<span class="keyword">class</span> <span class="cmd">GPTWithTying</span>(nn.Module):
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, vocab_size, d_model, **kwargs):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>()
+        self.tok_emb = nn.<span class="cmd">Embedding</span>(vocab_size, d_model)
+        <span class="cmt"># ... diğer katmanlar ...</span>
+        self.lm_head = nn.<span class="cmd">Linear</span>(d_model, vocab_size, bias=<span class="keyword">False</span>)
+
+        <span class="cmt"># Weight tying: aynı tensörü paylaş</span>
+        self.tok_emb.weight = self.lm_head.weight
+        <span class="cmt"># Artık backward sırasında gradyanlar her ikisine de akar</span>
+
+    <span class="keyword">def</span> <span class="cmd">count_params</span>(self):
+        total = <span class="cmd">sum</span>(p.<span class="cmd">numel</span>() <span class="keyword">for</span> p <span class="keyword">in</span> self.<span class="cmd">parameters</span>())
+        unique = <span class="cmd">sum</span>(p.<span class="cmd">numel</span>() <span class="keyword">for</span> p <span class="keyword">in</span> <span class="cmd">set</span>(self.<span class="cmd">parameters</span>()))
+        <span class="keyword">return</span> total, unique
+
+<span class="cmt"># ── Doğrulama ────────────────────────────────────────────────</span>
+m = <span class="cmd">GPTWithTying</span>(<span class="str">50257</span>, <span class="str">768</span>)
+total, unique = m.<span class="cmd">count_params</span>()
+tied_savings = total - unique
+<span class="cmd">print</span>(<span class="str">f"Toplam sayılı: {total/1e6:.1f}M"</span>)
+<span class="cmd">print</span>(<span class="str">f"Gerçek unique: {unique/1e6:.1f}M"</span>)
+<span class="cmd">print</span>(<span class="str">f"Tying tasarrufu: {tied_savings/1e6:.1f}M"</span>)
+
+<span class="cmt"># Aynı nesneye işaret ettiklerini doğrula</span>
+<span class="cmd">print</span>(m.tok_emb.weight <span class="keyword">is</span> m.lm_head.weight)  <span class="cmt"># True</span>
+
+<span class="cmt"># ── Weight initialization ────────────────────────────────────</span>
+<span class="keyword">def</span> <span class="cmd">init_weights</span>(module):
+    <span class="keyword">if</span> <span class="cmd">isinstance</span>(module, nn.Linear):
+        torch.nn.init.<span class="cmd">normal_</span>(module.weight, mean=<span class="str">0.0</span>, std=<span class="str">0.02</span>)
+        <span class="keyword">if</span> module.bias <span class="keyword">is</span> <span class="keyword">not</span> <span class="keyword">None</span>:
+            torch.nn.init.<span class="cmd">zeros_</span>(module.bias)
+    <span class="keyword">elif</span> <span class="cmd">isinstance</span>(module, nn.Embedding):
+        torch.nn.init.<span class="cmd">normal_</span>(module.weight, mean=<span class="str">0.0</span>, std=<span class="str">0.02</span>)
+
+m.<span class="cmd">apply</span>(init_weights)</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s9 ──────────────────────────────────────────────────── -->
+  <section id="s9">
+    <h2><span class="num">09</span> nanoGPT Kodu Satır Satır — Karpathy Implementasyonu</h2>
+    <p class="section-lead">Andrej Karpathy'nin nanoGPT'i 300 satırda tam GPT implementasyonu sunar; her satır bir kavramı somutlaştırır.</p>
+
+    <p>nanoGPT (<a href="https://github.com/karpathy/nanoGPT">github.com/karpathy/nanoGPT</a>), GPT-2 eğitimini minimal kod ile gerçekleştirir. <code class="inline">model.py</code>'daki CausalSelfAttention, öğretici açıklığıyla yazılmıştır. <code class="inline">train.py</code>, gradient accumulation, mixed precision (bfloat16), DDP (DistributedDataParallel) ve model checkpoint destekler. GPT-2 ağırlıklarını yükleyip fine-tune etmek de mümkündür.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>nanogpt_key_parts.py</span><span class="dot">●</span></div>
+      <pre><code><span class="cmt"># nanoGPT'in kritik satırları — yorumlu özet</span>
+<span class="keyword">import</span> torch, torch.nn <span class="keyword">as</span> nn
+<span class="keyword">import</span> torch.nn.functional <span class="keyword">as</span> F
+<span class="keyword">from</span> dataclasses <span class="keyword">import</span> dataclass
+
+@dataclass
+<span class="keyword">class</span> <span class="cmd">GPTConfig</span>:
+    block_size: int = <span class="str">1024</span>
+    vocab_size: int = <span class="str">50304</span>  <span class="cmt"># GPT-2: 50257, 64'ün katı'na yuvarla</span>
+    n_layer:    int = <span class="str">12</span>
+    n_head:     int = <span class="str">12</span>
+    n_embd:     int = <span class="str">768</span>
+    dropout:    float = <span class="str">0.0</span>
+    bias:       bool = <span class="keyword">True</span>
+
+<span class="keyword">class</span> <span class="cmd">CausalSelfAttention</span>(nn.Module):
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, config):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>()
+        <span class="keyword">assert</span> config.n_embd % config.n_head == <span class="str">0</span>
+        <span class="cmt"># Q, K, V için tek matris — verimlilik</span>
+        self.c_attn = nn.<span class="cmd">Linear</span>(config.n_embd, <span class="str">3</span> * config.n_embd, bias=config.bias)
+        self.c_proj = nn.<span class="cmd">Linear</span>(config.n_embd, config.n_embd, bias=config.bias)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        <span class="cmt"># Flash Attention varsa kullan (PyTorch 2.0+)</span>
+        self.flash = <span class="cmd">hasattr</span>(torch.nn.functional, <span class="str">"scaled_dot_product_attention"</span>)
+        <span class="keyword">if</span> <span class="keyword">not</span> self.flash:
+            self.<span class="cmd">register_buffer</span>(<span class="str">"bias"</span>,
+                torch.<span class="cmd">tril</span>(torch.<span class="cmd">ones</span>(config.block_size, config.block_size))
+                      .<span class="cmd">view</span>(<span class="str">1</span>, <span class="str">1</span>, config.block_size, config.block_size))
+
+    <span class="keyword">def</span> <span class="cmd">forward</span>(self, x):
+        B, T, C = x.shape
+        q, k, v = self.<span class="cmd">c_attn</span>(x).<span class="cmd">split</span>(self.n_embd, dim=<span class="str">2</span>)
+        k = k.<span class="cmd">view</span>(B, T, self.n_head, C // self.n_head).<span class="cmd">transpose</span>(<span class="str">1</span>, <span class="str">2</span>)
+        q = q.<span class="cmd">view</span>(B, T, self.n_head, C // self.n_head).<span class="cmd">transpose</span>(<span class="str">1</span>, <span class="str">2</span>)
+        v = v.<span class="cmd">view</span>(B, T, self.n_head, C // self.n_head).<span class="cmd">transpose</span>(<span class="str">1</span>, <span class="str">2</span>)
+
+        <span class="keyword">if</span> self.flash:
+            <span class="cmt"># Flash Attention — kernel fuzyonu ile bellek ve hız</span>
+            y = F.<span class="cmd">scaled_dot_product_attention</span>(
+                q, k, v,
+                attn_mask=<span class="keyword">None</span>,
+                dropout_p=self.dropout <span class="keyword">if</span> self.training <span class="keyword">else</span> <span class="str">0</span>,
+                is_causal=<span class="keyword">True</span>
+            )
+        <span class="keyword">else</span>:
+            att = (q @ k.<span class="cmd">transpose</span>(-<span class="str">2</span>, -<span class="str">1</span>)) * (k.size(-<span class="str">1</span>) ** -<span class="str">0.5</span>)
+            att = att.<span class="cmd">masked_fill</span>(self.bias[:,:,:T,:T] == <span class="str">0</span>, float(<span class="str">"-inf"</span>))
+            att = F.<span class="cmd">softmax</span>(att, dim=-<span class="str">1</span>)
+            y = att @ v
+
+        y = y.<span class="cmd">transpose</span>(<span class="str">1</span>, <span class="str">2</span>).<span class="cmd">contiguous</span>().<span class="cmd">view</span>(B, T, C)
+        <span class="keyword">return</span> self.<span class="cmd">c_proj</span>(y)</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s10 ──────────────────────────────────────────────────── -->
+  <section id="s10">
+    <h2><span class="num">10</span> Ölçekleme Deneyleri — Hyperparametre Sweep &amp; TinyShakespeare</h2>
+    <p class="section-lead">TinyShakespeare üzerinde sistematik hyperparametre araması ile ölçekleme yasalarını (scaling laws) pratikte gözlemleyin.</p>
+
+    <p><em>Chinchilla Scaling Laws</em> (Hoffmann et al. 2022): optimal N (parametre) ve D (token) için N ≈ 20 × D / (20 × N) ilişkisi. Pratik anlam: 1B parametre model için ~20B token eğitim verisi optimal. TinyShakespeare (~1M token) bu deneyi küçük ölçekte simüle eder. Sweep parametreleri: d_model, n_layers, n_heads, learning_rate ve block_size.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>scaling_sweep.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> itertools, json
+<span class="keyword">from</span> pathlib <span class="keyword">import</span> Path
+
+<span class="cmt"># ── Sweep konfigürasyonları ──────────────────────────────────</span>
+SWEEP = {
+    <span class="str">"d_model"</span>:    [<span class="str">128</span>, <span class="str">256</span>, <span class="str">384</span>],
+    <span class="str">"n_layers"</span>:   [<span class="str">4</span>, <span class="str">6</span>, <span class="str">8</span>],
+    <span class="str">"n_heads"</span>:    [<span class="str">4</span>, <span class="str">8</span>],     <span class="cmt"># d_model / n_heads tam bölünmeli</span>
+    <span class="str">"max_lr"</span>:     [<span class="str">1e-3</span>, <span class="str">3e-3</span>],
+}
+
+<span class="keyword">def</span> <span class="cmd">run_experiment</span>(config: dict, max_iters: int = <span class="str">2000</span>) -> dict:
+    d_model  = config[<span class="str">"d_model"</span>]
+    n_heads  = config[<span class="str">"n_heads"</span>]
+    <span class="keyword">if</span> d_model % n_heads != <span class="str">0</span>:
+        <span class="keyword">return</span> <span class="keyword">None</span>  <span class="cmt"># geçersiz kombinasyon</span>
+
+    model = <span class="cmd">GPT</span>(
+        vocab_size=vocab_size,
+        d_model=d_model,
+        n_heads=n_heads,
+        n_layers=config[<span class="str">"n_layers"</span>],
+        block_size=<span class="str">256</span>,
+    ).<span class="cmd">to</span>(device)
+
+    n_params = <span class="cmd">sum</span>(p.<span class="cmd">numel</span>() <span class="keyword">for</span> p <span class="keyword">in</span> model.<span class="cmd">parameters</span>()) / <span class="str">1e6</span>
+
+    optimizer = torch.optim.<span class="cmd">AdamW</span>(
+        model.<span class="cmd">parameters</span>(), lr=config[<span class="str">"max_lr"</span>],
+        weight_decay=<span class="str">0.1</span>, betas=(<span class="str">0.9</span>, <span class="str">0.95</span>)
+    )
+
+    best_val = float(<span class="str">"inf"</span>)
+    <span class="keyword">for</span> it <span class="keyword">in</span> <span class="cmd">range</span>(max_iters):
+        xb, yb = <span class="cmd">get_batch</span>(<span class="str">"train"</span>)
+        _, loss = <span class="cmd">model</span>(xb.<span class="cmd">to</span>(device), yb.<span class="cmd">to</span>(device))
+        optimizer.<span class="cmd">zero_grad</span>()
+        loss.<span class="cmd">backward</span>()
+        torch.nn.utils.<span class="cmd">clip_grad_norm_</span>(model.<span class="cmd">parameters</span>(), <span class="str">1.0</span>)
+        optimizer.<span class="cmd">step</span>()
+
+        <span class="keyword">if</span> it == max_iters - <span class="str">1</span>:
+            model.<span class="cmd">eval</span>()
+            <span class="keyword">with</span> torch.<span class="cmd">no_grad</span>():
+                xv, yv = <span class="cmd">get_batch</span>(<span class="str">"val"</span>)
+                _, val_loss = <span class="cmd">model</span>(xv.<span class="cmd">to</span>(device), yv.<span class="cmd">to</span>(device))
+                best_val = <span class="cmd">float</span>(val_loss)
+
+    <span class="keyword">return</span> {**config, <span class="str">"n_params_M"</span>: n_params, <span class="str">"val_loss"</span>: best_val}
+
+<span class="cmt"># ── Tüm kombinasyonları çalıştır ─────────────────────────────</span>
+results = []
+keys = <span class="cmd">list</span>(SWEEP.keys())
+<span class="keyword">for</span> combo <span class="keyword">in</span> itertools.<span class="cmd">product</span>(*SWEEP.<span class="cmd">values</span>()):
+    cfg = <span class="cmd">dict</span>(<span class="cmd">zip</span>(keys, combo))
+    result = <span class="cmd">run_experiment</span>(cfg)
+    <span class="keyword">if</span> result:
+        results.<span class="cmd">append</span>(result)
+        <span class="cmd">print</span>(result)
+
+results.<span class="cmd">sort</span>(key=<span class="keyword">lambda</span> x: x[<span class="str">"val_loss"</span>])
+<span class="cmd">print</span>(<span class="str">"\n=== En iyi 3 konfigürasyon ==="</span>)
+<span class="keyword">for</span> r <span class="keyword">in</span> results[:<span class="str">3</span>]:
+    <span class="cmd">print</span>(<span class="str">f"val_loss={r['val_loss']:.4f} | params={r['n_params_M']:.1f}M | {r}"</span>)
+
+<span class="keyword">with</span> <span class="cmd">open</span>(<span class="str">"sweep_results.json"</span>, <span class="str">"w"</span>) <span class="keyword">as</span> f:
+    json.<span class="cmd">dump</span>(results, f, indent=<span class="str">2</span>)</code></pre>
+    </div>
+
+    <div class="callout">
+      <div class="label">GÖZLEMLer</div>
+      <p>TinyShakespeare sweep'te tipik gözlemler: d_model=256, n_layers=6, n_heads=8, lr=1e-3 kombinasyonu genellikle Pareto-optimal noktada. Daha derin &gt; daha geniş (katman eklmek, d_model büyütmekten genellikle daha iyi). Çok yüksek LR (3e-3) küçük modellerde unstable. nanoGPT-small: ~10M param, 2000 iter sonrası ~1.5 val loss.</p>
+    </div>
+  </section>
+
+</main>
+
+<footer>◆ EMİRHAN PEHLEVAN ◆<br>emirpehlevan@outlook.com</footer>

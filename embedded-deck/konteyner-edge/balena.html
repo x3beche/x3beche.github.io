@@ -1,0 +1,704 @@
+---
+layout: tutorial
+title: "balenaOS — Fleet Yönetimi"
+back_url: "../index.html"
+back_label: "Konteyner Orkestrasyon"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>KONTEYNER &amp; EDGE</span>
+    <span>balenaOS</span>
+    <span>2026</span>
+  </div>
+  <h1>balenaOS —<br><em>Fleet Yönetimi.</em></h1>
+  <p class="subtitle">Immutable OS, Supervisor ve Docker Compose tabanlı edge fleet yönetimi. balenaCloud'da multi-container uygulama, delta OTA güncelleme ve cihaz sağlık izleme. MQTT + InfluxDB + Grafana stack'i 10 cihaza deploy.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">balenaOS mimarisi — immutable OS, Supervisor, Docker Compose</a></li>
+    <li><a href="#s1">balenaCloud hesap ve fleet oluşturma</a></li>
+    <li><a href="#s2">balena CLI — push, logs, ssh</a></li>
+    <li><a href="#s3">docker-compose.yml ile multi-container app</a></li>
+    <li><a href="#s4">Environment variable ve secret yönetimi</a></li>
+    <li><a href="#s5">OTA güncelleme akışı — delta update</a></li>
+    <li><a href="#s6">Device health monitoring — dashboard ve metrikler</a></li>
+    <li><a href="#s7">balena local mode — yerel geliştirme</a></li>
+    <li><a href="#s8">Pratik — MQTT + InfluxDB + Grafana 10 cihaza deploy</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> balenaOS mimarisi — immutable OS, Supervisor, Docker Compose</h2>
+  <p class="section-lead">balenaOS, edge cihazlar için özel olarak tasarlanmış, <strong>immutable (değişmez)</strong> bir Linux dağıtımıdır. Uygulama katmanı Docker container'larında çalışır; OS katmanı OTA ile atomik olarak güncellenir.</p>
+
+  <h3>Katmanlı mimari</h3>
+
+  <div class="flow">
+    <pre>
+  ┌──────────────────────────────────────────────────────┐
+  │  Kullanıcı Uygulamaları (Docker Compose servisleri)  │
+  │  sensor-collector  mqtt-broker  influxdb  grafana    │
+  ├──────────────────────────────────────────────────────┤
+  │  balena Supervisor (Go daemon)                       │
+  │  · OTA uygulama güncellemesi                         │
+  │  · Device state raporlama                            │
+  │  · Sağlık kontrolü ve otomatik restart               │
+  ├──────────────────────────────────────────────────────┤
+  │  balenaEngine (Docker API uyumlu container runtime)  │
+  ├──────────────────────────────────────────────────────┤
+  │  balenaOS (Yocto tabanlı, immutable rootfs)          │
+  │  · Read-only root partition                          │
+  │  · A/B partition tabanlı OS güncelleme               │
+  │  · Minimal attack surface                            │
+  └──────────────────────────────────────────────────────┘
+    </pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">Immutable rootfs</span><span class="desc">Root dosya sistemi sadece okunabilir. Donanım arızası veya güç kesilmesinde bozulma yaşanmaz. Disk tutarsızlığı riski ortadan kalkar.</span></div>
+    <div class="param"><span class="name">A/B partition</span><span class="desc">OS güncellemesi boştaki partition'a yazılır. Reboot sonrası yeni partition aktive edilir. Başarısız güncelleme otomatik rollback yapar.</span></div>
+    <div class="param"><span class="name">balena Supervisor</span><span class="desc">Cihaz üzerinde çalışan Go daemon'u. balenaCloud ile WebSocket bağlantısı kurar, uygulama güncellemelerini çeker, sağlık metriklerini gönderir.</span></div>
+    <div class="param"><span class="name">balenaEngine</span><span class="desc">Docker Engine fork'u. Docker Compose v3 tam uyumluluğu. Mevcut Compose dosyaları değişiklik gerektirmez.</span></div>
+    <div class="param"><span class="name">Desteklenen donanım</span><span class="desc">RPi 3/4/5, CM3/CM4, balenaFin, Jetson Nano/TX2, Intel NUC, BeagleBone, NVIDIA Orin ve 100'den fazla donanım.</span></div>
+  </div>
+
+  <h3>balena ekosistemi bileşenleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Bileşen</th><th>Görev</th></tr></thead>
+      <tbody>
+        <tr><td>balenaCloud</td><td>Fleet yönetim platformu — web dashboard, API, OTA orchestration</td></tr>
+        <tr><td>balenaOS</td><td>Yocto tabanlı immutable Linux OS</td></tr>
+        <tr><td>balena Supervisor</td><td>Cihaz üstü daemon; OTA, sağlık, state sync</td></tr>
+        <tr><td>balenaEngine</td><td>Docker uyumlu container runtime</td></tr>
+        <tr><td>balena CLI</td><td>Geliştirici araç seti: push, logs, ssh, local dev</td></tr>
+        <tr><td>openbalena</td><td>Self-hosted balenaCloud alternatifi</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>balenaOS = immutable Yocto OS + A/B partition + balena Supervisor</li>
+      <li>Uygulama Docker Compose ile tanımlanır; Supervisor OTA ile günceller</li>
+      <li>RPi4, CM4, balenaFin dahil 100+ donanım resmi destek alır</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> balenaCloud hesap ve fleet oluşturma</h2>
+  <p class="section-lead">balenaCloud'da fleet (cihaz grubu) oluşturma, OS image indirme ve cihazı kaydetme adımları.</p>
+
+  <h3>Fleet oluşturma adımları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">1. Hesap oluştur</span><span class="desc">dashboard.balena.io adresinde hesap aç. Ücretsiz plan: 10 cihaz, unlimited fleet.</span></div>
+    <div class="param"><span class="name">2. Fleet oluştur</span><span class="desc">"Create fleet" → Donanım tipini seç (Raspberry Pi 4) → Fleet adı gir → Production veya Development mod seç.</span></div>
+    <div class="param"><span class="name">3. OS Image indir</span><span class="desc">Fleet sayfasından "Add device" → balenaOS image indir. Development modda SSH ve local mode açık gelir. Production modda kapalıdır.</span></div>
+    <div class="param"><span class="name">4. SD karta yaz</span><span class="desc">balenaEtcher ile image'ı SD karta yaz. Cihazı başlat — internet bağlantısıyla otomatik olarak fleet'e kayıt olur.</span></div>
+    <div class="param"><span class="name">5. Cihaz görünür</span><span class="desc">Dashboard'da cihaz "Online" olarak görünür. UUID, IP adresi, OS versiyonu ve uygulama durumu görüntülenir.</span></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — balena CLI ile fleet yönetimi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># balena CLI kurulumu (npm)</span>
+<span class="cmd">npm</span> install <span class="flag">-g</span> balena-cli
+
+<span class="cmt"># veya binary indirme</span>
+<span class="cmd">curl</span> <span class="flag">-fsSL</span> https://github.com/balena-io/balena-cli/releases/latest/download/balena-cli-v18.0.0-linux-x64-standalone.zip \
+  | <span class="cmd">unzip</span> - <span class="flag">-d</span> ~/.local/bin/
+
+<span class="cmt"># balenaCloud hesabına giriş</span>
+<span class="cmd">balena</span> login
+<span class="cmt"># ? How would you like to login?</span>
+<span class="cmt"># > Web authorization (recommended)</span>
+
+<span class="cmt"># Fleet listele</span>
+<span class="cmd">balena</span> fleets
+
+<span class="cmt"># Fleet oluştur</span>
+<span class="cmd">balena</span> fleet create sensor-platform \
+  <span class="flag">--type</span> raspberrypi4-64
+
+<span class="cmt"># Cihazları listele</span>
+<span class="cmd">balena</span> devices <span class="flag">--fleet</span> sensor-platform
+
+<span class="cmt"># Cihaz detayları</span>
+<span class="cmd">balena</span> device &lt;device-uuid&gt;</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Fleet oluştur → OS indir → balenaEtcher ile yaz → cihaz otomatik kaydolur</li>
+      <li>Development mod: SSH açık; Production mod: SSH kapalı, güvenli</li>
+      <li>balena CLI ile fleet ve cihaz yönetimi terminal üzerinden yapılır</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> balena CLI — push, logs, ssh</h2>
+  <p class="section-lead">balena CLI'nin en çok kullanılan üç komutu: <code>balena push</code> (uygulama deploy), <code>balena logs</code> (container log izleme) ve <code>balena ssh</code> (uzak terminal).</p>
+
+  <h3>balena push — uygulama deploy</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — balena push ile fleet'e deploy</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Proje dizinine git</span>
+<span class="cmd">cd</span> ~/projects/sensor-platform
+
+<span class="cmt"># Tüm fleet'e push et</span>
+<span class="cmd">balena</span> push sensor-platform
+
+<span class="cmt"># balena push adımları:</span>
+<span class="cmt"># 1. docker-compose.yml dosyasını okur</span>
+<span class="cmt"># 2. Her servis için Dockerfile build eder (balena builder buluta yükler)</span>
+<span class="cmt"># 3. Multi-arch imaj oluşturur (ARM64 için aarch64 native)</span>
+<span class="cmt"># 4. Release oluşturur → fleet'teki tüm cihazlara deploy başlar</span>
+
+<span class="cmt"># Push çıktısı:</span>
+<span class="cmt"># [Build]   [main] Step 1/8 : FROM python:3.11-slim</span>
+<span class="cmt"># [Build]   [main] Successfully built abc123</span>
+<span class="cmt"># [Info]    Release: 1234567 (commit: abc123def)</span>
+<span class="cmt"># [Success] Deploy successful</span>
+
+<span class="cmt"># Belirli cihaza push et</span>
+<span class="cmd">balena</span> push &lt;device-uuid&gt; <span class="flag">--source</span> .
+
+<span class="cmt"># Draft release oluştur (production'a gitmeden test)</span>
+<span class="cmd">balena</span> push sensor-platform <span class="flag">--draft</span></code></pre>
+  </div>
+
+  <h3>balena logs</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — container log izleme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm servislerin logunu izle</span>
+<span class="cmd">balena</span> logs &lt;device-uuid&gt;
+
+<span class="cmt"># Belirli servis logu</span>
+<span class="cmd">balena</span> logs &lt;device-uuid&gt; <span class="flag">--service</span> sensor-collector
+
+<span class="cmt"># Son 100 satır</span>
+<span class="cmd">balena</span> logs &lt;device-uuid&gt; <span class="flag">--tail</span> 100
+
+<span class="cmt"># Sistem logları (Supervisor dahil)</span>
+<span class="cmd">balena</span> logs &lt;device-uuid&gt; <span class="flag">--system</span></code></pre>
+  </div>
+
+  <h3>balena ssh</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — uzak terminal erişimi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Host OS'e SSH (development mod veya tunnel)</span>
+<span class="cmd">balena</span> ssh &lt;device-uuid&gt;
+
+<span class="cmt"># Belirli servis container'ına gir</span>
+<span class="cmd">balena</span> ssh &lt;device-uuid&gt; <span class="flag">--service</span> sensor-collector
+
+<span class="cmt"># Container içinde komut çalıştır</span>
+<span class="cmd">balena</span> ssh &lt;device-uuid&gt; <span class="flag">-s</span> sensor-collector -- python3 -c <span class="str">"import sys; print(sys.version)"</span>
+
+<span class="cmt"># Lokal ağdaki cihaza direk SSH (local mode)</span>
+<span class="cmd">balena</span> ssh &lt;local-ip&gt;
+<span class="cmt"># root@&lt;uuid&gt;:~#</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>balena push: bulutta build → release oluştur → tüm fleet'e OTA deploy</li>
+      <li>balena logs: servis bazında log takibi, --system Supervisor loglarını kapsar</li>
+      <li>balena ssh: host OS veya belirli container'a uzak terminal erişimi</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> docker-compose.yml ile multi-container app</h2>
+  <p class="section-lead">balenaOS uygulamaları Docker Compose v3 formatında tanımlanır. Her servis ayrı bir container olarak çalışır; Supervisor bu compose dosyasını yorumlar.</p>
+
+  <h3>Örnek multi-container compose</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>docker-compose.yml — sensor platform stack</span><span class="dot">●</span></div>
+    <pre><code>version: "2.4"
+
+volumes:
+  influxdb-data:
+  grafana-data:
+  mosquitto-data:
+
+services:
+
+  mqtt-broker:
+    build: ./mqtt-broker
+    restart: always
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - mosquitto-data:/mosquitto/data
+      - ./mqtt-broker/config:/mosquitto/config:ro
+    labels:
+      io.balena.features.supervisor-api: "1"
+
+  sensor-collector:
+    build: ./sensor-collector
+    restart: always
+    privileged: true
+    devices:
+      - "/dev/i2c-1:/dev/i2c-1"
+      - "/dev/gpiomem:/dev/gpiomem"
+    environment:
+      MQTT_HOST: mqtt-broker
+      MQTT_PORT: "1883"
+      POLL_INTERVAL: "10"
+    depends_on:
+      - mqtt-broker
+    labels:
+      io.balena.features.balena-socket: "1"
+
+  influxdb:
+    image: influxdb:2.7-alpine
+    restart: always
+    ports:
+      - "8086:8086"
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    restart: always
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - influxdb</code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">io.balena.features.supervisor-api</span><span class="desc">Servis, Supervisor API'sine erişebilir. Cihaz yeniden başlatma, uygulama güncelleme gibi işlemler programatik yapılabilir.</span></div>
+    <div class="param"><span class="name">io.balena.features.balena-socket</span><span class="desc">balenaEngine Docker socket'ine erişim. Dinamik container yönetimi gerektiğinde kullanılır.</span></div>
+    <div class="param"><span class="name">privileged: true</span><span class="desc">GPIO ve I2C erişimi için gerekli. Üretimde mümkün olduğunca --device ile sınırlı erişim tercih edilmeli.</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Docker Compose v2.4 formatı kullanılır (v3 özelliklerinin bir kısmı desteklenmez)</li>
+      <li>io.balena.features.* label'ları ile Supervisor özellikleri etkinleştirilir</li>
+      <li>GPIO/I2C için devices veya privileged; üretimde devices tercih edilmeli</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Environment variable ve secret yönetimi</h2>
+  <p class="section-lead">balenaCloud'da ortam değişkenleri fleet seviyesinde veya tekil cihaz seviyesinde tanımlanabilir. Hassas değerler için "balena Secret" özelliği kullanılır.</p>
+
+  <h3>Fleet ve cihaz seviyesi değişkenler</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — balena CLI ile env var yönetimi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Fleet seviyesi değişken ekle (tüm cihazlara uygulanır)</span>
+<span class="cmd">balena</span> env add MQTT_BROKER_URL \
+  mqtt://mqtt-broker:1883 \
+  <span class="flag">--fleet</span> sensor-platform
+
+<span class="cmt"># Birden fazla servis için (belirli servise)</span>
+<span class="cmd">balena</span> env add POLL_INTERVAL 30 \
+  <span class="flag">--fleet</span> sensor-platform \
+  <span class="flag">--service</span> sensor-collector
+
+<span class="cmt"># Cihaz seviyesi değişken (yalnızca bu cihaz için)</span>
+<span class="cmd">balena</span> env add DEVICE_LOCATION \
+  "factory-floor-A" \
+  <span class="flag">--device</span> &lt;device-uuid&gt;
+
+<span class="cmt"># Tüm değişkenleri listele</span>
+<span class="cmd">balena</span> envs <span class="flag">--fleet</span> sensor-platform
+
+<span class="cmt"># Değişken güncelle</span>
+<span class="cmd">balena</span> env rename &lt;var-id&gt; NEW_VALUE
+
+<span class="cmt"># Değişken sil</span>
+<span class="cmd">balena</span> env rm &lt;var-id&gt;</code></pre>
+  </div>
+
+  <h3>balena Secret (gizli değerler)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — secret yönetimi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Secret oluştur — dashboard'da değer şifreli saklanır</span>
+<span class="cmd">balena</span> env add INFLUXDB_PASSWORD \
+  "s3cr3tP@ssw0rd" \
+  <span class="flag">--fleet</span> sensor-platform \
+  <span class="flag">--secret</span>
+
+<span class="cmt"># API token secret'ı</span>
+<span class="cmd">balena</span> env add GRAFANA_ADMIN_PASSWORD \
+  "gr4f4n4P4ss" \
+  <span class="flag">--fleet</span> sensor-platform \
+  <span class="flag">--secret</span>
+
+<span class="cmt"># Secret değerler CLI çıktısında maskelenir</span>
+<span class="cmt"># balena envs → INFLUXDB_PASSWORD: ***</span></code></pre>
+  </div>
+
+  <h3>compose'da env var kullanımı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>docker-compose.yml — env var referansı</span><span class="dot">●</span></div>
+    <pre><code">  influxdb:
+    image: influxdb:2.7-alpine
+    environment:
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUXDB_PASSWORD}
+      DOCKER_INFLUXDB_INIT_ORG: ${INFLUXDB_ORG:-myorg}
+      DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUXDB_BUCKET:-sensors}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Fleet seviyesi değişkenler tüm cihazlara, cihaz seviyesi değişkenler tekil cihaza uygulanır</li>
+      <li>--secret flag'i ile değer dashboard'da maskelenir, log'a düşmez</li>
+      <li>compose'da ${VAR:-default} sözdizimi ile varsayılan değer tanımlanır</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> OTA güncelleme akışı — delta update</h2>
+  <p class="section-lead">balenaCloud'un delta update sistemi, yalnızca değişen dosya bloklarını iletir. 100 MB imaj için sadece 2-5 MB veri aktarılabilir; düşük bant genişliği ve ölçülü veri planı olan edge cihazlar için kritiktir.</p>
+
+  <h3>OTA güncelleme akışı</h3>
+
+  <div class="flow">
+    <pre>
+  Geliştirici
+  balena push sensor-platform
+         │
+         ▼
+  balena Builder (bulut)
+  · Dockerfile build (aarch64 native)
+  · Multi-layer imaj oluştur
+  · Delta hesapla (mevcut sürümle fark)
+         │
+         ▼
+  balenaCloud Release (commit hash)
+         │
+         ▼ (SuperVisor polling veya push event)
+  Cihazlar (10x RPi4)
+  · Delta parçaları indir (~MB, tam imaj değil ~100MB)
+  · containerd imaj katmanlarını güncelle
+  · Graceful restart: eski container dur → yeni başlar
+  · Başarısızsa: otomatik rollback
+    </pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — release yönetimi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Güncel release listele</span>
+<span class="cmd">balena</span> releases sensor-platform
+
+<span class="cmt"># Belirli release'i pinle (otomatik güncelleme durdur)</span>
+<span class="cmd">balena</span> fleet pin sensor-platform &lt;release-commit&gt;
+
+<span class="cmt"># Tekil cihaza release pinle</span>
+<span class="cmd">balena</span> device pin &lt;device-uuid&gt; &lt;release-commit&gt;
+
+<span class="cmt"># Pin kaldır (tekrar otomatik güncellemeye geç)</span>
+<span class="cmd">balena</span> fleet track-latest sensor-platform
+
+<span class="cmt"># Draft release'i final yap (staged rollout)</span>
+<span class="cmd">balena</span> release finalize &lt;release-commit&gt;
+
+<span class="cmt"># Cihaz güncelleme durumunu izle</span>
+<span class="cmd">balena</span> devices <span class="flag">--fleet</span> sensor-platform \
+  <span class="flag">--fields</span> id,uuid,status,is_online,os_version,supervisor_version</code></pre>
+  </div>
+
+  <h3>Supervisor API ile programatik güncelleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Supervisor API üzerinden güncelleme tetikleme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Container içinden (io.balena.features.supervisor-api aktif)</span>
+<span class="cmt"># Uygulamayı güncelle</span>
+<span class="cmd">curl</span> <span class="flag">-X</span> POST \
+  "http://$(BALENA_SUPERVISOR_ADDRESS)/v1/update" \
+  <span class="flag">-H</span> "Authorization: Bearer $BALENA_SUPERVISOR_API_KEY" \
+  <span class="flag">-H</span> "Content-Type: application/json" \
+  <span class="flag">-d</span> <span class="str">'{"force": true}'</span>
+
+<span class="cmt"># Cihazı yeniden başlat</span>
+<span class="cmd">curl</span> <span class="flag">-X</span> POST \
+  "http://$(BALENA_SUPERVISOR_ADDRESS)/v1/reboot" \
+  <span class="flag">-H</span> "Authorization: Bearer $BALENA_SUPERVISOR_API_KEY"</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Delta update: değişen bloklar iletilir; bant genişliği %90+ tasarruf</li>
+      <li>Release pin ile belirli sürüm dondurulur; staged rollout desteklenir</li>
+      <li>Supervisor API ile container içinden güncelleme ve reboot tetiklenir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Device health monitoring — dashboard ve metrikler</h2>
+  <p class="section-lead">balenaCloud dashboard'u, cihaz sağlığını anlık izleme, CPU/RAM/disk metrikleri ve bağlantı durumu görünürlüğü sağlar.</p>
+
+  <h3>Dashboard metrikleri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">CPU kullanımı</span><span class="desc">Ortalama ve anlık CPU yükü (%). Yüksek değerler uygulama performans sorununa işaret eder.</span></div>
+    <div class="param"><span class="name">Bellek kullanımı</span><span class="desc">Kullanılan / toplam RAM (MB). Bellek sızıntısı tespitinde zaman serisi grafiği kullanılır.</span></div>
+    <div class="param"><span class="name">Depolama</span><span class="desc">Data partition kullanımı (%). Log birikimi ve data büyümesi disk dolmasına yol açabilir.</span></div>
+    <div class="param"><span class="name">Ağ bağlantısı</span><span class="desc">Online/offline durumu, son görülme zamanı, VPN bağlantı durumu.</span></div>
+    <div class="param"><span class="name">OS ve Supervisor versiyonu</span><span class="desc">Fleet'teki tüm cihazlarda versiyon dağılımı. Eski versiyondaki cihazlar tespit edilir.</span></div>
+  </div>
+
+  <h3>Supervisor API ile metrik okuma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Supervisor API metrik endpointleri</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Cihaz durumu (container içinden)</span>
+<span class="cmd">curl</span> <span class="str">"http://$BALENA_SUPERVISOR_ADDRESS/v2/device/name"</span> \
+  <span class="flag">-H</span> <span class="str">"Authorization: Bearer $BALENA_SUPERVISOR_API_KEY"</span>
+<span class="cmt"># {"status":"success","deviceName":"floral-dew"}</span>
+
+<span class="cmt"># Çalışan servisler</span>
+<span class="cmd">curl</span> <span class="str">"http://$BALENA_SUPERVISOR_ADDRESS/v2/containerId"</span> \
+  <span class="flag">-H</span> <span class="str">"Authorization: Bearer $BALENA_SUPERVISOR_API_KEY"</span>
+
+<span class="cmt"># Uygulama state</span>
+<span class="cmd">curl</span> <span class="str">"http://$BALENA_SUPERVISOR_ADDRESS/v2/applications/state"</span> \
+  <span class="flag">-H</span> <span class="str">"Authorization: Bearer $BALENA_SUPERVISOR_API_KEY"</span>
+
+<span class="cmt"># Host OS metrik</span>
+<span class="cmd">curl</span> <span class="str">"http://$BALENA_SUPERVISOR_ADDRESS/v1/device"</span> \
+  <span class="flag">-H</span> <span class="str">"Authorization: Bearer $BALENA_SUPERVISOR_API_KEY"</span>
+<span class="cmt"># {"api_port":48484,"ip_address":"192.168.1.50","mac_address":"dc:a6:32:xx:xx:xx",</span>
+<span class="cmt">#  "memory_usage":412,"memory_total":3904,"storage_usage":2048,"storage_total":29000,</span>
+<span class="cmt">#  "cpu_usage":12,"cpu_temp":47}</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">Prometheus entegrasyonu</div>
+    <p>Supervisor metriklerini kendi Prometheus/Grafana stack'inize aktarmak için <code>BALENA_SUPERVISOR_ADDRESS</code> ve <code>BALENA_SUPERVISOR_API_KEY</code> ortam değişkenlerini kullanan bir exporter servisi yazabilirsiniz. Bu metrikleri Fleet'teki tüm cihazlardan merkezde toplamak için Prometheus remote_write kullanın.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Dashboard: CPU, RAM, disk, ağ durumu, OS/Supervisor versiyonu</li>
+      <li>Supervisor API /v1/device ile programatik metrik okuma</li>
+      <li>Metrikler kendi Prometheus/Grafana stack'ine aktarılabilir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> balena local mode — yerel geliştirme</h2>
+  <p class="section-lead">Local mode, balenaCloud'a push etmeden aynı ağdaki cihaza doğrudan kod deploy etmeyi sağlar. Geliştirme döngüsünü saniyeye indirir.</p>
+
+  <h3>Local mode aktifleştirme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — local mode etkinleştirme ve kullanım</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Dashboard'dan veya CLI ile local mode aç</span>
+<span class="cmd">balena</span> device local-mode enable &lt;device-uuid&gt;
+
+<span class="cmt"># Aynı ağdaki cihazları tara</span>
+<span class="cmd">balena</span> scan
+<span class="cmt"># - 192.168.1.50   floral-dew.local</span>
+<span class="cmt"># - 192.168.1.51   crimson-leaf.local</span>
+
+<span class="cmt"># Lokal cihaza push et (bulut build olmadan)</span>
+<span class="cmd">balena</span> push floral-dew.local
+
+<span class="cmt"># veya IP ile</span>
+<span class="cmd">balena</span> push 192.168.1.50
+
+<span class="cmt"># Lokal SSH</span>
+<span class="cmd">balena</span> ssh floral-dew.local
+
+<span class="cmt"># Servis container'ına gir</span>
+<span class="cmd">balena</span> ssh floral-dew.local <span class="flag">-s</span> sensor-collector</code></pre>
+  </div>
+
+  <h3>Live update (sıcak kod güncellemesi)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — live update ile anında kod değişikliği</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># Live update: dosya değişikliği algılanır, container yeniden başlatılmadan güncellenir</span>
+<span class="cmd">balena</span> push floral-dew.local <span class="flag">--live</span>
+
+<span class="cmt"># Çıktı:</span>
+<span class="cmt"># [Live] Watching for file changes...</span>
+<span class="cmt"># [Live] File changed: src/sensor.py</span>
+<span class="cmt"># [Live] Syncing to sensor-collector...</span>
+<span class="cmt"># [Live] Sync complete in 1.2s</span>
+
+<span class="cmt"># .balenaignore ile gereksiz dosyaları hariç tut</span>
+<span class="cmd">cat</span> .balenaignore
+<span class="cmt"># __pycache__/</span>
+<span class="cmt"># *.pyc</span>
+<span class="cmt"># .git/</span>
+<span class="cmt"># node_modules/</span>
+<span class="cmt"># tests/</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Local mode: buluta push gerekmez, aynı ağdaki cihaza doğrudan deploy</li>
+      <li>balena scan ile ağdaki balenaOS cihazları keşfedilir</li>
+      <li>--live flag'i ile dosya değişikliği anında cihaza sync edilir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik — MQTT + InfluxDB + Grafana 10 cihaza deploy</h2>
+  <p class="section-lead">10 adet Raspberry Pi 4'ten oluşan bir sensör izleme fleet'ine balenaCloud üzerinden MQTT + InfluxDB + Grafana stack'i deploy ediyoruz.</p>
+
+  <h3>Proje yapısı</h3>
+
+  <div class="flow">
+    <pre>
+  sensor-platform/
+  ├── docker-compose.yml
+  ├── mqtt-broker/
+  │   ├── Dockerfile
+  │   └── config/mosquitto.conf
+  ├── sensor-collector/
+  │   ├── Dockerfile
+  │   ├── requirements.txt
+  │   └── src/collector.py
+  ├── influxdb/
+  │   └── setup.sh
+  └── grafana/
+      └── provisioning/
+          ├── datasources/influxdb.yaml
+          └── dashboards/sensors.json
+    </pre>
+  </div>
+
+  <h3>sensor-collector Dockerfile</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>sensor-collector/Dockerfile</span><span class="dot">●</span></div>
+    <pre><code">FROM balenalib/raspberrypi4-64-python:3.11-bookworm-run
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY src/ ./src/
+CMD ["python3", "src/collector.py"]</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>sensor-collector/src/collector.py — MQTT sensör toplayıcı</span><span class="dot">●</span></div>
+    <pre><code>import os, time, json, smbus2
+import paho.mqtt.client as mqtt
+
+MQTT_HOST    = os.environ.get("MQTT_HOST", "mqtt-broker")
+MQTT_PORT    = int(os.environ.get("MQTT_PORT", 1883))
+DEVICE_UUID  = os.environ.get("BALENA_DEVICE_UUID", "unknown")
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 10))
+
+client = mqtt.Client(client_id=f"collector-{DEVICE_UUID}")
+client.connect(MQTT_HOST, MQTT_PORT)
+client.loop_start()
+
+def read_sensor():
+    # BME280 I2C sensör okuma (gerçek uygulamada)
+    import random
+    return {
+        "device_uuid": DEVICE_UUID,
+        "temperature": 23.0 + random.uniform(-1, 1),
+        "humidity":    55.0 + random.uniform(-5, 5),
+        "pressure":    1013.0 + random.uniform(-2, 2),
+        "timestamp":   time.time()
+    }
+
+while True:
+    data = read_sensor()
+    topic = f"sensors/{DEVICE_UUID}/environment"
+    client.publish(topic, json.dumps(data), qos=1)
+    print(f"Published: {data}")
+    time.sleep(POLL_INTERVAL)</code></pre>
+  </div>
+
+  <h3>Fleet deploy ve izleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — fleet deploy ve cihaz izleme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Fleet değişkenlerini ayarla</span>
+<span class="cmd">balena</span> env add INFLUXDB_ORG myorg <span class="flag">--fleet</span> sensor-platform
+<span class="cmd">balena</span> env add INFLUXDB_BUCKET sensors <span class="flag">--fleet</span> sensor-platform
+<span class="cmd">balena</span> env add INFLUXDB_PASSWORD "s3cr3t" <span class="flag">--fleet</span> sensor-platform <span class="flag">--secret</span>
+<span class="cmd">balena</span> env add GRAFANA_ADMIN_PASSWORD "gr4f4n4" <span class="flag">--fleet</span> sensor-platform <span class="flag">--secret</span>
+
+<span class="cmt"># Tüm fleet'e push et</span>
+<span class="cmd">balena</span> push sensor-platform
+
+<span class="cmt"># 10 cihazın güncelleme durumunu izle</span>
+<span class="cmd">watch</span> <span class="flag">-n</span> 5 <span class="str">"balena devices --fleet sensor-platform | grep -E 'UUID|STATUS'"</span>
+
+<span class="cmt"># MQTT mesajlarını test cihazından izle</span>
+<span class="cmd">balena</span> ssh &lt;device-uuid&gt; <span class="flag">-s</span> mqtt-broker -- \
+  mosquitto_sub <span class="flag">-h</span> localhost <span class="flag">-t</span> <span class="str">"sensors/#"</span> <span class="flag">-v</span>
+
+<span class="cmt"># InfluxDB'de veri kontrolü</span>
+<span class="cmd">balena</span> ssh &lt;device-uuid&gt; <span class="flag">-s</span> influxdb -- \
+  influx query <span class="str">'from(bucket:"sensors") |> range(start: -1h) |> limit(n:5)'</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">Ölçeklendirme notu</div>
+    <p>10 cihaz için balenaCloud ücretsiz planı yeterlidir. Daha büyük fleet'lerde (100+ cihaz) openbalena self-hosted kurulumu maliyet optimizasyonu sağlar. openbalena, tam balenaCloud stack'ini kendi altyapınızda çalıştırmanıza olanak verir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>MQTT → InfluxDB → Grafana stack balenaOS üzerinde Compose ile çalışır</li>
+      <li>BALENA_DEVICE_UUID env değişkeni her cihazda unique topic oluşturmak için kullanıldı</li>
+      <li>balena push ile tüm 10 cihaza delta OTA güncelleme tek komutla yapılır</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

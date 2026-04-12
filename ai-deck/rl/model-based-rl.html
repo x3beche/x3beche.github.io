@@ -1,0 +1,718 @@
+---
+layout: tutorial
+title: "Model-Based RL — World Models & Planning"
+back_url: "../index.html"
+back_label: "Reinforcement Learning"
+---
+
+<header class="header">
+  <div class="meta">
+    <span>Rehber</span>
+    <span>Yapay Zeka</span>
+    <span>RL · Model-Based</span>
+  </div>
+  <h1>Model-Based RL<br><em>World Models &amp; Planning.</em></h1>
+  <p class="subtitle">Model-free'nin sample verimsizliğini aşmak için ortam dinamikleri öğren, hayal et, planla. Dyna-Q'dan MuZero'ya, Dreamer'a.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçerik</div>
+  <ol>
+    <li><a href="#s0">Model-Based vs Model-Free Tradeoff</a></li>
+    <li><a href="#s1">World Model Nedir?</a></li>
+    <li><a href="#s2">Dyna-Q — Model + Planning + Learning</a></li>
+    <li><a href="#s3">MuZero Mimarisi</a></li>
+    <li><a href="#s4">MCTS ile Learned Model</a></li>
+    <li><a href="#s5">Dreamer — Latent Dynamics</a></li>
+    <li><a href="#s6">PlaNet ve RSSM</a></li>
+    <li><a href="#s7">Imagination Rollouts</a></li>
+    <li><a href="#s8">Sample Efficiency Karşılaştırma</a></li>
+    <li><a href="#s9">Pratik: Pendulum MPC</a></li>
+  </ol>
+</nav>
+
+<main>
+
+  <!-- ── s0 ──────────────────────────────────────────────────── -->
+  <section id="s0">
+    <h2><span class="num">00</span> Model-Based vs Model-Free Tradeoff</h2>
+    <p class="section-lead">Model-free algoritmalar güvenilir ama veri açtır; model-based yöntemler verimlidir ama model hatalarına karşı hassastır.</p>
+
+    <p>PPO ve DQN gibi model-free yöntemler, sadece deneyimden (s,a,r,s') öğrenir. Ortamın nasıl çalıştığına dair herhangi bir model tutmazlar. Bu yaklaşım robusttır — hatalı model yoktur — ama son derece sample-verimsizdir. Atari'de uzman insan seviyesine ulaşmak için tipik olarak 200 milyon frame gerekir; bir insan birkaç saatte aynı noktaya ulaşır.</p>
+
+    <p><strong>Model-based RL</strong>, ortamın bir <em>world model</em>'ini öğrenir: P(s'|s,a) ve R(s,a). Bu model, gerçek ortam etkileşimi olmadan "hayal edilen" deneyimler üretebilir. Avantajları: dramatik olarak daha az gerçek etkileşim, planlama kapasitesi, öğrenilen dinamiklerden genelleme.</p>
+
+    <div class="file-table">
+      <div class="ft-header">
+        <span>Özellik</span>
+        <span>Model-Free</span>
+        <span>Model-Based</span>
+      </div>
+      <div class="ft-row">
+        <span>Sample efficiency</span>
+        <span>Düşük (10M+ step)</span>
+        <span>Yüksek (100K-1M step)</span>
+      </div>
+      <div class="ft-row">
+        <span>Planlama kapasitesi</span>
+        <span>Yok</span>
+        <span>Var (MCTS, MPC)</span>
+      </div>
+      <div class="ft-row">
+        <span>Model hatası riski</span>
+        <span>Yok</span>
+        <span>Var (compounding error)</span>
+      </div>
+      <div class="ft-row">
+        <span>Hesaplama maliyeti</span>
+        <span>Orta</span>
+        <span>Yüksek (planlama)</span>
+      </div>
+      <div class="ft-row">
+        <span>Uygulama örnekleri</span>
+        <span>PPO, DQN, SAC</span>
+        <span>MuZero, Dreamer, Dyna-Q</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── s1 ──────────────────────────────────────────────────── -->
+  <section id="s1">
+    <h2><span class="num">01</span> World Model Nedir?</h2>
+    <p class="section-lead">World model, ortamın dinamiklerini ve ödül fonksiyonunu parametrik biçimde temsil eden bir sinir ağıdır.</p>
+
+    <p>Bir world model iki temel bileşenden oluşur:</p>
+
+    <div class="params">
+      <div class="param-row">
+        <span class="param-name">Dynamics Model</span>
+        <span class="param-desc">f_θ(s,a) → s' : Mevcut state ve eylem verildiğinde bir sonraki state'i tahmin eder. Deterministik veya stokastik olabilir.</span>
+      </div>
+      <div class="param-row">
+        <span class="param-name">Reward Model</span>
+        <span class="param-desc">r_φ(s,a) → r : Bir state-action çiftinin vereceği ödülü tahmin eder. Gerçek reward fonksiyonu bilinmediğinde öğrenilir.</span>
+      </div>
+    </div>
+
+    <p>Opsiyonel olarak <em>termination model</em> de eklenebilir: d_ψ(s) → {0,1}. Bu üçlü birlikte, gerçek ortamı simüle eden bir "hayal ortamı" oluşturur.</p>
+
+    <p>World model öğrenme: gerçek deneyimlerden (s, a, r, s') oluşan bir veri kümesi üzerinde supervised learning ile eğitilir. Sonra bu model, policy iyileştirme için hayal edilen veri üretmekte kullanılır.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>world_model.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> torch
+<span class="keyword">import</span> torch.nn <span class="keyword">as</span> nn
+<span class="keyword">import</span> torch.nn.functional <span class="keyword">as</span> F
+
+<span class="keyword">class</span> <span class="cmd">DeterministicWorldModel</span>(nn.Module):
+    <span class="str">"""
+    Basit deterministik dünya modeli.
+    Input : (state, action)
+    Output: (next_state, reward)
+    """</span>
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, state_dim, action_dim, hidden=<span class="str">256</span>):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>()
+        self.dynamics = nn.<span class="cmd">Sequential</span>(
+            nn.<span class="cmd">Linear</span>(state_dim + action_dim, hidden), nn.<span class="cmd">SiLU</span>(),
+            nn.<span class="cmd">Linear</span>(hidden, hidden),                  nn.<span class="cmd">SiLU</span>(),
+            nn.<span class="cmd">Linear</span>(hidden, state_dim)
+        )
+        self.reward = nn.<span class="cmd">Sequential</span>(
+            nn.<span class="cmd">Linear</span>(state_dim + action_dim, hidden), nn.<span class="cmd">SiLU</span>(),
+            nn.<span class="cmd">Linear</span>(hidden, hidden // <span class="str">2</span>),              nn.<span class="cmd">SiLU</span>(),
+            nn.<span class="cmd">Linear</span>(hidden // <span class="str">2</span>, <span class="str">1</span>)
+        )
+
+    <span class="keyword">def</span> <span class="cmd">forward</span>(self, state, action):
+        x         = torch.<span class="cmd">cat</span>([state, action], dim=-<span class="str">1</span>)
+        next_state = state + self.dynamics(x)  <span class="cmt"># residual bağlantı</span>
+        reward     = self.reward(x).<span class="cmd">squeeze</span>(-<span class="str">1</span>)
+        <span class="keyword">return</span> next_state, reward
+
+<span class="keyword">def</span> <span class="cmd">train_world_model</span>(model, optimizer, replay_buffer, batch_size=<span class="str">256</span>):
+    <span class="str">"""Gerçek deneyimlerden world model eğit."""</span>
+    s, a, r, s2, _ = replay_buffer.<span class="cmd">sample</span>(batch_size)
+
+    s_pred, r_pred = model(s, a)
+
+    dyn_loss = F.<span class="cmd">mse_loss</span>(s_pred, s2)
+    rew_loss = F.<span class="cmd">mse_loss</span>(r_pred, r)
+    loss     = dyn_loss + rew_loss
+
+    optimizer.<span class="cmd">zero_grad</span>()
+    loss.<span class="cmd">backward</span>()
+    optimizer.<span class="cmd">step</span>()
+
+    <span class="keyword">return</span> dyn_loss.<span class="cmd">item</span>(), rew_loss.<span class="cmd">item</span>()</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s2 ──────────────────────────────────────────────────── -->
+  <section id="s2">
+    <h2><span class="num">02</span> Dyna-Q — Model + Planning + Learning</h2>
+    <p class="section-lead">Dyna-Q, gerçek deneyim ve model-tabanlı simülasyonu tek döngüde birleştirir.</p>
+
+    <p>Sutton'ın 1991'de tanımladığı Dyna mimarisi, birbirini tamamlayan üç bileşenden oluşur: (1) Gerçek ortamla etkileşim, (2) bu deneyimlerden model öğrenme, (3) öğrenilen modelden simüle edilmiş deneyimler üretip Q-learning ile güncelleme.</p>
+
+    <p>Her adımda k kez "planlama" yapılır: mevcut model ile hayal edilen (s,a,r,s') tuple'ları üretilir ve Q-tablosu bu hayali deneyimlerle de güncellenir. k büyüdükçe daha hızlı öğrenilir — ama daha fazla hesaplama gerekir.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>dyna_q.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> gymnasium <span class="keyword">as</span> gym
+<span class="keyword">import</span> numpy <span class="keyword">as</span> np
+<span class="keyword">from</span> collections <span class="keyword">import</span> defaultdict
+<span class="keyword">import</span> random
+
+<span class="keyword">class</span> <span class="cmd">DynaQAgent</span>:
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, n_states, n_actions, alpha=<span class="str">0.1</span>,
+                 gamma=<span class="str">0.99</span>, eps=<span class="str">0.1</span>, k_planning=<span class="str">5</span>):
+        self.Q = np.<span class="cmd">zeros</span>((n_states, n_actions))
+        <span class="cmt"># Model: (s,a) → (r, s') geçmişini sakla</span>
+        self.model = {}         <span class="cmt"># {(s,a): (r, s_next)}</span>
+        self.visited = []       <span class="cmt"># ziyaret edilen (s,a) çiftleri</span>
+
+        self.alpha      = alpha
+        self.gamma      = gamma
+        self.eps        = eps
+        self.k_planning = k_planning
+
+    <span class="keyword">def</span> <span class="cmd">act</span>(self, state):
+        <span class="keyword">if</span> np.random.<span class="cmd">random</span>() &lt; self.eps:
+            <span class="keyword">return</span> np.random.<span class="cmd">randint</span>(self.Q.shape[<span class="str">1</span>])
+        <span class="keyword">return</span> np.<span class="cmd">argmax</span>(self.Q[state])
+
+    <span class="keyword">def</span> <span class="cmd">update</span>(self, s, a, r, s2, done):
+        <span class="cmt"># 1. Gerçek deneyimden Q-learning güncellemesi</span>
+        td_target = r + self.gamma * np.<span class="cmd">max</span>(self.Q[s2]) * (<span class="str">1</span>-done)
+        self.Q[s, a] += self.alpha * (td_target - self.Q[s, a])
+
+        <span class="cmt"># 2. Model güncelleme (deterministik tablo tabanlı)</span>
+        self.model[(s, a)] = (r, s2)
+        <span class="keyword">if</span> (s, a) <span class="keyword">not</span> <span class="keyword">in</span> self.visited:
+            self.visited.<span class="cmd">append</span>((s, a))
+
+        <span class="cmt"># 3. Planlama: k kez hayali deneyim üret</span>
+        <span class="keyword">for</span> _ <span class="keyword">in</span> <span class="cmd">range</span>(self.k_planning):
+            <span class="keyword">if</span> <span class="keyword">not</span> self.visited:
+                <span class="keyword">break</span>
+            s_sim, a_sim = random.<span class="cmd">choice</span>(self.visited)
+            r_sim, s2_sim = self.model[(s_sim, a_sim)]
+            td_t = r_sim + self.gamma * np.<span class="cmd">max</span>(self.Q[s2_sim])
+            self.Q[s_sim, a_sim] += self.alpha * (td_t - self.Q[s_sim, a_sim])
+
+<span class="cmt"># FrozenLake ile Dyna-Q test</span>
+env = gym.<span class="cmd">make</span>(<span class="str">'FrozenLake-v1'</span>, is_slippery=<span class="keyword">False</span>)
+agent = <span class="cmd">DynaQAgent</span>(n_states=<span class="str">16</span>, n_actions=<span class="str">4</span>, k_planning=<span class="str">10</span>)
+
+rewards = []
+<span class="keyword">for</span> ep <span class="keyword">in</span> <span class="cmd">range</span>(<span class="str">2000</span>):
+    s, _ = env.<span class="cmd">reset</span>()
+    total = <span class="str">0</span>
+    <span class="keyword">while</span> <span class="keyword">True</span>:
+        a = agent.<span class="cmd">act</span>(s)
+        s2, r, done, trunc, _ = env.<span class="cmd">step</span>(a)
+        agent.<span class="cmd">update</span>(s, a, r, s2, done)
+        s = s2; total += r
+        <span class="keyword">if</span> done <span class="keyword">or</span> trunc: <span class="keyword">break</span>
+    rewards.<span class="cmd">append</span>(total)
+
+<span class="keyword">import</span> numpy <span class="keyword">as</span> np
+<span class="cmd">print</span>(<span class="str">f"Son 500 ep win rate: {np.mean(rewards[-500:]):.3f}"</span>)
+<span class="cmt"># Dyna-Q (k=10) saf Q-learning'den çok daha hızlı converge eder</span></code></pre>
+    </div>
+  </section>
+
+  <!-- ── s3 ──────────────────────────────────────────────────── -->
+  <section id="s3">
+    <h2><span class="num">03</span> MuZero Mimarisi</h2>
+    <p class="section-lead">MuZero, ortam dinamiklerini öğrenilen latent uzayda temsil eder — oyun kuralları olmadan AlphaZero kalitesine ulaşır.</p>
+
+    <p>DeepMind'ın 2019 Nature makalesinde tanımlanan MuZero, three-network mimarisine dayanır:</p>
+
+    <div class="params">
+      <div class="param-row">
+        <span class="param-name">Representation Network h_θ</span>
+        <span class="param-desc">Gözlem o_t'yi latent state s_t'ye dönüştürür: s_0 = h(o_1,...,o_t). Ham gözlemden sıkıştırılmış temsil.</span>
+      </div>
+      <div class="param-row">
+        <span class="param-name">Dynamics Network g_θ</span>
+        <span class="param-desc">Latent state ve aksiyon verildiğinde sonraki latent state ve reward tahmin eder: (r_k, s_k) = g(s_{k-1}, a_k). Gerçek ortam kuralları öğrenilir.</span>
+      </div>
+      <div class="param-row">
+        <span class="param-name">Prediction Network f_θ</span>
+        <span class="param-desc">Latent state'ten policy ve value tahmin eder: (p_k, v_k) = f(s_k). MCTS için prior policy ve bootstrap değeri sağlar.</span>
+      </div>
+    </div>
+
+    <p>MuZero'nun özgünlüğü: gerçek ortam kuralarını hiç kullanmaz. Tüm planlama, öğrenilen latent space'te yapılır. Bu, Chess, Go, Atari ve Mancala gibi çok farklı problemleri tek mimariye sığdırır.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>muzero_networks.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> torch
+<span class="keyword">import</span> torch.nn <span class="keyword">as</span> nn
+
+<span class="keyword">class</span> <span class="cmd">RepresentationNetwork</span>(nn.Module):
+    <span class="str">"""h_θ: gözlem → latent state"""</span>
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, obs_dim, latent_dim=<span class="str">256</span>):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>()
+        self.net = nn.<span class="cmd">Sequential</span>(
+            nn.<span class="cmd">Linear</span>(obs_dim, <span class="str">512</span>), nn.<span class="cmd">ReLU</span>(),
+            nn.<span class="cmd">Linear</span>(<span class="str">512</span>, latent_dim),  nn.<span class="cmd">Tanh</span>()  <span class="cmt"># normalize</span>
+        )
+    <span class="keyword">def</span> <span class="cmd">forward</span>(self, obs):
+        <span class="keyword">return</span> self.net(obs)
+
+<span class="keyword">class</span> <span class="cmd">DynamicsNetwork</span>(nn.Module):
+    <span class="str">"""g_θ: (latent_state, action) → (next_latent, reward)"""</span>
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, latent_dim, n_actions):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>()
+        self.action_embed = nn.<span class="cmd">Embedding</span>(n_actions, <span class="str">64</span>)
+        self.net = nn.<span class="cmd">Sequential</span>(
+            nn.<span class="cmd">Linear</span>(latent_dim + <span class="str">64</span>, <span class="str">512</span>), nn.<span class="cmd">ReLU</span>(),
+            nn.<span class="cmd">Linear</span>(<span class="str">512</span>, <span class="str">512</span>),              nn.<span class="cmd">ReLU</span>()
+        )
+        self.next_state = nn.<span class="cmd">Sequential</span>(nn.<span class="cmd">Linear</span>(<span class="str">512</span>, latent_dim), nn.<span class="cmd">Tanh</span>())
+        self.reward     = nn.<span class="cmd">Linear</span>(<span class="str">512</span>, <span class="str">601</span>)  <span class="cmt"># categorical reward</span>
+
+    <span class="keyword">def</span> <span class="cmd">forward</span>(self, latent, action):
+        a_emb  = self.action_embed(action)
+        x      = torch.<span class="cmd">cat</span>([latent, a_emb], dim=-<span class="str">1</span>)
+        feat   = self.net(x)
+        <span class="keyword">return</span> self.next_state(feat), self.reward(feat)
+
+<span class="keyword">class</span> <span class="cmd">PredictionNetwork</span>(nn.Module):
+    <span class="str">"""f_θ: latent_state → (policy, value)"""</span>
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, latent_dim, n_actions):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>()
+        self.shared = nn.<span class="cmd">Sequential</span>(
+            nn.<span class="cmd">Linear</span>(latent_dim, <span class="str">512</span>), nn.<span class="cmd">ReLU</span>(),
+            nn.<span class="cmd">Linear</span>(<span class="str">512</span>, <span class="str">512</span>),        nn.<span class="cmd">ReLU</span>()
+        )
+        self.policy = nn.<span class="cmd">Linear</span>(<span class="str">512</span>, n_actions)   <span class="cmt"># prior for MCTS</span>
+        self.value  = nn.<span class="cmd">Linear</span>(<span class="str">512</span>, <span class="str">601</span>)          <span class="cmt"># categorical value</span>
+
+    <span class="keyword">def</span> <span class="cmd">forward</span>(self, latent):
+        feat = self.shared(latent)
+        <span class="keyword">return</span> self.policy(feat), self.value(feat)</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s4 ──────────────────────────────────────────────────── -->
+  <section id="s4">
+    <h2><span class="num">04</span> MCTS ile Learned Model</h2>
+    <p class="section-lead">Monte Carlo Tree Search, öğrenilen world model ile birleşince güçlü bir planlama aracına dönüşür.</p>
+
+    <p>Klasik MCTS (AlphaGo, AlphaZero) gerçek ortam simülatörünü kullanır. MuZero'da ise MCTS, öğrenilen dynamics network üzerinde çalışır. Her MCTS simülasyonu, gerçek ortam yerine latent state geçişleri kullanır.</p>
+
+    <p>MCTS döngüsü 4 adımdan oluşur: <strong>Selection</strong> (en umut verici node'u seç, UCB skoru), <strong>Expansion</strong> (yeni node oluştur, prediction network ile prior al), <strong>Simulation</strong> (dynamics network ile rollout), <strong>Backpropagation</strong> (değerleri geriye yay).</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>mcts_node.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> math
+<span class="keyword">import</span> numpy <span class="keyword">as</span> np
+
+<span class="keyword">class</span> <span class="cmd">MCTSNode</span>:
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, prior: <span class="cmd">float</span>):
+        self.prior      = prior     <span class="cmt"># P(s,a) — prediction network'ten</span>
+        self.visit_count = <span class="str">0</span>
+        self.value_sum  = <span class="str">0.0</span>
+        self.children   = {}        <span class="cmt"># {action: MCTSNode}</span>
+        self.hidden_state = <span class="keyword">None</span>   <span class="cmt"># latent state</span>
+        self.reward     = <span class="str">0.0</span>
+
+    @property
+    <span class="keyword">def</span> <span class="cmd">value</span>(self):
+        <span class="keyword">if</span> self.visit_count == <span class="str">0</span>: <span class="keyword">return</span> <span class="str">0</span>
+        <span class="keyword">return</span> self.value_sum / self.visit_count
+
+    <span class="keyword">def</span> <span class="cmd">ucb_score</span>(self, parent_visit, c_puct=<span class="str">1.25</span>):
+        <span class="str">"""UCB skoru: değer tahmini + keşif bonusu."""</span>
+        u = (c_puct * self.prior *
+             math.<span class="cmd">sqrt</span>(parent_visit) / (<span class="str">1</span> + self.visit_count))
+        <span class="keyword">return</span> self.value + u
+
+<span class="keyword">def</span> <span class="cmd">run_mcts</span>(root_hidden, pred_net, dyn_net, n_simulations=<span class="str">50</span>, n_actions=<span class="str">4</span>):
+    <span class="str">"""Basit MCTS — learned model üzerinde."""</span>
+    <span class="keyword">import</span> torch
+
+    <span class="cmt"># Root node</span>
+    <span class="keyword">with</span> torch.<span class="cmd">no_grad</span>():
+        policy_logits, value = pred_net(root_hidden)
+        priors = torch.softmax(policy_logits, dim=-<span class="str">1</span>).<span class="cmd">squeeze</span>().<span class="cmd">numpy</span>()
+
+    root = <span class="cmd">MCTSNode</span>(prior=<span class="str">1.0</span>)
+    root.hidden_state = root_hidden
+    <span class="keyword">for</span> a <span class="keyword">in</span> <span class="cmd">range</span>(n_actions):
+        root.children[a] = <span class="cmd">MCTSNode</span>(prior=<span class="cmd">float</span>(priors[a]))
+
+    <span class="keyword">for</span> _ <span class="keyword">in</span> <span class="cmd">range</span>(n_simulations):
+        node = root
+        path = [root]
+
+        <span class="cmt"># Selection: en yüksek UCB'yi seç</span>
+        <span class="keyword">while</span> node.children <span class="keyword">and</span> <span class="cmd">all</span>(c.visit_count > <span class="str">0</span>
+                                    <span class="keyword">for</span> c <span class="keyword">in</span> node.children.<span class="cmd">values</span>()):
+            action = <span class="cmd">max</span>(node.children,
+                         key=<span class="keyword">lambda</span> a: node.children[a].<span class="cmd">ucb_score</span>(node.visit_count))
+            node = node.children[action]
+            path.<span class="cmd">append</span>(node)
+
+        <span class="cmt"># Expansion + Simulation</span>
+        <span class="keyword">with</span> torch.<span class="cmd">no_grad</span>():
+            a_tensor = torch.<span class="cmd">tensor</span>([<span class="cmd">list</span>(node.children.<span class="cmd">keys</span>())[<span class="str">0</span>]])
+            next_h, _ = dyn_net(path[-<span class="str">2</span>].hidden_state, a_tensor)
+            _, v = pred_net(next_h)
+            value_est = v.<span class="cmd">item</span>()
+
+        <span class="cmt"># Backprop</span>
+        <span class="keyword">for</span> n <span class="keyword">in</span> path:
+            n.visit_count += <span class="str">1</span>
+            n.value_sum   += value_est
+
+    <span class="cmt"># En çok ziyaret edilen aksiyon</span>
+    best_action = <span class="cmd">max</span>(root.children, key=<span class="keyword">lambda</span> a: root.children[a].visit_count)
+    <span class="keyword">return</span> best_action</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s5 ──────────────────────────────────────────────────── -->
+  <section id="s5">
+    <h2><span class="num">05</span> Dreamer — Latent Dynamics</h2>
+    <p class="section-lead">Dreamer, tüm öğrenmeyi latent hayal edilmiş diziler üzerinde yapar — gerçek ortamla minimum etkileşimle.</p>
+
+    <p>Hafner ve arkadaşlarının Dreamer serisinde (v1 2019, v2 2020, v3 2023), agent ham piksel gözlemlerinden latent temsiller öğrenir ve policy'yi tamamen bu "hayal edilen" deneyimlerle günceller. Gerçek ortam yalnızca world model eğitimi için kullanılır.</p>
+
+    <p>Temel fikir: latent state s_t deterministik (h_t, RNN ile hesaplanan) ve stokastik (z_t, Gaussian örnekleme) bileşenlerden oluşur. Bu <em>RSSM (Recurrent State-Space Model)</em> yapısı, geçmiş bilgiyi deterministik h_t'de taşırken belirsizliği z_t'de modeller.</p>
+
+    <div class="callout">
+      <div class="label">RSSM FORMÜLÜ</div>
+      <p>
+        h_t = f(h_{t-1}, z_{t-1}, a_{t-1}) &nbsp;→ deterministik (GRU)<br>
+        z_t ~ q(z_t | h_t, o_t) &nbsp;→ stokastik, gözlemden posterior<br>
+        z_t ~ p(z_t | h_t) &nbsp;→ stokastik, hayal için prior<br>
+        ô_t = dec(h_t, z_t) &nbsp;→ gözlem rekonstrüksiyonu
+      </p>
+    </div>
+
+    <div class="code-block">
+      <div class="code-header"><span>rssm_simplified.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> torch
+<span class="keyword">import</span> torch.nn <span class="keyword">as</span> nn
+<span class="keyword">from</span> torch.distributions <span class="keyword">import</span> Normal
+
+<span class="keyword">class</span> <span class="cmd">RSSM</span>(nn.Module):
+    <span class="str">"""
+    Basitleştirilmiş Recurrent State-Space Model.
+    h: deterministik hidden state (GRU)
+    z: stokastik latent state (Gaussian)
+    """</span>
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, obs_dim, action_dim, h_dim=<span class="str">256</span>, z_dim=<span class="str">32</span>):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>()
+        self.h_dim = h_dim
+        self.z_dim = z_dim
+
+        <span class="cmt"># Deterministik geçiş: GRU</span>
+        self.cell = nn.<span class="cmd">GRUCell</span>(z_dim + action_dim, h_dim)
+
+        <span class="cmt"># Prior: p(z_t | h_t)</span>
+        self.prior_net = nn.<span class="cmd">Sequential</span>(
+            nn.<span class="cmd">Linear</span>(h_dim, h_dim), nn.<span class="cmd">ELU</span>(),
+            nn.<span class="cmd">Linear</span>(h_dim, z_dim * <span class="str">2</span>)   <span class="cmt"># mean, log_std</span>
+        )
+
+        <span class="cmt"># Posterior: q(z_t | h_t, o_t)</span>
+        self.posterior_net = nn.<span class="cmd">Sequential</span>(
+            nn.<span class="cmd">Linear</span>(h_dim + obs_dim, h_dim), nn.<span class="cmd">ELU</span>(),
+            nn.<span class="cmd">Linear</span>(h_dim, z_dim * <span class="str">2</span>)
+        )
+
+    <span class="keyword">def</span> <span class="cmd">posterior_step</span>(self, h, obs, action):
+        <span class="str">"""Gözlem ile posterior z örnekle."""</span>
+        <span class="cmt"># Posterior: z ~ q(z|h,o)</span>
+        post_out    = self.posterior_net(<span class="cmd">torch.cat</span>([h, obs], dim=-<span class="str">1</span>))
+        post_mean, post_log_std = post_out.<span class="cmd">chunk</span>(<span class="str">2</span>, dim=-<span class="str">1</span>)
+        post_std    = post_log_std.<span class="cmd">exp</span>().<span class="cmd">clamp</span>(<span class="str">0.1</span>, <span class="str">10</span>)
+        z           = post_mean + post_std * torch.<span class="cmd">randn_like</span>(post_mean)
+
+        <span class="cmt"># Bir sonraki h</span>
+        h_next = self.cell(<span class="cmd">torch.cat</span>([z, action], dim=-<span class="str">1</span>), h)
+        <span class="keyword">return</span> h_next, z, <span class="cmd">Normal</span>(post_mean, post_std)
+
+    <span class="keyword">def</span> <span class="cmd">imagine_step</span>(self, h, action):
+        <span class="str">"""Gözlem olmadan prior z ile hayal et."""</span>
+        prior_out   = self.prior_net(h)
+        prior_mean, prior_log_std = prior_out.<span class="cmd">chunk</span>(<span class="str">2</span>, dim=-<span class="str">1</span>)
+        prior_std   = prior_log_std.<span class="cmd">exp</span>().<span class="cmd">clamp</span>(<span class="str">0.1</span>, <span class="str">10</span>)
+        z           = prior_mean + prior_std * torch.<span class="cmd">randn_like</span>(prior_mean)
+
+        h_next = self.cell(<span class="cmd">torch.cat</span>([z, action], dim=-<span class="str">1</span>), h)
+        <span class="keyword">return</span> h_next, z</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s6 ──────────────────────────────────────────────────── -->
+  <section id="s6">
+    <h2><span class="num">06</span> PlaNet ve RSSM</h2>
+    <p class="section-lead">PlaNet, planlama için latent uzayda trajektori optimizasyonu yapar — CEM ile.</p>
+
+    <p>Hafner ve ark.'nın 2019 tarihli PlaNet'i, RSSM tabanlı world model öğrenir ve planlama için <em>Random Shooting</em> veya <em>CEM (Cross Entropy Method)</em> kullanır. Agent, her adımda latent uzayda birçok olası aksiyon dizisi hayal eder, tahmini kümülatif ödülleri hesaplar ve en iyi diziyi seçer.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>cem_planning.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> torch
+<span class="keyword">import</span> numpy <span class="keyword">as</span> np
+
+<span class="keyword">def</span> <span class="cmd">cem_plan</span>(rssm, reward_model, h_init, z_init, horizon=<span class="str">12</span>,
+              n_candidates=<span class="str">1000</span>, n_elite=<span class="str">100</span>, n_iters=<span class="str">10</span>,
+              action_dim=<span class="str">1</span>, action_low=<span class="str">-1.0</span>, action_high=<span class="str">1.0</span>):
+    <span class="str">"""
+    CEM (Cross Entropy Method) ile latent uzayda planlama.
+    En umut verici horizon-adımlık aksiyon dizisini bul.
+    """</span>
+    <span class="cmt"># Başlangıç dağılım parametreleri</span>
+    mean = torch.<span class="cmd">zeros</span>(horizon, action_dim)
+    std  = torch.<span class="cmd">ones</span>(horizon, action_dim)
+
+    <span class="keyword">for</span> iteration <span class="keyword">in</span> <span class="cmd">range</span>(n_iters):
+        <span class="cmt"># Aday aksiyon dizileri örnekle: (N, T, action_dim)</span>
+        actions = mean + std * torch.<span class="cmd">randn</span>(n_candidates, horizon, action_dim)
+        actions = actions.<span class="cmd">clamp</span>(action_low, action_high)
+
+        <span class="cmt"># Her aday için hayal rollout yap</span>
+        returns = torch.<span class="cmd">zeros</span>(n_candidates)
+        <span class="keyword">with</span> torch.<span class="cmd">no_grad</span>():
+            <span class="keyword">for</span> i <span class="keyword">in</span> <span class="cmd">range</span>(n_candidates):
+                h = h_init.<span class="cmd">clone</span>()
+                z = z_init.<span class="cmd">clone</span>()
+                total_r = <span class="str">0.0</span>
+                <span class="keyword">for</span> t <span class="keyword">in</span> <span class="cmd">range</span>(horizon):
+                    a = actions[i, t].<span class="cmd">unsqueeze</span>(<span class="str">0</span>)
+                    h, z = rssm.<span class="cmd">imagine_step</span>(h, a)
+                    r = reward_model(<span class="cmd">torch.cat</span>([h, z], dim=-<span class="str">1</span>))
+                    total_r += (<span class="str">0.99</span> ** t) * r.<span class="cmd">item</span>()
+                returns[i] = total_r
+
+        <span class="cmt"># Elite örnekleri seç (en yüksek return'ler)</span>
+        elite_idx  = returns.<span class="cmd">topk</span>(n_elite).<span class="cmd">indices</span>
+        elite_acts = actions[elite_idx]
+
+        <span class="cmt"># Dağılım güncelle</span>
+        mean = elite_acts.<span class="cmd">mean</span>(dim=<span class="str">0</span>)
+        std  = elite_acts.<span class="cmd">std</span>(dim=<span class="str">0</span>) + <span class="str">1e-5</span>
+
+    <span class="keyword">return</span> mean[<span class="str">0</span>]  <span class="cmt"># İlk adımın en iyi aksiyonu</span></code></pre>
+    </div>
+  </section>
+
+  <!-- ── s7 ──────────────────────────────────────────────────── -->
+  <section id="s7">
+    <h2><span class="num">07</span> Imagination Rollouts</h2>
+    <p class="section-lead">Dreamer-v2 ve v3'te policy, tamamen hayal edilen rollout'lar üzerinde PPO/actor-critic ile güncellenir.</p>
+
+    <p>World model bir kez eğitildiğinde, policy gradients hesaplanmak için gerçek ortama ihtiyaç kalmaz. RSSM'in imagine_step fonksiyonu ile H adım ileri sarılır, her adımda reward ve value tahmin edilir:</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>imagination_rollout.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> torch
+
+<span class="keyword">def</span> <span class="cmd">imagine_trajectory</span>(rssm, actor, reward_model, value_model,
+                        h_init, z_init, horizon=<span class="str">15</span>, gamma=<span class="str">0.99</span>, lam=<span class="str">0.95</span>):
+    <span class="str">"""
+    Latent uzayda H-adım hayal rollout.
+    Tüm hesaplama differentiable → doğrudan policy gradient.
+    """</span>
+    states   = []    <span class="cmt"># (h,z) çiftleri</span>
+    rewards  = []
+    values   = []
+    log_probs = []
+
+    h, z = h_init, z_init
+
+    <span class="keyword">for</span> t <span class="keyword">in</span> <span class="cmd">range</span>(horizon):
+        state = torch.<span class="cmd">cat</span>([h, z], dim=-<span class="str">1</span>)
+
+        <span class="cmt"># Actor: aksiyon örnekle</span>
+        action_dist = actor(state)
+        action      = action_dist.<span class="cmd">rsample</span>()    <span class="cmt"># reparameterization</span>
+        log_prob    = action_dist.<span class="cmd">log_prob</span>(action)
+
+        <span class="cmt"># Reward tahmini</span>
+        r = reward_model(state).<span class="cmd">squeeze</span>()
+        <span class="cmt"># Value tahmini (bootstrap)</span>
+        v = value_model(state).<span class="cmd">squeeze</span>()
+
+        states.<span class="cmd">append</span>(state)
+        rewards.<span class="cmd">append</span>(r)
+        values.<span class="cmd">append</span>(v)
+        log_probs.<span class="cmd">append</span>(log_prob)
+
+        <span class="cmt"># Hayal adımı (differentiable)</span>
+        h, z = rssm.<span class="cmd">imagine_step</span>(h, action)
+
+    <span class="cmt"># Lambda-returns hesapla</span>
+    next_v = value_model(<span class="cmd">torch.cat</span>([h, z], dim=-<span class="str">1</span>)).<span class="cmd">squeeze</span>()
+    targets = []
+    last = next_v
+    <span class="keyword">for</span> r, v <span class="keyword">in</span> <span class="cmd">zip</span>(<span class="cmd">reversed</span>(rewards), <span class="cmd">reversed</span>(values)):
+        last = r + gamma * ((1-lam)*v + lam*last)
+        targets.<span class="cmd">insert</span>(<span class="str">0</span>, last)
+
+    targets = torch.<span class="cmd">stack</span>(targets)
+
+    <span class="cmt"># Policy loss + value loss</span>
+    values_t  = torch.<span class="cmd">stack</span>(values)
+    actor_loss  = -(torch.<span class="cmd">stack</span>(log_probs) * (targets - values_t.<span class="cmd">detach</span>())).<span class="cmd">mean</span>()
+    critic_loss = ((values_t - targets.<span class="cmd">detach</span>()) ** <span class="str">2</span>).<span class="cmd">mean</span>()
+
+    <span class="keyword">return</span> actor_loss, critic_loss</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s8 ──────────────────────────────────────────────────── -->
+  <section id="s8">
+    <h2><span class="num">08</span> Sample Efficiency Karşılaştırma</h2>
+    <p class="section-lead">Model-based yöntemler, aynı performans için 10-100x daha az gerçek etkileşim gerektirir.</p>
+
+    <div class="file-table">
+      <div class="ft-header">
+        <span>Algoritma</span>
+        <span>Tip</span>
+        <span>DMControl'de 100K step sonrası ödül</span>
+      </div>
+      <div class="ft-row">
+        <span>SAC (model-free)</span>
+        <span>Model-Free</span>
+        <span>~200-400</span>
+      </div>
+      <div class="ft-row">
+        <span>Dreamer-v2</span>
+        <span>Model-Based</span>
+        <span>~700-900</span>
+      </div>
+      <div class="ft-row">
+        <span>Dreamer-v3</span>
+        <span>Model-Based</span>
+        <span>~800-950</span>
+      </div>
+      <div class="ft-row">
+        <span>TD-MPC2</span>
+        <span>Model-Based</span>
+        <span>~900-1000</span>
+      </div>
+    </div>
+
+    <div class="callout">
+      <div class="label">PRATIK ÖNERI</div>
+      <p>Gerçek robotik uygulamalar veya pahalı simülasyonlar için model-based tercih edilir. Atari ve oyun ortamları için model-free (özellikle PPO/SAC) genellikle yeterlidir — simülasyon ucuzdur. Hybrid yaklaşım: Dyna-Q tarzı model yardımıyla model-free'yi hızlandır.</p>
+    </div>
+  </section>
+
+  <!-- ── s9 ──────────────────────────────────────────────────── -->
+  <section id="s9">
+    <h2><span class="num">09</span> Pratik: Pendulum MPC</h2>
+    <p class="section-lead">Gymnasium Pendulum-v1 üzerinde neural dynamics model ve Model Predictive Control ile kontrol.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>pendulum_mpc.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> gymnasium <span class="keyword">as</span> gym
+<span class="keyword">import</span> torch
+<span class="keyword">import</span> torch.nn <span class="keyword">as</span> nn
+<span class="keyword">import</span> torch.optim <span class="keyword">as</span> optim
+<span class="keyword">import</span> numpy <span class="keyword">as</span> np
+<span class="keyword">from</span> collections <span class="keyword">import</span> deque
+<span class="keyword">import</span> random
+
+<span class="keyword">class</span> <span class="cmd">DynamicsModel</span>(nn.Module):
+    <span class="str">"""Pendulum dynamics: (obs, action) → next_obs"""</span>
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>()
+        self.net = nn.<span class="cmd">Sequential</span>(
+            nn.<span class="cmd">Linear</span>(<span class="str">3</span> + <span class="str">1</span>, <span class="str">256</span>), nn.<span class="cmd">SiLU</span>(),
+            nn.<span class="cmd">Linear</span>(<span class="str">256</span>, <span class="str">256</span>),   nn.<span class="cmd">SiLU</span>(),
+            nn.<span class="cmd">Linear</span>(<span class="str">256</span>, <span class="str">3</span>)
+        )
+    <span class="keyword">def</span> <span class="cmd">forward</span>(self, obs, action):
+        x = torch.<span class="cmd">cat</span>([obs, action], dim=-<span class="str">1</span>)
+        <span class="keyword">return</span> obs + self.net(x)   <span class="cmt"># residual</span>
+
+<span class="keyword">def</span> <span class="cmd">pendulum_reward</span>(obs, action):
+    <span class="str">"""Pendulum-v1 reward: -(theta^2 + 0.1*theta_dot^2 + 0.001*a^2)"""</span>
+    cos_th, sin_th, th_dot = obs[..., <span class="str">0</span>], obs[..., <span class="str">1</span>], obs[..., <span class="str">2</span>]
+    theta = torch.<span class="cmd">atan2</span>(sin_th, cos_th)
+    a     = action[..., <span class="str">0</span>]
+    cost  = theta**<span class="str">2</span> + <span class="str">0.1</span> * th_dot**<span class="str">2</span> + <span class="str">0.001</span> * a**<span class="str">2</span>
+    <span class="keyword">return</span> -cost
+
+<span class="keyword">def</span> <span class="cmd">random_shooting_mpc</span>(model, obs, horizon=<span class="str">20</span>, n_samples=<span class="str">500</span>):
+    <span class="str">"""Random shooting MPC: en iyi aksiyon dizisini bul."""</span>
+    obs_t = torch.<span class="cmd">FloatTensor</span>(obs).<span class="cmd">unsqueeze</span>(<span class="str">0</span>).<span class="cmd">expand</span>(n_samples, -<span class="str">1</span>)
+    actions = torch.<span class="cmd">FloatTensor</span>(n_samples, horizon, <span class="str">1</span>).<span class="cmd">uniform_</span>(-<span class="str">2</span>, <span class="str">2</span>)
+    total_r = torch.<span class="cmd">zeros</span>(n_samples)
+
+    <span class="keyword">with</span> torch.<span class="cmd">no_grad</span>():
+        curr_obs = obs_t.<span class="cmd">clone</span>()
+        <span class="keyword">for</span> t <span class="keyword">in</span> <span class="cmd">range</span>(horizon):
+            a_t    = actions[:, t, :]
+            r_t    = <span class="cmd">pendulum_reward</span>(curr_obs, a_t)
+            total_r += (<span class="str">0.99</span>**t) * r_t
+            curr_obs = model(curr_obs, a_t)
+
+    best_idx = total_r.<span class="cmd">argmax</span>()
+    <span class="keyword">return</span> actions[best_idx, <span class="str">0</span>, <span class="str">0</span>].<span class="cmd">item</span>()
+
+<span class="cmt"># ── Ana eğitim döngüsü ─────────────────────────────────────</span>
+env     = gym.<span class="cmd">make</span>(<span class="str">'Pendulum-v1'</span>)
+model   = <span class="cmd">DynamicsModel</span>()
+opt     = optim.<span class="cmd">Adam</span>(model.<span class="cmd">parameters</span>(), lr=<span class="str">1e-3</span>)
+buffer  = <span class="cmd">deque</span>(maxlen=<span class="str">50_000</span>)
+
+ep_rewards = []
+
+<span class="keyword">for</span> ep <span class="keyword">in</span> <span class="cmd">range</span>(<span class="str">200</span>):
+    obs, _   = env.<span class="cmd">reset</span>()
+    total_r  = <span class="str">0</span>
+    use_mpc  = ep >= <span class="str">30</span>    <span class="cmt"># İlk 30 ep: rastgele veri topla</span>
+
+    <span class="keyword">for</span> step <span class="keyword">in</span> <span class="cmd">range</span>(<span class="str">200</span>):
+        <span class="keyword">if</span> use_mpc:
+            a_val = <span class="cmd">random_shooting_mpc</span>(model, obs)
+        <span class="keyword">else</span>:
+            a_val = env.action_space.<span class="cmd">sample</span>()[<span class="str">0</span>]
+
+        action  = np.<span class="cmd">array</span>([a_val])
+        obs2, r, done, trunc, _ = env.<span class="cmd">step</span>(action)
+        buffer.<span class="cmd">append</span>((obs, a_val, obs2))
+        total_r += r; obs = obs2
+
+        <span class="cmt"># Model güncelleme</span>
+        <span class="keyword">if</span> <span class="cmd">len</span>(buffer) >= <span class="str">256</span>:
+            batch    = random.<span class="cmd">sample</span>(buffer, <span class="str">256</span>)
+            s_b      = torch.<span class="cmd">FloatTensor</span>([b[<span class="str">0</span>] <span class="keyword">for</span> b <span class="keyword">in</span> batch])
+            a_b      = torch.<span class="cmd">FloatTensor</span>([[b[<span class="str">1</span>]] <span class="keyword">for</span> b <span class="keyword">in</span> batch])
+            s2_b     = torch.<span class="cmd">FloatTensor</span>([b[<span class="str">2</span>] <span class="keyword">for</span> b <span class="keyword">in</span> batch])
+            pred_s2  = model(s_b, a_b)
+            loss     = nn.functional.<span class="cmd">mse_loss</span>(pred_s2, s2_b)
+            opt.<span class="cmd">zero_grad</span>(); loss.<span class="cmd">backward</span>(); opt.<span class="cmd">step</span>()
+
+        <span class="keyword">if</span> done <span class="keyword">or</span> trunc: <span class="keyword">break</span>
+
+    ep_rewards.<span class="cmd">append</span>(total_r)
+    <span class="keyword">if</span> (ep + <span class="str">1</span>) % <span class="str">10</span> == <span class="str">0</span>:
+        <span class="cmd">print</span>(<span class="str">f"Ep {ep+1:3d} | Reward: {total_r:7.1f} | MPC: {use_mpc}"</span>)
+
+env.<span class="cmd">close</span>()
+<span class="cmt"># MPC devreye girdikten sonra reward -1000'den ~-200'e iyileşir</span></code></pre>
+    </div>
+
+    <div class="callout">
+      <div class="label">BEKLENEN SONUÇ</div>
+      <p>30 episode rastgele veri toplama sonrası MPC devreye girer. Episode reward -1000'den -200 ile -400 arasına iyileşir. Model daha fazla veriyle güçlendikçe MPC performansı artar. Gerçek RL ile rekabetçi, ama çok daha az gerçek etkileşim gerektirir.</p>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

@@ -1,0 +1,752 @@
+---
+layout: tutorial
+title: "vLLM & TensorRT-LLM — LLM Serving"
+back_url: "../index.html"
+back_label: "Model Serving Altyapısı"
+---
+
+<header class="header">
+  <div class="meta"><span>Rehber</span><span>Model Serving</span><span>01 · LLM Serving</span></div>
+  <h1>vLLM &amp;<br><em>TensorRT-LLM.</em></h1>
+  <p class="subtitle">PagedAttention ile KV cache fragmentasyonunu ortadan kaldır. Continuous batching, speculative decoding, tensor parallelism ve TensorRT-LLM ile NVIDIA optimize edilmiş yüksek verimli LLM serving.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçerik</div>
+  <ol>
+    <li><a href="#s0">LLM Serving Zorlukları</a></li>
+    <li><a href="#s1">PagedAttention Mimarisi</a></li>
+    <li><a href="#s2">Continuous Batching</a></li>
+    <li><a href="#s3">vLLM Kurulumu ve Temel Kullanım</a></li>
+    <li><a href="#s4">OpenAI-Compatible API</a></li>
+    <li><a href="#s5">Tensor Parallelism</a></li>
+    <li><a href="#s6">Speculative Decoding</a></li>
+    <li><a href="#s7">TensorRT-LLM</a></li>
+    <li><a href="#s8">Quantization: AWQ, GPTQ, INT4/INT8</a></li>
+    <li><a href="#s9">Throughput Benchmark</a></li>
+    <li><a href="#s10">Pratik: Llama-3 Deploy ve Streaming</a></li>
+  </ol>
+</nav>
+
+<main>
+
+  <!-- ── S0: LLM Serving Zorlukları ─────────────────────────── -->
+  <section id="s0">
+    <h2><span class="num">00</span> LLM Serving Zorlukları</h2>
+    <p class="section-lead">Üretimde LLM çalıştırmak neden bu kadar karmaşık? Bellek yönetimi ve batching verimsizliğinin anatomisi.</p>
+
+    <p>
+      Bir LLM'i tek kullanıcı için çalıştırmak zaten zordur; ama aynı modeli yüzlerce eş zamanlı kullanıcıya servis etmek bambaşka bir mühendislik problemidir. İki temel engel öne çıkar: <em>KV cache bellek parçalanması</em> ve <em>batching verimsizliği</em>.
+    </p>
+
+    <h3>KV Cache Memory Sorunu</h3>
+    <p>
+      Her transformer katmanındaki attention mekanizması, daha önce üretilen token'ların Key ve Value matrislerini hafızada tutmak zorundadır — buna KV cache denir. Sequence uzadıkça bu cache büyür; farklı uzunluktaki sequence'lar için ayrı ayrı bellek bloğu tahsis edilmesi gerekir. Geleneksel sistemlerde bu bellek <em>statik</em> olarak önceden ayrılır; yüksek fragmentasyon ve düşük kullanım oranı kaçınılmazdır.
+    </p>
+
+    <div class="flow">
+      <pre><span class="step-num">Problem</span> 40 GB GPU, 7B model ağırlıkları → ~14 GB
+<span class="step-num">Kalan  </span> 26 GB KV cache için kullanılabilir
+<span class="step-num">Statik </span> Her sequence için max_len × layer × head × d_head ayrılır
+<span class="step-num">Sonuç  </span> Çoğu blok boş, GPU dolmuş görünür — utilization %30-40</pre>
+    </div>
+
+    <h3>Batching Verimsizliği</h3>
+    <p>
+      Static batching'de tüm sequence'ların aynı anda tamamlanması beklenir. Kısa bir yanıt veren kullanıcı, en uzun sequence bitene kadar bekler. GPU o süre boyunca kısmen boş çalışır — <em>padding waste</em> olarak adlandırılan bu kayıp, throughput'u ciddi ölçüde düşürür.
+    </p>
+
+    <table class="file-table">
+      <thead>
+        <tr><th>Sorun</th><th>Nedeni</th><th>Etkisi</th><th>vLLM Çözümü</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>KV Fragmentasyonu</td><td>Statik bellek tahsisi</td><td>%60-70 VRAM atıl</td><td>PagedAttention</td></tr>
+        <tr><td>Batching Gecikme</td><td>Static batch senkronizasyonu</td><td>Throughput düşük</td><td>Continuous batching</td></tr>
+        <tr><td>TTFT Yüksek</td><td>Sıra bekleme</td><td>Kötü UX</td><td>Preemption + prioritization</td></tr>
+        <tr><td>Memory OOM</td><td>Tahmin edilemeyen sequence uzunluğu</td><td>Sunucu çökmesi</td><td>Dinamik block allocation</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout">
+      <div class="label">İPUCU</div>
+      <p>vLLM, orijinal Orca paper'ındaki continuous batching fikrini PagedAttention ile birleştirerek 24× daha yüksek throughput elde eder. Bu sayının arka planını anlamak için önce bu iki kavramı kavramak şarttır.</p>
+    </div>
+  </section>
+
+  <!-- ── S1: PagedAttention Mimarisi ────────────────────────── -->
+  <section id="s1">
+    <h2><span class="num">01</span> PagedAttention Mimarisi</h2>
+    <p class="section-lead">Sanal bellek ilkesini KV cache'e uyarla — virtual KV cache ve block table ile fragmentasyonu sıfıra indir.</p>
+
+    <p>
+      PagedAttention, işletim sistemlerindeki <em>virtual memory paging</em> ilkesini KV cache yönetimine uygular. Fiziksel GPU belleği sabit boyutlu <strong>bloklara</strong> (block size = 16 token) bölünür. Her sequence için bir <strong>block table</strong> tutulur; bu tablo sanal blok numaralarını fiziksel bloklara eşler.
+    </p>
+
+    <div class="flow">
+      <pre><span class="step-num">Fiziksel</span> GPU VRAM → N adet eşit boyutlu blok (ör. 16 token/blok)
+<span class="step-num">Sanal  </span> Her sequence kendi sanal blok listesine sahip
+<span class="step-num">Tablo  </span> block_table[seq_id] = [phys_blk_3, phys_blk_7, phys_blk_12, ...]
+<span class="step-num">Tahsis </span> Yeni token üretildikçe boş fiziksel blok talep edilir
+<span class="step-num">Serbest</span> Sequence tamamlandığında bloklar hemen geri verilir</pre>
+    </div>
+
+    <h3>Copy-on-Write ile Beam Search</h3>
+    <p>
+      Beam search veya parallel sampling gibi senaryolarda aynı prefix farklı sequence'lar arasında paylaşılabilir. PagedAttention, aynı fiziksel bloğa birden fazla sequence'ın referans vermesine olanak tanır. Bir sequence o bloktaki içeriği değiştirmeye kalkarsa <em>copy-on-write</em> tetiklenir, sadece o an değiştirilen blok kopyalanır.
+    </p>
+
+    <table class="file-table">
+      <thead>
+        <tr><th>Özellik</th><th>Geleneksel</th><th>PagedAttention</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Bellek tahsisi</td><td>max_seq_len önceden ayrılır</td><td>Token üretildikçe dinamik</td></tr>
+        <tr><td>Fragmentasyon</td><td>Yüksek (%60+)</td><td>Neredeyse sıfır (&lt;4%)</td></tr>
+        <tr><td>Prefix paylaşımı</td><td>Yok</td><td>Copy-on-write ile var</td></tr>
+        <tr><td>Batch boyutu</td><td>Bellek sınırlı (küçük)</td><td>Büyük batch mümkün</td></tr>
+        <tr><td>OOM riski</td><td>Tahmin edilemez</td><td>Belirleyici, kontrollü</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout">
+      <div class="label">TEKNİK NOT</div>
+      <p>Block size seçimi kritiktir. Küçük bloklar (ör. 8 token) daha fazla esneklik sağlar ama block table overhead'i artar. Büyük bloklar (ör. 32 token) overhead'i düşürür ama son blokta iç fragmentasyon oluşur. vLLM varsayılanı 16'dır.</p>
+    </div>
+  </section>
+
+  <!-- ── S2: Continuous Batching ────────────────────────────── -->
+  <section id="s2">
+    <h2><span class="num">02</span> Continuous Batching</h2>
+    <p class="section-lead">Static batching'in GPU boşa harcama sorununu her iteration adımında çözüme kavuşturan yaklaşım.</p>
+
+    <p>
+      Static batching'de bir batch oluşturulur, tüm sequence'lar tamamlanana kadar beklenir, sonra yeni batch oluşturulur. Bu yaklaşımda bir sequence erken biterse GPU kapasitesi atıl kalır.
+    </p>
+    <p>
+      Continuous batching'de <em>her token üretim adımında</em> (iteration level) scheduler devreye girer: tamamlanan sequence'lar batch'ten çıkarılır, bekleme kuyruğundaki yeni sequence'lar eklenir. GPU hiçbir zaman boş kalmaz.
+    </p>
+
+    <div class="flow">
+      <pre><span class="step-num">Iter 1</span> Batch = [A(10), B(50), C(30)] token kaldı
+<span class="step-num">Iter 2</span> A tamamlandı → Batch = [B(49), C(29), D(yeni)]
+<span class="step-num">Iter 3</span> Batch = [B(48), C(28), D(devam)]
+<span class="step-num">...</span>
+<span class="step-num">Sonuç</span> GPU utilization %90+ (static'te %40-60)</pre>
+    </div>
+
+    <h3>Preemption ve Priority</h3>
+    <p>
+      Bellek yetersiz kaldığında vLLM <em>preemption</em> uygular: düşük öncelikli sequence'ların KV cache'i diske (swap) veya başka GPU'ya taşınır. Bu mekanizma OOM yerine kontrollü performans düşüşü sağlar.
+    </p>
+
+    <div class="params">
+      <div class="param-row">
+        <span class="param-name">max_num_seqs</span>
+        <span class="param-desc">Aynı anda işlenecek maksimum sequence sayısı (varsayılan: 256)</span>
+      </div>
+      <div class="param-row">
+        <span class="param-name">max_num_batched_tokens</span>
+        <span class="param-desc">Bir iterasyonda işlenecek maksimum token sayısı</span>
+      </div>
+      <div class="param-row">
+        <span class="param-name">swap_space</span>
+        <span class="param-desc">CPU RAM'de KV cache swap için ayrılan alan (GB)</span>
+      </div>
+      <div class="param-row">
+        <span class="param-name">block_size</span>
+        <span class="param-desc">PagedAttention blok boyutu (token sayısı, varsayılan: 16)</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── S3: vLLM Kurulumu ──────────────────────────────────── -->
+  <section id="s3">
+    <h2><span class="num">03</span> vLLM Kurulumu ve Temel Kullanım</h2>
+    <p class="section-lead">vLLM'i CUDA ortamına kur, ilk modeli yükle ve offline/online inference çalıştır.</p>
+
+    <div class="code-block">
+      <div class="code-label">bash</div>
+      <pre><code># CUDA 12.1+ gerektirir
+pip install vllm
+
+# Belirli CUDA versiyonu için
+pip install vllm --extra-index-url https://download.pytorch.org/whl/cu121
+
+# Docker ile (önerilen production yöntemi)
+docker pull vllm/vllm-openai:latest</code></pre>
+    </div>
+
+    <h3>Offline Inference (LLM sınıfı)</h3>
+    <div class="code-block">
+      <div class="code-label">python</div>
+      <pre><code>from vllm import LLM, SamplingParams
+
+# Modeli yükle
+llm = LLM(
+    model="meta-llama/Meta-Llama-3-8B-Instruct",
+    tensor_parallel_size=1,   # tek GPU
+    gpu_memory_utilization=0.90,
+    max_model_len=4096,
+    dtype="bfloat16",
+)
+
+# Sampling parametreleri
+sampling_params = SamplingParams(
+    temperature=0.7,
+    top_p=0.95,
+    max_tokens=512,
+    stop=["&lt;|eot_id|&gt;"],
+)
+
+# Batch inference — tüm prompts tek seferde işlenir
+prompts = [
+    "Transformer mimarisini açıkla:",
+    "Python'da async/await nedir?",
+    "Docker container neden kullanılır?",
+]
+
+outputs = llm.generate(prompts, sampling_params)
+
+for output in outputs:
+    prompt = output.prompt
+    generated_text = output.outputs[0].text
+    print(f"Prompt: {prompt!r}")
+    print(f"Output: {generated_text!r}")
+    print("-" * 60)</code></pre>
+    </div>
+
+    <h3>Chat Template ile Kullanım</h3>
+    <div class="code-block">
+      <div class="code-label">python</div>
+      <pre><code>from vllm import LLM, SamplingParams
+
+llm = LLM(model="meta-llama/Meta-Llama-3-8B-Instruct")
+
+# Chat formatında mesajlar
+conversation = [
+    {"role": "system", "content": "Sen yardımcı bir asistansın."},
+    {"role": "user",   "content": "vLLM neden bu kadar hızlı?"},
+]
+
+# Tokenizer'ın chat template'ini kullan
+tokenizer = llm.get_tokenizer()
+prompt = tokenizer.apply_chat_template(
+    conversation,
+    tokenize=False,
+    add_generation_prompt=True,
+)
+
+outputs = llm.generate([prompt], SamplingParams(max_tokens=256))
+print(outputs[0].outputs[0].text)</code></pre>
+    </div>
+  </section>
+
+  <!-- ── S4: OpenAI-Compatible API ─────────────────────────── -->
+  <section id="s4">
+    <h2><span class="num">04</span> vLLM OpenAI-Compatible API</h2>
+    <p class="section-lead">vLLM'i OpenAI API formatında bir HTTP sunucusu olarak çalıştır — mevcut OpenAI istemcileri sıfır değişiklikle çalışır.</p>
+
+    <div class="code-block">
+      <div class="code-label">bash</div>
+      <pre><code># Sunucuyu başlat
+python -m vllm.entrypoints.openai.api_server \
+  --model meta-llama/Meta-Llama-3-8B-Instruct \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 1 \
+  --gpu-memory-utilization 0.90 \
+  --max-model-len 8192 \
+  --served-model-name llama-3-8b</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — OpenAI istemcisi</div>
+      <pre><code>from openai import OpenAI
+
+# vLLM sunucusuna yönlendir
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="token-abc123",  # herhangi bir değer
+)
+
+# Chat completion
+response = client.chat.completions.create(
+    model="llama-3-8b",
+    messages=[
+        {"role": "system", "content": "Kısa ve net yanıt ver."},
+        {"role": "user",   "content": "PagedAttention nedir?"},
+    ],
+    max_tokens=256,
+    temperature=0.7,
+    stream=False,
+)
+print(response.choices[0].message.content)</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — Streaming</div>
+      <pre><code>import sys
+
+stream = client.chat.completions.create(
+    model="llama-3-8b",
+    messages=[{"role": "user", "content": "Bana bir hikaye anlat."}],
+    max_tokens=512,
+    stream=True,
+)
+
+for chunk in stream:
+    delta = chunk.choices[0].delta
+    if delta.content:
+        sys.stdout.write(delta.content)
+        sys.stdout.flush()
+print()  # newline</code></pre>
+    </div>
+
+    <h3>Kullanılabilir Endpoint'ler</h3>
+    <table class="file-table">
+      <thead>
+        <tr><th>Endpoint</th><th>Metot</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>/v1/chat/completions</td><td>POST</td><td>Chat formatı (GPT-4 uyumlu)</td></tr>
+        <tr><td>/v1/completions</td><td>POST</td><td>Legacy text completion</td></tr>
+        <tr><td>/v1/embeddings</td><td>POST</td><td>Embedding modelleri için</td></tr>
+        <tr><td>/v1/models</td><td>GET</td><td>Yüklü modelleri listele</td></tr>
+        <tr><td>/health</td><td>GET</td><td>Sunucu sağlık kontrolü</td></tr>
+        <tr><td>/metrics</td><td>GET</td><td>Prometheus metrikleri</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ── S5: Tensor Parallelism ─────────────────────────────── -->
+  <section id="s5">
+    <h2><span class="num">05</span> Tensor Parallelism</h2>
+    <p class="section-lead">Büyük modelleri birden fazla GPU'ya yay — tensor parallelism ile 70B modelleri çalıştır.</p>
+
+    <p>
+      Tensor parallelism, model matrislerini farklı GPU'lara böler. Attention head'leri ve MLP katmanları sütun/satır bazında parçalanır. Her GPU hesabın bir bölümünü yapar, sonuçlar all-reduce ile birleştirilir.
+    </p>
+
+    <div class="code-block">
+      <div class="code-label">bash — 4 GPU ile 70B model</div>
+      <pre><code># 4 GPU için tensor parallelism
+python -m vllm.entrypoints.openai.api_server \
+  --model meta-llama/Meta-Llama-3-70B-Instruct \
+  --tensor-parallel-size 4 \
+  --pipeline-parallel-size 1 \
+  --gpu-memory-utilization 0.95 \
+  --max-model-len 8192 \
+  --dtype bfloat16
+
+# 8 GPU: tensor × pipeline parallelism
+python -m vllm.entrypoints.openai.api_server \
+  --model meta-llama/Meta-Llama-3-70B-Instruct \
+  --tensor-parallel-size 4 \
+  --pipeline-parallel-size 2 \
+  --max-model-len 4096</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — programatik</div>
+      <pre><code>from vllm import LLM
+
+# 4 GPU'ya tensor parallelism
+llm = LLM(
+    model="meta-llama/Meta-Llama-3-70B-Instruct",
+    tensor_parallel_size=4,
+    gpu_memory_utilization=0.95,
+    dtype="bfloat16",
+    enforce_eager=False,   # CUDA graph kullan (daha hızlı)
+)
+
+# GPU kullanımını kontrol et
+import torch
+for i in range(torch.cuda.device_count()):
+    mem = torch.cuda.memory_allocated(i) / 1024**3
+    print(f"GPU {i}: {mem:.1f} GB kullanımda")</code></pre>
+    </div>
+
+    <div class="params">
+      <div class="param-row">
+        <span class="param-name">--tensor-parallel-size</span>
+        <span class="param-desc">Tensor parallelism derecesi (GPU sayısı, 2'nin kuvveti olmalı)</span>
+      </div>
+      <div class="param-row">
+        <span class="param-name">--pipeline-parallel-size</span>
+        <span class="param-desc">Pipeline parallelism derecesi (katman bölümlemesi)</span>
+      </div>
+      <div class="param-row">
+        <span class="param-name">--distributed-executor-backend</span>
+        <span class="param-desc">ray veya mp (multiprocessing) — varsayılan: mp</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── S6: Speculative Decoding ───────────────────────────── -->
+  <section id="s6">
+    <h2><span class="num">06</span> Speculative Decoding</h2>
+    <p class="section-lead">Küçük taslak model ile büyük hedef modelin birlikte çalışması — latency'yi 2-3x düşür.</p>
+
+    <p>
+      Speculative decoding'de küçük (draft) bir model hızlıca birkaç token üretir; büyük (target) model bu token'ları paralel olarak doğrular. Hedef model kabul ederse token'lar ücretsiz gelmiş olur, reddettiğinde kendi token'ını üretir.
+    </p>
+
+    <div class="code-block">
+      <div class="code-label">bash — Eagle speculative decoding</div>
+      <pre><code># Eagle draft model ile speculative decoding
+python -m vllm.entrypoints.openai.api_server \
+  --model meta-llama/Meta-Llama-3-8B-Instruct \
+  --speculative-model eagle \
+  --num-speculative-tokens 5 \
+  --speculative-draft-tensor-parallel-size 1
+
+# Küçük model ile (harici draft)
+python -m vllm.entrypoints.openai.api_server \
+  --model meta-llama/Meta-Llama-3-70B-Instruct \
+  --speculative-model meta-llama/Meta-Llama-3-8B-Instruct \
+  --num-speculative-tokens 5 \
+  --tensor-parallel-size 4</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — Medusa heads</div>
+      <pre><code">from vllm import LLM, SamplingParams
+
+# Medusa: hedef modele eklenen ek head'ler
+llm = LLM(
+    model="FasterDecoding/medusa-vicuna-7b-v1.3",
+    speculative_model="[medusa]",
+    num_speculative_tokens=3,
+    tensor_parallel_size=1,
+)
+
+outputs = llm.generate(
+    ["Python'da decorator nasıl kullanılır?"],
+    SamplingParams(max_tokens=256, temperature=0.0),
+)
+print(outputs[0].outputs[0].text)</code></pre>
+    </div>
+
+    <table class="file-table">
+      <thead>
+        <tr><th>Yöntem</th><th>Mekanizma</th><th>Speedup</th><th>Doğruluk Kaybı</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Eagle</td><td>Autoregressive draft head</td><td>2-3×</td><td>Yok (lossless)</td></tr>
+        <tr><td>Medusa</td><td>Paralel speculative heads</td><td>1.5-2×</td><td>Yok (lossless)</td></tr>
+        <tr><td>Draft model</td><td>Ayrı küçük model</td><td>2-4×</td><td>Yok (lossless)</td></tr>
+        <tr><td>n-gram</td><td>Prompt'tan n-gram tahmin</td><td>1.3-2×</td><td>Yok (lossless)</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ── S7: TensorRT-LLM ───────────────────────────────────── -->
+  <section id="s7">
+    <h2><span class="num">07</span> TensorRT-LLM</h2>
+    <p class="section-lead">NVIDIA'nın optimize edilmiş LLM inference kütüphanesi — kernel fusion, in-flight batching ve quantization.</p>
+
+    <p>
+      TensorRT-LLM (TRT-LLM), NVIDIA'nın CUDA çekirdeklerini model mimarisine özgü fuse eden, in-flight batching (continuous batching benzeri), multi-GPU desteği ve agresif quantization sunan bir inference framework'üdür. vLLM'den farklı olarak derleme adımı gerektirir; ancak NVIDIA donanımında genellikle daha yüksek throughput sunar.
+    </p>
+
+    <div class="code-block">
+      <div class="code-label">bash — TRT-LLM kurulumu</div>
+      <pre><code># Docker önerilen yöntem
+docker pull nvcr.io/nvidia/tritonserver:24.01-trtllm-python-py3
+
+# pip install (CUDA 12.x)
+pip install tensorrt-llm -U --extra-index-url https://pypi.nvidia.com
+
+# Model derleme (Llama-3 örneği)
+python examples/llama/convert_checkpoint.py \
+  --model_dir /models/llama-3-8b-hf \
+  --output_dir /models/llama-3-8b-trt-ckpt \
+  --dtype bfloat16 \
+  --tp_size 1
+
+trtllm-build \
+  --checkpoint_dir /models/llama-3-8b-trt-ckpt \
+  --output_dir /models/llama-3-8b-trt-engine \
+  --gemm_plugin bfloat16 \
+  --max_batch_size 32 \
+  --max_input_len 2048 \
+  --max_seq_len 4096</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — TRT-LLM inference</div>
+      <pre><code">import tensorrt_llm
+from tensorrt_llm.runtime import ModelRunnerCpp
+
+# Engine'i yükle
+runner = ModelRunnerCpp.from_dir(
+    engine_dir="/models/llama-3-8b-trt-engine",
+    rank=tensorrt_llm.mpi_rank(),
+)
+
+# Batch inference
+import torch
+input_ids = [
+    torch.tensor([1, 29871, 13, 450], dtype=torch.int32),
+    torch.tensor([1, 29871, 13], dtype=torch.int32),
+]
+
+outputs = runner.generate(
+    batch_input_ids=input_ids,
+    max_new_tokens=256,
+    temperature=0.7,
+    end_id=2,
+    pad_id=2,
+)
+print(outputs)</code></pre>
+    </div>
+
+    <div class="callout">
+      <div class="label">vLLM vs TRT-LLM</div>
+      <p>vLLM kurulumu daha kolay ve framework-agnostic'tir. TRT-LLM, NVIDIA GPU'larda daha yüksek throughput sağlar ama derleme süreci ve NVIDIA ekosistemi gerektirir. Production'da çoğu ekip vLLM ile başlar, ardından gerekirse TRT-LLM'e geçiş yapar.</p>
+    </div>
+  </section>
+
+  <!-- ── S8: Quantization ───────────────────────────────────── -->
+  <section id="s8">
+    <h2><span class="num">08</span> Quantization: AWQ, GPTQ, INT4/INT8</h2>
+    <p class="section-lead">Model ağırlıklarını sıkıştır — VRAM gereksinimini yarıya indir, throughput'u artır, kaliteyi koru.</p>
+
+    <div class="code-block">
+      <div class="code-label">bash — AWQ quantized model</div>
+      <pre><code># AWQ (Activation-Aware Weight Quantization) — önerilen INT4
+pip install autoawq
+
+# Hugging Face'den hazır AWQ model
+python -m vllm.entrypoints.openai.api_server \
+  --model TheBloke/Llama-3-8B-Instruct-AWQ \
+  --quantization awq \
+  --dtype half
+
+# GPTQ model
+python -m vllm.entrypoints.openai.api_server \
+  --model TheBloke/Llama-3-8B-Instruct-GPTQ \
+  --quantization gptq \
+  --dtype half</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — AWQ modeli kendin quantize et</div>
+      <pre><code">from awq import AutoAWQForCausalLM
+from transformers import AutoTokenizer
+
+model_path = "meta-llama/Meta-Llama-3-8B-Instruct"
+quant_path = "llama-3-8b-awq"
+
+# Quantization konfigürasyonu
+quant_config = {
+    "zero_point": True,
+    "q_group_size": 128,
+    "w_bit": 4,           # INT4
+    "version": "GEMM",
+}
+
+# Model ve tokenizer yükle
+model = AutoAWQForCausalLM.from_pretrained(model_path)
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+# Kalibrasyon verisi ile quantize et
+model.quantize(tokenizer, quant_config=quant_config)
+model.save_quantized(quant_path)
+tokenizer.save_pretrained(quant_path)
+print(f"AWQ model kaydedildi: {quant_path}")</code></pre>
+    </div>
+
+    <table class="file-table">
+      <thead>
+        <tr><th>Yöntem</th><th>Bit</th><th>Bellek (7B)</th><th>Kalite Kaybı</th><th>Hız</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>FP16 (baseline)</td><td>16</td><td>14 GB</td><td>—</td><td>1×</td></tr>
+        <tr><td>GPTQ INT4</td><td>4</td><td>3.5 GB</td><td>Hafif</td><td>2-3×</td></tr>
+        <tr><td>AWQ INT4</td><td>4</td><td>3.5 GB</td><td>Çok hafif</td><td>2-3×</td></tr>
+        <tr><td>INT8 (W8A8)</td><td>8</td><td>7 GB</td><td>Minimal</td><td>1.5-2×</td></tr>
+        <tr><td>FP8 (Hopper+)</td><td>8</td><td>7 GB</td><td>Neredeyse yok</td><td>2×</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ── S9: Throughput Benchmark ──────────────────────────── -->
+  <section id="s9">
+    <h2><span class="num">09</span> Throughput Benchmark</h2>
+    <p class="section-lead">tokens/sec, TTFT ve latency percentile — LLM serving performansını doğru ölç.</p>
+
+    <div class="code-block">
+      <div class="code-label">bash — vLLM benchmark suite</div>
+      <pre><code"># vLLM'in dahili benchmark aracı
+python benchmarks/benchmark_throughput.py \
+  --model meta-llama/Meta-Llama-3-8B-Instruct \
+  --backend vllm \
+  --num-prompts 1000 \
+  --input-len 512 \
+  --output-len 128 \
+  --tensor-parallel-size 1
+
+# Sonraki çıktıya örnek:
+# Throughput: 1423.2 tokens/s
+# Request Throughput: 11.1 req/s</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — özel benchmark istemcisi</div>
+      <pre><code">import asyncio
+import time
+import aiohttp
+import statistics
+
+async def send_request(session, url, prompt, req_id):
+    start = time.perf_counter()
+    first_token_time = None
+    tokens = 0
+
+    async with session.post(url, json={
+        "model": "llama-3-8b",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 256,
+        "stream": True,
+    }) as resp:
+        async for line in resp.content:
+            line = line.decode().strip()
+            if line.startswith("data: ") and line != "data: [DONE]":
+                if first_token_time is None:
+                    first_token_time = time.perf_counter()
+                tokens += 1
+
+    total_time = time.perf_counter() - start
+    ttft = first_token_time - start if first_token_time else total_time
+    return {
+        "req_id": req_id,
+        "ttft_ms": ttft * 1000,
+        "total_ms": total_time * 1000,
+        "tokens": tokens,
+        "tps": tokens / total_time,
+    }
+
+async def benchmark(concurrency=10, total_requests=100):
+    url = "http://localhost:8000/v1/chat/completions"
+    prompt = "Makine öğrenmesinde overfitting nedir ve nasıl önlenir?"
+
+    async with aiohttp.ClientSession() as session:
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def bounded_req(i):
+            async with semaphore:
+                return await send_request(session, url, prompt, i)
+
+        start = time.perf_counter()
+        results = await asyncio.gather(*[bounded_req(i) for i in range(total_requests)])
+        elapsed = time.perf_counter() - start
+
+    ttfts = [r["ttft_ms"] for r in results]
+    tpss  = [r["tps"] for r in results]
+    print(f"Toplam süre:     {elapsed:.1f}s")
+    print(f"Request/s:       {total_requests/elapsed:.1f}")
+    print(f"TTFT p50:        {statistics.median(ttfts):.0f} ms")
+    print(f"TTFT p95:        {sorted(ttfts)[int(0.95*len(ttfts))]:.0f} ms")
+    print(f"Throughput p50:  {statistics.median(tpss):.0f} tok/s")
+
+asyncio.run(benchmark(concurrency=20, total_requests=200))</code></pre>
+    </div>
+
+    <table class="file-table">
+      <thead>
+        <tr><th>Metrik</th><th>Açıklama</th><th>İyi Değer (8B, A100)</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>TTFT (p50)</td><td>İlk token süresi, medyan</td><td>&lt; 100 ms</td></tr>
+        <tr><td>TTFT (p99)</td><td>İlk token süresi, %99 percentile</td><td>&lt; 500 ms</td></tr>
+        <tr><td>Throughput</td><td>Saniyede üretilen token</td><td>&gt; 1000 tok/s</td></tr>
+        <tr><td>Request/s</td><td>Saniyede tamamlanan istek</td><td>&gt; 10 req/s</td></tr>
+        <tr><td>GPU Util</td><td>GPU kullanım oranı</td><td>&gt; 85%</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ── S10: Pratik ────────────────────────────────────────── -->
+  <section id="s10">
+    <h2><span class="num">10</span> Pratik: Llama-3 vLLM ile Deploy</h2>
+    <p class="section-lead">Llama-3-8B-Instruct'ı vLLM ile production'a al, throughput benchmark yap ve streaming output entegre et.</p>
+
+    <div class="code-block">
+      <div class="code-label">bash — tam deploy scripti</div>
+      <pre><code"># 1. Model indir (HuggingFace Hub)
+huggingface-cli login
+huggingface-cli download meta-llama/Meta-Llama-3-8B-Instruct \
+  --local-dir /models/llama-3-8b
+
+# 2. vLLM sunucusu başlat
+python -m vllm.entrypoints.openai.api_server \
+  --model /models/llama-3-8b \
+  --served-model-name llama-3-8b \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --gpu-memory-utilization 0.90 \
+  --max-model-len 8192 \
+  --enable-prefix-caching \
+  --disable-log-requests \
+  --tensor-parallel-size 1 &amp;
+
+# 3. Sağlık kontrolü
+curl http://localhost:8000/health
+
+# 4. Hızlı throughput testi
+python benchmarks/benchmark_throughput.py \
+  --model llama-3-8b \
+  --backend openai \
+  --endpoint http://localhost:8000/v1 \
+  --num-prompts 200 \
+  --request-rate 10</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — streaming FastAPI proxy</div>
+      <pre><code">import asyncio
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from openai import AsyncOpenAI
+from pydantic import BaseModel
+
+app = FastAPI(title="LLM Proxy")
+client = AsyncOpenAI(base_url="http://localhost:8000/v1", api_key="x")
+
+class ChatRequest(BaseModel):
+    message: str
+    system: str = "Sen yardımcı bir asistansın."
+    max_tokens: int = 512
+
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest):
+    async def event_generator():
+        stream = await client.chat.completions.create(
+            model="llama-3-8b",
+            messages=[
+                {"role": "system", "content": req.system},
+                {"role": "user",   "content": req.message},
+            ],
+            max_tokens=req.max_tokens,
+            stream=True,
+        )
+        async for chunk in stream:
+            delta = chunk.choices[0].delta
+            if delta.content:
+                yield f"data: {delta.content}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+# Çalıştır: uvicorn serve:app --host 0.0.0.0 --port 8080</code></pre>
+    </div>
+
+    <div class="callout">
+      <div class="label">SONUÇ</div>
+      <p>Llama-3-8B-Instruct + vLLM + tek A100 80GB GPU kombinasyonu tipik olarak 1200-1800 token/s throughput, &lt;80ms TTFT (p50) sağlar. AWQ INT4 quantization ile bu değerler 2000+ token/s'ye ulaşabilir, TTFT ise benzer kalır.</p>
+    </div>
+  </section>
+
+</main>

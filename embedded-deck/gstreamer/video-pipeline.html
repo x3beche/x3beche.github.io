@@ -1,0 +1,685 @@
+---
+layout: tutorial
+title: "Video Pipeline — Encode & Decode"
+back_url: "../index.html"
+back_label: "GStreamer & Multimedya"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GSTREAMER</span>
+    <span>VIDEO PIPELINE</span>
+    <span>2026</span>
+  </div>
+  <h1>Video Pipeline —<br><em>Encode &amp; Decode.</em></h1>
+  <p class="subtitle">H.264'ten AV1'e codec temelleri, V4L2 kamera formatları, software ve hardware encode/decode pipeline'ları — gömülü sistemlerde video kalitesi ile kaynak kullanımını dengele.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Video codec temelleri — H.264, H.265, AV1, VP9</a></li>
+    <li><a href="#s1">v4l2src — kamera format ve yapılandırma</a></li>
+    <li><a href="#s2">Video dönüşüm element'leri</a></li>
+    <li><a href="#s3">Software encode — x264enc ve x265enc</a></li>
+    <li><a href="#s4">Hardware encode — v4l2h264enc, VAAPI, Jetson</a></li>
+    <li><a href="#s5">Decode pipeline — decodebin ve donanım decode</a></li>
+    <li><a href="#s6">Sink seçenekleri — filesink, udpsink, appsink</a></li>
+    <li><a href="#s7">Kalite ve performans analizi</a></li>
+    <li><a href="#s8">Pratik: kamera → H.264 MP4 + eş zamanlı UDP stream</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Video codec temelleri — H.264, H.265, AV1, VP9</h2>
+  <p class="section-lead">Codec seçimi; bant genişliği, CPU/VPU yükü, gecikme ve uyumluluk arasındaki dengeyi belirler. Gömülü sistemlerde donanım desteği olan codec tercih edilmelidir.</p>
+
+  <h3>Codec karşılaştırması</h3>
+
+  <div class="file-table">
+    <div class="file-row header"><div>Codec</div><div>Standart</div><div>Sıkıştırma Verimliliği</div><div>HW Desteği</div><div>Gecikme</div></div>
+    <div class="file-row"><div>H.264 (AVC)</div><div>ITU-T H.264</div><div>Temel</div><div>Evrensel</div><div>Düşük</div></div>
+    <div class="file-row"><div>H.265 (HEVC)</div><div>ITU-T H.265</div><div>H.264'e göre ~2x</div><div>Yaygın</div><div>Orta</div></div>
+    <div class="file-row"><div>AV1</div><div>AOMedia</div><div>HEVC'ye göre ~30% iyi</div><div>Sınırlı (yeni)</div><div>Yüksek</div></div>
+    <div class="file-row"><div>VP9</div><div>Google</div><div>H.264'e göre ~50% iyi</div><div>Orta</div><div>Orta</div></div>
+  </div>
+
+  <h3>Frame türleri</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">I-Frame (Intra)</div><div class="desc">Tam referans kare, diğer karelerden bağımsız. En büyük boyut. Seek ve hata kurtarma noktası. IDR (Instantaneous Decoder Refresh) özel türü.</div></div>
+    <div class="param"><div class="name">P-Frame (Predicted)</div><div class="desc">Bir önceki I veya P frame'e göre fark kodlanır. I-frame'in 1/3-1/5 boyutu.</div></div>
+    <div class="param"><div class="name">B-Frame (Bi-directional)</div><div class="desc">Hem önceki hem sonraki frame'e referans verir. En küçük boyut, en yüksek gecikme. Gerçek zamanlı akışlarda genellikle kapatılır.</div></div>
+  </div>
+
+  <h3>Bitrate modları</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">CBR (Constant Bitrate)</div><div class="desc">Sabit bant genişliği. Ağ streaming için ideal. Kalite sahneden sahneye değişir. x264enc: pass=cbr bitrate=2000</div></div>
+    <div class="param"><div class="name">VBR (Variable Bitrate)</div><div class="desc">Sabit kalite hedefi. Karmaşık sahnelerde daha fazla bit kullanır. Dosya kayıt için tercih edilir.</div></div>
+    <div class="param"><div class="name">CQP (Constant Quantization Parameter)</div><div class="desc">Doğrudan QP değeri kontrol. Donanım encoder'larında yaygın. Düşük QP → yüksek kalite, büyük dosya.</div></div>
+    <div class="param"><div class="name">CRF (Constant Rate Factor)</div><div class="desc">x264/x265'e özgü VBR modu. 0-51 arası değer, 23 varsayılan. İnsan gözü için optimize edilmiş kalite.</div></div>
+  </div>
+
+  <div class="callout">
+    <div class="label">GÖMÜLÜ SİSTEM</div>
+    <p>Gömülü sistemlerde B-frame'leri kapatmak (<code class="inline">b-frames=0</code>), <code class="inline">tune=zerolatency</code> kullanmak ve IDR aralığını düşük tutmak (<code class="inline">key-int-max=30</code>) gecikmeyi minimize eder.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> v4l2src — kamera format ve yapılandırma</h2>
+  <p class="section-lead">v4l2src, Video4Linux2 arayüzü üzerinden kameradan ham frame alan GStreamer source element'idir. Format seçimi, sonraki pipeline element'lerini doğrudan etkiler.</p>
+
+  <h3>Yaygın kamera formatları</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">YUYV (YUY2)</div><div class="desc">4:2:2 chroma subsampling. USB kameralarda varsayılan. Her pixel başına 2 byte. Yüksek bant genişliği tüketir; encode öncesi I420/NV12'ye dönüştür.</div></div>
+    <div class="param"><div class="name">NV12</div><div class="desc">4:2:0, Y plane + interleaved UV plane. Donanım encoder'larının tercih ettiği format. YUYV'dan yaklaşık %25 daha küçük.</div></div>
+    <div class="param"><div class="name">MJPEG</div><div class="desc">Her frame JPEG olarak sıkıştırılmış. Düşük USB bant genişliği, CPU decode gerektirir. 1080p@30fps için ideal.</div></div>
+    <div class="param"><div class="name">H264</div><div class="desc">Kamera içinde encode edilmiş (örn: RPi kamera v2, Logitech C920). En düşük bant genişliği, doğrudan streaming için hazır.</div></div>
+  </div>
+
+  <h3>v4l2src özellikleri ve caps</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kamera caps listesi (GStreamer ile)</span>
+gst-device-monitor-1.0 Video/Source
+
+<span class="cmt"># YUYV 1280x720 @ 30fps</span>
+gst-launch-1.0 \
+  v4l2src device=/dev/video0 ! \
+  video/x-raw,format=YUYV,width=1280,height=720,framerate=30/1 ! \
+  videoconvert ! autovideosink
+
+<span class="cmt"># MJPEG 1920x1080 @ 30fps (USB kamera)</span>
+gst-launch-1.0 \
+  v4l2src device=/dev/video0 ! \
+  image/jpeg,width=1920,height=1080,framerate=30/1 ! \
+  jpegdec ! videoconvert ! autovideosink
+
+<span class="cmt"># io-mode: userptr DMA transfer (sıfır kopya için)</span>
+gst-launch-1.0 \
+  v4l2src device=/dev/video0 io-mode=4 ! \
+  video/x-raw,format=NV12,width=1920,height=1080 ! \
+  v4l2h264enc ! filesink location=out.h264</code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><div class="name">io-mode=0</div><div class="desc">AUTO — kernel otomatik seçer.</div></div>
+    <div class="param"><div class="name">io-mode=1</div><div class="desc">MMAP — kernel buffer'ları mmap ile kullanıcı alanına eşler. Varsayılan.</div></div>
+    <div class="param"><div class="name">io-mode=2</div><div class="desc">USERPTR — uygulama buffer hafızasını verir.</div></div>
+    <div class="param"><div class="name">io-mode=4</div><div class="desc">DMABUF — DMA-BUF fd ile zero-copy. Donanım encoder ile kullanımda en verimli.</div></div>
+  </div>
+
+  <h3>V4L2 kontrol ayarları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Parlaklık, kontrast gibi kamera kontrollerini listele</span>
+v4l2-ctl -d /dev/video0 --list-ctrls
+
+<span class="cmt"># GStreamer içinden v4l2 kontrol yaz</span>
+gst-launch-1.0 \
+  v4l2src device=/dev/video0 extra-controls="c,brightness=128,contrast=64" ! \
+  videoconvert ! autovideosink</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Video dönüşüm element'leri</h2>
+  <p class="section-lead">videoconvert, videoscale ve videorate; pipeline içindeki format, çözünürlük ve kare hızı dönüşümlerini gerçekleştiren temel filter element'leridir.</p>
+
+  <div class="params">
+    <div class="param"><div class="name">videoconvert</div><div class="desc">Renk uzayı ve piksel format dönüşümü: YUYV→I420, I420→NV12, RGB→BGR vb. CPU tabanlı; yoğun kullanımda performans darboğazı olabilir.</div></div>
+    <div class="param"><div class="name">videoscale</div><div class="desc">Çözünürlük değiştirme: 1920x1080 → 1280x720. Çeşitli interpolasyon metotları destekler (nearest, bilinear, lanczos).</div></div>
+    <div class="param"><div class="name">videorate</div><div class="desc">Kare hızını değiştirir: 60fps → 30fps. Buffer'ları çoğaltır veya atar. Kaynak stabil değilse senkronizasyon için kullanılır.</div></div>
+    <div class="param"><div class="name">glupload / gldownload</div><div class="desc">CPU ↔ GPU bellek transferi. OpenGL pipeline ile entegrasyon için.</div></div>
+  </div>
+
+  <h3>Zincir örneği</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1080p@60 kamera → 720p@30 → H.264 encode</span>
+gst-launch-1.0 \
+  v4l2src device=/dev/video0 ! \
+  video/x-raw,format=YUYV,width=1920,height=1080,framerate=60/1 ! \
+  videoconvert ! \
+  videoscale ! \
+  video/x-raw,width=1280,height=720 ! \
+  videorate ! \
+  video/x-raw,framerate=30/1 ! \
+  x264enc bitrate=2000 ! \
+  mp4mux ! filesink location=out.mp4
+
+<span class="cmt"># videoscale metodu seç</span>
+gst-launch-1.0 videotestsrc ! \
+  videoscale method=bilinear ! \
+  video/x-raw,width=640,height=360 ! \
+  autovideosink</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">OPTİMİZASYON</div>
+    <p>videoconvert → videoscale → videoconvert zinciri gereksiz CPU yükü yaratır. Mümkünse hardware üzerinde tek format + tek ölçekleyici (örn: imxvideoconvert_g2d i.MX8'de) tercih edin. Önce ölçekle, sonra format dönüştür sırası genellikle daha verimlidir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Software encode — x264enc ve x265enc</h2>
+  <p class="section-lead">x264 ve x265, açık kaynaklı referans H.264/H.265 encoder'larıdır. CPU kullanımı yüksektir; ancak donanım encoder'ı olmayan sistemlerde veya kalite öncelikli senaryolarda tercih edilir.</p>
+
+  <h3>x264enc parametreleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — x264enc</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Temel kullanım</span>
+gst-launch-1.0 \
+  videotestsrc ! videoconvert ! \
+  x264enc bitrate=2000 ! \
+  mp4mux ! filesink location=sw_encode.mp4
+
+<span class="cmt"># Düşük gecikme (RTSP/streaming için)</span>
+gst-launch-1.0 \
+  v4l2src device=/dev/video0 ! \
+  video/x-raw,format=YUYV,width=1280,height=720 ! \
+  videoconvert ! \
+  x264enc \
+    tune=zerolatency \
+    speed-preset=ultrafast \
+    bitrate=1500 \
+    key-int-max=30 \
+    b-adapt=false \
+    bframes=0 ! \
+  rtph264pay ! \
+  udpsink host=192.168.1.100 port=5000
+
+<span class="cmt"># Yüksek kalite arşiv (CRF modu)</span>
+gst-launch-1.0 -e \
+  v4l2src device=/dev/video0 num-buffers=300 ! \
+  video/x-raw,format=YUYV,width=1920,height=1080 ! \
+  videoconvert ! \
+  x264enc \
+    pass=qual \
+    quantizer=21 \
+    profile=high ! \
+  mp4mux ! filesink location=hq.mp4</code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><div class="name">speed-preset</div><div class="desc">ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow. Hız/kalite/CPU dengesi. Gömülü için ultrafast veya superfast.</div></div>
+    <div class="param"><div class="name">tune</div><div class="desc">zerolatency: B-frame kapalı, lookahead yok, anlık encode. film: kalite optimize. grain: film grain korunur.</div></div>
+    <div class="param"><div class="name">bitrate</div><div class="desc">Hedef bitrate (kbps). CBR modunda kullanılır.</div></div>
+    <div class="param"><div class="name">quantizer</div><div class="desc">CRF değeri (0-51). Düşük = yüksek kalite. pass=qual ile aktif.</div></div>
+    <div class="param"><div class="name">profile</div><div class="desc">baseline (en uyumlu), main, high. Donanım decode uyumluluğuna göre seç.</div></div>
+    <div class="param"><div class="name">key-int-max</div><div class="desc">Maksimum IDR frame aralığı. 30fps'de 30 = her saniye I-frame. Seek ve hata kurtarma için önemli.</div></div>
+  </div>
+
+  <h3>x265enc parametreleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — x265enc</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># HEVC encode — H.264'e göre ~2x daha verimli sıkıştırma</span>
+gst-launch-1.0 \
+  videotestsrc num-buffers=150 ! \
+  video/x-raw,format=I420,width=1920,height=1080,framerate=30/1 ! \
+  x265enc \
+    bitrate=1000 \
+    speed-preset=fast \
+    tune=zerolatency ! \
+  h265parse ! \
+  mp4mux ! filesink location=hevc.mp4
+
+<span class="cmt"># Not: x265enc çıkışı için h265parse gerekebilir</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Hardware encode — v4l2h264enc, VAAPI, Jetson</h2>
+  <p class="section-lead">Donanım encoder'ları; CPU'yu devre dışı bırakarak VPU/GPU üzerinde encode yapar. Güç tüketimi ve ısı açısından gömülü sistemler için kritiktir.</p>
+
+  <h3>v4l2h264enc (i.MX8 / Raspberry Pi)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — v4l2h264enc</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Raspberry Pi 4 — hardware H.264 encode</span>
+gst-launch-1.0 \
+  v4l2src device=/dev/video0 ! \
+  video/x-raw,format=YUY2,width=1920,height=1080,framerate=30/1 ! \
+  v4l2convert ! \
+  video/x-raw,format=NV12 ! \
+  v4l2h264enc extra-controls="controls,repeat_sequence_header=1" ! \
+  video/x-h264,level=(string)4 ! \
+  h264parse ! \
+  mp4mux ! filesink location=rpi_hw.mp4
+
+<span class="cmt"># i.MX8MP — hardware encode + DMA-BUF</span>
+gst-launch-1.0 \
+  v4l2src device=/dev/video0 io-mode=dmabuf ! \
+  video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 ! \
+  v4l2h264enc capture-io-mode=dmabuf ! \
+  filesink location=imx8_hw.h264
+
+<span class="cmt"># Encoder kontrollerini listele</span>
+v4l2-ctl -d /dev/video1 --list-ctrls
+<span class="cmt"># /dev/video1 genellikle encode, /dev/video0 kamera</span></code></pre>
+  </div>
+
+  <h3>VA-API (Intel / AMD)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — gstreamer-vaapi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># VA-API bilgilerini kontrol et</span>
+vainfo
+<span class="cmt"># vainfo: VA-API version: 1.16
+# Driver version: Intel iHD driver  ...
+# Supported profile and entrypoints:</span>
+
+<span class="cmt"># VAAPI H.264 encode</span>
+gst-launch-1.0 \
+  videotestsrc num-buffers=300 ! \
+  video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 ! \
+  vaapih264enc bitrate=4000 keyframe-period=30 ! \
+  mp4mux ! filesink location=vaapi.mp4
+
+<span class="cmt"># VAAPI H.265 encode</span>
+gst-launch-1.0 \
+  videotestsrc ! \
+  vaapih265enc bitrate=2000 ! \
+  h265parse ! \
+  mp4mux ! filesink location=vaapi_hevc.mp4</code></pre>
+  </div>
+
+  <h3>Jetson NVENC (nvv4l2h264enc)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Jetson Nano/NX</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Jetson hardware H.264 encode</span>
+gst-launch-1.0 \
+  v4l2src device=/dev/video0 ! \
+  video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 ! \
+  nvv4l2h264enc \
+    bitrate=4000000 \
+    iframeinterval=30 \
+    preset-level=1 \
+    insert-sps-pps=true ! \
+  h264parse ! \
+  mp4mux ! filesink location=jetson_hw.mp4
+
+<span class="cmt"># Jetson H.265 encode</span>
+gst-launch-1.0 \
+  v4l2src device=/dev/video0 ! \
+  video/x-raw,format=NV12,width=3840,height=2160 ! \
+  nvv4l2h265enc bitrate=8000000 ! \
+  h265parse ! \
+  filesink location=jetson_4k.h265</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">UYUMLULUK</div>
+    <p>Donanım encoder'larının büyük çoğunluğu sadece NV12 veya I420 formatını kabul eder. Kamera YUYV çıkış veriyorsa <code class="inline">videoconvert</code> veya <code class="inline">v4l2convert</code> ile dönüşüm zorunludur. Ancak bu dönüşüm CPU'ya yük getirir; mümkünse kamerayı doğrudan NV12 modunda yapılandırın.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Decode pipeline — decodebin ve donanım decode</h2>
+  <p class="section-lead">Decode tarafında GStreamer'ın otomatik bağlama özelliği (decodebin/uridecodebin) büyük kolaylık sağlar. Donanım decoder ile CPU decode arasındaki fark çok büyüktür.</p>
+
+  <h3>decodebin — otomatik decode</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — decodebin</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Herhangi bir video dosyasını otomatik decode et ve göster</span>
+gst-launch-1.0 \
+  filesrc location=video.mp4 ! \
+  decodebin ! \
+  videoconvert ! \
+  autovideosink
+
+<span class="cmt"># uridecodebin — URI destekli (file://, rtsp://, http://)</span>
+gst-launch-1.0 \
+  uridecodebin uri=file:///home/user/video.mp4 ! \
+  videoconvert ! \
+  autovideosink
+
+<span class="cmt"># playbin — tam oynatıcı (audio+video+subtitle)</span>
+gst-launch-1.0 \
+  playbin uri=file:///home/user/video.mp4</code></pre>
+  </div>
+
+  <h3>Manuel H.264 decode pipeline</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — manuel decode</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Software decode (avdec_h264 — libav/FFmpeg)</span>
+gst-launch-1.0 \
+  filesrc location=video.h264 ! \
+  h264parse ! \
+  avdec_h264 ! \
+  videoconvert ! \
+  autovideosink
+
+<span class="cmt"># V4L2 hardware decode (i.MX8 / RPi)</span>
+gst-launch-1.0 \
+  filesrc location=video.h264 ! \
+  h264parse ! \
+  v4l2h264dec ! \
+  videoconvert ! \
+  autovideosink
+
+<span class="cmt"># Jetson hardware decode</span>
+gst-launch-1.0 \
+  filesrc location=video.h264 ! \
+  h264parse ! \
+  nvv4l2decoder ! \
+  nvvideoconvert ! \
+  nv3dsink
+
+<span class="cmt"># VAAPI decode (Intel/AMD)</span>
+gst-launch-1.0 \
+  filesrc location=video.h264 ! \
+  h264parse ! \
+  vaapih264dec ! \
+  vaapipostproc ! \
+  autovideosink</code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><div class="name">h264parse</div><div class="desc">H.264 byte-stream'ini parse eder, NAL unit'leri ayırır. Hardware decoder öncesi genellikle gereklidir.</div></div>
+    <div class="param"><div class="name">avdec_h264</div><div class="desc">FFmpeg tabanlı software H.264 decoder. Geniş uyumluluk, yüksek CPU kullanımı.</div></div>
+    <div class="param"><div class="name">v4l2h264dec</div><div class="desc">V4L2 M2M (Memory-to-Memory) hardware decoder. i.MX8, RPi gibi platformlarda mevcut.</div></div>
+    <div class="param"><div class="name">nvv4l2decoder</div><div class="desc">Jetson NVDEC tabanlı hardware decoder. 4K@60fps decode edebilir.</div></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Sink seçenekleri — filesink, udpsink, appsink</h2>
+  <p class="section-lead">Pipeline'ın son noktası sink element'idir. Hedef; depolama, ağ, ekran veya uygulama tampon belleği olabilir.</p>
+
+  <div class="params">
+    <div class="param"><div class="name">filesink</div><div class="desc">Ham veriyi dosyaya yazar. location özelliği zorunludur. mp4mux, matroskamux ile birlikte konteyner formatı oluşturulur.</div></div>
+    <div class="param"><div class="name">udpsink</div><div class="desc">UDP üzerinden RTP paketi gönderir. host, port özellik. Düşük gecikme, güvenilmez teslimat.</div></div>
+    <div class="param"><div class="name">tcpclientsink</div><div class="desc">TCP bağlantısı açar, stream gönderir. Güvenilir ama gecikme ekler.</div></div>
+    <div class="param"><div class="name">appsink</div><div class="desc">Uygulama kodu pipeline'dan buffer çeker. AI inference, frame işleme için kritik.</div></div>
+    <div class="param"><div class="name">autovideosink</div><div class="desc">Platform otomatik video çıkışı. Wayland, X11, fbdev, kmssink arasından seçer.</div></div>
+    <div class="param"><div class="name">waylandsink</div><div class="desc">Wayland compositor'a doğrudan çıkış. Gömülü yeni nesil platformlarda tercih.</div></div>
+    <div class="param"><div class="name">kmssink</div><div class="desc">DRM/KMS doğrudan çıkış. Wayland/X11 olmayan headless sistemlerde framebuffer alternatifi.</div></div>
+  </div>
+
+  <h3>appsink ile buffer yakalama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>appsink_example.c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;gst/gst.h&gt;
+#include &lt;gst/app/gstappsink.h&gt;
+
+static GstFlowReturn new_sample_cb(GstAppSink *sink, gpointer data)
+{
+    GstSample  *sample;
+    GstBuffer  *buffer;
+    GstMapInfo  map;
+
+    sample = gst_app_sink_pull_sample(sink);
+    if (!sample) return GST_FLOW_ERROR;
+
+    buffer = gst_sample_get_buffer(sample);
+    gst_buffer_map(buffer, &amp;map, GST_MAP_READ);
+
+    /* map.data → ham piksel verisi, map.size → byte boyutu */
+    g_print("Frame alındı: %zu byte, ts=%" GST_TIME_FORMAT "\n",
+            map.size, GST_TIME_ARGS(GST_BUFFER_PTS(buffer)));
+
+    /* Burada frame işleme: OpenCV, TFLite vb. */
+
+    gst_buffer_unmap(buffer, &amp;map);
+    gst_sample_unref(sample);
+    return GST_FLOW_OK;
+}
+
+int main(int argc, char *argv[])
+{
+    GstElement *pipeline, *appsink_el;
+    GstAppSink *appsink;
+
+    gst_init(&amp;argc, &amp;argv);
+
+    pipeline = gst_parse_launch(
+        "v4l2src device=/dev/video0 ! "
+        "video/x-raw,format=RGB,width=640,height=480 ! "
+        "videoconvert ! "
+        "video/x-raw,format=RGB ! "
+        "appsink name=sink emit-signals=true max-buffers=1 drop=true",
+        NULL);
+
+    appsink_el = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
+    appsink    = GST_APP_SINK(appsink_el);
+
+    /* Yeni frame sinyalini bağla */
+    g_signal_connect(appsink, "new-sample", G_CALLBACK(new_sample_cb), NULL);
+
+    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+
+    /* Ana döngü */
+    GMainLoop *loop = g_main_loop_new(NULL, FALSE);
+    g_main_loop_run(loop);
+
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(pipeline);
+    return 0;
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Kalite ve performans analizi</h2>
+  <p class="section-lead">Pipeline performansını ölçmek; darboğazları tespit etmek, parametre optimizasyonu yapmak ve ısıl sorunu önceden görmek için kritiktir.</p>
+
+  <h3>GST_DEBUG ile log analizi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — debug logging</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Seviye: 0=NONE, 1=ERROR, 2=WARN, 3=FIXME, 4=INFO, 5=DEBUG, 6=LOG, 7=TRACE</span>
+export GST_DEBUG="*:3"               # tüm kategoriler WARNING+
+export GST_DEBUG="v4l2src:5,x264enc:4"  # seçici
+export GST_DEBUG_FILE=/tmp/gst.log   # dosyaya yaz
+
+<span class="cmt"># Renk log (terminal)</span>
+export GST_DEBUG_COLOR_MODE=on
+
+<span class="cmt"># Şema (dot) dosyası oluştur — pipeline görselleştirme</span>
+export GST_DEBUG_DUMP_DOT_DIR=/tmp/gst_dots
+<span class="cmt"># Pipeline PLAYING'e geçince .dot dosyası oluşur</span>
+<span class="cmt"># dot -Tpng pipeline.dot -o pipeline.png</span></code></pre>
+  </div>
+
+  <h3>Performans ölçüm araçları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># fpsdisplaysink ile gerçek zamanlı FPS izleme</span>
+gst-launch-1.0 \
+  v4l2src device=/dev/video0 ! \
+  video/x-raw,width=1920,height=1080,framerate=30/1 ! \
+  videoconvert ! \
+  fpsdisplaysink video-sink=autovideosink sync=false text-overlay=true
+
+<span class="cmt"># CPU kullanımını ölç (encode sırasında)</span>
+pidstat -u 1 &amp;
+gst-launch-1.0 -e \
+  v4l2src device=/dev/video0 num-buffers=300 ! \
+  videoconvert ! x264enc ! filesink location=/dev/null
+
+<span class="cmt"># Pipeline gecikme analizi</span>
+GST_DEBUG="GST_PERFORMANCE:5" gst-launch-1.0 \
+  v4l2src device=/dev/video0 ! \
+  videoconvert ! \
+  x264enc tune=zerolatency ! \
+  udpsink host=127.0.0.1 port=5000 2>&1 | grep latency</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">THERMAL</div>
+    <p>Uzun süre 1080p encode sırasında gömülü sistemlerde termal kısıtlama (throttling) devreye girebilir. <code class="inline">watch -n1 cat /sys/thermal/thermal_zone0/temp</code> ile sıcaklığı izleyin. Soğutma yeterliyse donanım encoder tercih edin — güç tüketimi yazılım encode'a göre genellikle 5-10x daha düşüktür.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: kamera → H.264 MP4 + eş zamanlı UDP stream</h2>
+  <p class="section-lead">Tek kamera kaynağından hem yüksek kaliteli MP4 dosyaya yazma hem de düşük gecikmeli UDP stream — tee element ile eş zamanlı iki çıkış yönetimi.</p>
+
+  <h3>Pipeline tasarımı</h3>
+
+  <div class="flow">
+    <div class="flow-step">v4l2src<br><small>/dev/video0</small></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step">videoconvert<br><small>YUYV→I420</small></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step">tee<br><small>çoğalt</small></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step">encode → MP4<br><small>yüksek kalite</small></div>
+  </div>
+  <div style="margin-left:200px;margin-top:-10px;margin-bottom:16px;">
+    <div class="flow">
+      <div class="flow-step" style="visibility:hidden">tee</div>
+      <div class="flow-arrow">↓</div>
+      <div class="flow-step">encode → UDP<br><small>düşük gecikme</small></div>
+    </div>
+  </div>
+
+  <h3>gst-launch komutu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — tee pipeline</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kamera → tee → (MP4 dosya) + (UDP RTP stream)</span>
+gst-launch-1.0 -e \
+  v4l2src device=/dev/video0 ! \
+  video/x-raw,format=YUYV,width=1280,height=720,framerate=30/1 ! \
+  videoconvert ! \
+  video/x-raw,format=I420 ! \
+  tee name=t \
+    t. ! queue max-size-buffers=5 leaky=downstream ! \
+       x264enc bitrate=3000 speed-preset=fast key-int-max=30 ! \
+       mp4mux ! filesink location=kayit.mp4 \
+    t. ! queue max-size-buffers=2 leaky=downstream ! \
+       x264enc bitrate=1000 speed-preset=ultrafast tune=zerolatency ! \
+       rtph264pay config-interval=1 pt=96 ! \
+       udpsink host=192.168.1.100 port=5000</code></pre>
+  </div>
+
+  <h3>Alıcı tarafı (VLC veya GStreamer)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — alıcı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># VLC ile izle</span>
+vlc rtp://0.0.0.0:5000
+
+<span class="cmt"># GStreamer alıcı pipeline</span>
+gst-launch-1.0 \
+  udpsrc port=5000 ! \
+  application/x-rtp,encoding-name=H264,payload=96 ! \
+  rtph264depay ! \
+  h264parse ! \
+  avdec_h264 ! \
+  videoconvert ! \
+  fpsdisplaysink sync=false</code></pre>
+  </div>
+
+  <h3>C uygulaması — gst_parse_launch ile</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dual_output.c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;gst/gst.h&gt;
+#include &lt;signal.h&gt;
+
+static GMainLoop *loop;
+
+static void sig_handler(int s) { g_main_loop_quit(loop); }
+
+static gboolean bus_cb(GstBus *bus, GstMessage *msg, gpointer data)
+{
+    switch (GST_MESSAGE_TYPE(msg)) {
+    case GST_MESSAGE_EOS:
+        g_main_loop_quit((GMainLoop *)data); break;
+    case GST_MESSAGE_ERROR: {
+        GError *e; gchar *d;
+        gst_message_parse_error(msg, &amp;e, &amp;d);
+        g_printerr("HATA: %s\n", e->message);
+        g_error_free(e); g_free(d);
+        g_main_loop_quit((GMainLoop *)data); break;
+    }
+    default: break;
+    }
+    return TRUE;
+}
+
+int main(int argc, char *argv[])
+{
+    const char *host = argc > 1 ? argv[1] : "127.0.0.1";
+    gchar *desc;
+    GstElement *pipeline;
+    GstBus *bus;
+
+    gst_init(&amp;argc, &amp;argv);
+    signal(SIGINT, sig_handler);
+
+    desc = g_strdup_printf(
+        "v4l2src device=/dev/video0 ! "
+        "video/x-raw,format=YUYV,width=1280,height=720,framerate=30/1 ! "
+        "videoconvert ! video/x-raw,format=I420 ! "
+        "tee name=t "
+        "t. ! queue leaky=2 ! "
+        "    x264enc bitrate=3000 speed-preset=fast key-int-max=30 ! "
+        "    mp4mux ! filesink location=kayit.mp4 "
+        "t. ! queue leaky=2 max-size-buffers=2 ! "
+        "    x264enc bitrate=1000 speed-preset=ultrafast tune=zerolatency ! "
+        "    rtph264pay config-interval=1 pt=96 ! "
+        "    udpsink host=%s port=5000", host);
+
+    pipeline = gst_parse_launch(desc, NULL);
+    g_free(desc);
+
+    loop = g_main_loop_new(NULL, FALSE);
+    bus  = gst_element_get_bus(pipeline);
+    gst_bus_add_watch(bus, bus_cb, loop);
+    gst_object_unref(bus);
+
+    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    g_print("Kayıt ve stream başladı → %s:5000\n", host);
+    g_main_loop_run(loop);
+
+    /* EOS → dosyayı kapat */
+    gst_element_send_event(pipeline, gst_event_new_eos());
+    g_usleep(500000);  /* 0.5s MP4 kapansın */
+
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(pipeline);
+    g_main_loop_unref(loop);
+    return 0;
+}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">QUEUE AYARI</div>
+    <p>tee sonrası her dal mutlaka <code class="inline">queue</code> içermelidir. Aksi halde iki dal aynı thread'de çalışır, biri diğerini bloklar. <code class="inline">leaky=downstream</code> ile dolduğunda en eski buffer atılır — canlı stream senkronunu korur. Dosya yazan dal için <code class="inline">leaky=0</code> (hiç atma) tercih edilmelidir.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

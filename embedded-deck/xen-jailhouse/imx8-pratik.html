@@ -1,0 +1,658 @@
+---
+layout: tutorial
+title: "i.MX8 Pratik — Jailhouse + FreeRTOS + Linux"
+back_url: "../index.html"
+back_label: "Xen & Jailhouse — Gömülü Hypervisor"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>JAILHOUSE</span>
+    <span>i.MX8 PRATİK</span>
+    <span>2026</span>
+  </div>
+  <h1>i.MX8 Pratik —<br><em>Jailhouse + FreeRTOS + Linux.</em></h1>
+  <p class="subtitle">NXP i.MX8QM kartında Jailhouse hypervisor kurulumundan FreeRTOS ve Linux inmate'lerin çalıştırılmasına: cell config dosyası, FreeRTOS inmate binary, Linux guest, IVSHMEM paylaşımlı bellek ve cell'ler arası iletişim protokolü.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">i.MX8QM donanım mimarisi ve kaynak bölümlendirmesi</a></li>
+    <li><a href="#s1">Jailhouse derleme ve kurulum</a></li>
+    <li><a href="#s2">Root cell Linux yapılandırması</a></li>
+    <li><a href="#s3">FreeRTOS inmate cell yapılandırması</a></li>
+    <li><a href="#s4">FreeRTOS inmate binary derleme</a></li>
+    <li><a href="#s5">Linux inmate (ikinci Linux guest)</a></li>
+    <li><a href="#s6">IVSHMEM paylaşımlı bellek kurulumu</a></li>
+    <li><a href="#s7">Cell'ler arası iletişim protokolü tasarımı</a></li>
+    <li><a href="#s8">Hata ayıklama ve izleme</a></li>
+    <li><a href="#s9">Üretim için sertleştirme adımları</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> i.MX8QM donanım mimarisi ve kaynak bölümlendirmesi</h2>
+  <p class="section-lead">NXP i.MX8 QuadMax, birden fazla işlemci çekirdeği, GPU, DSP ve bağımsız güç alanlarıyla karmaşık mixed-criticality tasarımlar için uygundur. Jailhouse bu SoC için resmi destek sağlar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>i.MX8QM İşlemci Kompleksi</span><span class="dot">●</span></div>
+    <pre><code>i.MX8 QuadMax İşlemci Kaynakları:
+  ├── CA72 Cluster (2 core, ARMv8-A)
+  │     Saat: 1.6 GHz, L2=1MB/core, L3=4MB paylaşımlı
+  ├── CA53 Cluster (4 core, ARMv8-A)
+  │     Saat: 1.2 GHz, L2=512KB/core
+  ├── CM4F (2 core, ARMv7E-M)
+  │     Saat: 264 MHz, TCM: 256KB ITCM + 256KB DTCM
+  ├── HiFi4 DSP
+  ├── GC7000L GPU
+  └── VPU (video encode/decode)
+
+Bellek haritası (DDR4-3200, 6 GB):
+  0x80000000 – 0xBFFFFFFF  Linux root (1 GB)
+  0xC0000000 – 0xCFFFFFFF  FreeRTOS inmate (256 MB)
+  0xD0000000 – 0xDFFFFFFF  Linux inmate (256 MB)
+  0xE0000000 – 0xE00FFFFF  IVSHMEM (1 MB)
+  0x7FC00000 – 0x7FFFFFFF  Jailhouse hypervisor (4 MB)</code></pre>
+  </div>
+
+  <p>i.MX8 kartları arasında MCIMX8QM-CPU (MEK — Multi-sensory Evaluation Kit) veya Toradex Apalis i.MX8QM en yaygın geliştirme platformlarıdır. Bu rehber MEK tabanlıdır.</p>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Jailhouse derleme ve kurulum</h2>
+  <p class="section-lead">Jailhouse, Linux kaynak ağacıyla birlikte derlenir. Out-of-tree modül olarak derlenmesi önerilir; kernel versiyonuna duyarlıdır.</p>
+
+  <h3>Çapraz derleme ortamı</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — çapraz derleme kurulumu</span><span class="dot">●</span></div>
+    <pre><code">sudo apt install gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+                 device-tree-compiler python3-mako
+
+export ARCH=arm64
+export CROSS_COMPILE=aarch64-linux-gnu-
+
+# Jailhouse kaynak kodu
+git clone https://github.com/siemens/jailhouse.git
+cd jailhouse
+git checkout v0.12  # kararlı sürüm
+
+# Kernel source dizini (NXP BSP kernel)
+KDIR=/path/to/linux-imx</code></pre>
+  </div>
+
+  <h3>Jailhouse derleme</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"># Jailhouse modülü ve araçları derle
+make KDIR=$KDIR ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+     BOARDDIR=configs/arm64
+
+# Derleme çıktıları:
+# driver/jailhouse.ko          — kernel modülü
+# hypervisor/jailhouse.bin     — hypervisor binary
+# tools/jailhouse               — yönetim aracı
+# configs/arm64/imx8qm*.cell   — örnek cell config'leri
+
+# Karta kopyala
+scp driver/jailhouse.ko root@imx8:/lib/modules/$(uname -r)/extra/
+scp hypervisor/jailhouse.bin root@imx8:/lib/firmware/
+scp tools/jailhouse root@imx8:/usr/local/bin/
+scp configs/arm64/imx8qm-mek.cell root@imx8:/etc/jailhouse/</code></pre>
+  </div>
+
+  <h3>Kernel yapılandırma gereksinimleri</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Linux .config gereksinimleri</span><span class="dot">●</span></div>
+    <pre><code">CONFIG_ARM_SMMU=y
+CONFIG_ARM_SMMU_V3=y
+CONFIG_IOMMU_API=y
+CONFIG_IOMMU_DEFAULT_PASSTHROUGH=y
+CONFIG_VIRTUALIZATION=y
+CONFIG_ARM_VIRT_EXT=y
+CONFIG_UIO=m
+CONFIG_UIO_IVSHMEM=m    # IVSHMEM UIO driver
+CONFIG_PCI=y            # Jailhouse PCI emülasyonu için
+CONFIG_KALLSYMS_ALL=y
+CONFIG_MODULES=y</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Root cell Linux yapılandırması</h2>
+  <p class="section-lead">Root cell, Jailhouse'un başladığında aldığı mevcut Linux sistemidir. Root cell yapılandırması sistemdeki tüm donanımı listeler; inmate'lere devredilen kaynaklar root cell'den çıkarılır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>imx8qm-root.c — root cell config (kısaltılmış)</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;jailhouse/types.h&gt;
+#include &lt;jailhouse/cell-config.h&gt;
+
+#define JAILHOUSE_ARRAY_TERMINATOR { 0 }
+
+struct {
+    struct jailhouse_system header;
+    __u64  cpus[1];
+    struct jailhouse_memory mem_regions[16];
+    struct jailhouse_irqchip irqchips[3];
+} __attribute__((packed)) config = {
+    .header = {
+        .signature = JAILHOUSE_SYSTEM_SIGNATURE,
+        .revision  = JAILHOUSE_CONFIG_REVISION,
+        .architecture = JAILHOUSE_ARM64,
+        .hypervisor_memory = {
+            .phys_start = 0x7fc00000,
+            .size       = 0x00400000,
+        },
+        .debug_uart = {
+            .phys_start = 0x5a060000,  /* LPUART0 */
+            .size       = 0x1000,
+            .type       = JAILHOUSE_CON_TYPE_IMX_LPUART,
+            .flags      = JAILHOUSE_CON_ACCESS_MMIO | JAILHOUSE_CON_REGDIST_4,
+        },
+        .platform_info = {
+            .arm = {
+                .gicd_base   = 0x51a00000,
+                .gicc_base   = 0x51b00000,
+                .gich_base   = 0x51b40000,
+                .gicv_base   = 0x51c40000,
+                .gicr_base   = 0x51a40000,
+                .maintenance_irq = 25,
+                .gic_version = 3,
+                .iommu_units = {
+                    {
+                        .type = JAILHOUSE_IOMMU_SMMU_V3,
+                        .base = 0x51400000,
+                        .size = 0x00020000,
+                    },
+                },
+            },
+        },
+        .root_cell = {
+            .name            = "i.MX8QM Linux",
+            .num_cpus        = 2,
+            .cpu_set_size    = sizeof(__u64),
+            .num_memory_regions = 16,
+            .num_irqchips    = 3,
+        },
+    },
+    .cpus = { 0x3 },  /* CA72 core 0,1 */
+    /* Bellek bölgeleri — DDR, MMIO peripheral'lar */
+    .mem_regions = {
+        /* Main DDR — root Linux */
+        JAILHOUSE_MEM_REGION(0x80000000, 0x80000000, 0x40000000,
+            JAILHOUSE_MEM_READ | JAILHOUSE_MEM_WRITE |
+            JAILHOUSE_MEM_EXECUTE | JAILHOUSE_MEM_DMA),
+        /* UART0 */
+        JAILHOUSE_MEM_REGION(0x5a060000, 0x5a060000, 0x1000,
+            JAILHOUSE_MEM_READ | JAILHOUSE_MEM_WRITE | JAILHOUSE_MEM_IO),
+        /* ... */
+    },
+};</code></pre>
+  </div>
+
+  <h3>Bootloader (U-Boot) ayarları</h3>
+  <div class="code-block">
+    <div class="code-header"><span>U-Boot ortam değişkenleri</span><span class="dot">●</span></div>
+    <pre><code"># U-Boot konsolunda:
+setenv jailhouse_args "mem=1536M@0x80000000"
+setenv bootargs "console=ttyLP0,115200 root=/dev/mmcblk0p2 \
+                 rootwait rw earlycon \
+                 mem=1536M@0x80000000 \
+                 isolcpus=2,3,4,5 nohz_full=2,3,4,5"
+saveenv</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> FreeRTOS inmate cell yapılandırması</h2>
+  <p class="section-lead">Inmate cell config dosyası, FreeRTOS guest'inin hangi CPU'ları, bellek bölgelerini ve peripheral'ları kullanacağını tanımlar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>imx8qm-freertos-inmate.c</span><span class="dot">●</span></div>
+    <pre><code">#include &lt;jailhouse/types.h&gt;
+#include &lt;jailhouse/cell-config.h&gt;
+
+struct {
+    struct jailhouse_cell_desc desc;
+    __u64  cpus[1];
+    struct jailhouse_memory mem_regions[6];
+    struct jailhouse_irqchip irqchips[1];
+    struct jailhouse_pci_device pci_devices[1];
+} __attribute__((packed)) config = {
+    .desc = {
+        .signature   = JAILHOUSE_CELL_DESC_SIGNATURE,
+        .revision    = JAILHOUSE_CONFIG_REVISION,
+        .name        = "freertos-adas",
+        .flags       = JAILHOUSE_CELL_PASSIVE_COMMREG,
+        .num_cpus    = 2,
+        .cpu_set_size= sizeof(__u64),
+        .num_memory_regions = 6,
+        .num_irqchips       = 1,
+        .num_pci_devices    = 1,
+        .vpci_irq_base      = 108,
+        .console = {
+            .phys_start = 0x5a070000,  /* LPUART1 — inmate debug */
+            .size       = 0x1000,
+            .type       = JAILHOUSE_CON_TYPE_IMX_LPUART,
+            .flags      = JAILHOUSE_CON_ACCESS_MMIO,
+        },
+    },
+    .cpus = { 0xC },  /* CA72 core 2,3 (bit 2,3) */
+    .mem_regions = {
+        /* FreeRTOS kod ve veri RAM'i */
+        {
+            .phys_start = 0xC0000000,
+            .virt_start = 0x80000000,  /* Inmate için sanal adres */
+            .size       = 0x10000000,  /* 256 MB */
+            .flags      = JAILHOUSE_MEM_READ | JAILHOUSE_MEM_WRITE |
+                          JAILHOUSE_MEM_EXECUTE | JAILHOUSE_MEM_LOADABLE,
+        },
+        /* IVSHMEM — paylaşımlı bellek */
+        {
+            .phys_start = 0xE0000000,
+            .virt_start = 0xE0000000,
+            .size       = 0x00100000,  /* 1 MB */
+            .flags      = JAILHOUSE_MEM_READ | JAILHOUSE_MEM_WRITE,
+        },
+        /* LPUART1 */
+        {
+            .phys_start = 0x5a070000,
+            .virt_start = 0x5a070000,
+            .size       = 0x1000,
+            .flags      = JAILHOUSE_MEM_READ | JAILHOUSE_MEM_WRITE |
+                          JAILHOUSE_MEM_IO,
+        },
+    },
+};</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> FreeRTOS inmate binary derleme</h2>
+  <p class="section-lead">Jailhouse için FreeRTOS inmate, standart FreeRTOS'a Jailhouse inmates framework'ü eklenerek oluşturulur. Jailhouse kendi küçük bootloader'ını sağlar.</p>
+
+  <h3>FreeRTOS inmate proje yapısı</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Dizin Yapısı</span><span class="dot">●</span></div>
+    <pre><code">freertos-inmate/
+├── Makefile
+├── main.c                  ← uygulama kodu
+├── inmates/
+│   ├── lib/
+│   │   ├── arm64/
+│   │   │   ├── gic.c       ← GIC başlatma (Jailhouse'dan)
+│   │   │   ├── uart.c
+│   │   │   └── entry.S     ← Jailhouse giriş noktası
+│   │   └── string.c
+├── FreeRTOS/               ← FreeRTOS kaynak
+│   ├── include/
+│   ├── portable/GCC/ARM_CA9/
+│   └── *.c
+└── ldscript.ld             ← bellek düzeni</code></pre>
+  </div>
+
+  <h3>main.c — ADAS sensör görevi</h3>
+  <div class="code-block">
+    <div class="code-header"><span>main.c</span><span class="dot">●</span></div>
+    <pre><code">#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
+#include "ivshmem_protocol.h"
+
+/* IVSHMEM base adresi (linker script'ten) */
+extern ivshmem_layout_t ivshmem_region;
+static ivshmem_layout_t *shm = &amp;ivshmem_region;
+
+static QueueHandle_t sensor_queue;
+
+typedef struct {
+    float x, y, z;       /* ivmeölçer verisi */
+    uint32_t timestamp;
+} sensor_data_t;
+
+void sensor_read_task(void *pvParameters)
+{
+    sensor_data_t data;
+    while (1) {
+        /* Donanım sensörünü oku (I2C/SPI) */
+        data.x = read_accel_x();
+        data.y = read_accel_y();
+        data.z = read_accel_z();
+        data.timestamp = xTaskGetTickCount();
+
+        xQueueSend(sensor_queue, &amp;data, 0);
+        vTaskDelay(pdMS_TO_TICKS(10));  /* 100 Hz */
+    }
+}
+
+void ivshmem_publish_task(void *pvParameters)
+{
+    sensor_data_t data;
+    ivshmem_msg_t msg;
+    while (1) {
+        if (xQueueReceive(sensor_queue, &amp;data, pdMS_TO_TICKS(100))) {
+            msg.type = 1;
+            msg.timestamp = data.timestamp;
+            memcpy(msg.payload, &amp;data, sizeof(data));
+            msg.payload_len = sizeof(data);
+            ivshmem_ring_push(&amp;shm->adas_to_root, &amp;msg);
+        }
+        /* Heartbeat güncelle */
+        atomic_fetch_add(&amp;shm->heartbeat_adas, 1);
+    }
+}
+
+void main_freertos(void)
+{
+    sensor_queue = xQueueCreate(64, sizeof(sensor_data_t));
+    xTaskCreate(sensor_read_task,    "SensorRead",  512, NULL, 3, NULL);
+    xTaskCreate(ivshmem_publish_task,"IVSHPub",     512, NULL, 2, NULL);
+    vTaskStartScheduler();
+}</code></pre>
+  </div>
+
+  <h3>Derleme ve yükleme</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code">make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+     JAILHOUSE_DIR=/path/to/jailhouse
+
+# freertos-adas.bin üretildi
+
+# Karta kopyala ve inmate'i başlat
+scp freertos-adas.bin root@imx8:/tmp/
+
+# Jailhouse üzerinden:
+jailhouse cell create /etc/jailhouse/imx8qm-freertos-inmate.cell
+jailhouse cell load freertos-adas /tmp/freertos-adas.bin
+jailhouse cell start freertos-adas
+
+# Konsol çıktısını izle (LPUART1)
+minicom -D /dev/ttyLP1</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Linux inmate (ikinci Linux guest)</h2>
+  <p class="section-lead">Jailhouse, tam bir Linux sistemi de inmate olarak çalıştırabilir. Bu, Android IVI veya güvenli Linux partition'ları için kullanılır.</p>
+
+  <h3>Linux inmate cell config</h3>
+  <div class="code-block">
+    <div class="code-header"><span>imx8qm-linux-inmate.c — özet</span><span class="dot">●</span></div>
+    <pre><code">.desc = {
+    .name  = "linux-ivi",
+    .num_cpus = 4,
+    .flags = JAILHOUSE_CELL_VIRTUAL_CONSOLE_PERMITTED,
+},
+.cpus = { 0x3C },  /* CA53 core 2,3,4,5 (bit 2-5) */
+.mem_regions = {
+    {
+        .phys_start = 0xD0000000,
+        .virt_start = 0x80000000,
+        .size       = 0x10000000,  /* 256 MB */
+        .flags      = JAILHOUSE_MEM_READ | JAILHOUSE_MEM_WRITE |
+                      JAILHOUSE_MEM_EXECUTE | JAILHOUSE_MEM_LOADABLE |
+                      JAILHOUSE_MEM_DMA,
+    },
+    /* GPU (GC7000) — sadece IVI cell'e tahsis edilmiş */
+    {
+        .phys_start = 0x38000000,
+        .virt_start = 0x38000000,
+        .size       = 0x80000,
+        .flags      = JAILHOUSE_MEM_READ | JAILHOUSE_MEM_WRITE |
+                      JAILHOUSE_MEM_IO,
+    },
+    /* IVSHMEM */
+    { .phys_start = 0xE0000000, .virt_start = 0xE0000000,
+      .size = 0x100000, .flags = JAILHOUSE_MEM_READ | JAILHOUSE_MEM_WRITE },
+},</code></pre>
+  </div>
+
+  <h3>Linux inmate başlatma</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — Linux guest başlatma</span><span class="dot">●</span></div>
+    <pre><code">jailhouse cell create /etc/jailhouse/imx8qm-linux-inmate.cell
+
+# Linux guest için: Image (kernel), DTB, rootfs
+jailhouse cell load linux-ivi \
+    /boot/Image          --address 0x80200000 \
+    /boot/inmate-ivi.dtb --address 0x87e00000 \
+    --initrd /opt/ivi-rootfs.cpio.gz --address 0x88000000
+
+# Kernel komut satırı
+jailhouse cell load linux-ivi \
+    --string "console=ttyLP2,115200 root=/dev/ram0 \
+              mem=240M@0x80000000 earlycon" \
+    --address 0x87f00000
+
+jailhouse cell start linux-ivi
+
+# IVI Linux konsolunu izle
+minicom -D /dev/ttyLP2</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> IVSHMEM paylaşımlı bellek kurulumu</h2>
+  <p class="section-lead">IVSHMEM, Jailhouse'un cell'ler arası paylaşımlı bellek mekanizmasıdır. Root cell ve tüm inmate'ler aynı fiziksel bellek bölgesini farklı sanal adreslerle görür.</p>
+
+  <h3>Linux'ta IVSHMEM sürücüsü</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — IVSHMEM UIO kurulumu</span><span class="dot">●</span></div>
+    <pre><code"># UIO sürücüsünü yükle
+modprobe uio
+modprobe uio_ivshmem
+
+# IVSHMEM cihazı
+ls /dev/uio*
+# /dev/uio0   ← IVSHMEM
+
+# Cihaz bilgisi
+cat /sys/class/uio/uio0/name
+# ivshmem
+cat /sys/class/uio/uio0/maps/map0/size
+# 0x100000  → 1 MB
+
+# Root cell'den IVSHMEM'e eriş
+cat &gt; /tmp/test_ivshmem.py &lt;&lt;'EOF'
+import mmap, struct, time
+
+with open("/dev/uio0", "r+b") as f:
+    shm = mmap.mmap(f.fileno(), 0x100000)
+
+# ADAS cell heartbeat'ini oku (offset 0x800)
+shm.seek(0x800)
+last = 0
+for _ in range(10):
+    val = struct.unpack("I", shm.read(4))[0]
+    print(f"FreeRTOS heartbeat: {val} (delta={val-last})")
+    last = val
+    shm.seek(0x800)
+    time.sleep(0.5)
+EOF
+python3 /tmp/test_ivshmem.py</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Cell'ler arası iletişim protokolü tasarımı</h2>
+  <p class="section-lead">IVSHMEM üzerinde verimli, lock-free iletişim için ring buffer protokolü tasarlanır. Producer-consumer modeli, her iki tarafın bağımsız çalışmasını sağlar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>ipc_ring.h — lock-free ring buffer</span><span class="dot">●</span></div>
+    <pre><code>#pragma once
+#include &lt;stdint.h&gt;
+#include &lt;stdatomic.h&gt;
+#include &lt;stdbool.h&gt;
+#include &lt;string.h&gt;
+
+#define RING_CAPACITY 64  /* 2'nin kuvveti olmalı */
+#define RING_MASK     (RING_CAPACITY - 1)
+
+typedef struct {
+    uint32_t type;
+    uint32_t seq;
+    uint32_t ts_ms;
+    uint32_t len;
+    uint8_t  data[112];   /* toplam 128 byte */
+} __attribute__((packed)) ipc_msg_t;
+
+typedef struct {
+    _Atomic uint32_t  head;  /* üretici yazar */
+    _Atomic uint32_t  tail;  /* tüketici yazar */
+    uint32_t          _pad[14];
+    ipc_msg_t         slots[RING_CAPACITY];
+} ipc_ring_t;
+
+static inline bool ipc_ring_push(ipc_ring_t *r, const ipc_msg_t *m)
+{
+    uint32_t head = atomic_load_explicit(&amp;r->head, memory_order_relaxed);
+    uint32_t next = (head + 1) &amp; RING_MASK;
+    if (next == atomic_load_explicit(&amp;r->tail, memory_order_acquire))
+        return false;  /* dolu */
+    r->slots[head] = *m;
+    atomic_store_explicit(&amp;r->head, next, memory_order_release);
+    return true;
+}
+
+static inline bool ipc_ring_pop(ipc_ring_t *r, ipc_msg_t *m)
+{
+    uint32_t tail = atomic_load_explicit(&amp;r->tail, memory_order_relaxed);
+    if (tail == atomic_load_explicit(&amp;r->head, memory_order_acquire))
+        return false;  /* boş */
+    *m = r->slots[tail];
+    atomic_store_explicit(&amp;r->tail, (tail + 1) &amp; RING_MASK,
+                          memory_order_release);
+    return true;
+}</code></pre>
+  </div>
+
+  <h3>Mesaj tipleri ve protokol</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Mesaj Tipi Tablosu</span><span class="dot">●</span></div>
+    <pre><code">Tip  Ad              Kaynak      Hedef        Periyot
+────────────────────────────────────────────────────────────
+0x01 SENSOR_IMU      FreeRTOS   Linux root    10ms
+0x02 SENSOR_CAN      FreeRTOS   Linux root    5ms
+0x03 COMMAND         Linux root FreeRTOS      talep üzerine
+0x04 HEARTBEAT       Her ikisi  Her ikisi     100ms
+0x05 LOG             FreeRTOS   Linux root    olay üzerine
+0x06 STATUS          FreeRTOS   Linux root    1000ms</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Hata ayıklama ve izleme</h2>
+  <p class="section-lead">Jailhouse sistemlerde hata ayıklama, tek çekirdekli sistemden daha karmaşıktır. Her cell bağımsız konsol kullanır; hypervisor UART multiplexing sağlar.</p>
+
+  <h3>Jailhouse sanal konsol</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — cell konsol erişimi</span><span class="dot">●</span></div>
+    <pre><code"># Tüm hücrelerin konsol çıktısını birleştir
+jailhouse console
+
+# Belirli cell'i izle (pseudo-terminal)
+jailhouse cell console freertos-adas
+
+# Cell istatistikleri
+jailhouse cell stats freertos-adas
+# CPU kullanımı, interrupt sayıları, bellek ihlalleri</code></pre>
+  </div>
+
+  <h3>GDB ile FreeRTOS inmate debug</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — JTAG/OpenOCD ile</span><span class="dot">●</span></div>
+    <pre><code"># OpenOCD ile i.MX8QM JTAG bağlantısı
+openocd -f interface/jlink.cfg \
+        -f target/imx8qm.cfg \
+        -c "init; targets"
+
+# GDB ile FreeRTOS inmate'e bağlan (CA72 core 2)
+aarch64-linux-gnu-gdb freertos-adas.elf
+(gdb) target extended-remote localhost:3333
+(gdb) monitor targets imx8qm.cpu2
+(gdb) break main_freertos
+(gdb) continue</code></pre>
+  </div>
+
+  <h3>IVSHMEM mesaj istatistikleri</h3>
+  <div class="code-block">
+    <div class="code-header"><span>ipc_stats.py</span><span class="dot">●</span></div>
+    <pre><code">import mmap, struct, time
+
+with open("/dev/uio0", "r+b") as f:
+    shm = mmap.mmap(f.fileno(), 0x100000)
+
+ring_offset = 0   # adas_to_root ring başlangıcı
+
+while True:
+    shm.seek(ring_offset)
+    head = struct.unpack("I", shm.read(4))[0]
+    tail = struct.unpack("I", shm.read(4))[0]
+    used = (head - tail) % 64
+    print(f"Ring kullanımı: {used}/64  head={head} tail={tail}")
+    time.sleep(1)</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 09 ═══════════════════ -->
+<section id="s9">
+  <h2><span class="num">09</span> Üretim için sertleştirme adımları</h2>
+  <p class="section-lead">Geliştirme ortamından üretim sistemine geçişte güvenlik ve kararlılık için ek adımlar gerekmektedir.</p>
+
+  <h3>Secure boot zinciri</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Güvenli Başlatma Zinciri</span><span class="dot">●</span></div>
+    <pre><code">ROM Bootloader (donanımda)
+       ↓ (RSA-4096 imza doğrulama)
+U-Boot (HABv4 imzalı)
+       ↓ (FIT Image doğrulama)
+Linux Kernel (imzalı)
+       ↓
+Jailhouse (Linux modülü olarak yükle)
+       ↓
+Cell yapılandırmaları (dm-verity korumalı /etc/jailhouse)
+       ↓
+FreeRTOS + Linux inmate binary'leri (imzalı)</code></pre>
+  </div>
+
+  <h3>Üretim kontrol listesi</h3>
+  <div class="params">
+    <div class="param"><div class="name">Debug UART'ları devre dışı bırak</div><div class="desc">Inmate debug UART'larını üretimde kapat. Cell config'de console alanını temizle veya devre dışı bırak.</div></div>
+    <div class="param"><div class="name">Jailhouse console erişimini kısıtla</div><div class="desc">jailhouse console komutu root cell'de root yetkisi gerektirir; üretimde audit log tutun.</div></div>
+    <div class="param"><div class="name">Watchdog yapılandırması</div><div class="desc">Her cell bağımsız watchdog kullanmalıdır. Root cell watchdog'u tüm inmate'leri kapsayacak şekilde ayarlayın.</div></div>
+    <div class="param"><div class="name">SMMU kısıtlamalarını doğrula</div><div class="desc">dmesg | grep -i smmu ile SMMU hata loglarını kontrol edin. Üretimde SMMU hatası sıfır olmalıdır.</div></div>
+    <div class="param"><div class="name">Cell yeniden başlatma politikası</div><div class="desc">JAILHOUSE_CELL_FATAL_UNHANDLED_FAULT flag'i ile kritik olmayan cell'lerin çökmesi sistemi yeniden başlatmak yerine yalnızca o cell'i durdurur.</div></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — üretim sağlık kontrolü</span><span class="dot">●</span></div>
+    <pre><code"># Tüm cell'lerin çalışır durumda olduğunu doğrula
+check_cells() {
+    local expected=("i.MX8QM Linux" "freertos-adas" "linux-ivi")
+    for name in "${expected[@]}"; do
+        state=$(jailhouse cell list | grep "$name" | awk '{print $3}')
+        if [ "$state" != "running" ]; then
+            logger -t jailhouse "HATA: $name cell durumu: $state"
+            # Yeniden başlatma kararı (safety monitor'a ilet)
+        fi
+    done
+}
+
+# systemd timer veya cron ile her 30 saniyede çalıştır
+check_cells</code></pre>
+  </div>
+</section>
+
+</main>

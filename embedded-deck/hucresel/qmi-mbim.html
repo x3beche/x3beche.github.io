@@ -1,0 +1,781 @@
+---
+layout: tutorial
+title: "QMI & MBIM — Düşük Seviye Modem Protokolleri"
+back_url: "../index.html"
+back_label: "Hücresel Bağlantı"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>HÜCRESEL BAĞLANTI</span>
+    <span>QMI / MBIM</span>
+    <span>2026</span>
+  </div>
+  <h1>QMI &amp; MBIM<br><em>düşük seviye modem.</em></h1>
+  <p class="subtitle">Qualcomm QMI protokolü, libqmi/qmicli araçları, Microsoft MBIM standardı ve libmbim — data session yönetimi ve Python ile modem kontrolü.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">QMI protokol mimarisi — Qualcomm Modem Interface</a></li>
+    <li><a href="#s1">libqmi kurulum ve qmicli temel kullanımı</a></li>
+    <li><a href="#s2">WDS servisi — data session yönetimi</a></li>
+    <li><a href="#s3">NAS servisi — network durumu ve sinyal</a></li>
+    <li><a href="#s4">DMS servisi — cihaz bilgisi ve firmware</a></li>
+    <li><a href="#s5">MBIM protokolü — Microsoft USB modem standardı</a></li>
+    <li><a href="#s6">libmbim ve mbimcli kullanımı</a></li>
+    <li><a href="#s7">Raw data session — wwan0 üzerinden trafik</a></li>
+    <li><a href="#s8">Practical — Python libqmi binding ile modem yönetimi</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> QMI protokol mimarisi — Qualcomm Modem Interface</h2>
+  <p class="section-lead">QMI (Qualcomm MSM Interface), Qualcomm MDM yongasetlerinde kullanılan tescilli bir protokoldür. AT komutlarına göre çok daha hızlı ve zengin API sunar.</p>
+
+  <div class="flow">
+    <pre>
+  QMI Protokol Yığını
+  ──────────────────────────────────────────────────
+  Uygulama (qmicli, libqmi, Python)
+        ↓  libqmi userspace kütüphanesi
+  <span class="field">QMI servisler:</span>
+        ├── WDS  (Wireless Data Service)  → data oturumları
+        ├── NAS  (Network Access Service) → ağ durumu, sinyal
+        ├── DMS  (Device Management Svc) → cihaz bilgisi
+        ├── UIM  (User Identity Module)   → SIM yönetimi
+        ├── WMS  (Wireless Messaging)     → SMS
+        ├── LOC  (Location Service)       → GPS/GNSS
+        └── PDC  (Platform Device Config) → firmware
+        ↓  /dev/cdc-wdm0  (cdc_wdm kernel driver)
+  <span class="field">USB cihaz</span>   →  Qualcomm MDM modem
+        ↓  USB vendor-specific interface
+  <span class="field">Modem RF yığını</span>   (EC25, RM500Q, Sierra EM7455...)
+    </pre>
+  </div>
+
+  <h3>QMI vs AT karşılaştırması</h3>
+
+  <div class="file-table">
+    <div class="ft-head">
+      <span>Özellik</span>
+      <span>AT Komutları</span>
+      <span>QMI</span>
+    </div>
+    <div class="ft-row">
+      <span>Protokol türü</span>
+      <span>ASCII metin</span>
+      <span>Binary TLV (Type-Length-Value)</span>
+    </div>
+    <div class="ft-row">
+      <span>Hız</span>
+      <span>Düşük (serialize)</span>
+      <span>Yüksek (asenkron)</span>
+    </div>
+    <div class="ft-row">
+      <span>Çoklu istemci</span>
+      <span>Hayır (tek port)</span>
+      <span>Evet (çok istemci)</span>
+    </div>
+    <div class="ft-row">
+      <span>Hata yönetimi</span>
+      <span>OK/ERROR</span>
+      <span>Detaylı hata kodları</span>
+    </div>
+    <div class="ft-row">
+      <span>Standartlaşma</span>
+      <span>ITU V.250 (standart)</span>
+      <span>Qualcomm tescilli</span>
+    </div>
+    <div class="ft-row">
+      <span>Kernel driver</span>
+      <span>option, cdc-acm</span>
+      <span>qmi_wwan</span>
+    </div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — QMI cihaz tespiti</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># USB cihazı gör</span>
+<span class="cmd">lsusb</span>
+<span class="cmt"># Bus 001 Device 003: ID 2c7c:0125 Quectel EC25</span>
+
+<span class="cmt"># qmi_wwan driver yüklü mü?</span>
+<span class="cmd">lsmod</span> | grep qmi
+<span class="cmt"># qmi_wwan              28672  0
+# cdc_wdm               20480  1 qmi_wwan</span>
+
+<span class="cmt"># Driver yükle (gerekirse)</span>
+<span class="cmd">modprobe</span> qmi_wwan
+<span class="cmd">modprobe</span> cdc_wdm
+
+<span class="cmt"># QMI kontrol cihazı</span>
+<span class="cmd">ls</span> /dev/cdc-wdm*
+<span class="cmt"># /dev/cdc-wdm0</span>
+
+<span class="cmt"># wwan0 ağ arayüzü</span>
+<span class="cmd">ip</span> link show wwan0
+<span class="cmt"># 4: wwan0: &lt;BROADCAST,MULTICAST,NOARP&gt; mtu 1500 ...</span>
+
+<span class="cmt"># USB interface numarası ile eşleşme</span>
+<span class="cmd">ls</span> -la /sys/class/net/wwan0/device/
+<span class="cmd">cat</span> /sys/class/net/wwan0/device/uevent
+<span class="cmt"># DRIVER=qmi_wwan
+# PRODUCT=2c7c/125/0</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> libqmi kurulum ve qmicli temel kullanımı</h2>
+  <p class="section-lead">libqmi, QMI protokolünü implement eden açık kaynak kütüphanedir. qmicli, libqmi'yi kullanan komut satırı aracıdır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — libqmi kurulum</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Debian / Ubuntu</span>
+<span class="cmd">apt-get</span> install libqmi-utils
+
+<span class="cmt"># Versiyon kontrol</span>
+<span class="cmd">qmicli</span> --version
+<span class="cmt"># qmicli 1.34.0</span>
+
+<span class="cmt"># Cihaz bilgisi al (DMS)</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --dms-get-ids
+<span class="cmt"># [/dev/cdc-wdm0] Device IDs retrieved:
+#         ESN: '0'
+#        IMEI: '867729040000001'
+#        MEID: '0'</span>
+
+<span class="cmt"># Üretici bilgisi</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --dms-get-manufacturer
+<span class="cmt"># [/dev/cdc-wdm0] Device manufacturer retrieved:
+#       Manufacturer: 'Quectel'</span>
+
+<span class="cmt"># Model ve revision</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --dms-get-model
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --dms-get-revision
+
+<span class="cmt"># QMI modem state</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --dms-get-operating-mode
+<span class="cmt"># [/dev/cdc-wdm0] Operating mode retrieved:
+#     Mode: 'online'</span>
+
+<span class="cmt"># Raw IP modu ayarla (wwan0 için gerekli)</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --wda-set-data-format=raw-ip
+<span class="cmd">ip</span> link set wwan0 arp off
+<span class="cmd">ip</span> link set wwan0 up</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> WDS servisi — data session yönetimi</h2>
+  <p class="section-lead">WDS (Wireless Data Service), QMI'nin veri oturumlarını yöneten servisidir. Bağlantı kurma, kesme ve durum sorgulama burada gerçekleşir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — WDS ile data bağlantısı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># WDS paket servisi durumu sorgula</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --wds-get-packet-service-status
+<span class="cmt"># [/dev/cdc-wdm0] Packet service status retrieved:
+#     Connection status: 'disconnected'</span>
+
+<span class="cmt"># Data bağlantısı kur (APN ile)</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 \
+  --wds-start-network="apn=internet,ip-type=4" \
+  --client-no-release-cid
+<span class="cmt"># [/dev/cdc-wdm0] Network started
+#     Packet data handle: '2249109920'
+# [/dev/cdc-wdm0] Client ID not released:
+#     Service: 'wds'
+#     CID: '19'</span>
+
+<span class="cmt"># ÖNEMLİ: handle ve CID değerlerini kaydet</span>
+HANDLE=2249109920
+CID=19
+
+<span class="cmt"># Bağlantı durumunu sorgula</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --wds-get-packet-service-status
+<span class="cmt"># Connection status: 'connected'</span>
+
+<span class="cmt"># IP ayarlarını al</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --wds-get-current-settings
+<span class="cmt"># [/dev/cdc-wdm0] Current settings retrieved:
+#         IP Family: IPv4
+#         IP Address: 100.65.45.123
+#            Prefix: 30
+#           Gateway: 100.65.45.124
+#       Primary DNS: 8.8.8.8
+#     Secondary DNS: 8.8.4.4</span>
+
+<span class="cmt"># IP adresini wwan0'a ata</span>
+<span class="cmd">ip</span> addr add 100.65.45.123/30 dev wwan0
+<span class="cmd">ip</span> route add default via 100.65.45.124 dev wwan0
+<span class="cmd">echo</span> "nameserver 8.8.8.8" > /etc/resolv.conf
+
+<span class="cmt"># Bağlantıyı kes</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 \
+  --wds-stop-network=$HANDLE \
+  --client-cid=$CID
+
+<span class="cmt"># Veri istatistikleri</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --wds-get-data-bearer-technology
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --wds-get-packet-statistics</code></pre>
+  </div>
+
+  <h3>Tam bağlantı script'i</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — qmi-connect.sh</span><span class="dot">●</span></div>
+    <pre><code>#!/bin/bash
+# QMI ile tam LTE bağlantı scripti
+DEVICE=/dev/cdc-wdm0
+IFACE=wwan0
+APN="${1:-internet}"
+
+log() { logger -t qmi-connect "$*"; echo "$*"; }
+
+# Raw IP modu
+log "Raw IP modu ayarlanıyor..."
+qmicli -d $DEVICE --wda-set-data-format=raw-ip
+ip link set $IFACE arp off
+ip link set $IFACE up
+
+# Data session başlat
+log "Data session başlatılıyor (APN=$APN)..."
+OUTPUT=$(qmicli -d $DEVICE \
+  --wds-start-network="apn=$APN,ip-type=4" \
+  --client-no-release-cid 2>&1)
+
+HANDLE=$(echo "$OUTPUT" | grep -oP 'handle: '\''\K[0-9]+')
+CID=$(echo "$OUTPUT" | grep -oP 'CID: '\''\K[0-9]+')
+
+if [ -z "$HANDLE" ]; then
+    log "HATA: Bağlantı kurulamadı"
+    echo "$OUTPUT"
+    exit 1
+fi
+
+log "Bağlantı kuruldu. Handle=$HANDLE, CID=$CID"
+
+# IP ayarlarını al ve uygula
+SETTINGS=$(qmicli -d $DEVICE --wds-get-current-settings 2>&1)
+IP=$(echo "$SETTINGS"   | grep -oP 'IP Address: \K[\d.]+')
+GW=$(echo "$SETTINGS"   | grep -oP 'Gateway: \K[\d.]+')
+DNS=$(echo "$SETTINGS"  | grep -oP 'Primary DNS: \K[\d.]+')
+
+log "IP=$IP GW=$GW DNS=$DNS"
+
+ip addr flush dev $IFACE
+ip addr add "$IP/30" dev $IFACE
+ip route add default via "$GW" dev $IFACE metric 100
+echo "nameserver $DNS" > /etc/resolv.conf
+
+# Handle ve CID'yi kaydet (disconnect için)
+echo "$HANDLE $CID" > /run/qmi-session
+
+log "LTE bağlantısı hazır: $IP"</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> NAS servisi — network durumu ve sinyal</h2>
+  <p class="section-lead">NAS (Network Access Service), ağ kayıt durumu, operatör seçimi ve sinyal ölçümlerini sağlar. AT+CREG ve AT+CSQ'nun QMI karşılığıdır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — NAS sorgular</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Sinyal gücü ölç</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --nas-get-signal-strength
+<span class="cmt"># [/dev/cdc-wdm0] Successfully got signal strength
+#     Current:
+#         Network 'lte': '-71 dBm'
+#     RSSI:
+#         Network 'lte': '-71 dBm'
+#     ECIO:
+#         Network 'lte': '0.0 dBm'
+#     SNR:
+#         Network 'lte': '22.8 dB'
+#     IO: '-106 dBm'</span>
+
+<span class="cmt"># Sinyal detayları (RSRP, RSRQ)</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --nas-get-signal-info
+<span class="cmt"># [/dev/cdc-wdm0] Successfully got signal info
+#     LTE:
+#         RSSI: '-71 dBm'
+#         RSRQ: '-11 dB'
+#         RSRP: '-93 dBm'
+#          SNR: '22.8 dB'</span>
+
+<span class="cmt"># Network kayıt durumu</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --nas-get-serving-system
+<span class="cmt"># [/dev/cdc-wdm0] Got serving system:
+#     Registration state: 'registered'
+#      CS: 'attached'  PS: 'attached'
+#      MCC: '286'  MNC: '01'  (Turkcell)
+#      Roaming: no</span>
+
+<span class="cmt"># LTE cell bilgisi</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --nas-get-cell-location-info
+<span class="cmt"># [/dev/cdc-wdm0] Got cell location info
+#     Intrafrequency LTE Info:
+#         UE In Idle: 'no'
+#         PLMN: '28601'
+#         Tracking Area Code: '0x0B13'
+#         Global Cell ID: '0x021A4D01'
+#         EUTRA Absolute RF Channel Number: 1750
+#         Serving Cell ID: 123
+#         Cell Reselection Priority: 4
+#         Non-intrafrequency threshold: -10
+#         Threshold serving low: -10</span>
+
+<span class="cmt"># Desteklenen bandlar</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --nas-get-rf-band-info
+<span class="cmt"># [/dev/cdc-wdm0] Got RF band info
+#         Radio Interface: 'lte'
+#                   Band: 'eutran-3'
+#     Active Bandwidth: '20'</span>
+
+<span class="cmt"># Operatör tarama</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --nas-network-scan
+<span class="cmt"># (bu işlem uzun sürebilir, ~30s)</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> DMS servisi — cihaz bilgisi ve firmware</h2>
+  <p class="section-lead">DMS (Device Management Service), modem kimliği, donanım bilgisi, pil durumu ve firmware güncelleme işlemlerini kapsar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — DMS sorgular</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm cihaz bilgisi</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --dms-get-ids
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --dms-get-manufacturer
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --dms-get-model
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --dms-get-revision
+
+<span class="cmt"># Donanım versiyonu</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --dms-get-hardware-revision
+<span class="cmt"># [/dev/cdc-wdm0] Hardware revision retrieved:
+#     Revision: '10000'</span>
+
+<span class="cmt"># Çalışma modu</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --dms-get-operating-mode
+<span class="cmt"># Mode: 'online'
+# HW restricted: 'no'</span>
+
+<span class="cmt"># Çevrimdışı moda geç (RF kapat)</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --dms-set-operating-mode=offline
+
+<span class="cmt"># Online moda dön</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --dms-set-operating-mode=online
+
+<span class="cmt"># Modem sıfırla</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --dms-set-operating-mode=reset
+
+<span class="cmt"># Desteklenen bandlar</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --dms-get-band-capabilities
+
+<span class="cmt"># UIM (SIM) slot bilgisi</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --uim-get-card-status
+<span class="cmt"># [/dev/cdc-wdm0] Successfully got card status
+#     Slot [1]:
+#         Card state: 'present'
+#          UPIN state: 'unblocked'
+#          UPIN retries: '3'
+#          UPUK retries: '10'
+#         Application [1]:
+#             Type: 'usim'
+#             State: 'ready'
+#             Personalization state: 'ready'
+#             UPIN replaces PIN1: 'no'
+#             PIN1 state: 'disabled'</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> MBIM protokolü — Microsoft USB modem standardı</h2>
+  <p class="section-lead">MBIM (Mobile Broadband Interface Model), USB IF tarafından standartlaştırılmış modem protokolüdür. Qualcomm, Sierra, Telit ve diğer üreticiler destekler.</p>
+
+  <div class="flow">
+    <pre>
+  MBIM Protokol Yığını
+  ──────────────────────────────────────────────────
+  Uygulama (mbimcli, libmbim, NetworkManager)
+        ↓  libmbim userspace kütüphanesi
+  <span class="field">MBIM komutlar:</span>
+        ├── MBIM_CID_DEVICE_CAPS     → cihaz bilgisi
+        ├── MBIM_CID_SUBSCRIBER_READY → SIM durumu
+        ├── MBIM_CID_REGISTER_STATE  → ağ kaydı
+        ├── MBIM_CID_SIGNAL_STATE    → sinyal gücü
+        ├── MBIM_CID_CONNECT         → data bağlantısı
+        ├── MBIM_CID_IP_CONFIGURATION → IP ayarları
+        └── MBIM_CID_SMS_*           → SMS
+        ↓  /dev/cdc-wdm0 (cdc_mbim kernel driver)
+  <span class="field">USB CDC NCM/MBIM arayüzü</span>
+        ↓
+  <span class="field">Modem</span>   (Sierra EM7455, Telit FN980, Quectel EM120R)
+    </pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — MBIM driver tespiti</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># cdc_mbim driver yüklü mü?</span>
+<span class="cmd">lsmod</span> | grep mbim
+<span class="cmt"># cdc_mbim               28672  0
+# cdc_wdm                20480  1 cdc_mbim</span>
+
+<span class="cmt"># MBIM kontrol cihazı</span>
+<span class="cmd">ls</span> /dev/cdc-wdm*
+<span class="cmt"># /dev/cdc-wdm0</span>
+
+<span class="cmt"># wwan0 ağ arayüzü (MBIM için de aynı)</span>
+<span class="cmd">ip</span> link show wwan0
+
+<span class="cmt"># QMI mi MBIM mi? USB descriptor'a bak</span>
+<span class="cmd">lsusb</span> -v -d 2c7c:0125 | grep -A3 "bInterfaceSubClass"
+<span class="cmt"># bInterfaceSubClass  14 = MBIM
+# bInterfaceSubClass  255 = QMI (vendor specific)</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> libmbim ve mbimcli kullanımı</h2>
+  <p class="section-lead">libmbim ve mbimcli, MBIM modemlerini yönetmek için kullanılır. qmicli'ye benzer sözdizimi sunar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — mbimcli temel kullanım</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kurulum</span>
+<span class="cmd">apt-get</span> install libmbim-utils
+
+<span class="cmt"># Versiyon</span>
+<span class="cmd">mbimcli</span> --version
+<span class="cmt"># mbimcli 1.28.0</span>
+
+<span class="cmt"># Cihaz bilgisi</span>
+<span class="cmd">mbimcli</span> -d /dev/cdc-wdm0 --query-device-caps
+<span class="cmt"># [/dev/cdc-wdm0] Device capabilities retrieved:
+#               Device type: 'embedded'
+#             Cellular class: 'gsm'
+#             Voice class: 'no-voice'
+#               SIM class: 'removable'
+#           Data class: 'lte'
+#                 SMS caps: 'pdu-send, pdu-receive'
+#                 Control caps: 'reg-manual'
+#             Max sessions: '4'
+#           Custom data class: ''
+#                   Dev ID: '867729040000001'
+#              Firmware info: 'EC25EFAR06A12M4G'
+#              Hardware info: ''</span>
+
+<span class="cmt"># SIM durumu</span>
+<span class="cmd">mbimcli</span> -d /dev/cdc-wdm0 --query-subscriber-ready-status
+<span class="cmt"># Ready state: 'initialized'
+#     IMSI: '286011234567890'
+#     ICCID: '89901012345678901234'
+#     Subscriber ID: '286011234567890'</span>
+
+<span class="cmt"># Ağ kayıt durumu</span>
+<span class="cmd">mbimcli</span> -d /dev/cdc-wdm0 --query-register-state
+<span class="cmt"># Register state: 'home'
+#       Network error: 'unknown'
+#      Available data class: 'lte'
+#       Current cellular class: 'gsm'
+#       Provider ID: '28601'
+#       Provider name: 'Turkcell'
+#       Roaming text: ''</span>
+
+<span class="cmt"># Sinyal gücü</span>
+<span class="cmd">mbimcli</span> -d /dev/cdc-wdm0 --query-signal-state
+<span class="cmt"># Signal: '71' (0-100 arası, 100 en iyi)</span>
+
+<span class="cmt"># Data bağlantısı kur</span>
+<span class="cmd">mbimcli</span> -d /dev/cdc-wdm0 \
+  --connect="apn='internet',ip-type=ipv4" \
+  --no-open --no-close
+<span class="cmt"># [/dev/cdc-wdm0] Successfully connected
+#       Session ID: '0'
+#      Activation state: 'activated'
+#         IP type: 'ipv4'</span>
+
+<span class="cmt"># IP konfigürasyonu al</span>
+<span class="cmd">mbimcli</span> -d /dev/cdc-wdm0 --query-ip-configuration=0
+<span class="cmt"># IPv4 configuration:
+#       Method: 'static'
+#      Address: '100.65.45.123'
+#       Prefix: '30'
+#      Gateway: '100.65.45.124'
+#          DNS: '8.8.8.8'</span>
+
+<span class="cmt"># Bağlantıyı kes</span>
+<span class="cmd">mbimcli</span> -d /dev/cdc-wdm0 --disconnect=0</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Raw data session — wwan0 üzerinden trafik</h2>
+  <p class="section-lead">QMI veya MBIM ile data session kurduktan sonra wwan0 arayüzünü ağa hazır hale getirme — raw IP modu ve routing.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — wwan0 hazırlık ve routing</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1. Raw IP modu (QMI için zorunlu)</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 --wda-set-data-format=raw-ip
+<span class="cmd">ip</span> link set wwan0 arp off
+<span class="cmd">ip</span> link set wwan0 mtu 1500
+<span class="cmd">ip</span> link set wwan0 up
+
+<span class="cmt"># 2. Data session başlat ve IP al</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 \
+  --wds-start-network="apn=internet,ip-type=4" \
+  --client-no-release-cid
+<span class="cmt"># Packet data handle: '2249109920'</span>
+
+<span class="cmt"># 3. IP ayarlarını uygula</span>
+IP="100.65.45.123"
+GW="100.65.45.124"
+<span class="cmd">ip</span> addr add ${IP}/30 dev wwan0
+<span class="cmd">ip</span> route add default via $GW dev wwan0 metric 100
+
+<span class="cmt"># 4. DNS ayarla</span>
+<span class="cmd">echo</span> "nameserver 8.8.8.8" > /etc/resolv.conf
+
+<span class="cmt"># 5. Bağlantı testi</span>
+<span class="cmd">ping</span> -c 3 -I wwan0 8.8.8.8
+<span class="cmt"># PING 8.8.8.8 (8.8.8.8): 56 data bytes
+# 64 bytes from 8.8.8.8: icmp_seq=0 ttl=56 time=28.4 ms</span>
+
+<span class="cmt"># 6. İstatistikler</span>
+<span class="cmd">ip</span> -s link show wwan0
+<span class="cmd">cat</span> /sys/class/net/wwan0/statistics/rx_bytes
+<span class="cmd">cat</span> /sys/class/net/wwan0/statistics/tx_bytes
+
+<span class="cmt"># 7. DHCP ile otomatik IP (udhcpc)</span>
+<span class="cmt"># Bazı modemler DHCP'yi de destekler</span>
+<span class="cmd">udhcpc</span> -i wwan0 -n -q -t 10
+
+<span class="cmt"># 8. Bağlantıyı kes</span>
+<span class="cmd">qmicli</span> -d /dev/cdc-wdm0 \
+  --wds-stop-network=2249109920 \
+  --client-cid=19
+<span class="cmd">ip</span> addr flush dev wwan0
+<span class="cmd">ip</span> link set wwan0 down</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">RAW IP</div>
+    <p>QMI data session'ı <strong>raw IP</strong> kullanır — Ethernet frame yok, ARP yok. <code class="inline">ip link set wwan0 arp off</code> zorunludur. MBIM bazı durumlarda NCM (Ethernet frame) kullanabilir, bu durumda ARP gerekir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Practical — Python libqmi binding ile modem yönetimi</h2>
+  <p class="section-lead">qmicli'yi subprocess ile çağırarak Python'da modem yönetimi — JSON benzeri ayrıştırma ve tam data session yönetimi.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>python — qmi_manager.py</span><span class="dot">●</span></div>
+    <pre><code>#!/usr/bin/env python3
+"""
+QMI modem yöneticisi — qmicli subprocess wrapper.
+Gereksinimler: libqmi-utils, Python 3.8+
+"""
+import subprocess
+import re
+import time
+import logging
+import ipaddress
+
+log = logging.getLogger('QMIManager')
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s [%(levelname)s] %(message)s')
+
+
+class QMIManager:
+    def __init__(self, device='/dev/cdc-wdm0', iface='wwan0'):
+        self.device = device
+        self.iface = iface
+        self._session_handle = None
+        self._client_cid = None
+
+    def _run(self, *args, timeout=30):
+        cmd = ['qmicli', '-d', self.device] + list(args)
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout)
+            return r.stdout + r.stderr
+        except subprocess.TimeoutExpired:
+            log.error(f"Zaman aşımı: {' '.join(args)}")
+            return ''
+
+    def _parse_field(self, text, pattern):
+        m = re.search(pattern, text)
+        return m.group(1).strip() if m else None
+
+    # ── Cihaz bilgisi ─────────────────────────────────────
+    def get_device_info(self):
+        out = self._run('--dms-get-ids')
+        out += self._run('--dms-get-manufacturer')
+        out += self._run('--dms-get-model')
+        out += self._run('--dms-get-revision')
+        return {
+            'imei':         self._parse_field(out, r"IMEI: '([^']+)'"),
+            'manufacturer': self._parse_field(out, r"Manufacturer: '([^']+)'"),
+            'model':        self._parse_field(out, r"Model: '([^']+)'"),
+            'revision':     self._parse_field(out, r"Revision: '([^']+)'"),
+        }
+
+    # ── Sinyal ────────────────────────────────────────────
+    def get_signal(self):
+        out = self._run('--nas-get-signal-info')
+        return {
+            'rssi': self._parse_field(out, r"RSSI: '(-?\d+ dBm)'"),
+            'rsrq': self._parse_field(out, r"RSRQ: '(-?\d+ dB)'"),
+            'rsrp': self._parse_field(out, r"RSRP: '(-?\d+ dBm)'"),
+            'sinr': self._parse_field(out, r"SNR: '(-?[\d.]+ dB)'"),
+        }
+
+    # ── Ağ kayıt ──────────────────────────────────────────
+    def get_registration(self):
+        out = self._run('--nas-get-serving-system')
+        state = self._parse_field(out, r"Registration state: '([^']+)'")
+        plmn  = self._parse_field(out, r"MNC: '(\d+)'")
+        return {
+            'state':      state,
+            'registered': state == 'registered',
+            'roaming':    'roaming' in (out.lower()),
+            'plmn':       plmn,
+        }
+
+    def wait_registered(self, timeout=120):
+        log.info("LTE ağına kayıt bekleniyor...")
+        start = time.time()
+        while time.time() - start < timeout:
+            reg = self.get_registration()
+            if reg['registered']:
+                log.info(f"Kayıt OK {'(roaming)' if reg['roaming'] else '(ev ağı)'}")
+                return True
+            time.sleep(4)
+        return False
+
+    # ── Data session ──────────────────────────────────────
+    def setup_raw_ip(self):
+        log.info("Raw IP modu ayarlanıyor...")
+        self._run('--wda-set-data-format=raw-ip')
+        subprocess.run(['ip', 'link', 'set', self.iface, 'arp', 'off'])
+        subprocess.run(['ip', 'link', 'set', self.iface, 'mtu', '1500'])
+        subprocess.run(['ip', 'link', 'set', self.iface, 'up'])
+
+    def start_data_session(self, apn='internet'):
+        log.info(f"Data session başlatılıyor (APN={apn})...")
+        out = self._run(
+            f'--wds-start-network=apn={apn},ip-type=4',
+            '--client-no-release-cid',
+            timeout=60
+        )
+        self._session_handle = self._parse_field(
+            out, r"Packet data handle: '(\d+)'"
+        )
+        self._client_cid = self._parse_field(
+            out, r"CID: '(\d+)'"
+        )
+        if self._session_handle:
+            log.info(f"Session: handle={self._session_handle}, CID={self._client_cid}")
+            return True
+        log.error(f"Session başlatılamadı: {out}")
+        return False
+
+    def get_ip_settings(self):
+        out = self._run('--wds-get-current-settings')
+        return {
+            'ip':  self._parse_field(out, r"IP Address: ([\d.]+)"),
+            'gw':  self._parse_field(out, r"Gateway: ([\d.]+)"),
+            'dns': self._parse_field(out, r"Primary DNS: ([\d.]+)"),
+            'prefix': self._parse_field(out, r"Prefix: (\d+)"),
+        }
+
+    def apply_ip_settings(self, settings):
+        ip, gw, dns = settings['ip'], settings['gw'], settings['dns']
+        prefix = settings.get('prefix', '30')
+        log.info(f"IP uygulanıyor: {ip}/{prefix} gw={gw}")
+        subprocess.run(['ip', 'addr', 'flush', 'dev', self.iface])
+        subprocess.run(['ip', 'addr', 'add', f'{ip}/{prefix}', 'dev', self.iface])
+        subprocess.run(['ip', 'route', 'add', 'default', 'via', gw,
+                        'dev', self.iface, 'metric', '100'])
+        with open('/etc/resolv.conf', 'w') as f:
+            f.write(f'nameserver {dns}\n')
+
+    def stop_data_session(self):
+        if not self._session_handle:
+            return
+        log.info("Data session durduruluyor...")
+        self._run(
+            f'--wds-stop-network={self._session_handle}',
+            f'--client-cid={self._client_cid}'
+        )
+        subprocess.run(['ip', 'addr', 'flush', 'dev', self.iface])
+        subprocess.run(['ip', 'link', 'set', self.iface, 'down'])
+        self._session_handle = None
+        self._client_cid = None
+
+    # ── Tam bağlantı ──────────────────────────────────────
+    def connect(self, apn='internet'):
+        info = self.get_device_info()
+        log.info(f"Modem: {info.get('manufacturer')} {info.get('model')}")
+        log.info(f"IMEI : {info.get('imei')}")
+
+        self.setup_raw_ip()
+
+        if not self.wait_registered():
+            log.error("Ağ kaydı başarısız")
+            return False
+
+        if not self.start_data_session(apn):
+            return False
+
+        time.sleep(2)
+        settings = self.get_ip_settings()
+        if settings['ip']:
+            self.apply_ip_settings(settings)
+            log.info(f"Bağlantı hazır: {settings['ip']}")
+            return True
+        return False
+
+
+def main():
+    qmi = QMIManager(device='/dev/cdc-wdm0', iface='wwan0')
+
+    if qmi.connect(apn='internet'):
+        sig = qmi.get_signal()
+        log.info(f"Sinyal: {sig}")
+
+        # 60 saniye bekle, sonra kes
+        log.info("60s aktif, sonra bağlantı kesilecek...")
+        time.sleep(60)
+        qmi.stop_data_session()
+    else:
+        log.error("Bağlantı kurulamadı")
+
+
+if __name__ == '__main__':
+    main()</code></pre>
+  </div>
+
+  <div class="callout info">
+    <div class="label">GI-QMI (Python binding)</div>
+    <p>Doğrudan libqmi Python binding için <code class="inline">python3-qmi</code> paketi bazı dağıtımlarda mevcuttur. GObject Introspection üzerinden çalışır. subprocess wrapper yaklaşımı ise hiçbir ek bağımlılık gerektirmez ve production'da daha güvenilirdir.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

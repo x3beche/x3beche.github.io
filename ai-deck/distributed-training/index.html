@@ -1,0 +1,728 @@
+---
+layout: tutorial
+title: "Dağıtık Eğitim — DeepSpeed & FSDP"
+back_url: "../index.html"
+back_label: "Tüm rehberler"
+---
+
+<header class="header">
+  <div class="meta">
+    <span>Rehber</span>
+    <span>Yapay Zeka</span>
+    <span>Distributed Training</span>
+  </div>
+  <h1>Dağıtık Eğitim<br><em>DeepSpeed &amp; FSDP.</em></h1>
+  <p class="subtitle">Büyük dil modellerini tek GPU'ya sığdır. ZeRO Stage 1/2/3, FSDP shard stratejileri, mixed precision ve Flash Attention 2'yi öğren. LLaMA-3 8B LoRA fine-tuning ile tek GPU vs DeepSpeed ZeRO3 karşılaştırması.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçerik</div>
+  <ol>
+    <li><a href="#s0">Neden Distributed Training?</a></li>
+    <li><a href="#s1">Data Parallelism (DDP)</a></li>
+    <li><a href="#s2">Model Parallelism Türleri</a></li>
+    <li><a href="#s3">ZeRO Optimizer</a></li>
+    <li><a href="#s4">DeepSpeed Kurulumu</a></li>
+    <li><a href="#s5">FSDP — PyTorch Native</a></li>
+    <li><a href="#s6">Mixed Precision Training</a></li>
+    <li><a href="#s7">Gradient Checkpointing</a></li>
+    <li><a href="#s8">Flash Attention 2</a></li>
+    <li><a href="#s9">Pratik: LLaMA-3 LoRA Fine-tuning</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ─────────────────────────────────────────────────── s0 -->
+<section id="s0">
+  <h2><span class="num">00</span> Neden Distributed Training?</h2>
+  <p class="section-lead">Modern LLM'lerin parametre sayısı ile eğitim verisi hacmi, tek bir GPU'nun belleğini çoktan aştı. Dağıtık eğitim bu eşiği aşmanın tek pratik yoludur.</p>
+
+  <h3>Model Boyutu vs GPU Belleği</h3>
+  <table class="file-table">
+    <thead><tr><th>Model</th><th>Parametre</th><th>bf16 Ağırlık</th><th>Adam State</th><th>Toplam (yaklaşık)</th></tr></thead>
+    <tbody>
+      <tr><td>LLaMA-3 8B</td><td>8B</td><td>16 GB</td><td>64 GB</td><td>~80 GB</td></tr>
+      <tr><td>LLaMA-3 70B</td><td>70B</td><td>140 GB</td><td>560 GB</td><td>~700 GB</td></tr>
+      <tr><td>GPT-4 (tahmin)</td><td>~1.8T</td><td>3.6 TB</td><td>—</td><td>çok GPU</td></tr>
+      <tr><td>RTX 4090</td><td>—</td><td colspan="3">24 GB VRAM</td></tr>
+      <tr><td>H100 SXM</td><td>—</td><td colspan="3">80 GB VRAM</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Bellek Bileşenleri</h3>
+  <div class="params">
+    <div class="param">
+      <span class="name">Model Ağırlıkları</span>
+      <span class="desc">fp16/bf16: param_count × 2 bayt. fp32: param_count × 4 bayt. 7B model = 14 GB (bf16).</span>
+    </div>
+    <div class="param">
+      <span class="name">Optimizer State (Adam)</span>
+      <span class="desc">Momentum (fp32) + variance (fp32) = param_count × 8 bayt. 7B model için 56 GB ek bellek.</span>
+    </div>
+    <div class="param">
+      <span class="name">Gradients</span>
+      <span class="desc">Her parametre için bir gradient: fp16/bf16 = 2 bayt/param. 7B = 14 GB.</span>
+    </div>
+    <div class="param">
+      <span class="name">Aktivasyonlar</span>
+      <span class="desc">Forward pass sırasında saklanan ara tensörler. Batch size ve sequence length ile doğru orantılı.</span>
+    </div>
+  </div>
+
+  <div class="callout">
+    <strong>Kural:</strong> Full precision training'de 1B parametre ≈ 20 GB GPU belleği (ağırlık + gradyan + optimizer state). Bu yüzden 7B model full training için 140 GB bellek gerektirir; tek bir H100 (80 GB) yetmez.
+  </div>
+</section>
+
+<!-- ─────────────────────────────────────────────────── s1 -->
+<section id="s1">
+  <h2><span class="num">01</span> Data Parallelism — DDP</h2>
+  <p class="section-lead">Data Parallelism, aynı modeli her GPU'ya kopyalar ve batch'i böler. Gradient all-reduce ile senkronizasyon sağlanır. PyTorch DDP bu yaklaşımın standart implementasyonudur.</p>
+
+  <h3>Gradient All-Reduce</h3>
+  <div class="flow">
+    <pre><span class="step-num">01</span> Her GPU: mini-batch alır, forward + backward yapar
+<span class="step-num">02</span> Her GPU: kendi gradient'larını hesaplar
+<span class="step-num">03</span> <span class="accent">All-Reduce</span>: Tüm GPU'ların gradient'ları toplanır/ortalaması alınır
+<span class="step-num">04</span> Her GPU: aynı gradient ile kendi modelini günceller
+<span class="step-num">05</span> Sonuç: Tüm GPU'lar özdeş model parametrelerine sahiptir</pre>
+  </div>
+
+  <h3>PyTorch DDP Kurulumu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>ddp_training.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> torch
+<span class="keyword">import</span> torch.distributed <span class="keyword">as</span> dist
+<span class="keyword">from</span> torch.nn.parallel <span class="keyword">import</span> DistributedDataParallel <span class="keyword">as</span> DDP
+<span class="keyword">from</span> torch.utils.data.distributed <span class="keyword">import</span> DistributedSampler
+<span class="keyword">import</span> os
+
+<span class="keyword">def</span> <span class="cmd">setup</span>(rank: int, world_size: int):
+    os.environ[<span class="str">"MASTER_ADDR"</span>] = <span class="str">"localhost"</span>
+    os.environ[<span class="str">"MASTER_PORT"</span>] = <span class="str">"12355"</span>
+    dist.<span class="cmd">init_process_group</span>(<span class="str">"nccl"</span>, rank=rank, world_size=world_size)
+    torch.cuda.<span class="cmd">set_device</span>(rank)
+
+<span class="keyword">def</span> <span class="cmd">cleanup</span>():
+    dist.<span class="cmd">destroy_process_group</span>()
+
+<span class="keyword">def</span> <span class="cmd">train</span>(rank: int, world_size: int, model, dataset, epochs: int = <span class="cmd">3</span>):
+    <span class="cmd">setup</span>(rank, world_size)
+
+    <span class="cmt"># Modeli GPU'ya taşı ve DDP'ye sar</span>
+    model = model.<span class="cmd">to</span>(rank)
+    model = <span class="cmd">DDP</span>(model, device_ids=[rank])
+
+    <span class="cmt"># DistributedSampler: her GPU farklı alt-küme görür</span>
+    sampler = <span class="cmd">DistributedSampler</span>(dataset, num_replicas=world_size, rank=rank)
+    dataloader = torch.utils.data.<span class="cmd">DataLoader</span>(
+        dataset, batch_size=<span class="cmd">4</span>, sampler=sampler, num_workers=<span class="cmd">4</span>, pin_memory=<span class="keyword">True</span>
+    )
+
+    optimizer = torch.optim.<span class="cmd">AdamW</span>(model.<span class="cmd">parameters</span>(), lr=<span class="cmd">1e-4</span>)
+
+    <span class="keyword">for</span> epoch <span class="keyword">in</span> <span class="cmd">range</span>(epochs):
+        sampler.<span class="cmd">set_epoch</span>(epoch)  <span class="cmt"># Her epoch farklı shuffle</span>
+        <span class="keyword">for</span> batch <span class="keyword">in</span> dataloader:
+            input_ids = batch[<span class="str">"input_ids"</span>].<span class="cmd">to</span>(rank)
+            labels    = batch[<span class="str">"labels"</span>].<span class="cmd">to</span>(rank)
+
+            loss = model(input_ids, labels=labels).loss
+            loss.<span class="cmd">backward</span>()    <span class="cmt"># All-reduce otomatik</span>
+            optimizer.<span class="cmd">step</span>()
+            optimizer.<span class="cmd">zero_grad</span>()
+
+    <span class="cmd">cleanup</span>()
+
+<span class="cmt"># Başlatma (torchrun kullan)</span>
+<span class="cmt"># torchrun --nproc_per_node=4 ddp_training.py</span>
+<span class="keyword">if</span> __name__ == <span class="str">"__main__"</span>:
+    <span class="keyword">import</span> torch.multiprocessing <span class="keyword">as</span> mp
+    world_size = torch.cuda.<span class="cmd">device_count</span>()
+    mp.<span class="cmd">spawn</span>(train, args=(world_size, model, dataset), nprocs=world_size)</code></pre>
+  </div>
+
+  <div class="callout">
+    <strong>DDP Sınırı:</strong> DDP her GPU'da tam model kopyası barındırır. 7B model bf16'da ~14 GB — her GPU'da bu kadar bellek gerekir. Model tek GPU'ya sığmıyorsa DDP çalışmaz; ZeRO veya model parallelism gerekir.
+  </div>
+</section>
+
+<!-- ─────────────────────────────────────────────────── s2 -->
+<section id="s2">
+  <h2><span class="num">02</span> Model Parallelism Türleri</h2>
+  <p class="section-lead">Modelin kendisini GPU'lara bölen stratejiler. Pipeline, tensor ve expert parallelism farklı boyut ve trade-off'lara sahiptir.</p>
+
+  <h3>Pipeline Parallelism</h3>
+  <p>Modelin katmanları GPU'lara sıralı olarak bölünür. GPU-0 ilk N katmanı, GPU-1 sonraki N katmanı çalıştırır. Mikro-batch'ler ile boru hattı verimliliği artırılır.</p>
+
+  <div class="flow">
+    <pre><span class="step-num">GPU 0</span>  Layer  0–11  │  mb1  mb2  mb3  mb4  <span class="accent">idle</span>
+<span class="step-num">GPU 1</span>  Layer 12–23  │  <span class="accent">idle</span>  mb1  mb2  mb3  mb4
+<span class="step-num">GPU 2</span>  Layer 24–35  │  <span class="accent">idle idle</span>  mb1  mb2  mb3
+<span class="step-num">GPU 3</span>  Layer 36–47  │  <span class="accent">idle idle idle</span>  mb1  mb2</pre>
+  </div>
+
+  <h3>Tensor Parallelism</h3>
+  <p>Her matris çarpımı GPU'lar arasında bölünür. Megatron-LM yaklaşımı: attention head'leri ve FFN satırları/sütunları paralele bölünür. İletişim yoğundur, NVLink gerektirir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>tensor_parallel_sketch.py</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Basitleştirilmiş tensor parallelism örneği
+# W: [d_model, 4*d_model] matrisini iki GPU'ya böl</span>
+
+<span class="cmt"># GPU 0: W_0 = W[:, :2*d_model]   → ilk yarı sütunlar</span>
+<span class="cmt"># GPU 1: W_1 = W[:, 2*d_model:]   → son yarı sütunlar</span>
+
+<span class="keyword">import</span> torch
+<span class="keyword">import</span> torch.distributed <span class="keyword">as</span> dist
+
+<span class="keyword">def</span> <span class="cmd">column_parallel_linear</span>(x, weight_shard, bias_shard=<span class="keyword">None</span>):
+    <span class="cmt"># Her GPU kendi sütun dilimini çarpar</span>
+    local_out = torch.nn.functional.<span class="cmd">linear</span>(x, weight_shard, bias_shard)
+    <span class="keyword">return</span> local_out   <span class="cmt"># All-gather sonradan yapılır</span>
+
+<span class="keyword">def</span> <span class="cmd">row_parallel_linear</span>(x_shard, weight_shard, bias=<span class="keyword">None</span>):
+    <span class="cmt"># Her GPU kendi satır dilimini çarpar, sonra all-reduce</span>
+    local_out = torch.nn.functional.<span class="cmd">linear</span>(x_shard, weight_shard)
+    dist.<span class="cmd">all_reduce</span>(local_out, op=dist.ReduceOp.SUM)
+    <span class="keyword">if</span> bias <span class="keyword">is not None</span>:
+        local_out += bias
+    <span class="keyword">return</span> local_out</code></pre>
+  </div>
+
+  <h3>Expert Parallelism (Mixture of Experts)</h3>
+  <p>MoE modellerde her "uzman" (expert) FFN farklı bir GPU'ya atanır. Token routing (dispatcher) hangi token'ların hangi GPU'ya gideceğini belirler.</p>
+
+  <table class="file-table">
+    <thead><tr><th>Strateji</th><th>Bölme Boyutu</th><th>İletişim</th><th>Kullanım</th></tr></thead>
+    <tbody>
+      <tr><td>Pipeline</td><td>Katmanlar</td><td>Düşük (aktivasyon)</td><td>Büyük modeller, düşük bant genişliği</td></tr>
+      <tr><td>Tensor</td><td>Matris boyutu</td><td>Yüksek (her katman)</td><td>NVLink, küçük world_size</td></tr>
+      <tr><td>Expert</td><td>FFN uzmanları</td><td>Orta (routing)</td><td>MoE mimarileri</td></tr>
+      <tr><td>Sequence</td><td>Sequence uzunluğu</td><td>Attention cross-GPU</td><td>Çok uzun bağlam</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ─────────────────────────────────────────────────── s3 -->
+<section id="s3">
+  <h2><span class="num">03</span> ZeRO — Zero Redundancy Optimizer</h2>
+  <p class="section-lead">ZeRO, optimizer state, gradient ve model parametrelerini GPU'lara shardlayarak her GPU'nun bellek kullanımını düşürür. DeepSpeed'in temel katkısıdır.</p>
+
+  <h3>ZeRO Aşamaları</h3>
+
+  <div class="params">
+    <div class="param">
+      <span class="name">ZeRO Stage 1 — Optimizer Sharding</span>
+      <span class="desc">Optimizer state (momentum + variance) GPU'lara bölünür. Ağırlıklar ve gradyanlar tam kopya. Bellek tasarrufu: 4× (Adam ile).</span>
+    </div>
+    <div class="param">
+      <span class="name">ZeRO Stage 2 — Gradient Sharding</span>
+      <span class="desc">Stage 1 + gradient'lar da bölünür. Her GPU yalnızca kendi shard'ının gradyanını tutar. Bellek tasarrufu: 8× (Adam ile).</span>
+    </div>
+    <div class="param">
+      <span class="name">ZeRO Stage 3 — Parameter Sharding</span>
+      <span class="desc">Stage 2 + model parametreleri de bölünür. Forward/backward sırasında gerekli parametreler all-gather ile toplanır. Bellek tasarrufu: world_size×.</span>
+    </div>
+    <div class="param">
+      <span class="name">ZeRO-Infinity</span>
+      <span class="desc">Stage 3 + NVMe SSD offloading. CPU RAM ve SSD'yi GPU belleğinin uzantısı olarak kullanır. Tek GPU ile trillion parametre eğitimi teorik olarak mümkün.</span>
+    </div>
+  </div>
+
+  <h3>Bellek Tasarrufu Formülü</h3>
+  <div class="code-block">
+    <div class="code-header"><span>zero_memory.py</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># N = GPU sayısı, Ψ = parametre sayısı
+# Adam: fp32 weights(4) + fp32 momentum(4) + fp32 variance(4) + fp16 weights(2) + fp16 grad(2) = 16 byte/param
+
+# Baseline (DDP):
+baseline = <span class="str">"16Ψ bytes per GPU"</span>
+
+# ZeRO Stage 1 (optimizer state split):
+stage1 = <span class="str">"4Ψ + 12Ψ/N bytes per GPU"</span>
+
+# ZeRO Stage 2 (gradient + optimizer split):
+stage2 = <span class="str">"2Ψ + 14Ψ/N bytes per GPU"</span>
+
+# ZeRO Stage 3 (full split):
+stage3 = <span class="str">"16Ψ/N bytes per GPU"</span>  # Lineer ölçekleme!</span>
+
+<span class="keyword">def</span> <span class="cmd">zero_memory</span>(params_b: float, n_gpus: int) -> dict:
+    <span class="str">"""params_b: parametre sayısı milyar olarak"""</span>
+    P = params_b * <span class="cmd">1e9</span> * <span class="cmd">16</span> / <span class="cmd">1e9</span>  <span class="cmt"># GB (baseline)</span>
+    <span class="keyword">return</span> {
+        <span class="str">"baseline_gb"</span>:  P,
+        <span class="str">"stage1_gb"</span>: <span class="cmd">4</span>/16 * P + (<span class="cmd">12</span>/16 * P) / n_gpus,
+        <span class="str">"stage2_gb"</span>: <span class="cmd">2</span>/16 * P + (<span class="cmd">14</span>/16 * P) / n_gpus,
+        <span class="str">"stage3_gb"</span>: P / n_gpus,
+    }
+
+<span class="cmt"># LLaMA-3 8B, 8 GPU:</span>
+<span class="keyword">for</span> k, v <span class="keyword">in</span> <span class="cmd">zero_memory</span>(<span class="cmd">8</span>, <span class="cmd">8</span>).items():
+    <span class="cmd">print</span>(<span class="str">f"{k:12s}: {v:.1f} GB/GPU"</span>)
+<span class="cmt"># baseline_gb :  80.0 GB/GPU
+# stage1_gb   :  28.8 GB/GPU
+# stage2_gb   :  18.0 GB/GPU
+# stage3_gb   :  10.0 GB/GPU</span></code></pre>
+  </div>
+</section>
+
+<!-- ─────────────────────────────────────────────────── s4 -->
+<section id="s4">
+  <h2><span class="num">04</span> DeepSpeed Kurulumu</h2>
+  <p class="section-lead">DeepSpeed, ds_config.json ile yapılandırılır ve deepspeed komut satırı ile başlatılır. HuggingFace Trainer ile entegrasyon tek satırdır.</p>
+
+  <h3>ds_config.json (ZeRO Stage 3)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>ds_config_zero3.json</span><span class="dot">●</span></div>
+    <pre><code>{
+  <span class="str">"zero_optimization"</span>: {
+    <span class="str">"stage"</span>: 3,
+    <span class="str">"offload_optimizer"</span>: {
+      <span class="str">"device"</span>: <span class="str">"cpu"</span>,
+      <span class="str">"pin_memory"</span>: true
+    },
+    <span class="str">"offload_param"</span>: {
+      <span class="str">"device"</span>: <span class="str">"cpu"</span>,
+      <span class="str">"pin_memory"</span>: true
+    },
+    <span class="str">"overlap_comm"</span>: true,
+    <span class="str">"contiguous_gradients"</span>: true,
+    <span class="str">"sub_group_size"</span>: 1e9,
+    <span class="str">"reduce_bucket_size"</span>: <span class="str">"auto"</span>,
+    <span class="str">"stage3_prefetch_bucket_size"</span>: <span class="str">"auto"</span>,
+    <span class="str">"stage3_param_persistence_threshold"</span>: <span class="str">"auto"</span>,
+    <span class="str">"stage3_max_live_parameters"</span>: 1e9,
+    <span class="str">"stage3_max_reuse_distance"</span>: 1e9,
+    <span class="str">"stage3_gather_16bit_weights_on_model_save"</span>: true
+  },
+  <span class="str">"bf16"</span>: {
+    <span class="str">"enabled"</span>: true
+  },
+  <span class="str">"gradient_accumulation_steps"</span>: 4,
+  <span class="str">"gradient_clipping"</span>: 1.0,
+  <span class="str">"steps_per_print"</span>: 100,
+  <span class="str">"train_batch_size"</span>: <span class="str">"auto"</span>,
+  <span class="str">"train_micro_batch_size_per_gpu"</span>: <span class="str">"auto"</span>,
+  <span class="str">"wall_clock_breakdown"</span>: false
+}</code></pre>
+  </div>
+
+  <h3>HuggingFace Trainer ile DeepSpeed</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>train_deepspeed.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">from</span> transformers <span class="keyword">import</span> (
+    AutoModelForCausalLM, AutoTokenizer,
+    TrainingArguments, Trainer
+)
+<span class="keyword">from</span> peft <span class="keyword">import</span> LoraConfig, get_peft_model
+<span class="keyword">from</span> datasets <span class="keyword">import</span> load_dataset
+
+model_id = <span class="str">"meta-llama/Meta-Llama-3-8B"</span>
+tokenizer = AutoTokenizer.<span class="cmd">from_pretrained</span>(model_id)
+model = AutoModelForCausalLM.<span class="cmd">from_pretrained</span>(
+    model_id, torch_dtype=<span class="str">"auto"</span>
+)
+
+<span class="cmt"># LoRA config</span>
+lora_config = <span class="cmd">LoraConfig</span>(
+    r=<span class="cmd">16</span>, lora_alpha=<span class="cmd">32</span>,
+    target_modules=[<span class="str">"q_proj"</span>, <span class="str">"v_proj"</span>, <span class="str">"k_proj"</span>, <span class="str">"o_proj"</span>],
+    lora_dropout=<span class="cmd">0.05</span>, bias=<span class="str">"none"</span>
+)
+model = <span class="cmd">get_peft_model</span>(model, lora_config)
+model.<span class="cmd">print_trainable_parameters</span>()
+<span class="cmt"># trainable params: 83,886,080 || total: 8,114,896,896 || 1.034%</span>
+
+<span class="cmt"># Training argümanları — deepspeed config'e işaret et</span>
+training_args = <span class="cmd">TrainingArguments</span>(
+    output_dir=<span class="str">"./llama3-lora"</span>,
+    num_train_epochs=<span class="cmd">3</span>,
+    per_device_train_batch_size=<span class="cmd">1</span>,
+    gradient_accumulation_steps=<span class="cmd">16</span>,
+    learning_rate=<span class="cmd">2e-4</span>,
+    bf16=<span class="keyword">True</span>,
+    logging_steps=<span class="cmd">10</span>,
+    save_steps=<span class="cmd">200</span>,
+    deepspeed=<span class="str">"ds_config_zero3.json"</span>,  <span class="cmt"># Tek satır!</span>
+    report_to=<span class="str">"wandb"</span>
+)
+
+dataset = <span class="cmd">load_dataset</span>(<span class="str">"tatsu-lab/alpaca"</span>, split=<span class="str">"train"</span>)
+trainer = <span class="cmd">Trainer</span>(model=model, args=training_args, train_dataset=dataset)
+trainer.<span class="cmd">train</span>()
+
+<span class="cmt"># Başlatma:
+# deepspeed --num_gpus=4 train_deepspeed.py
+# veya:
+# torchrun --nproc_per_node=4 train_deepspeed.py</span></code></pre>
+  </div>
+</section>
+
+<!-- ─────────────────────────────────────────────────── s5 -->
+<section id="s5">
+  <h2><span class="num">05</span> FSDP — Fully Sharded Data Parallel</h2>
+  <p class="section-lead">PyTorch native FSDP, ZeRO Stage 3'e eşdeğer işlevsellik sağlar. Harici kütüphane gerektirmez; PyTorch 1.12+ ile gelir.</p>
+
+  <h3>Shard Stratejileri</h3>
+  <div class="params">
+    <div class="param">
+      <span class="name">FULL_SHARD</span>
+      <span class="desc">Parametreler, gradyanlar ve optimizer state tamamen shardlanır. ZeRO Stage 3 eşdeğeri. Maksimum bellek tasarrufu, yüksek iletişim yükü.</span>
+    </div>
+    <div class="param">
+      <span class="name">SHARD_GRAD_OP</span>
+      <span class="desc">Yalnızca gradyan ve optimizer state shardlanır, parametreler tam. ZeRO Stage 2 eşdeğeri. Orta bellek tasarrufu.</span>
+    </div>
+    <div class="param">
+      <span class="name">NO_SHARD</span>
+      <span class="desc">Standart DDP. Sharding yok, tüm parametreler her GPU'da. Temel karşılaştırma noktası.</span>
+    </div>
+    <div class="param">
+      <span class="name">HYBRID_SHARD</span>
+      <span class="desc">Node içi FULL_SHARD, node'lar arası DDP. Çok node senaryosunda iletişim yükünü dengeler.</span>
+    </div>
+  </div>
+
+  <h3>FSDP Implementasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>fsdp_training.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> torch
+<span class="keyword">import</span> torch.distributed <span class="keyword">as</span> dist
+<span class="keyword">from</span> torch.distributed.fsdp <span class="keyword">import</span> (
+    FullyShardedDataParallel <span class="keyword">as</span> FSDP,
+    ShardingStrategy,
+    BackwardPrefetch,
+    MixedPrecision,
+)
+<span class="keyword">from</span> torch.distributed.fsdp.wrap <span class="keyword">import</span> transformer_auto_wrap_policy
+<span class="keyword">from</span> transformers.models.llama.modeling_llama <span class="keyword">import</span> LlamaDecoderLayer
+<span class="keyword">import</span> functools
+
+<span class="keyword">def</span> <span class="cmd">create_fsdp_model</span>(model, rank: int):
+    <span class="cmt"># Mixed precision policy</span>
+    mp_policy = <span class="cmd">MixedPrecision</span>(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.bfloat16,
+        buffer_dtype=torch.bfloat16,
+    )
+
+    <span class="cmt"># LlamaDecoderLayer'ı wrap policy ile FSDP birimlerine böl</span>
+    wrap_policy = functools.<span class="cmd">partial</span>(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={LlamaDecoderLayer},
+    )
+
+    fsdp_model = <span class="cmd">FSDP</span>(
+        model,
+        auto_wrap_policy=wrap_policy,
+        mixed_precision=mp_policy,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+        device_id=rank,
+        use_orig_params=<span class="keyword">True</span>,   <span class="cmt"># LoRA için gerekli</span>
+    )
+    <span class="keyword">return</span> fsdp_model
+
+<span class="cmt"># Checkpoint kaydetme (FSDP ile özel state_dict gerekir)</span>
+<span class="keyword">from</span> torch.distributed.fsdp <span class="keyword">import</span> FullStateDictConfig, StateDictType
+
+<span class="keyword">def</span> <span class="cmd">save_fsdp_model</span>(model, output_dir: str, rank: int):
+    cfg = <span class="cmd">FullStateDictConfig</span>(offload_to_cpu=<span class="keyword">True</span>, rank0_only=<span class="keyword">True</span>)
+    <span class="keyword">with</span> FSDP.<span class="cmd">state_dict_type</span>(model, StateDictType.FULL_STATE_DICT, cfg):
+        state_dict = model.<span class="cmd">state_dict</span>()
+    <span class="keyword">if</span> rank == <span class="cmd">0</span>:
+        torch.<span class="cmd">save</span>(state_dict, <span class="str">f"{output_dir}/model.pt"</span>)</code></pre>
+  </div>
+</section>
+
+<!-- ─────────────────────────────────────────────────── s6 -->
+<section id="s6">
+  <h2><span class="num">06</span> Mixed Precision Training</h2>
+  <p class="section-lead">bf16/fp16 ile eğitim, bellek kullanımını ve işlem süresini yaklaşık yarıya indirir. PyTorch autocast ve gradient scaler bu süreci otomatize eder.</p>
+
+  <h3>bf16 vs fp16</h3>
+  <table class="file-table">
+    <thead><tr><th>Format</th><th>Bit</th><th>Dinamik Aralık</th><th>Hassasiyet</th><th>Öneri</th></tr></thead>
+    <tbody>
+      <tr><td>fp32</td><td>32</td><td>±3.4×10³⁸</td><td>7 ondalık</td><td>Referans</td></tr>
+      <tr><td>bf16</td><td>16</td><td>±3.4×10³⁸</td><td>3 ondalık</td><td>H100/A100 GPU'larda önerilen</td></tr>
+      <tr><td>fp16</td><td>16</td><td>±6.5×10⁴</td><td>4 ondalık</td><td>Eski GPU'lar, scaler gerekir</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Autocast ile Eğitim</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>mixed_precision.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> torch
+<span class="keyword">from</span> torch.cuda.amp <span class="keyword">import</span> autocast, GradScaler
+
+model = <span class="cmd">MyModel</span>().<span class="cmd">to</span>(<span class="str">"cuda"</span>)
+optimizer = torch.optim.<span class="cmd">AdamW</span>(model.<span class="cmd">parameters</span>(), lr=<span class="cmd">1e-4</span>)
+scaler = <span class="cmd">GradScaler</span>()   <span class="cmt"># Yalnızca fp16 için gerekli</span>
+
+<span class="keyword">for</span> batch <span class="keyword">in</span> dataloader:
+    <span class="cmt"># bf16: torch_dtype=torch.bfloat16 — scaler gerekmez</span>
+    <span class="keyword">with</span> <span class="cmd">autocast</span>(device_type=<span class="str">"cuda"</span>, dtype=torch.bfloat16):
+        output = model(batch[<span class="str">"input_ids"</span>].<span class="cmd">to</span>(<span class="str">"cuda"</span>))
+        loss = output.loss
+
+    <span class="cmt"># fp16 için scaler kullan</span>
+    <span class="cmt"># scaler.scale(loss).backward()</span>
+    <span class="cmt"># scaler.step(optimizer)</span>
+    <span class="cmt"># scaler.update()</span>
+
+    <span class="cmt"># bf16 için direkt</span>
+    loss.<span class="cmd">backward</span>()
+    torch.nn.utils.<span class="cmd">clip_grad_norm_</span>(model.<span class="cmd">parameters</span>(), <span class="cmd">1.0</span>)
+    optimizer.<span class="cmd">step</span>()
+    optimizer.<span class="cmd">zero_grad</span>()</code></pre>
+  </div>
+</section>
+
+<!-- ─────────────────────────────────────────────────── s7 -->
+<section id="s7">
+  <h2><span class="num">07</span> Gradient Checkpointing</h2>
+  <p class="section-lead">Gradient checkpointing, aktivasyonları saklamak yerine backward pass'te yeniden hesaplar. Bellek kullanımı sqrt(L) katına iner; hesaplama maliyeti %30 artar.</p>
+
+  <h3>Neden Aktivasyonlar Bellek Alır?</h3>
+  <p>Backpropagation için forward pass sırasındaki tüm ara aktivasyonların saklanması gerekir. Uzun bir transformer için bu, GPU belleğinin büyük bölümünü doldurabilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>gradient_checkpointing.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">from</span> transformers <span class="keyword">import</span> AutoModelForCausalLM
+
+model = AutoModelForCausalLM.<span class="cmd">from_pretrained</span>(<span class="str">"meta-llama/Meta-Llama-3-8B"</span>)
+
+<span class="cmt"># Tek satırda aktif et</span>
+model.<span class="cmd">gradient_checkpointing_enable</span>()
+
+<span class="cmt"># Veya manuel PyTorch checkpoint</span>
+<span class="keyword">from</span> torch.utils.checkpoint <span class="keyword">import</span> checkpoint
+
+<span class="keyword">class</span> <span class="cmd">CheckpointedLayer</span>(torch.nn.Module):
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, layer):
+        <span class="cmd">super</span>().__init__()
+        self.layer = layer
+
+    <span class="keyword">def</span> <span class="cmd">forward</span>(self, x):
+        <span class="cmt"># Aktivasyonları saklamaz, backward'da yeniden hesaplar</span>
+        <span class="keyword">return</span> <span class="cmd">checkpoint</span>(self.layer, x, use_reentrant=<span class="keyword">False</span>)
+
+<span class="cmt"># Bellek karşılaştırması (LLaMA-3 8B, seq=2048, bs=1):
+# Gradient checkpointing kapalı:  ~60 GB
+# Gradient checkpointing açık:    ~28 GB
+# Fiyat: ~%30 daha yavaş eğitim</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <strong>LoRA + Checkpointing:</strong> PEFT/LoRA ile gradient checkpointing kullanırken <code class="inline">model.enable_input_require_grads()</code> çağrısı zorunludur. Aksi takdirde LoRA gradyanları hesaplanmaz.
+  </div>
+</section>
+
+<!-- ─────────────────────────────────────────────────── s8 -->
+<section id="s8">
+  <h2><span class="num">08</span> Flash Attention 2 — Bellek Verimliliği</h2>
+  <p class="section-lead">Flash Attention, standart attention'ın O(N²) bellek karmaşıklığını tiling ile O(N) seviyesine indirir. Hem hızlı hem de bellek verimlidir.</p>
+
+  <h3>Standart vs Flash Attention</h3>
+  <table class="file-table">
+    <thead><tr><th>Özellik</th><th>Standart Attention</th><th>Flash Attention 2</th></tr></thead>
+    <tbody>
+      <tr><td>Bellek (N token)</td><td>O(N²)</td><td>O(N)</td></tr>
+      <tr><td>HBM okuma/yazma</td><td>O(N²)</td><td>O(N² / block_size)</td></tr>
+      <tr><td>Hız (4096 token)</td><td>Baz</td><td>~2–4× hızlı</td></tr>
+      <tr><td>Desteklenen</td><td>Tüm GPU</td><td>Ampere+ (A100, H100, RTX 30xx+)</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Flash Attention 2 Kurulumu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>flash_attention.py</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kurulum</span>
+<span class="cmt"># pip install flash-attn --no-build-isolation</span>
+
+<span class="keyword">from</span> transformers <span class="keyword">import</span> AutoModelForCausalLM
+<span class="keyword">import</span> torch
+
+<span class="cmt"># HuggingFace ile tek parametre</span>
+model = AutoModelForCausalLM.<span class="cmd">from_pretrained</span>(
+    <span class="str">"meta-llama/Meta-Llama-3-8B"</span>,
+    torch_dtype=torch.bfloat16,
+    attn_implementation=<span class="str">"flash_attention_2"</span>,  <span class="cmt"># ← burada</span>
+    device_map=<span class="str">"auto"</span>
+)
+
+<span class="cmt"># Manuel kullanım</span>
+<span class="keyword">from</span> flash_attn <span class="keyword">import</span> flash_attn_func
+
+<span class="keyword">def</span> <span class="cmd">flash_attention_forward</span>(q, k, v, dropout_p=<span class="cmd">0.0</span>, causal=<span class="keyword">True</span>):
+    <span class="str">"""
+    q, k, v: (batch, seq, heads, head_dim) — float16 veya bfloat16
+    """</span>
+    <span class="keyword">return</span> <span class="cmd">flash_attn_func</span>(
+        q, k, v,
+        dropout_p=dropout_p,
+        softmax_scale=q.shape[-<span class="cmd">1</span>] ** (-<span class="cmd">0.5</span>),
+        causal=causal    <span class="cmt"># Decoder için True</span>
+    )
+
+<span class="cmt"># Bellek karşılaştırma (seq_len=4096, 8B model):
+# Standart attn:  ~45 GB aktivasyon
+# Flash attn 2:   ~12 GB aktivasyon</span></code></pre>
+  </div>
+</section>
+
+<!-- ─────────────────────────────────────────────────── s9 -->
+<section id="s9">
+  <h2><span class="num">09</span> Pratik: LLaMA-3 8B LoRA Fine-tuning Karşılaştırması</h2>
+  <p class="section-lead">Tek RTX 4090 (24 GB) ile DeepSpeed ZeRO3 kullanarak LLaMA-3 8B LoRA fine-tuning yapılabilir mi? Karşılaştırmalı benchmark.</p>
+
+  <h3>Karşılaştırma Tablosu</h3>
+  <table class="file-table">
+    <thead><tr><th>Konfigürasyon</th><th>GPU Bellek</th><th>Throughput (tok/s)</th><th>Uygulanabilir?</th></tr></thead>
+    <tbody>
+      <tr><td>Tek RTX 4090, fp32</td><td>OOM</td><td>—</td><td>Hayır</td></tr>
+      <tr><td>Tek RTX 4090, bf16 + LoRA r=16</td><td>~22 GB</td><td>~800</td><td>Evet (sınırda)</td></tr>
+      <tr><td>Tek RTX 4090, bf16 + LoRA + GC</td><td>~14 GB</td><td>~550</td><td>Evet</td></tr>
+      <tr><td>4× RTX 4090, DeepSpeed ZeRO2</td><td>~18 GB/GPU</td><td>~3200</td><td>Evet</td></tr>
+      <tr><td>4× RTX 4090, DeepSpeed ZeRO3</td><td>~8 GB/GPU</td><td>~2800</td><td>Evet (en verimli)</td></tr>
+      <tr><td>8× H100 80G, DeepSpeed ZeRO3</td><td>~12 GB/GPU</td><td>~18000</td><td>Evet (prodüksiyon)</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Tam Fine-tuning Script</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>finetune_llama3_lora.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> torch
+<span class="keyword">from</span> transformers <span class="keyword">import</span> (
+    AutoModelForCausalLM, AutoTokenizer,
+    TrainingArguments, DataCollatorForLanguageModeling
+)
+<span class="keyword">from</span> trl <span class="keyword">import</span> SFTTrainer
+<span class="keyword">from</span> peft <span class="keyword">import</span> LoraConfig, get_peft_model, TaskType
+<span class="keyword">from</span> datasets <span class="keyword">import</span> load_dataset
+<span class="keyword">import</span> os
+
+MODEL_ID  = <span class="str">"meta-llama/Meta-Llama-3-8B"</span>
+OUTPUT    = <span class="str">"./llama3-8b-lora-finetuned"</span>
+DS_CONFIG = <span class="str">"./ds_config_zero3.json"</span>  <span class="cmt"># yukarıdaki JSON</span>
+
+<span class="cmt"># 1. Model ve tokenizer yükle</span>
+tokenizer = AutoTokenizer.<span class="cmd">from_pretrained</span>(MODEL_ID)
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = <span class="str">"right"</span>
+
+model = AutoModelForCausalLM.<span class="cmd">from_pretrained</span>(
+    MODEL_ID,
+    torch_dtype=torch.bfloat16,
+    attn_implementation=<span class="str">"flash_attention_2"</span>,
+)
+model.<span class="cmd">enable_input_require_grads</span>()
+
+<span class="cmt"># 2. LoRA config</span>
+lora_cfg = <span class="cmd">LoraConfig</span>(
+    task_type=TaskType.CAUSAL_LM,
+    r=<span class="cmd">16</span>,
+    lora_alpha=<span class="cmd">32</span>,
+    target_modules=[<span class="str">"q_proj"</span>, <span class="str">"v_proj"</span>, <span class="str">"k_proj"</span>, <span class="str">"o_proj"</span>,
+                    <span class="str">"gate_proj"</span>, <span class="str">"up_proj"</span>, <span class="str">"down_proj"</span>],
+    lora_dropout=<span class="cmd">0.05</span>,
+    bias=<span class="str">"none"</span>,
+    modules_to_save=[<span class="str">"embed_tokens"</span>, <span class="str">"lm_head"</span>],
+)
+model = <span class="cmd">get_peft_model</span>(model, lora_cfg)
+model.<span class="cmd">print_trainable_parameters</span>()
+
+<span class="cmt"># 3. Veri seti</span>
+dataset = <span class="cmd">load_dataset</span>(<span class="str">"tatsu-lab/alpaca"</span>, split=<span class="str">"train"</span>)
+
+<span class="keyword">def</span> <span class="cmd">format_prompt</span>(example):
+    <span class="keyword">if</span> example[<span class="str">"input"</span>]:
+        text = <span class="str">f"### Talimat:\n{example['instruction']}\n\n### Giriş:\n{example['input']}\n\n### Yanıt:\n{example['output']}"</span>
+    <span class="keyword">else</span>:
+        text = <span class="str">f"### Talimat:\n{example['instruction']}\n\n### Yanıt:\n{example['output']}"</span>
+    <span class="keyword">return</span> {<span class="str">"text"</span>: text}
+
+dataset = dataset.<span class="cmd">map</span>(format_prompt)
+
+<span class="cmt"># 4. Training arguments</span>
+args = <span class="cmd">TrainingArguments</span>(
+    output_dir=OUTPUT,
+    num_train_epochs=<span class="cmd">3</span>,
+    per_device_train_batch_size=<span class="cmd">2</span>,
+    gradient_accumulation_steps=<span class="cmd">8</span>,
+    gradient_checkpointing=<span class="keyword">True</span>,
+    learning_rate=<span class="cmd">2e-4</span>,
+    weight_decay=<span class="cmd">0.01</span>,
+    lr_scheduler_type=<span class="str">"cosine"</span>,
+    warmup_ratio=<span class="cmd">0.03</span>,
+    bf16=<span class="keyword">True</span>,
+    logging_steps=<span class="cmd">10</span>,
+    save_strategy=<span class="str">"epoch"</span>,
+    deepspeed=DS_CONFIG,      <span class="cmt"># ← ZeRO3 aktif</span>
+    dataloader_num_workers=<span class="cmd">4</span>,
+    report_to=<span class="str">"wandb"</span>,
+    run_name=<span class="str">"llama3-8b-lora-zero3"</span>,
+)
+
+<span class="cmt"># 5. SFT Trainer</span>
+trainer = <span class="cmd">SFTTrainer</span>(
+    model=model,
+    tokenizer=tokenizer,
+    train_dataset=dataset,
+    dataset_text_field=<span class="str">"text"</span>,
+    max_seq_length=<span class="cmd">2048</span>,
+    args=args,
+)
+
+trainer.<span class="cmd">train</span>()
+trainer.<span class="cmd">save_model</span>(OUTPUT)
+
+<span class="cmt"># Başlatma:
+# deepspeed --num_gpus=4 finetune_llama3_lora.py
+# W&B ile izle: wandb.ai/your_project</span></code></pre>
+  </div>
+
+  <h3>Profiling ile Darboğaz Analizi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>profile_training.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> torch
+<span class="keyword">from</span> torch.profiler <span class="keyword">import</span> profile, ProfilerActivity, tensorboard_trace_handler
+
+<span class="keyword">with</span> <span class="cmd">profile</span>(
+    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    schedule=torch.profiler.<span class="cmd">schedule</span>(wait=<span class="cmd">1</span>, warmup=<span class="cmd">1</span>, active=<span class="cmd">3</span>, repeat=<span class="cmd">1</span>),
+    on_trace_ready=<span class="cmd">tensorboard_trace_handler</span>(<span class="str">"./profiler_logs"</span>),
+    record_shapes=<span class="keyword">True</span>,
+    profile_memory=<span class="keyword">True</span>,
+    with_stack=<span class="keyword">True</span>
+) <span class="keyword">as</span> prof:
+    <span class="keyword">for</span> step, batch <span class="keyword">in</span> <span class="cmd">enumerate</span>(dataloader):
+        <span class="keyword">if</span> step >= <span class="cmd">5</span>:
+            <span class="keyword">break</span>
+        <span class="cmd">train_step</span>(batch)
+        prof.<span class="cmd">step</span>()
+
+<span class="cmt"># TensorBoard'da izle:
+# tensorboard --logdir=./profiler_logs</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <strong>Özet — Ne Zaman Ne Kullan:</strong> Tek GPU ile sığmıyorsa önce LoRA + gradient checkpointing dene. Hâlâ sığmıyorsa DeepSpeed ZeRO2/3 ekle. Çok node'a geçiyorsan FSDP HYBRID_SHARD veya ZeRO + CPU offload değerlendir. Flash Attention 2 her durumda açık olsun.
+  </div>
+</section>
+
+</main>
+
+<footer>◆ EMİRHAN PEHLEVAN ◆<br>emirpehlevan@outlook.com</footer>

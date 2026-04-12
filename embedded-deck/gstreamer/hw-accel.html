@@ -1,0 +1,710 @@
+---
+layout: tutorial
+title: "Donanım Hızlandırmalı Video — VPU & Zero-Copy"
+back_url: "../index.html"
+back_label: "GStreamer & Multimedya"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GSTREAMER</span>
+    <span>DONANIM HIZLANDIRMA</span>
+    <span>2026</span>
+  </div>
+  <h1>Donanım Hızlandırmalı Video —<br><em>VPU &amp; Zero-Copy.</em></h1>
+  <p class="subtitle">CPU yerine VPU/GPU: i.MX VPU, Rockchip MPP, Jetson NVENC/NVDEC, VA-API ve DMA-BUF zero-copy pipeline — gömülü sistemlerde güç ve termal sınırları aşmadan 1080p encode.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Neden donanım codec — CPU vs VPU</a></li>
+    <li><a href="#s1">i.MX VPU — imxvpuenc ve mxc_vpu driver</a></li>
+    <li><a href="#s2">Rockchip MPP — mppvideodec ve rkmpp</a></li>
+    <li><a href="#s3">Jetson NVENC/NVDEC — nvv4l2 pipeline</a></li>
+    <li><a href="#s4">VA-API — Intel ve AMD GPU encode</a></li>
+    <li><a href="#s5">DMA-BUF zero-copy pipeline</a></li>
+    <li><a href="#s6">GstVideoInfo ve format negotiation</a></li>
+    <li><a href="#s7">Benchmark metodolojisi</a></li>
+    <li><a href="#s8">Pratik: i.MX8MP 1080p@30 H.264 encode karşılaştırma</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Neden donanım codec — CPU vs VPU</h2>
+  <p class="section-lead">Gömülü sistemlerde yazılım encode, CPU'yu tamamen meşgul eder; ısıl kısıtlama (thermal throttling) devreye girerek çalışma süresini kısaltır. VPU, sabit fonksiyon donanımı olduğundan aynı işi çok daha az güçle yapar.</p>
+
+  <h3>Karşılaştırma tablosu — i.MX8MP örneği</h3>
+
+  <div class="file-table">
+    <div class="file-row header"><div>Metrik</div><div>x264enc (software)</div><div>v4l2h264enc (HW VPU)</div></div>
+    <div class="file-row"><div>1080p@30 CPU kullanımı</div><div>~95%</div><div>~5%</div></div>
+    <div class="file-row"><div>Güç tüketimi (encode)</div><div>~3.5W</div><div>~0.5W</div></div>
+    <div class="file-row"><div>Encode latency</div><div>~15ms (ultrafast)</div><div>~8ms</div></div>
+    <div class="file-row"><div>Maksimum çözünürlük</div><div>Sınırsız (CPU'ya bağlı)</div><div>Platform limitine kadar</div></div>
+    <div class="file-row"><div>Termal sorun</div><div>Uzun süre kritik</div><div>Yok</div></div>
+  </div>
+
+  <h3>VPU mimarisi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>VPU Blok Diyagramı</span><span class="dot">●</span></div>
+    <pre><code>┌────────────────────────────────────────────────────┐
+│                 SoC (örn: i.MX8MP)                  │
+│                                                      │
+│  ┌──────────┐    DMA-BUF    ┌────────────────────┐  │
+│  │   ISP /  │ ──────────→  │   VPU (Video        │  │
+│  │  V4L2    │              │   Processing Unit)   │  │
+│  │  kamera  │              │   H.264/H.265 HW     │  │
+│  └──────────┘              └────────┬───────────┘  │
+│                                     │ encoded data  │
+│  ┌──────────┐    DDR        ┌────────▼───────────┐  │
+│  │   CPU    │ ◄──────────── │   Output buffer    │  │
+│  │  (ARM)   │               │   (filesink/net)   │  │
+│  └──────────┘               └────────────────────┘  │
+└────────────────────────────────────────────────────┘
+
+Zero-copy path: V4L2 DMA-BUF → VPU DMA-BUF input
+Kamera frame CPU'ya hiç taşınmaz — doğrudan VPU'ya</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">UYARI</div>
+    <p>Donanım encoder kalite/hız parametreleri yazılım encoder'a göre sınırlıdır. x264enc'in tune/preset seçeneklerinin tamamı VPU'da mevcut değildir. Kalite kritikse yazılım encode tercih edin; güç/ısı kritikse donanım zorunludur.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> i.MX VPU — imxvpuenc ve mxc_vpu driver</h2>
+  <p class="section-lead">NXP i.MX serisi SoC'larda (i.MX6, i.MX8, i.MX8MP) entegre VPU bulunur. Kernel driver mxc_vpu veya imx-vpu, GStreamer plugin'i gstreamer-imx üzerinden erişilir.</p>
+
+  <h3>Kernel ve driver durumu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — i.MX VPU kontrolü</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># VPU cihaz düğümlerini kontrol et</span>
+ls -la /dev/mxc_vpu* /dev/video* 2>/dev/null
+<span class="cmt"># /dev/mxc_vpu      ← i.MX6 VPU (eski driver)
+# /dev/video10       ← i.MX8 VPU encode (V4L2 M2M)
+# /dev/video12       ← i.MX8 VPU decode (V4L2 M2M)</span>
+
+<span class="cmt"># Kernel modülünü kontrol et</span>
+lsmod | grep vpu
+<span class="cmt"># imx_vpu_v4l2_dec   ...
+# imx_vpu_v4l2_enc   ...</span>
+
+<span class="cmt"># V4L2 M2M encoder desteklediği formatları listele</span>
+v4l2-ctl -d /dev/video10 --list-formats
+<span class="cmt"># Index: 0 (Output)
+#   Pixel Format: 'NV12' (Y/UV 4:2:0)
+# Index: 0 (Capture)
+#   Pixel Format: 'H264' (H.264)</span></code></pre>
+  </div>
+
+  <h3>gstreamer-imx pipeline</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — i.MX8MP hardware encode</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># gstreamer-imx plugin'leri kur (Yocto: meta-imx)</span>
+<span class="cmt"># IMAGE_INSTALL += " gstreamer1.0-plugins-imx"</span>
+
+<span class="cmt"># imxvpuenc_h264 ile hardware encode</span>
+gst-launch-1.0 \
+  v4l2src device=/dev/video0 ! \
+  video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 ! \
+  imxvpuenc_h264 \
+    bitrate=4000 \
+    intra-refresh=0 \
+    idr-interval=30 ! \
+  h264parse ! \
+  filesink location=imx_hw.mp4
+
+<span class="cmt"># v4l2h264enc (standard V4L2 M2M — yeni kernel)</span>
+gst-launch-1.0 \
+  v4l2src device=/dev/video0 io-mode=4 ! \
+  video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 ! \
+  v4l2h264enc \
+    capture-io-mode=4 \
+    extra-controls="controls,h264_profile=4,h264_level=41" ! \
+  video/x-h264,level=\(string\)4 ! \
+  h264parse ! \
+  filesink location=v4l2hw.h264</code></pre>
+  </div>
+
+  <h3>i.MX G2D hardware scaler</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — imxvideoconvert_g2d</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># G2D (2D GPU) ile zero-copy format dönüşüm ve scale</span>
+<span class="cmt"># CPU yerine 2D GPU kullanır</span>
+gst-launch-1.0 \
+  v4l2src device=/dev/video0 ! \
+  video/x-raw,format=YUYV,width=1920,height=1080 ! \
+  imxvideoconvert_g2d ! \
+  video/x-raw,format=NV12,width=1280,height=720 ! \
+  v4l2h264enc ! \
+  filesink location=g2d_scaled.h264</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Rockchip MPP — mppvideodec ve rkmpp</h2>
+  <p class="section-lead">Rockchip RK3399, RK3568, RK3588 SoC'ları güçlü Media Process Platform (MPP) VPU'ya sahiptir. rkmpp GStreamer plugin'i ve rockchip-mpp kütüphanesi ile H.264/H.265/VP9 donanım encode/decode desteklenir.</p>
+
+  <h3>MPP kurulum ve yapı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Rockchip MPP kurulum</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Debian/Ubuntu (Armbian/Ubuntu 22.04 for RK3588)</span>
+sudo apt install librockchip-mpp1 librockchip-mpp-dev
+
+<span class="cmt"># gstreamer-rockchip plugin kur</span>
+<span class="cmt"># Genellikle BSP imajında gelir veya kaynak koddan derlenir</span>
+<span class="cmt"># https://github.com/JeffyCN/rockchip_mirrors/gstreamer-rockchip</span>
+
+<span class="cmt"># VPU cihaz kontrolü</span>
+ls -la /dev/mpp_service /dev/rga
+<span class="cmt"># /dev/mpp_service    ← Rockchip MPP
+# /dev/rga            ← Rockchip RGA (2D accelerator)</span>
+
+<span class="cmt"># MPP codec bilgisi</span>
+mpi_enc_test -w 1920 -h 1080 -t 7 -f 0 -o /tmp/test.h264
+<span class="cmt"># MPP INFO: mpp_enc encode success, frame cnt 100</span></code></pre>
+  </div>
+
+  <h3>rkmpp GStreamer pipeline</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — RK3588 hardware encode/decode</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># H.264 hardware encode (RK3568/RK3588)</span>
+gst-launch-1.0 \
+  v4l2src device=/dev/video0 ! \
+  video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 ! \
+  mpph264enc \
+    bps=4000000 \
+    bps-target=4000000 \
+    rc-mode=vbr \
+    profile=high \
+    gop=30 ! \
+  h264parse ! \
+  filesink location=rk_hw.h264
+
+<span class="cmt"># H.265 hardware encode (RK3588 — 8K capable)</span>
+gst-launch-1.0 \
+  v4l2src device=/dev/video0 ! \
+  video/x-raw,format=NV12,width=3840,height=2160,framerate=30/1 ! \
+  mpph265enc bps=8000000 rc-mode=vbr ! \
+  h265parse ! \
+  filesink location=rk_4k_hevc.h265
+
+<span class="cmt"># Hardware decode</span>
+gst-launch-1.0 \
+  filesrc location=video.h264 ! \
+  h264parse ! \
+  mppvideodec ! \
+  videoconvert ! autovideosink
+
+<span class="cmt"># RGA ile scale + format dönüşüm</span>
+gst-launch-1.0 \
+  v4l2src device=/dev/video0 ! \
+  video/x-raw,format=NV12,width=3840,height=2160 ! \
+  rgaconvert ! \
+  video/x-raw,format=NV12,width=1920,height=1080 ! \
+  mpph264enc bps=4000000 ! filesink location=4k_to_1080p.h264</code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><div class="name">mpph264enc</div><div class="desc">Rockchip MPP H.264 encoder. bps, bps-target, rc-mode (cbr/vbr/fixqp), profile, gop parametreleri.</div></div>
+    <div class="param"><div class="name">mppvideodec</div><div class="desc">Rockchip MPP decoder. H.264, H.265, VP9, AV1 destekler (platform bağımlı).</div></div>
+    <div class="param"><div class="name">rgaconvert</div><div class="desc">Rockchip RGA 2D accelerator ile format dönüşüm ve ölçekleme. CPU yok.</div></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Jetson NVENC/NVDEC — nvv4l2 pipeline</h2>
+  <p class="section-lead">NVIDIA Jetson serisinde (Nano, NX, AGX Orin) NVENC (encoder) ve NVDEC (decoder) donanımsal video işleme birimi bulunur. DeepStream SDK veya doğrudan nvv4l2 GStreamer plugin'i ile kullanılır.</p>
+
+  <h3>Jetson ortam kurulumu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Jetson kurulum</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># JetPack kurulu Jetson'da nvv4l2 plugin genellikle hazırdır</span>
+gst-inspect-1.0 nvv4l2h264enc
+<span class="cmt"># Plugin Details:
+#   Name: nvv4l2h264enc
+#   Description: NVENC Video H264 Encoder
+#   Version: 1.16.5</span>
+
+<span class="cmt"># CUDA ve codec bilgisi</span>
+jetson_clocks --show
+nvpmodel -q
+<span class="cmt"># MAXN veya farklı güç modu seç</span>
+
+<span class="cmt"># Tüm V4L2 M2M cihazları listele</span>
+v4l2-ctl --list-devices</code></pre>
+  </div>
+
+  <h3>Jetson hardware encode pipeline</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — nvv4l2h264enc</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Jetson hardware H.264 encode</span>
+gst-launch-1.0 \
+  v4l2src device=/dev/video0 ! \
+  video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 ! \
+  nvv4l2h264enc \
+    bitrate=4000000 \
+    iframeinterval=30 \
+    preset-level=1 \
+    insert-sps-pps=true \
+    bufapi-version=true ! \
+  h264parse ! \
+  mp4mux ! filesink location=jetson.mp4
+
+<span class="cmt"># Jetson H.265 4K encode</span>
+gst-launch-1.0 \
+  v4l2src device=/dev/video0 ! \
+  video/x-raw,format=NV12,width=3840,height=2160,framerate=30/1 ! \
+  nvv4l2h265enc bitrate=8000000 iframeinterval=30 ! \
+  h265parse ! filesink location=jetson_4k.h265
+
+<span class="cmt"># Jetson hardware decode + display</span>
+gst-launch-1.0 \
+  filesrc location=video.h264 ! \
+  h264parse ! \
+  nvv4l2decoder ! \
+  nvvideoconvert ! \
+  nv3dsink
+
+<span class="cmt"># CUDA tabanlı ek işlem için nvdsvideotemplate</span></code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><div class="name">nvv4l2h264enc</div><div class="desc">NVENC H.264 encoder. bitrate (bps), iframeinterval, preset-level (1=ultrafast, 4=medium), insert-sps-pps.</div></div>
+    <div class="param"><div class="name">nvv4l2decoder</div><div class="desc">NVDEC hardware decoder. H.264, H.265, VP9, AV1 destekler (AGX Orin için). Çıkış NV12 formatında.</div></div>
+    <div class="param"><div class="name">nvvideoconvert</div><div class="desc">GPU üzerinde renk uzayı dönüşümü. NV12↔RGBA, zero-copy GPU memory.</div></div>
+    <div class="param"><div class="name">nv3dsink</div><div class="desc">Jetson ekran çıkışı (EGLStream/OpenGL). GPU bellek → display, zero-copy.</div></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> VA-API — Intel ve AMD GPU encode</h2>
+  <p class="section-lead">VA-API (Video Acceleration API), Linux'ta GPU video işleme için standart arayüzdür. Intel iHD/i965, AMD Mesa RadeonSI driver'ları ile çalışır. Masaüstü ve embedded x86 platformlarda yaygındır.</p>
+
+  <h3>VA-API durumu kontrol</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — vainfo</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># VA-API kurulum</span>
+sudo apt install vainfo libva-dev gstreamer1.0-vaapi
+
+<span class="cmt"># Desteklenen profil ve işlemleri listele</span>
+vainfo
+<span class="cmt"># vainfo: VA-API version: 1.16 (libva 2.16.0)
+# Driver version: Intel iHD driver for Intel(R) Gen Graphics - 22.5
+# Supported profile and entrypoints
+# ...
+#    VAProfileH264Main               :    VAEntrypointEncSliceLP
+#    VAProfileH264High               :    VAEntrypointEncSliceLP
+#    VAProfileH264High               :    VAEntrypointVLD (decode)
+#    VAProfileHEVCMain               :    VAEntrypointEncSliceLP
+# ...</span>
+
+<span class="cmt"># GPU cihaz kontrolü</span>
+ls -la /dev/dri/
+<span class="cmt"># renderD128 ← GPU render node (VA-API buna erişir)</span></code></pre>
+  </div>
+
+  <h3>gstreamer-vaapi encode pipeline</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — VAAPI encode</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># VAAPI H.264 encode</span>
+gst-launch-1.0 \
+  videotestsrc num-buffers=300 ! \
+  video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 ! \
+  vaapih264enc \
+    bitrate=4000 \
+    keyframe-period=30 \
+    tune=high-compression \
+    rate-control=cbr ! \
+  h264parse ! \
+  mp4mux ! filesink location=vaapi_h264.mp4
+
+<span class="cmt"># VAAPI H.265 encode</span>
+gst-launch-1.0 \
+  videotestsrc num-buffers=300 ! \
+  vaapih265enc bitrate=2000 keyframe-period=30 ! \
+  h265parse ! \
+  mp4mux ! filesink location=vaapi_h265.mp4
+
+<span class="cmt"># VAAPI decode</span>
+gst-launch-1.0 \
+  filesrc location=video.h264 ! \
+  h264parse ! \
+  vaapih264dec ! \
+  vaapipostproc ! \
+  autovideosink
+
+<span class="cmt"># VAAPI postprocessing (scale + color)</span>
+gst-launch-1.0 \
+  filesrc location=video.h264 ! h264parse ! vaapih264dec ! \
+  vaapipostproc \
+    width=1280 height=720 \
+    format=nv12 \
+    deinterlace-mode=bob ! \
+  vaapih264enc bitrate=2000 ! filesink location=scaled.h264</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">DRM RENDER NODE</div>
+    <p>VAAPI /dev/dri/renderD128 cihazına erişim gerektirir. Kullanıcının <code class="inline">render</code> grubunda olması veya uygun yetkiye sahip olması gerekir: <code class="inline">sudo usermod -aG render $USER</code></p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> DMA-BUF zero-copy pipeline</h2>
+  <p class="section-lead">DMA-BUF (Direct Memory Access Buffer), çeşitli donanım bileşenlerinin (kamera, GPU, codec) aynı fiziksel bellek bloğuna CPU kopyası olmadan erişmesini sağlar. Gömülü sistemlerde bant genişliği ve gecikme kritik avantaj sağlar.</p>
+
+  <h3>DMA-BUF mekanizması</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>DMA-BUF Akış Diyagramı</span><span class="dot">●</span></div>
+    <pre><code>Geleneksel pipeline (KOPYALI):
+  Kamera → [DMA → CPU bellek] → [CPU kopyası → encode giriş] → VPU encode
+  Bellek kopyası: 2x (1080p NV12 = 3MB × 30fps = 90MB/s kopyalama!)
+
+DMA-BUF zero-copy pipeline:
+  Kamera → [DMA-BUF fd] → VPU encode (aynı fiziksel bellek)
+  Bellek kopyası: 0
+
+Faydalar:
+  - DDR bant genişliği tasarrufu
+  - CPU meşguliyeti azalma
+  - Gecikme düşüşü (1-5ms)
+  - Güç tüketimi azalma</code></pre>
+  </div>
+
+  <h3>V4L2 → DMA-BUF → encode</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — zero-copy pipeline</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># io-mode=4 (DMABUF) ile kamera → encoder zero-copy</span>
+gst-launch-1.0 \
+  v4l2src device=/dev/video0 io-mode=dmabuf ! \
+  video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 ! \
+  v4l2h264enc \
+    capture-io-mode=dmabuf-import \
+    extra-controls="controls,h264_profile=4" ! \
+  h264parse ! filesink location=zerocopy.h264
+
+<span class="cmt"># io-mode değerleri</span>
+<span class="cmt"># dmabuf         = v4l2src output DMA-BUF olarak export eder
+# dmabuf-import  = encoder input DMA-BUF import eder</span></code></pre>
+  </div>
+
+  <h3>DMA-BUF C API ile manuel yönetim</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dmabuf_pipeline.c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;gst/gst.h&gt;
+#include &lt;gst/allocators/gstdmabuf.h&gt;
+#include &lt;gst/video/gstvideometa.h&gt;
+
+/* DMA-BUF buffer'ı kontrol etmek için probe */
+static GstPadProbeReturn dmabuf_probe(GstPad *pad, GstPadProbeInfo *info,
+                                       gpointer data)
+{
+    GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER(info);
+    GstMemory *mem = gst_buffer_peek_memory(buf, 0);
+
+    if (gst_is_dmabuf_memory(mem)) {
+        gint fd = gst_dmabuf_memory_get_fd(mem);
+        gsize size = gst_memory_get_sizes(mem, NULL, NULL);
+        g_print("DMA-BUF: fd=%d, size=%zu, pts=%" GST_TIME_FORMAT "\n",
+                fd, size, GST_TIME_ARGS(GST_BUFFER_PTS(buf)));
+    } else {
+        g_print("Uyarı: Buffer DMA-BUF değil — kopya gerekecek!\n");
+    }
+    return GST_PAD_PROBE_OK;
+}
+
+int main(int argc, char *argv[])
+{
+    GstElement *pipeline, *v4l2src, *enc, *sink;
+    GstPad     *pad;
+
+    gst_init(&amp;argc, &amp;argv);
+
+    pipeline = gst_pipeline_new("zerocopy");
+    v4l2src  = gst_element_factory_make("v4l2src",      "src");
+    enc      = gst_element_factory_make("v4l2h264enc",  "enc");
+    sink     = gst_element_factory_make("filesink",     "sink");
+
+    g_object_set(v4l2src, "device", "/dev/video0",
+                          "io-mode", 4 /* DMABUF */, NULL);
+    g_object_set(sink, "location", "out.h264", NULL);
+
+    gst_bin_add_many(GST_BIN(pipeline), v4l2src, enc, sink, NULL);
+
+    /* Caps filter: NV12 formatı encoder için */
+    GstCaps *caps = gst_caps_from_string(
+        "video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1");
+    gst_element_link_filtered(v4l2src, enc, caps);
+    gst_caps_unref(caps);
+    gst_element_link(enc, sink);
+
+    /* v4l2src src pad'ine probe ekle — DMA-BUF kontrolü */
+    pad = gst_element_get_static_pad(v4l2src, "src");
+    gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, dmabuf_probe, NULL, NULL);
+    gst_object_unref(pad);
+
+    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+
+    GMainLoop *loop = g_main_loop_new(NULL, FALSE);
+    g_main_loop_run(loop);
+
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(pipeline);
+    return 0;
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> GstVideoInfo ve format negotiation</h2>
+  <p class="section-lead">Hardware encoder/decoder'lar belirli piksel formatlarını destekler. GstVideoInfo API ile format detaylarını sorgulamak ve caps negotiation'ı doğru yönlendirmek gerekir.</p>
+
+  <h3>Donanım formatları</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">NV12</div><div class="desc">Y plane tam çözünürlük + interleaved UV plane yarım çözünürlük. Çoğu hardware encoder'ın tercih ettiği format. Her pixel 1.5 byte.</div></div>
+    <div class="param"><div class="name">I420 (YUV420P)</div><div class="desc">Y + U + V ayrı düzlemler, UV yarım çözünürlük. Software encoder'ların tercihi. NV12'ye göre benzer boyut, farklı layout.</div></div>
+    <div class="param"><div class="name">P010 (10-bit)</div><div class="desc">NV12'nin 10-bit versiyonu. Her komponent 10-bit (2 byte). HEVC Main10 ve HDR encode için gerekli.</div></div>
+    <div class="param"><div class="name">YUYV (YUY2)</div><div class="desc">4:2:2 packed format. USB kamera çıkışı. Her pixel 2 byte. Hardware encoder öncesi dönüşüm gerekir.</div></div>
+  </div>
+
+  <h3>GstVideoInfo C API</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>video_info_example.c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;gst/video/video.h&gt;
+
+void print_video_info(GstCaps *caps)
+{
+    GstVideoInfo info;
+
+    if (!gst_video_info_from_caps(&amp;info, caps)) {
+        g_print("Caps'ten video info alınamadı.\n");
+        return;
+    }
+
+    g_print("Format    : %s\n", gst_video_format_to_string(info.finfo->format));
+    g_print("Çözünürlük: %dx%d\n", info.width, info.height);
+    g_print("FPS       : %d/%d\n", info.fps_n, info.fps_d);
+    g_print("Stride[0] : %d byte\n", info.stride[0]);
+    g_print("Offset[0] : %zu\n", info.offset[0]);
+    g_print("Toplam    : %zu byte/frame\n", info.size);
+
+    /* NV12 için Y ve UV plane ayrıntıları */
+    if (info.finfo->format == GST_VIDEO_FORMAT_NV12) {
+        g_print("Y  plane stride : %d\n", info.stride[0]);
+        g_print("UV plane stride : %d\n", info.stride[1]);
+        g_print("UV plane offset : %zu\n", info.offset[1]);
+    }
+}
+
+/* Caps negotiation için yardımcı */
+GstCaps* make_hw_caps(gint w, gint h, gint fps_n, gint fps_d)
+{
+    return gst_caps_new_simple("video/x-raw",
+        "format",    G_TYPE_STRING,  "NV12",
+        "width",     G_TYPE_INT,     w,
+        "height",    G_TYPE_INT,     h,
+        "framerate", GST_TYPE_FRACTION, fps_n, fps_d,
+        NULL);
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Benchmark metodolojisi</h2>
+  <p class="section-lead">Donanım ve yazılım encode'u karşılaştırmak için tekrarlanabilir ölçüm yöntemi gerekir. CPU kullanımı, termal performans, gerçek bitrate ve kalite metrikleri kayıt altına alınmalıdır.</p>
+
+  <h3>CPU kullanımı ölçümü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — CPU benchmark</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Yöntem 1: top ile anlık izleme</span>
+gst-launch-1.0 -e \
+  videotestsrc num-buffers=600 ! \
+  video/x-raw,format=I420,width=1920,height=1080,framerate=30/1 ! \
+  x264enc speed-preset=ultrafast ! filesink location=/dev/null &
+PID=$!
+top -b -n 20 -p $PID | grep gst-launch
+wait $PID
+
+<span class="cmt"># Yöntem 2: /usr/bin/time ile toplam CPU</span>
+/usr/bin/time -v gst-launch-1.0 \
+  videotestsrc num-buffers=300 ! \
+  videoconvert ! x264enc ! filesink location=/dev/null 2>&1 | \
+  grep "Percent of CPU"
+
+<span class="cmt"># Yöntem 3: pidstat (sysstat)</span>
+pidstat -u 1 -G gst-launch &
+PIDSTAT=$!
+gst-launch-1.0 videotestsrc num-buffers=300 ! \
+  videoconvert ! x264enc speed-preset=ultrafast ! filesink location=/dev/null
+kill $PIDSTAT</code></pre>
+  </div>
+
+  <h3>Termal izleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — thermal monitoring</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm thermal zone sıcaklıkları</span>
+watch -n 0.5 'for f in /sys/class/thermal/thermal_zone*/temp; do
+  zone=$(basename $(dirname $f))
+  type=$(cat $(dirname $f)/type)
+  temp=$(cat $f)
+  printf "%-20s: %d.%d°C\n" "$type" "$((temp/1000))" "$((temp%1000/100))"
+done'
+
+<span class="cmt"># Frekans kısıtlaması izle (i.MX8)</span>
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq
+
+<span class="cmt"># Encode sırasında sıcaklık logu al</span>
+(while true; do
+  date +%s
+  cat /sys/class/thermal/thermal_zone0/temp
+  sleep 1
+done) > /tmp/temp_log.txt &
+TEMP_PID=$!
+gst-launch-1.0 -e videotestsrc num-buffers=1800 ! \
+  videoconvert ! x264enc ! filesink location=/dev/null
+kill $TEMP_PID</code></pre>
+  </div>
+
+  <h3>PSNR/SSIM kalite ölçümü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — kalite metrikleri</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Orijinal ve encode edilmiş video PSNR karşılaştırması</span>
+ffmpeg -i original.yuv -i encoded.h264 \
+  -lavfi psnr=psnr.log -f null /dev/null 2>&1 | grep PSNR
+
+<span class="cmt"># GStreamer ile PSNR (ssim element)</span>
+gst-launch-1.0 \
+  filesrc location=original.y4m ! y4mdec ! tee name=t \
+  t. ! queue ! identity name=ref ! fakesink \
+  t. ! queue ! x264enc bitrate=2000 ! avdec_h264 ! \
+     videomixer name=mix ! \
+     fakesink \
+  ref. ! mix.</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: i.MX8MP üzerinde 1080p@30 H.264 encode CPU karşılaştırma</h2>
+  <p class="section-lead">NXP i.MX8M Plus üzerinde yazılım (x264enc) ve donanım (v4l2h264enc VPU) encode'u karşılaştıran kapsamlı benchmark senaryosu.</p>
+
+  <h3>Test ortamı</h3>
+
+  <div class="file-table">
+    <div class="file-row header"><div>Parametre</div><div>Değer</div></div>
+    <div class="file-row"><div>Platform</div><div>NXP i.MX8M Plus EVK</div></div>
+    <div class="file-row"><div>CPU</div><div>Cortex-A53 @ 1.8GHz (4 core)</div></div>
+    <div class="file-row"><div>VPU</div><div>Hantro G1/H1 (H.264/H.265)</div></div>
+    <div class="file-row"><div>OS</div><div>Yocto kirkstone, kernel 5.15</div></div>
+    <div class="file-row"><div>Test sinyal</div><div>videotestsrc 1920x1080@30fps NV12</div></div>
+    <div class="file-row"><div>Süre</div><div>60 saniye (1800 frame)</div></div>
+  </div>
+
+  <h3>Benchmark script'i</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bench_encode.sh</span><span class="dot">●</span></div>
+    <pre><code>#!/bin/bash
+# i.MX8MP encode benchmark
+
+LOG=/tmp/bench_result.txt
+echo "i.MX8MP Encode Benchmark $(date)" > $LOG
+
+run_bench() {
+    local name="$1"
+    local pipeline="$2"
+    local frames=1800
+
+    echo "--- $name ---" | tee -a $LOG
+
+    # CPU sıcaklığı başlangıç
+    TEMP_START=$(cat /sys/class/thermal/thermal_zone0/temp)
+
+    # Encode + zaman + CPU ölçümü
+    START_TIME=$(date +%s%N)
+    /usr/bin/time -f "CPU: %P, MaxRSS: %M kB" \
+        gst-launch-1.0 -q \
+          videotestsrc num-buffers=$frames is-live=false ! \
+          "video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1" ! \
+          $pipeline filesink location=/dev/null 2>> $LOG
+    END_TIME=$(date +%s%N)
+
+    # Süre hesapla
+    DURATION=$(( (END_TIME - START_TIME) / 1000000 ))
+    FPS=$(echo "scale=1; $frames * 1000 / $DURATION" | bc)
+
+    TEMP_END=$(cat /sys/class/thermal/thermal_zone0/temp)
+
+    echo "  Süre   : ${DURATION}ms" | tee -a $LOG
+    echo "  FPS    : ${FPS}" | tee -a $LOG
+    echo "  Temp   : $((TEMP_START/1000))°C → $((TEMP_END/1000))°C" | tee -a $LOG
+    echo "" | tee -a $LOG
+}
+
+# Test 1: Yazılım encode (x264enc ultrafast)
+run_bench "Software x264enc (ultrafast)" \
+    "x264enc speed-preset=ultrafast tune=zerolatency bitrate=4000 ! h264parse !"
+
+# Test 2: Yazılım encode (x264enc fast)
+run_bench "Software x264enc (fast)" \
+    "x264enc speed-preset=fast bitrate=4000 ! h264parse !"
+
+# Test 3: Donanım encode (v4l2h264enc)
+run_bench "Hardware v4l2h264enc" \
+    "v4l2h264enc extra-controls=controls,h264_profile=4 ! h264parse !"
+
+echo "Benchmark tamamlandı. Sonuçlar: $LOG"</code></pre>
+  </div>
+
+  <h3>Beklenen sonuçlar</h3>
+
+  <div class="file-table">
+    <div class="file-row header"><div>Encoder</div><div>FPS</div><div>CPU Kullanımı</div><div>Sıcaklık Artışı</div></div>
+    <div class="file-row"><div>x264enc ultrafast</div><div>28-32</div><div>~92%</div><div>+25°C</div></div>
+    <div class="file-row"><div>x264enc fast</div><div>15-20</div><div>~98%</div><div>+35°C</div></div>
+    <div class="file-row"><div>v4l2h264enc (VPU)</div><div>30+ (gerçek zamanlı)</div><div>~4-6%</div><div>+3°C</div></div>
+  </div>
+
+  <div class="callout">
+    <div class="label">SONUÇ</div>
+    <p>i.MX8MP VPU, 1080p@30 encode'u CPU'nun sadece %5'ini kullanarak gerçek zamanlı gerçekleştirir. Yazılım encode ise sınırı zorlar ve termal kısıtlamayla gerçek zamanlılık kaybedilir. Üretim sistemlerinde donanım encoder zorunlu, yazılım encoder sadece yedek veya kalite test amaçlı kullanılmalıdır.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

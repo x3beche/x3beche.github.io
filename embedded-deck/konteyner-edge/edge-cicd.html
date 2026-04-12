@@ -1,0 +1,696 @@
+---
+layout: tutorial
+title: "Edge CI/CD — GitHub Actions Multi-Arch & ARM Runner"
+back_url: "../index.html"
+back_label: "Konteyner Orkestrasyon (Edge)"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>KONTEYNER</span>
+    <span>EDGE CI/CD</span>
+    <span>2026</span>
+  </div>
+  <h1>Edge CI/CD —<br><em>GitHub Actions Multi-Arch &amp; ARM Runner.</em></h1>
+  <p class="subtitle">ARM/RISC-V edge cihazlar için eksiksiz CI/CD boru hattı: Docker buildx ile çok mimari image derleme, QEMU emülasyonu, self-hosted ARM64 runner kurulumu, OCI registry push, Cosign imzalama ve OTA dağıtım iş akışı.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Edge CI/CD boru hattı mimarisi</a></li>
+    <li><a href="#s1">Docker buildx ile multi-arch build</a></li>
+    <li><a href="#s2">QEMU emülasyonu — ARM64/ARMv7 x86'da derleme</a></li>
+    <li><a href="#s3">Self-hosted ARM64 runner kurulumu</a></li>
+    <li><a href="#s4">GitHub Actions workflow — multi-arch build</a></li>
+    <li><a href="#s5">OCI registry push ve image tagging stratejisi</a></li>
+    <li><a href="#s6">Cosign imzalama ile güvenli pipeline</a></li>
+    <li><a href="#s7">OTA (Over-the-Air) dağıtım iş akışı</a></li>
+    <li><a href="#s8">Dağıtım doğrulama ve rollback</a></li>
+    <li><a href="#s9">Maliyet optimizasyonu ve paralel build stratejileri</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Edge CI/CD boru hattı mimarisi</h2>
+  <p class="section-lead">Edge sistemler için CI/CD, klasik web uygulamalarından farklıdır: çoklu CPU mimarileri (AMD64, ARM64, ARMv7, RISC-V), kısıtlı bant genişliği, bağlantısız dönemler ve atomik güncelleme gereksinimleri söz konusudur.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>Tam Edge CI/CD Boru Hattı</span><span class="dot">●</span></div>
+    <pre><code">Geliştirici (git push)
+       │
+       ▼
+GitHub Actions (CI)
+  ├── Trivy secret scan
+  ├── Unit / integration testleri
+  ├── docker buildx (multi-arch: amd64, arm64, armv7)
+  │     ├── QEMU emülasyon (hızlı prototip)
+  │     └── Native ARM64 runner (üretim hızı)
+  ├── Trivy image CVE tarama
+  ├── Cosign image imzalama
+  └── OCI registry push (GHCR / Harbor / ECR)
+       │
+       ▼
+Registry (imzalı multi-arch manifest)
+       │
+       ▼
+OTA Dağıtım (Moshi / RAUC / SWUpdate / Flux CD)
+  ├── Edge fleet manager → hedef cihaz grupları
+  ├── Kademeli yayın (canary → %5 → %25 → %100)
+  ├── Sağlık kontrolü → başarısızsa rollback
+  └── Dağıtım doğrulama (smoke test)</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Docker buildx ile multi-arch build</h2>
+  <p class="section-lead">Docker buildx, BuildKit üzerine inşa edilmiş ve çoklu mimari image derlemeyi destekleyen build aracıdır. Tek komutla amd64, arm64, armv7 image'ları üretir ve tek OCI manifest altında yayınlar.</p>
+
+  <h3>buildx kurulum ve builder oluşturma</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code">## buildx versiyonunu kontrol et
+docker buildx version
+# github.com/docker/buildx v0.17.1
+
+## Multi-platform builder oluştur
+docker buildx create \
+    --name multiarch-builder \
+    --driver docker-container \
+    --platform linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v6 \
+    --use
+
+## Builder'ı başlat ve bootstrap et
+docker buildx inspect --bootstrap multiarch-builder
+
+## Desteklenen platformlar
+docker buildx ls
+# NAME/NODE              DRIVER/ENDPOINT  STATUS   PLATFORMS
+# multiarch-builder *    docker-container running
+#   multiarch-builder0   unix:///var/...  running  linux/amd64,
+#                                                  linux/arm64,
+#                                                  linux/arm/v7</code></pre>
+  </div>
+
+  <h3>Multi-arch image derleme ve push</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — tek komutla çoklu mimari</span><span class="dot">●</span></div>
+    <pre><code">## Tüm mimarileri derle ve registry'e push et
+docker buildx build \
+    --platform linux/amd64,linux/arm64,linux/arm/v7 \
+    --tag ghcr.io/org/edge-app:v1.2.3 \
+    --tag ghcr.io/org/edge-app:latest \
+    --push \
+    .
+
+## Manifest listesini doğrula
+docker buildx imagetools inspect ghcr.io/org/edge-app:v1.2.3
+# Name: ghcr.io/org/edge-app:v1.2.3
+# MediaType: application/vnd.oci.image.index.v1+json
+# Digest: sha256:abc123...
+#
+# Manifests:
+#   Name: ghcr.io/org/edge-app:v1.2.3@sha256:aaa...
+#   MediaType: application/vnd.oci.image.manifest.v1+json
+#   Platform: linux/amd64
+#
+#   Name: ghcr.io/org/edge-app:v1.2.3@sha256:bbb...
+#   Platform: linux/arm64
+#
+#   Name: ghcr.io/org/edge-app:v1.2.3@sha256:ccc...
+#   Platform: linux/arm/v7</code></pre>
+  </div>
+
+  <h3>Platform-aware Dockerfile</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Dockerfile — TARGETPLATFORM kullanımı</span><span class="dot">●</span></div>
+    <pre><code">## buildx otomatik TARGETPLATFORM, TARGETARCH, TARGETOS değişkenlerini sağlar
+FROM --platform=$BUILDPLATFORM golang:1.22 AS builder
+ARG TARGETPLATFORM
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /app
+COPY . .
+RUN GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    CGO_ENABLED=0 \
+    go build -ldflags="-s -w" -o /edge-app ./cmd/
+
+FROM gcr.io/distroless/static:nonroot
+COPY --from=builder /edge-app /edge-app
+ENTRYPOINT ["/edge-app"]</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> QEMU emülasyonu — ARM64/ARMv7 x86'da derleme</h2>
+  <p class="section-lead">QEMU user-space emülasyonu, x86 runner üzerinde ARM binary'lerini çalıştırır. Yerel derlemeye göre 5–20× yavaştır; yalnızca hızlı prototipleme veya küçük image'lar için uygundur.</p>
+
+  <h3>QEMU kurulum ve test</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code">## QEMU statik binary'lerini Docker daemon'a kaydet
+docker run --privileged --rm \
+    tonistiigi/binfmt --install all
+
+## Kayıtlı emülatörler
+ls /proc/sys/fs/binfmt_misc/ | grep qemu
+# qemu-aarch64
+# qemu-arm
+# qemu-riscv64
+
+## ARM64 image'ı doğrudan çalıştır (x86 makine)
+docker run --platform linux/arm64 --rm \
+    arm64v8/alpine:3.20 uname -m
+# aarch64   ← QEMU sayesinde x86'da ARM64 çalıştı
+
+## Derleme hızı karşılaştırması (basit Go projesi)
+# QEMU (x86 → arm64):    ~45 saniye
+# Native ARM64 runner:    ~8 saniye
+# Çapraz derleme (CGO=0): ~6 saniye</code></pre>
+  </div>
+
+  <h3>CGO ile çapraz derleme (QEMU gerektirmez)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Dockerfile — çapraz derleme (hızlı)</span><span class="dot">●</span></div>
+    <pre><code">## CGO_ENABLED=0: QEMU emülasyonu gerektirmez
+FROM --platform=linux/amd64 golang:1.22 AS builder
+ARG TARGETARCH
+RUN apt-get update && apt-get install -y \
+    gcc-aarch64-linux-gnu  # CGO kullanan paketler için
+
+ENV CGO_ENABLED=0
+ENV GOOS=linux
+ENV GOARCH=$TARGETARCH
+
+WORKDIR /app
+COPY . .
+RUN go build -o /app/edge-app ./cmd/
+
+FROM --platform=$TARGETPLATFORM gcr.io/distroless/static:nonroot
+COPY --from=builder /app/edge-app /edge-app
+ENTRYPOINT ["/edge-app"]</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Self-hosted ARM64 runner kurulumu</h2>
+  <p class="section-lead">Yerel ARM64 runner, QEMU emülasyonuna kıyasla 5–10× daha hızlı derleme sağlar. Raspberry Pi 5, Jetson Orin veya AWS Graviton instance kullanılabilir.</p>
+
+  <h3>GitHub Actions runner kurulumu</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — Raspberry Pi 5 (ARM64)</span><span class="dot">●</span></div>
+    <pre><code">## GitHub → Repository → Settings → Actions → Runners → New self-hosted runner
+
+## Runner indirme (ARM64)
+mkdir -p ~/actions-runner && cd ~/actions-runner
+
+curl -o actions-runner-linux-arm64-2.319.1.tar.gz -L \
+  https://github.com/actions/runner/releases/download/v2.319.1/\
+actions-runner-linux-arm64-2.319.1.tar.gz
+
+tar xzf actions-runner-linux-arm64-2.319.1.tar.gz
+
+## Yapılandırma (GitHub'dan token al)
+./config.sh \
+    --url https://github.com/org/repo \
+    --token AABBC1234XXXXX \
+    --name "rpi5-arm64-runner" \
+    --labels "self-hosted,linux,ARM64,edge" \
+    --work "_work"
+
+## Servis olarak kur (systemd)
+sudo ./svc.sh install
+sudo ./svc.sh start
+sudo systemctl status actions.runner.org-repo.rpi5-arm64-runner</code></pre>
+  </div>
+
+  <h3>Runner önbellekleme optimizasyonu</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — Docker layer cache</span><span class="dot">●</span></div>
+    <pre><code">## Self-hosted runner'da BuildKit cache mount
+docker buildx create \
+    --name arm64-builder \
+    --driver docker-container \
+    --driver-opt image=moby/buildkit:latest \
+    --use
+
+## Cache mount ile Dockerfile
+# RUN --mount=type=cache,target=/root/.cache/go-build \
+#     go build ./...
+
+## GitHub Actions cache backend
+docker buildx build \
+    --cache-from type=gha \
+    --cache-to type=gha,mode=max \
+    --platform linux/arm64 \
+    -t ghcr.io/org/app:latest \
+    --push \
+    .</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> GitHub Actions workflow — multi-arch build</h2>
+  <p class="section-lead">Eksiksiz bir multi-arch build ve deploy workflow'u: QEMU emülasyonu, native ARM64 runner, Trivy tarama ve Cosign imzalamayı tek pipeline'da birleştirme.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>.github/workflows/edge-build.yml</span><span class="dot">●</span></div>
+    <pre><code">name: Edge Multi-Arch Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: &#36;&#123;&#123; github.repository &#125;&#125;
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Secret tarama
+      uses: trufflesecurity/trufflehog@main
+      with:
+        path: ./
+
+  build-and-push:
+    needs: security-scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # Cosign keyless için
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Docker meta (tag hesapla)
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: &#36;&#123;&#123; env.REGISTRY &#125;&#125;/&#36;&#123;&#123; env.IMAGE_NAME &#125;&#125;
+        tags: |
+          type=semver,pattern=&#123;&#123;version&#125;&#125;
+          type=semver,pattern=&#123;&#123;major&#125;&#125;.&#123;&#123;minor&#125;&#125;
+          type=sha,prefix=git-
+          type=raw,value=latest,enable=&#36;&#123;&#123; github.ref == 'refs/heads/main' &#125;&#125;
+
+    - name: QEMU kurulum
+      uses: docker/setup-qemu-action@v3
+      with:
+        platforms: arm64,arm
+
+    - name: Docker Buildx kurulum
+      uses: docker/setup-buildx-action@v3
+      with:
+        driver-opts: image=moby/buildkit:latest
+
+    - name: GHCR login
+      uses: docker/login-action@v3
+      with:
+        registry: &#36;&#123;&#123; env.REGISTRY &#125;&#125;
+        username: &#36;&#123;&#123; github.actor &#125;&#125;
+        password: &#36;&#123;&#123; secrets.GITHUB_TOKEN &#125;&#125;
+
+    - name: Multi-arch build ve push
+      id: build
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64,linux/arm/v7
+        tags: &#36;&#123;&#123; steps.meta.outputs.tags &#125;&#125;
+        labels: &#36;&#123;&#123; steps.meta.outputs.labels &#125;&#125;
+        push: &#36;&#123;&#123; github.event_name != 'pull_request' &#125;&#125;
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        sbom: true     # SBOM oluştur
+        provenance: true  # SLSA provenance
+
+    - name: Trivy CVE tarama
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: &#36;&#123;&#123; env.REGISTRY &#125;&#125;/&#36;&#123;&#123; env.IMAGE_NAME &#125;&#125;:latest
+        severity: CRITICAL,HIGH
+        exit-code: 1
+        ignore-unfixed: true
+
+    - name: Cosign kurulum
+      uses: sigstore/cosign-installer@v3
+
+    - name: Cosign keyless imzalama
+      if: github.event_name != 'pull_request'
+      run: |
+        cosign sign --yes \
+          &#36;&#123;&#123; env.REGISTRY &#125;&#125;/&#36;&#123;&#123; env.IMAGE_NAME &#125;&#125;@&#36;&#123;&#123; steps.build.outputs.digest &#125;&#125;</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> OCI registry push ve image tagging stratejisi</h2>
+  <p class="section-lead">Doğru image tagging stratejisi, hangi sürümün nerede çalıştığını izlemeyi ve güvenli rollback'i kolaylaştırır. Semantik sürümleme + git SHA kombinasyonu önerilir.</p>
+
+  <h3>Tagging stratejisi</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Tag Stratejisi</span><span class="dot">●</span></div>
+    <pre><code">Tag türü         Örnek                     Kullanım
+─────────────────────────────────────────────────────────────────
+SemVer           :v1.2.3                   Üretim release
+SemVer major     :v1                       Major stable
+SemVer minor     :v1.2                     Minor stable
+Git SHA          :git-a1b2c3d              Debug, izlenebilirlik
+Branch           :main, :develop           CI test sürümü
+latest           :latest                   Son main build
+edge             :edge                     Geliştirme kanalı</code></pre>
+  </div>
+
+  <h3>Harbor registry ile imzalı image yönetimi</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — Harbor + Cosign</span><span class="dot">●</span></div>
+    <pre><code">## Harbor'a imzalı image push
+docker login harbor.edge.company.com
+docker buildx build \
+    --platform linux/amd64,linux/arm64 \
+    -t harbor.edge.company.com/edge/app:v1.2.3 \
+    --push .
+
+## Cosign imzala
+cosign sign --key cosign.key \
+    harbor.edge.company.com/edge/app:v1.2.3
+
+## Harbor'da content trust doğrula
+cosign verify --key cosign.pub \
+    harbor.edge.company.com/edge/app:v1.2.3
+
+## Image silme politikası — 30 günden eski :git-* tag'lerini temizle
+harbor garbage-collect --delete-untagged</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Cosign imzalama ile güvenli pipeline</h2>
+  <p class="section-lead">Cosign'ı CI/CD pipeline'ına entegre ederek her imzalı build için doğrulanabilir kriptografik kanıt oluşturulur. SLSA provenance ve SBOM attestation ile yazılım tedarik zinciri güvence altına alınır.</p>
+
+  <h3>SBOM ve Provenance attestation</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — SBOM üretme ve imzalama</span><span class="dot">●</span></div>
+    <pre><code">## Syft ile SBOM üret
+syft ghcr.io/org/edge-app:v1.2.3 \
+    -o spdx-json > sbom.spdx.json
+
+## SBOM'u Cosign attestation olarak imzala
+cosign attest --key cosign.key \
+    --predicate sbom.spdx.json \
+    --type spdxjson \
+    ghcr.io/org/edge-app:v1.2.3
+
+## SLSA provenance (GitHub Actions ile otomatik)
+# docker/build-push-action provenance=true ayarıyla SLSA Level 2
+
+## Attestation doğrula
+cosign verify-attestation \
+    --key cosign.pub \
+    --type spdxjson \
+    ghcr.io/org/edge-app:v1.2.3 \
+    | jq '.payload | @base64d | fromjson | .predicate.packages | length'</code></pre>
+  </div>
+
+  <h3>GitHub Actions imzalama adımı</h3>
+  <div class="code-block">
+    <div class="code-header"><span>workflow kısmı</span><span class="dot">●</span></div>
+    <pre><code">    - name: Cosign keyless + SBOM attestation
+      if: startsWith(github.ref, 'refs/tags/v')
+      env:
+        DIGEST: &#36;&#123;&#123; steps.build.outputs.digest &#125;&#125;
+      run: |
+        IMAGE="&#36;&#123;&#123; env.REGISTRY &#125;&#125;/&#36;&#123;&#123; env.IMAGE_NAME &#125;&#125;"
+
+        # Image imzala
+        cosign sign --yes "${IMAGE}@${DIGEST}"
+
+        # SBOM üret ve attest
+        syft "${IMAGE}@${DIGEST}" -o spdx-json > sbom.json
+        cosign attest --yes \
+            --predicate sbom.json \
+            --type spdxjson \
+            "${IMAGE}@${DIGEST}"
+
+        echo "Image: ${IMAGE}@${DIGEST}" >> $GITHUB_STEP_SUMMARY
+        echo "Cosign imzalandı" >> $GITHUB_STEP_SUMMARY</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> OTA (Over-the-Air) dağıtım iş akışı</h2>
+  <p class="section-lead">Edge cihazlara güvenli ve güvenilir OTA dağıtım, A/B bölümleme veya konteyner güncelleme yöneticileriyle sağlanır. Fleet yönetimi için kademeli yayın (progressive rollout) kritiktir.</p>
+
+  <h3>Flux CD ile GitOps tabanlı OTA</h3>
+  <div class="code-block">
+    <div class="code-header"><span>flux — edge fleet deployment</span><span class="dot">●</span></div>
+    <pre><code">## Flux CD kurulum (edge cluster — k3s)
+flux bootstrap github \
+    --owner=org \
+    --repository=edge-fleet-config \
+    --branch=main \
+    --path=clusters/edge-site-01
+
+## HelmRelease ile kademeli güncelleme
+cat > edge-app-helmrelease.yaml &lt;&lt;'EOF'
+apiVersion: helm.toolkit.fluxcd.io/v2beta2
+kind: HelmRelease
+metadata:
+  name: edge-app
+  namespace: default
+spec:
+  interval: 1m
+  chart:
+    spec:
+      chart: edge-app
+      version: "1.2.*"
+      sourceRef:
+        kind: HelmRepository
+        name: edge-charts
+  values:
+    image:
+      repository: ghcr.io/org/edge-app
+      tag: v1.2.3
+    replicas: 1
+  upgrade:
+    remediation:
+      retries: 3
+  rollback:
+    timeout: 5m
+    cleanupOnFail: true
+EOF
+kubectl apply -f edge-app-helmrelease.yaml</code></pre>
+  </div>
+
+  <h3>Balena Cloud (konteyner tabanlı OTA)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>docker-compose.yml — balena fleet</span><span class="dot">●</span></div>
+    <pre><code">version: "2"
+services:
+  edge-app:
+    image: ghcr.io/org/edge-app:v1.2.3
+    restart: always
+    privileged: false
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - NODE_ENV=production
+    ports:
+      - "8080:8080"
+    volumes:
+      - data:/var/lib/app
+    healthcheck:
+      test: ["CMD", "/edge-app", "--health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  data:</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>GitHub Actions — Balena OTA push</span><span class="dot">●</span></div>
+    <pre><code">    - name: Balena push (OTA)
+      if: startsWith(github.ref, 'refs/tags/v')
+      env:
+        BALENA_API_KEY: &#36;&#123;&#123; secrets.BALENA_API_KEY &#125;&#125;
+      run: |
+        npm install -g balena-cli
+        balena login --token "$BALENA_API_KEY"
+        balena push edge-production-fleet</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Dağıtım doğrulama ve rollback</h2>
+  <p class="section-lead">Başarılı dağıtım, image'ın çekilmesi değil, uygulamanın istenen durumda çalışmasıdır. Smoke test, health check ve otomatik rollback pipeline'ın son katmanıdır.</p>
+
+  <h3>Kubernetes rollout ve smoke test</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — rollout takibi</span><span class="dot">●</span></div>
+    <pre><code">## Güncellemeyi izle
+kubectl set image deployment/edge-app \
+    edge-app=ghcr.io/org/edge-app:v1.2.3
+
+kubectl rollout status deployment/edge-app --timeout=5m
+# Waiting for deployment "edge-app" rollout to finish:
+# 1 out of 3 new replicas have been updated...
+# deployment "edge-app" successfully rolled out
+
+## Pod sağlık durumu
+kubectl get pods -l app=edge-app -w
+
+## Smoke test
+kubectl run smoke-test --rm -it --image=curlimages/curl \
+    --restart=Never -- \
+    curl -f http://edge-app:8080/healthz
+# {"status":"ok","version":"v1.2.3"}</code></pre>
+  </div>
+
+  <h3>Otomatik rollback — GitHub Actions</h3>
+  <div class="code-block">
+    <div class="code-header"><span>workflow — deploy ve rollback</span><span class="dot">●</span></div>
+    <pre><code">  deploy-and-verify:
+    needs: [build-and-push]
+    runs-on: ubuntu-latest
+    steps:
+    - name: Deploy
+      run: |
+        kubectl set image deployment/edge-app \
+            edge-app=ghcr.io/org/edge-app:&#36;&#123;&#123; github.sha &#125;&#125;
+        kubectl rollout status deployment/edge-app --timeout=5m
+
+    - name: Smoke test
+      run: |
+        ENDPOINT=$(kubectl get svc edge-app \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+        curl -f --retry 5 --retry-delay 3 \
+            http://${ENDPOINT}:8080/healthz
+
+    - name: Rollback on failure
+      if: failure()
+      run: |
+        echo "Dağıtım başarısız — rollback yapılıyor"
+        kubectl rollout undo deployment/edge-app
+        kubectl rollout status deployment/edge-app
+        exit 1</code></pre>
+  </div>
+
+  <h3>Kademeli yayın — Argo Rollouts</h3>
+  <div class="code-block">
+    <div class="code-header"><span>argo-rollout.yaml</span><span class="dot">●</span></div>
+    <pre><code">apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: edge-app
+spec:
+  replicas: 10
+  strategy:
+    canary:
+      steps:
+      - setWeight: 10     # %10 canary
+      - pause: {duration: 5m}
+      - analysis:
+          templates:
+          - templateName: edge-app-health
+      - setWeight: 50
+      - pause: {duration: 5m}
+      - setWeight: 100
+  selector:
+    matchLabels:
+      app: edge-app
+  template:
+    spec:
+      containers:
+      - name: edge-app
+        image: ghcr.io/org/edge-app:v1.2.3</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 09 ═══════════════════ -->
+<section id="s9">
+  <h2><span class="num">09</span> Maliyet optimizasyonu ve paralel build stratejileri</h2>
+  <p class="section-lead">Multi-arch build'ler GitHub Actions dakika tüketimini artırabilir. Akıllı paralelleştirme ve cache stratejileri hem süreyi hem maliyeti düşürür.</p>
+
+  <h3>Build süresi karşılaştırması</h3>
+  <div class="code-block">
+    <div name="code-header"><span>Süre Tablosu — Node.js Uygulaması (100MB image)</span><span class="dot">●</span></div>
+    <div class="code-header"><span>Tablo</span><span class="dot">●</span></div>
+    <pre><code">Yöntem                           amd64  arm64  armv7  Toplam
+──────────────────────────────────────────────────────────────
+QEMU emülasyon (seri)            2 dk   18 dk  22 dk   42 dk
+QEMU emülasyon (paralel matrix)  2 dk   18 dk  22 dk   22 dk
+Native ARM64 runner              2 dk    3 dk   —       5 dk
+Çapraz derleme (CGO=0)          2 dk    2 dk   2 dk    4 dk
+Cache ile çapraz derleme         30sn   30sn   30sn    90sn</code></pre>
+  </div>
+
+  <h3>Matrix strategy ile paralel build</h3>
+  <div class="code-block">
+    <div class="code-header"><span>workflow — matrix paralel build</span><span class="dot">●</span></div>
+    <pre><code">  build-matrix:
+    strategy:
+      matrix:
+        platform:
+          - linux/amd64
+          - linux/arm64
+          - linux/arm/v7
+      fail-fast: false
+    runs-on: &#36;&#123;&#123; matrix.platform == 'linux/arm64' && 'self-hosted' || 'ubuntu-latest' &#125;&#125;
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build platform image
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        platforms: &#36;&#123;&#123; matrix.platform &#125;&#125;
+        outputs: type=image,name=ghcr.io/org/app,push-by-digest=true,push=true
+        cache-from: type=gha,scope=&#36;&#123;&#123; matrix.platform &#125;&#125;
+        cache-to: type=gha,mode=max,scope=&#36;&#123;&#123; matrix.platform &#125;&#125;
+
+  merge-manifest:
+    needs: build-matrix
+    runs-on: ubuntu-latest
+    steps:
+    - name: Manifest birleştir
+      run: |
+        docker buildx imagetools create \
+            -t ghcr.io/org/app:&#36;&#123;&#123; github.sha &#125;&#125; \
+            $(docker buildx imagetools inspect ghcr.io/org/app \
+              --format '&#123;&#123;.Manifest.Digest&#125;&#125;')</code></pre>
+  </div>
+
+  <h3>Optimizasyon özeti</h3>
+  <div class="params">
+    <div class="param"><div class="name">GitHub Actions cache</div><div class="desc">type=gha cache backend ile tekrarlayan build'lerde layer yeniden kullanımı. İlk build sonrası 5–10× hızlanma.</div></div>
+    <div class="param"><div class="name">CGO=0 çapraz derleme</div><div class="desc">Go, Rust, Zig gibi diller için CGO kapatıp standart çapraz derleme kullanın. QEMU'ya gerek kalmaz.</div></div>
+    <div class="param"><div class="name">Self-hosted ARM64 runner</div><div class="desc">Raspberry Pi 5 veya AWS Graviton3 runner ile arm64 build'leri yerelde yapın. Dakika ücreti sıfır.</div></div>
+    <div class="param"><div class="name">Conditional build</div><div class="desc">PR'larda sadece amd64 derle, main/tag'lerde çoklu mimari. Geliştirme döngüsünü hızlandırır.</div></div>
+  </div>
+</section>
+
+</main>

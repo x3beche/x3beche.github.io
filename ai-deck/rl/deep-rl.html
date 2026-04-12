@@ -1,0 +1,617 @@
+---
+layout: tutorial
+title: "Deep RL — DQN, A2C, PPO"
+back_url: "../index.html"
+back_label: "Reinforcement Learning"
+---
+
+<header class="header">
+  <div class="meta">
+    <span>Rehber</span>
+    <span>Yapay Zeka</span>
+    <span>RL · Deep RL</span>
+  </div>
+  <h1>Deep RL<br><em>DQN, A2C, PPO.</em></h1>
+  <p class="subtitle">Tabular Q'dan derin ağa geçiş, replay buffer ve target network, Actor-Critic ve PPO clipping. SB3 ile LunarLander-v2 çözümü.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçerik</div>
+  <ol>
+    <li><a href="#s0">Neden Deep Q-Network?</a></li>
+    <li><a href="#s1">DQN Mimarisi</a></li>
+    <li><a href="#s2">Double DQN ve Dueling DQN</a></li>
+    <li><a href="#s3">Actor-Critic Temelleri</a></li>
+    <li><a href="#s4">A2C ve A3C</a></li>
+    <li><a href="#s5">PPO — Proximal Policy Optimization</a></li>
+    <li><a href="#s6">Stable Baselines3 ile PPO</a></li>
+    <li><a href="#s7">Hyperparameter Tuning</a></li>
+    <li><a href="#s8">WandB ile Eğitim Takibi</a></li>
+    <li><a href="#s9">Pratik: LunarLander-v2 Çözümü</a></li>
+  </ol>
+</nav>
+
+<main>
+
+  <!-- ── s0 ──────────────────────────────────────────────────── -->
+  <section id="s0">
+    <h2><span class="num">00</span> Neden Deep Q-Network?</h2>
+    <p class="section-lead">Tabular Q-learning, büyük ve sürekli state uzaylarında ölçeklenemez — sinir ağı bu problemi çözer.</p>
+
+    <p>FrozenLake gibi küçük ortamlarda Q-tablosu işe yarar. Ama Atari Pong'da state, ham piksel görüntüsüdür: 84×84×1 gri tonlamalı frame. Bu uzayda her olası state için ayrı bir tablo girişi tutmak imkansızdır — 10^{~7000} olası state sayısı. CartPole bile sürekli state uzayına sahip olduğundan discretize etmek gerekiyordu.</p>
+
+    <p>Çözüm, Q fonksiyonunu parametrik bir model — bir sinir ağı — ile yaklaştırmaktır: <code class="inline">Q(s,a; θ) ≈ Q*(s,a)</code>. Bu yaklaşım genelleşme sağlar: benzer state'lerde benzer Q değerleri üretilir. Ağ hem feature extraction hem değer tahmini yapar.</p>
+
+    <div class="callout">
+      <div class="label">YAKINSAMA SORUNU</div>
+      <p>Naif sinir ağı + Q-learning kombinasyonu genellikle ıraksar. İki temel sorun: (1) Ardışık deneyimler arasındaki yüksek korelasyon, (2) güncelleme hedefinin sürekli değişmesi. DQN bu sorunları replay buffer ve target network ile çözer.</p>
+    </div>
+  </section>
+
+  <!-- ── s1 ──────────────────────────────────────────────────── -->
+  <section id="s1">
+    <h2><span class="num">01</span> DQN Mimarisi</h2>
+    <p class="section-lead">Replay buffer veri korelasyonunu kırar; target network güncelleme hedefini sabitler.</p>
+
+    <p>Mnih ve arkadaşlarının 2015 Nature makalesinde tanımlanan DQN iki kritik yenilik içerir:</p>
+
+    <div class="params">
+      <div class="param-row">
+        <span class="param-name">Replay Buffer</span>
+        <span class="param-desc">Geçmiş deneyimler (s,a,r,s',done) bir bellek tamponunda saklanır. Eğitimde rastgele mini-batch seçilir. Bu işlem i.i.d. varsayımını sağlar ve veriden birden fazla kez öğrenilir.</span>
+      </div>
+      <div class="param-row">
+        <span class="param-name">Target Network</span>
+        <span class="param-desc">İki özdeş ağ kullanılır: online ağ (θ, sürekli güncellenir) ve target ağ (θ⁻, periyodik olarak kopyalanır). TD target, target ağ ile hesaplanır: r + γ·max Q(s';θ⁻). Bu, hedefin ani değişimini önler.</span>
+      </div>
+    </div>
+
+    <p><strong>Loss fonksiyonu:</strong></p>
+    <p><code class="inline">L(θ) = E[(r + γ·max_a Q(s',a;θ⁻) - Q(s,a;θ))²]</code></p>
+
+    <div class="code-block">
+      <div class="code-header"><span>dqn.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> torch
+<span class="keyword">import</span> torch.nn <span class="keyword">as</span> nn
+<span class="keyword">import</span> torch.optim <span class="keyword">as</span> optim
+<span class="keyword">import</span> numpy <span class="keyword">as</span> np
+<span class="keyword">from</span> collections <span class="keyword">import</span> deque
+<span class="keyword">import</span> random
+
+<span class="keyword">class</span> <span class="cmd">QNetwork</span>(nn.Module):
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, obs_dim, n_actions, hidden=<span class="str">128</span>):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>()
+        self.net = nn.<span class="cmd">Sequential</span>(
+            nn.<span class="cmd">Linear</span>(obs_dim, hidden), nn.<span class="cmd">ReLU</span>(),
+            nn.<span class="cmd">Linear</span>(hidden, hidden),  nn.<span class="cmd">ReLU</span>(),
+            nn.<span class="cmd">Linear</span>(hidden, n_actions)
+        )
+    <span class="keyword">def</span> <span class="cmd">forward</span>(self, x):
+        <span class="keyword">return</span> self.net(x)
+
+<span class="keyword">class</span> <span class="cmd">ReplayBuffer</span>:
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, capacity=<span class="str">50_000</span>):
+        self.buf = <span class="cmd">deque</span>(maxlen=capacity)
+    <span class="keyword">def</span> <span class="cmd">push</span>(self, *args):
+        self.buf.<span class="cmd">append</span>(args)
+    <span class="keyword">def</span> <span class="cmd">sample</span>(self, batch_size):
+        batch = random.<span class="cmd">sample</span>(self.buf, batch_size)
+        s,a,r,s2,d = <span class="cmd">zip</span>(*batch)
+        <span class="keyword">return</span> (torch.<span class="cmd">FloatTensor</span>(np.<span class="cmd">array</span>(s)),
+                torch.<span class="cmd">LongTensor</span>(a),
+                torch.<span class="cmd">FloatTensor</span>(r),
+                torch.<span class="cmd">FloatTensor</span>(np.<span class="cmd">array</span>(s2)),
+                torch.<span class="cmd">FloatTensor</span>(d))
+    <span class="keyword">def</span> <span class="cmd">__len__</span>(self): <span class="keyword">return</span> <span class="cmd">len</span>(self.buf)
+
+<span class="keyword">class</span> <span class="cmd">DQNAgent</span>:
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, obs_dim, n_actions, lr=<span class="str">1e-3</span>, gamma=<span class="str">0.99</span>,
+                 batch_size=<span class="str">64</span>, target_update=<span class="str">500</span>):
+        self.n_actions    = n_actions
+        self.gamma        = gamma
+        self.batch_size   = batch_size
+        self.target_update = target_update
+        self.step_count   = <span class="str">0</span>
+
+        self.online = <span class="cmd">QNetwork</span>(obs_dim, n_actions)
+        self.target = <span class="cmd">QNetwork</span>(obs_dim, n_actions)
+        self.target.<span class="cmd">load_state_dict</span>(self.online.<span class="cmd">state_dict</span>())
+        self.target.<span class="cmd">eval</span>()
+
+        self.opt    = optim.<span class="cmd">Adam</span>(self.online.<span class="cmd">parameters</span>(), lr=lr)
+        self.buffer = <span class="cmd">ReplayBuffer</span>()
+
+    <span class="keyword">def</span> <span class="cmd">act</span>(self, state, eps):
+        <span class="keyword">if</span> np.random.<span class="cmd">random</span>() &lt; eps:
+            <span class="keyword">return</span> np.random.<span class="cmd">randint</span>(self.n_actions)
+        <span class="keyword">with</span> torch.<span class="cmd">no_grad</span>():
+            q = self.online(<span class="cmd">torch.FloatTensor</span>(state).<span class="cmd">unsqueeze</span>(<span class="str">0</span>))
+        <span class="keyword">return</span> q.<span class="cmd">argmax</span>().<span class="cmd">item</span>()
+
+    <span class="keyword">def</span> <span class="cmd">update</span>(self):
+        <span class="keyword">if</span> <span class="cmd">len</span>(self.buffer) &lt; self.batch_size:
+            <span class="keyword">return</span> <span class="keyword">None</span>
+        s, a, r, s2, d = self.buffer.<span class="cmd">sample</span>(self.batch_size)
+
+        <span class="cmt"># Current Q values</span>
+        q_vals = self.online(s).<span class="cmd">gather</span>(<span class="str">1</span>, a.<span class="cmd">unsqueeze</span>(<span class="str">1</span>)).<span class="cmd">squeeze</span>()
+
+        <span class="cmt"># Target Q values (target network, no grad)</span>
+        <span class="keyword">with</span> torch.<span class="cmd">no_grad</span>():
+            next_q = self.target(s2).<span class="cmd">max</span>(<span class="str">1</span>)[<span class="str">0</span>]
+            td_target = r + self.gamma * next_q * (<span class="str">1</span> - d)
+
+        loss = nn.functional.<span class="cmd">mse_loss</span>(q_vals, td_target)
+        self.opt.<span class="cmd">zero_grad</span>(); loss.<span class="cmd">backward</span>(); self.opt.<span class="cmd">step</span>()
+
+        self.step_count += <span class="str">1</span>
+        <span class="keyword">if</span> self.step_count % self.target_update == <span class="str">0</span>:
+            self.target.<span class="cmd">load_state_dict</span>(self.online.<span class="cmd">state_dict</span>())
+
+        <span class="keyword">return</span> loss.<span class="cmd">item</span>()</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s2 ──────────────────────────────────────────────────── -->
+  <section id="s2">
+    <h2><span class="num">02</span> Double DQN ve Dueling DQN</h2>
+    <p class="section-lead">Double DQN overestimation bias'ı giderir; Dueling DQN V ve A'yı ayrı öğrenerek daha hızlı konverjans sağlar.</p>
+
+    <p><strong>Double DQN:</strong> Standart DQN'de target hesabında hem aksiyon seçimi hem değerlendirme target network ile yapılır. Bu, sistematik overestimation'a yol açar. Double DQN'de aksiyon online ağla seçilir, değerlendirme target ağla yapılır:</p>
+    <p><code class="inline">target = r + γ · Q(s', argmax_a Q(s',a;θ) ; θ⁻)</code></p>
+
+    <p><strong>Dueling DQN:</strong> Q fonksiyonunu V(s) + A(s,a) olarak ayırır. V stream state'in genel değerini, A stream her aksiyonun avantajını öğrenir. Çoğu aksiyonun önemsiz olduğu durumlarda (örn. sadece ileri gidiş) V hızla öğrenilir.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>dueling_dqn.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> torch
+<span class="keyword">import</span> torch.nn <span class="keyword">as</span> nn
+
+<span class="keyword">class</span> <span class="cmd">DuelingQNetwork</span>(nn.Module):
+    <span class="str">"""Dueling DQN: Q(s,a) = V(s) + A(s,a) - mean(A(s,·))"""</span>
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, obs_dim, n_actions, hidden=<span class="str">256</span>):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>()
+        self.feature = nn.<span class="cmd">Sequential</span>(
+            nn.<span class="cmd">Linear</span>(obs_dim, hidden), nn.<span class="cmd">ReLU</span>()
+        )
+        <span class="cmt"># Value stream: V(s)</span>
+        self.value_stream = nn.<span class="cmd">Sequential</span>(
+            nn.<span class="cmd">Linear</span>(hidden, hidden), nn.<span class="cmd">ReLU</span>(),
+            nn.<span class="cmd">Linear</span>(hidden, <span class="str">1</span>)
+        )
+        <span class="cmt"># Advantage stream: A(s,a)</span>
+        self.adv_stream = nn.<span class="cmd">Sequential</span>(
+            nn.<span class="cmd">Linear</span>(hidden, hidden), nn.<span class="cmd">ReLU</span>(),
+            nn.<span class="cmd">Linear</span>(hidden, n_actions)
+        )
+
+    <span class="keyword">def</span> <span class="cmd">forward</span>(self, x):
+        feat = self.feature(x)
+        V    = self.value_stream(feat)          <span class="cmt"># (B, 1)</span>
+        A    = self.adv_stream(feat)            <span class="cmt"># (B, n_actions)</span>
+        <span class="cmt"># Q(s,a) = V(s) + A(s,a) - mean_a A(s,a)</span>
+        Q = V + A - A.<span class="cmd">mean</span>(dim=<span class="str">1</span>, keepdim=<span class="keyword">True</span>)
+        <span class="keyword">return</span> Q
+
+<span class="cmt"># Double DQN target hesaplama</span>
+<span class="keyword">def</span> <span class="cmd">double_dqn_target</span>(online_net, target_net, s2, r, d, gamma=<span class="str">0.99</span>):
+    <span class="keyword">with</span> torch.<span class="cmd">no_grad</span>():
+        <span class="cmt"># Aksiyon seçimi: online network</span>
+        best_actions = online_net(s2).<span class="cmd">argmax</span>(dim=<span class="str">1</span>, keepdim=<span class="keyword">True</span>)
+        <span class="cmt"># Değerlendirme: target network</span>
+        next_q = target_net(s2).<span class="cmd">gather</span>(<span class="str">1</span>, best_actions).<span class="cmd">squeeze</span>()
+        target = r + gamma * next_q * (<span class="str">1</span> - d)
+    <span class="keyword">return</span> target</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s3 ──────────────────────────────────────────────────── -->
+  <section id="s3">
+    <h2><span class="num">03</span> Actor-Critic Temelleri</h2>
+    <p class="section-lead">Actor politikayı, Critic değer fonksiyonunu öğrenir — ikisi birbirini güçlendirir.</p>
+
+    <p>Policy gradient yöntemleri (REINFORCE), politikayı doğrudan optimize eder: <code class="inline">∇_θ J(θ) = E[∇_θ log π(a|s;θ) · G_t]</code>. Ama G_t (tam episodic return) yüksek variance'a sahiptir. Bir <em>baseline</em> çıkarmak variance'ı dramatik biçimde azaltır:</p>
+
+    <p><code class="inline">∇_θ J(θ) = E[∇_θ log π(a|s;θ) · (G_t - b(s))]</code></p>
+
+    <p>En iyi baseline V(s)'dir; bu durumda <code class="inline">G_t - V(s) ≈ A(s,a)</code> elde edilir. Critic, V(s)'i öğrenir ve bu tahmin advantage hesabında kullanılır. Actor, advantage ile ağırlıklandırılmış policy gradient ile güncellenir.</p>
+
+    <div class="callout">
+      <div class="label">ACTOR-CRITIC AVANTAJI</div>
+      <p>Policy gradient (REINFORCE) ile değer tabanlı (DQN) yöntemlerin en iyi yanlarını birleştirir: sürekli action space desteği, online learning ve düşük variance. Modern RL algoritmalarının büyük çoğunluğu (PPO, A3C, SAC, TD3) Actor-Critic çerçevesini kullanır.</p>
+    </div>
+
+    <div class="code-block">
+      <div class="code-header"><span>actor_critic.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> torch
+<span class="keyword">import</span> torch.nn <span class="keyword">as</span> nn
+<span class="keyword">import</span> torch.nn.functional <span class="keyword">as</span> F
+<span class="keyword">from</span> torch.distributions <span class="keyword">import</span> Categorical
+
+<span class="keyword">class</span> <span class="cmd">ActorCritic</span>(nn.Module):
+    <span class="str">"""Paylaşımlı feature extraction, ayrı actor/critic head."""</span>
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, obs_dim, n_actions, hidden=<span class="str">256</span>):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>()
+        self.shared = nn.<span class="cmd">Sequential</span>(
+            nn.<span class="cmd">Linear</span>(obs_dim, hidden), nn.<span class="cmd">Tanh</span>(),
+            nn.<span class="cmd">Linear</span>(hidden, hidden),  nn.<span class="cmd">Tanh</span>()
+        )
+        self.actor  = nn.<span class="cmd">Linear</span>(hidden, n_actions)   <span class="cmt"># logits</span>
+        self.critic = nn.<span class="cmd">Linear</span>(hidden, <span class="str">1</span>)           <span class="cmt"># V(s)</span>
+
+    <span class="keyword">def</span> <span class="cmd">forward</span>(self, x):
+        feat   = self.shared(x)
+        logits = self.actor(feat)
+        value  = self.critic(feat).<span class="cmd">squeeze</span>(-<span class="str">1</span>)
+        dist   = <span class="cmd">Categorical</span>(<span class="cmd">logits</span>=logits)
+        <span class="keyword">return</span> dist, value
+
+    <span class="keyword">def</span> <span class="cmd">get_action</span>(self, state):
+        state = torch.<span class="cmd">FloatTensor</span>(state).<span class="cmd">unsqueeze</span>(<span class="str">0</span>)
+        dist, value = self.<span class="cmd">forward</span>(state)
+        action = dist.<span class="cmd">sample</span>()
+        log_prob = dist.<span class="cmd">log_prob</span>(action)
+        <span class="keyword">return</span> action.<span class="cmd">item</span>(), log_prob, value</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s4 ──────────────────────────────────────────────────── -->
+  <section id="s4">
+    <h2><span class="num">04</span> A2C ve A3C</h2>
+    <p class="section-lead">A3C birden fazla worker ile asenkron öğrenir; A2C senkron versiyonudur ve pratikte daha kararlıdır.</p>
+
+    <p><strong>A3C (Asynchronous Advantage Actor-Critic):</strong> DeepMind'ın 2016 tarihli algoritması. Birden fazla worker (genellikle CPU thread) paralel ortamlarda bağımsız deneyim toplar ve gradyanları merkezi ağa asenkron olarak gönderir. GPU gerektirmez — CPU paralelizmi kullanır.</p>
+
+    <p><strong>A2C (Synchronous A3C):</strong> Tüm worker'lar bir adım sonra senkronize olur ve gradyanlar toplu güncellenir. Daha kararlıdır ve GPU kullanımını optimize eder. OpenAI tarafından A3C'nin pratikte daha iyi performans verdiği gösterilmiştir.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>a2c_update.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> torch
+<span class="keyword">import</span> torch.nn.functional <span class="keyword">as</span> F
+
+<span class="keyword">def</span> <span class="cmd">a2c_loss</span>(log_probs, values, rewards, dones,
+             gamma=<span class="str">0.99</span>, entropy_coef=<span class="str">0.01</span>, value_coef=<span class="str">0.5</span>):
+    <span class="str">"""
+    A2C güncelleme adımı.
+    log_probs : (T,)  alınan aksiyonların log olasılıkları
+    values    : (T,)  critic tahminleri V(s_t)
+    rewards   : (T,)  ortamdan alınan ödüller
+    dones     : (T,)  episode bitiş bayrakları
+    """</span>
+    T = <span class="cmd">len</span>(rewards)
+
+    <span class="cmt"># Discounted returns hesapla (son state'ten geriye)</span>
+    returns = []
+    G = <span class="str">0</span>
+    <span class="keyword">for</span> r, d <span class="keyword">in</span> <span class="cmd">zip</span>(<span class="cmd">reversed</span>(rewards), <span class="cmd">reversed</span>(dones)):
+        G = r + gamma * G * (<span class="str">1</span> - d)
+        returns.<span class="cmd">insert</span>(<span class="str">0</span>, G)
+    returns = torch.<span class="cmd">FloatTensor</span>(returns)
+
+    <span class="cmt"># Advantage = return - baseline (normalize edilmiş)</span>
+    advantages = returns - values.<span class="cmd">detach</span>()
+    advantages = (advantages - advantages.<span class="cmd">mean</span>()) / (advantages.<span class="cmd">std</span>() + <span class="str">1e-8</span>)
+
+    <span class="cmt"># Policy loss (actor)</span>
+    policy_loss = -(log_probs * advantages).<span class="cmd">mean</span>()
+
+    <span class="cmt"># Value loss (critic)</span>
+    value_loss = F.<span class="cmd">mse_loss</span>(values, returns)
+
+    <span class="cmt"># Entropy bonus (keşif teşviki)</span>
+    <span class="cmt"># (entropy ayrıca gerekirse distribution'dan hesaplanır)</span>
+
+    total_loss = policy_loss + value_coef * value_loss
+    <span class="keyword">return</span> total_loss, policy_loss.<span class="cmd">item</span>(), value_loss.<span class="cmd">item</span>()</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s5 ──────────────────────────────────────────────────── -->
+  <section id="s5">
+    <h2><span class="num">05</span> PPO — Proximal Policy Optimization</h2>
+    <p class="section-lead">PPO, policy güncellemelerini "güvenli bölge"de tutarak hem kararlılık hem performans sağlar — modern RL'in varsayılan algoritması.</p>
+
+    <p>Schulman ve arkadaşlarının 2017 makalesi, Trust Region Policy Optimization (TRPO) fikrini basitleştirir. TRPO KL divergence kısıtı kullanırken PPO, bir clipping mekanizmasıyla politikanın çok hızlı değişmesini engeller.</p>
+
+    <p><strong>Clipped Surrogate Objective:</strong></p>
+    <p><code class="inline">L^{CLIP}(θ) = E[min(r_t(θ)·Â_t, clip(r_t(θ), 1-ε, 1+ε)·Â_t)]</code></p>
+    <p>burada <code class="inline">r_t(θ) = π(a|s;θ) / π(a|s;θ_old)</code> olasılık oranıdır. ε=0.2 standart seçimdir.</p>
+
+    <p><strong>GAE (Generalized Advantage Estimation):</strong> Schulman'ın 2016 makalesi, advantage tahminini λ parametresiyle düzgünleştirir:</p>
+    <p><code class="inline">Â_t^{GAE(γ,λ)} = Σ_{l=0}^∞ (γλ)^l · δ_{t+l}</code></p>
+    <p>burada <code class="inline">δ_t = r_t + γ·V(s_{t+1}) - V(s_t)</code>.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>ppo_core.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> torch
+<span class="keyword">import</span> torch.nn.functional <span class="keyword">as</span> F
+
+<span class="keyword">def</span> <span class="cmd">compute_gae</span>(rewards, values, dones, gamma=<span class="str">0.99</span>, lam=<span class="str">0.95</span>):
+    <span class="str">"""
+    GAE (Generalized Advantage Estimation) hesapla.
+    values: (T+1,) — son state için bootstrap değeri dahil.
+    """</span>
+    advantages = []
+    gae = <span class="str">0</span>
+    <span class="keyword">for</span> t <span class="keyword">in</span> <span class="cmd">reversed</span>(<span class="cmd">range</span>(<span class="cmd">len</span>(rewards))):
+        delta  = rewards[t] + gamma * values[t+<span class="str">1</span>] * (<span class="str">1</span>-dones[t]) - values[t]
+        gae    = delta + gamma * lam * (<span class="str">1</span>-dones[t]) * gae
+        advantages.<span class="cmd">insert</span>(<span class="str">0</span>, gae)
+    advantages = torch.<span class="cmd">FloatTensor</span>(advantages)
+    returns    = advantages + torch.<span class="cmd">FloatTensor</span>(values[:-<span class="str">1</span>])
+    <span class="keyword">return</span> advantages, returns
+
+<span class="keyword">def</span> <span class="cmd">ppo_update</span>(actor_critic, optimizer, states, actions, old_log_probs,
+               advantages, returns, clip_eps=<span class="str">0.2</span>, value_coef=<span class="str">0.5</span>,
+               entropy_coef=<span class="str">0.01</span>, n_epochs=<span class="str">10</span>, minibatch_size=<span class="str">64</span>):
+    <span class="str">"""PPO güncelleme — n_epochs kez minibatch üzerinde."""</span>
+    dataset_size = states.<span class="cmd">shape</span>[<span class="str">0</span>]
+    advantages = (advantages - advantages.<span class="cmd">mean</span>()) / (advantages.<span class="cmd">std</span>() + <span class="str">1e-8</span>)
+
+    total_loss_log = []
+    <span class="keyword">for</span> _ <span class="keyword">in</span> <span class="cmd">range</span>(n_epochs):
+        idx = torch.<span class="cmd">randperm</span>(dataset_size)
+        <span class="keyword">for</span> start <span class="keyword">in</span> <span class="cmd">range</span>(<span class="str">0</span>, dataset_size, minibatch_size):
+            mb_idx = idx[start:start+minibatch_size]
+            mb_s   = states[mb_idx]
+            mb_a   = actions[mb_idx]
+            mb_adv = advantages[mb_idx]
+            mb_ret = returns[mb_idx]
+            mb_lp  = old_log_probs[mb_idx]
+
+            dist, values = actor_critic(mb_s)
+            new_log_probs = dist.<span class="cmd">log_prob</span>(mb_a)
+            entropy       = dist.<span class="cmd">entropy</span>().<span class="cmd">mean</span>()
+
+            <span class="cmt"># Clipped surrogate loss</span>
+            ratio        = (new_log_probs - mb_lp).<span class="cmd">exp</span>()
+            surr1        = ratio * mb_adv
+            surr2        = torch.<span class="cmd">clamp</span>(ratio, <span class="str">1</span>-clip_eps, <span class="str">1</span>+clip_eps) * mb_adv
+            policy_loss  = -torch.<span class="cmd">min</span>(surr1, surr2).<span class="cmd">mean</span>()
+
+            value_loss   = F.<span class="cmd">mse_loss</span>(values, mb_ret)
+
+            loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
+            optimizer.<span class="cmd">zero_grad</span>(); loss.<span class="cmd">backward</span>(); optimizer.<span class="cmd">step</span>()
+            total_loss_log.<span class="cmd">append</span>(loss.<span class="cmd">item</span>())
+
+    <span class="keyword">return</span> sum(total_loss_log) / <span class="cmd">len</span>(total_loss_log)</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s6 ──────────────────────────────────────────────────── -->
+  <section id="s6">
+    <h2><span class="num">06</span> Stable Baselines3 ile PPO</h2>
+    <p class="section-lead">SB3, araştırma kalitesinde RL uygulamalarını birkaç satır kodla çalıştırmanızı sağlar.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>sb3_ppo.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">from</span> stable_baselines3 <span class="keyword">import</span> PPO
+<span class="keyword">from</span> stable_baselines3.common.env_util <span class="keyword">import</span> make_vec_env
+<span class="keyword">from</span> stable_baselines3.common.callbacks <span class="keyword">import</span> EvalCallback
+<span class="keyword">from</span> stable_baselines3.common.monitor <span class="keyword">import</span> Monitor
+<span class="keyword">import</span> gymnasium <span class="keyword">as</span> gym
+
+<span class="cmt"># Vektörel ortam: 8 paralel env</span>
+vec_env = <span class="cmd">make_vec_env</span>(<span class="str">"CartPole-v1"</span>, n_envs=<span class="str">8</span>)
+
+<span class="cmt"># PPO modeli tanımla</span>
+model = <span class="cmd">PPO</span>(
+    policy       = <span class="str">"MlpPolicy"</span>,
+    env          = vec_env,
+    learning_rate = <span class="str">3e-4</span>,
+    n_steps      = <span class="str">2048</span>,     <span class="cmt"># rollout uzunluğu</span>
+    batch_size   = <span class="str">64</span>,
+    n_epochs     = <span class="str">10</span>,
+    gamma        = <span class="str">0.99</span>,
+    gae_lambda   = <span class="str">0.95</span>,
+    clip_range   = <span class="str">0.2</span>,
+    ent_coef     = <span class="str">0.0</span>,
+    vf_coef      = <span class="str">0.5</span>,
+    max_grad_norm = <span class="str">0.5</span>,
+    verbose      = <span class="str">1</span>,
+    tensorboard_log = <span class="str">"./ppo_cartpole_tb/"</span>
+)
+
+<span class="cmt"># Değerlendirme callback</span>
+eval_env = <span class="cmd">Monitor</span>(gym.<span class="cmd">make</span>(<span class="str">"CartPole-v1"</span>))
+eval_cb  = <span class="cmd">EvalCallback</span>(eval_env,
+                         best_model_save_path=<span class="str">"./best_model/"</span>,
+                         eval_freq=<span class="str">5000</span>, n_eval_episodes=<span class="str">20</span>,
+                         verbose=<span class="str">1</span>)
+
+<span class="cmt"># Eğit</span>
+model.<span class="cmd">learn</span>(total_timesteps=<span class="str">300_000</span>, callback=eval_cb)
+model.<span class="cmd">save</span>(<span class="str">"ppo_cartpole_final"</span>)
+
+<span class="cmt"># Değerlendirme</span>
+<span class="keyword">from</span> stable_baselines3.common.evaluation <span class="keyword">import</span> evaluate_policy
+mean_r, std_r = <span class="cmd">evaluate_policy</span>(model, eval_env, n_eval_episodes=<span class="str">100</span>)
+<span class="cmd">print</span>(<span class="str">f"Ortalama ödül: {mean_r:.1f} ± {std_r:.1f}"</span>)</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s7 ──────────────────────────────────────────────────── -->
+  <section id="s7">
+    <h2><span class="num">07</span> Hyperparameter Tuning</h2>
+    <p class="section-lead">PPO'nun performansı hyperparameter seçimine çok duyarlıdır — sistematik arama kritiktir.</p>
+
+    <div class="params">
+      <div class="param-row">
+        <span class="param-name">learning_rate</span>
+        <span class="param-desc">Genellikle 1e-4 ile 3e-4 arası. Ortam karmaşıklığıyla ters orantılı. Cosine veya linear schedule kullanmak performansı artırır.</span>
+      </div>
+      <div class="param-row">
+        <span class="param-name">n_steps</span>
+        <span class="param-desc">Rollout uzunluğu. Kısa episode'lar için küçük (128-512), uzun episode'lar için büyük (2048-4096). n_envs × n_steps = toplam batch.</span>
+      </div>
+      <div class="param-row">
+        <span class="param-name">clip_range</span>
+        <span class="param-desc">PPO clipping parametresi ε. Standart 0.2. Çok büyük → kararsız; çok küçük → çok yavaş öğrenme. Linear schedule (0.2→0) sıkça kullanılır.</span>
+      </div>
+      <div class="param-row">
+        <span class="param-name">gae_lambda</span>
+        <span class="param-desc">GAE λ. 0.9-0.99 arası. Yüksek → daha düşük bias, yüksek variance. Düşük → daha yüksek bias, düşük variance.</span>
+      </div>
+      <div class="param-row">
+        <span class="param-name">ent_coef</span>
+        <span class="param-desc">Entropy bonus katsayısı. 0.0-0.01 arası. Keşfi teşvik eder. Sparse reward ortamlarında kritik, dense reward ortamlarında çoğunlukla 0.</span>
+      </div>
+    </div>
+
+    <div class="code-block">
+      <div class="code-header"><span>optuna_sweep.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> optuna
+<span class="keyword">from</span> stable_baselines3 <span class="keyword">import</span> PPO
+<span class="keyword">from</span> stable_baselines3.common.env_util <span class="keyword">import</span> make_vec_env
+<span class="keyword">from</span> stable_baselines3.common.evaluation <span class="keyword">import</span> evaluate_policy
+<span class="keyword">import</span> gymnasium <span class="keyword">as</span> gym
+
+<span class="keyword">def</span> <span class="cmd">objective</span>(trial):
+    lr       = trial.<span class="cmd">suggest_float</span>(<span class="str">"lr"</span>, <span class="str">1e-5</span>, <span class="str">1e-3</span>, log=<span class="keyword">True</span>)
+    n_steps  = trial.<span class="cmd">suggest_categorical</span>(<span class="str">"n_steps"</span>, [<span class="str">128</span>, <span class="str">256</span>, <span class="str">512</span>, <span class="str">1024</span>])
+    clip     = trial.<span class="cmd">suggest_float</span>(<span class="str">"clip"</span>, <span class="str">0.1</span>, <span class="str">0.4</span>)
+    gae_lam  = trial.<span class="cmd">suggest_float</span>(<span class="str">"gae_lambda"</span>, <span class="str">0.9</span>, <span class="str">0.99</span>)
+
+    vec_env = <span class="cmd">make_vec_env</span>(<span class="str">"LunarLander-v2"</span>, n_envs=<span class="str">4</span>)
+    model   = <span class="cmd">PPO</span>(<span class="str">"MlpPolicy"</span>, vec_env, learning_rate=lr,
+                   n_steps=n_steps, clip_range=clip, gae_lambda=gae_lam,
+                   verbose=<span class="str">0</span>)
+    model.<span class="cmd">learn</span>(<span class="str">100_000</span>)
+
+    eval_env = gym.<span class="cmd">make</span>(<span class="str">"LunarLander-v2"</span>)
+    mean_r, _ = <span class="cmd">evaluate_policy</span>(model, eval_env, n_eval_episodes=<span class="str">20</span>)
+    <span class="keyword">return</span> mean_r
+
+study = optuna.<span class="cmd">create_study</span>(direction=<span class="str">"maximize"</span>)
+study.<span class="cmd">optimize</span>(objective, n_trials=<span class="str">30</span>)
+<span class="cmd">print</span>(<span class="str">"En iyi parametreler:"</span>, study.best_params)</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s8 ──────────────────────────────────────────────────── -->
+  <section id="s8">
+    <h2><span class="num">08</span> WandB ile Eğitim Takibi</h2>
+    <p class="section-lead">Weights &amp; Biases, deney takibini, hyperparameter loglamasını ve görselleştirmeyi otomatikleştirir.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>wandb_training.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> wandb
+<span class="keyword">from</span> stable_baselines3 <span class="keyword">import</span> PPO
+<span class="keyword">from</span> stable_baselines3.common.env_util <span class="keyword">import</span> make_vec_env
+<span class="keyword">from</span> stable_baselines3.common.callbacks <span class="keyword">import</span> BaseCallback
+
+<span class="keyword">class</span> <span class="cmd">WandbCallback</span>(BaseCallback):
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, verbose=<span class="str">0</span>):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>(verbose)
+        self.episode_rewards = []
+
+    <span class="keyword">def</span> <span class="cmd">_on_step</span>(self) -> <span class="cmd">bool</span>:
+        <span class="keyword">for</span> info <span class="keyword">in</span> self.locals.<span class="cmd">get</span>(<span class="str">'infos'</span>, []):
+            <span class="keyword">if</span> <span class="str">'episode'</span> <span class="keyword">in</span> info:
+                ep_rew = info[<span class="str">'episode'</span>][<span class="str">'r'</span>]
+                wandb.<span class="cmd">log</span>({
+                    <span class="str">'episode_reward'</span>: ep_rew,
+                    <span class="str">'timestep'</span>: self.num_timesteps
+                })
+        <span class="keyword">return</span> <span class="keyword">True</span>
+
+<span class="cmt"># WandB başlat</span>
+wandb.<span class="cmd">init</span>(
+    project = <span class="str">"lunarlander-ppo"</span>,
+    config  = {
+        <span class="str">"algorithm"</span>    : <span class="str">"PPO"</span>,
+        <span class="str">"env"</span>          : <span class="str">"LunarLander-v2"</span>,
+        <span class="str">"learning_rate"</span>: <span class="str">3e-4</span>,
+        <span class="str">"n_steps"</span>      : <span class="str">2048</span>,
+        <span class="str">"total_timesteps"</span>: <span class="str">1_000_000</span>
+    }
+)
+
+vec_env = <span class="cmd">make_vec_env</span>(<span class="str">"LunarLander-v2"</span>, n_envs=<span class="str">8</span>)
+model   = <span class="cmd">PPO</span>(<span class="str">"MlpPolicy"</span>, vec_env, learning_rate=<span class="str">3e-4</span>,
+               n_steps=<span class="str">2048</span>, verbose=<span class="str">0</span>)
+model.<span class="cmd">learn</span>(total_timesteps=<span class="str">1_000_000</span>, callback=<span class="cmd">WandbCallback</span>())
+wandb.<span class="cmd">finish</span>()</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s9 ──────────────────────────────────────────────────── -->
+  <section id="s9">
+    <h2><span class="num">09</span> Pratik: LunarLander-v2 Çözümü</h2>
+    <p class="section-lead">SB3 PPO ile LunarLander-v2'yi çöz, learning curve analizi yap ve policy'yi görselleştir.</p>
+
+    <div class="callout">
+      <div class="label">ORTAM BİLGİSİ</div>
+      <p>LunarLander-v2: 8 boyutlu state (konum, hız, açı, ayak teması), 4 ayrık aksiyon (hiçbir şey, sol itici, ana itici, sağ itici). Ortalama ödül ≥200 çözüm kabul edilir. Gravity -1.6, max steps 1000.</p>
+    </div>
+
+    <div class="code-block">
+      <div class="code-header"><span>lunarlander_solve.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> gymnasium <span class="keyword">as</span> gym
+<span class="keyword">import</span> numpy <span class="keyword">as</span> np
+<span class="keyword">import</span> matplotlib.pyplot <span class="keyword">as</span> plt
+<span class="keyword">from</span> stable_baselines3 <span class="keyword">import</span> PPO
+<span class="keyword">from</span> stable_baselines3.common.env_util <span class="keyword">import</span> make_vec_env
+<span class="keyword">from</span> stable_baselines3.common.evaluation <span class="keyword">import</span> evaluate_policy
+<span class="keyword">from</span> stable_baselines3.common.callbacks <span class="keyword">import</span> EvalCallback
+
+<span class="cmt"># Eğitim ortamı (paralel)</span>
+train_env = <span class="cmd">make_vec_env</span>(<span class="str">"LunarLander-v2"</span>, n_envs=<span class="str">8</span>, seed=<span class="str">42</span>)
+
+<span class="cmt"># Model — SB3 varsayılan PPO ayarları iyi çalışır</span>
+model = <span class="cmd">PPO</span>(
+    <span class="str">"MlpPolicy"</span>, train_env,
+    learning_rate = <span class="str">3e-4</span>,
+    n_steps       = <span class="str">1024</span>,
+    batch_size    = <span class="str">64</span>,
+    n_epochs      = <span class="str">4</span>,
+    gamma         = <span class="str">0.999</span>,
+    gae_lambda    = <span class="str">0.98</span>,
+    ent_coef      = <span class="str">0.01</span>,
+    verbose       = <span class="str">1</span>,
+    seed          = <span class="str">42</span>
+)
+
+<span class="cmt"># Eval callback ile en iyi modeli kaydet</span>
+eval_env = gym.<span class="cmd">make</span>(<span class="str">"LunarLander-v2"</span>)
+eval_cb  = <span class="cmd">EvalCallback</span>(eval_env,
+                         best_model_save_path=<span class="str">"./ll_best/"</span>,
+                         eval_freq=<span class="str">10_000</span>,
+                         n_eval_episodes=<span class="str">20</span>,
+                         verbose=<span class="str">1</span>)
+
+model.<span class="cmd">learn</span>(total_timesteps=<span class="str">1_000_000</span>, callback=eval_cb)
+
+<span class="cmt"># Son değerlendirme</span>
+mean_r, std_r = <span class="cmd">evaluate_policy</span>(model, eval_env, n_eval_episodes=<span class="str">100</span>)
+<span class="cmd">print</span>(<span class="str">f"Son performans: {mean_r:.1f} ± {std_r:.1f}"</span>)
+<span class="keyword">if</span> mean_r >= <span class="str">200</span>:
+    <span class="cmd">print</span>(<span class="str">"LunarLander-v2 ÇÖZÜLDÜ!"</span>)
+
+<span class="cmt"># Learning curve — SB3 monitor verilerini oku</span>
+<span class="keyword">from</span> stable_baselines3.common.results_plotter <span class="keyword">import</span> load_results, ts2xy
+
+<span class="cmt"># Render ile izle</span>
+render_env = gym.<span class="cmd">make</span>(<span class="str">"LunarLander-v2"</span>, render_mode=<span class="str">"human"</span>)
+obs, _ = render_env.<span class="cmd">reset</span>()
+<span class="keyword">for</span> _ <span class="keyword">in</span> <span class="cmd">range</span>(<span class="str">1000</span>):
+    action, _ = model.<span class="cmd">predict</span>(obs, deterministic=<span class="keyword">True</span>)
+    obs, _, done, trunc, _ = render_env.<span class="cmd">step</span>(action)
+    <span class="keyword">if</span> done <span class="keyword">or</span> trunc:
+        obs, _ = render_env.<span class="cmd">reset</span>()
+render_env.<span class="cmd">close</span>()</code></pre>
+    </div>
+
+    <div class="callout">
+      <div class="label">BEKLENEN SONUÇ</div>
+      <p>1M timestep sonunda ortalama ödül ~250-280 seviyesine ulaşır. Çözüm eşiği 200'dir. 8 paralel env ile ~20 dakika CPU'da, GPU kullanılmadığından süre değişmez. En iyi model genellikle 400-600k step arasında bulunur.</p>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

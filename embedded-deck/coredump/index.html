@@ -1,0 +1,735 @@
+---
+layout: tutorial
+title: "Core Dump &amp; Crash Analizi — Post-Mortem"
+back_url: "../index.html"
+back_label: "embedded-deck"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>CORE DUMP &amp; CRASH</span>
+    <span>2026</span>
+  </div>
+  <h1>Core Dump &amp; Crash Analizi<br><em>Post-Mortem.</em></h1>
+  <p class="subtitle">SIGSEGV ve ulimit ayarlarından systemd-coredump'a, cross-architecture GDB analizinden addr2line ile satır tespitine, ASAN entegrasyonundan kernel oops analizine ve Breakpad/Crashpad automated crash reporting'e kadar eksiksiz post-mortem debug rehberi.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Core dump nedir</a></li>
+    <li><a href="#s1">systemd-coredump</a></li>
+    <li><a href="#s2">Cross-architecture analiz</a></li>
+    <li><a href="#s3">GDB ile core analiz</a></li>
+    <li><a href="#s4">addr2line ve nm</a></li>
+    <li><a href="#s5">ASAN core dump</a></li>
+    <li><a href="#s6">Kernel oops/panic analiz</a></li>
+    <li><a href="#s7">Automated crash reporting</a></li>
+    <li><a href="#s8">Pratik: NULL deref + stack overflow pipeline</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Core dump nedir</h2>
+  <p class="section-lead">Core dump, bir process çöktüğünde kernel tarafından oluşturulan process belleğinin anlık görüntüsüdür. Stack, heap, register durumu ve mapped dosyaları içerir. Çökme sonrası analiz (post-mortem debugging) için temel araçtır.</p>
+
+  <h3>Çöküm sinyalleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">SIGSEGV (11)</span><span class="desc">Segmentation fault — geçersiz bellek erişimi, NULL deref, stack overflow, izinsiz bölge</span></div>
+    <div class="param"><span class="name">SIGABRT (6)</span><span class="desc">abort() çağrısı — assert() başarısız, heap corruption, double free tespit</span></div>
+    <div class="param"><span class="name">SIGBUS (7)</span><span class="desc">Bus error — hizalama hatası, geçersiz fiziksel adres erişimi, SIGBUS_MCEERR_AR</span></div>
+    <div class="param"><span class="name">SIGFPE (8)</span><span class="desc">Floating point exception — sıfıra bölme, integer overflow (bazı mimariler)</span></div>
+    <div class="param"><span class="name">SIGILL (4)</span><span class="desc">Illegal instruction — bozuk kod, yanlış ISA, stack bozulması nedeniyle PC sapması</span></div>
+  </div>
+
+  <h3>Core dump etkinleştirme</h3>
+  <pre><code class="language-bash"># Mevcut core dosya boyut limiti
+ulimit -c
+# 0  ← core dump devre dışı!
+
+# Sınırsız core dump etkinleştir (session için)
+ulimit -c unlimited
+
+# Kalıcı ayar — /etc/security/limits.conf
+echo "* soft core unlimited" >> /etc/security/limits.conf
+echo "* hard core unlimited" >> /etc/security/limits.conf
+
+# Core dosya adı ve konumu
+cat /proc/sys/kernel/core_pattern
+# core                        ← mevcut dizin
+# /tmp/core.%e.%p.%t          ← tam yol, program adı, PID, timestamp
+
+# core_pattern format dizileri:
+# %e = executable adı
+# %p = PID
+# %t = Unix timestamp
+# %s = çöküm sinyali
+# %u = UID
+# %h = hostname
+
+# systemd varsa coredump handler'a yönlendirir:
+# |/usr/lib/systemd/systemd-coredump %P %u %g %s %t %c %h</code></pre>
+
+  <h3>Core dump içeriği</h3>
+  <pre><code class="language-bash"># ELF formatındaki core dosyasını incele
+file core.1234
+# core.1234: ELF 64-bit LSB core file, x86-64
+
+# Program headers
+readelf -l core.1234 | grep -E "LOAD|NOTE"
+
+# NOTE segment'i — register, signal bilgisi
+readelf -n core.1234 | head -30</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> systemd-coredump</h2>
+  <p class="section-lead">systemd-coredump, core dump'ları otomatik olarak sıkıştırıp <code>/var/lib/systemd/coredump/</code>'a kaydeder. <code>coredumpctl</code> aracıyla listeler, inceler ve analiz araçlarına iletebilirsiniz.</p>
+
+  <h3>systemd-coredump kurulumu</h3>
+  <pre><code class="language-bash"># Debian/Ubuntu
+sudo apt install systemd-coredump
+
+# core_pattern'i kontrol et — systemd pipe olmalı
+cat /proc/sys/kernel/core_pattern
+# |/usr/lib/systemd/systemd-coredump %P %u %g %s %t %c %h %e
+
+# Konfigürasyon
+cat /etc/systemd/coredump.conf
+# [Coredump]
+# Storage=external        # /var/lib/systemd/coredump/'a kaydet
+# Compress=yes            # zstd ile sıkıştır
+# ProcessSizeMax=2G       # maksimum işlenecek boyut
+# ExternalSizeMax=2G      # harici dosya maksimumu
+# JournalSizeMax=767M     # journal'a yazılacak maksimum</code></pre>
+
+  <h3>coredumpctl komutları</h3>
+  <pre><code class="language-bash"># Tüm core dump'ları listele
+coredumpctl list
+# TIME                            PID  UID  GID SIG     COREFILE EXE
+# Sat 2026-01-15 14:23:11 UTC    1234 1000 1000 SIGSEGV present  /usr/bin/myapp
+
+# Belirli PID veya program için
+coredumpctl list myapp
+coredumpctl list 1234
+
+# Detaylı bilgi (backtrace dahil)
+coredumpctl info 1234
+# PID: 1234 (myapp)
+# Signal: 11 (SEGV)
+# Timestamp: Sat 2026-01-15 14:23:11 UTC
+# ...
+# Stack trace of thread 1:
+# #0  0x000055555555a123 crash_func (myapp.c:42)
+# #1  0x000055555555b456 main (myapp.c:87)
+
+# Core dosyasını dışarı aktar
+coredumpctl dump 1234 -o /tmp/myapp.core
+
+# GDB'yi doğrudan başlat
+coredumpctl debug 1234
+coredumpctl debug myapp   # en son</code></pre>
+
+  <h3>Depolama yönetimi</h3>
+  <pre><code class="language-bash"># Kaydedilen core dump boyutları
+ls -lh /var/lib/systemd/coredump/
+
+# Eski dumpları temizle
+journalctl --vacuum-size=500M  # journal boyutunu sınırla
+
+# coredumpctl ile sil
+coredumpctl clean    # eski ve artık yok olan binary'lerin dumpları
+
+# Disk kullanımı
+du -sh /var/lib/systemd/coredump/</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Cross-architecture analiz</h2>
+  <p class="section-lead">Embedded sistemlerden gelen ARM64 veya ARM32 core dump'larını, geliştirme makinesinde (x86-64) cross-GDB ve hedef sysroot kullanarak analiz etmek için adımlar.</p>
+
+  <h3>Cross-GDB kurulumu</h3>
+  <pre><code class="language-bash"># ARM64 (aarch64) için cross-GDB
+sudo apt install gdb-multiarch
+
+# veya distro araç zincirine özgü:
+sudo apt install gcc-aarch64-linux-gnu gdb-aarch64-linux-gnu
+
+# Doğrulama
+gdb-multiarch --version
+aarch64-linux-gnu-gdb --version
+
+# Kaynak koddan derle (son sürüm için):
+# configure --target=aarch64-linux-gnu \
+#           --with-python \
+#           --enable-tui</code></pre>
+
+  <h3>Sysroot hazırlama</h3>
+  <pre><code class="language-bash"># Hedef cihazdan sysroot kopyala (rsync ile)
+mkdir -p /opt/sysroot-aarch64
+rsync -avz root@192.168.1.100:/{lib,usr/lib,usr/include} \
+      /opt/sysroot-aarch64/
+
+# Buildroot sysroot (output/staging)
+SYSROOT=/path/to/buildroot/output/staging
+
+# Yocto SDK sysroot
+source /opt/poky/4.0/environment-setup-cortexa72-poky-linux
+echo $SDKTARGETSYSROOT</code></pre>
+
+  <h3>Cross-GDB ile core analizi</h3>
+  <pre><code class="language-bash"># ARM64 core dump'ı x86 host'ta analiz et
+gdb-multiarch \
+    --ex "set sysroot /opt/sysroot-aarch64" \
+    --ex "set solib-search-path /opt/sysroot-aarch64/lib:/opt/sysroot-aarch64/usr/lib" \
+    --ex "set architecture aarch64" \
+    /opt/sysroot-aarch64/usr/bin/myapp \
+    /tmp/core.myapp.1234
+
+# GDB içinde:
+# (gdb) info sharedlibrary   ← yüklenen kütüphaneler
+# (gdb) bt                   ← backtrace
+# (gdb) info registers       ← register durumu</code></pre>
+
+  <h3>.gdbinit ile cross debug otomasyonu</h3>
+  <pre><code class="language-bash"># ~/.gdbinit veya proje dizininde .gdbinit
+cat &gt; .gdbinit &lt;&lt;'EOF'
+set sysroot /opt/sysroot-aarch64
+set solib-search-path /opt/sysroot-aarch64/lib
+set solib-absolute-prefix /opt/sysroot-aarch64
+set substitute-path /build/source /home/user/myproject/src
+set architecture aarch64
+set print pretty on
+set print object on
+EOF
+
+# Çalıştır
+gdb-multiarch ./myapp-aarch64 core.1234</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> GDB ile core analiz</h2>
+  <p class="section-lead">GDB'nin core dump üzerindeki temel komutları: backtrace, frame navigasyonu, yerel değişkenler, register durumu ve bellek incelemesi.</p>
+
+  <h3>Core yükleme ve backtrace</h3>
+  <pre><code class="language-bash"># Temel core analizi
+gdb ./myapp core.1234
+
+# GDB otomatik crash noktasını gösterir:
+# Program terminated with signal SIGSEGV, Segmentation fault.
+# #0  0x000055555555a123 in crash_func (ptr=0x0) at myapp.c:42
+# 42      *ptr = 42;   ← NULL deref!
+
+# Tam backtrace
+(gdb) bt
+# #0  crash_func (ptr=0x0) at myapp.c:42
+# #1  0x000055555555b456 in process_data (data=0x55555576a0a0) at myapp.c:75
+# #2  0x000055555555c789 in main (argc=1, argv=0x7fffffffe068) at myapp.c:87
+
+# Tüm thread'lerin backtrace
+(gdb) thread apply all bt</code></pre>
+
+  <h3>Frame navigasyonu</h3>
+  <pre><code class="language-bash"># Belirli frame'e git
+(gdb) frame 1
+# #1  process_data (data=0x55555576a0a0) at myapp.c:75
+# 75      crash_func(data->ptr);
+
+# Frame bilgisi
+(gdb) info frame
+# Stack level 1, frame at 0x7fffffffdde0:
+#  rip = 0x55555555b456 in process_data (myapp.c:75)
+#  caller of frame at 0x7fffffffde00
+#  source language c.
+
+# Yerel değişkenler
+(gdb) info locals
+# data = 0x55555576a0a0
+# result = 0
+
+# Fonksiyon argümanları
+(gdb) info args
+# data = 0x55555576a0a0</code></pre>
+
+  <h3>Register ve bellek inceleme</h3>
+  <pre><code class="language-bash"># Tüm register'lar
+(gdb) info registers
+# rax    0x0      0
+# rbx    0x55555576a0a0    93824994713760
+# rsp    0x7fffffffddc0    0x7fffffffddc0
+# rip    0x55555555a123    0x55555555a123 &lt;crash_func+35&gt;
+
+# Belirli register
+(gdb) p/x $rip
+(gdb) p/x $rsp
+
+# Bellek inceleme (examine)
+# x/[N][fmt][unit] addr
+# fmt: x=hex, d=dec, s=string, i=instr, b=byte
+(gdb) x/10xw 0x55555576a0a0    # 10 word, hex
+(gdb) x/s   0x55555576a0b0     # string
+(gdb) x/5i  $rip               # 5 assembly instruction
+(gdb) x/32xb $rsp              # stack'in 32 byte'ı</code></pre>
+
+  <h3>Değişken ve ifade değerlendirme</h3>
+  <pre><code class="language-bash"># Değişken değerini göster
+(gdb) p data
+# $1 = (struct mydata *) 0x55555576a0a0
+
+# Struct üyelerini göster
+(gdb) p *data
+# $2 = {ptr = 0x0, len = 42, name = 0x55555555d123 "test"}
+
+(gdb) p data->len
+# $3 = 42
+
+# Bellek adresindeki struct'ı cast et
+(gdb) p *(struct mydata*)0x55555576a0a0
+
+# Python ile GDB scripting
+(gdb) python print([gdb.parse_and_eval(f"$r{i}") for i in range(13)])</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> addr2line ve nm</h2>
+  <p class="section-lead"><code>addr2line</code> bir adres veya offset'i kaynak dosya + satır numarasına çevirir. <code>nm</code> binary'deki sembolleri listeler. Her ikisi de GDB olmadan hızlı crash tespiti sağlar.</p>
+
+  <h3>addr2line kullanımı</h3>
+  <pre><code class="language-bash"># Crash adresini kaynak satıra çevir
+addr2line -e myapp -a 0x55555555a123 -f -p -i
+# 0x55555555a123: crash_func at /home/user/myapp.c:42
+# (inlined by) process_data at /home/user/myapp.c:75
+
+# Parametreler:
+# -e binary   : ELF dosyası
+# -a addr     : adres
+# -f          : fonksiyon adını göster
+# -p          : güzel çıktı (pretty-print)
+# -i          : inline fonksiyonları göster
+# -C          : C++ mangled isimlerini demangling
+
+# Birden fazla adres
+addr2line -e myapp -f \
+    0x55555555a123 \
+    0x55555555b456 \
+    0x55555555c789
+
+# ARM64 binary (cross-toolchain)
+aarch64-linux-gnu-addr2line -e myapp-arm64 -f -p \
+    0x000000000001a123</code></pre>
+
+  <h3>nm ile sembol arama</h3>
+  <pre><code class="language-bash"># Tüm sembolleri listele
+nm myapp | head -20
+# 0000000000001234 T crash_func     ← Text (kod)
+# 0000000000002000 D global_data    ← Data (init)
+# 0000000000003000 B global_bss     ← BSS (uninit)
+# 0000000000004000 R const_string   ← Read-only
+
+# Sembol türleri:
+# T/t: kod (Text)  D/d: init data  B/b: BSS
+# U:   undefined   W: weak         I: indirect
+
+# Belirli sembol ara
+nm myapp | grep crash_func
+nm myapp | grep -i "malloc\|free"
+
+# Offset'e göre yakın sembolü bul
+nm --numeric-sort myapp | awk -v addr=0x55555555a100 '
+BEGIN { target=strtonum(addr) }
+{ cur=strtonum("0x"$1); if(cur<=target) { prev=$0; prevaddr=cur } else { print prev; exit } }
+'</code></pre>
+
+  <h3>Mapfile analizi</h3>
+  <pre><code class="language-bash"># Linker map dosyası (derleme sırasında oluştur)
+gcc -Wl,-Map,myapp.map -o myapp myapp.c
+
+# Map'ten crash adresinin lokasyonu
+grep -A2 "0x55555555a" myapp.map
+
+# Objdump ile disassemble + kaynak
+objdump -d -S --source myapp | grep -A 20 "&lt;crash_func&gt;"</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> ASAN core dump</h2>
+  <p class="section-lead">AddressSanitizer (ASAN), stack/heap taşmaları ve use-after-free hatalarını derleme zamanı enstrümantasyonu ile tespit eder. Core dump ile kombine edildiğinde tam hata analizi sağlar.</p>
+
+  <h3>ASAN ile derleme</h3>
+  <pre><code class="language-bash"># ASAN etkinleştirme
+gcc -fsanitize=address \
+    -fsanitize=undefined \
+    -fno-omit-frame-pointer \
+    -g \
+    -O1 \
+    -o myapp myapp.c
+
+# CMake ile
+cmake -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
+      -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address" ..
+
+# Clang ile daha iyi raporlar
+clang -fsanitize=address,undefined \
+      -fsanitize-recover=all \
+      -fno-omit-frame-pointer -g -O1 \
+      -o myapp myapp.c</code></pre>
+
+  <h3>ASAN runtime ortam değişkenleri</h3>
+  <pre><code class="language-bash"># ASAN core dump oluştur
+ASAN_OPTIONS="abort_on_error=1:disable_coredump=0:unmap_shadow_on_exit=1" \
+    ulimit -c unlimited && ./myapp
+
+# Tüm ASAN seçenekleri
+ASAN_OPTIONS=help=1 ./myapp 2>&amp;1 | head -30
+
+# Önemli seçenekler:
+# abort_on_error=1        → hata = SIGABRT → core dump
+# disable_coredump=0      → core dump'u engelleme
+# symbolize=1             → anlık sembol çözümü
+# halt_on_error=1         → ilk hatada dur
+# detect_leaks=1          → leak tespiti (LSan)
+# log_path=/tmp/asan.log  → log dosyası</code></pre>
+
+  <h3>ASAN çıktısı örneği ve analiz</h3>
+  <pre><code class="language-bash"># Heap buffer overflow:
+ASAN_OPTIONS="abort_on_error=1" ./myapp
+# =================================================================
+# ==1234==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000000028
+# READ of size 4 at 0x602000000028 thread T0
+#     #0 0x55a123456789 in read_data myapp.c:55
+#     #1 0x55a123456abc in main myapp.c:88
+#
+# 0x602000000028 is located 8 bytes to the right of 32-byte region
+# [0x602000000000,0x602000000020)
+# allocated by thread T0 here:
+#     #0 0x7f... in __interceptor_malloc
+#     #1 0x55a123456def in alloc_buffer myapp.c:40
+
+# Use-after-free:
+# ==1234==ERROR: AddressSanitizer: heap-use-after-free on address 0x603000000030
+# WRITE of size 8 at 0x603000000030 thread T0
+#     #0 0x55a... in bad_write myapp.c:67
+
+# core dump'ı gdb ile analiz et:
+ASAN_SYMBOLIZER_PATH=$(which llvm-symbolizer) \
+    gdb ./myapp core.1234</code></pre>
+
+  <h3>Cross-compiled ASAN (ARM64)</h3>
+  <pre><code class="language-bash"># Yocto'da ASAN etkinleştirme (local.conf)
+# EXTRA_OEMAKE:append = " CFLAGS='-fsanitize=address -g'"
+
+# libasan paylaşımlı kütüphanesini hedefe kopyala
+scp /usr/aarch64-linux-gnu/lib/libasan.so.* root@device:/usr/lib/
+
+# Cihazda çalıştır
+ssh root@device "ASAN_OPTIONS='abort_on_error=1' ulimit -c unlimited; ./myapp"
+
+# Core'u host'a çek ve analiz et
+scp root@device:/tmp/core.myapp.* ./
+aarch64-linux-gnu-gdb ./myapp-arm64 core.myapp.1234</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Kernel oops/panic analiz</h2>
+  <p class="section-lead">Kernel oops, kernel içindeki hata durumunu (NULL deref, use-after-free, stack overflow) raporlar. Panic, kurtarılamaz bir hatadır. Her ikisi de dmesg/serial console üzerinden analiz edilir.</p>
+
+  <h3>Kernel oops formatı</h3>
+  <pre><code class="language-bash"># Tipik kernel oops — dmesg çıktısı:
+dmesg | grep -A 30 "BUG\|Oops\|general protection"
+
+# Örnek oops:
+# BUG: kernel NULL pointer dereference, address: 0000000000000010
+# #PF: supervisor read access in kernel mode
+# #PF: error_code(0x0000) - not-present page
+# PGD 0 P4D 0
+# Oops: 0000 [#1] SMP PTI
+# CPU: 2 PID: 1234 Comm: mymodule Tainted: G  OE  5.15.0
+# Hardware name: ...
+# RIP: 0010:bad_kernel_func+0x35/0x80 [mymodule]
+# RSP: 0018:ffffb12345678d48 EFLAGS: 00010286
+# Call Trace:
+#  &lt;TASK&gt;
+#  another_func+0x12/0x40 [mymodule]
+#  module_entry+0x45/0xa0 [mymodule]
+#  do_one_initcall+0x46/0x200</code></pre>
+
+  <h3>%pS — sembol çözme</h3>
+  <pre><code class="language-bash"># Kernel oops'taki adres sembolünü çöz
+# RIP: 0010:bad_kernel_func+0x35/0x80
+
+# addr2line ile kernel modül sembol çözme:
+addr2line -e /lib/modules/$(uname -r)/extra/mymodule.ko \
+          -f -p 0x35
+
+# kallsyms ile sembol ara
+grep bad_kernel_func /proc/kallsyms
+# ffffffffc0a12300 t bad_kernel_func [mymodule]
+
+# scripts/decode_stacktrace.sh (kernel kaynak)
+dmesg | scripts/decode_stacktrace.sh vmlinux . modules/</code></pre>
+
+  <h3>kdump / crash — kernel crash analizi</h3>
+  <pre><code class="language-bash"># kdump kurulumu (Debian/Ubuntu)
+sudo apt install kdump-tools crash linux-image-$(uname -r)-dbg
+
+# /etc/default/kdump-tools
+# USE_KDUMP=1
+# KDUMP_KERNEL=/boot/vmlinuz-$(uname -r)
+
+# Crash tool ile vmcore analizi
+crash /usr/lib/debug/boot/vmlinux-5.15.0 /var/crash/vmcore
+
+# crash komutları:
+# bt          ← backtrace (çöken process)
+# bt -a       ← tüm process'ler
+# ps          ← process listesi
+# log         ← dmesg ring buffer
+# files PID   ← açık dosyalar
+# vm          ← virtual memory
+# dev         ← cihaz bilgisi</code></pre>
+
+  <h3>Kernel taint flags</h3>
+  <pre><code class="language-bash">cat /proc/sys/kernel/tainted
+# Değer bit maskeleri:
+# 0  = temiz
+# 1  = proprietary module yüklü
+# 2  = out-of-tree module
+# 4  = SMP sorunu
+# 64 = machine check exception
+
+# dmesg'de Tainted: anlamı
+# Tainted: G   = proprietary driver
+# Tainted: O   = out-of-tree module
+# Tainted: E   = unsigned module (Secure Boot)</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Automated crash reporting</h2>
+  <p class="section-lead">Üretim ortamındaki embedded cihazlarda manuel analiz mümkün değildir. Google Breakpad/Crashpad, minidump formatı ve remote symbol server ile otomatik crash raporlama kurulumu.</p>
+
+  <h3>Google Breakpad entegrasyonu</h3>
+  <pre><code class="language-bash"># Breakpad klonla ve derle
+git clone https://chromium.googlesource.com/breakpad/breakpad
+cd breakpad
+./configure && make
+
+# ARM64 için cross-compile
+./configure --host=aarch64-linux-gnu \
+            CC=aarch64-linux-gnu-gcc \
+            CXX=aarch64-linux-gnu-g++
+make</code></pre>
+
+  <h3>Breakpad C++ entegrasyon kodu</h3>
+  <pre><code class="language-cpp">#include "client/linux/handler/exception_handler.h"
+#include &lt;string&gt;
+
+static bool MinidumpCallback(const google_breakpad::MinidumpDescriptor &amp;descriptor,
+                             void *context, bool succeeded) {
+    fprintf(stderr, "Minidump: %s\n", descriptor.path());
+    // Burada minidump'ı uzak sunucuya yükle
+    return succeeded;
+}
+
+int main(int argc, char *argv[]) {
+    google_breakpad::MinidumpDescriptor descriptor("/tmp/minidumps");
+    google_breakpad::ExceptionHandler eh(
+        descriptor,
+        nullptr,         // filter callback
+        MinidumpCallback,
+        nullptr,         // context
+        true,            // install handler
+        -1               // server fd
+    );
+
+    /* Normal uygulama kodu */
+    return 0;
+}</code></pre>
+
+  <h3>Symbol server ve minidump analizi</h3>
+  <pre><code class="language-bash"># Binary'den symbol dosyası oluştur
+dump_syms ./myapp > /symbols/myapp/BUILD_ID/myapp.sym
+
+# Symbol server dizin yapısı:
+# symbols/
+#   myapp/
+#     A3B4C5D6E7F8.../    ← Build ID
+#       myapp.sym
+
+# Minidump'ı analiz et
+minidump_stackwalk /tmp/minidumps/crash.dmp /symbols/
+
+# Otomatik upload scripti
+cat &gt; /usr/local/bin/upload_crash.sh &lt;&lt;'EOF'
+#!/bin/bash
+DUMP_FILE=$1
+DEVICE_ID=$(cat /etc/machine-id)
+curl -F "dump=@$DUMP_FILE" \
+     -F "device=$DEVICE_ID" \
+     -F "version=$(cat /etc/app-version)" \
+     https://crash.example.com/upload
+EOF</code></pre>
+
+  <h3>Crashpad (Breakpad halefi)</h3>
+  <pre><code class="language-bash"># Crashpad — Chrome/Electron kullanıyor
+git clone https://chromium.googlesource.com/crashpad/crashpad
+
+# Crashpad handler başlatma (C++)
+# #include "client/crashpad_client.h"
+# CrashpadClient client;
+# client.StartHandler(
+#     base::FilePath("/usr/lib/crashpad_handler"),
+#     base::FilePath("/tmp/crashes"),
+#     base::FilePath("/tmp/crashes"),
+#     "https://crash.example.com/api",
+#     {},  // annotations
+#     {"--no-rate-limit"},  // arguments
+#     false  // restartable
+# );</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: NULL deref + stack overflow → tam backtrace pipeline</h2>
+  <p class="section-lead">Kasıtlı NULL deref ve stack overflow hataları oluşturarak, core dump alıp tam backtrace analizini gerçekleştiren adım adım pipeline.</p>
+
+  <h3>Adım 1: Test programı — kasıtlı hatalar</h3>
+  <pre><code class="language-c">/* crash_test.c — eğitim amaçlı kasıtlı crash'ler */
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+
+/* NULL pointer dereference */
+void null_deref_crash(void) {
+    int *ptr = NULL;
+    printf("About to crash: NULL deref\n");
+    *ptr = 42;   /* SIGSEGV */
+}
+
+/* Stack overflow — sonsuz özyineleme */
+void stack_overflow(int depth) {
+    char local_buf[4096];   /* her frame 4KB stack tüketir */
+    memset(local_buf, depth &amp; 0xFF, sizeof(local_buf));
+    printf("depth=%d sp=%p\n", depth, local_buf);
+    stack_overflow(depth + 1);   /* SIGSEGV — stack exhausted */
+}
+
+/* Heap buffer overflow */
+void heap_overflow(void) {
+    char *buf = malloc(16);
+    memset(buf, 'A', 64);   /* 48 byte taşma */
+    free(buf);               /* SIGABRT — heap corruption */
+}
+
+int main(int argc, char *argv[]) {
+    if (argc &lt; 2) {
+        fprintf(stderr, "Usage: %s [null|stack|heap]\n", argv[0]);
+        return 1;
+    }
+    if (strcmp(argv[1], "null") == 0)  null_deref_crash();
+    if (strcmp(argv[1], "stack") == 0) stack_overflow(0);
+    if (strcmp(argv[1], "heap") == 0)  heap_overflow();
+    return 0;
+}</code></pre>
+
+  <h3>Adım 2: Debug sembollerle derleme</h3>
+  <pre><code class="language-bash"># Debug sembollerle derle
+gcc -g -O0 -fno-omit-frame-pointer \
+    -o crash_test crash_test.c
+
+# ARM64 cross-compile
+aarch64-linux-gnu-gcc -g -O0 -fno-omit-frame-pointer \
+    -o crash_test_arm64 crash_test.c</code></pre>
+
+  <h3>Adım 3: Core dump oluşturma</h3>
+  <pre><code class="language-bash"># Core dump etkinleştir ve programı çalıştır
+ulimit -c unlimited
+export CORE_DIR=/tmp/cores
+mkdir -p $CORE_DIR
+
+# core_pattern'i ayarla
+sudo bash -c "echo '$CORE_DIR/core.%e.%p.%s.%t' > /proc/sys/kernel/core_pattern"
+
+# NULL deref testi
+./crash_test null
+ls -la $CORE_DIR/
+# -rw------- 1 user user 278528 Jan 15 14:23 core.crash_test.1234.11.1705330987
+
+# Stack overflow testi
+./crash_test stack
+# (birkaç saniye çalışır, sonra SIGSEGV)</code></pre>
+
+  <h3>Adım 4: GDB ile analiz</h3>
+  <pre><code class="language-bash"># NULL deref core analizi
+gdb -q ./crash_test $CORE_DIR/core.crash_test.1234.11.*
+
+# GDB çıktısı:
+# Reading symbols from ./crash_test...
+# [New LWP 1234]
+# Core was generated by `./crash_test null'.
+# Program terminated with signal SIGSEGV, Segmentation fault.
+# #0  0x000055555555527a in null_deref_crash () at crash_test.c:11
+# 11          *ptr = 42;
+
+(gdb) bt
+# #0  null_deref_crash () at crash_test.c:11
+# #1  0x00005555555552f8 in main (argc=2, argv=0x7fffffffe068) at crash_test.c:29
+
+(gdb) info locals
+# ptr = 0x0   ← NULL pointer!
+
+(gdb) p ptr
+# $1 = (int *) 0x0
+
+(gdb) x/3i $rip-5
+# 0x555555555275 &lt;null_deref_crash+15&gt;:  mov DWORD PTR [rax],0x2a
+#   ← 0x2a = 42 decimal, rax=0x0 → NULL write</code></pre>
+
+  <h3>Adım 5: addr2line ile doğrulama</h3>
+  <pre><code class="language-bash"># GDB backtrace adreslerini kaynak satırlarına çevir
+addr2line -e ./crash_test -f -p -i \
+    0x000055555555527a \
+    0x00005555555552f8
+
+# Çıktı:
+# 0x000055555555527a: null_deref_crash at crash_test.c:11
+# 0x00005555555552f8: main at crash_test.c:29</code></pre>
+
+  <h3>Adım 6: Stack overflow analizi</h3>
+  <pre><code class="language-bash">gdb -q ./crash_test $CORE_DIR/core.crash_test.*.11.*
+
+# (gdb) bt
+# Stack overflow sonsuz backtrace gösterir, sonunda kesilir:
+# #0  stack_overflow (depth=2847) at crash_test.c:18
+# #1  0x00005555555551f8 in stack_overflow (depth=2846) at crash_test.c:20
+# #2  0x00005555555551f8 in stack_overflow (depth=2845) at crash_test.c:20
+# ... (2847 frame tekrar)
+
+# Stack pointer → stack limitine ulaşmış
+(gdb) p $rsp
+(gdb) info proc mappings
+# [stack]  0x7fff0000000 - 0x800000000  (8 MB)
+# rsp'nin bu aralık dışına çıktığını gösterir</code></pre>
+
+  <div class="callout">
+    <div class="label">ÖZET</div>
+    <p>Core dump analiz pipeline şu adımlardan oluşur: (1) <code>ulimit -c unlimited</code> + <code>core_pattern</code> ayarı, (2) debug sembollü derleme, (3) çöküşü tetikle + core kaydet, (4) GDB ile <code>bt/frame/info locals</code>, (5) <code>addr2line</code> ile satır doğrulama. Cross-architecture için <code>gdb-multiarch</code> + hedef sysroot zorunludur. Production sistemlerde Breakpad/Crashpad ile minidump otomatik toplanabilir.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

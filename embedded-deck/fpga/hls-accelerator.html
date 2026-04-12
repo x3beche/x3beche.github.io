@@ -1,0 +1,647 @@
+---
+layout: tutorial
+title: "HLS ile Hızlandırıcı — C-to-RTL & Linux Driver"
+back_url: "../index.html"
+back_label: "FPGA & Linux Entegrasyonu"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>FPGA</span>
+    <span>HLS HIZLANDIRICI</span>
+    <span>2026</span>
+  </div>
+  <h1>HLS ile Hızlandırıcı —<br><em>C-to-RTL &amp; Linux Driver.</em></h1>
+  <p class="subtitle">Vitis HLS ile C/C++ algoritmasını FPGA donanım hızlandırıcısına dönüştür: PIPELINE/DATAFLOW/INTERFACE pragma'ları, AXI-Stream pipeline tasarımı, Vivado IP entegrasyonu, Linux char device driver yazma ve gerçek performans kıyaslaması.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">HLS metodolojisi — C-to-RTL akışı</a></li>
+    <li><a href="#s1">Vitis HLS proje kurulumu ve TCL akışı</a></li>
+    <li><a href="#s2">PIPELINE pragma — döngü boru hattı</a></li>
+    <li><a href="#s3">DATAFLOW pragma — görev düzeyi paralellik</a></li>
+    <li><a href="#s4">INTERFACE pragma — AXI4 ve AXI-Stream</a></li>
+    <li><a href="#s5">AXI-Stream ile görüntü işleme pipeline'ı</a></li>
+    <li><a href="#s6">Vivado IP entegrasyonu ve bitstream üretimi</a></li>
+    <li><a href="#s7">Linux char device driver yazma</a></li>
+    <li><a href="#s8">Kullanıcı alanından DMA ile veri transferi</a></li>
+    <li><a href="#s9">Performans kıyaslama ve optimizasyon</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> HLS metodolojisi — C-to-RTL akışı</h2>
+  <p class="section-lead">High-Level Synthesis (HLS), C/C++ veya SystemC kodu alarak RTL (VHDL/Verilog) üretir. El yapımı RTL yazımına kıyasla tasarım süresini 5–10× kısaltır. Vitis HLS 2024.1, Xilinx'in birincil HLS aracıdır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C-to-RTL Geliştirme Akışı</span><span class="dot">●</span></div>
+    <pre><code>C/C++ Kaynak Kodu
+       │
+       ▼  Vitis HLS
+┌──────────────────────────────────────────────┐
+│ 1. Elaboration  — tür çıkarımı, döngü sınırı │
+│ 2. Scheduling   — operasyonları saat döngüsü │
+│ 3. Binding      — işlemleri LUT/DSP'ye bağla │
+│ 4. RTL üretimi  — VHDL / Verilog çıktısı     │
+│ 5. Co-simulation— C testbench ile RTL doğrula│
+└──────────────────────────────────────────────┘
+       │
+       ▼
+RTL → Vivado IP Packager → Block Design → Bitstream
+       │
+       ▼
+Linux Platform Driver → /dev/accel → Kullanıcı Uygulaması</code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><div class="name">Initiation Interval (II)</div><div class="desc">Ardışık iki veri kümesinin işlemeye başlaması arasındaki saat döngüsü sayısı. II=1 idealdir; her döngüde yeni veri kabul edilir.</div></div>
+    <div class="param"><div class="name">Latency</div><div class="desc">Bir verinin girişten çıkışa ulaşması için gereken saat döngüsü sayısı. Pipeline'da latency yüksek, II düşük olabilir.</div></div>
+    <div class="param"><div class="name">Throughput</div><div class="desc">Throughput = Fclk / II. 100 MHz ve II=1 için throughput 100M işlem/saniyedir.</div></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Vitis HLS proje kurulumu ve TCL akışı</h2>
+  <p class="section-lead">Vitis HLS hem GUI hem TCL betik akışını destekler. CI/CD entegrasyonu için TCL akışı tercih edilir.</p>
+
+  <h3>Örnek: FIR filtre hızlandırıcısı</h3>
+  <div class="code-block">
+    <div class="code-header"><span>fir_filter.h</span><span class="dot">●</span></div>
+    <pre><code>#pragma once
+#include &lt;ap_int.h&gt;
+#include &lt;hls_stream.h&gt;
+
+#define FIR_TAPS 16
+#define DATA_W   16
+
+typedef ap_int&lt;DATA_W&gt;      data_t;
+typedef ap_int&lt;DATA_W * 2&gt;  acc_t;
+
+void fir_filter(
+    hls::stream&lt;data_t&gt; &amp;in_stream,
+    hls::stream&lt;data_t&gt; &amp;out_stream,
+    const data_t coeffs[FIR_TAPS],
+    int num_samples
+);</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>fir_filter.cpp</span><span class="dot">●</span></div>
+    <pre><code>#include "fir_filter.h"
+
+void fir_filter(
+    hls::stream&lt;data_t&gt; &amp;in_stream,
+    hls::stream&lt;data_t&gt; &amp;out_stream,
+    const data_t coeffs[FIR_TAPS],
+    int num_samples)
+{
+#pragma HLS INTERFACE axis      port=in_stream
+#pragma HLS INTERFACE axis      port=out_stream
+#pragma HLS INTERFACE s_axilite port=coeffs      bundle=CTRL
+#pragma HLS INTERFACE s_axilite port=num_samples bundle=CTRL
+#pragma HLS INTERFACE s_axilite port=return      bundle=CTRL
+
+    static data_t shift_reg[FIR_TAPS] = {0};
+
+    for (int i = 0; i &lt; num_samples; i++) {
+#pragma HLS PIPELINE II=1
+        data_t sample = in_stream.read();
+        acc_t  acc    = 0;
+
+        SHIFT: for (int k = FIR_TAPS - 1; k &gt; 0; k--) {
+#pragma HLS UNROLL
+            shift_reg[k] = shift_reg[k - 1];
+        }
+        shift_reg[0] = sample;
+
+        MAC: for (int k = 0; k &lt; FIR_TAPS; k++) {
+#pragma HLS UNROLL
+            acc += (acc_t)shift_reg[k] * (acc_t)coeffs[k];
+        }
+        out_stream.write((data_t)(acc &gt;&gt; (DATA_W - 1)));
+    }
+}</code></pre>
+  </div>
+
+  <h3>TCL sentez betiği</h3>
+  <div class="code-block">
+    <div class="code-header"><span>synth.tcl</span><span class="dot">●</span></div>
+    <pre><code>open_project fir_hls
+set_top fir_filter
+add_files fir_filter.cpp
+add_files -tb fir_tb.cpp
+
+open_solution "solution1"
+set_part {xc7z020clg400-1}  ;# Zynq-7020
+create_clock -period 10     ;# 100 MHz
+
+csim_design
+csynth_design
+cosim_design
+export_design -format ip_catalog -output ../ip/fir_filter
+
+close_project</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code>vitis_hls -f synth.tcl 2>&1 | tee synth.log
+grep -A5 "== Latency" \
+  fir_hls/solution1/syn/report/fir_filter_csynth.rpt</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> PIPELINE pragma — döngü boru hattı</h2>
+  <p class="section-lead">PIPELINE pragma, bir döngünün her iterasyonunu bir önceki bitmeden başlatır. II=1 hedefiyle throughput maksimuma çıkar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>Pipeline olmadan vs. Pipeline ile</span><span class="dot">●</span></div>
+    <pre><code>// PIPELINE YOK: her iterasyon 4 saat döngüsü → toplam 4N döngü
+for (int i = 0; i &lt; N; i++) {
+    int a = in_a[i];   // döngü 1
+    int b = in_b[i];   // döngü 2
+    int c = a * b;     // döngü 3 (DSP)
+    out[i] = c;        // döngü 4
+}
+
+// PIPELINE II=1: toplam N+3 döngü
+for (int i = 0; i &lt; N; i++) {
+#pragma HLS PIPELINE II=1
+    int a = in_a[i];
+    int b = in_b[i];
+    int c = a * b;
+    out[i] = c;
+}</code></pre>
+  </div>
+
+  <h3>II=1 engelleyen durumlar ve çözümler</h3>
+  <div class="params">
+    <div class="param"><div class="name">Bellek çakışması</div><div class="desc">Aynı BRAM'a aynı döngüde okuma/yazma. Çözüm: ARRAY_PARTITION complete ile her eleman ayrı register.</div></div>
+    <div class="param"><div class="name">Döngü bağımlılığı</div><div class="desc">İterasyon N, N-1'in sonucuna bağımlıysa II&gt;1 olur. Ara değişken veya algoritma yeniden düzenleme gerekir.</div></div>
+    <div class="param"><div class="name">DSP kaynak kısıtı</div><div class="desc">DSP48 blokları yetmiyorsa II&gt;1. ALLOCATION pragma ile kaynak sınırlandırılır.</div></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>Dizi bölümleme</span><span class="dot">●</span></div>
+    <pre><code>int coeff[16];
+#pragma HLS ARRAY_PARTITION variable=coeff complete dim=1
+// complete: 16 ayrı register, eş zamanlı erişim
+// cyclic,factor=4: 4 banka döngüsel
+// block,factor=4: 4 banka blok</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> DATAFLOW pragma — görev düzeyi paralellik</h2>
+  <p class="section-lead">DATAFLOW, bağımsız alt fonksiyonları eş zamanlı çalıştırır. Üretici-tüketici zinciri hls::stream ile kurulur.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>dataflow_pipeline.cpp</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;hls_stream.h&gt;
+#include &lt;ap_int.h&gt;
+
+typedef ap_uint&lt;8&gt; pixel_t;
+
+void read_input(pixel_t *in, hls::stream&lt;pixel_t&gt; &amp;s0, int N) {
+#pragma HLS INLINE off
+    for (int i = 0; i &lt; N; i++) {
+#pragma HLS PIPELINE II=1
+        s0.write(in[i]);
+    }
+}
+
+void brightness(hls::stream&lt;pixel_t&gt; &amp;s0,
+                hls::stream&lt;pixel_t&gt; &amp;s1, int N) {
+#pragma HLS INLINE off
+    for (int i = 0; i &lt; N; i++) {
+#pragma HLS PIPELINE II=1
+        pixel_t p = s0.read();
+        s1.write((pixel_t)((p + 50 &gt; 255) ? 255 : p + 50));
+    }
+}
+
+void contrast(hls::stream&lt;pixel_t&gt; &amp;s1,
+              hls::stream&lt;pixel_t&gt; &amp;s2, int N) {
+#pragma HLS INLINE off
+    for (int i = 0; i &lt; N; i++) {
+#pragma HLS PIPELINE II=1
+        pixel_t p = s1.read();
+        s2.write((pixel_t)((p * 110) / 100));
+    }
+}
+
+void write_output(hls::stream&lt;pixel_t&gt; &amp;s2, pixel_t *out, int N) {
+#pragma HLS INLINE off
+    for (int i = 0; i &lt; N; i++) {
+#pragma HLS PIPELINE II=1
+        out[i] = s2.read();
+    }
+}
+
+void image_pipeline(pixel_t *in, pixel_t *out, int N) {
+#pragma HLS INTERFACE m_axi     port=in  offset=slave bundle=GMEM0
+#pragma HLS INTERFACE m_axi     port=out offset=slave bundle=GMEM1
+#pragma HLS INTERFACE s_axilite port=N      bundle=CTRL
+#pragma HLS INTERFACE s_axilite port=return bundle=CTRL
+#pragma HLS DATAFLOW
+
+    hls::stream&lt;pixel_t&gt; s0("s0"), s1("s1"), s2("s2");
+#pragma HLS STREAM variable=s0 depth=16
+#pragma HLS STREAM variable=s1 depth=16
+#pragma HLS STREAM variable=s2 depth=16
+
+    read_input  (in,  s0, N);
+    brightness  (s0, s1, N);
+    contrast    (s1, s2, N);
+    write_output(s2, out, N);
+    // 4 görev paralel çalışır; latency ≈ N+derinlik döngüsü
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> INTERFACE pragma — AXI4 ve AXI-Stream</h2>
+  <p class="section-lead">HLS fonksiyon argümanları, INTERFACE pragma ile donanım arayüzlerine dönüşür. Gömülü Linux'ta en yaygın: AXI4-Lite (kontrol registerleri), AXI4 Master (DMA) ve AXI4-Stream.</p>
+
+  <h3>AXI4-Lite kontrol ve AXI4 Master bellek arayüzü</h3>
+  <div class="code-block">
+    <div class="code-header"><span>INTERFACE pragma örnekleri</span><span class="dot">●</span></div>
+    <pre><code>void my_accel(
+    int *input,     // DDR'dan okuma (AXI Master)
+    int *output,    // DDR'a yazma  (AXI Master)
+    int  length,    // kontrol reg
+    int  threshold) // kontrol reg
+{
+#pragma HLS INTERFACE m_axi     port=input    offset=slave bundle=GMEM
+#pragma HLS INTERFACE m_axi     port=output   offset=slave bundle=GMEM
+#pragma HLS INTERFACE s_axilite port=input    bundle=CTRL
+#pragma HLS INTERFACE s_axilite port=output   bundle=CTRL
+#pragma HLS INTERFACE s_axilite port=length   bundle=CTRL
+#pragma HLS INTERFACE s_axilite port=threshold bundle=CTRL
+#pragma HLS INTERFACE s_axilite port=return   bundle=CTRL
+}</code></pre>
+  </div>
+
+  <h3>Otomatik üretilen AXI4-Lite register haritası</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Register Haritası</span><span class="dot">●</span></div>
+    <pre><code>Offset  Register       Açıklama
+0x00    ap_ctrl        bit0=start, bit1=done, bit2=idle, bit3=ready
+0x04    gier           Global Interrupt Enable
+0x08    ip_ier         IP Interrupt Enable
+0x0c    ip_isr         IP Interrupt Status
+0x10    input[31:0]    Input pointer düşük 32 bit
+0x14    input[63:32]   Input pointer yüksek 32 bit
+0x18    output[31:0]   Output pointer
+0x20    length         Uzunluk
+0x28    threshold      Eşik değeri</code></pre>
+  </div>
+
+  <h3>AXI4-Stream arayüzü</h3>
+  <div class="code-block">
+    <div class="code-header"><span>AXI-Stream — TLAST dahil</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;ap_axi_sdata.h&gt;
+typedef ap_axiu&lt;32, 0, 0, 0&gt; axis_pkt_t;
+
+void stream_double(
+    hls::stream&lt;axis_pkt_t&gt; &amp;in_s,
+    hls::stream&lt;axis_pkt_t&gt; &amp;out_s)
+{
+#pragma HLS INTERFACE axis      port=in_s
+#pragma HLS INTERFACE axis      port=out_s
+#pragma HLS INTERFACE s_axilite port=return bundle=CTRL
+#pragma HLS PIPELINE II=1
+
+    axis_pkt_t pkt = in_s.read();
+    pkt.data = pkt.data * 2;
+    out_s.write(pkt);
+    // pkt.last == 1 → son paket (DMA engine için kritik)
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> AXI-Stream ile görüntü işleme pipeline'ı</h2>
+  <p class="section-lead">Xilinx Vitis Vision Library, AXI-Stream üzerinde çalışan görüntü işleme IP'leri oluşturmak için hazır fonksiyonlar sunar. hls::Mat veri tipi kamera karelerini pipeline boyunca taşır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>sobel_accel.cpp — kenar algılama</span><span class="dot">●</span></div>
+    <pre><code>#include "hls_video.h"
+
+#define WIDTH  640
+#define HEIGHT 480
+
+typedef hls::stream&lt;ap_axiu&lt;8,1,1,1&gt;&gt;  AXI_STREAM;
+typedef hls::Mat&lt;HEIGHT, WIDTH, HLS_8UC1&gt; GRAY_IMG;
+
+void sobel_accel(AXI_STREAM &amp;src, AXI_STREAM &amp;dst,
+                 int rows, int cols)
+{
+#pragma HLS INTERFACE axis      port=src
+#pragma HLS INTERFACE axis      port=dst
+#pragma HLS INTERFACE s_axilite port=rows   bundle=CTRL
+#pragma HLS INTERFACE s_axilite port=cols   bundle=CTRL
+#pragma HLS INTERFACE s_axilite port=return bundle=CTRL
+#pragma HLS DATAFLOW
+
+    GRAY_IMG img_in(rows, cols);
+    GRAY_IMG img_blur(rows, cols);
+    GRAY_IMG img_out(rows, cols);
+
+    hls::AXIvideo2Mat(src, img_in);
+    hls::GaussianBlur&lt;5,5&gt;(img_in,   img_blur, 1.0);
+    hls::Sobel&lt;0,1,3&gt;      (img_blur, img_out);
+    hls::Mat2AXIvideo(img_out, dst);
+}</code></pre>
+  </div>
+
+  <h3>PS-PL DMA bağlantısı (Zynq Block Design)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Topoloji</span><span class="dot">●</span></div>
+    <pre><code>PS (ARM Cortex-A9)
+  ├── AXI HP0 ←──────────── AXI DMA (S_AXI_HP)
+  │                          ├── MM2S → sobel_accel:src
+  │                          └── S2MM ← sobel_accel:dst
+  └── AXI GP0 → Interconnect
+                  ├── AXI DMA  CTRL @ 0x40400000
+                  └── sobel_accel CTRL @ 0x43C00000</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Vivado IP entegrasyonu ve bitstream üretimi</h2>
+  <p class="section-lead">HLS'den üretilen IP'yi Vivado Block Design'a ekleyip bitstream'e kadar tam TCL otomasyonu, yeniden üretilebilir CI/CD sağlar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>vivado_flow.tcl</span><span class="dot">●</span></div>
+    <pre><code>create_project sobel_design ./vivado_proj -part xc7z020clg400-1
+set_property board_part digilentinc.com:zedboard:part0:1.0 [current_project]
+
+set_property ip_repo_paths {../ip/sobel_accel} [current_project]
+update_ip_catalog
+
+create_bd_design "system"
+
+# Zynq PS
+create_bd_cell -type ip -vlnv xilinx.com:ip:processing_system7 ps7
+apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 \
+    -config {make_external "FIXED_IO, DDR"} [get_bd_cells ps7]
+set_property -dict [list \
+    CONFIG.PCW_USE_S_AXI_HP0 {1} \
+    CONFIG.PCW_USE_FABRIC_INTERRUPT {1}] [get_bd_cells ps7]
+
+# AXI DMA
+create_bd_cell -type ip -vlnv xilinx.com:ip:axi_dma dma0
+set_property -dict [list \
+    CONFIG.c_include_sg {0} \
+    CONFIG.c_sg_include_stscntrl_strm {0}] [get_bd_cells dma0]
+
+# HLS IP
+create_bd_cell -type ip -vlnv xilinx.com:hls:sobel_accel:1.0 sobel0
+
+# DMA &lt;-&gt; Sobel AXI-Stream bağlantıları
+connect_bd_intf_net [get_bd_intf_pins dma0/M_AXIS_MM2S] \
+                    [get_bd_intf_pins sobel0/src_V]
+connect_bd_intf_net [get_bd_intf_pins sobel0/dst_V] \
+                    [get_bd_intf_pins dma0/S_AXIS_S2MM]
+
+validate_bd_design
+generate_target all [get_files system.bd]
+launch_runs impl_1 -to_step write_bitstream -jobs 8
+wait_on_run impl_1
+write_hw_platform -fixed -include_bit ./sobel_design.xsa</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — PetaLinux ile</span><span class="dot">●</span></div>
+    <pre><code>petalinux-create -t project --template zynq -n sobel_proj
+cd sobel_proj
+petalinux-config --get-hw-description=../sobel_design.xsa
+petalinux-build
+petalinux-package --boot --fsbl images/linux/zynq_fsbl.elf \
+    --bitstream images/linux/system.bit --u-boot --force</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Linux char device driver yazma</h2>
+  <p class="section-lead">HLS IP'sini kontrol etmek için Linux kernel platform driver gereklidir. Driver AXI4-Lite registerlerini ioremap ile eşler, interrupt bekler.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>sobel_driver.c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/module.h&gt;
+#include &lt;linux/platform_device.h&gt;
+#include &lt;linux/of.h&gt;
+#include &lt;linux/io.h&gt;
+#include &lt;linux/interrupt.h&gt;
+#include &lt;linux/wait.h&gt;
+#include &lt;linux/cdev.h&gt;
+#include &lt;linux/uaccess.h&gt;
+
+#define AP_START BIT(0)
+#define AP_DONE  BIT(1)
+#define AP_IDLE  BIT(2)
+
+struct sobel_dev {
+    void __iomem     *ctrl_base;
+    int               irq;
+    wait_queue_head_t wait;
+    bool              done;
+    struct cdev       cdev;
+    dev_t             devno;
+};
+
+static irqreturn_t sobel_irq(int irq, void *dev_id)
+{
+    struct sobel_dev *s = dev_id;
+    iowrite32(0x3, s->ctrl_base + 0x0c);  /* ip_isr temizle */
+    s->done = true;
+    wake_up_interruptible(&amp;s->wait);
+    return IRQ_HANDLED;
+}
+
+static long sobel_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+{
+    struct sobel_dev *s = f->private_data;
+    iowrite32(AP_START, s->ctrl_base + 0x00);
+    wait_event_interruptible(s->wait, s->done);
+    s->done = false;
+    return 0;
+}
+
+static const struct file_operations sobel_fops = {
+    .owner          = THIS_MODULE,
+    .unlocked_ioctl = sobel_ioctl,
+};
+
+static int sobel_probe(struct platform_device *pdev)
+{
+    struct sobel_dev *s;
+    struct resource  *res;
+
+    s = devm_kzalloc(&amp;pdev->dev, sizeof(*s), GFP_KERNEL);
+    init_waitqueue_head(&amp;s->wait);
+
+    res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+    s->ctrl_base = devm_ioremap_resource(&amp;pdev->dev, res);
+
+    s->irq = platform_get_irq(pdev, 0);
+    devm_request_irq(&amp;pdev->dev, s->irq, sobel_irq, 0, "sobel", s);
+
+    platform_set_drvdata(pdev, s);
+    dev_info(&amp;pdev->dev, "sobel-accel hazır, IRQ=%d\n", s->irq);
+    return 0;
+}
+
+static const struct of_device_id sobel_ids[] = {
+    { .compatible = "xlnx,sobel-accel-1.0" },
+    { }
+};
+MODULE_DEVICE_TABLE(of, sobel_ids);
+
+static struct platform_driver sobel_drv = {
+    .driver = { .name = "sobel-accel", .of_match_table = sobel_ids },
+    .probe  = sobel_probe,
+};
+module_platform_driver(sobel_drv);
+MODULE_LICENSE("GPL");</code></pre>
+  </div>
+
+  <h3>Device Tree düğümü</h3>
+  <div class="code-block">
+    <div class="code-header"><span>system-user.dtsi</span><span class="dot">●</span></div>
+    <pre><code>&amp;amba {
+    sobel_accel@43c00000 {
+        compatible = "xlnx,sobel-accel-1.0";
+        reg = &lt;0x43c00000 0x10000&gt;;
+        interrupts = &lt;0 29 4&gt;;
+        interrupt-parent = &lt;&amp;intc&gt;;
+    };
+};</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Kullanıcı alanından DMA ile veri transferi</h2>
+  <p class="section-lead">Linux'ta FPGA hızlandırıcısına veri göndermek için DMA kullanılır. /dev/mem + mmap ile hızlı prototip yapılır; üretimde udmabuf veya dma-proxy driver tercih edilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>sobel_userspace.c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;stdio.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;string.h&gt;
+
+#define DMA_BASE  0x40400000
+#define CTRL_BASE 0x43C00000
+#define PHYS_SRC  0x18000000
+#define PHYS_DST  0x18100000
+#define IMG_SIZE  (640 * 480)
+#define MAP_SZ    0x10000
+
+#define MM2S_CTRL   0x00
+#define MM2S_ADDR   0x18
+#define MM2S_LENGTH 0x28
+#define S2MM_CTRL   0x30
+#define S2MM_ADDR   0x48
+#define S2MM_LENGTH 0x58
+
+#define WR32(base, off, val) \
+    (*((volatile uint32_t*)((base) + (off))) = (val))
+#define RD32(base, off) \
+    (*((volatile uint32_t*)((base) + (off))))
+
+int main(void)
+{
+    int fd = open("/dev/mem", O_RDWR | O_SYNC);
+    void *dma  = mmap(NULL, MAP_SZ, PROT_READ|PROT_WRITE,
+                      MAP_SHARED, fd, DMA_BASE);
+    void *ctrl = mmap(NULL, MAP_SZ, PROT_READ|PROT_WRITE,
+                      MAP_SHARED, fd, CTRL_BASE);
+    uint8_t *src = mmap(NULL, IMG_SIZE, PROT_READ|PROT_WRITE,
+                        MAP_SHARED, fd, PHYS_SRC);
+    uint8_t *dst = mmap(NULL, IMG_SIZE, PROT_READ|PROT_WRITE,
+                        MAP_SHARED, fd, PHYS_DST);
+
+    memset(src, 128, IMG_SIZE);  /* test görüntüsü */
+
+    WR32(ctrl, 0x20, 480);       /* rows */
+    WR32(ctrl, 0x28, 640);       /* cols */
+
+    WR32(dma, MM2S_ADDR,   PHYS_SRC);
+    WR32(dma, MM2S_LENGTH, IMG_SIZE);
+    WR32(dma, MM2S_CTRL,   0x0001);
+
+    WR32(dma, S2MM_ADDR,   PHYS_DST);
+    WR32(dma, S2MM_LENGTH, IMG_SIZE);
+    WR32(dma, S2MM_CTRL,   0x0001);
+
+    WR32(ctrl, 0x00, 0x01);  /* ap_start */
+
+    /* S2MM IDLE bekle */
+    while (!(RD32(dma, S2MM_CTRL) &amp; 0x02));
+
+    printf("Tamamlandı. dst[0]=%d\n", dst[0]);
+    return 0;
+}</code></pre>
+  </div>
+
+  <p><strong>Üretim notu:</strong> /dev/mem güvenlik riski taşır. Üretim kodunda <code>udmabuf</code> (kullanıcı alanı CMA tahsisi) veya Xilinx dma-proxy driver kullanın.</p>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 09 ═══════════════════ -->
+<section id="s9">
+  <h2><span class="num">09</span> Performans kıyaslama ve optimizasyon</h2>
+  <p class="section-lead">HLS'nin ürettiği RTL, el yapımı RTL'e kıyasla genellikle %10–30 daha fazla kaynak kullanır; ancak tasarım süresi dramatik biçimde azalır.</p>
+
+  <h3>Sobel filtresi kıyaslama — Zynq-7020 @ 100 MHz</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Kıyaslama Tablosu</span><span class="dot">●</span></div>
+    <pre><code>                 El Yapımı RTL  HLS (PIPELINE)  HLS (DATAFLOW)
+──────────────────────────────────────────────────────────────
+LUT                1.240          1.580 (+27%)     1.620 (+31%)
+FF                   890          1.120 (+26%)     1.380 (+55%)
+DSP48                  4              4                 4
+BRAM                   2              2                 2
+Fmax (MHz)           125            118               122
+Latency 640×480     2.46ms         2.60ms            2.52ms
+Tasarım süresi      3 gün          4 saat            4 saat</code></pre>
+  </div>
+
+  <h3>Optimizasyon önerileri</h3>
+  <div class="params">
+    <div class="param"><div class="name">Kaynak raporu analizi</div><div class="desc">csynth_design sonrası raporda II&gt;1 olan döngüleri tespit edin. Timing violation varsa constraint gevşetilebilir.</div></div>
+    <div class="param"><div class="name">ALLOCATION pragma</div><div class="desc">#pragma HLS ALLOCATION instances=mul limit=2 operation ile DSP kullanımı sınırlanır.</div></div>
+    <div class="param"><div class="name">Bit genişliği azaltma</div><div class="desc">ap_int&lt;16&gt; yerine ap_int&lt;12&gt; kullanımı LUT ve DSP tüketimini düşürür.</div></div>
+    <div class="param"><div class="name">Cosimulation</div><div class="desc">cosim_design, RTL simülasyonunu C testbench ile çalıştırır. Sentez öncesi algoritma doğrulanmalıdır.</div></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — sentez raporu özeti</span><span class="dot">●</span></div>
+    <pre><code>python3 -c "
+import re
+with open('solution1/syn/report/sobel_accel_csynth.rpt') as f:
+    content = f.read()
+for res in ['LUT','FF','DSP','BRAM']:
+    m = re.search(rf'{res}\s+\|\s+(\d+)', content)
+    if m: print(f'{res}: {m.group(1)}')
+"</code></pre>
+  </div>
+</section>
+
+</main>

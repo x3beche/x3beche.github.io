@@ -1,0 +1,792 @@
+---
+layout: tutorial
+title: "BentoML — Model Paketleme & Servis"
+back_url: "../index.html"
+back_label: "Model Serving Altyapısı"
+---
+
+<header class="header">
+  <div class="meta"><span>Rehber</span><span>Model Serving</span><span>03 · Framework</span></div>
+  <h1>BentoML —<br><em>Model Paketleme.</em></h1>
+  <p class="subtitle">Framework-agnostic model paketleme ve servis. Service API, adaptive batching, runner async dispatch, Docker containerize ve Kubernetes deployment pipeline.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçerik</div>
+  <ol>
+    <li><a href="#s0">BentoML Nedir?</a></li>
+    <li><a href="#s1">Service Tanımı</a></li>
+    <li><a href="#s2">Model Store</a></li>
+    <li><a href="#s3">Adaptive Batching</a></li>
+    <li><a href="#s4">Runner: Async Dispatch</a></li>
+    <li><a href="#s5">Bento Build</a></li>
+    <li><a href="#s6">Containerize — Docker</a></li>
+    <li><a href="#s7">Deployment: BentoCloud, Kubernetes, Lambda</a></li>
+    <li><a href="#s8">Monitoring — OpenTelemetry</a></li>
+    <li><a href="#s9">Pratik: HuggingFace → BentoML → K8s</a></li>
+  </ol>
+</nav>
+
+<main>
+
+  <!-- ── S0: BentoML Nedir? ─────────────────────────────────── -->
+  <section id="s0">
+    <h2><span class="num">00</span> BentoML Nedir?</h2>
+    <p class="section-lead">Herhangi bir ML framework'ünden bağımsız, üretim için model paketleme ve servis çözümü.</p>
+
+    <p>
+      BentoML, ML modellerini üretim için paketleyen ve servis eden açık kaynaklı bir framework'tür. PyTorch, TensorFlow, scikit-learn, HuggingFace Transformers veya özel Python kodu fark etmeksizin aynı API ile çalışır. Amaç, notebook'tan production'a geçişi standardize etmek ve tekrarlanabilir hale getirmektir.
+    </p>
+
+    <div class="flow">
+      <pre><span class="step-num">Geliştir</span> Model eğit → bentoml.save_model() ile kaydet
+<span class="step-num">Tanımla </span> @bentoml.service ile API endpoint yaz
+<span class="step-num">Paketle </span> bentoml build → Bento (tüm bağımlılıklarla)
+<span class="step-num">Konteyner</span> bentoml containerize → Docker imajı
+<span class="step-num">Deploy  </span> Kubernetes / BentoCloud / Lambda</pre>
+    </div>
+
+    <table class="file-table">
+      <thead>
+        <tr><th>Özellik</th><th>BentoML</th><th>FastAPI+Manual</th><th>Triton</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Framework desteği</td><td>Herhangi</td><td>Herhangi</td><td>Belirli backend'ler</td></tr>
+        <tr><td>Adaptive batching</td><td>Dahili</td><td>Manuel</td><td>config.pbtxt</td></tr>
+        <tr><td>Model versiyonlama</td><td>Dahili store</td><td>Manuel</td><td>Dizin yapısı</td></tr>
+        <tr><td>Docker build</td><td>1 komut</td><td>Dockerfile yaz</td><td>NVIDIA resmi image</td></tr>
+        <tr><td>Monitoring</td><td>OpenTelemetry dahili</td><td>Manuel entegrasyon</td><td>Prometheus endpoint</td></tr>
+      </tbody>
+    </table>
+
+    <div class="code-block">
+      <div class="code-label">bash — kurulum</div>
+      <pre><code">pip install bentoml
+pip install bentoml[io]          # io extras (pydantic, PIL, pandas)
+pip install bentoml[grpc]        # GRPC desteği
+pip install "bentoml[transformers]"  # HF entegrasyonu</code></pre>
+    </div>
+  </section>
+
+  <!-- ── S1: Service Tanımı ─────────────────────────────────── -->
+  <section id="s1">
+    <h2><span class="num">01</span> Service Tanımı</h2>
+    <p class="section-lead">@bentoml.service dekoratörü ile HTTP endpoint tanımla — input/output şeması ve runner entegrasyonu.</p>
+
+    <div class="code-block">
+      <div class="code-label">service.py — temel servis</div>
+      <pre><code">import bentoml
+from bentoml.io import Text, JSON
+from pydantic import BaseModel
+from typing import List
+
+# Pydantic şema
+class SentimentRequest(BaseModel):
+    texts: List[str]
+    threshold: float = 0.5
+
+class SentimentResponse(BaseModel):
+    labels: List[str]
+    scores: List[float]
+
+# Runner: modeli izole süreçte çalıştır
+sentiment_runner = bentoml.sklearn.get("sentiment-model:latest").to_runner()
+
+# Servis tanımı
+svc = bentoml.Service("sentiment-service", runners=[sentiment_runner])
+
+@svc.api(
+    input=bentoml.io.JSON(pydantic_model=SentimentRequest),
+    output=bentoml.io.JSON(pydantic_model=SentimentResponse),
+    route="/predict",
+)
+async def predict(request: SentimentRequest) -> SentimentResponse:
+    """Metinlerin sentiment analizini yap."""
+    # Runner'a async olarak gönder (adaptive batching devrede)
+    results = await sentiment_runner.predict.async_run(request.texts)
+    labels = ["positive" if r > request.threshold else "negative" for r in results]
+    return SentimentResponse(labels=labels, scores=results.tolist())
+
+@svc.api(input=Text(), output=Text(), route="/health")
+def health_check(_: str) -> str:
+    return "OK"</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">bash — servisi çalıştır</div>
+      <pre><code">bentoml serve service:svc --reload --port 3000
+
+# Production modu (Gunicorn workers)
+bentoml serve service:svc \
+  --production \
+  --port 3000 \
+  --workers 4
+
+# Test et
+curl -X POST http://localhost:3000/predict \
+  -H "Content-Type: application/json" \
+  -d '{"texts": ["Bu ürün harika!", "Çok kötüydü."]}'</code></pre>
+    </div>
+
+    <div class="params">
+      <div class="param-row">
+        <span class="param-name">--reload</span>
+        <span class="param-desc">Geliştirme modunda dosya değişikliği izle ve yeniden başlat</span>
+      </div>
+      <div class="param-row">
+        <span class="param-name">--production</span>
+        <span class="param-desc">Gunicorn ile çok worker'lı production modu</span>
+      </div>
+      <div class="param-row">
+        <span class="param-name">--workers</span>
+        <span class="param-desc">Worker process sayısı (varsayılan: CPU sayısı)</span>
+      </div>
+      <div class="param-row">
+        <span class="param-name">--api-workers</span>
+        <span class="param-desc">API işleyici thread sayısı (worker başına)</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── S2: Model Store ────────────────────────────────────── -->
+  <section id="s2">
+    <h2><span class="num">02</span> Model Store</h2>
+    <p class="section-lead">BentoML'in yerel model deposu — save, load, versiyonlama ve metadata.</p>
+
+    <div class="code-block">
+      <div class="code-label">python — model kaydetme</div>
+      <pre><code">import bentoml
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+# Basit bir model eğit
+X = np.random.randn(1000, 10)
+y = (X[:, 0] + X[:, 1] > 0).astype(int)
+
+pipeline = Pipeline([
+    ("scaler", StandardScaler()),
+    ("clf", LogisticRegression(max_iter=200)),
+])
+pipeline.fit(X, y)
+
+# BentoML store'a kaydet
+saved_model = bentoml.sklearn.save_model(
+    name="sentiment-model",
+    model=pipeline,
+    signatures={"predict": {"batchable": True, "batch_dim": 0}},
+    labels={"team": "mlops", "stage": "production"},
+    metadata={"accuracy": 0.934, "training_size": 1000},
+    custom_objects={"threshold": 0.5},
+)
+print(f"Model kaydedildi: {saved_model.tag}")
+# Model kaydedildi: sentiment-model:gy5dfr2ytwpk6drp</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — model yükleme ve yönetim</div>
+      <pre><code">import bentoml
+
+# En güncel versiyonu yükle
+model = bentoml.sklearn.load_model("sentiment-model:latest")
+
+# Belirli versiyon
+model_v1 = bentoml.sklearn.load_model("sentiment-model:gy5dfr2ytwpk6drp")
+
+# Model listesi
+models = bentoml.models.list()
+for m in models:
+    print(f"{m.tag} — {m.creation_time} — {m.labels}")
+
+# Model metadata
+info = bentoml.models.get("sentiment-model:latest")
+print(info.metadata)
+
+# HuggingFace model kaydet
+from transformers import pipeline as hf_pipeline
+
+hf_model = hf_pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
+saved = bentoml.transformers.save_model("distilbert-sentiment", hf_model)
+print(f"HF model kaydedildi: {saved.tag}")</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">bash — model store komutları</div>
+      <pre><code">bentoml models list
+bentoml models get sentiment-model:latest
+bentoml models delete sentiment-model:old_tag
+bentoml models export sentiment-model:latest ./exported.bentomodel
+bentoml models import ./exported.bentomodel</code></pre>
+    </div>
+  </section>
+
+  <!-- ── S3: Adaptive Batching ─────────────────────────────── -->
+  <section id="s3">
+    <h2><span class="num">03</span> Adaptive Batching</h2>
+    <p class="section-lead">Gelen istekleri otomatik grupla — max_batch_size ve max_latency_ms ile throughput/latency dengesi.</p>
+
+    <p>
+      Adaptive batching, birden fazla eş zamanlı isteği tek bir batch olarak modele gönderir. BentoML bunu runner düzeyinde yönetir; her <code class="inline">async_run</code> çağrısı bir batcher kuyruğuna düşer.
+    </p>
+
+    <div class="code-block">
+      <div class="code-label">service.py — adaptive batching konfigürasyonu</div>
+      <pre><code">import bentoml
+from bentoml.io import NumpyNdarray
+import numpy as np
+
+# Modeli runner olarak al — batching konfigürasyonu burada
+runner = bentoml.sklearn.get("sentiment-model:latest").to_runner(
+    max_batch_size=64,        # maksimum batch büyüklüğü
+    max_latency_ms=50,        # maksimum bekleme süresi (ms)
+)
+
+svc = bentoml.Service("batching-demo", runners=[runner])
+
+@svc.api(input=NumpyNdarray(shape=(-1, 10), dtype=np.float32),
+         output=NumpyNdarray(dtype=np.float32))
+async def predict(features: np.ndarray) -> np.ndarray:
+    # Her çağrı bir runner isteği oluşturur
+    # BentoML bunları otomatik batch'e toplar
+    return await runner.predict.async_run(features)</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — batching performans testi</div>
+      <pre><code">import asyncio
+import aiohttp
+import numpy as np
+import time
+
+async def test_throughput(concurrency: int, total: int):
+    url = "http://localhost:3000/predict"
+    data = np.random.randn(1, 10).astype(np.float32).tolist()
+    sem = asyncio.Semaphore(concurrency)
+
+    async def req(session):
+        async with sem:
+            async with session.post(url, json=data) as r:
+                return await r.json()
+
+    async with aiohttp.ClientSession() as session:
+        start = time.perf_counter()
+        await asyncio.gather(*[req(session) for _ in range(total)])
+        elapsed = time.perf_counter() - start
+
+    print(f"Concurrency={concurrency:3d} | {total/elapsed:6.0f} req/s")
+
+async def main():
+    for c in [1, 4, 8, 16, 32, 64]:
+        await test_throughput(c, 200)
+
+asyncio.run(main())</code></pre>
+    </div>
+
+    <div class="callout">
+      <div class="label">AYAR KILAVUZU</div>
+      <p>max_latency_ms değeri SLO'nuzdan küçük olmalıdır. max_batch_size ise GPU belleği ve model boyutuna göre belirlenir. Tipik olarak max_batch_size=32-64 ve max_latency_ms=20-100ms kombinasyonu iyi bir başlangıç noktasıdır.</p>
+    </div>
+  </section>
+
+  <!-- ── S4: Runner ─────────────────────────────────────────── -->
+  <section id="s4">
+    <h2><span class="num">04</span> Runner: Async Dispatch ve Multi-Instance</h2>
+    <p class="section-lead">Runner, modeli izole bir süreçte çalıştırır — API ve model scaling birbirinden bağımsız olur.</p>
+
+    <div class="code-block">
+      <div class="code-label">service.py — multi-runner pipeline</div>
+      <pre><code">import bentoml
+from bentoml.io import Image, JSON
+from PIL.Image import Image as PILImage
+from pydantic import BaseModel
+from typing import List
+
+# İki farklı model için ayrı runner
+preprocessor_runner = bentoml.picklable_model.get("image-preprocessor:latest").to_runner(
+    max_batch_size=128,
+    max_latency_ms=10,
+)
+classifier_runner = bentoml.pytorch.get("resnet50-classifier:latest").to_runner(
+    max_batch_size=32,
+    max_latency_ms=30,
+    # Her GPU'da bağımsız scaling
+    nvidia_gpu=1,
+)
+
+svc = bentoml.Service(
+    "image-pipeline",
+    runners=[preprocessor_runner, classifier_runner],
+)
+
+class ClassifyResponse(BaseModel):
+    label: str
+    confidence: float
+    top5: List[dict]
+
+@svc.api(input=Image(), output=JSON(pydantic_model=ClassifyResponse))
+async def classify(image: PILImage) -> ClassifyResponse:
+    # Sıralı pipeline: iki async_run çağrısı
+    tensor = await preprocessor_runner.preprocess.async_run(image)
+    logits = await classifier_runner.forward.async_run(tensor)
+
+    import torch
+    probs = torch.softmax(logits, dim=-1)
+    top5_probs, top5_ids = probs.topk(5)
+
+    return ClassifyResponse(
+        label=f"class_{top5_ids[0].item()}",
+        confidence=top5_probs[0].item(),
+        top5=[{"id": int(i), "prob": float(p)} for i, p in zip(top5_ids, top5_probs)],
+    )</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — custom runner sınıfı</div>
+      <pre><code">import bentoml
+from bentoml import Runnable
+import torch
+import numpy as np
+
+class MyModelRunnable(Runnable):
+    SUPPORTED_RESOURCES = ("nvidia.com/gpu",)
+    SUPPORTS_CPU_MULTI_THREADING = True
+
+    def __init__(self):
+        import torch
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = torch.jit.load("/models/my_model.pt").to(self.device)
+        self.model.eval()
+
+    @Runnable.method(batchable=True, batch_dim=0)
+    def predict(self, input_tensor: np.ndarray) -> np.ndarray:
+        with torch.no_grad():
+            tensor = torch.from_numpy(input_tensor).to(self.device)
+            output = self.model(tensor)
+            return output.cpu().numpy()
+
+# Runner oluştur
+runner = bentoml.Runner(MyModelRunnable, name="my-model-runner",
+                         max_batch_size=32, max_latency_ms=50)
+
+svc = bentoml.Service("custom-runner-service", runners=[runner])
+
+@svc.api(input=bentoml.io.NumpyNdarray(), output=bentoml.io.NumpyNdarray())
+async def infer(data: np.ndarray) -> np.ndarray:
+    return await runner.predict.async_run(data)</code></pre>
+    </div>
+  </section>
+
+  <!-- ── S5: Bento Build ────────────────────────────────────── -->
+  <section id="s5">
+    <h2><span class="num">05</span> Bento Build</h2>
+    <p class="section-lead">bentofile.yaml ile tüm bağımlılıkları paketle — yeniden üretilebilir Bento arşivi oluştur.</p>
+
+    <div class="code-block">
+      <div class="code-label">bentofile.yaml</div>
+      <pre><code">service: "service:svc"   # modül:servis_değişkeni
+
+labels:
+  owner: mlops-team
+  stage: production
+  project: sentiment-api
+
+include:
+  - "service.py"
+  - "utils/*.py"
+  - "config.yaml"
+
+exclude:
+  - "tests/"
+  - "*.ipynb"
+  - "__pycache__"
+
+python:
+  packages:
+    - torch==2.2.0
+    - transformers==4.39.0
+    - scikit-learn==1.4.0
+    - numpy>=1.24
+    - pandas>=2.0
+  requirements_txt: "./requirements.txt"   # veya requirements.txt kullan
+  lock_packages: true   # tam versiyon kilitleme
+
+models:
+  - "sentiment-model:latest"
+  - "distilbert-sentiment:gy5dfr2ytwpk6drp"
+
+docker:
+  base_image: "python:3.11-slim"
+  cuda_version: "12.1"
+  system_packages:
+    - libgomp1
+  env:
+    - TOKENIZERS_PARALLELISM=false
+    - TRANSFORMERS_CACHE=/app/cache</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">bash — Bento oluştur</div>
+      <pre><code">cd /project
+bentoml build
+
+# Başarılı çıktı:
+# ██████╗░ ███████╗███╗   ██╗████████╗ ██████╗ ███╗   ███╗██╗
+# ██╔══██╗██╔════╝████╗  ██║╚══██╔══╝██╔═══██╗████╗ ████║██║
+# ...
+# Successfully built Bento(tag="sentiment-service:a1b2c3d4")
+
+# Bento listesi
+bentoml list
+
+# Bento detayı
+bentoml get sentiment-service:latest
+
+# Bento'yu dışa aktar
+bentoml export sentiment-service:latest ./sentiment-service.bento
+
+# Bento'yu içe aktar
+bentoml import ./sentiment-service.bento</code></pre>
+    </div>
+  </section>
+
+  <!-- ── S6: Containerize ───────────────────────────────────── -->
+  <section id="s6">
+    <h2><span class="num">06</span> Containerize — Docker İmajı</h2>
+    <p class="section-lead">Bento'yu tek komutla Docker imajına dönüştür — CUDA destekli production-ready container.</p>
+
+    <div class="code-block">
+      <div class="code-label">bash — Docker imajı oluştur</div>
+      <pre><code">bentoml containerize sentiment-service:latest \
+  --image-tag myregistry/sentiment-service:v1.0 \
+  --platform linux/amd64
+
+# GPU destekli (CUDA)
+bentoml containerize sentiment-service:latest \
+  --image-tag myregistry/sentiment-service:v1.0-gpu \
+  --opt build-arg=BENTOML_SERVER_THREADS=4
+
+# Çalıştır
+docker run --gpus all -p 3000:3000 \
+  myregistry/sentiment-service:v1.0-gpu serve
+
+# Docker registry'e push
+docker push myregistry/sentiment-service:v1.0</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">Dockerfile — manuel oluşturma (isteğe bağlı)</div>
+      <pre><code">FROM nvcr.io/nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
+
+# Sistem bağımlılıkları
+RUN apt-get update &amp;&amp; apt-get install -y \
+    python3.11 python3-pip libgomp1 \
+    &amp;&amp; rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# BentoML ve bağımlılıkları kur
+COPY requirements.txt .
+RUN pip install --no-cache-dir bentoml -r requirements.txt
+
+# Bento arşivini içe aktar
+COPY sentiment-service.bento .
+RUN bentoml import sentiment-service.bento
+
+ENV BENTOML_HOME=/app/bentoml
+EXPOSE 3000
+
+CMD ["bentoml", "serve", "sentiment-service:latest", "--production", "--port", "3000"]</code></pre>
+    </div>
+  </section>
+
+  <!-- ── S7: Deployment ─────────────────────────────────────── -->
+  <section id="s7">
+    <h2><span class="num">07</span> Deployment: BentoCloud, Kubernetes, Lambda</h2>
+    <p class="section-lead">BentoML modellerini farklı ortamlara deploy et — Kubernetes manifesto, BentoCloud CLI ve Lambda handler.</p>
+
+    <div class="code-block">
+      <div class="code-label">yaml — Kubernetes Deployment</div>
+      <pre><code">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentiment-service
+  namespace: ml-serving
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: sentiment-service
+  template:
+    metadata:
+      labels:
+        app: sentiment-service
+    spec:
+      containers:
+        - name: sentiment-service
+          image: myregistry/sentiment-service:v1.0-gpu
+          ports:
+            - containerPort: 3000
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "500m"
+              nvidia.com/gpu: "1"
+            limits:
+              memory: "4Gi"
+              cpu: "2000m"
+              nvidia.com/gpu: "1"
+          env:
+            - name: BENTOML_SERVER_THREADS
+              value: "4"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 3000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentiment-service-svc
+  namespace: ml-serving
+spec:
+  selector:
+    app: sentiment-service
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 3000
+  type: LoadBalancer</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — AWS Lambda handler</div>
+      <pre><code">import json
+import bentoml
+import numpy as np
+
+# Lambda cold start'ta model yükle
+model = bentoml.sklearn.load_model("sentiment-model:latest")
+
+def lambda_handler(event, context):
+    """AWS Lambda entry point."""
+    try:
+        body = json.loads(event.get("body", "{}"))
+        texts = body.get("texts", [])
+
+        if not texts:
+            return {"statusCode": 400, "body": json.dumps({"error": "texts required"})}
+
+        # Inference (Lambda'da GPU yok, CPU ile çalışır)
+        # Gerçek projede feature extraction ayrı yapılır
+        results = model.predict(texts)
+
+        return {
+            "statusCode": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({
+                "predictions": results.tolist(),
+                "model_version": "latest",
+            }),
+        }
+    except Exception as e:
+        return {"statusCode": 500, "body": json.dumps({"error": str(e)})}</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">bash — BentoCloud deploy</div>
+      <pre><code">pip install bentoml[cloud]
+
+# BentoCloud giriş
+bentoml cloud login --api-token $BENTOCLOUD_TOKEN
+
+# Deploy et
+bentoml deploy sentiment-service:latest \
+  --name sentiment-prod \
+  --scaling-min 1 \
+  --scaling-max 10 \
+  --instance-type gpu.t4.1
+
+# Deploy durumu
+bentoml deployment list
+bentoml deployment get sentiment-prod</code></pre>
+    </div>
+  </section>
+
+  <!-- ── S8: Monitoring ─────────────────────────────────────── -->
+  <section id="s8">
+    <h2><span class="num">08</span> Monitoring — OpenTelemetry Entegrasyonu</h2>
+    <p class="section-lead">BentoML'in dahili OpenTelemetry desteği ile request tracing, metrik toplama ve Prometheus entegrasyonu.</p>
+
+    <div class="code-block">
+      <div class="code-label">bash — OTel collector ile başlat</div>
+      <pre><code">pip install bentoml[tracing-otlp]
+
+bentoml serve service:svc \
+  --production \
+  --port 3000 \
+  --enable-metrics \
+  --log-level info
+
+# OTel environment variables
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+export OTEL_SERVICE_NAME=sentiment-service
+export OTEL_TRACES_SAMPLER=parentbased_traceidratio
+export OTEL_TRACES_SAMPLER_ARG=0.1   # %10 örnekleme</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — custom span ve metrik</div>
+      <pre><code">import bentoml
+from bentoml.io import JSON
+from opentelemetry import trace, metrics
+from opentelemetry.trace import Status, StatusCode
+import time
+
+# Tracer ve meter al
+tracer = trace.get_tracer(__name__)
+meter  = metrics.get_meter(__name__)
+
+# Custom metrikler
+request_counter    = meter.create_counter("sentiment_requests_total")
+inference_duration = meter.create_histogram("sentiment_inference_duration_ms")
+
+runner = bentoml.transformers.get("distilbert-sentiment:latest").to_runner()
+svc = bentoml.Service("monitored-service", runners=[runner])
+
+@svc.api(input=JSON(), output=JSON())
+async def predict(data: dict) -> dict:
+    texts = data.get("texts", [])
+    request_counter.add(len(texts), {"endpoint": "/predict"})
+
+    with tracer.start_as_current_span("inference") as span:
+        span.set_attribute("batch_size", len(texts))
+        start = time.perf_counter()
+        try:
+            results = await runner.async_run(texts)
+            duration = (time.perf_counter() - start) * 1000
+            inference_duration.record(duration, {"status": "success"})
+            span.set_status(Status(StatusCode.OK))
+            return {"results": results, "latency_ms": duration}
+        except Exception as e:
+            span.set_status(Status(StatusCode.ERROR, str(e)))
+            span.record_exception(e)
+            inference_duration.record(
+                (time.perf_counter() - start) * 1000, {"status": "error"}
+            )
+            raise</code></pre>
+    </div>
+
+    <table class="file-table">
+      <thead>
+        <tr><th>Metrik</th><th>Tür</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>bentoml_request_total</td><td>Counter</td><td>Toplam HTTP istek sayısı</td></tr>
+        <tr><td>bentoml_request_duration_seconds</td><td>Histogram</td><td>İstek süresi dağılımı</td></tr>
+        <tr><td>bentoml_runner_request_total</td><td>Counter</td><td>Runner'a gönderilen istek sayısı</td></tr>
+        <tr><td>bentoml_runner_batch_size</td><td>Histogram</td><td>Adaptive batch boyutu dağılımı</td></tr>
+        <tr><td>bentoml_marshal_dispatch_duration</td><td>Histogram</td><td>Batcher dispatch süresi</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ── S9: Pratik ─────────────────────────────────────────── -->
+  <section id="s9">
+    <h2><span class="num">09</span> Pratik: HuggingFace → BentoML → Docker → Kubernetes</h2>
+    <p class="section-lead">Sentiment modeli için uçtan uca pipeline: model kaydet, servis yaz, Bento oluştur, Docker imajı yap, K8s'e deploy et.</p>
+
+    <div class="code-block">
+      <div class="code-label">python — 1. Model kaydet</div>
+      <pre><code">import bentoml
+from transformers import pipeline
+
+# HuggingFace sentiment pipeline
+hf_model = pipeline(
+    "sentiment-analysis",
+    model="distilbert-base-uncased-finetuned-sst-2-english",
+    device=-1,   # CPU (GPU için: device=0)
+)
+
+# BentoML store'a kaydet
+saved = bentoml.transformers.save_model(
+    "distilbert-sentiment",
+    hf_model,
+    signatures={"__call__": {"batchable": True, "batch_dim": 0}},
+    metadata={"base_model": "distilbert-base-uncased", "task": "sentiment"},
+)
+print(f"Kaydedildi: {saved.tag}")</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — 2. service.py yaz</div>
+      <pre><code">import bentoml
+from bentoml.io import JSON
+from pydantic import BaseModel
+from typing import List
+
+class PredictRequest(BaseModel):
+    texts: List[str]
+
+class PredictResult(BaseModel):
+    label: str
+    score: float
+
+runner = bentoml.transformers.get("distilbert-sentiment:latest").to_runner(
+    max_batch_size=32,
+    max_latency_ms=20,
+)
+svc = bentoml.Service("sentiment-prod", runners=[runner])
+
+@svc.api(
+    input=JSON(pydantic_model=PredictRequest),
+    output=JSON(),
+    route="/predict",
+)
+async def predict(req: PredictRequest):
+    results = await runner.async_run(req.texts)
+    return [{"label": r["label"], "score": round(r["score"], 4)} for r in results]</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">bash — 3. Build, containerize, deploy</div>
+      <pre><code"># Bento oluştur
+bentoml build
+
+# Docker imajı yap
+bentoml containerize sentiment-prod:latest \
+  --image-tag gcr.io/myproject/sentiment-prod:v1.0
+
+# Test et
+docker run -p 3000:3000 gcr.io/myproject/sentiment-prod:v1.0 serve
+curl -s http://localhost:3000/predict \
+  -H "Content-Type: application/json" \
+  -d '{"texts":["Muhteşem bir deneyimdi","Berbat bir ürün"]}'
+
+# Kubernetes'e push ve deploy
+docker push gcr.io/myproject/sentiment-prod:v1.0
+kubectl apply -f k8s/deployment.yaml
+kubectl rollout status deployment/sentiment-service -n ml-serving
+
+# HPA (Horizontal Pod Autoscaler)
+kubectl autoscale deployment sentiment-service \
+  --cpu-percent=70 \
+  --min=2 --max=20 \
+  -n ml-serving</code></pre>
+    </div>
+
+    <div class="callout">
+      <div class="label">SONUÇ</div>
+      <p>Bu pipeline ile herhangi bir HuggingFace modeli 30 dakika içinde production Kubernetes ortamına taşınabilir. Adaptive batching ile tek instance'da saniyede 150-300 istek işlenebilir; HPA ile yük artışına otomatik ölçekleme sağlanır.</p>
+    </div>
+  </section>
+
+</main>

@@ -1,0 +1,877 @@
+---
+layout: tutorial
+title: "Hypervisor Temelleri — ARM EL2 & İzolasyon"
+back_url: "../index.html"
+back_label: "Xen & Jailhouse"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>HYPERVİSOR</span>
+    <span>2026</span>
+  </div>
+  <h1>Hypervisor Temelleri<br><em>ARM EL2 &amp; İzolasyon</em></h1>
+  <p class="subtitle">Mixed-criticality gereksinimleri, ARM Stage-2 MMU, EL2 exception flow, SMMU/IOMMU, interrupt virtualization ve embedded hypervisor seçim rehberi.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Neden hypervisor — mixed-criticality</a></li>
+    <li><a href="#s1">Type-1 vs Type-2 hypervisor</a></li>
+    <li><a href="#s2">ARM virtualization extensions</a></li>
+    <li><a href="#s3">Paravirtualization vs full vs HW-assisted</a></li>
+    <li><a href="#s4">Embedded hypervisor karşılaştırması</a></li>
+    <li><a href="#s5">Hypervisor attack surface ve güvenlik</a></li>
+    <li><a href="#s6">Memory isolation — SMMU/IOMMU</a></li>
+    <li><a href="#s7">Interrupt virtualization</a></li>
+    <li><a href="#s8">ARM VHE ve EL2 exception flow</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Neden hypervisor — mixed-criticality</h2>
+  <p class="section-lead">Modern gömülü sistemlerde tek bir SoC üzerinde farklı güvenlik ve kritiklik seviyelerine sahip yazılımların çalıştırılması zorunlu hale gelmiştir. Bu durum <strong>mixed-criticality</strong> problem olarak tanımlanır ve çözümü hypervisor teknolojisindedir.</p>
+
+  <h3>Endüstriyel motivasyon</h3>
+  <p>Otomotiv ECU'larında IVI (In-Vehicle Infotainment), ADAS algoritmları ve powertrain kontrolü artık aynı SoC üzerinde çalışmaktadır. Bu bileşenlerin farklı güvenlik seviyeleri vardır: IVI için güvenilirlik önemli ancak güvenlik kritik değilken, powertrain kontrolü ASIL-D seviyesindedir. Hypervisor bu bileşenler arasında sert bir duvar çizer.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Bileşen</th><th>Güvenlik Seviyesi</th><th>OS</th><th>Bölme</th></tr></thead>
+      <tbody>
+        <tr><td>IVI / Multimedya</td><td>QM (Quality Managed)</td><td>Android / Linux</td><td>domU / non-root cell</td></tr>
+        <tr><td>Telematics / Bağlantı</td><td>ASIL-B</td><td>Linux + TEE</td><td>domU / non-root cell</td></tr>
+        <tr><td>ADAS</td><td>ASIL-B/C</td><td>Linux (güvenli)</td><td>ayrı domU</td></tr>
+        <tr><td>Powertrain / Güvenlik</td><td>ASIL-D</td><td>RTOS (FreeRTOS/AUTOSAR)</td><td>non-root cell</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>ISO 26262 ve IEC 61508 gereksinimleri</h3>
+  <p>ISO 26262 (otomotiv) ve IEC 61508 (fonksiyonel güvenlik) standartları, farklı ASIL/SIL seviyelerindeki bileşenler arasında <strong>freedom from interference</strong> (girişim özgürlüğü) gerektirir. Hypervisor bu izolasyonu yazılım ve donanım katmanlarında sağlar.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Temporal Isolation</span><span class="desc">Bir bölmenin CPU zamanını aşırı tüketmesi diğer bölmeleri etkilememelidir — watchdog, CPU quota</span></div>
+    <div class="param"><span class="name">Spatial Isolation</span><span class="desc">Bellek erişimi: bir bölme diğerinin fiziksel belleğine erişemez — Stage-2 MMU, SMMU</span></div>
+    <div class="param"><span class="name">Communication Channels</span><span class="desc">Bölmeler arası iletişim kontrollü ve tanımlı olmalıdır — shared memory, virtio, IVSHMEM</span></div>
+    <div class="param"><span class="name">Freedom from Interference</span><span class="desc">Düşük kritiklik bölmesindeki hata yüksek kritiklik bölmesini etkilememeli</span></div>
+  </div>
+
+  <h3>Hypervisor olmadan ne olur?</h3>
+  <p>Hypervisor olmadan tüm bileşenler aynı Linux çekirdeği üzerinde process olarak çalışır. Bu durumda kernel exploit, bir sürecin başka süreçlerin belleğine erişmesi veya aşırı kaynak tüketimi tüm sistemi tehdit eder. Güvenlik sertifikasyonu ise neredeyse imkânsız hale gelir.</p>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Mixed-criticality: tek SoC, farklı ASIL seviyeleri — izolasyon zorunlu</li>
+      <li>ISO 26262 / IEC 61508: freedom from interference gereksinimi</li>
+      <li>Hypervisor: temporal + spatial izolasyon sağlayan katman</li>
+      <li>ASIL-D bileşeni ASIL-QM bileşenden tamamen yalıtılmalı</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Type-1 vs Type-2 hypervisor</h2>
+  <p class="section-lead">Hypervisor'lar donanım ile olan ilişkilerine göre iki temel kategoriye ayrılır. Gömülü sistemlerde deterministik davranış ve düşük overhead gerektiren uygulamalar için Type-1 tercih edilir.</p>
+
+  <h3>Temel fark</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>Type-1 (Bare-metal)</th><th>Type-2 (Hosted)</th></tr></thead>
+      <tbody>
+        <tr><td>Çalışma katmanı</td><td>Doğrudan donanım üzerinde</td><td>Host OS üzerinde</td></tr>
+        <tr><td>Performans</td><td>Yüksek — donanım erişimi doğrudan</td><td>Düşük — host OS overhead</td></tr>
+        <tr><td>Güvenlik yüzeyi</td><td>Küçük — minimal hypervisor kodu</td><td>Büyük — host OS dahil</td></tr>
+        <tr><td>Determinizm</td><td>Yüksek — real-time mümkün</td><td>Düşük — host OS jitter</td></tr>
+        <tr><td>Örnekler</td><td>Xen, Jailhouse, ACRN, seL4/CAmkES</td><td>VirtualBox, VMware Workstation, QEMU</td></tr>
+        <tr><td>Gömülü kullanım</td><td>Tercih edilen</td><td>Geliştirme/test ortamı</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Jailhouse: Linux üzerinde Type-1</h3>
+  <p>Jailhouse ilginç bir hibrit yaklaşım sunar: başlangıçta Linux üzerinde çalışır ancak <code>jailhouse enable</code> komutuyla Linux kendisini bir cell içine alır ve Jailhouse doğrudan donanımı kontrol eden gerçek bir Type-1 hypervisor'a dönüşür. Bu yüzden Jailhouse hem "Linux üzerinde çalışır" hem de "Type-1'dir" ifadeleri doğrudur.</p>
+
+  <h3>TCB (Trusted Computing Base) perspektifi</h3>
+  <p>Güvenlik sertifikasyonunda TCB, güvenilir olması gereken kod tabanının büyüklüğünü tanımlar. Hypervisor türüne göre TCB boyutu önemli ölçüde değişir.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Hypervisor</th><th>TCB Büyüklüğü</th><th>Sertifikasyon Uygunluğu</th></tr></thead>
+      <tbody>
+        <tr><td>Jailhouse</td><td>~20.000 satır</td><td>ASIL-D için uygun</td></tr>
+        <tr><td>Xen (minimal subset)</td><td>~100.000 satır</td><td>ASIL-B/C için zorlu</td></tr>
+        <tr><td>KVM + Linux</td><td>~25.000.000 satır</td><td>ASIL için pratik değil</td></tr>
+        <tr><td>seL4</td><td>~10.000 satır</td><td>Formally verified — ASIL-D</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="flow">
+    <pre>
+Başlangıç:   [ Linux (bare-metal) ]
+                     |
+jailhouse enable komutu
+                     ↓
+Sonra:       [ Jailhouse Hypervisor ]
+             [ Root Cell (Linux) ] [ Non-root Cell (RTOS) ]
+    </pre>
+  </div>
+
+  <h3>Mikro-kernel yaklaşımı — seL4</h3>
+  <p>seL4 gibi formally verified mikro-kernel tabanlı hypervisor'lar, matematiksel olarak kanıtlanmış izolasyon sağlar. Kod tabanı binlerce satır mertebesinde olup ASIL-D sertifikasyonu için idealdir ancak geliştirme ekosistemi Xen/Jailhouse'a kıyasla daha kısıtlıdır.</p>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Type-1: donanım üzerinde doğrudan — düşük overhead, yüksek güvenlik</li>
+      <li>Type-2: host OS üzerinde — geliştirme kolaylığı, yüksek overhead</li>
+      <li>Jailhouse: Linux enable → Type-1'e dönüşen hibrit model</li>
+      <li>seL4: formally verified — ASIL-D için uygun ama ekosistem kısıtlı</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> ARM virtualization extensions</h2>
+  <p class="section-lead">ARMv7-A ve ARMv8-A/v9-A mimarilerinde donanım sanallaştırma desteği EL2 (Exception Level 2) ile sağlanır. Bu seviye, hypervisor kodunun çalıştığı ayrıcalıklı kattır.</p>
+
+  <h3>ARM exception level hiyerarşisi</h3>
+
+  <div class="flow">
+    <pre>
+EL3  — Secure Monitor (TrustZone, ATF BL31)        ← en ayrıcalıklı
+EL2  — Hypervisor (Xen, Jailhouse, KVM/ARM)
+EL1  — OS Kernel (Linux, RTOS)
+EL0  — Userspace (uygulamalar)                      ← en az ayrıcalıklı
+    </pre>
+  </div>
+
+  <h3>Stage-2 MMU (İki aşamalı bellek çevirisi)</h3>
+  <p>ARM sanallaştırmasının temel taşı Stage-2 MMU'dur. Normal bellek çevirisi (Stage-1) guest OS tarafından yönetilirken, Stage-2 hypervisor tarafından kontrol edilir ve guest'in fiziksel adres görünümünü gerçek fiziksel adreslerle eşler.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Aşama</th><th>Giriş</th><th>Çıkış</th><th>Kontrol Eden</th></tr></thead>
+      <tbody>
+        <tr><td>Stage-1</td><td>VA (Virtual Address)</td><td>IPA (Intermediate Physical Address)</td><td>Guest OS (EL1)</td></tr>
+        <tr><td>Stage-2</td><td>IPA (Intermediate Physical)</td><td>PA (Real Physical Address)</td><td>Hypervisor (EL2)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>HCR_EL2 — Hypervisor Configuration Register</h3>
+  <p>HCR_EL2 kaydı hypervisor'ın guest kontrolünü belirler. Bu kayıttaki bitler hangi işlemlerin EL1'de trap oluşturacağını ve EL2'ye geçiş yapacağını tanımlar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>ARM assembly — HCR_EL2 temel bit'leri</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">; HCR_EL2 önemli bit'ler</span>
+<span class="cmt">; VM  [0]  : Stage-2 MMU etkinleştir (1 = enabled)</span>
+<span class="cmt">; SWIO[1]  : Set/Way cache operations trap</span>
+<span class="cmt">; PTW [2]  : Protected Table Walk</span>
+<span class="cmt">; FMO[8]   : FIQ routing to EL2</span>
+<span class="cmt">; IMO[9]   : IRQ routing to EL2</span>
+<span class="cmt">; AMO[10]  : Async abort routing to EL2</span>
+<span class="cmt">; RW [31]  : Register Width — 1=aarch64 guest</span>
+<span class="cmt">; TGE[27]  : Trap General Exceptions to EL2</span>
+
+<span class="cmt">; Hypervisor başlangıcında HCR_EL2 ayarı</span>
+mov  x0, #(1 &lt;&lt; 31)    <span class="cmt">; RW — AArch64 guest</span>
+orr  x0, x0, #(1 &lt;&lt; 1) <span class="cmt">; SWIO</span>
+orr  x0, x0, #(1 &lt;&lt; 0) <span class="cmt">; VM — Stage-2 aktif</span>
+msr  HCR_EL2, x0
+isb</code></pre>
+  </div>
+
+  <h3>VGIC — Virtualized Generic Interrupt Controller</h3>
+  <p>ARM GICv3/GICv4, donanım düzeyinde interrupt sanallaştırmayı destekler. VGIC, her guest'e kendi sanal interrupt controller görünümünü sunar. LPI (Locality-specific Peripheral Interrupts) ile fiziksel interruptlar doğrudan guest'e iletilebilir — bu <strong>direct injection</strong> olarak bilinir ve VM-exit gerektirmez.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">VGIC Distributor</span><span class="desc">Her guest kendi GICD register'larını görür; hypervisor bu register erişimlerini trap eder</span></div>
+    <div class="param"><span class="name">VGIC Redistributor</span><span class="desc">Per-vCPU redistributor — GICv3'te her CPU'ya ait interrupt state</span></div>
+    <div class="param"><span class="name">LPI Direct Injection</span><span class="desc">GICv4: MSI interrupt'ları hypervisor müdahalesi olmadan guest'e iletilir</span></div>
+    <div class="param"><span class="name">Virtual CPU Interface</span><span class="desc">ICC_IAR1_EL1 gibi system register'lar guest tarafından doğrudan erişilebilir</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>EL2: ARM'da hypervisor seviyesi — EL3 (secure monitor) altında, EL1 (kernel) üstünde</li>
+      <li>Stage-2 MMU: VA→IPA (guest) + IPA→PA (hypervisor) — çift katmanlı çeviri</li>
+      <li>HCR_EL2: hypervisor konfigürasyon kaydı — VM bit, routing, RW flag</li>
+      <li>VGIC: donanım destekli interrupt sanallaştırma — GICv3/v4</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Paravirtualization vs full vs HW-assisted</h2>
+  <p class="section-lead">Guest OS ile hypervisor arasındaki etkileşim modeli performansı ve uyumluluk karmaşıklığını doğrudan belirler. ARM donanım sanallaştırması ile bu farklar önemli ölçüde azalmıştır.</p>
+
+  <h3>Üç yaklaşımın karşılaştırması</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Yaklaşım</th><th>Guest OS Değişimi</th><th>Performans</th><th>Uyumluluk</th><th>Örnek</th></tr></thead>
+      <tbody>
+        <tr><td>Full Virtualization</td><td>Yok — değiştirilmemiş guest</td><td>Orta — her privileged instr. trap</td><td>Yüksek — herhangi bir OS</td><td>QEMU (binary translation)</td></tr>
+        <tr><td>Paravirtualization (PV)</td><td>Yüksek — guest hypercall kullanır</td><td>Yüksek — trap sayısı az</td><td>Düşük — kernel değiştirilmeli</td><td>Xen PV, virtio</td></tr>
+        <tr><td>HW-Assisted</td><td>Minimal — driver-level</td><td>En yüksek — donanım trap</td><td>Yüksek — değiştirilmemiş guest</td><td>Xen HVM, KVM, Jailhouse</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>ARM PV (Paravirtualized) sürücüler</h3>
+  <p>Xen ARM'da tam paravirtualization yerine <strong>PVHVM</strong> yaklaşımı kullanılır: guest değiştirilmemiş Linux çekirdeğidir ancak PV sürücüler (xen-blkfront, xen-netfront) I/O için hypercall arayüzünü kullanır. Bu emülasyona kıyasla çok daha yüksek I/O throughput sağlar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Xen PV sürücü durumu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Guest içinde PV sürücü yüklü mü?</span>
+<span class="cmd">lsmod</span> | grep xen
+<span class="cmt"># xen_netfront    24576  0</span>
+<span class="cmt"># xen_blkfront    40960  2</span>
+<span class="cmt"># xenbus_probe_frontend  16384  2 xen_netfront,xen_blkfront</span>
+
+<span class="cmt"># Xen hypervisor üzerinde olduğumuzu doğrula</span>
+<span class="cmd">cat</span> /proc/xen/capabilities
+<span class="cmt"># control_d  (dom0 ise)</span>
+
+<span class="cmd">xl</span> dmesg | grep -i "virt"
+<span class="cmt"># (XEN) ARM64 Virtualization Extensions enabled</span></code></pre>
+  </div>
+
+  <h3>Virtio — standart PV I/O arayüzü</h3>
+  <p>Virtio, Xen ve KVM gibi farklı hypervisor'larda kullanılabilen standart bir paravirtualized I/O arayüzüdür. <code>virtio-net</code>, <code>virtio-blk</code>, <code>virtio-serial</code> gibi sürücüler Linux kernel'ında hazır gelir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — virtio sürücü kontrolü</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Virtio sürücülerini listele</span>
+<span class="cmd">lspci</span> | grep -i virtio
+<span class="cmt"># 00:01.0 Ethernet controller: Red Hat, Inc. Virtio network device</span>
+
+<span class="cmt"># Virtio disk performans testi</span>
+<span class="cmd">dd</span> if=/dev/vda of=/dev/null bs=1M count=512 iflag=direct
+<span class="cmt"># 512+0 records in ... 1.23 GB/s</span>
+
+<span class="cmt"># Virtio ağ arayüzü</span>
+<span class="cmd">ip</span> link show
+<span class="cmt"># 2: eth0: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; ... virtio_net</span></code></pre>
+  </div>
+
+  <h3>Shared memory IPC — PV iletişim kanalları</h3>
+  <p>Paravirtualized sistemlerde bölmeler arası iletişim için doğrudan paylaşımlı bellek en verimli yöntemdir. Xen'de <strong>grant table</strong>, Jailhouse'da <strong>IVSHMEM</strong> bu mekanizmayı sağlar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Xen grant table bilgisi (dom0)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Dom0'da grant table bilgisi</span>
+<span class="cmd">cat</span> /proc/xen/grant_tables
+<span class="cmt"># nr_pages: 16</span>
+<span class="cmt"># max_nr_pages: 4096</span>
+
+<span class="cmt"># Aktif grant referansları</span>
+<span class="cmd">ls</span> /sys/kernel/debug/xen/
+<span class="cmt"># grant-table  grant-tables  runstate  xenbus</span>
+
+<span class="cmt"># DomU'nun grant ettiği sayfalar</span>
+<span class="cmd">cat</span> /sys/kernel/debug/xen/grant-table
+<span class="cmt"># domid=1: 128 active grants</span></code></pre>
+  </div>
+
+  <h3>VM-exit overhead analizi</h3>
+  <p>Her VM-exit (trap), guest CPU'nun kaydedilmesi ve hypervisor işlemciye geçmesi anlamına gelir. Bu geçiş yüzlerce nanosaniyeden birkaç mikroşaniyeye kadar sürebilir ve sistem performansını direkt etkiler.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">ARM EL1→EL2 geçişi</span><span class="desc">~200-500ns — register save/restore dahil</span></div>
+    <div class="param"><span class="name">MMIO emülasyonu</span><span class="desc">Her MMIO erişimi = VM-exit → ~1-5µs overhead</span></div>
+    <div class="param"><span class="name">Interrupt injection</span><span class="desc">~500ns-1µs — VGIC üzerinden sanal IRQ</span></div>
+    <div class="param"><span class="name">Jailhouse overhead</span><span class="desc">Minimal — static partitioning sayesinde çok az VM-exit</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Full virt: değiştirilmemiş guest, orta performans — tüm trap'ler emüle edilir</li>
+      <li>Paravirt: guest hypercall kullanır, yüksek I/O performansı — kernel değişikliği gerekli</li>
+      <li>HW-assisted: ARM EL2 ile donanım trap — en iyi performans ve uyumluluk</li>
+      <li>Virtio: cross-hypervisor standart PV I/O — net/blk/serial</li>
+      <li>Grant table: Xen zero-copy IPC — domU → dom0 bellek sayfası paylaşımı</li>
+      <li>VM-exit overhead: 200ns-5µs — Jailhouse statik yapısıyla minimize eder</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Embedded hypervisor karşılaştırması</h2>
+  <p class="section-lead">Gömülü sistemler için birden fazla hypervisor seçeneği mevcuttur. Her birinin güçlü ve zayıf yönleri farklı kullanım senaryolarına uyum sağlar.</p>
+
+  <h3>Kapsamlı karşılaştırma tablosu</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Hypervisor</th><th>Mimari</th><th>Lisans</th><th>Güvenlik</th><th>Ekosistem</th><th>Gömülü Uygunluk</th></tr></thead>
+      <tbody>
+        <tr><td>Xen</td><td>Type-1, mikro-kernel benzeri</td><td>GPL-2.0</td><td>FLASK/XSM, Xen Security Modules</td><td>Geniş — Yocto, OpenEmbedded</td><td>Yüksek — ARM, x86</td></tr>
+        <tr><td>Jailhouse</td><td>Type-1, static partitioning</td><td>GPL-2.0</td><td>Minimal saldırı yüzeyi</td><td>Orta — Yocto destekli</td><td>Çok yüksek — determinizm</td></tr>
+        <tr><td>KVM/ARM</td><td>Type-1 (Linux modülü)</td><td>GPL-2.0</td><td>Linux güvenlik modülleri</td><td>Çok geniş — QEMU, libvirt</td><td>Orta — overhead yüksek</td></tr>
+        <tr><td>ACRN</td><td>Type-1, Intel odaklı</td><td>BSD-3-Clause</td><td>ACRN-DM güvenlik modeli</td><td>Orta — Intel ekosistemi</td><td>Yüksek — IVI odaklı</td></tr>
+        <tr><td>seL4</td><td>Mikro-kernel</td><td>GPL-2.0 / ticari</td><td>Formal verification</td><td>Kısıtlı</td><td>ASIL-D için ideal</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Jailhouse'un avantajları — gömülü perspektif</h3>
+  <p>Jailhouse, static partitioning yaklaşımıyla öne çıkar. Dinamik VM oluşturma/silme yoktur; her şey önceden yapılandırılmıştır. Bu yaklaşım:</p>
+  <ul>
+    <li>Çok küçük hypervisor kod tabanı (~20.000 satır) — daha kolay sertifikasyon</li>
+    <li>Deterministik davranış — real-time bölmeler için kritik</li>
+    <li>Linux sürücü ekosistemini root cell üzerinden kullanma imkânı</li>
+    <li>Bare-metal inmate ile custom firmware yazılabilmesi</li>
+  </ul>
+
+  <h3>Xen'in avantajları</h3>
+  <p>Xen, olgunlaşmış bir proje olup sunucu sanallaştırmasında kanıtlanmış güvenlik kaydına sahiptir. Gömülü alanda dom0-less boot ile Linux olmadan çalışabilir, FLASK/XSM ile MAC politikaları uygulanabilir.</p>
+
+  <h3>ACRN — Otomotiv odaklı hypervisor</h3>
+  <p>Intel'in geliştirdiği ACRN (A Cracking Real-time hypervisor for embedded), otomotiv IVI sistemleri için özel olarak tasarlanmıştır. x86 Intel VT-x üzerinde çalışır, Android guest desteği güçlüdür. ARM desteği kısıtlı olup i.MX8 gibi ARM SoC'larda tercih edilmez.</p>
+
+  <h3>Gömülü hypervisor seçim kriterleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Hypervisor seçim yardımcısı</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># Platform: ARM mı, x86 mi?</span>
+<span class="cmt"># ARM + gömülü → Xen veya Jailhouse</span>
+<span class="cmt"># x86 + IVI → ACRN veya KVM</span>
+
+<span class="cmt"># Sertifikasyon gerekli mi?</span>
+<span class="cmt"># ASIL-D → Jailhouse (küçük TCB) veya seL4</span>
+<span class="cmt"># ASIL-B/C → Xen (olgun, FLASK/XSM)</span>
+
+<span class="cmt"># Dinamik VM yönetimi gerekli mi?</span>
+<span class="cmt"># Evet → Xen (xl toolstack) veya KVM (libvirt)</span>
+<span class="cmt"># Hayır → Jailhouse (static, deterministic)</span>
+
+<span class="cmt"># Real-time garantisi?</span>
+<span class="cmt"># Sıkı RT → Jailhouse bare-metal cell</span>
+<span class="cmt"># Esnek RT → Xen RTDS scheduler + KVM CPU pinning</span>
+
+<span class="cmt"># Platform kontrolü</span>
+<span class="cmd">jailhouse</span> hardware check  <span class="cmt"># Jailhouse uyumluluğu</span>
+<span class="cmd">xl</span> info 2&gt;/dev/null        <span class="cmt"># Xen çalışıyor mu?</span>
+<span class="cmd">ls</span> /dev/kvm 2&gt;/dev/null    <span class="cmt"># KVM mevcut mu?</span></code></pre>
+  </div>
+
+  <h3>Hypervisor güvenlik sertifika yolları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Standart</th><th>Sektör</th><th>Hypervisor Gereksinimi</th><th>Uygun Seçenek</th></tr></thead>
+      <tbody>
+        <tr><td>ISO 26262 ASIL-D</td><td>Otomotiv</td><td>Formal kanıt + küçük TCB</td><td>Jailhouse, seL4</td></tr>
+        <tr><td>IEC 61508 SIL-3</td><td>Endüstriyel</td><td>Güvenlik analizi + test</td><td>Jailhouse, Xen</td></tr>
+        <tr><td>DO-178C Level A</td><td>Aviyonik</td><td>MC/DC coverage + formal</td><td>seL4, PikeOS</td></tr>
+        <tr><td>CC EAL4+</td><td>Güvenlik</td><td>Formal doğrulama</td><td>seL4, Xen (CC belgelenmiş)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Jailhouse: static partitioning, küçük kod tabanı, determinizm — gömülü ideal</li>
+      <li>Xen: olgun, FLASK/XSM güvenlik, dom0-less — ARM gömülü için güçlü</li>
+      <li>KVM: geniş ekosistem ama overhead yüksek — cloud/geliştirme uygun</li>
+      <li>ACRN: Intel IVI odaklı — ARM'da kısıtlı destek</li>
+      <li>seL4: formal verification — ASIL-D, DO-178C Level A için</li>
+      <li>Seçim kriterleri: ARM/x86, sertifikasyon, dinamik VM, RT garantisi</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Hypervisor attack surface ve güvenlik</h2>
+  <p class="section-lead">Hypervisor güvenliği, tüm üstündeki sistemlerin güvenliğini belirler. Hypervisor compromise = tüm guest'lerin compromise'ı anlamına gelir. Bu yüzden saldırı yüzeyi minimize edilmelidir.</p>
+
+  <h3>Temel saldırı vektörleri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">VM escape</span><span class="desc">Guest'ten hypervisor'a geçiş — güvenlik açığı sömürülerek Stage-2 MMU bypass</span></div>
+    <div class="param"><span class="name">MMIO emülasyon açıkları</span><span class="desc">Emüle edilen I/O cihazlarında buffer overflow veya integer overflow</span></div>
+    <div class="param"><span class="name">Hypercall interface</span><span class="desc">Xen hypercall'larında validation eksikliği — saldırgan guest olarak exploit</span></div>
+    <div class="param"><span class="name">Side-channel</span><span class="desc">Spectre/Meltdown — paylaşılan CPU önbelleği üzerinden bilgi sızıntısı</span></div>
+    <div class="param"><span class="name">DMA saldırıları</span><span class="desc">Kötü niyetli donanım sürücüsü — SMMU olmadan fiziksel belleğe DMA erişimi</span></div>
+  </div>
+
+  <h3>Savunma stratejileri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Xen güvenlik sertleştirme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Xen komut satırı güvenlik seçenekleri</span>
+<span class="cmt"># /boot/extlinux.conf veya GRUB'da Xen parametreleri</span>
+
+<span class="cmt"># SMMU etkinleştir (IOMMU)</span>
+xen.gz iommu=on iommu_inclusive_mappings=on
+
+<span class="cmt"># Spectre/Meltdown azaltmaları</span>
+xen.gz spec-ctrl=full bti-thunk=retpoline
+
+<span class="cmt"># Dom0 yeteneklerini kısıtla</span>
+xen.gz dom0_max_vcpus=2 dom0_mem=512M,max:512M
+
+<span class="cmt"># XSM (Xen Security Modules) etkinleştir</span>
+xen.gz flask=enforcing
+
+<span class="cmt"># Dom0 için driver domain modeli — minimum yetki</span>
+<span class="cmt"># Ayrı driver domain'ler dom0'dan bağımsız sürücü çalıştırır</span></code></pre>
+  </div>
+
+  <h3>Jailhouse minimal saldırı yüzeyi</h3>
+  <p>Jailhouse'un en büyük güvenlik avantajı minimal kod tabanıdır. Hypervisor kodu yalnızca ~20.000 satırdır ve dinamik bellek yönetimi veya kompleks hypercall interface içermez. Sertifikasyon için bu kritik bir avantajdır.</p>
+
+  <h3>Güvenli hypervisor konfigürasyon kontrol listesi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Jailhouse güvenlik kontrol listesi</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># 1. SMMU/IOMMU etkin mi?</span>
+<span class="cmd">jailhouse</span> hardware check | grep IOMMU
+<span class="cmt"># [  OK  ] IOMMU available</span>
+
+<span class="cmt"># 2. Cell'lerin bellek bölgeleri örtüşüyor mu?</span>
+<span class="cmt"># (Jailhouse enable sırasında otomatik kontrol edilir)</span>
+<span class="cmd">jailhouse</span> enable root.cell 2&gt;&amp;1 | grep -i overlap
+<span class="cmt"># (çıktı olmamalı)</span>
+
+<span class="cmt"># 3. Xen: FLASK enforcing mod</span>
+<span class="cmd">xl</span> getenforce
+<span class="cmt"># Enforcing</span>
+
+<span class="cmt"># 4. Secure boot zinciri (platform bütünlüğü)</span>
+<span class="cmd">dmesg</span> | grep -i "secure boot\|verified boot"
+
+<span class="cmt"># 5. Spectre/Meltdown azaltmaları</span>
+<span class="cmd">cat</span> /sys/devices/system/cpu/vulnerabilities/spectre_v2
+<span class="cmt"># Mitigation: CSV2, BHB</span>
+<span class="cmd">cat</span> /sys/devices/system/cpu/vulnerabilities/meltdown
+<span class="cmt"># Mitigation: Stage-2 isolation</span></code></pre>
+  </div>
+
+  <h3>TrustZone ile hypervisor entegrasyonu</h3>
+  <p>ARM TrustZone ve EL2 hypervisor birlikte kullanılabilir. TrustZone (EL3/Secure EL1) güvenli dünyayı yönetirken, Xen/Jailhouse (EL2) normal dünya sanallaştırmasını yürütür. Bu katmanlama ASIL-D güvenli depolama ve şifreleme için idealdir.</p>
+
+  <div class="flow">
+    <pre>
+Normal World (NS=1)          Secure World (NS=0)
+EL2: Xen/Jailhouse           EL3: ATF BL31 (Secure Monitor)
+EL1: Guest Linux/RTOS        EL1-S: OP-TEE / OPTEE_OS
+EL0: Guest Userspace         EL0-S: Trusted Applications
+         ↑                            ↑
+         └──── SMC (Secure Monitor Call) ────┘
+    </pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>VM escape: en kritik saldırı — Stage-2 MMU bypass</li>
+      <li>SMMU/IOMMU: DMA saldırılarına karşı zorunlu koruma</li>
+      <li>Spectre/Meltdown: Xen spec-ctrl parametreleri + ARM CSV2/BHB</li>
+      <li>Jailhouse: küçük kod tabanı = küçük saldırı yüzeyi</li>
+      <li>TrustZone + EL2: normal dünya hypervisor + güvenli dünya TEE</li>
+      <li>FLASK enforcing + secure boot: katmanlı güvenlik yaklaşımı</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Memory isolation — SMMU/IOMMU</h2>
+  <p class="section-lead">Stage-2 MMU CPU bellek erişimini izole eder ancak DMA-capable cihazlar bu korumayı atlayabilir. SMMU (System Memory Management Unit) bu boşluğu kapatır.</p>
+
+  <h3>SMMU mimarisi</h3>
+  <p>ARM SMMU (SMMUv2/SMMUv3), bir DMA master cihazının gerçekleştireceği bellek işlemlerini Stream ID'ye göre filtreleme ve çevirme yeteneği sunar. Bu sayede bir guest'e atanmış bir DMA cihazı yalnızca o guest'in fiziksel bellek bölgesine erişebilir.</p>
+
+  <div class="flow">
+    <pre>
+DMA Master (NIC, USB, PCIe) → SMMU → Stage-2 benzeri çeviri → Fiziksel Bellek
+        Stream ID ↗              ↑
+                         Context Descriptor Table
+                         (hypervisor tarafından yönetilir)
+    </pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — SMMU durum kontrolü (Linux)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ARM SMMU sürücü yüklü mü?</span>
+<span class="cmd">dmesg</span> | grep -i smmu
+<span class="cmt"># [    1.234567] arm-smmu 51400000.iommu: probing hardware configuration</span>
+<span class="cmt"># [    1.234890] arm-smmu 51400000.iommu: stage 2 translation only</span>
+
+<span class="cmt"># IOMMU gruplarını listele</span>
+<span class="cmd">ls</span> /sys/kernel/iommu_groups/
+<span class="cmt"># 0  1  2  3  ...</span>
+
+<span class="cmt"># Belirli bir grubun cihazlarını gör</span>
+<span class="cmd">ls</span> /sys/kernel/iommu_groups/1/devices/
+<span class="cmt"># 0000:00:01.0 -&gt; ../../../devices/pci0000:00/0000:00:01.0</span>
+
+<span class="cmt"># VFIO ile cihazı guest'e ata (Xen passthrough için)</span>
+<span class="cmd">echo</span> vfio-pci &gt; /sys/bus/pci/devices/0000:00:01.0/driver_override
+<span class="cmd">echo</span> 0000:00:01.0 &gt; /sys/bus/pci/drivers/vfio-pci/bind</code></pre>
+  </div>
+
+  <h3>Memory color ve cache partitioning</h3>
+  <p>Gelişmiş mixed-criticality sistemlerde DRAM bankı renklendirme (memory coloring) ile önbellek kirliliği azaltılır. L2/L3 önbelleği farklı bölmeler arasında paylaştırılmaz — her bölme kendi önbellek setlerini kullanır.</p>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>SMMU: DMA master'ları için Stage-2 benzeri bellek çevirisi ve izolasyon</li>
+      <li>Stream ID: her DMA cihazına ait bağlam tanımlayıcısı</li>
+      <li>VFIO: Linux'ta güvenli device passthrough için SMMU entegrasyonu</li>
+      <li>Memory coloring: cache kirliliğini önlemek için DRAM bankı renklendirme</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Interrupt virtualization</h2>
+  <p class="section-lead">Interrupt'ların guest'lere dağıtımı hypervisor'ın en kritik görevlerinden biridir. ARM GICv3/v4 bu işlemi donanım düzeyinde optimize eder.</p>
+
+  <h3>Interrupt yönlendirme modları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Mod</th><th>Açıklama</th><th>Gecikme</th><th>Kullanım</th></tr></thead>
+      <tbody>
+        <tr><td>Trap-and-emulate</td><td>GIC register erişimi EL2'ye trap olur, hypervisor emüle eder</td><td>Yüksek (~1µs)</td><td>Eski GICv2</td></tr>
+        <tr><td>Virtual IRQ injection</td><td>Hypervisor sanal IRQ oluşturur, guest CPU arayüzüne yazar</td><td>Orta (~500ns)</td><td>GICv3</td></tr>
+        <tr><td>LPI direct injection</td><td>Fiziksel IRQ doğrudan guest'e — hypervisor müdahalesi yok</td><td>Düşük (~100ns)</td><td>GICv4, passthrough</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Xen'de interrupt yönetimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>xl.cfg — IRQ passthrough (Xen)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># domU'ya fiziksel interrupt atama</span>
+irqs = [ 32, 33 ]    <span class="cmt"># SPI 0 ve 1 (32 = SPI 0)</span>
+
+<span class="cmt"># IRQ numaraları: /proc/interrupts veya device tree'den</span>
+<span class="cmt"># cat /proc/interrupts | grep uart</span>
+<span class="cmt">#  32:     1234   GICv3  32 Level  uart0</span>
+
+<span class="cmt"># VGIC v3 kullan (GICv3 donanım gerektirir)</span>
+gic_version = "v3"</code></pre>
+  </div>
+
+  <h3>Timer virtualization</h3>
+  <p>ARM Generic Timer (arch_timer) sanal timer sağlar. EL1 Physical Timer, EL1 Virtual Timer ve EL2 Physical Timer olmak üzere ayrı timer register'ları mevcuttur. Guest'ler virtual timer kullanırken hypervisor EL2 timer ile kendi zamanlama görevlerini yürütür.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Timer sanallaştırma kontrolü</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ARM arch_timer interrupt'ları</span>
+<span class="cmd">cat</span> /proc/interrupts | grep arch_timer
+<span class="cmt"># 11:    123456    GICv3  11 Level    arch_timer</span>
+<span class="cmt"># 12:      5678    GICv3  12 Level    arch_timer (virtual)</span>
+
+<span class="cmt"># Timer frekansı</span>
+<span class="cmd">cat</span> /sys/devices/system/clocksource/clocksource0/current_clocksource
+<span class="cmt"># arch_sys_counter</span></code></pre>
+  </div>
+
+  <h3>SGI — Software Generated Interrupt</h3>
+  <p>SGI (Software Generated Interrupt, IPI), yazılım tarafından üretilen ve işlemciler arası iletişim için kullanılan bir GIC interrupt türüdür. Hypervisor ortamında SGI'lar sanal CPU'lar arasında da kullanılabilir — örneğin dom0 bir domU vCPU'sunu SGI ile uyandırabilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — GIC interrupt türleri</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># GIC interrupt kategorileri</span>
+<span class="cmt"># SGI (Software Generated): 0-15   — IPI, işlemciler arası</span>
+<span class="cmt"># PPI (Private Peripheral):  16-31 — CPU'ya özel (timer, PMU)</span>
+<span class="cmt"># SPI (Shared Peripheral):   32+   — paylaşılan (UART, DMA)</span>
+<span class="cmt"># LPI (Locality-spec):       8192+ — MSI, PCIe</span>
+
+<span class="cmt"># /proc/interrupts ile interrupt dağılımı</span>
+<span class="cmd">cat</span> /proc/interrupts | head -20
+<span class="cmt">#           CPU0   CPU1   CPU2   CPU3</span>
+<span class="cmt">#  1:        100      0      0      0  GICv3   1 Edge  IPI reschedule</span>
+<span class="cmt">#  2:          0    150      0      0  GICv3   2 Edge  IPI call func</span>
+<span class="cmt"># 11:      45678  23456  12345   9876  GICv3  11 Level arch_timer</span>
+
+<span class="cmt"># Xen: virtual SGI kullanımı</span>
+<span class="cmd">xl</span> dmesg | grep -i "SGI\|IPI"
+<span class="cmt"># (XEN) VGIC: virtual SGI injection for domain 1</span></code></pre>
+  </div>
+
+  <h3>Interrupt affinity ve real-time</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Interrupt affinity yönetimi</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># Interrupt'ı belirli CPU'ya yönlendir</span>
+<span class="cmd">cat</span> /proc/irq/58/smp_affinity_list
+<span class="cmt"># 0-3  (tüm CPU'larda)</span>
+
+<span class="cmt"># Sadece CPU 0-1'de işle (real-time CPU 2-3 korunur)</span>
+<span class="cmd">echo</span> "0,1" &gt; /proc/irq/58/smp_affinity_list
+
+<span class="cmt"># UART interrupts → CPU 0'a yönlendir</span>
+<span class="cmd">for</span> irq in $(grep -l serial /proc/irq/*/type 2&gt;/dev/null | \
+             grep -o '[0-9]\+'); do
+    echo 1 &gt; /proc/irq/$irq/smp_affinity
+done
+
+<span class="cmt"># Jailhouse'da inmate CPU'larına interrupt routing</span>
+<span class="cmt"># Cell config irqchips.pin_bitmap ile kontrol edilir</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Trap-and-emulate: en yüksek gecikme, eski GIC ile zorunlu</li>
+      <li>Virtual IRQ injection: GICv3 — orta gecikme, yaygın kullanım</li>
+      <li>LPI direct injection: GICv4 — donanım hızında, en düşük gecikme</li>
+      <li>ARM Generic Timer: EL1 virtual / EL2 physical — guest/hypervisor ayrımı</li>
+      <li>SGI (IPI): yazılım interrupt — vCPU'lar arası uyandırma mekanizması</li>
+      <li>smp_affinity: interrupt CPU yönlendirmesi — RT CPU koruması</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> ARM VHE ve EL2 exception flow</h2>
+  <p class="section-lead">ARM VHE (Virtualization Host Extensions, ARMv8.1) host OS'u EL2'de çalıştırmayı mümkün kılar. Bu, KVM gibi hosted hypervisor'ların EL1↔EL2 geçişi overhead'ını ortadan kaldırır.</p>
+
+  <h3>VHE nedir?</h3>
+  <p>Geleneksel ARM sanallaştırmada host OS EL1'de, hypervisor EL2'de çalışır. KVM gibi hypervisor'larda EL1 (host Linux) ile EL2 (kvm.ko) arasındaki context switch overhead sorunuydu. VHE ile:</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Durum</th><th>Host OS</th><th>Hypervisor</th><th>Guest OS</th></tr></thead>
+      <tbody>
+        <tr><td>VHE öncesi</td><td>EL1</td><td>EL2</td><td>EL1 (ayrı)</td></tr>
+        <tr><td>VHE sonrası</td><td>EL2 (HCR_EL2.E2H=1)</td><td>EL2 (kernel modülü)</td><td>EL1</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>EL2 exception entry/exit akışı</h3>
+
+  <div class="flow">
+    <pre>
+Guest (EL1) çalışıyor
+       |
+       | Privileged instruction / Stage-2 fault / IRQ (IMO=1)
+       ↓
+EL2 exception vector (VBAR_EL2)
+       |
+       | Hypervisor exception handler
+       | - ESR_EL2: exception syndrome register okuma
+       | - FAR_EL2: fault address register (page fault ise)
+       | - HPFAR_EL2: IPA fault address
+       ↓
+Hypervisor işlemi tamamlar (page table güncelle, IRQ inject, emüle et)
+       |
+       | ERET (Exception Return)
+       ↓
+Guest (EL1) kaldığı yerden devam eder
+    </pre>
+  </div>
+
+  <h3>ESR_EL2 — Exception Syndrome Register</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — ESR_EL2 decode örneği (Jailhouse stili)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* ESR_EL2 EC (Exception Class) alanı [31:26] */</span>
+<span class="cmt">/* Yaygın EC değerleri */</span>
+#define ESR_EC_UNKNOWN       0x00  <span class="cmt">/* bilinmeyen neden */</span>
+#define ESR_EC_WFX           0x01  <span class="cmt">/* WFI/WFE trap */</span>
+#define ESR_EC_SVC_A64       0x15  <span class="cmt">/* SVC instruction (AArch64) */</span>
+#define ESR_EC_HVC_A64       0x16  <span class="cmt">/* HVC hypercall */</span>
+#define ESR_EC_SMC_A64       0x17  <span class="cmt">/* SMC secure monitor call */</span>
+#define ESR_EC_INSTR_ABORT   0x20  <span class="cmt">/* instruction abort (Stage-2) */</span>
+#define ESR_EC_DATA_ABORT    0x24  <span class="cmt">/* data abort (Stage-2) */</span>
+#define ESR_EC_SYS_REG       0x18  <span class="cmt">/* system register access */</span>
+
+static void handle_exception(uint64_t esr_el2)
+{
+    uint32_t ec = (esr_el2 >> 26) &amp; 0x3F;
+
+    switch (ec) {
+    case ESR_EC_HVC_A64:
+        handle_hypercall(esr_el2);
+        break;
+    case ESR_EC_DATA_ABORT:
+        handle_mmio(esr_el2);
+        break;
+    case ESR_EC_SYS_REG:
+        handle_sysreg(esr_el2);
+        break;
+    default:
+        panic("Unhandled exception EC=0x%x", ec);
+    }
+}</code></pre>
+  </div>
+
+  <h3>Pratik: VHE kontrolü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — VHE desteği kontrolü</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># CPU özelliklerini kontrol et</span>
+<span class="cmd">grep</span> -o 'sve\|vhe\|lse\|atomics' /proc/cpuinfo | sort -u
+<span class="cmt"># Doğrudan VHE flag görünmeyebilir; kernel loguna bak</span>
+
+<span class="cmd">dmesg</span> | grep -i "vhe\|el2\|hyp"
+<span class="cmt"># [    0.000000] CPU: All CPU(s) booted fully, EL2 available</span>
+<span class="cmt"># [    0.000001] kvm: hypervisor initialized (VHE mode)</span>
+
+<span class="cmt"># ARM CPU ID register — ARMv8.1 veya üstü gerekli</span>
+<span class="cmd">cat</span> /sys/devices/system/cpu/cpu0/regs/identification/midr_el1
+<span class="cmt"># 0x00000000410fd034  (Cortex-A53 örneği)</span>
+<span class="cmt"># VHE için en az Cortex-A72 / ARMv8.1 gerekli</span>
+
+<span class="cmt"># KVM VHE mod doğrulama</span>
+<span class="cmd">dmesg</span> | grep "kvm:"
+<span class="cmt"># [    2.345678] kvm: Hyp mode initialized successfully</span></code></pre>
+  </div>
+
+  <h3>VMID — Virtual Machine Identifier</h3>
+  <p>ARM MMU her sanal makine için ayrı bir VMID (Virtual Machine Identifier) kullanır. VMID TLB'yi etiketler, böylece farklı guest'lerin çeviri girdileri birbirini geçersiz kılmaz. VMID alanı 8 veya 16 bit olabilir (VTCR_EL2.VS bit ile).</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — VMID ve TLB invalidation</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ARM64 TLB invalidation komutları (hypervisor context)</span>
+<span class="cmt"># Tüm TLB girişlerini temizle (VMID bağımsız)</span>
+tlbi alle2     <span class="cmt">; EL2 TLB hepsini temizle</span>
+tlbi alle1is   <span class="cmt">; EL1 TLB (inner shareable)</span>
+
+<span class="cmt"># Belirli IPA için Stage-2 TLB invalidation</span>
+tlbi ipas2e1is, x0   <span class="cmt">; x0 = IPA &gt;&gt; 12</span>
+
+<span class="cmt"># VMID tabanlı TLB invalidation</span>
+<span class="cmt"># VTTBR_EL2 kaydında VMID[63:48] alanı</span>
+<span class="cmt"># msr VTTBR_EL2, x0  ; x0 = (vmid &lt;&lt; 48) | (s2_pgdir &gt;&gt; 1)</span>
+isb
+dsb ish</code></pre>
+  </div>
+
+  <h3>Stage-2 sayfa tablosu konfigürasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — Stage-2 MMU konfigürasyonu (VTCR_EL2)</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt">/* VTCR_EL2 — Virtualization Translation Control Register */</span>
+<span class="cmt">/* T0SZ[5:0]: (64 - IPA_size_bits) — IPA adres uzunluğu */</span>
+<span class="cmt">/* SL0[7:6]:  başlangıç seviyesi (00=L2, 01=L1, 10=L0)  */</span>
+<span class="cmt">/* TG0[15:14]: granüle boyutu (00=4KB, 01=64KB, 10=16KB) */</span>
+<span class="cmt">/* PS[18:16]:  fiziksel adres boyutu                     */</span>
+
+#define VTCR_T0SZ_40BIT  (64 - 40)   <span class="cmt">/* 40-bit IPA */</span>
+#define VTCR_SL0_L1      (0x1 &lt;&lt; 6)  <span class="cmt">/* Level 1 başlangıç */</span>
+#define VTCR_TG0_4KB     (0x0 &lt;&lt; 14)
+#define VTCR_PS_40BIT    (0x2 &lt;&lt; 16) <span class="cmt">/* 40-bit PA */</span>
+#define VTCR_SH0_IS      (0x3 &lt;&lt; 12) <span class="cmt">/* Inner Shareable */</span>
+#define VTCR_ORGN0_WBWA  (0x1 &lt;&lt; 10)
+#define VTCR_IRGN0_WBWA  (0x1 &lt;&lt; 8)
+
+static uint64_t vtcr_el2 = VTCR_T0SZ_40BIT | VTCR_SL0_L1 |
+                            VTCR_TG0_4KB    | VTCR_PS_40BIT |
+                            VTCR_SH0_IS     | VTCR_ORGN0_WBWA |
+                            VTCR_IRGN0_WBWA;
+
+<span class="cmt">/* Hypervisor başlangıcında VTCR_EL2 yazılır */</span>
+void setup_stage2_mmu(void)
+{
+    asm volatile("msr vtcr_el2, %0\n isb" :: "r"(vtcr_el2));
+}</code></pre>
+  </div>
+
+  <h3>Hypercall mekanizması</h3>
+  <p>Guest OS, hypervisor ile <code>HVC</code> (Hypervisor Call) talimatı aracılığıyla iletişim kurar. HVC çalıştırıldığında EL2'ye trap oluşur. Xen, KVM ve Jailhouse farklı hypercall arayüzleri tanımlar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — Xen ARM hypercall mekanizması</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt">/* Xen ARM hypercall calling convention */</span>
+<span class="cmt">/* x0: hypercall numarası                */</span>
+<span class="cmt">/* x1-x5: parametreler                  */</span>
+<span class="cmt">/* Sonuç: x0                            */</span>
+
+#define __HYPERVISOR_console_io    18
+#define __HYPERVISOR_grant_table_op 20
+#define __HYPERVISOR_memory_op     12
+
+static long xen_hypercall(unsigned long op,
+                          unsigned long a1,
+                          unsigned long a2)
+{
+    long ret;
+    asm volatile(
+        "mov x0, %1\n"
+        "mov x1, %2\n"
+        "mov x2, %3\n"
+        "hvc #0\n"
+        "mov %0, x0\n"
+        : "=r"(ret)
+        : "r"(op), "r"(a1), "r"(a2)
+        : "x0", "x1", "x2", "memory"
+    );
+    return ret;
+}
+
+<span class="cmt">/* Örnek: Xen console'a yazdır */</span>
+void xen_console_write(const char *str, int len)
+{
+    xen_hypercall(__HYPERVISOR_console_io, 0,
+                  (unsigned long)str);
+}</code></pre>
+  </div>
+
+  <h3>PSCI — Power State Coordination Interface</h3>
+  <p>PSCI, ARM işlemcilerde güç yönetimi için standart bir hypercall arayüzüdür. CPU_ON, CPU_OFF, SYSTEM_RESET gibi operasyonlar PSCI üzerinden gerçekleştirilir. Hypervisor PSCI çağrılarını yakalar ve guest'in CPU'ları açıp kapamasına izin verir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — PSCI doğrulama</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># PSCI versiyonu kontrol et</span>
+<span class="cmd">cat</span> /sys/firmware/devicetree/base/psci/compatible
+<span class="cmt"># arm,psci-1.0</span>
+
+<span class="cmt"># PSCI metodunu kontrol et (hvc veya smc)</span>
+<span class="cmd">cat</span> /sys/firmware/devicetree/base/psci/method
+<span class="cmt"># hvc  (hypervisor varsa hvc, yoksa smc)</span>
+
+<span class="cmt"># CPU hotplug (PSCI CPU_ON çağrısı kullanır)</span>
+<span class="cmd">echo</span> 0 &gt; /sys/devices/system/cpu/cpu3/online
+<span class="cmd">echo</span> 1 &gt; /sys/devices/system/cpu/cpu3/online</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>VHE (ARMv8.1): host OS'u EL2'de çalıştır — EL1↔EL2 overhead yok</li>
+      <li>EL2 exception entry: VBAR_EL2 → handler → ESR_EL2 decode → işlem</li>
+      <li>VMID: TLB etiketleme — farklı guest'lerin çeviri girişleri çakışmaz</li>
+      <li>VTCR_EL2: Stage-2 MMU konfigürasyonu — T0SZ, SL0, PS alanları</li>
+      <li>HVC: guest → hypervisor hypercall — x0=numara, x1-x5=parametreler</li>
+      <li>PSCI: güç yönetimi için standart hypercall — hvc veya smc metodu</li>
+      <li>ERET: EL2'den EL1'e dönüş — guest kaldığı yerden devam eder</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

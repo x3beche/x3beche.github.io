@@ -1,0 +1,601 @@
+---
+layout: tutorial
+title: "FPGA-SoC Mimarisi — PS/PL & AXI Bus"
+back_url: "../index.html"
+back_label: "FPGA & Linux"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>FPGA &amp; LINUX</span>
+    <span>MİMARİ</span>
+    <span>2026</span>
+  </div>
+  <h1>FPGA-SoC Mimarisi<br><em>PS/PL &amp; AXI Bus</em></h1>
+  <p class="subtitle">Zynq-7000 ve Zynq UltraScale+ PS-PL entegrasyonu, AXI bus hiyerarşisi, bellek haritası, interrupt yönlendirme ve FSBL→U-Boot→Linux önyükleme akışı.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">FPGA-SoC nedir? — PS ve PL kavramları</a></li>
+    <li><a href="#s1">AXI bus hiyerarşisi — AXI4, AXI-Lite, AXI-Stream</a></li>
+    <li><a href="#s2">Zynq-7000 blok diyagramı</a></li>
+    <li><a href="#s3">Zynq UltraScale+ MPSoC mimarisi</a></li>
+    <li><a href="#s4">Cyclone V SoC HPS — Intel tarafı</a></li>
+    <li><a href="#s5">HW/SW co-design metodolojisi</a></li>
+    <li><a href="#s6">Bellek haritası ve adres uzayı</a></li>
+    <li><a href="#s7">Interrupt yönlendirme PS→PL</a></li>
+    <li><a href="#s8">Boot akışı ve pratik: AXI-Lite LED denetleyici</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> FPGA-SoC nedir? — PS ve PL kavramları</h2>
+  <p class="section-lead">Modern FPGA-SoC (System on Chip) cihazları, sabit bir işlemci alt sistemi (Processing System — PS) ile programlanabilir bir lojik dokusunu (Programmable Logic — PL) tek bir silikon üzerinde birleştirir. Bu yaklaşım, ARM işlemcisinin yazılım ekosistemini FPGA'nın esnekliğiyle harmanlar.</p>
+
+  <h3>Diskret FPGA vs FPGA-SoC farkı</h3>
+  <p>Klasik diskret FPGA tasarımında (Xilinx 7 serisi, Intel Cyclone 10 LP) tüm işlemler PL üzerinde gerçekleşir; Soft-core işlemci (MicroBlaze, Nios II) bile programlanabilir kaynaklardan tüketilir ve harici bir işlemciyle paralel çalıştırılır. FPGA-SoC yaklaşımında ise ARM Cortex-A serisi işlemci silikon üzerinde donanım olarak sabittir; PL yalnızca hızlandırıcı, periferel veya veri yolu olarak kullanılır.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>Diskret FPGA</th><th>FPGA-SoC</th></tr></thead>
+      <tbody>
+        <tr><td>İşlemci</td><td>Soft-core (LUT tabanlı)</td><td>Hard ARM Cortex-A (silikon)</td></tr>
+        <tr><td>İşlemci performansı</td><td>Düşük (50–200 MHz)</td><td>Yüksek (650 MHz – 1.5 GHz)</td></tr>
+        <tr><td>Linux desteği</td><td>Sınırlı (ucLinux)</td><td>Tam Linux (MMU, çok çekirdek)</td></tr>
+        <tr><td>PS-PL bant genişliği</td><td>Yok (ayrı çip)</td><td>Yüksek (AXI HP portları)</td></tr>
+        <tr><td>Güç tüketimi</td><td>Sadece PL</td><td>PS + PL (ancak entegre)</td></tr>
+        <tr><td>Tipik kullanım</td><td>Dijital tasarım, protokol</td><td>Gömülü Linux + HW hızlandırıcı</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>PS alt sistemi bileşenleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">ARM Cortex-A işlemci</span><span class="desc">Zynq-7000: çift çekirdek Cortex-A9; UltraScale+: dört çekirdek Cortex-A53 + çift Cortex-R5</span></div>
+    <div class="param"><span class="name">On-chip RAM (OCM)</span><span class="desc">256 KB (Zynq-7000) / 256 KB (UltraScale+) — FSBL ve kritik kod için</span></div>
+    <div class="param"><span class="name">DDR kontrolcüsü</span><span class="desc">PS'ten yönetilen harici DRAM; PL de AXI HP portları üzerinden erişir</span></div>
+    <div class="param"><span class="name">Sabit periferaller</span><span class="desc">UART, SPI, I2C, CAN, USB, GigE, SD/MMC — MIO pinleriyle çıkarılır</span></div>
+    <div class="param"><span class="name">GIC (Generic Interrupt Controller)</span><span class="desc">PL kaynaklı kesmeleri ARM işlemcisine yönlendirir</span></div>
+    <div class="param"><span class="name">AXI Interconnect</span><span class="desc">PS ile PL arasındaki veri yolu köprüsü — HP, HPC, ACP, GP portları</span></div>
+  </div>
+
+  <h3>PL ile entegrasyon senaryoları</h3>
+  <p>PL, PS'e birkaç farklı biçimde bağlanır: (1) <strong>Periferel modu</strong> — PL'de özel AXI-Lite register'lı bir blok; PS yazılımı bunu bellek eşlemeli G/Ç gibi erişir. (2) <strong>Veri akış motoru</strong> — PL'de AXI-Stream arayüzlü bir işleme hattı; AXI-DMA ile DDR'dan ham veri alır ve işlenmiş veriyi geri koyar. (3) <strong>Bağımsız işlemci</strong> — PL'de MicroBlaze veya Zynq'in R5 çekirdeği bağımsız çalışır, AXI Mailbox ile haberleşir.</p>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>FPGA-SoC: sabit ARM (PS) + programlanabilir lojik (PL) — tek silikon</li>
+      <li>PS: hard ARM Cortex-A, DDR kontrolcüsü, GIC, sabit periferaller</li>
+      <li>PL: hızlandırıcı, özel periferel veya veri akış motoru</li>
+      <li>PS-PL bağlantısı: AXI Interconnect portları (GP, HP, HPC, ACP)</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> AXI bus hiyerarşisi — AXI4, AXI-Lite, AXI-Stream</h2>
+  <p class="section-lead">AMBA AXI (Advanced eXtensible Interface) protokolü, ARM'ın AMBA 3 ve AMBA 4 standardının parçasıdır. Zynq/Cyclone SoC tasarımlarında PS-PL iletişiminin omurgasını oluşturur; üç temel varyantı vardır.</p>
+
+  <h3>AXI4 — yüksek bant genişlikli bellek erişimi</h3>
+  <p>AXI4 tam özellikli protokoldür: beş kanal (AW, W, B, AR, R), burst transferler (256 beat'e kadar), multiple outstanding transaction, dar/geniş veri yolu desteği (32–1024 bit). DDR bellekle büyük veri bloklarını taşırken kullanılır.</p>
+
+  <div class="flow">
+    <pre>
+  AXI4 Kanalları:
+  ┌──────────────────────────────────────────────────────────┐
+  │  Master → Slave:  AW (Write Address)  · W (Write Data)  │
+  │  Slave  → Master: B  (Write Response)                   │
+  │  Master → Slave:  AR (Read Address)                     │
+  │  Slave  → Master: R  (Read Data)                        │
+  └──────────────────────────────────────────────────────────┘
+  Handshake: VALID + READY — her kanalda bağımsız akış kontrolü</pre>
+  </div>
+
+  <h3>AXI4-Lite — register haritası erişimi</h3>
+  <p>AXI4-Lite, burst ve narrow transfer desteği olmayan sadeleştirilmiş AXI4'tür. Tek bir 32-bit veya 64-bit transfer; custom IP register'larına erişmek için idealdir. Sentez alanı küçük, protokol basit. Her özel periferalin kontrol-durum register'ları (CSR) AXI-Lite ile erişilir.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">AXI4 vs AXI4-Lite</span><span class="desc">AXI4: burst (max 256 beat), outstanding tx, dar veri yolu — DDR, DMA için; AXI-Lite: tek transfer, basit register haritası için</span></div>
+    <div class="param"><span class="name">Veri genişliği</span><span class="desc">AXI4: 32–1024 bit; AXI-Lite: 32 veya 64 bit</span></div>
+    <div class="param"><span class="name">Gecikme</span><span class="desc">AXI-Lite: 2–4 saat döngüsü; AXI4 burst: pipeline'da sürekli veri</span></div>
+  </div>
+
+  <h3>AXI4-Stream — veri akışı</h3>
+  <p>AXI4-Stream adres kanalı olmayan, yalnızca TDATA/TVALID/TREADY/TLAST sinyallerinden oluşan tek yönlü bir veri akış protokolüdür. Video pikselleri, ADC örnekleri, network paketleri gibi sürekli veri akışlarında kullanılır. Sideband sinyalleri: TKEEP (byte lane), TSTRB, TID, TDEST, TUSER.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>AXI4-Stream minimal arayüz (Verilog)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">// AXI4-Stream slave (alıcı) arayüzü</span>
+<span class="keyword">module</span> axis_sink #(
+    <span class="keyword">parameter</span> DATA_WIDTH = 32
+) (
+    <span class="keyword">input</span>  wire                   aclk,
+    <span class="keyword">input</span>  wire                   aresetn,
+    <span class="cmt">// AXI4-Stream Slave</span>
+    <span class="keyword">input</span>  wire [DATA_WIDTH-1:0]  s_axis_tdata,
+    <span class="keyword">input</span>  wire                   s_axis_tvalid,
+    <span class="keyword">output</span> wire                   s_axis_tready,
+    <span class="keyword">input</span>  wire                   s_axis_tlast
+);
+    <span class="cmt">// Alıcı her zaman hazır</span>
+    <span class="keyword">assign</span> s_axis_tready = 1'b1;
+
+    <span class="keyword">always</span> @(<span class="keyword">posedge</span> aclk) <span class="keyword">begin</span>
+        <span class="keyword">if</span> (s_axis_tvalid &amp;&amp; s_axis_tready) <span class="keyword">begin</span>
+            <span class="cmt">// Veriyi işle: s_axis_tdata geçerli</span>
+            <span class="keyword">if</span> (s_axis_tlast)
+                <span class="cmt">// Paket/frame sonu</span>
+        <span class="keyword">end</span>
+    <span class="keyword">end</span>
+<span class="keyword">endmodule</span></code></pre>
+  </div>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Protokol</th><th>Kanallar</th><th>Burst</th><th>Tipik kullanım</th></tr></thead>
+      <tbody>
+        <tr><td>AXI4</td><td>AW, W, B, AR, R</td><td>Evet (256)</td><td>DDR, DMA, HP portları</td></tr>
+        <tr><td>AXI4-Lite</td><td>AW, W, B, AR, R</td><td>Hayır</td><td>CSR register haritası</td></tr>
+        <tr><td>AXI4-Stream</td><td>Tek yönlü akış</td><td>Sürekli</td><td>Video, ADC, DMA veri yolu</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>AXI4: 5 kanal, burst 256, outstanding — DDR ve DMA için</li>
+      <li>AXI4-Lite: sadeleştirilmiş, tek transfer — CSR register erişimi</li>
+      <li>AXI4-Stream: adressiz veri akışı — video, ADC, paket işleme</li>
+      <li>Handshake: VALID + READY — her kanalda bağımsız akış kontrolü</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Zynq-7000 blok diyagramı</h2>
+  <p class="section-lead">Xilinx Zynq-7000 (XC7Z010/020/030/045/100), çift çekirdekli ARM Cortex-A9 tabanlı PS ile Artix-7 veya Kintex-7 tabanlı PL dokusunu birleştiren ilk yaygın FPGA-SoC platformdur.</p>
+
+  <h3>PS bileşenleri</h3>
+  <div class="flow">
+    <pre>
+  Zynq-7000 PS Blok Diyagramı:
+  ┌─────────────────────────────────────────────────────────────┐
+  │  APU (Application Processing Unit)                         │
+  │  ┌────────────────┐  ┌──────────┐  ┌────────────────────┐  │
+  │  │ Cortex-A9 #0   │  │ SCU      │  │ Cortex-A9 #1       │  │
+  │  │ NEON/FPU       │  │ Snoop    │  │ NEON/FPU           │  │
+  │  │ L1 I+D$ 32KB   │  │ Filter   │  │ L1 I+D$ 32KB       │  │
+  │  └────────────────┘  └──────────┘  └────────────────────┘  │
+  │         ↕ AXI                  L2$ 512 KB                   │
+  ├─────────────────────────────────────────────────────────────┤
+  │  Central Interconnect                                       │
+  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐  │
+  │  │ DDR CTRL │ │ OCM 256K │ │ GIC      │ │ DMA (8ch)    │  │
+  │  │ (PS DDR) │ │          │ │ (IRQ)    │ │              │  │
+  │  └──────────┘ └──────────┘ └──────────┘ └──────────────┘  │
+  ├─────────────────────────────────────────────────────────────┤
+  │  I/O Periferals (MIO çıkışlı)                              │
+  │  UART0/1 · SPI0/1 · I2C0/1 · CAN0/1 · USB0/1 · GigE0/1   │
+  │  SD/MMC0/1 · GPIO · QSPI                                   │
+  ├─────────────────────────────────────────────────────────────┤
+  │  PS-PL AXI Portları                                        │
+  │  GP0/GP1 (32-bit, master) → PL periferallerine erişim      │
+  │  HP0–HP3 (64-bit, slave) ← PL DMA → PS DDR               │
+  │  ACP (64-bit, L2 cache coherent) ← PL → PS cache          │
+  │  IRQ (16 PL kesmesi → GIC)                                │
+  └─────────────────────────────────────────────────────────────┘
+  PL: Artix-7 / Kintex-7 lojik dokusu (LUT, FF, BRAM, DSP, PLL)</pre>
+  </div>
+
+  <h3>AXI port türleri ve kullanım senaryoları</h3>
+  <div class="params">
+    <div class="param"><span class="name">GP (General Purpose) — Master</span><span class="desc">PS→PL yönü, 32-bit, AXI4-Lite uyumlu; PS'in PL periferallerine erişimi için; max ~1.2 GB/s</span></div>
+    <div class="param"><span class="name">HP (High Performance) — Slave</span><span class="desc">PL→PS DDR yönü, 64-bit AXI4; AXI-DMA ile büyük veri transferleri; 4 port, toplam ~16 GB/s</span></div>
+    <div class="param"><span class="name">ACP (Accelerator Coherency Port) — Slave</span><span class="desc">PL→PS L2 önbellek tutarlılığı; küçük, sık erişilen veriler için; düşük gecikme</span></div>
+  </div>
+
+  <h3>Zynq-7000 hedef kullanım alanları</h3>
+  <p>Endüstriyel motor kontrolü (FSMC), tıbbi görüntüleme (ultrasound DSP), SDR (yazılım tanımlı radyo), makine görüsü, motor enkoder arayüzü ve aviyonik veri konsantratörü gibi uygulamalar için tercih edilir. ZedBoard, PYNQ-Z1/Z2, MiniZed ve Arty Z7 popüler geliştirme kartlarıdır.</p>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>PS: çift Cortex-A9, 512 KB L2, DDR3 kontrolcü, GIC, 8-kanal DMA</li>
+      <li>GP portları: PS→PL, 32-bit, register erişimi; HP portları: PL→DDR, 64-bit, yüksek bant</li>
+      <li>ACP: önbellek tutarlı PL erişimi — küçük veri kümesi için avantajlı</li>
+      <li>PL: Artix-7 / Kintex-7 dokusu — Vivado ile sentezlenir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Zynq UltraScale+ MPSoC mimarisi</h2>
+  <p class="section-lead">Zynq UltraScale+ MPSoC (ZU2–ZU19), Zynq-7000'in halefisidir: dört çekirdek Cortex-A53 + çift çekirdek Cortex-R5F + Mali-400 GPU + UltraScale+ PL dokusu.</p>
+
+  <h3>Çok işlemcili yapı</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>İşlemci Grubu</th><th>Çekirdek</th><th>Tipik kullanım</th></tr></thead>
+      <tbody>
+        <tr><td>APU (Application)</td><td>4× Cortex-A53 @ 1.5 GHz</td><td>Linux, uygulama katmanı</td></tr>
+        <tr><td>RPU (Real-time)</td><td>2× Cortex-R5F @ 600 MHz</td><td>FreeRTOS, gerçek zamanlı kontrol</td></tr>
+        <tr><td>PMU (Platform Mgmt)</td><td>MicroBlaze PMU</td><td>Güç yönetimi, boot sıralaması</td></tr>
+        <tr><td>CSU (Config Security)</td><td>MicroBlaze CSU</td><td>Güvenli önyükleme, şifreleme</td></tr>
+        <tr><td>GPU</td><td>Mali-400 MP2</td><td>HMI, grafik arayüzü</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>PS-PL AXI portları (UltraScale+)</h3>
+  <div class="params">
+    <div class="param"><span class="name">LPD-PL (Low Power Domain)</span><span class="desc">R5 işlemcisinden PL'e AXI-Lite erişim; gerçek zamanlı kontrol döngüleri</span></div>
+    <div class="param"><span class="name">HPM0/HPM1 (High Performance Master)</span><span class="desc">APU'dan PL'e 128-bit AXI4; PL periferallerine yüksek bant genişliği erişim</span></div>
+    <div class="param"><span class="name">HPC0/HPC1 (High Performance Cache Coherent)</span><span class="desc">PL→PS, önbellek tutarlı; büyük DMA transferleri için</span></div>
+    <div class="param"><span class="name">HP0–HP3</span><span class="desc">PL→DDR, 128-bit AXI4; video/görüntü işleme pipeline'ları</span></div>
+  </div>
+
+  <div class="callout info">
+    <div class="label">NOT</div>
+    <p>UltraScale+'ın RPU'su (Cortex-R5F) bağımsız çalışabilir (lockstep veya split modu) ya da APU ile OpenAMP/RPMsg üzerinden haberleşebilir. Bu, gömülü bir gerçek zamanlı kontrolörü Linux ile birleştiren güçlü bir tasarım desenidir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>APU: 4× A53 (Linux); RPU: 2× R5F (FreeRTOS); PMU + CSU: platform yönetimi</li>
+      <li>HPC portları: önbellek tutarlı PL→PS DMA — büyük veri transferleri</li>
+      <li>RPU + OpenAMP/RPMsg: Linux ve RTOS eş zamanlı çalışma deseni</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Cyclone V SoC HPS — Intel tarafı</h2>
+  <p class="section-lead">Intel (Altera) Cyclone V SoC, çift çekirdek ARM Cortex-A9 tabanlı HPS (Hard Processor System) ile Cyclone V FPGA dokusunu birleştiren endüstriyel hedefli bir platformdur. DE1-SoC ve Arrow SoCKit popüler geliştirme kartlarıdır.</p>
+
+  <h3>HPS-FPGA köprüleri</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Köprü</th><th>Yön</th><th>Genişlik</th><th>Kullanım</th></tr></thead>
+      <tbody>
+        <tr><td>HPS-to-FPGA (H2F)</td><td>HPS master → FPGA slave</td><td>32/64/128-bit</td><td>HPS'den FPGA periferallerine yazma/okuma</td></tr>
+        <tr><td>FPGA-to-HPS (F2H)</td><td>FPGA master → HPS slave</td><td>32/64/128-bit</td><td>FPGA DMA → HPS DDR veya periferaller</td></tr>
+        <tr><td>Lightweight H2F</td><td>HPS master → FPGA</td><td>32-bit</td><td>Düşük bant genişlikli CSR register erişimi</td></tr>
+        <tr><td>F2H SDRAM</td><td>FPGA → DDR</td><td>128/256-bit</td><td>FPGA DMA doğrudan DDR erişimi</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Quartus + Linux geliştirme akışı</h3>
+  <p>Intel tarafında araç akışı: Quartus Prime (sentez ve P&amp;R) + Platform Designer (Qsys, köprü yapılandırması) + SoC EDS (Embedded Development Suite) + Yocto/buildroot. HPS periferallerinin pinout yapılandırması Quartus'taki <em>HPS Component</em> üzerinden yapılır; boot ROM, MMC/QSPI veya NAND'dan yüklenir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>HPS→FPGA Lightweight köprüsü üzerinden register erişimi (C)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">// Cyclone V SoC — H2F Lightweight Bridge</span>
+<span class="cmt">// Temel adres: 0xFF200000</span>
+#include &lt;sys/mman.h&gt;
+#include &lt;fcntl.h&gt;
+
+#define H2F_LW_BASE  0xFF200000UL
+#define H2F_LW_SPAN  0x00200000UL   <span class="cmt">/* 2 MB */</span>
+
+<span class="keyword">int</span> fd = open(<span class="str">"/dev/mem"</span>, O_RDWR | O_SYNC);
+<span class="keyword">void</span> *h2f_lw = mmap(NULL, H2F_LW_SPAN,
+                    PROT_READ | PROT_WRITE,
+                    MAP_SHARED, fd, H2F_LW_BASE);
+
+<span class="cmt">/* FPGA üzerindeki periferalin offset'i: 0x0000 */</span>
+<span class="keyword">volatile</span> <span class="keyword">uint32_t</span> *led_reg =
+    (<span class="keyword">volatile</span> <span class="keyword">uint32_t</span> *)((uintptr_t)h2f_lw + 0x0000);
+
+*led_reg = 0xAA;   <span class="cmt">/* LED'leri yak */</span>
+printf(<span class="str">"LED register: 0x%08X\n"</span>, *led_reg);</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>HPS: çift Cortex-A9, DDR3, GigE, USB, UART, SPI, I2C, SD/MMC</li>
+      <li>H2F / F2H / Lightweight H2F köprüleri — farklı bant genişliği ve gecikme</li>
+      <li>F2H SDRAM: FPGA DMA doğrudan DDR erişimi</li>
+      <li>Geliştirme: Quartus + Platform Designer + SoC EDS + Yocto</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> HW/SW co-design metodolojisi</h2>
+  <p class="section-lead">Donanım/yazılım eş tasarımı (HW/SW co-design), bir uygulamanın hangi kısımlarının FPGA PL'de, hangi kısımlarının PS'de çalışacağını sistematik olarak belirleme ve birlikte geliştirme sürecidir.</p>
+
+  <h3>Bölümleme kriterleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">PL'e taşı (donanım hızlandırma)</span><span class="desc">Tekrarlayan döngüler (FFT, FIR, şifreleme), kesin zamanlama gerektiren (motor enkoder, PWM), çok bit paralel işlem (SIMD benzeri)</span></div>
+    <div class="param"><span class="name">PS'te bırak (yazılım)</span><span class="desc">Protokol yönetimi (TCP/IP, USB), kullanıcı arayüzü, yapılandırma, hata yönetimi, periyodik olmayan görevler</span></div>
+    <div class="param"><span class="name">Arayüz tasarımı</span><span class="desc">PS↔PL veri akışı — AXI-Lite CSR (kontrol/durum), AXI-Stream (veri yolu), AXI4 DMA (büyük bloklar)</span></div>
+  </div>
+
+  <h3>Tipik geliştirme döngüsü</h3>
+  <div class="flow">
+    <pre>
+  1. Algoritma analizi → darboğaz belirleme (profiling)
+  2. Bölümleme kararı → hangi bloklar PL'e?
+  3. HLS veya HDL ile PL bloklarını tasarla
+  4. Vivado/Quartus: Block Design → sentez → P&amp;R → bitstream
+  5. Device Tree güncellemesi (PL periferaller için nodes)
+  6. Linux sürücüsü: platform_driver veya UIO
+  7. Kullanıcı alanı uygulaması: test + benchmark
+  8. Optimizasyon → 3'e geri dön</pre>
+  </div>
+
+  <div class="callout tip">
+    <div class="label">İPUCU</div>
+    <p>İlk prototipte HLS kullanın: C++ algoritmayı doğrudan RTL'e çevirin, latency/throughput raporlarını alın. Yeterliyse canlıya geçin; yetersizse elle yazılmış VHDL/Verilog ile kritik modülleri optimize edin.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>PL'e: tekrarlı döngüler, kesin zamanlama, paralel işlem</li>
+      <li>PS'te: protokol, UI, yapılandırma, aperiodik görevler</li>
+      <li>Arayüz seçimi: AXI-Lite (CSR) / AXI-Stream (veri) / AXI4 DMA (büyük bloklar)</li>
+      <li>Döngü: profil → bölümle → HLS/HDL → sentez → DT → sürücü → benchmark</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Bellek haritası ve adres uzayı</h2>
+  <p class="section-lead">Zynq-7000'de PS ve PL bileşenleri 32-bit adres uzayını paylaşır. PL'de oluşturulan AXI periferalleri bu haritaya belirlenmiş bölgelere yerleştirilir.</p>
+
+  <h3>Zynq-7000 bellek haritası özeti</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Adres Aralığı</th><th>Alan</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td>0x0000_0000 – 0x3FFF_FFFF</td><td>DDR (1 GB)</td><td>PS DDR — Linux belleği</td></tr>
+        <tr><td>0x4000_0000 – 0x7FFF_FFFF</td><td>PL via GP0</td><td>GP0 portuna bağlı PL periferalleri (1 GB)</td></tr>
+        <tr><td>0x8000_0000 – 0xBFFF_FFFF</td><td>PL via GP1</td><td>GP1 portuna bağlı PL periferalleri (1 GB)</td></tr>
+        <tr><td>0xE000_0000 – 0xE02F_FFFF</td><td>PS I/O Periferalleri</td><td>UART, SPI, I2C, CAN, USB, GigE, SD</td></tr>
+        <tr><td>0xF000_0000 – 0xF8FF_FFFF</td><td>PS Sistem Kaydedicileri</td><td>SLCR, GIC, Timers, SWDT</td></tr>
+        <tr><td>0xFFFC_0000 – 0xFFFF_FFFF</td><td>OCM (256 KB)</td><td>On-chip SRAM — FSBL ve kritik kod</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>PL periferali adres atama (Vivado)</h3>
+  <p>Vivado Address Editor'da her AXI slave'e 0x4000_0000–0x7FFF_FFFF aralığından bir offset ve boyut atanır. Örneğin özel bir AXI-Lite LED denetleyicisi 0x4000_0000'e, AXI-DMA motoru 0x4040_0000'e yerleştirilir. Bu adresler Device Tree'de <code>reg</code> property olarak tanımlanır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>Device Tree — PL AXI periferali tanımı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* arch/arm/boot/dts/zynq-zed.dts veya overlay */</span>
+&amp;amba_pl {
+    led_ctrl_0: led-ctrl@40000000 {
+        compatible = <span class="str">"xlnx,led-ctrl-1.0"</span>;
+        reg = &lt;0x40000000 0x10000&gt;;   <span class="cmt">/* base, 64 KB */</span>
+        clocks = &lt;&amp;clkc 15&gt;;
+        clock-names = <span class="str">"s00_axi_aclk"</span>;
+    };
+
+    axi_dma_0: dma@40400000 {
+        compatible = <span class="str">"xlnx,axi-dma-1.00.a"</span>;
+        reg = &lt;0x40400000 0x10000&gt;;
+        dma-channel&#64;40400000 {
+            compatible = <span class="str">"xlnx,axi-dma-mm2s-channel"</span>;
+            interrupts = &lt;0 29 4&gt;;
+            xlnx,datawidth = &lt;32&gt;;
+        };
+    };
+};</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>0x4000_0000–0x7FFF_FFFF: GP0 PL periferalleri; 0x8000_0000–0xBFFF_FFFF: GP1</li>
+      <li>Vivado Address Editor: her AXI slave'e adres ve boyut atanır</li>
+      <li>Device Tree: reg property ile adres bilgisi kernel sürücüsüne aktarılır</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Interrupt yönlendirme PS→PL</h2>
+  <p class="section-lead">Zynq-7000'de PL, GIC (Generic Interrupt Controller) üzerinden PS'e 16 adet kesme sinyali gönderebilir. Bu sinyaller Device Tree'de tanımlanır ve Linux IRQ subsystem aracılığıyla sürücülere iletilir.</p>
+
+  <h3>PL→PS kesme yolları</h3>
+  <div class="params">
+    <div class="param"><span class="name">IRQ_F2P[15:0]</span><span class="desc">PL'den 16 adet kesme sinyali — GIC SPI (Shared Peripheral Interrupt) olarak gelir; IRQ numaraları 61–76 (Zynq)</span></div>
+    <div class="param"><span class="name">GIC SPI 61–68</span><span class="desc">IRQ_F2P[0:7] → yüksek öncelik</span></div>
+    <div class="param"><span class="name">GIC SPI 84–91</span><span class="desc">IRQ_F2P[8:15] → normal öncelik</span></div>
+  </div>
+
+  <h3>Device Tree — kesme tanımı</h3>
+  <div class="code-block">
+    <div class="code-header"><span>DTS interrupt tanımı (Zynq-7000)</span><span class="dot">●</span></div>
+    <pre><code>my_periph@40000000 {
+    compatible = <span class="str">"myco,my-periph-1.0"</span>;
+    reg = &lt;0x40000000 0x10000&gt;;
+    <span class="cmt">/* GIC: &lt;tip IRQ tetik&gt;
+       tip 0: SPI (paylaşımlı), 1: PPI
+       IRQ 29 → GIC SPI 61 (IRQ_F2P[0])
+       tetik: 1=yükselen kenar, 4=yüksek seviye */</span>
+    interrupts = &lt;0 29 1&gt;;
+    interrupt-parent = &lt;&amp;gic&gt;;
+};</code></pre>
+  </div>
+
+  <h3>Sürücüde kesme kaydetme</h3>
+  <div class="code-block">
+    <div class="code-header"><span>platform_driver — IRQ kayıt (C)</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">static</span> irqreturn_t my_irq_handler(int irq, <span class="keyword">void</span> *dev_id)
+{
+    <span class="keyword">struct</span> my_priv *priv = dev_id;
+    <span class="cmt">/* PL'den gelen kesmeyi işle */</span>
+    priv-&gt;irq_count++;
+    wake_up_interruptible(&amp;priv-&gt;wait_q);
+    <span class="keyword">return</span> IRQ_HANDLED;
+}
+
+<span class="keyword">static</span> int my_probe(<span class="keyword">struct</span> platform_device *pdev)
+{
+    <span class="keyword">int</span> irq = platform_get_irq(pdev, 0);
+    devm_request_irq(&amp;pdev-&gt;dev, irq, my_irq_handler,
+                     0, <span class="str">"my-periph"</span>, priv);
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>IRQ_F2P[15:0]: 16 PL→PS kesme sinyali; GIC SPI 61–76 olarak eşlenir</li>
+      <li>DTS: interrupts = &lt;0 IRQ-offset tetik&gt;; interrupt-parent = &lt;&amp;gic&gt;</li>
+      <li>platform_get_irq() + devm_request_irq() — Linux sürücü kayıt deseni</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Boot akışı ve pratik: Zynq-7000 AXI-Lite LED denetleyici</h2>
+  <p class="section-lead">Zynq-7000 önyükleme akışı FSBL → U-Boot → Linux'tan oluşur. Pratik bölümde sıfırdan bir AXI-Lite LED denetleyicisi tasarlanacak, Vivado Block Design'a entegre edilecek ve Linux'tan kontrol edilecektir.</p>
+
+  <h3>Boot akışı</h3>
+  <div class="flow">
+    <pre>
+  ROM (BootROM) → QSPI/SD'den BOOT.BIN oku
+        ↓
+  FSBL (First Stage Boot Loader)
+    - OCM'de çalışır (0xFFFC_0000)
+    - PS başlatma (DDR, PLL, CLK)
+    - PL bitstream yükleme (isteğe bağlı)
+    - U-Boot'u DDR'a kopyala
+        ↓
+  U-Boot (Second Stage Boot Loader)
+    - DDR testleri
+    - Ortam değişkenleri
+    - Kernel + DTB + initrd yükleme
+    - bootm / bootz komutu
+        ↓
+  Linux Kernel
+    - of_* API ile DT parse
+    - Platform sürücüler probe
+    - Rootfs mount, init/systemd</pre>
+  </div>
+
+  <h3>Pratik: AXI-Lite LED denetleyici — VHDL tasarımı</h3>
+  <div class="code-block">
+    <div class="code-header"><span>axi_lite_led.vhd — register haritası</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">-- Register haritası:
+-- 0x00: LED_DATA  (RW) — 8 bit LED çıkışı
+-- 0x04: LED_DIR   (RW) — yön (1=çıkış)
+-- 0x08: STATUS    (RO) — 0x1 = hazır</span>
+<span class="keyword">library</span> ieee;
+<span class="keyword">use</span> ieee.std_logic_1164.<span class="keyword">all</span>;
+<span class="keyword">use</span> ieee.numeric_std.<span class="keyword">all</span>;
+
+<span class="keyword">entity</span> axi_lite_led <span class="keyword">is</span>
+  <span class="keyword">generic</span> (
+    C_S_AXI_DATA_WIDTH : integer := 32;
+    C_S_AXI_ADDR_WIDTH : integer := 4
+  );
+  <span class="keyword">port</span> (
+    <span class="cmt">-- AXI4-Lite Slave</span>
+    S_AXI_ACLK    : <span class="keyword">in</span>  std_logic;
+    S_AXI_ARESETN : <span class="keyword">in</span>  std_logic;
+    S_AXI_AWADDR  : <span class="keyword">in</span>  std_logic_vector(C_S_AXI_ADDR_WIDTH-1 downto 0);
+    S_AXI_AWVALID : <span class="keyword">in</span>  std_logic;
+    S_AXI_AWREADY : <span class="keyword">out</span> std_logic;
+    S_AXI_WDATA   : <span class="keyword">in</span>  std_logic_vector(C_S_AXI_DATA_WIDTH-1 downto 0);
+    S_AXI_WSTRB   : <span class="keyword">in</span>  std_logic_vector(3 downto 0);
+    S_AXI_WVALID  : <span class="keyword">in</span>  std_logic;
+    S_AXI_WREADY  : <span class="keyword">out</span> std_logic;
+    S_AXI_BRESP   : <span class="keyword">out</span> std_logic_vector(1 downto 0);
+    S_AXI_BVALID  : <span class="keyword">out</span> std_logic;
+    S_AXI_BREADY  : <span class="keyword">in</span>  std_logic;
+    S_AXI_ARADDR  : <span class="keyword">in</span>  std_logic_vector(C_S_AXI_ADDR_WIDTH-1 downto 0);
+    S_AXI_ARVALID : <span class="keyword">in</span>  std_logic;
+    S_AXI_ARREADY : <span class="keyword">out</span> std_logic;
+    S_AXI_RDATA   : <span class="keyword">out</span> std_logic_vector(C_S_AXI_DATA_WIDTH-1 downto 0);
+    S_AXI_RRESP   : <span class="keyword">out</span> std_logic_vector(1 downto 0);
+    S_AXI_RVALID  : <span class="keyword">out</span> std_logic;
+    S_AXI_RREADY  : <span class="keyword">in</span>  std_logic;
+    <span class="cmt">-- Uygulama çıkışı</span>
+    LED_OUT : <span class="keyword">out</span> std_logic_vector(7 downto 0)
+  );
+<span class="keyword">end</span> axi_lite_led;</code></pre>
+  </div>
+
+  <h3>Linux sürücüsü — /dev/mem veya platform driver</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Kullanıcı alanı — /dev/mem ile LED kontrolü (C)</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;unistd.h&gt;
+
+#define LED_BASE   0x40000000UL
+#define MAP_SIZE   0x10000UL
+#define REG_LED    0x00  <span class="cmt">/* LED_DATA */</span>
+#define REG_DIR    0x04  <span class="cmt">/* LED_DIR  */</span>
+#define REG_STATUS 0x08  <span class="cmt">/* STATUS   */</span>
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>)
+{
+    int fd = open(<span class="str">"/dev/mem"</span>, O_RDWR | O_SYNC);
+    <span class="keyword">if</span> (fd &lt; 0) { perror(<span class="str">"open"</span>); <span class="keyword">return</span> 1; }
+
+    <span class="keyword">volatile</span> uint32_t *regs = mmap(NULL, MAP_SIZE,
+        PROT_READ | PROT_WRITE, MAP_SHARED, fd, LED_BASE);
+
+    <span class="cmt">/* Yön: tüm pinler çıkış */</span>
+    regs[REG_DIR / 4] = 0xFF;
+    <span class="cmt">/* LED deseni: alternatif */</span>
+    <span class="keyword">for</span> (int i = 0; i &lt; 10; i++) {
+        regs[REG_LED / 4] = (i % 2) ? 0xAA : 0x55;
+        usleep(500000);
+    }
+
+    munmap((<span class="keyword">void</span> *)regs, MAP_SIZE);
+    close(fd);
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>/dev/mem erişimi üretim sistemlerinde güvenlik açığı oluşturur. Gerçek ürünlerde kernel platform_driver veya UIO sürücüsü tercih edilmelidir. Bu örnekteki kullanım yalnızca hızlı prototipleme içindir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Boot: BootROM → FSBL (OCM) → U-Boot (DDR) → Linux Kernel</li>
+      <li>FSBL: DDR/PLL başlatma + isteğe bağlı PL bitstream + U-Boot yükleme</li>
+      <li>AXI-Lite LED: 3 register (LED_DATA, LED_DIR, STATUS), VHDL AXI-Lite slave</li>
+      <li>/dev/mem + mmap: hızlı prototipleme; üretimde platform_driver/UIO tercih edilmeli</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

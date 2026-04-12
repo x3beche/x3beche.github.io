@@ -1,0 +1,841 @@
+---
+layout: tutorial
+title: "Podman — Rootless Container Runtime"
+back_url: "../index.html"
+back_label: "Konteyner Orkestrasyon"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>KONTEYNER &amp; EDGE</span>
+    <span>Podman</span>
+    <span>2026</span>
+  </div>
+  <h1>Podman —<br><em>Rootless Container Runtime.</em></h1>
+  <p class="subtitle">Daemonless, fork/exec mimarisi ile güvenli container çalıştırma. User namespace izolasyonu, Quadlet ile systemd entegrasyonu, pod konsepti ve ARM64 cross-build. Raspberry Pi'da rootless Nginx + Python API.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Podman mimarisi — daemonless ve fork/exec modeli</a></li>
+    <li><a href="#s1">Rootless container temelleri — user namespace ve UID mapping</a></li>
+    <li><a href="#s2">Rootless networking — slirp4netns ve pasta</a></li>
+    <li><a href="#s3">Temel kullanım — pull, run, exec, stop, rm</a></li>
+    <li><a href="#s4">Podman vs Docker CLI karşılaştırması</a></li>
+    <li><a href="#s5">Quadlet ile systemd entegrasyonu</a></li>
+    <li><a href="#s6">Pod konsepti — infra container ve pod yönetimi</a></li>
+    <li><a href="#s7">ARM64 cross-build ve secret yönetimi</a></li>
+    <li><a href="#s8">Pratik — RPi'da rootless Nginx + Python API pod</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Podman mimarisi — daemonless ve fork/exec modeli</h2>
+  <p class="section-lead">Docker'ın aksine Podman, sürekli çalışan bir daemon gerektirmez. Her container, kullanıcının oturumundan <strong>doğrudan fork/exec</strong> ile başlatılır; bu tasarım saldırı yüzeyini dramatik biçimde azaltır.</p>
+
+  <h3>Docker daemon vs Podman fork/exec</h3>
+
+  <div class="flow">
+    <pre>
+  Docker (daemon mimarisi)
+  ─────────────────────────────────────────────────────
+  docker CLI  →  dockerd (root daemon)  →  containerd  →  runc  →  container
+               (her zaman çalışır, root yetkisi)
+
+  Podman (daemonless)
+  ─────────────────────────────────────────────────────
+  podman CLI  →  conmon (monitor)  →  crun/runc  →  container
+  (her komut ayrı process, kullanıcı yetkisiyle)
+    </pre>
+  </div>
+
+  <p>Podman, OCI uyumlu <strong>libpod</strong> kütüphanesini kullanır. Container lifecycle yönetimi doğrudan bu kütüphane aracılığıyla yapılır; araya giren bir daemon yoktur. <code>conmon</code> (container monitor) süreci container'ın stdin/stdout'unu ve çıkış kodunu izler, ancak container silindikten sonra kendisi de sonlanır.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Güvenlik avantajı</span><span class="desc">Root daemon olmaması, privilege escalation saldırılarının önünde büyük bir engel oluşturur. Container'a sızan saldırgan yalnızca kullanıcı yetkisine sahip olur.</span></div>
+    <div class="param"><span class="name">Audit kolaylığı</span><span class="desc">Her container işlemi kullanıcı processından türetilir; standart Linux audit araçlarıyla (auditd, journald) izlenebilir.</span></div>
+    <div class="param"><span class="name">Systemd uyumu</span><span class="desc">Podman container'ları doğrudan systemd service olarak tanımlanabilir; daemon başlamadan systemd init sırasında container ayağa kalkar.</span></div>
+    <div class="param"><span class="name">Docker compat</span><span class="desc">Docker CLI ile birebir uyumlu komut satırı arayüzü. Dockerfile'lar değiştirilmeden kullanılır, Docker Hub imajları çekilebilir.</span></div>
+  </div>
+
+  <h3>OCI araç zinciri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Bileşen</th><th>Görev</th><th>Alternatif</th></tr></thead>
+      <tbody>
+        <tr><td>libpod</td><td>Container lifecycle, image, network yönetimi</td><td>dockerd</td></tr>
+        <tr><td>conmon</td><td>Container I/O monitor, exit code yakalama</td><td>containerd-shim</td></tr>
+        <tr><td>crun</td><td>OCI runtime — container başlatır (C, hafif)</td><td>runc (Go)</td></tr>
+        <tr><td>netavark</td><td>Ağ kurulumu — bridge, VLAN, firewall</td><td>CNI plugins</td></tr>
+        <tr><td>aardvark-dns</td><td>Container DNS çözümlemesi</td><td>dnsmasq</td></tr>
+        <tr><td>buildah</td><td>OCI image build (Podman build altyapısı)</td><td>docker build</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">Dikkat</div>
+    <p>Podman 4.x ve sonrasında varsayılan ağ yığını <strong>netavark + aardvark-dns</strong>'e geçildi. Eski CNI tabanlı kurulumlar varsa <code>podman network ls</code> ile kontrol edin; geçiş için <code>podman system reset</code> gerekebilir (tüm container/image silinir).</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Podman = daemonless, fork/exec; root daemon yoktur</li>
+      <li>conmon container I/O izler; crun OCI runtime olarak container başlatır</li>
+      <li>Docker CLI ile birebir uyumlu; Dockerfile değişikliği gerekmez</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Rootless container temelleri — user namespace ve UID mapping</h2>
+  <p class="section-lead">Rootless modda container, host'ta normal bir kullanıcı olarak çalışır. Linux <strong>user namespace</strong> mekanizması, container içindeki root (uid=0) ile host'taki sub-uid arasında eşleme yapar.</p>
+
+  <h3>/etc/subuid ve /etc/subgid</h3>
+  <p>Rootless Podman'ın çalışması için her kullanıcıya bir UID/GID alt aralığı tahsis edilmesi gerekir. Bu aralıklar <code>/etc/subuid</code> ve <code>/etc/subgid</code> dosyalarında tanımlanır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — subuid/subgid yapılandırması</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kullanıcıya sub-uid/gid aralığı ekle (usermod veya manuel)</span>
+<span class="cmd">sudo</span> usermod <span class="flag">--add-subuids</span> 100000-165535 emirhan
+<span class="cmd">sudo</span> usermod <span class="flag">--add-subgids</span> 100000-165535 emirhan
+
+<span class="cmt"># Sonucu doğrula</span>
+<span class="cmd">cat</span> /etc/subuid
+<span class="cmt"># emirhan:100000:65536</span>
+
+<span class="cmt"># Podman unshare ile namespace içini incele</span>
+<span class="cmd">podman</span> unshare cat /proc/self/uid_map
+<span class="cmt"># container-uid  host-uid  range</span>
+<span class="cmt"># 0              1000      1      (kullanıcı kendisi → root)</span>
+<span class="cmt"># 1              100000    65536  (container uid 1..65536 → host 100000..165535)</span></code></pre>
+  </div>
+
+  <h3>User namespace izolasyonu nasıl çalışır</h3>
+
+  <div class="flow">
+    <pre>
+  Host                            Container (user ns)
+  ──────────────────────────────────────────────────
+  emirhan (uid=1000)    ←map→    root (uid=0)
+  emirhan+1 (uid=100000) ←map→   uid=1
+  emirhan+2 (uid=100001) ←map→   uid=2
+  ...
+  emirhan+N (uid=165535) ←map→   uid=65535
+    </pre>
+  </div>
+
+  <p>Container içindeki root, host'ta <code>emirhan</code> kullanıcısına eşlendiğinden; container çöküp host dosya sistemine erişmeye çalışsa bile yalnızca emirhan yetkilerine sahip olur. <strong>Host root'una erişim yoktur.</strong></p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — rootless kurulum ve doğrulama</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Podman kurulumu (Ubuntu 22.04/Debian 12)</span>
+<span class="cmd">sudo</span> apt-get install -y podman
+
+<span class="cmt"># Rootless sistem yap — kullanıcı başına migration</span>
+<span class="cmd">podman</span> system migrate
+
+<span class="cmt"># Rootless olarak container çalıştır</span>
+<span class="cmd">podman</span> run <span class="flag">--rm</span> alpine whoami
+<span class="cmt"># root   (container içinde root görünür)</span>
+
+<span class="cmt"># Ama host'ta hangi UID?</span>
+<span class="cmd">podman</span> run <span class="flag">--rm</span> alpine sh -c <span class="str">"cat /proc/self/status | grep '^Uid'"</span>
+<span class="cmt"># Uid: 0 0 0 0   (container içinde)</span>
+
+<span class="cmt"># Bilgi: gerçek host UID'si subuid tablosundan gelir</span>
+<span class="cmd">podman</span> info <span class="flag">--format</span> <span class="str">'&#123;&#123;.Host.IDMappings.UIDMap&#125;&#125;'</span></code></pre>
+  </div>
+
+  <h3>Storage yapılandırması</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">~/.local/share/containers</span><span class="desc">Rootless modda container image, volume ve metadata buraya yazılır. Root gerektirmez.</span></div>
+    <div class="param"><span class="name">overlay storage driver</span><span class="desc">Kernel 5.11+ ile rootless overlay doğrudan desteklenir. Eski kernellerde fuse-overlayfs kullanılır.</span></div>
+    <div class="param"><span class="name">~/.config/containers/storage.conf</span><span class="desc">Storage driver'ı ve graph root yolu burada özelleştirilebilir.</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Rootless = user namespace + /etc/subuid mapping</li>
+      <li>Container içi root → host'ta normal kullanıcı UID'si</li>
+      <li>Image ve veriler ~/.local/share/containers altında, root yetkisi gerekmez</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Rootless networking — slirp4netns ve pasta</h2>
+  <p class="section-lead">Rootless container'lar host ağ namespace'ine doğrudan erişemez. <strong>slirp4netns</strong> ve yeni nesil <strong>pasta</strong> araçları, root gerektirmeden sanal ağ arayüzü sağlar.</p>
+
+  <h3>slirp4netns</h3>
+  <p>slirp4netns, userspace TCP/IP yığını olan bir proxy gibi davranır. Container'ın ağ trafiği, kullanıcı alanında işlenerek host ağına çıkar. Performans tam kernel yığınından düşüktür ama yeterlidir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — slirp4netns port yönlendirme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Container içindeki port 80'i host 8080'e yönlendir</span>
+<span class="cmd">podman</span> run <span class="flag">-d</span> <span class="flag">-p</span> 8080:80 <span class="flag">--name</span> webserver nginx:alpine
+
+<span class="cmt"># Bağlantıyı test et</span>
+<span class="cmd">curl</span> http://localhost:8080
+
+<span class="cmt"># Ağ bilgisini incele</span>
+<span class="cmd">podman</span> inspect webserver <span class="flag">--format</span> <span class="str">'&#123;&#123;.NetworkSettings.Networks&#125;&#125;'</span>
+
+<span class="cmt"># Rootless modda hangi ağ backend kullanılıyor?</span>
+<span class="cmd">podman</span> info <span class="flag">--format</span> <span class="str">'&#123;&#123;.Host.NetworkBackend&#125;&#125;'</span></code></pre>
+  </div>
+
+  <h3>pasta (yeni nesil)</h3>
+  <p>Podman 4.4+ ile gelen <strong>pasta</strong>, slirp4netns'e göre çok daha yüksek performans sunar. Kernel'deki AF_INET/AF_UNIX soketleri doğrudan kullanılır, userspace proxy overhead'i asgari düzeydedir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>~/.config/containers/containers.conf — pasta etkinleştirme</span><span class="dot">●</span></div>
+    <pre><code>[network]
+default_rootless_network_cmd = "pasta"
+
+[containers]
+# pasta ile DNS otomatik yapılandırılır
+dns_servers = []</code></pre>
+  </div>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>slirp4netns</th><th>pasta</th></tr></thead>
+      <tbody>
+        <tr><td>Performans</td><td>Orta — userspace TCP yığını</td><td>Yüksek — kernel soket doğrudan</td></tr>
+        <tr><td>IPv6 desteği</td><td>Sınırlı</td><td>Tam</td></tr>
+        <tr><td>DNS</td><td>Manuel yapılandırma</td><td>Otomatik host DNS</td></tr>
+        <tr><td>Port forward</td><td>-p ile standart</td><td>-p ile standart</td></tr>
+        <tr><td>Kernel gereksinimi</td><td>&gt;= 4.9</td><td>&gt;= 5.6</td></tr>
+        <tr><td>Raspberry Pi OS</td><td>Bookworm destekler</td><td>Bookworm 64-bit destekler</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Host ağ namespace</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — host network modu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Rootless modda --network=host sınırlıdır</span>
+<span class="cmt"># Yalnızca non-privileged portlar (>1024) bind edilebilir</span>
+<span class="cmd">podman</span> run <span class="flag">--rm</span> <span class="flag">--network=host</span> nginx:alpine
+
+<span class="cmt"># Rootless &lt;1024 port için: sysctl net.ipv4.ip_unprivileged_port_start=80</span>
+<span class="cmd">sudo</span> sysctl <span class="flag">-w</span> net.ipv4.ip_unprivileged_port_start=80
+<span class="cmt"># Kalıcı hale getir:</span>
+<span class="cmd">echo</span> <span class="str">"net.ipv4.ip_unprivileged_port_start=80"</span> \
+  | <span class="cmd">sudo</span> tee /etc/sysctl.d/99-podman.conf</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>slirp4netns: userspace TCP proxy, geniş kernel uyumluluğu</li>
+      <li>pasta: Podman 4.4+, daha hızlı, IPv6 tam desteği</li>
+      <li>Port &lt;1024 için sysctl ip_unprivileged_port_start ayarı gerekir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Temel kullanım — pull, run, exec, stop, rm</h2>
+  <p class="section-lead">Podman'ın günlük kullanımda en sık çalıştırılan komutları: imaj indirme, container başlatma, içine girme, durdurma ve silme.</p>
+
+  <h3>Image çekme ve listeleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — podman pull ve image yönetimi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Docker Hub'dan imaj çek</span>
+<span class="cmd">podman</span> pull nginx:alpine
+<span class="cmd">podman</span> pull python:3.11-slim
+
+<span class="cmt"># Birden fazla registry: docker.io, quay.io, ghcr.io</span>
+<span class="cmd">podman</span> pull quay.io/fedora/fedora:latest
+<span class="cmd">podman</span> pull ghcr.io/home-assistant/home-assistant:stable
+
+<span class="cmt"># Lokal imajları listele</span>
+<span class="cmd">podman</span> images
+<span class="cmt"># REPOSITORY    TAG      IMAGE ID      CREATED      SIZE</span>
+<span class="cmt"># docker.io/library/nginx  alpine  abc123  2 hours ago  42.6MB</span>
+
+<span class="cmt"># İmaj geçmişini incele</span>
+<span class="cmd">podman</span> history nginx:alpine</code></pre>
+  </div>
+
+  <h3>Container çalıştırma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — podman run seçenekleri</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Arka planda çalıştır, port yönlendir, isim ver</span>
+<span class="cmd">podman</span> run <span class="flag">-d</span> \
+  <span class="flag">--name</span> webserver \
+  <span class="flag">-p</span> 8080:80 \
+  <span class="flag">-v</span> /home/emirhan/www:/usr/share/nginx/html:ro \
+  nginx:alpine
+
+<span class="cmt"># Ortam değişkeni ile çalıştır</span>
+<span class="cmd">podman</span> run <span class="flag">-d</span> \
+  <span class="flag">--name</span> myapp \
+  <span class="flag">-e</span> APP_ENV=production \
+  <span class="flag">-e</span> DB_HOST=192.168.1.10 \
+  <span class="flag">-p</span> 5000:5000 \
+  myapp:latest
+
+<span class="cmt"># Geçici container (--rm ile otomatik silinir)</span>
+<span class="cmd">podman</span> run <span class="flag">--rm</span> <span class="flag">-it</span> alpine /bin/sh
+
+<span class="cmt"># Resource limit ile çalıştır</span>
+<span class="cmd">podman</span> run <span class="flag">-d</span> \
+  <span class="flag">--memory</span> 256m \
+  <span class="flag">--cpus</span> 0.5 \
+  <span class="flag">--name</span> limited \
+  python:3.11-slim python3 -c <span class="str">"while True: pass"</span></code></pre>
+  </div>
+
+  <h3>exec, logs, stop, rm</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — container yönetim komutları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Çalışan container içine gir</span>
+<span class="cmd">podman</span> exec <span class="flag">-it</span> webserver /bin/sh
+
+<span class="cmt"># Tek komut çalıştır</span>
+<span class="cmd">podman</span> exec webserver nginx <span class="flag">-t</span>
+
+<span class="cmt"># Logları takip et</span>
+<span class="cmd">podman</span> logs <span class="flag">-f</span> webserver
+
+<span class="cmt"># Son 50 satır log</span>
+<span class="cmd">podman</span> logs <span class="flag">--tail</span> 50 webserver
+
+<span class="cmt"># Container durdur (SIGTERM, ardından SIGKILL)</span>
+<span class="cmd">podman</span> stop webserver
+<span class="cmd">podman</span> stop <span class="flag">-t</span> 5 webserver  <span class="cmt"># 5 saniye bekle</span>
+
+<span class="cmt"># Container sil</span>
+<span class="cmd">podman</span> rm webserver
+<span class="cmd">podman</span> rm <span class="flag">-f</span> webserver     <span class="cmt"># çalışıyorsa zorla durdur ve sil</span>
+
+<span class="cmt"># Durmuş tüm containerları temizle</span>
+<span class="cmd">podman</span> container prune
+
+<span class="cmt"># Sistem temizliği (kullanılmayan image, volume, network)</span>
+<span class="cmd">podman</span> system prune <span class="flag">-a</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>podman pull: docker.io, quay.io, ghcr.io registry'leri destekler</li>
+      <li>podman run: -d arka plan, -p port, -v volume, -e env, --memory/--cpus limit</li>
+      <li>exec/logs/stop/rm komutları Docker ile birebir uyumludur</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Podman vs Docker CLI karşılaştırması</h2>
+  <p class="section-lead">Podman, Docker ile API ve CLI uyumluluğunu kasıtlı olarak korur. Mevcut Dockerfile'lar ve komut dosyaları çoğunlukla değişiklik gerektirmez.</p>
+
+  <h3>Komut eşleştirme tablosu</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>İşlem</th><th>Docker</th><th>Podman</th><th>Not</th></tr></thead>
+      <tbody>
+        <tr><td>İmaj çek</td><td>docker pull img</td><td>podman pull img</td><td>Birebir uyumlu</td></tr>
+        <tr><td>İmaj oluştur</td><td>docker build -t tag .</td><td>podman build -t tag .</td><td>Buildah kullanır</td></tr>
+        <tr><td>Container başlat</td><td>docker run ...</td><td>podman run ...</td><td>Birebir uyumlu</td></tr>
+        <tr><td>İçine gir</td><td>docker exec -it c sh</td><td>podman exec -it c sh</td><td>Birebir uyumlu</td></tr>
+        <tr><td>Compose çalıştır</td><td>docker compose up</td><td>podman compose up</td><td>podman-compose gerekir</td></tr>
+        <tr><td>Pod yönetimi</td><td>Kubernetes gibi değil</td><td>podman pod create/start</td><td>Podman özgü</td></tr>
+        <tr><td>Systemd entegrasyon</td><td>Manuel unit yazma</td><td>podman generate systemd / Quadlet</td><td>Podman özgü</td></tr>
+        <tr><td>Rootless mod</td><td>Deneysel (userns-remap)</td><td>Varsayılan</td><td>Podman üstündür</td></tr>
+        <tr><td>Registry giriş</td><td>docker login</td><td>podman login</td><td>Birebir uyumlu</td></tr>
+        <tr><td>Secret yönetimi</td><td>docker secret (Swarm)</td><td>podman secret create</td><td>Swarm gerekmez</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Docker alias ile geçiş</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — docker alias kurulumu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Mevcut script'leri değiştirmeden Podman kullan</span>
+<span class="cmd">alias</span> docker=podman
+
+<span class="cmt"># ~/.bashrc veya ~/.zshrc'ye ekle</span>
+<span class="cmd">echo</span> <span class="str">"alias docker=podman"</span> >> ~/.bashrc
+<span class="cmd">source</span> ~/.bashrc
+
+<span class="cmt"># Docker socket emülasyonu (docker-compose uyumluluğu için)</span>
+<span class="cmd">systemctl</span> <span class="flag">--user</span> enable <span class="flag">--now</span> podman.socket
+
+<span class="cmt"># DOCKER_HOST ortam değişkeni</span>
+<span class="cmd">export</span> DOCKER_HOST=unix:///run/user/$(id -u)/podman/podman.sock</code></pre>
+  </div>
+
+  <h3>Önemli farklılıklar</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Daemon yok</span><span class="desc">docker ps komutu dockerd'nin cevabına ihtiyaç duyar; podman ps doğrudan libpod veritabanını okur. Bu nedenle podman daha hızlı yanıt verir.</span></div>
+    <div class="param"><span class="name">Ağ davranışı</span><span class="desc">Docker varsayılan olarak docker0 bridge oluşturur. Podman rootless modda slirp4netns/pasta kullanır; host IP'den görünmek için -p gerekir.</span></div>
+    <div class="param"><span class="name">Volume izinleri</span><span class="desc">Rootless modda bind mount izinleri user namespace mapping nedeniyle farklı görünebilir. :Z veya :z flag'i SELinux label düzeltir.</span></div>
+    <div class="param"><span class="name">podman-compose</span><span class="desc">docker compose tam uyumlu değildir; karmaşık Compose dosyaları için podman-compose veya quadlet kullanımı daha sağlıklıdır.</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>CLI komutları neredeyse birebir; alias docker=podman ile geçiş kolaylaşır</li>
+      <li>Rootless, pod ve Quadlet Podman'a özgü güçlü özelliklerdir</li>
+      <li>Ağ ve volume izin farklılıklarına dikkat edin</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Quadlet ile systemd entegrasyonu</h2>
+  <p class="section-lead">Podman 4.4+ ile gelen <strong>Quadlet</strong>, container'ları doğrudan systemd unit dosyası olarak tanımlamanıza olanak verir. Manuel <code>podman generate systemd</code> scriptine ihtiyaç kalmaz.</p>
+
+  <h3>Quadlet .container unit dosyası</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>~/.config/containers/systemd/nginx.container — Quadlet unit</span><span class="dot">●</span></div>
+    <pre><code>[Unit]
+Description=Nginx Web Sunucusu (Rootless Podman)
+After=network-online.target
+
+[Container]
+Image=docker.io/library/nginx:alpine
+PublishPort=8080:80
+Volume=/home/emirhan/www:/usr/share/nginx/html:ro,Z
+Environment=NGINX_HOST=example.com
+Environment=NGINX_PORT=80
+Label=app=webserver
+Label=env=production
+AutoUpdate=registry
+
+[Service]
+Restart=always
+TimeoutStartSec=30
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Quadlet service yönetimi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># systemd generator'ı yenile (unit dosyası değiştiğinde)</span>
+<span class="cmd">systemctl</span> <span class="flag">--user</span> daemon-reload
+
+<span class="cmt"># Service'i başlat ve etkinleştir</span>
+<span class="cmd">systemctl</span> <span class="flag">--user</span> enable <span class="flag">--now</span> nginx.service
+
+<span class="cmt"># Durumu kontrol et</span>
+<span class="cmd">systemctl</span> <span class="flag">--user</span> status nginx.service
+
+<span class="cmt"># Logları izle</span>
+<span class="cmd">journalctl</span> <span class="flag">--user</span> <span class="flag">-u</span> nginx.service <span class="flag">-f</span>
+
+<span class="cmt"># Service durdur/yeniden başlat</span>
+<span class="cmd">systemctl</span> <span class="flag">--user</span> restart nginx.service
+<span class="cmd">systemctl</span> <span class="flag">--user</span> stop nginx.service
+
+<span class="cmt"># Kullanıcı oturumu kapansa da çalışmaya devam et</span>
+<span class="cmd">sudo</span> loginctl enable-linger emirhan</code></pre>
+  </div>
+
+  <h3>Quadlet .kube ve .network unit dosyaları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>~/.config/containers/systemd/myapp.kube — Kubernetes YAML ile</span><span class="dot">●</span></div>
+    <pre><code>[Unit]
+Description=My App via Kubernetes YAML
+After=network-online.target
+
+[Kube]
+Yaml=/home/emirhan/k8s/myapp-pod.yaml
+PublishPort=8080:80
+
+[Service]
+Restart=on-failure
+
+[Install]
+WantedBy=default.target</code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">AutoUpdate=registry</span><span class="desc">podman auto-update komutu ile registry'deki yeni imaj otomatik çekilip container yeniden başlatılır. CI/CD ile birlikte kullanılır.</span></div>
+    <div class="param"><span class="name">.network unit</span><span class="desc">Quadlet ile özel bridge ağları tanımlanabilir; birden fazla container unit aynı ağa bağlanır.</span></div>
+    <div class="param"><span class="name">.volume unit</span><span class="desc">Quadlet ile named volume'lar systemd lifecycle'ına bağlı olarak yönetilir.</span></div>
+    <div class="param"><span class="name">loginctl enable-linger</span><span class="desc">Kullanıcı logout olsa bile user systemd instance'ı çalışmaya devam eder; IoT cihazlarda kritiktir.</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Quadlet: ~/.config/containers/systemd/*.container → otomatik systemd unit</li>
+      <li>systemctl --user enable --now ile rootless container servis olarak çalışır</li>
+      <li>loginctl enable-linger: oturum kapansa da servis hayatta kalır</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Pod konsepti — infra container ve pod yönetimi</h2>
+  <p class="section-lead">Podman'ın pod desteği Kubernetes pod semantiğini yerel ortamda simüle eder. Aynı pod içindeki container'lar ağ ve IPC namespace'i paylaşır; aralarındaki iletişim localhost üzerinden gerçekleşir.</p>
+
+  <h3>Pod mimarisi</h3>
+
+  <div class="flow">
+    <pre>
+  Pod: mypod
+  ┌──────────────────────────────────────────────┐
+  │  infra container (pause)                     │
+  │  (network + IPC namespace sahibi)            │
+  │                                              │
+  │  container-1: nginx           port 80        │
+  │  container-2: python-api      port 5000      │
+  │  container-3: log-collector   (sidecar)      │
+  └──────────────────────────────────────────────┘
+  Dışarıya: -p 8080:80 ve -p 5001:5000
+    </pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — pod oluşturma ve yönetme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Pod oluştur, dış portları tanımla</span>
+<span class="cmd">podman</span> pod create \
+  <span class="flag">--name</span> webapp \
+  <span class="flag">-p</span> 8080:80 \
+  <span class="flag">-p</span> 5001:5000
+
+<span class="cmt"># Pod'a container ekle</span>
+<span class="cmd">podman</span> run <span class="flag">-d</span> \
+  <span class="flag">--pod</span> webapp \
+  <span class="flag">--name</span> nginx-frontend \
+  nginx:alpine
+
+<span class="cmd">podman</span> run <span class="flag">-d</span> \
+  <span class="flag">--pod</span> webapp \
+  <span class="flag">--name</span> python-api \
+  <span class="flag">-e</span> API_PORT=5000 \
+  myapi:latest
+
+<span class="cmt"># Pod durumunu listele</span>
+<span class="cmd">podman</span> pod list
+<span class="cmd">podman</span> pod inspect webapp
+
+<span class="cmt"># Pod'daki tüm container'ları listele</span>
+<span class="cmd">podman</span> ps <span class="flag">--pod</span>
+
+<span class="cmt"># Pod başlat/durdur/sil</span>
+<span class="cmd">podman</span> pod stop webapp
+<span class="cmd">podman</span> pod start webapp
+<span class="cmd">podman</span> pod rm <span class="flag">-f</span> webapp   <span class="cmt"># tüm container'larla birlikte sil</span></code></pre>
+  </div>
+
+  <h3>Container'lar arası iletişim</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — pod içi localhost iletişimi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Aynı pod içindeki container'lar localhost ile konuşur</span>
+<span class="cmt"># nginx container, python-api'ye şöyle bağlanır:</span>
+<span class="cmd">podman</span> exec nginx-frontend \
+  wget <span class="flag">-qO-</span> http://localhost:5000/health
+
+<span class="cmt"># Kubernetes YAML'e dönüştür (K3s veya kind ile kullanmak için)</span>
+<span class="cmd">podman</span> generate kube webapp > webapp-pod.yaml
+<span class="cmd">cat</span> webapp-pod.yaml</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Pod = shared network/IPC namespace; infra container (pause) namespace'e sahip</li>
+      <li>Pod içi iletişim localhost; dışa portlar pod create sırasında tanımlanır</li>
+      <li>podman generate kube ile K3s/Kubernetes YAML üretilir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> ARM64 cross-build ve secret yönetimi</h2>
+  <p class="section-lead">Podman, QEMU user-static ile ARM64/ARMv7 imajlarını x86-64 host üzerinde derleyebilir. Secret yönetimi ise hassas verileri container'a güvenli şekilde iletir.</p>
+
+  <h3>ARM64 cross-build</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — QEMU kurulumu ve ARM64 build</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># QEMU user-static kurulumu</span>
+<span class="cmd">sudo</span> apt-get install -y qemu-user-static
+<span class="cmd">sudo</span> podman run <span class="flag">--rm</span> <span class="flag">--privileged</span> \
+  multiarch/qemu-user-static <span class="flag">--reset</span> <span class="flag">-p</span> yes
+
+<span class="cmt"># ARM64 imaj çek ve çalıştır</span>
+<span class="cmd">podman</span> run <span class="flag">--rm</span> <span class="flag">--platform</span> linux/arm64 \
+  alpine uname <span class="flag">-m</span>
+<span class="cmt"># aarch64</span>
+
+<span class="cmt"># ARM64 için build et</span>
+<span class="cmd">podman</span> build \
+  <span class="flag">--platform</span> linux/arm64 \
+  <span class="flag">-t</span> myapp:arm64 \
+  <span class="flag">-f</span> Dockerfile .
+
+<span class="cmt"># Multi-arch manifest oluştur</span>
+<span class="cmd">podman</span> build \
+  <span class="flag">--platform</span> linux/arm64,linux/amd64 \
+  <span class="flag">--manifest</span> myapp:latest \
+  <span class="flag">-f</span> Dockerfile .
+
+<span class="cmt"># Manifest'i registry'e push et</span>
+<span class="cmd">podman</span> manifest push myapp:latest \
+  docker://ghcr.io/myorg/myapp:latest</code></pre>
+  </div>
+
+  <h3>Secret yönetimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — podman secret oluşturma ve kullanma</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Dosyadan secret oluştur</span>
+<span class="cmd">echo</span> <span class="str">"s3cr3t_p4ssw0rd"</span> | <span class="cmd">podman</span> secret create db_password -
+
+<span class="cmt"># Ortam değişkeninden secret</span>
+<span class="cmd">printf</span> <span class="str">"%s"</span> <span class="str">"$API_KEY"</span> | <span class="cmd">podman</span> secret create api_key -
+
+<span class="cmt"># Secret dosyasından oluştur</span>
+<span class="cmd">podman</span> secret create tls_cert /path/to/cert.pem
+
+<span class="cmt"># Secret listele</span>
+<span class="cmd">podman</span> secret ls
+
+<span class="cmt"># Container'a secret bağla — /run/secrets/db_password olarak mount edilir</span>
+<span class="cmd">podman</span> run <span class="flag">-d</span> \
+  <span class="flag">--secret</span> db_password \
+  <span class="flag">--name</span> mydb-client \
+  myapp:latest
+
+<span class="cmt"># Container içinde oku</span>
+<span class="cmd">podman</span> exec mydb-client cat /run/secrets/db_password
+
+<span class="cmt"># Secret'ı ortam değişkeni olarak da bağlayabilirsin</span>
+<span class="cmd">podman</span> run <span class="flag">--rm</span> \
+  <span class="flag">--secret</span> db_password,type=env,target=DB_PASSWORD \
+  alpine sh -c <span class="str">"echo $DB_PASSWORD"</span></code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">Depolama</span><span class="desc">Secret değerleri ~/.local/share/containers/storage/secrets/ altında şifrelenerek (XSalsa20) saklanır; başka kullanıcılar erişemez.</span></div>
+    <div class="param"><span class="name">/run/secrets/</span><span class="desc">Container içinde tmpfs üzerine mount edilir, disk'e yazılmaz. Container durduğunda otomatik temizlenir.</span></div>
+    <div class="param"><span class="name">Quadlet entegrasyon</span><span class="desc">.container unit dosyasında Secret=db_password satırı ile Quadlet üzerinden de secret bağlanabilir.</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>--platform linux/arm64 ile x86-64 host üzerinde ARM64 imaj derlenir</li>
+      <li>podman secret create: değer şifreli saklanır, container'a /run/secrets/ olarak mount edilir</li>
+      <li>podman manifest ile tek tag altında çoklu mimari imaj yönetilir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik — RPi'da rootless Nginx + Python API pod</h2>
+  <p class="section-lead">Raspberry Pi üzerinde rootless Podman ile Nginx (frontend proxy) ve Flask Python API'yi aynı pod içinde çalıştırıyoruz. Quadlet ile systemd servisi olarak tanımlıyoruz.</p>
+
+  <h3>Uygulama mimarisi</h3>
+
+  <div class="flow">
+    <pre>
+  İstemci :8080
+       │
+       ▼
+  Pod: webapp (RPi4, rootless)
+  ┌─────────────────────────────────────────┐
+  │  nginx:alpine  (:80)                    │
+  │    /api/* → proxy_pass localhost:5000   │
+  │    /       → /usr/share/nginx/html      │
+  │                                         │
+  │  python-api:latest  (:5000)             │
+  │    Flask app — GPIO sensor verileri     │
+  │    /api/sensors → JSON response         │
+  └─────────────────────────────────────────┘
+    </pre>
+  </div>
+
+  <h3>Python Flask API</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>app/main.py — Flask sensor API</span><span class="dot">●</span></div>
+    <pre><code>from flask import Flask, jsonify
+import time, random
+
+app = Flask(__name__)
+
+@app.route("/api/sensors")
+def sensors():
+    # Gerçek uygulamada GPIO/I2C'den okuma yapılır
+    return jsonify({
+        "timestamp": time.time(),
+        "temperature": 23.4 + random.uniform(-0.5, 0.5),
+        "humidity":    55.0 + random.uniform(-2.0, 2.0),
+        "status": "ok"
+    })
+
+@app.route("/api/health")
+def health():
+    return jsonify({"status": "healthy"})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>app/Dockerfile — Python API imajı</span><span class="dot">●</span></div>
+    <pre><code>FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY main.py .
+EXPOSE 5000
+USER nobody
+CMD ["python3", "main.py"]</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>nginx/default.conf — reverse proxy yapılandırması</span><span class="dot">●</span></div>
+    <pre><code>server {
+    listen 80;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    location /api/ {
+        proxy_pass http://localhost:5000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}</code></pre>
+  </div>
+
+  <h3>Quadlet ile deploy</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — RPi'da build ve deploy adımları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># RPi'da imajı build et (aarch64 native)</span>
+<span class="cmd">podman</span> build <span class="flag">-t</span> localhost/python-api:latest ./app
+
+<span class="cmt"># Quadlet dizinini oluştur</span>
+<span class="cmd">mkdir</span> <span class="flag">-p</span> ~/.config/containers/systemd
+
+<span class="cmt"># Pod unit dosyası</span>
+<span class="cmd">cat</span> > ~/.config/containers/systemd/webapp.pod &lt;&lt;'EOF'
+[Unit]
+Description=Webapp Pod
+
+[Pod]
+PodName=webapp
+PublishPort=8080:80
+
+[Install]
+WantedBy=default.target
+EOF
+
+<span class="cmt"># Nginx container unit</span>
+<span class="cmd">cat</span> > ~/.config/containers/systemd/nginx.container &lt;&lt;'EOF'
+[Unit]
+Description=Nginx Frontend
+After=webapp-pod.service
+
+[Container]
+Image=docker.io/library/nginx:alpine
+Pod=webapp.pod
+Volume=/home/pi/webapp/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro,Z
+Volume=/home/pi/webapp/html:/usr/share/nginx/html:ro,Z
+
+[Service]
+Restart=always
+EOF
+
+<span class="cmt"># Python API container unit</span>
+<span class="cmd">cat</span> > ~/.config/containers/systemd/python-api.container &lt;&lt;'EOF'
+[Unit]
+Description=Python Sensor API
+After=webapp-pod.service
+
+[Container]
+Image=localhost/python-api:latest
+Pod=webapp.pod
+
+[Service]
+Restart=always
+EOF</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — servisleri başlat ve test et</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># systemd yenile ve servisleri başlat</span>
+<span class="cmd">systemctl</span> <span class="flag">--user</span> daemon-reload
+<span class="cmd">systemctl</span> <span class="flag">--user</span> enable <span class="flag">--now</span> webapp-pod.service
+<span class="cmd">systemctl</span> <span class="flag">--user</span> enable <span class="flag">--now</span> nginx.service
+<span class="cmd">systemctl</span> <span class="flag">--user</span> enable <span class="flag">--now</span> python-api.service
+
+<span class="cmt"># Linger etkinleştir — RPi reboot sonrası otomatik başlar</span>
+<span class="cmd">sudo</span> loginctl enable-linger pi
+
+<span class="cmt"># Test et</span>
+<span class="cmd">curl</span> http://localhost:8080/
+<span class="cmd">curl</span> http://localhost:8080/api/sensors
+<span class="cmt"># {"timestamp":1712345678.0,"temperature":23.6,"humidity":54.2,"status":"ok"}</span>
+
+<span class="cmt"># Pod durumu</span>
+<span class="cmd">podman</span> pod ps
+<span class="cmd">podman</span> pod inspect webapp</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">Üretim ipucu</div>
+    <p>RPi'da GPIO erişimi için container'ı <code>--device /dev/gpiomem</code> ile çalıştırın. Rootless modda device erişimi kısıtlıdır; libgpiod kullanımı chardev üzerinden daha güvenlidir ve root gerektirmez.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Nginx + Flask API aynı pod içinde localhost ile haberleşir</li>
+      <li>Quadlet .pod + .container unit dosyalarıyla systemd servisi tanımlanır</li>
+      <li>loginctl enable-linger ile RPi reboot'ta otomatik başlatma sağlanır</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

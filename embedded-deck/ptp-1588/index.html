@@ -1,0 +1,649 @@
+---
+layout: tutorial
+title: "IEEE 1588 PTP — Hassas Zaman Senkronizasyonu"
+back_url: "../index.html"
+back_label: "embedded-deck"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>ENDÜSTRİYEL</span>
+    <span>IEEE 1588 PTP</span>
+    <span>2026</span>
+  </div>
+  <h1>IEEE 1588 PTP<br><em>Hassas Zaman Senkronizasyonu.</em></h1>
+  <p class="subtitle">NTP'nin yetersiz kaldığı submikrosaniye senkronizasyon gereksinimlerinden PTP mesaj mekanizmasına, hardware timestamping'den linuxptp yapılandırmasına ve gPTP/TSN profilinden i.MX8 + Intel I210 üzerinde sub-μs ölçüme kadar IEEE 1588 PTP'nin eksiksiz rehberi.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Neden PTP</a></li>
+    <li><a href="#s1">PTP mimarisi</a></li>
+    <li><a href="#s2">PTP mesaj tipleri</a></li>
+    <li><a href="#s3">Hardware timestamping</a></li>
+    <li><a href="#s4">linuxptp kurulumu</a></li>
+    <li><a href="#s5">ptp4l konfigürasyonu</a></li>
+    <li><a href="#s6">gPTP (802.1AS)</a></li>
+    <li><a href="#s7">PTP over Ethernet vs UDP</a></li>
+    <li><a href="#s8">Pratik: i.MX8 + I210 sub-μs PTP</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Neden PTP</h2>
+  <p class="section-lead">NTP (Network Time Protocol) Internet üzerinde ±1–50 ms senkronizasyon sağlar. Endüstriyel otomasyon, TSN ağları ve telekomünikasyon altyapısı bu seviyeyle yetinmez; submikrosaniye (±100 ns veya daha iyi) senkronizasyon gerektirir.</p>
+
+  <h3>NTP vs PTP karşılaştırması</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Özellik</th><th>NTP</th><th>PTP (IEEE 1588)</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Doğruluk</td><td>±1–50 ms (WAN), ±1 ms (LAN)</td><td>±10–100 ns (HW timestamp)</td></tr>
+        <tr><td>Zaman kaynağı</td><td>İnternet stratum sunucuları</td><td>Yerel grandmaster (GPS/atom)</td></tr>
+        <tr><td>HW desteği</td><td>Gereksiz</td><td>PHC zorunlu (sub-μs için)</td></tr>
+        <tr><td>Kullanım alanı</td><td>Sunucu, genel IT</td><td>TSN, 5G, enerji, üretim</td></tr>
+        <tr><td>Protokol</td><td>UDP/123</td><td>L2 (Eth) veya UDP/319,320</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Kullanım alanları</h3>
+  <div class="params">
+    <div class="param"><span class="name">TSN (Time-Sensitive Networking)</span><span class="desc">802.1Qbv Time-Aware Shaper: paket gönderme zamanlaması için ±1 μs senkronizasyon gerekli</span></div>
+    <div class="param"><span class="name">Endüstriyel otomasyon</span><span class="desc">Servo motor koordinasyonu, robot kolu senkronizasyonu — IEC 61158 Profinet IRT</span></div>
+    <div class="param"><span class="name">Telekomünikasyon</span><span class="desc">5G fronthaul (eCPRI), LTE CPRI — ITU-T G.8275 telecom profili, ±130 ns</span></div>
+    <div class="param"><span class="name">Medya &amp; broadcast</span><span class="desc">SMPTE ST 2059 AES67 ses ağları, video senkronizasyonu</span></div>
+    <div class="param"><span class="name">Akıllı şebeke</span><span class="desc">IEC 61850 GOOSE mesajları, PMU senkrofazör ölçümü — IEEE C37.238</span></div>
+  </div>
+
+  <div class="callout">
+    <div class="label">ÖNEMLİ</div>
+    <p>Software timestamping ile NTP kalitesinde (~1 μs) PTP yapılabilir fakat sub-μs için mutlaka NIC'in PHC (PTP Hardware Clock) donanımı kullanılmalıdır. Çoğu modern Intel, Marvell ve NXP NIC/MAC PHC destekler.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> PTP mimarisi</h2>
+  <p class="section-lead">PTP ağında saati yayan bir grandmaster, senkronize olan slave'ler ve aralarında köprüler kurarak yayılımı sağlayan boundary/transparent clock'lar bulunur.</p>
+
+  <h3>Clock türleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">Grandmaster Clock (GM)</span><span class="desc">GPS, atom saati veya GNSS alıcısına bağlı en doğru kaynak. PTP zamanını yayar. Tüm ağa referans saat sağlar</span></div>
+    <div class="param"><span class="name">Ordinary Clock (OC)</span><span class="desc">Tek ağ portlu cihaz. Ya master (zaman yayar) ya da slave (zaman alır) rolünde çalışır</span></div>
+    <div class="param"><span class="name">Boundary Clock (BC)</span><span class="desc">Birden fazla port: upstream'den zaman alır, downstream'e master olarak dağıtır. Büyük ağlarda gecikme birikimini kesmek için kullanılır</span></div>
+    <div class="param"><span class="name">Transparent Clock (TC)</span><span class="desc">Paket geçiş gecikmesini ölçüp Sync paketine ekler (residence time correction). Switch katmanında şeffaf senkronizasyon</span></div>
+  </div>
+
+  <h3>BMCA (Best Master Clock Algorithm)</h3>
+  <div class="flow">
+    <pre>
+Her clock periyodik Announce mesajı gönderir:
+  - grandmasterClockQuality (accuracy, clockClass)
+  - grandmasterPriority1 (0=en iyi, 255=en kötü)
+  - grandmasterPriority2 (eşitlik bozucu)
+  - grandmasterIdentity (EUI-64)
+  - stepsRemoved (GM'e kaç hop)
+
+BMCA seçim sırası:
+1. priority1 en küçük → GM
+2. clockClass en küçük → GM
+3. clockAccuracy en küçük → GM
+4. offsetScaledLogVariance → GM
+5. priority2 → GM
+6. clockIdentity (deterministik, EUI-64) → GM
+    </pre>
+  </div>
+
+  <h3>PTP domain</h3>
+  <pre><code class="language-bash"># Farklı domainlar birbirinden bağımsız PTP ağları oluşturur
+# Domain 0: varsayılan (IEEE 1588)
+# Domain 24-31: IEEE 802.1AS (gPTP) için ayrılmış
+# Domain 127: test amaçlı
+
+# ptp4l.conf'ta domain ayarı:
+# domainNumber 0</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> PTP mesaj tipleri</h2>
+  <p class="section-lead">PTP, zaman senkronizasyonu için iki kategori mesaj kullanır: <em>event mesajları</em> (timestamp alınır) ve <em>general mesajlar</em> (timestamp alınmaz).</p>
+
+  <h3>Event mesajları (timestamped)</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Mesaj</th><th>Yön</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Sync</td><td>Master → Slave</td><td>t1 gönderim zamanı (one-step'te gömülü, two-step'te Follow_Up'ta)</td></tr>
+        <tr><td>Delay_Req</td><td>Slave → Master</td><td>Slave'in gönderim zamanı t3</td></tr>
+        <tr><td>Pdelay_Req</td><td>Her yön</td><td>Peer-delay mekanizması — her segmentte gecikim ölçümü</td></tr>
+        <tr><td>Pdelay_Resp</td><td>Karşı taraf</td><td>Pdelay_Req'e yanıt</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>General mesajlar</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Mesaj</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Announce</td><td>GM bilgisi, BMCA için — her 2 saniye</td></tr>
+        <tr><td>Follow_Up</td><td>Two-step Sync'teki t1 gönderim zamanı</td></tr>
+        <tr><td>Delay_Resp</td><td>Master'ın t2 alım + slave'in t3 gönderim zamanı</td></tr>
+        <tr><td>Pdelay_Resp_Follow_Up</td><td>Two-step Pdelay_Resp'teki timestamp</td></tr>
+        <tr><td>Management</td><td>Uzaktan konfigürasyon ve durum sorgulama</td></tr>
+        <tr><td>Signaling</td><td>Unicast müzakere, mesaj hızı talepleri</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Two-step vs one-step</h3>
+  <pre><code class="language-bash"># One-step: Sync mesajı içine HW timestamp gömülür
+# → Daha az mesaj, HW desteği şart
+# → Intel I210, Marvell 88E1512 one-step destekler
+
+# Two-step: Sync gönderilir, ardından Follow_Up ile t1 bildirilir
+# → Daha toleranslı, SW timestamp ile de çalışır
+# → linuxptp varsayılanı
+
+# ptp4l'de ayar:
+# twoStepFlag 1   ← iki adımlı (varsayılan)
+# twoStepFlag 0   ← tek adımlı (HW gerektirir)</code></pre>
+
+  <h3>Delay_Request-Response mekanizması</h3>
+  <div class="flow">
+    <pre>
+Master                              Slave
+  |                                   |
+  |──── Sync (t1) ───────────────────→|  t2 kaydedilir
+  |──── Follow_Up (t1) ──────────────→|
+  |                                   |
+  |←─── Delay_Req ────────────────────| t3 kaydedilir
+  |──── Delay_Resp (t4) ─────────────→|
+
+offsetFromMaster = ((t2-t1) - (t4-t3)) / 2
+meanPathDelay    = ((t2-t1) + (t4-t3)) / 2
+    </pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Hardware timestamping</h2>
+  <p class="section-lead">Sub-μs doğruluk için PTP paketlerinin gönderim/alım zamanının donanım (NIC PHC) tarafından kaydedilmesi gerekir. Software timestamping kernel+interrupt gecikmesinden etkilenir.</p>
+
+  <h3>NIC timestamping kapasitesini kontrol et</h3>
+  <pre><code class="language-bash"># ethtool ile HW timestamp desteği
+ethtool -T eth0
+# Time stamping parameters for eth0:
+# Capabilities:
+#   hardware-transmit     (SOF_TIMESTAMPING_TX_HARDWARE)
+#   software-transmit     (SOF_TIMESTAMPING_TX_SOFTWARE)
+#   hardware-receive      (SOF_TIMESTAMPING_RX_HARDWARE)
+#   software-receive      (SOF_TIMESTAMPING_RX_SOFTWARE)
+#   raw-hardware          (SOF_TIMESTAMPING_RAW_HARDWARE)
+# PTP Hardware Clock: 0      ← /dev/ptp0'a karşılık gelir
+# Hardware Transmit Timestamp Modes:
+#   off                    (HWTSTAMP_TX_OFF)
+#   on                     (HWTSTAMP_TX_ON)
+# Hardware Receive Filter Modes:
+#   none                   (HWTSTAMP_FILTER_NONE)
+#   ptpv1-l4-event         (HWTSTAMP_FILTER_PTP_V1_L4_EVENT)
+#   ptpv2-l4-event         (HWTSTAMP_FILTER_PTP_V2_L4_EVENT)
+#   ptpv2-l2-event         (HWTSTAMP_FILTER_PTP_V2_L2_EVENT)
+#   ptpv2-event            (HWTSTAMP_FILTER_PTP_V2_EVENT)</code></pre>
+
+  <h3>/dev/ptp0 — PHC arayüzü</h3>
+  <pre><code class="language-bash"># PHC cihazlarını listele
+ls -la /dev/ptp*
+
+# PHC bilgisi
+cat /sys/class/ptp/ptp0/clock_name
+# eth0
+
+# phc_ctl ile PHC saatini yönet
+phc_ctl /dev/ptp0 get          # mevcut PHC zamanı
+phc_ctl /dev/ptp0 set          # sistem saatini PHC'ye yaz
+phc_ctl /dev/ptp0 adj 1000     # 1000 ns ileri ayarla
+phc_ctl /dev/ptp0 freq 0       # frekans düzeltmesi sıfırla
+phc_ctl /dev/ptp0 cmp          # PHC ile CLOCK_REALTIME farkı
+
+# PHC ve sistem saati farkı (phc2sys olmadan)
+phc_ctl /dev/ptp0 get 2>&amp;1 | awk '{print $NF}'</code></pre>
+
+  <h3>Yazılım vs donanım timestamping farkı</h3>
+  <div class="callout">
+    <div class="label">KIYASLAMA</div>
+    <p>Yazılım timestamping: ±1–10 μs (kernel interrupt latency, scheduling jitter)<br>
+    Donanım timestamping: ±10–100 ns (NIC PHC, doğrudan wire event)<br>
+    Fark yaklaşık 100x. Sub-μs hedef için <strong>HW timestamping zorunludur</strong>.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> linuxptp kurulumu</h2>
+  <p class="section-lead">linuxptp, ptp4l (PTP clock servo) ve phc2sys (PHC ile sistem saati senkronizasyonu) araçlarını içeren Linux için standart PTP implementasyonudur.</p>
+
+  <h3>Kurulum</h3>
+  <pre><code class="language-bash"># Debian/Ubuntu
+sudo apt install linuxptp
+
+# Kaynak koddan derle (son sürüm için)
+git clone https://git.code.sf.net/p/linuxptp/code linuxptp
+cd linuxptp
+make
+sudo make install
+
+# Araçlar:
+# ptp4l    — PTP clock daemon (mesaj alışverişi + servo)
+# phc2sys  — PHC ↔ CLOCK_REALTIME senkronizasyon
+# ts2phc   — harici timestamp kaynağını PHC'ye sync
+# pmc      — PTP Management Client (sorgulama)
+# tstool   — timestamp test aracı</code></pre>
+
+  <h3>ptp4l — temel çalıştırma</h3>
+  <pre><code class="language-bash"># Slave mode — eth0 üzerinde HW timestamp
+sudo ptp4l -i eth0 -f /etc/linuxptp/ptp4l.conf -s -m
+
+# Parametreler:
+# -i eth0  : ağ arayüzü
+# -s       : slave only (master olmaz)
+# -m       : mesajları stdout'a yaz
+# -f       : konfigürasyon dosyası
+
+# Master mode
+sudo ptp4l -i eth0 -f /etc/linuxptp/ptp4l.conf -m
+
+# Software timestamp ile test (HW yoksa)
+sudo ptp4l -i eth0 -S -m   # -S = software timestamping</code></pre>
+
+  <h3>phc2sys — PHC ile sistem saati senkronizasyonu</h3>
+  <pre><code class="language-bash"># PHC'yi (ptp4l'in senkronize ettiği) CLOCK_REALTIME'a yaz
+sudo phc2sys -s /dev/ptp0 -c CLOCK_REALTIME \
+             -n 24 -O -37 -m
+
+# Parametreler:
+# -s /dev/ptp0      : kaynak saat (PHC)
+# -c CLOCK_REALTIME : hedef saat
+# -n 24             : domain numarası
+# -O -37            : UTC offset (TAI-UTC = 37 saniye, 2025 itibarıyla)
+# -m                : mesajları stdout'a yaz
+
+# ptp4l'den otomatik PHC bilgisi al
+sudo phc2sys -a -r -m   # auto mode</code></pre>
+
+  <h3>ts2phc — PPS/GPS → PHC senkronizasyonu</h3>
+  <pre><code class="language-bash"># GPS PPS sinyalini PHC'ye sync
+sudo ts2phc -f /etc/linuxptp/ts2phc.conf \
+            -s nmea -c eth0 -m
+
+# ts2phc.conf örneği:
+# [global]
+# ts2phc.nmea_serialport /dev/ttyS0
+# ts2phc.nmea_baudrate 9600
+# leapfile /usr/share/zoneinfo/leap-seconds.list
+
+# Doğrulama:
+journalctl -u ts2phc -f</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> ptp4l konfigürasyonu</h2>
+  <p class="section-lead">ptp4l.conf dosyası, transport katmanı, delay mekanizması, clock servo ve boundary clock ayarlarını içerir. Doğru konfigürasyon senkronizasyon kalitesini belirler.</p>
+
+  <h3>Temel ptp4l.conf</h3>
+  <pre><code class="language-bash">cat /etc/linuxptp/ptp4l.conf
+
+[global]
+# ─── Transport ───────────────────────────────────────────
+# L2 (Ethernet) — sub-μs doğruluk için tercih
+network_transport   L2
+
+# UDP üzerinden (NAT geçişi, farklı subnet)
+# network_transport   UDPv4
+
+# ─── Delay mekanizması ───────────────────────────────────
+# E2E: End-to-End delay (Request-Response)
+delay_mechanism     E2E
+
+# P2P: Peer-to-Peer (her segment bağımsız ölçüm, TC için)
+# delay_mechanism   P2P
+
+# ─── Clock servo ─────────────────────────────────────────
+# PI (orantılı-integral) servo — varsayılan
+clock_servo         pi
+
+# linreg (doğrusal regresyon) — bazı ortamlarda daha iyi
+# clock_servo       linreg
+
+# ─── Adım eşiği ──────────────────────────────────────────
+# 1 sn'den büyük fark → step (ani ayar), küçük → slew
+step_threshold      1.0
+
+# ─── İlk ayar ────────────────────────────────────────────
+# İlk senkronizasyonda büyük offset → hemen adım at
+first_step_threshold  0.00002   # 20 μs
+
+# ─── Mesaj aralıkları (log2 saniye) ──────────────────────
+logSyncInterval         -3   # 2^-3 = 0.125 sn = 8 msg/sn
+logAnnounceInterval      1   # 2^1  = 2 sn
+logMinDelayReqInterval  -3
+
+# ─── Boundary clock ──────────────────────────────────────
+# Birden fazla port varsa BC modu
+# boundary_clock_jbod 1
+
+# ─── Mesaj log seviyesi ──────────────────────────────────
+verbose      1
+logging_level  6   # INFO
+
+[eth0]
+# Arayüz başına HW timestamp
+network_transport L2</code></pre>
+
+  <h3>PI servo parametreleri</h3>
+  <pre><code class="language-bash"># [global] bölümüne ekle:
+pi_proportional_const    0.0
+pi_integral_const        0.0
+# 0 = otomatik hesaplama
+
+# Özelleştirme (çok titreyen sistemler için):
+pi_proportional_exponent   -0.3
+pi_proportional_norm_max    0.7
+pi_integral_exponent        0.4
+pi_integral_norm_max        0.3</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> gPTP (IEEE 802.1AS)</h2>
+  <p class="section-lead">gPTP (generalized PTP), IEEE 802.1AS standardında tanımlanmış TSN profilidir. Otomotiv (AUTOSAR, AVB) ve endüstriyel ağlarda IEEE 1588 PTP'nin kısıtlı ve optimize edilmiş alt kümesidir.</p>
+
+  <h3>gPTP ile IEEE 1588 farkları</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Özellik</th><th>IEEE 1588</th><th>gPTP (802.1AS)</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Transport</td><td>L2 veya UDP</td><td>Sadece L2 (Ethernet)</td></tr>
+        <tr><td>Delay mekanizması</td><td>E2E veya P2P</td><td>Sadece P2P (her segment)</td></tr>
+        <tr><td>Domain</td><td>0–127</td><td>Domain 0 (veya sabit)</td></tr>
+        <tr><td>Announce</td><td>Gerekli</td><td>802.1AS-2020'de opsiyonel</td></tr>
+        <tr><td>Propagation delay</td><td>Varsayılan kablosuz destekli</td><td>Kablolu odaklı (≤100 hop)</td></tr>
+        <tr><td>Multicast</td><td>01:1B:19:00:00:00</td><td>01:80:C2:00:00:0E</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>gPTP ptp4l konfigürasyonu</h3>
+  <pre><code class="language-bash">cat /etc/linuxptp/gPTP.cfg
+
+[global]
+gmCapable               1
+priority1               248
+priority2               248
+logAnnounceInterval     1
+logSyncInterval         -3
+logMinPdelayReqInterval  0
+network_transport       L2
+delay_mechanism         P2P
+time_stamping           hardware
+assume_two_step         1
+follow_up_info          1
+transportSpecific       0x1   # gPTP = 0x1
+
+[eth0]
+asCapable               auto</code></pre>
+
+  <h3>Automotive gPTP (AUTOSAR / DoIP)</h3>
+  <pre><code class="language-bash"># Araç içi Ethernet (100BASE-T1, 1000BASE-T1)
+# AUTOSAR araç ağlarında gPTP domain 0 kullanılır
+
+# OpenAVB / avb-lib ile gPTP (automotive AVB)
+# https://github.com/AVnu/OpenAvnu
+
+# Örnek: qdisc ile TSN + gPTP kombinasyonu
+tc qdisc add dev eth0 parent root handle 100 taprio \
+    num_tc 4 \
+    map 2 2 1 0 2 2 2 2 2 2 2 2 2 2 2 2 \
+    queues 1@0 1@1 1@2 1@3 \
+    base-time 1000000000 \
+    sched-entry S 0x07 300000 \
+    sched-entry S 0x0f 700000 \
+    flags 0x2   # clockid CLOCK_TAI</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> PTP over Ethernet vs UDP</h2>
+  <p class="section-lead">PTP mesajları iki transport modunda taşınabilir: doğrudan Ethernet frame (L2) veya UDP/IP (L3). Her ikisinin avantaj/dezavantajları ve konfigürasyonu farklıdır.</p>
+
+  <h3>L2 (Ethernet multicast)</h3>
+  <pre><code class="language-bash"># L2 PTP — Ethernet frame üzerinde doğrudan
+# EtherType: 0x88F7
+# Multicast MAC: 01:1B:19:00:00:00 (PTP v2 event)
+#                01:80:C2:00:00:0E (gPTP)
+
+# Avantajlar:
+# + En düşük gecikme (IP başlığı/routing yok)
+# + VLAN desteği (802.1Q etiketli)
+# + Switch'te hardware timestamping daha kolay
+
+# Dezavantajlar:
+# - Router/NAT'tan geçemez (L2 broadcast domain kısıtı)
+# - Farklı subnet'lerde çalışmaz
+
+# ptp4l.conf:
+# network_transport L2</code></pre>
+
+  <h3>UDP/IPv4 ve IPv6</h3>
+  <pre><code class="language-bash"># UDP PTP portları:
+# 319 — event mesajları (Sync, Delay_Req)
+# 320 — general mesajlar (Announce, Follow_Up)
+
+# Multicast adresleri (IPv4):
+# 224.0.1.129  — PTP primary multicast
+# 224.0.0.107  — PTP pdelay multicast
+
+# ptp4l.conf:
+# network_transport UDPv4
+
+# Unicast mode (multicast yoksa, L3 routing):
+# [eth0]
+# unicast_master_table 1
+# [unicast_master_table]
+# table_id         1
+# UDPv4            192.168.1.1   # grandmaster IP
+
+# Firewall kuralları:
+iptables -A INPUT -p udp --dport 319 -j ACCEPT
+iptables -A INPUT -p udp --dport 320 -j ACCEPT</code></pre>
+
+  <h3>VLAN ile PTP</h3>
+  <pre><code class="language-bash"># PTP trafiğini VLAN 100'de izole et
+ip link add link eth0 name eth0.100 type vlan id 100
+ip link set eth0.100 up
+
+# VLAN arayüzünde ptp4l çalıştır
+ptp4l -i eth0.100 -f /etc/linuxptp/ptp4l.conf -m
+
+# Switch tarafı: PTP portunu VLAN 100 tagged olarak ayarla
+# ve hardware timestamping VLAN'da çalışıyor mu kontrol et
+ethtool -T eth0.100</code></pre>
+
+  <div class="callout">
+    <div class="label">TAVSİYE</div>
+    <p>Sub-μs senkronizasyon hedefleniyorsa her zaman <strong>L2 transport + hardware timestamping</strong> kullanın. UDP/IP overhead ve kernel IP yığınından kaynaklanan gecikme jitter'ı birkaç yüz nanosaniye ile birkaç mikrosaniye ekler.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: i.MX8 + Intel I210 sub-μs PTP senkronizasyonu</h2>
+  <p class="section-lead">NXP i.MX8M Plus işlemcili embedded board ile Intel I210 NIC üzerinde sub-microsaniye PTP senkronizasyonu kurulumu ve offset histogram ölçümü.</p>
+
+  <h3>Adım 1: Donanım hazırlık</h3>
+  <pre><code class="language-bash"># Intel I210 NIC'in tanındığını doğrula
+lspci | grep -i "I210\|ethernet"
+# 00:19.0 Ethernet controller: Intel Corporation I210 Gigabit (rev 03)
+
+# PHC desteğini doğrula
+ethtool -T enp0s25 | grep -E "hardware|PHC|ptp"
+# PTP Hardware Clock: 0   ← /dev/ptp0
+
+# i.MX8 dahili MAC (FEC/ENET_QOS) de PHC destekler:
+ethtool -T eth0
+# PTP Hardware Clock: 1   ← /dev/ptp1
+
+# IRQ afinity — PTP portunu ayrı CPU core'a pin
+# (scheduling jitter azalt)
+cat /proc/interrupts | grep enp0s25
+echo 4 > /proc/irq/&lt;IRQ_NUM&gt;/smp_affinity_list  # core 2</code></pre>
+
+  <h3>Adım 2: ptp4l başlatma (I210 — slave)</h3>
+  <pre><code class="language-bash"># /etc/linuxptp/ptp4l-i210.conf
+[global]
+network_transport   L2
+delay_mechanism     E2E
+time_stamping       hardware
+clock_servo         pi
+step_threshold      0.000002       # 2 μs → step
+first_step_threshold 0.00002
+logSyncInterval     -4             # 16 msg/sn
+logMinDelayReqInterval -4
+verbose             1
+
+[enp0s25]
+
+# ptp4l çalıştır:
+sudo ptp4l -i enp0s25 \
+           -f /etc/linuxptp/ptp4l-i210.conf \
+           -s -m 2>&amp;1 | tee /tmp/ptp4l.log
+
+# Çıktı örneği:
+# ptp4l[100.234]: rms 45 max 120 freq -234 path delay 543
+# ptp4l[101.234]: rms 12 max  28 freq -238 path delay 541
+# ptp4l[102.234]: rms  8 max  15 freq -239 path delay 542
+# rms: RMS offset (nanosaniye)</code></pre>
+
+  <h3>Adım 3: phc2sys ile CLOCK_REALTIME sync</h3>
+  <pre><code class="language-bash"># ptp4l kararlı olduktan sonra phc2sys başlat
+sudo phc2sys -s /dev/ptp0 \
+             -c CLOCK_REALTIME \
+             -n 0 \
+             -O -37 \
+             -R 256 \
+             -u 10 \
+             -m 2>&amp;1 | tee /tmp/phc2sys.log
+
+# -R 256: saniyede 256 senkronizasyon
+# -u 10:  her 10 senkronizasyonda log yaz
+
+# Çıktı:
+# phc2sys[200.123]: CLOCK_REALTIME phc offset   -18 s2 freq -324 delay  523
+# phc2sys[200.127]: CLOCK_REALTIME phc offset    +5 s2 freq -319 delay  521</code></pre>
+
+  <h3>Adım 4: pmc ile durum sorgulama</h3>
+  <pre><code class="language-bash"># PTP Management Client
+sudo pmc -u -b 0 'GET CURRENT_DATA_SET'
+# sending: GET CURRENT_DATA_SET
+# offsetFromMaster 45
+# meanPathDelay    543
+# stepsRemoved     1
+
+sudo pmc -u -b 0 'GET TIME_STATUS_NP'
+# master_offset          45
+# ingress_time   1700000000000000000
+# cumulativeScaledRateOffset 0
+# scaledLastGmPhaseChange 0
+# gmTimeBaseIndicator 0
+# lastGmPhaseChange 00000000000000000000000000000000
+# gmPresent true
+# gmIdentity 68:05:ca:ff:fe:01:00:00</code></pre>
+
+  <h3>Adım 5: Offset histogram ölçümü</h3>
+  <pre><code class="language-bash">#!/bin/bash
+# ptp_histogram.sh — ptp4l offset histogramı
+LOG=/tmp/ptp4l.log
+DURATION=300  # 5 dakika veri topla
+
+# ptp4l logunu parse et, rms değerlerini çıkar
+awk '/rms/ {
+    for(i=1;i&lt;=NF;i++) if($i=="rms") print $(i+1)
+}' $LOG | sort -n | \
+awk '
+BEGIN { count=0; sum=0; max=0 }
+{
+    count++; sum+=$1
+    if($1>max) max=$1
+    bucket = int($1/10)*10
+    hist[bucket]++
+}
+END {
+    print "Toplam örnek:", count
+    print "Ortalama offset:", sum/count, "ns"
+    print "Maksimum offset:", max, "ns"
+    print "\nHistogram (ns):"
+    for (b in hist) printf "  %4d-%4d ns: %d\n", b, b+9, hist[b]
+}
+' | sort</code></pre>
+
+  <h3>Adım 6: Systemd servisleri</h3>
+  <pre><code class="language-bash"># /etc/systemd/system/ptp4l.service
+[Unit]
+Description=IEEE 1588 PTP Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/ptp4l -f /etc/linuxptp/ptp4l.conf -i enp0s25 -s
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
+---
+
+# /etc/systemd/system/phc2sys.service
+[Unit]
+Description=PTP PHC to System Clock Synchronization
+After=ptp4l.service
+Requires=ptp4l.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/phc2sys -s /dev/ptp0 -c CLOCK_REALTIME -O -37 -R 256
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+
+  <div class="callout">
+    <div class="label">ÖZET</div>
+    <p>Intel I210 + linuxptp kombinasyonu ile L2 transport ve hardware timestamping kullanıldığında rms offset tipik olarak 10–100 ns aralığında, maksimum offset ise 200–500 ns aralığında kalır. IRQ affinity ve CPU isolation (isolcpus) ile bu değerler daha da iyileştirilebilir. gPTP/TSN ağlarında ptp4l'i gPTP.cfg profiliyle çalıştırarak 802.1AS uyumluluğu sağlanır.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

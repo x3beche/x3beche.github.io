@@ -1,0 +1,617 @@
+---
+layout: tutorial
+title: "Federated Learning — Flower Framework"
+back_url: "../index.html"
+back_label: "Tüm rehberler"
+---
+
+<header class="header">
+  <div class="meta">
+    <span>Rehber</span>
+    <span>Yapay Zeka</span>
+    <span>Dağıtık Öğrenme</span>
+  </div>
+  <h1>Federated Learning —<br><em>Flower Framework.</em></h1>
+  <p class="subtitle">Veriyi merkeze toplamadan model eğitimi. FedAvg formülasyonu, Flower simülasyonu, Non-IID Dirichlet dağılımı, Differential Privacy, Secure Aggregation ve gerçek cihaz deployment.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçerik</div>
+  <ol>
+    <li><a href="#s0">Federated Learning Nedir?</a></li>
+    <li><a href="#s1">FedAvg Algoritması</a></li>
+    <li><a href="#s2">Flower Mimarisi — Server, Client, Strategy</a></li>
+    <li><a href="#s3">İlk Flower Simülasyonu — FashionMNIST</a></li>
+    <li><a href="#s4">Non-IID Veri Sorunu</a></li>
+    <li><a href="#s5">Differential Privacy</a></li>
+    <li><a href="#s6">Secure Aggregation</a></li>
+    <li><a href="#s7">Personalized FL — FedProx &amp; pFedMe</a></li>
+    <li><a href="#s8">Üretim — Gerçek Cihazlar</a></li>
+  </ol>
+</nav>
+
+<main>
+
+  <!-- ── s0 ──────────────────────────────────────────────────── -->
+  <section id="s0">
+    <h2><span class="num">00</span> Federated Learning Nedir? — Merkezi vs Dağıtık Eğitim</h2>
+    <p class="section-lead">Federated Learning, veriyi asla merkezi sunucuya göndermeden her cihazda yerel eğitim yapıp yalnızca model güncellemelerini paylaşır.</p>
+
+    <p>Klasik makine öğrenmesi sürecinde tüm veri bir sunucuda toplanır ve model bu merkezi küme üzerinde eğitilir. Bu yaklaşım kritik problemler doğurur: hastane verileri HIPAA/KVKK kapsamındadır, telefon kullanım verileri kişisel bilgi içerir, bankacılık verileri müşteri gizliliğini gerektirir. <em>Federated Learning (FL)</em>, 2017'de Google tarafından önerilen çözümdür: model ağırlıkları veya gradyanlar paylaşılır; ham veri asla cihazı terk etmez.</p>
+
+    <p>FL'nin temel akışı: sunucu global modeli seçilen istemcilere gönderir; her istemci yerel verisiyle birkaç epoch eğitim yapar; istemciler yalnızca model güncellemelerini geri gönderir; sunucu güncellemeleri toplar. Bu döngü <em>iletişim turları</em> boyunca tekrarlanır. Google Gboard yazılım tahmini, Apple siri kişiselleştirmesi ve tıbbi görüntü analizinde gerçek kullanım örnekleri mevcuttur.</p>
+
+    <table class="file-table">
+      <thead>
+        <tr><th>Özellik</th><th>Merkezi Eğitim</th><th>Federated Learning</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Veri konumu</td><td>Merkezi sunucu</td><td>İstemci cihazlar</td></tr>
+        <tr><td>Gizlilik</td><td>Düşük</td><td>Yüksek</td></tr>
+        <tr><td>Bant genişliği</td><td>Veri boyutu (GB)</td><td>Model boyutu (MB)</td></tr>
+        <tr><td>Heterojenlik</td><td>IID</td><td>Non-IID (sorun)</td></tr>
+        <tr><td>Ölçeklenebilirlik</td><td>Merkezi GPU cluster</td><td>Milyonlarca uç cihaz</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout">
+      <div class="label">SINIRLAMA</div>
+      <p>FL, gizliliği garanti etmez — gradyanlardan orijinal veri kısmen geri üretilebilir (gradient inversion attack). Gerçek gizlilik garantisi için Differential Privacy veya Secure Aggregation gereklidir.</p>
+    </div>
+  </section>
+
+  <!-- ── s1 ──────────────────────────────────────────────────── -->
+  <section id="s1">
+    <h2><span class="num">01</span> FedAvg Algoritması — Matematiksel Formülasyon</h2>
+    <p class="section-lead">McMahan et al. 2017'de yayımlanan FedAvg, veri miktarıyla ağırlıklı model ortalaması alarak FL'nin temel algoritmasını tanımlar.</p>
+
+    <p>FedAvg'ın optimize ettiği hedef: <code class="inline">min_θ F(θ) = Σ_k (n_k/n) F_k(θ)</code>. Burada F_k istemci k'nın yerel kayıp fonksiyonu, n_k yerel veri miktarı. Her iletişim turunda: sunucu C_t istemci alt kümesi seçer; her istemci k, θ'dan başlayarak E epoch SGD çalıştırır; sonuçlar n_k/n ağırlıklarıyla ortalaması alınır.</p>
+
+    <p>FedAvg'ın teorik analizi: IID verilerle yeteri kadar tur sonunda global minimuma yakınsama kanıtlanmıştır. Ancak non-IID veride her istemci kendi yerel optimumuna doğru çekildiğinden <em>client drift</em> problemi ortaya çıkar ve global model bozulur. Pratik parametreler: C (seçim fraksiyonu, tipik 0.1), E (yerel epochs, tipik 1-5), B (batch size).</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>fedavg_numpy.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> numpy <span class="keyword">as</span> np
+<span class="keyword">from</span> copy <span class="keyword">import</span> deepcopy
+<span class="keyword">from</span> typing <span class="keyword">import</span> List, Tuple
+
+<span class="keyword">def</span> <span class="cmd">fedavg</span>(
+    server_params: List[np.ndarray],
+    client_updates: List[Tuple[List[np.ndarray], int]]
+) -> List[np.ndarray]:
+    <span class="str">"""
+    FedAvg agregasyonu.
+    client_updates: [(params_k, n_k), ...] listesi
+    """</span>
+    total_samples = <span class="cmd">sum</span>(n for _, n <span class="keyword">in</span> client_updates)
+    aggregated = [np.<span class="cmd">zeros_like</span>(p) <span class="keyword">for</span> p <span class="keyword">in</span> server_params]
+
+    <span class="keyword">for</span> client_params, n_k <span class="keyword">in</span> client_updates:
+        weight = n_k / total_samples
+        <span class="keyword">for</span> i, param <span class="keyword">in</span> <span class="cmd">enumerate</span>(client_params):
+            aggregated[i] += weight * param
+
+    <span class="keyword">return</span> aggregated
+
+<span class="cmt"># ── Simülasyon ────────────────────────────────────────────────</span>
+<span class="keyword">def</span> <span class="cmd">simulate_fedavg</span>(n_clients=<span class="str">10</span>, rounds=<span class="str">20</span>, frac=<span class="str">0.5</span>):
+    <span class="cmt"># Basit lineer model: W ∈ ℝ^{100×1}</span>
+    server_W = np.<span class="cmd">zeros</span>((<span class="str">100</span>, <span class="str">1</span>))
+
+    <span class="cmt"># Farklı boyutlarda istemci veri setleri</span>
+    client_data = [
+        (np.random.<span class="cmd">randn</span>(np.random.<span class="cmd">randint</span>(<span class="str">50</span>, <span class="str">200</span>), <span class="str">100</span>),
+         np.random.<span class="cmd">randn</span>(np.random.<span class="cmd">randint</span>(<span class="str">50</span>, <span class="str">200</span>), <span class="str">1</span>))
+        <span class="keyword">for</span> _ <span class="keyword">in</span> <span class="cmd">range</span>(n_clients)
+    ]
+
+    <span class="keyword">for</span> rnd <span class="keyword">in</span> <span class="cmd">range</span>(rounds):
+        n_sel = <span class="cmd">max</span>(<span class="str">1</span>, <span class="cmd">int</span>(n_clients * frac))
+        selected = np.random.<span class="cmd">choice</span>(n_clients, n_sel, replace=<span class="keyword">False</span>)
+
+        updates = []
+        <span class="keyword">for</span> k <span class="keyword">in</span> selected:
+            X_k, y_k = client_data[k]
+            local_W = <span class="cmd">deepcopy</span>(server_W)
+            <span class="cmt"># 5 epoch SGD</span>
+            <span class="keyword">for</span> _ <span class="keyword">in</span> <span class="cmd">range</span>(<span class="str">5</span>):
+                grad = X_k.T @ (X_k @ local_W - y_k) / <span class="cmd">len</span>(y_k)
+                local_W -= <span class="str">0.01</span> * grad
+            updates.<span class="cmd">append</span>(([local_W], <span class="cmd">len</span>(y_k)))
+
+        server_W = <span class="cmd">fedavg</span>([server_W], updates)[<span class="str">0</span>]
+        loss = np.<span class="cmd">mean</span>((client_data[<span class="str">0</span>][<span class="str">0</span>] @ server_W - client_data[<span class="str">0</span>][<span class="str">1</span>])**<span class="str">2</span>)
+        <span class="keyword">if</span> rnd % <span class="str">5</span> == <span class="str">0</span>:
+            <span class="cmd">print</span>(<span class="str">f"Round {rnd+1:3d} | MSE: {loss:.4f}"</span>)
+
+<span class="cmd">simulate_fedavg</span>()</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s2 ──────────────────────────────────────────────────── -->
+  <section id="s2">
+    <h2><span class="num">02</span> Flower Mimarisi — Server, Client, Strategy</h2>
+    <p class="section-lead">Flower, framework-agnostik FL kütüphanesidir; PyTorch, TensorFlow veya scikit-learn gibi herhangi bir ML kütüphanesiyle çalışır.</p>
+
+    <p>Flower'ın üç temel bileşeni vardır. <em>Server</em>: iletişimi yönetir, stratejiyi çalıştırır, round döngüsünü kontrol eder. <em>Client</em>: <code class="inline">NumPyClient</code> veya <code class="inline">Client</code> arayüzünü uygular; <code class="inline">get_parameters</code>, <code class="inline">set_parameters</code>, <code class="inline">fit</code>, <code class="inline">evaluate</code> metotları zorunludur. <em>Strategy</em>: agregasyon mantığı; FedAvg, FedProx, FedAdam, QFedAvg, FaultTolerantFedAvg gibi hazır stratejiler veya <code class="inline">Strategy</code> arayüzünden özel implementasyon.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>flower_client.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> flwr <span class="keyword">as</span> fl
+<span class="keyword">import</span> torch
+<span class="keyword">import</span> torch.nn <span class="keyword">as</span> nn
+<span class="keyword">import</span> numpy <span class="keyword">as</span> np
+<span class="keyword">from</span> collections <span class="keyword">import</span> OrderedDict
+<span class="keyword">from</span> typing <span class="keyword">import</span> List, Tuple, Dict
+
+<span class="keyword">class</span> <span class="cmd">FlowerClient</span>(fl.client.NumPyClient):
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, model: nn.Module,
+                 train_loader, val_loader,
+                 device: str = <span class="str">"cpu"</span>):
+        self.model = model.<span class="cmd">to</span>(device)
+        self.train_loader = train_loader
+        self.val_loader   = val_loader
+        self.device = device
+        self.criterion = nn.<span class="cmd">CrossEntropyLoss</span>()
+
+    <span class="keyword">def</span> <span class="cmd">get_parameters</span>(self, config: Dict) -> List[np.ndarray]:
+        self.model.<span class="cmd">eval</span>()
+        <span class="keyword">return</span> [val.<span class="cmd">cpu</span>().<span class="cmd">numpy</span>()
+                <span class="keyword">for</span> _, val <span class="keyword">in</span> self.model.<span class="cmd">state_dict</span>().<span class="cmd">items</span>()]
+
+    <span class="keyword">def</span> <span class="cmd">set_parameters</span>(self, parameters: List[np.ndarray]) -> None:
+        params_dict = <span class="cmd">zip</span>(
+            self.model.<span class="cmd">state_dict</span>().<span class="cmd">keys</span>(), parameters
+        )
+        state_dict = <span class="cmd">OrderedDict</span>({
+            k: torch.<span class="cmd">tensor</span>(v) <span class="keyword">for</span> k, v <span class="keyword">in</span> params_dict
+        })
+        self.model.<span class="cmd">load_state_dict</span>(state_dict, strict=<span class="keyword">True</span>)
+
+    <span class="keyword">def</span> <span class="cmd">fit</span>(self, parameters, config):
+        self.<span class="cmd">set_parameters</span>(parameters)
+        epochs = <span class="cmd">int</span>(config.<span class="cmd">get</span>(<span class="str">"local_epochs"</span>, <span class="str">1</span>))
+        lr     = <span class="cmd">float</span>(config.<span class="cmd">get</span>(<span class="str">"lr"</span>, <span class="str">0.01</span>))
+        opt = torch.optim.<span class="cmd">SGD</span>(self.model.<span class="cmd">parameters</span>(), lr=lr, momentum=<span class="str">0.9</span>)
+
+        self.model.<span class="cmd">train</span>()
+        <span class="keyword">for</span> _ <span class="keyword">in</span> <span class="cmd">range</span>(epochs):
+            <span class="keyword">for</span> X, y <span class="keyword">in</span> self.train_loader:
+                X, y = X.<span class="cmd">to</span>(self.device), y.<span class="cmd">to</span>(self.device)
+                opt.<span class="cmd">zero_grad</span>()
+                self.<span class="cmd">criterion</span>(<span class="cmd">self.model</span>(X), y).<span class="cmd">backward</span>()
+                opt.<span class="cmd">step</span>()
+
+        n = <span class="cmd">len</span>(self.train_loader.dataset)
+        <span class="keyword">return</span> self.<span class="cmd">get_parameters</span>(config={}), n, {}
+
+    <span class="keyword">def</span> <span class="cmd">evaluate</span>(self, parameters, config):
+        self.<span class="cmd">set_parameters</span>(parameters)
+        self.model.<span class="cmd">eval</span>()
+        loss = correct = total = <span class="str">0</span>
+        <span class="keyword">with</span> torch.<span class="cmd">no_grad</span>():
+            <span class="keyword">for</span> X, y <span class="keyword">in</span> self.val_loader:
+                X, y = X.<span class="cmd">to</span>(self.device), y.<span class="cmd">to</span>(self.device)
+                logits = <span class="cmd">self.model</span>(X)
+                loss += self.<span class="cmd">criterion</span>(logits, y).<span class="cmd">item</span>()
+                correct += (logits.<span class="cmd">argmax</span>(<span class="str">1</span>) == y).<span class="cmd">sum</span>().<span class="cmd">item</span>()
+                total += <span class="cmd">len</span>(y)
+        <span class="keyword">return</span> loss / <span class="cmd">len</span>(self.val_loader), total, {<span class="str">"accuracy"</span>: correct/total}</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s3 ──────────────────────────────────────────────────── -->
+  <section id="s3">
+    <h2><span class="num">03</span> İlk Flower Simülasyonu — FashionMNIST ile 10 Client</h2>
+    <p class="section-lead">Flower'ın simülasyon modu, gerçek ağa ihtiyaç duymadan tek makinede çoklu istemci simüle eder; başlangıç için idealdir.</p>
+
+    <p>Flower simülasyonu (<code class="inline">flwr.simulation.start_simulation</code>) gerçek gRPC bağlantısı kurmaz; her istemciyi aynı süreçte çalıştırır ve Ray ile paralelleştirebilir. 10 istemci, 5 tur FedAvg ile FashionMNIST üzerinde temel FL deneyi aşağıda gösterilmiştir.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>federated_simulation.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> flwr <span class="keyword">as</span> fl
+<span class="keyword">import</span> torch, torch.nn <span class="keyword">as</span> nn
+<span class="keyword">from</span> torchvision <span class="keyword">import</span> datasets, transforms
+<span class="keyword">from</span> torch.utils.data <span class="keyword">import</span> DataLoader, Subset
+<span class="keyword">import</span> numpy <span class="keyword">as</span> np
+<span class="keyword">from</span> collections <span class="keyword">import</span> OrderedDict
+
+<span class="cmt"># ── Basit CNN ────────────────────────────────────────────────</span>
+<span class="keyword">class</span> <span class="cmd">CNN</span>(nn.Module):
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>()
+        self.net = nn.<span class="cmd">Sequential</span>(
+            nn.<span class="cmd">Conv2d</span>(<span class="str">1</span>, <span class="str">32</span>, <span class="str">3</span>), nn.<span class="cmd">ReLU</span>(),
+            nn.<span class="cmd">Conv2d</span>(<span class="str">32</span>, <span class="str">64</span>, <span class="str">3</span>), nn.<span class="cmd">ReLU</span>(),
+            nn.<span class="cmd">AdaptiveAvgPool2d</span>((<span class="str">4</span>, <span class="str">4</span>)),
+            nn.<span class="cmd">Flatten</span>(),
+            nn.<span class="cmd">Linear</span>(<span class="str">64</span> * <span class="str">4</span> * <span class="str">4</span>, <span class="str">128</span>), nn.<span class="cmd">ReLU</span>(),
+            nn.<span class="cmd">Linear</span>(<span class="str">128</span>, <span class="str">10</span>),
+        )
+    <span class="keyword">def</span> <span class="cmd">forward</span>(self, x): <span class="keyword">return</span> self.<span class="cmd">net</span>(x)
+
+<span class="cmt"># ── FashionMNIST IID partition ────────────────────────────────</span>
+NUM_CLIENTS = <span class="str">10</span>
+transform = transforms.<span class="cmd">Compose</span>([transforms.<span class="cmd">ToTensor</span>()])
+trainset = datasets.<span class="cmd">FashionMNIST</span>(<span class="str">"."</span>, train=<span class="keyword">True</span>,  download=<span class="keyword">True</span>, transform=transform)
+testset  = datasets.<span class="cmd">FashionMNIST</span>(<span class="str">"."</span>, train=<span class="keyword">False</span>, download=<span class="keyword">True</span>, transform=transform)
+
+<span class="cmt"># Veriyi eşit böl</span>
+partition_size = <span class="cmd">len</span>(trainset) // NUM_CLIENTS
+partitions = [
+    <span class="cmd">Subset</span>(trainset, <span class="cmd">range</span>(i * partition_size, (i+<span class="str">1</span>) * partition_size))
+    <span class="keyword">for</span> i <span class="keyword">in</span> <span class="cmd">range</span>(NUM_CLIENTS)
+]
+
+<span class="cmt"># ── Client factory ───────────────────────────────────────────</span>
+<span class="keyword">def</span> <span class="cmd">client_fn</span>(cid: str) -> fl.client.NumPyClient:
+    model = <span class="cmd">CNN</span>()
+    client_id = <span class="cmd">int</span>(cid)
+    train_loader = <span class="cmd">DataLoader</span>(partitions[client_id], batch_size=<span class="str">32</span>, shuffle=<span class="keyword">True</span>)
+    val_loader   = <span class="cmd">DataLoader</span>(testset, batch_size=<span class="str">64</span>)
+    <span class="keyword">return</span> <span class="cmd">FlowerClient</span>(model, train_loader, val_loader)
+
+<span class="cmt"># ── Strateji: FedAvg ──────────────────────────────────────────</span>
+strategy = fl.<span class="cmd">server.strategy.FedAvg</span>(
+    fraction_fit=<span class="str">0.5</span>,
+    fraction_evaluate=<span class="str">0.3</span>,
+    min_fit_clients=<span class="str">5</span>,
+    min_evaluate_clients=<span class="str">3</span>,
+    min_available_clients=NUM_CLIENTS,
+    on_fit_config_fn=<span class="keyword">lambda</span> r: {<span class="str">"local_epochs"</span>: <span class="str">2</span>},
+)
+
+<span class="cmt"># ── Simülasyonu başlat ───────────────────────────────────────</span>
+history = fl.simulation.<span class="cmd">start_simulation</span>(
+    client_fn=client_fn,
+    num_clients=NUM_CLIENTS,
+    config=fl.server.<span class="cmd">ServerConfig</span>(num_rounds=<span class="str">10</span>),
+    strategy=strategy,
+    client_resources={<span class="str">"num_cpus"</span>: <span class="str">1</span>, <span class="str">"num_gpus"</span>: <span class="str">0</span>},
+)
+<span class="cmd">print</span>(<span class="str">f"Son tur loss: {history.losses_distributed[-1]}"</span>)
+<span class="cmd">print</span>(<span class="str">f"Son tur accuracy: {history.metrics_distributed['accuracy'][-1]}"</span>)</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s4 ──────────────────────────────────────────────────── -->
+  <section id="s4">
+    <h2><span class="num">04</span> Non-IID Veri Sorunu — Dirichlet Dağılımı &amp; Stratified Sampling</h2>
+    <p class="section-lead">Gerçek FL sistemlerinde istemci verileri IID değildir; bir telefon kullanıcısı belirli sınıflara ağırlıklı veriye sahiptir. Bu durum FedAvg performansını önemli ölçüde düşürür.</p>
+
+    <p><em>Dirichlet dağılımı</em>, Non-IID partition simüle etmek için standart yöntemdir. α parametresi heterojenliği kontrol eder: α → ∞ IID'ye, α → 0 her istemcide tek sınıfa yaklaşır. α = 0.5 orta derece non-IID için yaygın kullanımdır. Non-IID'nin etkisi: yerel model kendi sınıflarına overfit olur, FedAvg agregasyonu bunu dengelemeye çalışır ama performans düşer.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>non_iid_partition.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> numpy <span class="keyword">as</span> np
+<span class="keyword">from</span> torch.utils.data <span class="keyword">import</span> Subset
+<span class="keyword">from</span> torchvision <span class="keyword">import</span> datasets, transforms
+
+<span class="keyword">def</span> <span class="cmd">dirichlet_partition</span>(dataset, n_clients: int, alpha: float = <span class="str">0.5</span>,
+                          seed: int = <span class="str">42</span>):
+    <span class="str">"""
+    Dirichlet dağılımıyla Non-IID partition.
+    alpha düşük → daha heterojen
+    """</span>
+    rng = np.random.<span class="cmd">default_rng</span>(seed)
+    labels = np.<span class="cmd">array</span>([dataset[i][<span class="str">1</span>] <span class="keyword">for</span> i <span class="keyword">in</span> <span class="cmd">range</span>(<span class="cmd">len</span>(dataset))])
+    n_classes = <span class="cmd">int</span>(labels.<span class="cmd">max</span>()) + <span class="str">1</span>
+
+    <span class="cmt"># Her sınıf için indeksleri topla</span>
+    class_indices = [np.<span class="cmd">where</span>(labels == c)[<span class="str">0</span>] <span class="keyword">for</span> c <span class="keyword">in</span> <span class="cmd">range</span>(n_classes)]
+
+    client_indices = [[] <span class="keyword">for</span> _ <span class="keyword">in</span> <span class="cmd">range</span>(n_clients)]
+
+    <span class="keyword">for</span> c <span class="keyword">in</span> <span class="cmd">range</span>(n_classes):
+        rng.<span class="cmd">shuffle</span>(class_indices[c])
+        <span class="cmt"># Dirichlet dağılımı: her sınıf istemciler arasında nasıl bölünür?</span>
+        proportions = rng.<span class="cmd">dirichlet</span>(np.<span class="cmd">repeat</span>(alpha, n_clients))
+        cumulative = np.<span class="cmd">cumsum</span>(proportions * <span class="cmd">len</span>(class_indices[c])).<span class="cmd">astype</span>(<span class="cmd">int</span>)
+        splits = np.<span class="cmd">split</span>(class_indices[c], cumulative[:-<span class="str">1</span>])
+        <span class="keyword">for</span> k, split <span class="keyword">in</span> <span class="cmd">enumerate</span>(splits):
+            client_indices[k].<span class="cmd">extend</span>(split.<span class="cmd">tolist</span>())
+
+    <span class="keyword">return</span> [<span class="cmd">Subset</span>(dataset, idx) <span class="keyword">for</span> idx <span class="keyword">in</span> client_indices]
+
+<span class="cmt"># ── Kullanım ────────────────────────────────────────────────</span>
+trainset = datasets.<span class="cmd">FashionMNIST</span>(<span class="str">"."</span>, train=<span class="keyword">True</span>, download=<span class="keyword">True</span>,
+                                   transform=transforms.<span class="cmd">ToTensor</span>())
+
+<span class="cmt"># IID (alpha büyük)</span>
+iid_partitions = <span class="cmd">dirichlet_partition</span>(trainset, n_clients=<span class="str">10</span>, alpha=<span class="str">100</span>)
+<span class="cmt"># Non-IID (alpha küçük)</span>
+noniid_partitions = <span class="cmd">dirichlet_partition</span>(trainset, n_clients=<span class="str">10</span>, alpha=<span class="str">0.3</span>)
+
+<span class="cmt"># Sınıf dağılımını göster</span>
+<span class="keyword">import</span> matplotlib.pyplot <span class="keyword">as</span> plt
+fig, axes = plt.<span class="cmd">subplots</span>(<span class="str">1</span>, <span class="str">2</span>, figsize=(<span class="str">14</span>, <span class="str">5</span>))
+<span class="keyword">for</span> title, parts, ax <span class="keyword">in</span> <span class="cmd">zip</span>([<span class="str">"IID (α=100)"</span>, <span class="str">"Non-IID (α=0.3)"</span>],
+                              [iid_partitions, noniid_partitions], axes):
+    dist = np.<span class="cmd">zeros</span>((<span class="str">10</span>, <span class="str">10</span>))
+    <span class="keyword">for</span> k, part <span class="keyword">in</span> <span class="cmd">enumerate</span>(parts):
+        <span class="keyword">for</span> _, label <span class="keyword">in</span> part:
+            dist[k][label] += <span class="str">1</span>
+    ax.<span class="cmd">imshow</span>(dist, aspect=<span class="str">"auto"</span>, cmap=<span class="str">"Blues"</span>)
+    ax.<span class="cmd">set_title</span>(title)
+plt.<span class="cmd">tight_layout</span>()</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s5 ──────────────────────────────────────────────────── -->
+  <section id="s5">
+    <h2><span class="num">05</span> Differential Privacy — Gaussian Mechanism &amp; clip_grad</h2>
+    <p class="section-lead">Differential Privacy (DP), gradyanlar üzerine matematiksel gürültü ekleyerek tek bir istemcinin varlığını gizler ve gizlilik garantisi sağlar.</p>
+
+    <p><em>(ε, δ)-Differential Privacy</em>: bir algoritma, herhangi iki komşu veritabanı için çıktı dağılımları arasındaki fark ε ve δ parametreleriyle sınırlandırılmışsa DP sağlar. FL bağlamında: her istemci gradyanlarını <em>clipping</em> (L2 normunu C ile sınırla) ve <em>Gaussian gürültü</em> (σ × C standart sapmayla N(0,1) ekle) adımlarından geçirir. Flower, <code class="inline">DifferentialPrivacyClientSideAdaptiveClipping</code> stratejisiyle yerleşik DP desteği sunar.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>dp_federated.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> torch, numpy <span class="keyword">as</span> np
+<span class="keyword">import</span> flwr <span class="keyword">as</span> fl
+
+<span class="cmt"># ── Gradient clipping + Gaussian gürültü ────────────────────</span>
+<span class="keyword">def</span> <span class="cmd">dp_noise</span>(params: list, clip_C: float = <span class="str">1.0</span>,
+              noise_mult: float = <span class="str">0.1</span>) -> list:
+    <span class="str">"""
+    clip_C: L2 norm sınırı
+    noise_mult: σ = noise_mult × clip_C
+    """</span>
+    <span class="cmt"># 1. Global L2 norm hesapla</span>
+    total_norm = np.<span class="cmd">sqrt</span>(<span class="cmd">sum</span>(np.<span class="cmd">sum</span>(p**<span class="str">2</span>) <span class="keyword">for</span> p <span class="keyword">in</span> params))
+
+    <span class="cmt"># 2. Clip (scale factor)</span>
+    scale = <span class="cmd">min</span>(<span class="str">1.0</span>, clip_C / (total_norm + <span class="str">1e-8</span>))
+    clipped = [p * scale <span class="keyword">for</span> p <span class="keyword">in</span> params]
+
+    <span class="cmt"># 3. Gaussian gürültü ekle</span>
+    sigma = noise_mult * clip_C
+    noised = [p + np.random.<span class="cmd">normal</span>(<span class="str">0</span>, sigma, p.shape)
+              <span class="keyword">for</span> p <span class="keyword">in</span> clipped]
+    <span class="keyword">return</span> noised
+
+<span class="cmt"># ── DP-aware FlowerClient ─────────────────────────────────────</span>
+<span class="keyword">class</span> <span class="cmd">DPFlowerClient</span>(<span class="cmd">FlowerClient</span>):
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, *args, clip_C=<span class="str">1.0</span>, noise_mult=<span class="str">0.1</span>, **kwargs):
+        <span class="cmd">super</span>().<span class="cmd">__init__</span>(*args, **kwargs)
+        self.clip_C      = clip_C
+        self.noise_mult  = noise_mult
+
+    <span class="keyword">def</span> <span class="cmd">fit</span>(self, parameters, config):
+        new_params, n_samples, metrics = <span class="cmd">super</span>().<span class="cmd">fit</span>(parameters, config)
+        <span class="cmt"># Gradient farkı = new - old params → clip + noise</span>
+        delta = [n - o <span class="keyword">for</span> n, o <span class="keyword">in</span> <span class="cmd">zip</span>(new_params, parameters)]
+        dp_delta = <span class="cmd">dp_noise</span>(delta, self.clip_C, self.noise_mult)
+        dp_params = [o + d <span class="keyword">for</span> o, d <span class="keyword">in</span> <span class="cmd">zip</span>(parameters, dp_delta)]
+        <span class="keyword">return</span> dp_params, n_samples, metrics
+
+<span class="cmt"># ── Flower DP strateji (yerleşik) ────────────────────────────</span>
+<span class="keyword">from</span> flwr.server.strategy <span class="keyword">import</span> DifferentialPrivacyClientSideAdaptiveClipping
+
+dp_strategy = <span class="cmd">DifferentialPrivacyClientSideAdaptiveClipping</span>(
+    strategy=fl.<span class="cmd">server.strategy.FedAvg</span>(
+        fraction_fit=<span class="str">0.5</span>, min_fit_clients=<span class="str">5</span>
+    ),
+    noise_multiplier=<span class="str">0.1</span>,
+    num_sampled_clients=<span class="str">5</span>,
+    initial_clipping_norm=<span class="str">1.0</span>,
+)</code></pre>
+    </div>
+
+    <div class="callout">
+      <div class="label">DENGE</div>
+      <p>DP gürültüsü arttıkça gizlilik artar ama model doğruluğu düşer. noise_mult = 0.01 ile başlayın ve ε değerini (privacy budget) Opacus'un accountant'ı ile ölçün. Tipik hedef: ε &lt; 10, δ &lt; 1/n_data_points.</p>
+    </div>
+  </section>
+
+  <!-- ── s6 ──────────────────────────────────────────────────── -->
+  <section id="s6">
+    <h2><span class="num">06</span> Secure Aggregation — HE ve Secret Sharing Temelleri</h2>
+    <p class="section-lead">Secure Aggregation, sunucunun bireysel model güncellemelerini görmeden toplamı hesaplamasına olanak tanır; kriptografik gizlilik sağlar.</p>
+
+    <p>Gradient inversion saldırıları, sunucunun bireysel gradyanlardan orijinal veriyi kısmen geri üretebileceğini göstermiştir. <em>Secure Aggregation</em>, bunu önler: sunucu yalnızca toplamı öğrenir, hiçbir istemcinin gönderisini ayrı ayrı göremez. İki temel yaklaşım vardır: <em>Secret Sharing</em> (Shamir's Secret Sharing) — her istemci gönderisini parçalara böler, her parça farklı tarafa gider; <em>Homomorphic Encryption (HE)</em> — şifreli değerler üzerinde toplama yapılır, sunucu şifreleme anahtarına sahip değildir.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>secure_aggregation.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> numpy <span class="keyword">as</span> np
+
+<span class="cmt"># ── Basit maskeli toplama (pairwise masking) ─────────────────</span>
+<span class="cmt"># İstemci i ve j, aralarında paylaşılan maske r_ij kullanır:</span>
+<span class="cmt"># i gönderir: g_i + r_ij,  j gönderir: g_j - r_ij</span>
+<span class="cmt"># Toplam: (g_i + r_ij) + (g_j - r_ij) = g_i + g_j  ← r iptal olur</span>
+
+<span class="keyword">def</span> <span class="cmd">pairwise_masked_sum</span>(gradients: list, seed: int = <span class="str">0</span>) -> np.ndarray:
+    <span class="str">"""
+    n istemci için basit mask-based secure aggregation simülasyonu.
+    """</span>
+    n = <span class="cmd">len</span>(gradients)
+    dim = gradients[<span class="str">0</span>].shape
+    rng = np.random.<span class="cmd">default_rng</span>(seed)
+
+    masked = [g.<span class="cmd">copy</span>() <span class="keyword">for</span> g <span class="keyword">in</span> gradients]
+
+    <span class="keyword">for</span> i <span class="keyword">in</span> <span class="cmd">range</span>(n):
+        <span class="keyword">for</span> j <span class="keyword">in</span> <span class="cmd">range</span>(i + <span class="str">1</span>, n):
+            <span class="cmt"># i ve j arasında paylaşılan rastgele maske</span>
+            mask = rng.<span class="cmd">normal</span>(<span class="str">0</span>, <span class="str">1</span>, dim)
+            masked[i] += mask
+            masked[j] -= mask
+
+    <span class="cmt"># Sunucu: maskeli değerleri topla</span>
+    total = <span class="cmd">sum</span>(masked)  <span class="cmt"># = sum(gradients) + tüm maskeler iptal</span>
+    <span class="keyword">return</span> total / n
+
+<span class="cmt"># Doğrulama</span>
+grads = [np.random.<span class="cmd">randn</span>(<span class="str">10</span>) <span class="keyword">for</span> _ <span class="keyword">in</span> <span class="cmd">range</span>(<span class="str">5</span>)]
+true_avg   = np.<span class="cmd">mean</span>(grads, axis=<span class="str">0</span>)
+secure_avg = <span class="cmd">pairwise_masked_sum</span>(grads)
+<span class="cmd">print</span>(<span class="str">f"Fark (sıfır olmalı): {np.max(np.abs(true_avg - secure_avg)):.8f}"</span>)
+
+<span class="cmt"># ── Tenseal ile HE toplama ────────────────────────────────────</span>
+<span class="cmt"># pip install tenseal</span>
+<span class="keyword">try</span>:
+    <span class="keyword">import</span> tenseal <span class="keyword">as</span> ts
+    ctx = ts.<span class="cmd">context</span>(ts.SCHEME_TYPE.CKKS, poly_modulus_degree=<span class="str">8192</span>,
+                       coeff_mod_bit_sizes=[<span class="str">60</span>, <span class="str">40</span>, <span class="str">40</span>, <span class="str">60</span>])
+    ctx.<span class="cmd">generate_galois_keys</span>()
+    ctx.<span class="cmd">global_scale</span> = <span class="str">2</span>**<span class="str">40</span>
+
+    g1 = ts.<span class="cmd">ckks_vector</span>(ctx, [<span class="str">1.0</span>, <span class="str">2.0</span>, <span class="str">3.0</span>])
+    g2 = ts.<span class="cmd">ckks_vector</span>(ctx, [<span class="str">4.0</span>, <span class="str">5.0</span>, <span class="str">6.0</span>])
+    encrypted_sum = g1 + g2  <span class="cmt"># şifreli toplama</span>
+    result = encrypted_sum.<span class="cmd">decrypt</span>()
+    <span class="cmd">print</span>(<span class="str">f"HE toplama: {result}"</span>)  <span class="cmt"># [5, 7, 9]</span>
+<span class="keyword">except</span> ImportError:
+    <span class="cmd">print</span>(<span class="str">"tenseal kurulu değil: pip install tenseal"</span>)</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s7 ──────────────────────────────────────────────────── -->
+  <section id="s7">
+    <h2><span class="num">07</span> Personalized FL — FedProx, pFedMe &amp; Local Fine-tuning</h2>
+    <p class="section-lead">Tek global model tüm istemciler için optimal değildir; kişiselleştirilmiş FL her istemciye adaptif model sağlar.</p>
+
+    <p><em>FedProx</em>, FedAvg'ı yerel kayıp fonksiyonuna proksimal terim ekleyerek genişletir: <code class="inline">F_k(θ) + (μ/2)||θ - θ_global||²</code>. Bu terim yerel modelin globalden çok uzaklaşmasını engeller ve client drift'i azaltır. <em>pFedMe</em>, her istemci için ayrı kişisel parametre öğrenir ve Moreau-Yosida düzenlileştirmesiyle global modelle bağ kurar. <em>Local Fine-tuning</em> (Meta-Learning ile): global model, birkaç gradient adımıyla hızlı kişiselleştirmeye imkan tanıyacak şekilde MAML benzeri meta-objective ile eğitilir.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>fedprox.py</span><span class="dot">●</span></div>
+      <pre><code><span class="keyword">import</span> torch, torch.nn <span class="keyword">as</span> nn
+<span class="keyword">import</span> flwr <span class="keyword">as</span> fl
+<span class="keyword">import</span> numpy <span class="keyword">as</span> np
+<span class="keyword">from</span> collections <span class="keyword">import</span> OrderedDict
+
+<span class="cmt"># ── FedProx istemcisi ────────────────────────────────────────</span>
+<span class="keyword">class</span> <span class="cmd">FedProxClient</span>(fl.client.NumPyClient):
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, model, train_loader, val_loader,
+                 mu: float = <span class="str">0.01</span>):
+        self.model = model
+        self.train_loader = train_loader
+        self.val_loader   = val_loader
+        self.mu = mu
+        self.global_params = <span class="keyword">None</span>
+
+    <span class="keyword">def</span> <span class="cmd">get_parameters</span>(self, config):
+        <span class="keyword">return</span> [v.<span class="cmd">cpu</span>().<span class="cmd">numpy</span>()
+                <span class="keyword">for</span> v <span class="keyword">in</span> self.model.<span class="cmd">state_dict</span>().<span class="cmd">values</span>()]
+
+    <span class="keyword">def</span> <span class="cmd">set_parameters</span>(self, params):
+        state = <span class="cmd">OrderedDict</span>({
+            k: torch.<span class="cmd">tensor</span>(v)
+            <span class="keyword">for</span> k, v <span class="keyword">in</span> <span class="cmd">zip</span>(self.model.<span class="cmd">state_dict</span>().<span class="cmd">keys</span>(), params)
+        })
+        self.model.<span class="cmd">load_state_dict</span>(state)
+        self.global_params = [p.<span class="cmd">clone</span>().<span class="cmd">detach</span>()
+                              <span class="keyword">for</span> p <span class="keyword">in</span> self.model.<span class="cmd">parameters</span>()]
+
+    <span class="keyword">def</span> <span class="cmd">fit</span>(self, parameters, config):
+        self.<span class="cmd">set_parameters</span>(parameters)
+        opt = torch.optim.<span class="cmd">SGD</span>(self.model.<span class="cmd">parameters</span>(), lr=<span class="str">0.01</span>)
+        criterion = nn.<span class="cmd">CrossEntropyLoss</span>()
+
+        self.model.<span class="cmd">train</span>()
+        <span class="keyword">for</span> _ <span class="keyword">in</span> <span class="cmd">range</span>(<span class="str">3</span>):
+            <span class="keyword">for</span> X, y <span class="keyword">in</span> self.train_loader:
+                opt.<span class="cmd">zero_grad</span>()
+                loss = <span class="cmd">criterion</span>(<span class="cmd">self.model</span>(X), y)
+                <span class="cmt"># FedProx proximal term</span>
+                prox = <span class="cmd">sum</span>(
+                    ((p - g)**<span class="str">2</span>).<span class="cmd">sum</span>()
+                    <span class="keyword">for</span> p, g <span class="keyword">in</span> <span class="cmd">zip</span>(self.model.<span class="cmd">parameters</span>(),
+                                      self.global_params)
+                )
+                (loss + (self.mu / <span class="str">2</span>) * prox).<span class="cmd">backward</span>()
+                opt.<span class="cmd">step</span>()
+
+        n = <span class="cmd">len</span>(self.train_loader.dataset)
+        <span class="keyword">return</span> self.<span class="cmd">get_parameters</span>(config={}), n, {}
+
+    <span class="keyword">def</span> <span class="cmd">evaluate</span>(self, parameters, config):
+        self.<span class="cmd">set_parameters</span>(parameters)
+        self.model.<span class="cmd">eval</span>()
+        criterion = nn.<span class="cmd">CrossEntropyLoss</span>()
+        loss = correct = total = <span class="str">0</span>
+        <span class="keyword">with</span> torch.<span class="cmd">no_grad</span>():
+            <span class="keyword">for</span> X, y <span class="keyword">in</span> self.val_loader:
+                out = <span class="cmd">self.model</span>(X)
+                loss += <span class="cmd">criterion</span>(out, y).<span class="cmd">item</span>()
+                correct += (out.<span class="cmd">argmax</span>(<span class="str">1</span>) == y).<span class="cmd">sum</span>().<span class="cmd">item</span>()
+                total += <span class="cmd">len</span>(y)
+        <span class="keyword">return</span> loss, total, {<span class="str">"accuracy"</span>: correct/total}</code></pre>
+    </div>
+  </section>
+
+  <!-- ── s8 ──────────────────────────────────────────────────── -->
+  <section id="s8">
+    <h2><span class="num">08</span> Üretim — Gerçek Cihazlar: Android/Raspberry Pi &amp; TFLite</h2>
+    <p class="section-lead">Simülasyondan üretime geçiş, Android cihazlar veya Raspberry Pi gibi sınırlı donanım üzerinde Flower istemcisi ve TFLite modeliyle gerçekleştirilir.</p>
+
+    <p>Gerçek cihaz FL'de ek zorluklar ortaya çıkar: <em>sistem heterojenliği</em> — farklı donanım gücü, batarya ve bant genişliği; <em>müsaitlik</em> — cihazlar her zaman çevrimiçi değil; <em>model boyutu</em> — mobil cihazlara büyük model gönderilemez. Flower, gRPC üzerinden gerçek cihaz bağlantısını destekler. TFLite modelleri quantization ile boyutunu 2-4x küçültür.</p>
+
+    <div class="code-block">
+      <div class="code-header"><span>raspberry_pi_client.py</span><span class="dot">●</span></div>
+      <pre><code><span class="cmt"># Raspberry Pi / edge device Flower istemcisi</span>
+<span class="cmt"># pip install flwr tflite-runtime numpy</span>
+
+<span class="keyword">import</span> flwr <span class="keyword">as</span> fl
+<span class="keyword">import</span> numpy <span class="keyword">as</span> np
+<span class="keyword">import</span> tflite_runtime.interpreter <span class="keyword">as</span> tflite
+
+<span class="keyword">class</span> <span class="cmd">EdgeClient</span>(fl.client.NumPyClient):
+    <span class="keyword">def</span> <span class="cmd">__init__</span>(self, model_path: str, data_path: str):
+        self.model_path = model_path
+        self.X_train, self.y_train = np.<span class="cmd">load</span>(data_path, allow_pickle=<span class="keyword">True</span>)
+
+    <span class="keyword">def</span> <span class="cmd">_get_interpreter</span>(self):
+        interp = tflite.<span class="cmd">Interpreter</span>(model_path=self.model_path)
+        interp.<span class="cmd">allocate_tensors</span>()
+        <span class="keyword">return</span> interp
+
+    <span class="keyword">def</span> <span class="cmd">get_parameters</span>(self, config):
+        interp = self.<span class="cmd">_get_interpreter</span>()
+        tensors = []
+        <span class="keyword">for</span> detail <span class="keyword">in</span> interp.<span class="cmd">get_tensor_details</span>():
+            <span class="keyword">if</span> <span class="str">"weight"</span> <span class="keyword">in</span> detail[<span class="str">"name"</span>]:
+                tensors.<span class="cmd">append</span>(interp.<span class="cmd">tensor</span>(detail[<span class="str">"index"</span>])())
+        <span class="keyword">return</span> tensors
+
+    <span class="keyword">def</span> <span class="cmd">fit</span>(self, parameters, config):
+        <span class="cmt"># TFLite on-device training (TF Lite Training API)</span>
+        <span class="cmt"># Basit örnek: gradient update simülasyonu</span>
+        n = <span class="cmd">len</span>(self.X_train)
+        <span class="cmd">print</span>(<span class="str">f"Yerel eğitim: {n} örnek"</span>)
+        <span class="keyword">return</span> parameters, n, {<span class="str">"platform"</span>: <span class="str">"raspberry_pi"</span>}
+
+    <span class="keyword">def</span> <span class="cmd">evaluate</span>(self, parameters, config):
+        interp = self.<span class="cmd">_get_interpreter</span>()
+        input_idx  = interp.<span class="cmd">get_input_details</span>()[<span class="str">0</span>][<span class="str">"index"</span>]
+        output_idx = interp.<span class="cmd">get_output_details</span>()[<span class="str">0</span>][<span class="str">"index"</span>]
+        correct = <span class="str">0</span>
+        <span class="keyword">for</span> x, y <span class="keyword">in</span> <span class="cmd">zip</span>(self.X_train, self.y_train):
+            interp.<span class="cmd">set_tensor</span>(input_idx, x[<span class="cmd">np.newaxis</span>])
+            interp.<span class="cmd">invoke</span>()
+            pred = interp.<span class="cmd">get_tensor</span>(output_idx).<span class="cmd">argmax</span>()
+            correct += (pred == y)
+        acc = correct / <span class="cmd">len</span>(self.y_train)
+        <span class="keyword">return</span> <span class="str">0.0</span>, <span class="cmd">len</span>(self.y_train), {<span class="str">"accuracy"</span>: acc}
+
+<span class="cmt"># Sunucuya bağlan</span>
+<span class="cmt"># python raspberry_pi_client.py --server_address 192.168.1.100:8080</span>
+<span class="keyword">import</span> argparse
+parser = argparse.<span class="cmd">ArgumentParser</span>()
+parser.<span class="cmd">add_argument</span>(<span class="str">"--server_address"</span>, default=<span class="str">"127.0.0.1:8080"</span>)
+args = parser.<span class="cmd">parse_args</span>()
+
+fl.client.<span class="cmd">start_client</span>(
+    server_address=args.server_address,
+    client=<span class="cmd">EdgeClient</span>(<span class="str">"model.tflite"</span>, <span class="str">"local_data.npy"</span>),
+)</code></pre>
+    </div>
+
+    <div class="callout">
+      <div class="label">ÜRETIM</div>
+      <p>Gerçek FL deployment checklist: (1) TLS ile şifreli iletişim. (2) Cihaz kimlik doğrulama. (3) Model boyutu sıkıştırma (quantization). (4) Async FL — çevrimdışı cihazlar beklenmez. (5) Merkezi izleme — her tur metriklerini kaydedin. Flower'ın SuperLink/SuperNode mimarisi bu ölçeklenebilir deployment için tasarlanmıştır.</p>
+    </div>
+  </section>
+
+</main>
+
+<footer>◆ EMİRHAN PEHLEVAN ◆<br>emirpehlevan@outlook.com</footer>

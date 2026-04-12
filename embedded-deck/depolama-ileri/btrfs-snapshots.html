@@ -1,0 +1,774 @@
+---
+layout: tutorial
+title: "Btrfs Snapshot — A/B OTA"
+back_url: "../index.html"
+back_label: "Depolama İleri Düzey"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>DEPOLAMA İLERİ</span>
+    <span>BTRFS SNAPSHOT</span>
+    <span>2026</span>
+  </div>
+  <h1>Btrfs Snapshot<br><em>A/B OTA.</em></h1>
+  <p class="subtitle">Btrfs CoW mimarisi, atomic snapshot ile A/B OTA güncelleme sistemi, btrfs send/receive delta transfer, deduplication ve zstd compression — gömülü Linux'ta güvenilir güncelleme altyapısı.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Btrfs mimarisi — B-tree ve CoW</a></li>
+    <li><a href="#s1">Subvolume oluşturma ve yönetimi</a></li>
+    <li><a href="#s2">Snapshot alma ve yönetimi</a></li>
+    <li><a href="#s3">A/B OTA — snapshot akışı</a></li>
+    <li><a href="#s4">btrfs send / receive — delta transfer</a></li>
+    <li><a href="#s5">Deduplication — duperemove</a></li>
+    <li><a href="#s6">Scrub ve data integrity</a></li>
+    <li><a href="#s7">Compression — zlib / lzo / zstd</a></li>
+    <li><a href="#s8">Pratik: Yocto + Btrfs snapshot OTA sistemi</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Btrfs mimarisi — B-tree ve CoW</h2>
+  <p class="section-lead">Btrfs (B-tree File System), 2007'de Oracle tarafından başlatılan, mainline 2.6.29'dan itibaren Linux'ta yer alan next-generation dosya sistemidir. Copy-on-Write semantiği, snapshot ve RAID desteği temel tasarım prensipleridir.</p>
+
+  <h3>B-tree veri yapısı</h3>
+  <p>Btrfs tüm metadata ve veriyi B-tree yapılarında saklar. Her ağaç belirli bir veri türüne hizmet eder ve tüm ağaçlar "tree of tree roots" üst ağacından erişilir.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Root Tree</span><span class="desc">Diğer tüm ağaçların köklerini tutan ana ağaç. Tüm subvolume'lerin listesini içerir</span></div>
+    <div class="param"><span class="name">Extent Tree</span><span class="desc">Veri ve metadata extent tahsislerini izler — disk alanı yönetimi</span></div>
+    <div class="param"><span class="name">FS Tree (subvolume ağacı)</span><span class="desc">İnode, dosya verileri ve dizin girdileri. Her subvolume bağımsız FS Tree'ye sahiptir</span></div>
+    <div class="param"><span class="name">Checksum Tree</span><span class="desc">Her veri bloğunun CRC32C veya XXH64 checksum'ını tutar — veri bütünlüğü için</span></div>
+    <div class="param"><span class="name">Chunk Tree</span><span class="desc">Mantıksal (disk içi) → fiziksel adres çevirimini yönetir — RAID stripe bilgisi burada</span></div>
+  </div>
+
+  <h3>Copy-on-Write (CoW) mekanizması</h3>
+  <div class="flow">
+    <pre>
+Dosya güncelleme (CoW):
+┌──────────────────────────────────────────────────┐
+│  Mevcut Blok A (offset 0)  ← inode işaret eder  │
+│  [DATA_OLD]                                       │
+└──────────────────────────────────────────────────┘
+                    ↓  yazma isteği
+┌──────────────────────────────────────────────────┐
+│  Yeni Blok B (boş alan)   ← kopyalanır + değişir│
+│  [DATA_NEW]                                       │
+└──────────────────────────────────────────────────┘
+                    ↓  atomik pointer güncellemesi
+inode → Blok B işaret eder
+Blok A → extent tree'de serbest bırakılır
+    </pre>
+  </div>
+
+  <h3>CoW avantajları ve dezavantajları</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Avantaj</th><th>Dezavantaj</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Atomic yazma — kısmi yazma riski yok</td><td>Parçalanma (fragmentation) artabilir</td></tr>
+        <tr><td>Anlık snapshot — disk alanı sıfır</td><td>Büyük DB dosyaları için NoCoW bayrağı gerekir</td></tr>
+        <tr><td>Checksum ile veri bütünlüğü</td><td>Metadata overhead daha fazla</td></tr>
+        <tr><td>Crash recovery güçlü</td><td>HDD'de seek overhead (SSD ile sorun yok)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">GÖMÜLÜ KULLANIM</div>
+    <p>Btrfs gömülü sistemlerde SSD/eMMC/NVMe üzerinde iyi çalışır. HDD üzerinde CoW parçalanması sorun yaratabilir. eMMC üzerinde Btrfs kullanıyorsanız <code>compress=zstd</code> ile hem alan hem de yazma sayısını azaltabilirsiniz.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Btrfs B-tree yapısı tüm metadata ve veriyi ağaç yapılarında saklar</li>
+      <li>CoW her yazmayı yeni konuma yazar — atomik güncelleme garantisi</li>
+      <li>DB ve büyük dosyalar için <code>chattr +C</code> ile NoCoW etkinleştirilmeli</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Subvolume oluşturma ve yönetimi</h2>
+  <p class="section-lead">Subvolume, Btrfs içindeki bağımsız dosya sistemi ağacıdır. Bağımsız mount edilebilir, snapshot alınabilir ve send/receive ile aktarılabilir.</p>
+
+  <h3>Btrfs kurulumu ve subvolume yapısı</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — mkfs.btrfs ve temel subvolume'ler</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Btrfs formatla</span>
+<span class="cmd">mkfs.btrfs</span> -L "embedded-data" /dev/mmcblk0p3
+
+<span class="cmt"># veya çok disk (RAID1)</span>
+<span class="cmd">mkfs.btrfs</span> -d raid1 -m raid1 -L "nas-pool" /dev/sda /dev/sdb
+
+<span class="cmt"># Geçici mount (subvolume oluşturmak için)</span>
+<span class="cmd">mount</span> /dev/mmcblk0p3 /mnt/btrfs
+
+<span class="cmt"># Temel subvolume düzeni (ArchLinux tarzı)</span>
+<span class="cmd">btrfs</span> subvolume create /mnt/btrfs/@          <span class="cmt"># root subvol</span>
+<span class="cmd">btrfs</span> subvolume create /mnt/btrfs/@home      <span class="cmt"># home</span>
+<span class="cmd">btrfs</span> subvolume create /mnt/btrfs/@data      <span class="cmt"># uygulama verisi</span>
+<span class="cmd">btrfs</span> subvolume create /mnt/btrfs/@snapshots <span class="cmt"># snapshot deposu</span>
+<span class="cmd">btrfs</span> subvolume create /mnt/btrfs/@var_log   <span class="cmt"># /var/log ayrı</span>
+
+<span class="cmt"># Subvolume listesi</span>
+<span class="cmd">btrfs</span> subvolume list /mnt/btrfs
+
+<span class="cmt"># Root subvolume ile mount et</span>
+<span class="cmd">umount</span> /mnt/btrfs
+<span class="cmd">mount</span> -o subvol=@ /dev/mmcblk0p3 /
+<span class="cmd">mount</span> -o subvol=@data /dev/mmcblk0p3 /data</code></pre>
+  </div>
+
+  <h3>Subvolume detay komutları</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — yönetim komutları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Subvolume bilgisi</span>
+<span class="cmd">btrfs</span> subvolume show /data
+
+<span class="cmt"># ID sorgulama</span>
+<span class="cmd">btrfs</span> subvolume list -p /
+
+<span class="cmt"># Subvolume sil</span>
+<span class="cmd">btrfs</span> subvolume delete /mnt/btrfs/@old_subvol
+
+<span class="cmt"># Subvolume'ü varsayılan yap (mount sırasında subvol= gerekmez)</span>
+<span class="cmd">btrfs</span> subvolume set-default 256 /  <span class="cmt"># 256 = subvolume ID</span>
+
+<span class="cmt"># NoCoW bayrağı (DB, swap dosyaları)</span>
+<span class="cmd">chattr</span> +C /data/postgresql/
+<span class="cmd">lsattr</span> -d /data/postgresql/</code></pre>
+  </div>
+
+  <h3>/etc/fstab — subvolume mount</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — fstab yapılandırması</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># /etc/fstab</span>
+UUID=btrfs-uuid  /         btrfs  defaults,subvol=@,compress=zstd:3,noatime  0  0
+UUID=btrfs-uuid  /data     btrfs  defaults,subvol=@data,compress=zstd:3,noatime  0  0
+UUID=btrfs-uuid  /var/log  btrfs  defaults,subvol=@var_log,noatime  0  0
+UUID=btrfs-uuid  /.snapshots btrfs defaults,subvol=@snapshots,noatime  0  0</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Subvolume bağımsız dosya ağacı — her biri ayrı mount ve snapshot alınabilir</li>
+      <li>@, @home, @data, @snapshots düzeni Btrfs best practice'idir</li>
+      <li>DB ve swap dosyaları için chattr +C ile CoW devre dışı bırakılmalı</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Snapshot alma ve yönetimi</h2>
+  <p class="section-lead">Btrfs snapshot'ları anlık olarak alınır ve ilk anda sıfır disk alanı tüketir. CoW sayesinde sadece değişen bloklar yeni alan kaplar.</p>
+
+  <h3>Snapshot oluşturma</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — snapshot komutları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Yazılabilir snapshot (default)</span>
+<span class="cmd">btrfs</span> subvolume snapshot /data /.snapshots/data-$(date +%Y%m%d-%H%M%S)
+
+<span class="cmt"># Salt-okunur (read-only) snapshot — OTA için zorunlu</span>
+<span class="cmd">btrfs</span> subvolume snapshot -r /data /.snapshots/data-ro-$(date +%Y%m%d)
+
+<span class="cmt"># Snapshot listesi</span>
+<span class="cmd">btrfs</span> subvolume list -r /   <span class="cmt"># sadece read-only snapshot'lar</span>
+<span class="cmd">btrfs</span> subvolume list /       <span class="cmt"># tüm subvolume'ler</span>
+
+<span class="cmt"># Snapshot bilgisi</span>
+<span class="cmd">btrfs</span> subvolume show /.snapshots/data-ro-20260401
+
+<span class="cmt"># Snapshot sil</span>
+<span class="cmd">btrfs</span> subvolume delete /.snapshots/data-ro-20260301
+
+<span class="cmt"># Snapshot'tan geri yükle (rollback)</span>
+<span class="cmd">btrfs</span> subvolume snapshot /.snapshots/data-ro-20260401 /data-restored</code></pre>
+  </div>
+
+  <h3>Otomatik snapshot — snapper entegrasyonu</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — snapper kurulum</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># snapper kur</span>
+<span class="cmd">apt-get</span> install snapper
+
+<span class="cmt"># Konfigürasyon oluştur</span>
+<span class="cmd">snapper</span> -c data create-config /data
+
+<span class="cmt"># Snapshot al</span>
+<span class="cmd">snapper</span> -c data create --description "before-update-$(date +%Y%m%d)"
+
+<span class="cmt"># Liste</span>
+<span class="cmd">snapper</span> -c data list
+
+<span class="cmt"># İki snapshot arasındaki fark</span>
+<span class="cmd">snapper</span> -c data diff 1..3
+
+<span class="cmt"># Belirli snapshot'a rollback</span>
+<span class="cmd">snapper</span> -c data undochange 1..2
+
+<span class="cmt"># Otomatik temizlik (eski snapshot'ları sil)</span>
+<span class="cmd">snapper</span> -c data cleanup number</code></pre>
+  </div>
+
+  <h3>Snapshot disk alanı kullanımı</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — alan analizi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Toplam Btrfs kullanımı</span>
+<span class="cmd">btrfs</span> filesystem usage /
+
+<span class="cmt"># Her subvolume/snapshot'ın özel (exclusive) alanı</span>
+<span class="cmd">btrfs</span> filesystem du -s /.snapshots/*
+
+<span class="cmt"># Paylaşılan (shared) vs özel (exclusive) bloklar</span>
+<span class="cmd">btrfs</span> qgroup show /   <span class="cmt"># quota group istatistikleri</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Snapshot -r (read-only) OTA için kullanılmalı — yazılabilir snapshot veriyi değiştirebilir</li>
+      <li>İlk snapshot anlık ve sıfır maliyetlidir; fark büyüdükçe alan tüketilir</li>
+      <li>snapper otomatik snapshot ve rollback yönetimi sağlar</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> A/B OTA — snapshot akışı</h2>
+  <p class="section-lead">Btrfs snapshot'ları ile A/B güncellemesi geleneksel çift partition gerektirmez. Mevcut rootfs'in snapshot'ı "B slot" olarak kullanılır, güncelleme bu snapshot üzerine uygulanır ve rollback snapshot'a dönmek kadar basittir.</p>
+
+  <h3>A/B OTA akışı</h3>
+  <div class="flow">
+    <pre>
+Mevcut durum: @ subvol (A = çalışan sistem)
+
+1. Güncelleme başlamadan önce snapshot al
+   btrfs subvol snapshot -r @ /.snapshots/rootfs-v1.2.0
+
+2. @ üzerinde güncellemeyi uygula
+   (OTA agent paketi indirir, dosyaları günceller)
+
+3. Güncelleme başarılıysa yeni snapshot al
+   btrfs subvol snapshot -r @ /.snapshots/rootfs-v1.3.0
+
+4. Bir sonraki boot'ta yeni sürümle devam et
+
+5. Güncelleme başarısızsa rollback:
+   btrfs subvol snapshot /.snapshots/rootfs-v1.2.0 @-rollback
+   (U-Boot: subvol=@-rollback ile önyükle)
+    </pre>
+  </div>
+
+  <h3>OTA agent scripti</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — /usr/sbin/btrfs-ota-update.sh</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">#!/bin/bash</span>
+set -euo pipefail
+
+BTRFS_MOUNT="/btrfs_root"
+SUBVOL_ACTIVE="@"
+SNAP_DIR="@snapshots"
+OTA_BUNDLE="$1"   <span class="cmt"># OTA tar.zst paketi</span>
+NEW_VERSION="$2"  <span class="cmt"># ör: v1.3.0</span>
+
+<span class="cmt"># 1. Btrfs kök (topslevol) mount et</span>
+<span class="cmd">mount</span> -o subvolid=5 /dev/mmcblk0p3 "$BTRFS_MOUNT"
+
+<span class="cmt"># 2. Mevcut sürümü snapshot ile yedekle</span>
+PREV_SNAP="$BTRFS_MOUNT/$SNAP_DIR/rootfs-backup-$(date +%Y%m%d-%H%M%S)"
+<span class="cmd">btrfs</span> subvolume snapshot -r \
+    "$BTRFS_MOUNT/$SUBVOL_ACTIVE" \
+    "$PREV_SNAP"
+echo "Yedek snapshot: $PREV_SNAP"
+
+<span class="cmt"># 3. OTA paketini uygula</span>
+echo "OTA paketi uygulanıyor: $OTA_BUNDLE"
+<span class="cmd">tar</span> -xf "$OTA_BUNDLE" -C "$BTRFS_MOUNT/$SUBVOL_ACTIVE"
+
+<span class="cmt"># 4. Temel doğrulama</span>
+if ! "$BTRFS_MOUNT/$SUBVOL_ACTIVE/usr/bin/version-check" "$NEW_VERSION"; then
+    echo "Doğrulama başarısız — rollback!"
+    <span class="cmd">btrfs</span> subvolume delete "$BTRFS_MOUNT/$SUBVOL_ACTIVE"
+    <span class="cmd">btrfs</span> subvolume snapshot "$PREV_SNAP" "$BTRFS_MOUNT/$SUBVOL_ACTIVE"
+    <span class="cmd">umount</span> "$BTRFS_MOUNT"
+    exit 1
+fi
+
+<span class="cmt"># 5. Başarılı — yeni sürüm snapshot'ı oluştur</span>
+<span class="cmd">btrfs</span> subvolume snapshot -r \
+    "$BTRFS_MOUNT/$SUBVOL_ACTIVE" \
+    "$BTRFS_MOUNT/$SNAP_DIR/rootfs-$NEW_VERSION"
+
+echo "OTA başarılı: $NEW_VERSION"
+<span class="cmd">umount</span> "$BTRFS_MOUNT"
+<span class="cmd">reboot</span></code></pre>
+  </div>
+
+  <h3>Rollback mekanizması</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — rollback scripti</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">#!/bin/bash</span>
+<span class="cmt"># /usr/sbin/btrfs-rollback.sh &lt;snapshot-ismi&gt;</span>
+BTRFS_MOUNT="/btrfs_root"
+TARGET_SNAP="$1"
+
+<span class="cmd">mount</span> -o subvolid=5 /dev/mmcblk0p3 "$BTRFS_MOUNT"
+
+<span class="cmt"># Mevcut @ subvol'ü geçici olarak yeniden adlandır</span>
+<span class="cmd">btrfs</span> subvolume snapshot -r \
+    "$BTRFS_MOUNT/@" \
+    "$BTRFS_MOUNT/@snapshots/rollback-$(date +%Y%m%d-%H%M%S)"
+
+<span class="cmt"># @ subvolumünü sil</span>
+<span class="cmd">btrfs</span> subvolume delete "$BTRFS_MOUNT/@"
+
+<span class="cmt"># Hedef snapshot'tan yeni @ oluştur</span>
+<span class="cmd">btrfs</span> subvolume snapshot \
+    "$BTRFS_MOUNT/@snapshots/$TARGET_SNAP" \
+    "$BTRFS_MOUNT/@"
+
+echo "Rollback tamamlandı: $TARGET_SNAP"
+<span class="cmd">umount</span> "$BTRFS_MOUNT"
+<span class="cmd">reboot</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Btrfs snapshot A/B OTA için çift partition gerektirmez — tek partition yeterli</li>
+      <li>Güncelleme öncesi read-only snapshot rollback noktası sağlar</li>
+      <li>Doğrulama başarısızsa snapshot'tan @ geri yüklenerek sisteme dönülür</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> btrfs send / receive — delta transfer</h2>
+  <p class="section-lead"><code>btrfs send</code> bir snapshot'ı (veya iki snapshot arasındaki farkı) binary akış olarak dışa aktarır. <code>btrfs receive</code> bu akışı başka bir Btrfs dosya sistemine uygular. Gömülü OTA'da delta güncelleme için kritik araçtır.</p>
+
+  <h3>Tam ve artımlı transfer</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — send/receive kullanımı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ── GÖNDERME TARAFI (sunucu / build makinesi) ──</span>
+
+<span class="cmt"># Tam snapshot transferi (ilk kurulum)</span>
+<span class="cmd">btrfs</span> send /.snapshots/rootfs-v1.0.0 | \
+  <span class="cmd">gzip</span> -c > /tmp/rootfs-v1.0.0.btrfs.gz
+
+<span class="cmt"># Delta (artımlı) transfer: v1.0.0 → v1.1.0</span>
+<span class="cmt"># Her iki snapshot da read-only (-r) olmalı!</span>
+<span class="cmd">btrfs</span> send -p /.snapshots/rootfs-v1.0.0 \
+            /.snapshots/rootfs-v1.1.0 | \
+  <span class="cmd">zstd</span> -c -T4 > /tmp/delta-v1.0.0-v1.1.0.btrfs.zst
+
+<span class="cmt"># Delta boyutu karşılaştır</span>
+<span class="cmd">du</span> -sh /tmp/rootfs-v1.0.0.btrfs.gz      <span class="cmt"># tam: ~200 MB</span>
+<span class="cmd">du</span> -sh /tmp/delta-v1.0.0-v1.1.0.btrfs.zst  <span class="cmt"># delta: ~8 MB</span>
+
+<span class="cmt"># ── ALMA TARAFI (hedef cihaz) ──</span>
+
+<span class="cmt"># İlk kurulum (tam snapshot)</span>
+<span class="cmd">zcat</span> /tmp/rootfs-v1.0.0.btrfs.gz | \
+  <span class="cmd">btrfs</span> receive /btrfs_root/@snapshots/
+
+<span class="cmt"># Delta güncelleme uygula</span>
+<span class="cmd">zstd</span> -d -c /tmp/delta-v1.0.0-v1.1.0.btrfs.zst | \
+  <span class="cmd">btrfs</span> receive /btrfs_root/@snapshots/
+
+<span class="cmt"># SSH üzerinden doğrudan delta transfer</span>
+<span class="cmd">btrfs</span> send -p /.snapshots/rootfs-v1.0.0 \
+            /.snapshots/rootfs-v1.1.0 | \
+  <span class="cmd">ssh</span> root@192.168.1.100 "btrfs receive /.snapshots/"</code></pre>
+  </div>
+
+  <h3>OTA pipeline — delta güncelleme akışı</h3>
+  <div class="flow">
+    <pre>
+Build Sunucusu:
+  Yeni imaj → Btrfs snapshot → btrfs send -p prev → zstd → delta.btrfs.zst
+                                                              ↓
+                                                       OTA Sunucusu (HTTP)
+                                                              ↓
+                                                      Cihaz (wget/curl)
+                                                              ↓
+                                              btrfs receive → yeni snapshot
+                                                              ↓
+                                                  @ subvol güncelle → reboot
+    </pre>
+  </div>
+
+  <h3>Delta boyutu optimizasyonu</h3>
+  <div class="params">
+    <div class="param"><span class="name">Snapshot tutarlılığı</span><span class="desc">Delta transferin doğru çalışması için kaynak ve hedef sistemdeki parent snapshot'ın birebir aynı olması gerekir. UUID kontrolü yapılmalıdır</span></div>
+    <div class="param"><span class="name">zstd sıkıştırma</span><span class="desc">btrfs send çıktısı zstd ile %40–60 daha fazla sıkışır. -T4 ile paralel sıkıştırma önerilir</span></div>
+    <div class="param"><span class="name">İnce delta (sparse)</span><span class="desc">--no-data flag ile sadece metadata gönderilir (test/doğrulama için)</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>btrfs send -p (parent) delta transferi sağlar — tam imaj yerine fark gönderilir</li>
+      <li>Delta boyutu güncellemenin büyüklüğüne bağlı — tipik OTA için %2–10 oranında</li>
+      <li>SSH pipe ile ağ üzerinden doğrudan aktarım mümkündür</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Deduplication — duperemove</h2>
+  <p class="section-lead">Deduplication, birden fazla dosya veya snapshot'ta aynı içeriğe sahip blokları tespit edip tek fiziksel kopyaya indirger. Btrfs'te çevrimdışı (offline) ve çevrimiçi (online) dedup desteklenir.</p>
+
+  <h3>duperemove — offline dedup</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — duperemove kullanımı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kur</span>
+<span class="cmd">apt-get</span> install duperemove
+
+<span class="cmt"># Çalıştır (kuru koşu — sadece raporla)</span>
+<span class="cmd">duperemove</span> -r -d --dry-run /.snapshots/
+
+<span class="cmt"># Gerçek dedup uygula</span>
+<span class="cmd">duperemove</span> -r -d /.snapshots/
+
+<span class="cmt"># Birden fazla dizin</span>
+<span class="cmd">duperemove</span> -r -d /data/ /.snapshots/
+
+<span class="cmt"># Hash veritabanı kullan (tekrarlı çalışma için hızlı)</span>
+<span class="cmd">duperemove</span> -r -d \
+  --hashfile=/var/lib/duperemove/hashdb \
+  /.snapshots/
+
+<span class="cmt"># Thread sayısını sınırla (gömülü)</span>
+<span class="cmd">duperemove</span> -r -d -I 4 --hashfile=/var/lib/duperemove/hashdb /.snapshots/</code></pre>
+  </div>
+
+  <h3>Btrfs dahili dedup (out-of-band)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — btrfs native dedup</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># btrfs dedupe ioctls ile kernel tarafı dedup</span>
+<span class="cmd">apt-get</span> install btrfs-compsize bedup
+
+<span class="cmt"># Aynı içerikli iki dosyayı reflink ile birleştir</span>
+<span class="cmd">cp</span> --reflink=always kaynak.img hedef.img
+
+<span class="cmt"># Sıkıştırılmış boyutu görüntüle (compsize)</span>
+<span class="cmd">compsize</span> /data/
+
+<span class="cmt"># Snapshot'lar arasında paylaşılan blokları göster</span>
+<span class="cmd">btrfs</span> filesystem du -s /.snapshots/rootfs-v1.0.0
+<span class="cmd">btrfs</span> filesystem du -s /.snapshots/rootfs-v1.1.0</code></pre>
+  </div>
+
+  <h3>Snapshot dedup tasarrufu tahmini</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Senaryo</th><th>Ham boyut</th><th>Dedup sonrası</th><th>Tasarruf</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>5 benzer rootfs snapshot</td><td>5 × 400 MB = 2 GB</td><td>~420 MB</td><td>~%79</td></tr>
+        <tr><td>Günlük veri snapshot (1 ay)</td><td>30 × 100 MB = 3 GB</td><td>~150 MB (fark küçükse)</td><td>~%95</td></tr>
+        <tr><td>Heterojen imajlar</td><td>10 × 200 MB = 2 GB</td><td>~1.5 GB</td><td>~%25</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>duperemove snapshot'lar arasındaki ortak blokları tespit edip alan kurtarır</li>
+      <li>--hashfile ile tekrarlı çalışmalarda yalnızca yeni/değişen bloklar taranır</li>
+      <li>Benzer rootfs snapshot'larında %70–80 dedup oranı tipiktir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Scrub ve data integrity</h2>
+  <p class="section-lead">Btrfs scrub, her bloğu checksum'ıyla karşılaştırarak sessiz veri bozulmalarını (silent corruption) tespit eder ve RAID konfigürasyonunda otomatik onarır.</p>
+
+  <h3>Scrub çalıştırma</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — btrfs scrub</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Scrub başlat (arka planda)</span>
+<span class="cmd">btrfs</span> scrub start /
+
+<span class="cmt"># Scrub durumunu izle</span>
+<span class="cmd">btrfs</span> scrub status /
+
+<span class="cmt"># Scrub tamamlanana kadar bekle (foreground)</span>
+<span class="cmd">btrfs</span> scrub start -B /
+
+<span class="cmt"># Scrub'u duraklat / devam ettir</span>
+<span class="cmd">btrfs</span> scrub cancel /
+<span class="cmd">btrfs</span> scrub resume /
+
+<span class="cmt"># Tüm bağlı Btrfs FS'leri scrub et</span>
+for mount in $(findmnt -t btrfs -n -o TARGET); do
+    echo "Scrubbing $mount"
+    <span class="cmd">btrfs</span> scrub start -B "$mount"
+    <span class="cmd">btrfs</span> scrub status "$mount"
+done</code></pre>
+  </div>
+
+  <h3>Scrub sonuç yorumlama</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — scrub çıktı örneği</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># btrfs scrub status / çıktısı</span>
+<span class="cmt"># scrub status for 91a5d3f2-.....</span>
+<span class="cmt"># scrub started at 2026-04-12 03:00:00</span>
+<span class="cmt"># total bytes scrubbed: 12.34GiB</span>
+<span class="cmt"># error stats:</span>
+<span class="cmt">#     read errors:        0</span>
+<span class="cmt">#     csum errors:        0    ← 0 olmalı</span>
+<span class="cmt">#     uncorrectable errors: 0  ← 0 olmalı</span>
+<span class="cmt">#     corrected errors:   0</span>
+<span class="cmt">#     unverified errors:  0</span>
+<span class="cmt"># status: finished</span>
+
+<span class="cmt"># Bozulma varsa kernel log'da görünür</span>
+<span class="cmd">dmesg</span> | grep -i "btrfs.*error\|checksum\|corrected"</code></pre>
+  </div>
+
+  <h3>Periyodik scrub timer</h3>
+  <div class="code-block">
+    <div class="code-header"><span>systemd — aylık scrub timer</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># /etc/systemd/system/btrfs-scrub.service</span>
+[Unit]
+Description=Btrfs Scrub — veri bütünlüğü kontrolü
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/btrfs scrub start -B /
+ExecStart=/usr/sbin/btrfs scrub start -B /data
+
+<span class="cmt"># /etc/systemd/system/btrfs-scrub.timer</span>
+[Unit]
+Description=Aylık Btrfs Scrub
+
+[Timer]
+OnCalendar=monthly
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Scrub sessiz bit çürümelerini (bit rot) proaktif olarak tespit eder</li>
+      <li>RAID1/5/6 konfigürasyonunda scrub bozuk bloğu otomatik onarır</li>
+      <li>Aylık scrub timer gömülü sistemler için yeterlidir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Compression — zlib / lzo / zstd</h2>
+  <p class="section-lead">Btrfs şeffaf sıkıştırma, dosyaları yazarken kernel içinde sıkıştırır. Özellikle flash depolamada hem alan tasarrufu hem de daha az yazma ile ömür uzatma sağlar.</p>
+
+  <h3>Sıkıştırma algoritması karşılaştırması</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Algoritma</th><th>Oran</th><th>Hız (sıkıştırma)</th><th>Hız (açma)</th><th>Kullanım</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>zlib (seviye 1–9)</td><td>Yüksek</td><td>Yavaş</td><td>Orta</td><td>Arşiv, nadiren erişilen</td></tr>
+        <tr><td>lzo</td><td>Düşük–Orta</td><td>Çok hızlı</td><td>Çok hızlı</td><td>Gerçek zamanlı, düşük CPU</td></tr>
+        <tr><td>zstd (seviye 1–15)</td><td>Yüksek</td><td>Hızlı</td><td>Çok hızlı</td><td>Genel amaç — önerilen</td></tr>
+        <tr><td>zstd:1</td><td>Orta</td><td>Çok hızlı</td><td>Çok hızlı</td><td>Aktif veri partisyonu</td></tr>
+        <tr><td>zstd:15</td><td>Çok yüksek</td><td>Yavaş</td><td>Hızlı</td><td>Arşiv / snapshot deposu</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Compression mount seçenekleri</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — compression yapılandırması</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Mount sırasında sıkıştırma etkinleştir</span>
+<span class="cmd">mount</span> -o compress=zstd:3 /dev/mmcblk0p3 /data
+
+<span class="cmt"># Mevcut dosyaları sıkıştır (yeni yazmalarda otomatik)</span>
+<span class="cmd">btrfs</span> filesystem defragment -r -czstd /data/
+
+<span class="cmt"># Belirli dizine farklı sıkıştırma (xattr ile)</span>
+<span class="cmd">btrfs</span> property set /data/logs/ compression zstd:8
+
+<span class="cmt"># Sıkıştırma devre dışı (binary, zaten sıkışık)</span>
+<span class="cmd">btrfs</span> property set /data/videos/ compression ""
+
+<span class="cmt"># Sıkıştırma oranını görüntüle</span>
+<span class="cmd">compsize</span> /data/
+
+<span class="cmt"># Örnek çıktı:</span>
+<span class="cmt"># Type       Perc     Disk Usage   Uncompressed Referenced</span>
+<span class="cmt"># TOTAL       62%      384M         621M         631M</span>
+<span class="cmt"># none       100%       21M          21M          21M</span>
+<span class="cmt"># zstd        59%      363M         600M         610M</span></code></pre>
+  </div>
+
+  <h3>/etc/fstab compression ayarı</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — fstab compression</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># /etc/fstab — zstd:3 genel amaç için iyi denge</span>
+UUID=btrfs-uuid  /data  btrfs  \
+  defaults,subvol=@data,compress=zstd:3,noatime,discard=async  0  0
+
+UUID=btrfs-uuid  /.snapshots  btrfs  \
+  defaults,subvol=@snapshots,compress=zstd:10,noatime  0  0</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>zstd:3 günlük kullanım için oran/hız dengesi açısından önerilen seçimdir</li>
+      <li>Snapshot deposu için zstd:10+ daha yüksek sıkıştırma oranı sağlar</li>
+      <li>compsize ile gerçek sıkıştırma oranı ölçülür</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: Yocto + Btrfs snapshot OTA sistemi</h2>
+  <p class="section-lead">Yocto ile üretilen gömülü Linux imajında Btrfs tabanlı OTA güncelleme altyapısı kurun: snapshot akışı, delta transfer ve rollback prosedürü.</p>
+
+  <h3>Yocto imaj tarifi</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bitbake — btrfs-ota-image.bb</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># meta-custom/recipes-core/images/btrfs-ota-image.bb</span>
+SUMMARY = "Btrfs snapshot OTA destekli gömülü imaj"
+inherit core-image
+
+IMAGE_FEATURES += "ssh-server-openssh"
+
+IMAGE_INSTALL:append = " \
+    btrfs-tools \
+    util-linux \
+    e2fsprogs-mke2fs \
+    bash \
+    curl \
+    zstd \
+    btrfs-ota-agent \
+"
+
+<span class="cmt"># Btrfs kernel konfigürasyonu</span>
+KERNEL_FEATURES:append = " cfg/btrfs.scc"
+
+<span class="cmt"># WKS disk imaj</span>
+WKS_FILE = "btrfs-ota.wks"</code></pre>
+  </div>
+
+  <h3>WKS disk düzeni</h3>
+  <div class="code-block">
+    <div class="code-header"><span>wks — btrfs-ota.wks</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># btrfs-ota.wks</span>
+bootloader --ptable gpt --timeout=5
+
+part /boot --source bootimg-partition \
+    --ondisk mmcblk0 --fstype=vfat --label boot \
+    --active --align 4 --size 64M
+
+part / --source rootfs \
+    --ondisk mmcblk0 --fstype=btrfs --label rootfs \
+    --align 4 --size 1G \
+    --mkfs-extraopts="-O compress,extra_attr"</code></pre>
+  </div>
+
+  <h3>İlk boot kurulum scripti</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — /usr/sbin/btrfs-ota-init.sh</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">#!/bin/bash</span>
+<span class="cmt"># İlk boot'ta Btrfs subvolume yapısını oluştur</span>
+set -e
+
+DEVICE="/dev/mmcblk0p2"
+MOUNT="/mnt/btrfs_init"
+VERSION=$(cat /etc/os-release | grep VERSION_ID | cut -d= -f2 | tr -d '"')
+
+[ -d "$MOUNT" ] || mkdir -p "$MOUNT"
+
+<span class="cmt"># Topsevil mount</span>
+<span class="cmd">mount</span> -o subvolid=5 "$DEVICE" "$MOUNT"
+
+<span class="cmt"># Subvolume yapısını oluştur (sadece ilk boot)</span>
+if ! <span class="cmd">btrfs</span> subvolume list "$MOUNT" | grep -q "@snapshots"; then
+    <span class="cmd">btrfs</span> subvolume create "$MOUNT/@snapshots"
+    <span class="cmt"># Mevcut root'u @ olarak al</span>
+    <span class="cmd">btrfs</span> subvolume snapshot -r "$MOUNT" \
+        "$MOUNT/@snapshots/rootfs-${VERSION}-initial"
+    echo "İlk snapshot oluşturuldu: rootfs-${VERSION}-initial"
+fi
+
+<span class="cmd">umount</span> "$MOUNT"</code></pre>
+  </div>
+
+  <h3>Tam OTA güncelleme döngüsü</h3>
+  <div class="code-block">
+    <div name="code-header"><span>bash — tam OTA test prosedürü</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">## BUILD SUNUCUSU (yocto build makinesi)</span>
+
+<span class="cmt"># 1. Yeni sürüm derle</span>
+<span class="cmd">bitbake</span> btrfs-ota-image
+
+<span class="cmt"># 2. Btrfs imajı mount et ve snapshot al</span>
+LOOP=$(losetup -f --show tmp/deploy/images/*/rootfs.btrfs)
+<span class="cmd">mount</span> -o subvolid=5 $LOOP /mnt/new_rootfs
+<span class="cmd">btrfs</span> subvolume snapshot -r /mnt/new_rootfs \
+    /mnt/new_rootfs/@snapshots/rootfs-v1.3.0
+
+<span class="cmt"># 3. Delta oluştur</span>
+<span class="cmd">btrfs</span> send -p /mnt/prev_rootfs/@snapshots/rootfs-v1.2.0 \
+            /mnt/new_rootfs/@snapshots/rootfs-v1.3.0 | \
+  <span class="cmd">zstd</span> -c -T4 > /ota-server/delta-v1.2.0-v1.3.0.btrfs.zst
+
+<span class="cmt">## HEDEF CİHAZ</span>
+
+<span class="cmt"># 4. Delta indir</span>
+<span class="cmd">wget</span> http://ota.example.com/delta-v1.2.0-v1.3.0.btrfs.zst \
+     -O /tmp/delta.btrfs.zst
+
+<span class="cmt"># 5. Uygula ve yeniden başlat</span>
+<span class="cmd">/usr/sbin/btrfs-ota-update.sh</span> /tmp/delta.btrfs.zst v1.3.0
+
+<span class="cmt"># 6. Başarısız olursa rollback</span>
+<span class="cmd">/usr/sbin/btrfs-rollback.sh</span> rootfs-v1.2.0</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Yocto + WKS ile Btrfs tabanlı rootfs imajı üretildi</li>
+      <li>Build sunucusunda btrfs send -p ile delta paket, cihazda btrfs receive ile uygulandı</li>
+      <li>Rollback scripti herhangi bir kayıtlı snapshot'a tek komutla dönmeyi sağlar</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

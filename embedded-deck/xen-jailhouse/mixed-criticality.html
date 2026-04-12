@@ -1,0 +1,533 @@
+---
+layout: tutorial
+title: "Mixed-Criticality Sistemler — ASIL-B/D İzolasyon"
+back_url: "../index.html"
+back_label: "Xen & Jailhouse — Gömülü Hypervisor"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>XEN / JAILHOUSE</span>
+    <span>MIXED-CRITICALITY</span>
+    <span>2026</span>
+  </div>
+  <h1>Mixed-Criticality Sistemler —<br><em>ASIL-B/D İzolasyon.</em></h1>
+  <p class="subtitle">Aynı SoC üzerinde farklı güvenlik bütünlüğü seviyelerini çalıştırma: ASIL-B/D gereksinimleri, IVI + RTOS + Linux izolasyonu, virtio-vsock IPC, bellek izolasyonu ve zamansal izolasyon teknikleri — ISO 26262 uyumlu tasarım.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Mixed-criticality kavramı ve ISO 26262 çerçevesi</a></li>
+    <li><a href="#s1">ASIL seviyeleri ve izolasyon gereksinimleri</a></li>
+    <li><a href="#s2">Aynı SoC'ta IVI + RTOS + Linux — topoloji</a></li>
+    <li><a href="#s3">Hypervisor tabanlı izolasyon — Jailhouse yaklaşımı</a></li>
+    <li><a href="#s4">Bellek izolasyonu — IOMMU ve MPU/MMU yapılandırması</a></li>
+    <li><a href="#s5">Zamansal izolasyon — CPU pinleme ve interrupt routing</a></li>
+    <li><a href="#s6">virtio-vsock ile güvenli IPC</a></li>
+    <li><a href="#s7">IVSHMEM ile paylaşımlı bellek protokolü</a></li>
+    <li><a href="#s8">Safety monitor — watchdog ve sağlık izleme</a></li>
+    <li><a href="#s9">Sertifikasyon izleri — kanıt üretimi</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Mixed-criticality kavramı ve ISO 26262 çerçevesi</h2>
+  <p class="section-lead">Mixed-criticality sistem (MCS), farklı güvenlik bütünlüğü seviyelerindeki yazılım bileşenlerinin aynı donanım üzerinde çalıştığı mimaridir. Otomotiv SoC'larında IVI, ADAS ve gövde kontrolü fonksiyonları bu kategoriye girer.</p>
+
+  <p>ISO 26262, araç elektrik/elektronik sistemlerinde işlevsel güvenliği standardize eder. E-Gas sistemleri ve fren kontrolü ASIL-D (en yüksek bütünlük) gerektirir; multimedya sistemleri QM veya ASIL-A ile yeterlidir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>Tipik Otomotiv SoC Bölümlendirmesi</span><span class="dot">●</span></div>
+    <pre><code>┌─────────────────────────────────────────────────────────────┐
+│  Renesas R-Car H3 / NXP i.MX8QM SoC                        │
+│                                                             │
+│  Cortex-A53 (cluster 0) ──── Linux IVI  [QM / ASIL-A]      │
+│  Cortex-A72 (cluster 1) ──── Android Auto / QNX [ASIL-B]   │
+│  Cortex-R7  (real-time) ──── AUTOSAR RTOS [ASIL-D]          │
+│  Cortex-M4  (MCU)       ──── Safety Monitor [ASIL-D]        │
+│                                                             │
+│  SMMU/IOMMU ─── DMA izolasyonu                              │
+│  TrustZone  ─── Güvenli dünya / Normal dünya                │
+│  HSEM       ─── Donanım semafor (çekirdekler arası)         │
+└─────────────────────────────────────────────────────────────┘</code></pre>
+  </div>
+
+  <p>Jailhouse veya Xen gibi bir hypervisor, bu bölümlendirmeyi yazılım katmanında uygular: her guest sadece kendisine atanmış donanıma ve belleğe erişebilir. Donanım desteği olmadan (SMMU/IOMMU) tam izolasyon mümkün değildir.</p>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> ASIL seviyeleri ve izolasyon gereksinimleri</h2>
+  <p class="section-lead">ISO 26262'de ASIL, A'dan D'ye dört seviyede tanımlanır. Her seviye, bağımsızlık (independence) ve müdahaleden özgürlük (freedom from interference) gereksinimlerini belirler.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>ASIL Seviyeleri</span><span class="dot">●</span></div>
+    <pre><code>Seviye  Açıklama                     Tipik Uygulama
+────────────────────────────────────────────────────────────
+QM      Kalite yönetimi              IVI, multimedya
+ASIL-A  Hafif güvenlik gereksinimi   Klima, pencere kontrolü
+ASIL-B  Orta düzey                   Şerit değişim uyarısı
+ASIL-C  Yüksek                       Fren destek sistemleri
+ASIL-D  En yüksek                    Birincil fren, direksiyon</code></pre>
+  </div>
+
+  <h3>Mixed-criticality izolasyon gereksinimleri</h3>
+  <div class="params">
+    <div class="param"><div class="name">Mekansal izolasyon</div><div class="desc">QM bileşeni, ASIL-D bileşenin belleğine ve registerlarına erişememelidir. SMMU/IOMMU + MMU ile sağlanır.</div></div>
+    <div class="param"><div class="name">Zamansal izolasyon</div><div class="desc">QM bileşeninin aşırı CPU kullanımı ASIL-D bileşenin zamanlama garantisini bozmamalıdır. CPU pinleme ve cache bölümlendirme ile sağlanır.</div></div>
+    <div class="param"><div class="name">Sağlık izleme</div><div class="desc">ASIL-D monitor, diğer bileşenlerin yaşam belirtisini izler. Watchdog timer ve heartbeat protokolü gerektirir.</div></div>
+    <div class="param"><div class="name">Güvenli başlatma</div><div class="desc">ASIL-D bileşen, QM bileşenlerden bağımsız ve önce başlar. Secure boot zinciri bu sırayı garanti eder.</div></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>İzolasyon Mekanizması Matrisi</span><span class="dot">●</span></div>
+    <pre><code>Tehdit                  Karşı Önlem              Donanım Desteği
+─────────────────────────────────────────────────────────────────
+Bellek erişim ihlali    MMU + SMMU               Zorunlu
+DMA erişim ihlali       IOMMU                    Zorunlu
+CPU zaman çalma         CPU pinleme + scheduler   CPU izolasyonu
+Cache thrashing         Cache-way bölümlendirme   L2C-310 / ARM CMN
+Interrupt çalma         GIC secure config         TrustZone/GIC-600
+Saat manipülasyonu      Ayrı donanım timer        ARM arch timer</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Aynı SoC'ta IVI + RTOS + Linux — topoloji</h2>
+  <p class="section-lead">Modern otomotiv SoC'ları birden fazla işlemci kümesi barındırır. Bu kümeleri hypervisor ile bölümlendirmek, her uygulamaya izole çalışma ortamı sağlar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>i.MX8QM Mixed-Criticality Topolojisi</span><span class="dot">●</span></div>
+    <pre><code>NXP i.MX8QM (Cortex-A72x2 + A53x4 + M4x2)
+│
+├── Jailhouse Root Cell (Linux)
+│     CPUs: A72-core0, A72-core1
+│     RAM:  0x80000000 – 0x8FFFFFFF  (256 MB)
+│     Cihaz: UART0, USB, PCIe, GigE
+│     Görev: Sistem yönetimi, BSP
+│
+├── Jailhouse Inmate 1: Android IVI
+│     CPUs: A53-core0..core3
+│     RAM:  0x90000000 – 0xBFFFFFFF  (768 MB)
+│     GPU:  GC7000, Display Controller 0
+│     ASIL: QM
+│
+├── Jailhouse Inmate 2: FreeRTOS ADAS
+│     CPUs: A72-core2, A72-core3
+│     RAM:  0xC0000000 – 0xC7FFFFFF  (128 MB)
+│     ASIL: ASIL-B
+│
+└── Jailhouse Inmate 3: AUTOSAR Safety
+      CPUs: M4F-core0
+      RAM:  0xC8000000 – 0xC8FFFFFF  (16 MB)
+      ASIL: ASIL-D</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Hypervisor tabanlı izolasyon — Jailhouse yaklaşımı</h2>
+  <p class="section-lead">Jailhouse, statik bölümlendirme yapan Type-1 hypervisordur. Linux çekirdeği içinde modül olarak başlar; root cell Linux'tur, diğer cell'ler inmate olarak çalışır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>root-cell.c — özet (kısaltılmış)</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;jailhouse/types.h&gt;
+#include &lt;jailhouse/cell-config.h&gt;
+
+struct {
+    struct jailhouse_system header;
+    __u64  cpus[1];
+    struct jailhouse_memory mem_regions[8];
+} __attribute__((packed)) config = {
+    .header = {
+        .signature = JAILHOUSE_SYSTEM_SIGNATURE,
+        .revision  = JAILHOUSE_CONFIG_REVISION,
+        .hypervisor_memory = {
+            .phys_start = 0x7fc00000,
+            .size       = 0x00400000,  /* 4 MB */
+        },
+        .platform_info = {
+            .arm = {
+                .gicd_base   = 0x51a00000,
+                .gicr_base   = 0x51a40000,
+                .gic_version = 3,
+                .iommu_units = {
+                    { .type = JAILHOUSE_IOMMU_SMMU_V3,
+                      .base = 0x51400000, .size = 0x20000 },
+                },
+            },
+        },
+        .root_cell = {
+            .name     = "i.MX8QM Linux",
+            .num_cpus = 2,
+        },
+    },
+    .cpus = { 0x3 },  /* CA72 core 0, 1 */
+    .mem_regions = {
+        { .phys_start = 0x80000000, .virt_start = 0x80000000,
+          .size = 0x10000000,
+          .flags = JAILHOUSE_MEM_READ | JAILHOUSE_MEM_WRITE |
+                   JAILHOUSE_MEM_EXECUTE | JAILHOUSE_MEM_DMA },
+        /* UART0, USB, PCIe ... */
+    },
+};</code></pre>
+  </div>
+
+  <h3>Jailhouse başlatma ve yönetim</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code">modprobe jailhouse
+jailhouse enable /etc/jailhouse/imx8qm.cell
+
+jailhouse cell create /etc/jailhouse/inmate-freertos.cell
+jailhouse cell load   freertos-adas freertos.bin --address 0xC0000000
+jailhouse cell start  freertos-adas
+
+# Durum
+jailhouse cell list
+# ID  Name            State    Assigned CPUs
+#  0  i.MX8QM Linux   running  0,1
+#  1  freertos-adas   running  2,3
+#  2  autosar-safety  running  M4</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Bellek izolasyonu — IOMMU ve MPU/MMU yapılandırması</h2>
+  <p class="section-lead">Donanım tabanlı bellek izolasyonu olmadan yazılım izolasyonu güvenli değildir. SMMU DMA transferlerini, ARM MMU ise CPU erişimlerini kısıtlar.</p>
+
+  <h3>SMMU — Device Tree bağlaması</h3>
+  <div class="code-block">
+    <div class="code-header"><span>system.dts</span><span class="dot">●</span></div>
+    <pre><code">smmu: iommu@51000000 {
+    compatible = "arm,smmu-v3";
+    reg = &lt;0x0 0x51000000 0x0 0x800000&gt;;
+    interrupts = &lt;GIC_SPI 65 IRQ_TYPE_EDGE_RISING&gt;,
+                 &lt;GIC_SPI 66 IRQ_TYPE_EDGE_RISING&gt;;
+    #iommu-cells = &lt;1&gt;;
+    dma-coherent;
+};
+
+/* GPU yalnızca IVI cell belleğine DMA yapabilir */
+gpu@38000000 {
+    compatible = "fsl,imx8-gpu";
+    reg = &lt;0x0 0x38000000 0x0 0x80000&gt;;
+    iommus = &lt;&amp;smmu 0x200&gt;;
+};</code></pre>
+  </div>
+
+  <h3>ARM MPU — FreeRTOS/AUTOSAR cell</h3>
+  <div class="code-block">
+    <div class="code-header"><span>mpu_config.c</span><span class="dot">●</span></div>
+    <pre><code">#include "FreeRTOS.h"
+#include "task.h"
+
+static const TaskParameters_t safety_task_params = {
+    .pvTaskCode   = safety_monitor_task,
+    .pcName       = "SafetyMon",
+    .usStackDepth = 512,
+    .uxPriority   = (configMAX_PRIORITIES - 1) | portPRIVILEGE_BIT,
+    .xRegions = {
+        {   /* Yalnızca kendi SRAM bölgesine erişim */
+            .pvBaseAddress   = (void*)0xC8000000,
+            .ulLengthInBytes = 0x8000,
+            .ulParameters    = portMPU_REGION_READ_WRITE |
+                               portMPU_REGION_EXECUTE_NEVER,
+        },
+        {   /* Watchdog register */
+            .pvBaseAddress   = (void*)0x5A3A0000,
+            .ulLengthInBytes = 0x1000,
+            .ulParameters    = portMPU_REGION_READ_WRITE |
+                               portMPU_REGION_EXECUTE_NEVER |
+                               portMPU_REGION_DEVICE_NGNRNE,
+        },
+        { 0, 0, 0 }
+    }
+};
+xTaskCreateRestricted(&amp;safety_task_params, &amp;safety_task_handle);</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Zamansal izolasyon — CPU pinleme ve interrupt routing</h2>
+  <p class="section-lead">Zamansal izolasyon, bir partition'ın CPU zamanını aşırı kullanmasının diğerini etkilememesini garanti eder. CPU pinleme bu izolasyonun temelidir.</p>
+
+  <h3>Linux root cell'de CPU izolasyonu</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Kernel parametresi (grub/extlinux)</span><span class="dot">●</span></div>
+    <pre><code">isolcpus=2,3,4,5 nohz_full=2,3,4,5 rcu_nocbs=2,3,4,5</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — affinite ve IRQ yönlendirme</span><span class="dot">●</span></div>
+    <pre><code"># Root cell görevlerini CPU 0,1 ile sınırla
+for pid in $(ps -e -o pid=); do
+    taskset -p 0x3 "$pid" 2>/dev/null
+done
+
+# Tüm interrupt'ları CPU 0,1'e yönlendir
+for irq in /proc/irq/*/smp_affinity; do
+    echo 3 > "$irq" 2>/dev/null
+done
+
+# Doğrulama
+grep -v "^0" /proc/irq/*/smp_affinity 2>/dev/null | head -5</code></pre>
+  </div>
+
+  <h3>Intel RDT (Cache Allocation Technology)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — LLC bölümlendirme</span><span class="dot">●</span></div>
+    <pre><code">mount -t resctrl resctrl /sys/fs/resctrl
+# 10 adet L3 way mevcut
+
+# IVI: way 0-4
+mkdir /sys/fs/resctrl/ivi
+echo "L3:0=01f" > /sys/fs/resctrl/ivi/schemata
+echo "2,3"      > /sys/fs/resctrl/ivi/cpus_list
+
+# ADAS: way 5-9
+mkdir /sys/fs/resctrl/adas
+echo "L3:0=3e0" > /sys/fs/resctrl/adas/schemata
+echo "4,5"      > /sys/fs/resctrl/adas/cpus_list</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> virtio-vsock ile güvenli IPC</h2>
+  <p class="section-lead">virtio-vsock, VM/cell'ler arası düşük gecikmeli soket iletişimi sağlar. TCP/IP yükü taşımadan Unix domain socket benzeri API sunar.</p>
+
+  <h3>Sunucu tarafı (RTOS/Linux cell)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>vsock_server.c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;sys/socket.h&gt;
+#include &lt;linux/vm_sockets.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include &lt;unistd.h&gt;
+
+#define VSOCK_PORT 1234
+
+int main(void)
+{
+    int srv = socket(AF_VSOCK, SOCK_STREAM, 0);
+    struct sockaddr_vm addr = {
+        .svm_family = AF_VSOCK,
+        .svm_cid    = VMADDR_CID_ANY,
+        .svm_port   = VSOCK_PORT,
+    };
+    bind(srv, (struct sockaddr *)&amp;addr, sizeof(addr));
+    listen(srv, 5);
+
+    while (1) {
+        struct sockaddr_vm cli;
+        socklen_t clen = sizeof(cli);
+        int cfd = accept(srv, (struct sockaddr *)&amp;cli, &amp;clen);
+
+        char buf[256];
+        ssize_t n = recv(cfd, buf, sizeof(buf) - 1, 0);
+        buf[n] = '\0';
+        printf("IVI mesajı: %s\n", buf);
+
+        const char *reply = "ACK:ok";
+        send(cfd, reply, strlen(reply), 0);
+        close(cfd);
+    }
+}</code></pre>
+  </div>
+
+  <h3>İstemci tarafı (IVI cell — Python)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>vsock_client.py</span><span class="dot">●</span></div>
+    <pre><code">import socket
+
+AF_VSOCK   = 40
+ADAS_CID   = 3
+VSOCK_PORT = 1234
+
+def send_command(cmd):
+    s = socket.socket(AF_VSOCK, socket.SOCK_STREAM)
+    s.connect((ADAS_CID, VSOCK_PORT))
+    s.sendall(cmd.encode())
+    reply = s.recv(256).decode()
+    s.close()
+    return reply
+
+print(send_command("CMD:activate_parking_assist"))</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> IVSHMEM ile paylaşımlı bellek protokolü</h2>
+  <p class="section-lead">IVSHMEM, cell'ler arasında fiziksel bellek paylaşımı için kullanılır. Donanım doorbell interrupt'ları ile bildirim yapılır; yüksek throughput, düşük gecikme sağlar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>ivshmem_layout.h</span><span class="dot">●</span></div>
+    <pre><code">#pragma once
+#include &lt;stdint.h&gt;
+#include &lt;stdatomic.h&gt;
+
+#define RING_CAP 64
+#define RING_MASK (RING_CAP - 1)
+
+typedef struct {
+    uint32_t type;
+    uint32_t seq;
+    uint32_t ts_ms;
+    uint32_t len;
+    uint8_t  data[112];
+} __attribute__((packed)) ivshmem_msg_t;
+
+typedef struct {
+    _Atomic uint32_t head;
+    _Atomic uint32_t tail;
+    uint32_t         _pad[14];
+    ivshmem_msg_t    slots[RING_CAP];
+} ivshmem_ring_t;
+
+typedef struct {
+    ivshmem_ring_t  adas_to_ivi;
+    ivshmem_ring_t  ivi_to_adas;
+    _Atomic uint32_t heartbeat_adas;
+    _Atomic uint32_t heartbeat_ivi;
+} ivshmem_layout_t;</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>ivshmem_push — lock-free üretici</span><span class="dot">●</span></div>
+    <pre><code">#include "ivshmem_layout.h"
+#include &lt;string.h&gt;
+
+static int ivshmem_push(ivshmem_ring_t *r, const ivshmem_msg_t *m)
+{
+    uint32_t head = atomic_load_explicit(&amp;r->head, memory_order_relaxed);
+    uint32_t next = (head + 1) &amp; RING_MASK;
+    if (next == atomic_load_explicit(&amp;r->tail, memory_order_acquire))
+        return -1;  /* dolu */
+    r->slots[head] = *m;
+    atomic_store_explicit(&amp;r->head, next, memory_order_release);
+    return 0;
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Safety monitor — watchdog ve sağlık izleme</h2>
+  <p class="section-lead">ISO 26262 ASIL-D sistemlerinde bağımsız bir safety monitor, tüm partition'ların yaşam belirtisini izler ve hata durumunda güvenli duruma geçiş kararı verir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>safety_monitor.c — Cortex-M4</span><span class="dot">●</span></div>
+    <pre><code">#include &lt;stdint.h&gt;
+#include &lt;stdbool.h&gt;
+#include "ivshmem_layout.h"
+#include "watchdog.h"
+
+#define HB_TIMEOUT_MS  500
+#define SAFE_GPIO       27
+
+extern ivshmem_layout_t *shm;
+
+typedef struct {
+    const char  *name;
+    _Atomic uint32_t *counter;
+    uint32_t     last;
+    bool         alive;
+} partition_t;
+
+static partition_t parts[] = {
+    { "Linux-IVI", &amp;shm->heartbeat_ivi,  0, true },
+    { "ADAS",      &amp;shm->heartbeat_adas, 0, true },
+};
+
+void safety_monitor_task(void *arg)
+{
+    uint32_t tick = 0;
+    while (1) {
+        tick += 100;
+        for (int i = 0; i &lt; 2; i++) {
+            uint32_t hb = atomic_load(parts[i].counter);
+            if (hb != parts[i].last) {
+                parts[i].last  = hb;
+                parts[i].alive = true;
+            } else if (tick - parts[i].last * 100 > HB_TIMEOUT_MS) {
+                parts[i].alive = false;
+                GPIO_Set(SAFE_GPIO, 1);
+                uart_puts("SAFE STATE triggered\r\n");
+            }
+        }
+        watchdog_kick();
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 09 ═══════════════════ -->
+<section id="s9">
+  <h2><span class="num">09</span> Sertifikasyon izleri — kanıt üretimi</h2>
+  <p class="section-lead">ISO 26262 sertifikasyonu için tasarım kararlarının, test sonuçlarının ve izolasyon mekanizmalarının belgelenmesi gerekir.</p>
+
+  <h3>Statik analiz araçları</h3>
+  <div class="params">
+    <div class="param"><div class="name">Polyspace Bug Finder / Code Prover</div><div class="desc">MISRA-C:2012 uyumluluğu ve çalışma zamanı hata kanıtı. ASIL-D projelerde zorunlu gibi kullanılır.</div></div>
+    <div class="param"><div class="name">LDRA Testbed</div><div class="desc">Kod kapsama analizi (MC/DC), data flow testi. DO-178C ve ISO 26262 için sertifikalı araç.</div></div>
+    <div class="param"><div class="name">cppcheck / clang-analyzer</div><div class="desc">Açık kaynak alternatifler; ASIL-B seviyesinde kullanılabilir kanıt sağlar.</div></div>
+  </div>
+
+  <h3>Bellek izolasyon testi ve sistem kanıtı</h3>
+  <div class="code-block">
+    <div class="code-header"><span>isolation_test.sh</span><span class="dot">●</span></div>
+    <pre><code">#!/bin/bash
+# SMMU hataları — izolasyon ihlali yok olmalı
+dmesg | grep -i "smmu.*fault" && echo "HATA: SMMU ihlali" || echo "SMMU: OK"
+
+# Cell çalışma durumu
+jailhouse cell list | awk '
+    /running/ { ok++ }
+    /stopped|fault/ { fail++ }
+    END {
+        print "Çalışan cell: " ok
+        if (fail > 0) print "HATA: " fail " cell durdu/hata"
+    }'
+
+# IVSHMEM heartbeat canlılık kontrolü
+python3 -c "
+import mmap, struct, time
+with open('/dev/uio0','r+b') as f:
+    shm = mmap.mmap(f.fileno(), 0x100000)
+# ADAS heartbeat offset
+shm.seek(0x800)
+v1 = struct.unpack('I', shm.read(4))[0]
+time.sleep(0.5)
+shm.seek(0x800)
+v2 = struct.unpack('I', shm.read(4))[0]
+print('ADAS heartbeat:', 'CANLI' if v2 > v1 else 'ÖLDU')
+"</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>Güvenli Başlatma Zinciri</span><span class="dot">●</span></div>
+    <pre><code">ROM Bootloader (donanımda imzalı)
+       ↓  RSA-4096 doğrulama
+U-Boot (HABv4 imzalı)
+       ↓  FIT Image doğrulama
+Linux Kernel (imzalı)
+       ↓
+Jailhouse modül yükleme
+       ↓
+dm-verity korumalı /etc/jailhouse cell config'leri
+       ↓
+FreeRTOS + Linux inmate binary'leri (imzalı)</code></pre>
+  </div>
+</section>
+
+</main>

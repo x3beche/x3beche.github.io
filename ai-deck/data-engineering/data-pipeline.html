@@ -1,0 +1,574 @@
+---
+layout: tutorial
+title: "Veri Pipeline — ETL, Lakehouse & Polars"
+back_url: "../data-engineering/index.html"
+back_label: "Veri Mühendisliği"
+---
+
+<header class="header">
+  <div class="meta"><span>Rehber</span><span>Veri Mühendisliği</span><span>01 · Pipeline</span></div>
+  <h1>Veri Pipeline<br><em>ETL, Lakehouse &amp; Polars.</em></h1>
+  <p class="subtitle">ETL vs ELT paradigmasından Airflow DAG'larına, Delta Lake lakehouse mimarisinden Polars lazy evaluation'a ve Spark optimizasyonlarına kapsamlı bir bakış.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçerik</div>
+  <ol>
+    <li><a href="#s0">ETL vs ELT — Paradigma Farkı</a></li>
+    <li><a href="#s1">Batch Pipeline Mimarisi — Airflow &amp; Prefect</a></li>
+    <li><a href="#s2">Data Lakehouse — Delta Lake, Iceberg, Hudi</a></li>
+    <li><a href="#s3">Polars ile Hızlı Veri Dönüşümü</a></li>
+    <li><a href="#s4">Spark Temel API</a></li>
+    <li><a href="#s5">Data Quality — Great Expectations &amp; Soda</a></li>
+    <li><a href="#s6">Pipeline Test Stratejisi</a></li>
+    <li><a href="#s7">Cost Optimization</a></li>
+    <li><a href="#s8">Practical — S3 → Delta Lake → Feature Tablosu</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ── S0 ──────────────────────────────────────────────────────── -->
+<section id="s0">
+  <h2><span class="num">00</span> ETL vs ELT — Paradigma Farkı</h2>
+  <p class="section-lead">İki paradigma aynı veriyi hareket ettirir ama farklı noktalarda dönüştürür. Modern bulut veri ambarları ELT'yi mümkün kıldı; ancak ikisinin doğru kullanım alanları hâlâ farklıdır.</p>
+
+  <p>
+    <em>ETL (Extract-Transform-Load)</em>: Veri kaynaktan çekilir, bir ara işlem katmanında (genellikle bir sunucu veya Spark cluster'ı) temizlenir/dönüştürülür, ardından hedef sisteme yüklenir. Klasik veri ambarı mimarilerinin (Teradata, IBM Netezza) temel yöntemidir.
+  </p>
+  <p>
+    <em>ELT (Extract-Load-Transform)</em>: Ham veri önce hedef sisteme (BigQuery, Snowflake, Redshift) yüklenir, dönüşüm işlemi hedef sistemin hesaplama gücüyle yapılır. dbt (data build tool) bu paradigmanın standart aracıdır. Modern bulut veri ambarlarının ölçeklenebilir SQL motoru sayesinde güçlenmiştir.
+  </p>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Kriter</th><th>ETL</th><th>ELT</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Dönüşüm Yeri</td><td>Kaynak ile hedef arasında</td><td>Hedef sistemde</td></tr>
+      <tr><td>Ham Veri</td><td>Hedefte saklanmaz</td><td>Ham halde saklanır</td></tr>
+      <tr><td>Araçlar</td><td>Informatica, SSIS, Spark</td><td>dbt, Dataform, BigQuery</td></tr>
+      <tr><td>Güçlü Olduğu Yer</td><td>PII masking, kısıtlı storage</td><td>Hızlı analitik, iterasyon</td></tr>
+      <tr><td>Zayıf Olduğu Yer</td><td>Büyük veri, yavaş iterasyon</td><td>Hedefte depolama maliyeti</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <strong>Ne zaman ETL?</strong> Kişisel veri (PII) içeren kayıtların hedef sisteme taşınmadan önce maskelenmesi/şifrelenmesi gerekiyorsa ETL zorunludur. Ayrıca hedef sistemin yeterli hesaplama gücü yoksa ara dönüşüm katmanı gerekir.
+  </div>
+</section>
+
+<!-- ── S1 ──────────────────────────────────────────────────────── -->
+<section id="s1">
+  <h2><span class="num">01</span> Batch Pipeline Mimarisi — Airflow &amp; Prefect</h2>
+  <p class="section-lead">Airflow DAG'ları ile günlük batch pipeline'lar; Prefect ile modern Python-first orkestrasyon.</p>
+
+  <p>
+    <em>Apache Airflow</em>, DAG (Directed Acyclic Graph) tabanlı iş akışı orkestrasyon aracıdır. Her adım bir <code>Operator</code>'dür; bağımlılıklar <code>&gt;&gt;</code> operatörüyle tanımlanır. Airflow Scheduler, belirlenen <code>schedule_interval</code>'da DAG'ı tetikler.
+  </p>
+
+  <div class="code-block">
+    <div class="code-header"><span>dags/daily_pipeline.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">from</span> airflow <span class="keyword">import</span> DAG
+<span class="keyword">from</span> airflow.operators.python <span class="keyword">import</span> PythonOperator
+<span class="keyword">from</span> airflow.providers.amazon.aws.operators.s3 <span class="keyword">import</span> S3DeleteObjectsOperator
+<span class="keyword">from</span> airflow.utils.dates <span class="keyword">import</span> days_ago
+<span class="keyword">from</span> datetime <span class="keyword">import</span> timedelta
+<span class="keyword">import</span> polars <span class="keyword">as</span> pl
+
+DEFAULT_ARGS = {
+    <span class="str">"owner"</span>: <span class="str">"data-eng"</span>,
+    <span class="str">"retries"</span>: 3,
+    <span class="str">"retry_delay"</span>: timedelta(minutes=5),
+    <span class="str">"email_on_failure"</span>: <span class="keyword">True</span>,
+    <span class="str">"email"</span>: [<span class="str">"alerts@company.com"</span>],
+}
+
+<span class="keyword">def</span> <span class="cmd">extract</span>(**context):
+    <span class="cmt"># S3'ten parquet oku</span>
+    ds = context[<span class="str">"ds"</span>]  <span class="cmt"># YYYY-MM-DD</span>
+    df = pl.<span class="cmd">read_parquet</span>(<span class="str">f"s3://raw-bucket/events/date={ds}/*.parquet"</span>)
+    context[<span class="str">"ti"</span>].<span class="cmd">xcom_push</span>(key=<span class="str">"row_count"</span>, value=<span class="cmd">len</span>(df))
+    df.<span class="cmd">write_parquet</span>(<span class="str">f"/tmp/extract_{ds}.parquet"</span>)
+
+<span class="keyword">def</span> <span class="cmd">transform</span>(**context):
+    ds = context[<span class="str">"ds"</span>]
+    df = pl.<span class="cmd">read_parquet</span>(<span class="str">f"/tmp/extract_{ds}.parquet"</span>)
+    df = (
+        df
+        .<span class="cmd">filter</span>(pl.col(<span class="str">"event_type"</span>).<span class="cmd">is_in</span>([<span class="str">"click"</span>, <span class="str">"purchase"</span>, <span class="str">"view"</span>]))
+        .<span class="cmd">with_columns</span>([
+            pl.col(<span class="str">"ts"</span>).<span class="cmd">cast</span>(pl.Datetime).<span class="cmd">alias</span>(<span class="str">"event_time"</span>),
+            (pl.col(<span class="str">"revenue"</span>).<span class="cmd">fill_null</span>(0.0)).<span class="cmd">alias</span>(<span class="str">"revenue"</span>),
+        ])
+        .<span class="cmd">drop_nulls</span>(subset=[<span class="str">"user_id"</span>, <span class="str">"event_type"</span>])
+    )
+    df.<span class="cmd">write_parquet</span>(<span class="str">f"/tmp/transform_{ds}.parquet"</span>)
+
+<span class="keyword">def</span> <span class="cmd">load_to_delta</span>(**context):
+    <span class="keyword">from</span> deltalake <span class="keyword">import</span> write_deltalake
+    ds = context[<span class="str">"ds"</span>]
+    df = pl.<span class="cmd">read_parquet</span>(<span class="str">f"/tmp/transform_{ds}.parquet"</span>)
+    <span class="cmd">write_deltalake</span>(
+        <span class="str">"s3://curated-bucket/events"</span>,
+        df.<span class="cmd">to_arrow</span>(),
+        mode=<span class="str">"append"</span>,
+        partition_by=[<span class="str">"event_type"</span>],
+    )
+
+<span class="keyword">with</span> <span class="cmd">DAG</span>(
+    dag_id=<span class="str">"daily_events_pipeline"</span>,
+    default_args=DEFAULT_ARGS,
+    schedule_interval=<span class="str">"@daily"</span>,
+    start_date=<span class="cmd">days_ago</span>(1),
+    catchup=<span class="keyword">False</span>,
+    tags=[<span class="str">"events"</span>, <span class="str">"production"</span>],
+) <span class="keyword">as</span> dag:
+
+    t_extract   = <span class="cmd">PythonOperator</span>(task_id=<span class="str">"extract"</span>,    python_callable=extract,        provide_context=<span class="keyword">True</span>)
+    t_transform = <span class="cmd">PythonOperator</span>(task_id=<span class="str">"transform"</span>,   python_callable=transform,      provide_context=<span class="keyword">True</span>)
+    t_load      = <span class="cmd">PythonOperator</span>(task_id=<span class="str">"load_delta"</span>,  python_callable=load_to_delta,  provide_context=<span class="keyword">True</span>)
+
+    t_extract &gt;&gt; t_transform &gt;&gt; t_load</code></pre>
+  </div>
+
+  <p>
+    <em>Prefect</em>, Python dekoratörleriyle çalışan modern alternatiftir. Airflow'un XML/YAML karmaşıklığı olmadan saf Python kodu yazar, dağıtım için <code>prefect deploy</code> yeterlidir.
+  </p>
+
+  <div class="code-block">
+    <div class="code-header"><span>flows/events_flow.py — Prefect</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">from</span> prefect <span class="keyword">import</span> flow, task
+<span class="keyword">from</span> prefect.tasks <span class="keyword">import</span> exponential_backoff
+<span class="keyword">import</span> polars <span class="keyword">as</span> pl
+
+@<span class="cmd">task</span>(retries=3, retry_delay_seconds=<span class="cmd">exponential_backoff</span>(backoff_factor=2))
+<span class="keyword">def</span> <span class="cmd">extract_events</span>(date: str) -&gt; pl.DataFrame:
+    <span class="keyword">return</span> pl.<span class="cmd">read_parquet</span>(<span class="str">f"s3://raw-bucket/events/date={date}/*.parquet"</span>)
+
+@<span class="cmd">task</span>
+<span class="keyword">def</span> <span class="cmd">transform_events</span>(df: pl.DataFrame) -&gt; pl.DataFrame:
+    <span class="keyword">return</span> (
+        df.<span class="cmd">filter</span>(pl.col(<span class="str">"event_type"</span>) != <span class="str">"bot"</span>)
+          .<span class="cmd">with_columns</span>(pl.col(<span class="str">"ts"</span>).<span class="cmd">cast</span>(pl.Datetime))
+    )
+
+@<span class="cmd">task</span>
+<span class="keyword">def</span> <span class="cmd">load_events</span>(df: pl.DataFrame, date: str):
+    <span class="keyword">from</span> deltalake <span class="keyword">import</span> write_deltalake
+    <span class="cmd">write_deltalake</span>(<span class="str">"s3://curated-bucket/events"</span>, df.<span class="cmd">to_arrow</span>(), mode=<span class="str">"append"</span>)
+
+@<span class="cmd">flow</span>(name=<span class="str">"events-pipeline"</span>, log_prints=<span class="keyword">True</span>)
+<span class="keyword">def</span> <span class="cmd">events_pipeline</span>(date: str = <span class="str">"2026-01-01"</span>):
+    raw  = <span class="cmd">extract_events</span>(date)
+    clean = <span class="cmd">transform_events</span>(raw)
+    <span class="cmd">load_events</span>(clean, date)
+    <span class="cmd">print</span>(<span class="str">f"Pipeline tamamlandı: {len(clean)} satır yüklendi."</span>)
+
+<span class="keyword">if</span> __name__ == <span class="str">"__main__"</span>:
+    <span class="cmd">events_pipeline</span>(date=<span class="str">"2026-04-12"</span>)</code></pre>
+  </div>
+</section>
+
+<!-- ── S2 ──────────────────────────────────────────────────────── -->
+<section id="s2">
+  <h2><span class="num">02</span> Data Lakehouse — Delta Lake, Iceberg, Hudi</h2>
+  <p class="section-lead">Object storage üzerinde ACID transaction desteği sağlayan açık tablo formatları data lake ve veri ambarı dünyasını birleştirdi.</p>
+
+  <p>
+    Klasik <em>data lake</em> (S3/GCS üzerinde parquet dosyaları) ölçeklenebilir ve ucuzdu ancak ACID garantisi yoktu: paralel yazılar veriyi bozabilir, kısmi başarısız yazılar kalıntı bırakır, schema evolution riskli, time-travel imkânsızdı. <em>Lakehouse</em> mimarisi bu sorunları çözer.
+  </p>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Format</th><th>Şirket</th><th>Güçlü Yanı</th><th>Ekosistem</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Delta Lake</td><td>Databricks / Linux Foundation</td><td>Spark entegrasyonu, DML (UPDATE/DELETE/MERGE)</td><td>PySpark, Delta-rs (Rust/Python)</td></tr>
+      <tr><td>Apache Iceberg</td><td>Netflix / Apache</td><td>Hidden partitioning, time travel, engine-agnostic</td><td>Spark, Flink, Trino, DuckDB</td></tr>
+      <tr><td>Apache Hudi</td><td>Uber / Apache</td><td>Streaming upserts, near-realtime ingestion</td><td>Spark, Flink, Presto</td></tr>
+    </tbody>
+  </table>
+
+  <div class="code-block">
+    <div class="code-header"><span>lakehouse_demo.py — Delta Lake (Python delta-rs)</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> pyarrow <span class="keyword">as</span> pa
+<span class="keyword">from</span> deltalake <span class="keyword">import</span> DeltaTable, write_deltalake
+
+TABLE_PATH = <span class="str">"s3://my-bucket/silver/users"</span>
+STORAGE_OPTIONS = {<span class="str">"AWS_REGION"</span>: <span class="str">"us-east-1"</span>, <span class="str">"AWS_S3_ALLOW_UNSAFE_RENAME"</span>: <span class="str">"true"</span>}
+
+<span class="cmt"># ── İlk yazma ──────────────────────────────────────────────────────</span>
+schema = pa.schema([
+    pa.field(<span class="str">"user_id"</span>,   pa.int64()),
+    pa.field(<span class="str">"name"</span>,      pa.string()),
+    pa.field(<span class="str">"country"</span>,   pa.string()),
+    pa.field(<span class="str">"created_at"</span>, pa.timestamp(<span class="str">"us"</span>)),
+])
+data = pa.table({
+    <span class="str">"user_id"</span>:   [1, 2, 3],
+    <span class="str">"name"</span>:      [<span class="str">"Alice"</span>, <span class="str">"Bob"</span>, <span class="str">"Carol"</span>],
+    <span class="str">"country"</span>:   [<span class="str">"TR"</span>, <span class="str">"DE"</span>, <span class="str">"US"</span>],
+    <span class="str">"created_at"</span>: pa.array([1_700_000_000_000_000] * 3, type=pa.timestamp(<span class="str">"us"</span>)),
+})
+<span class="cmd">write_deltalake</span>(TABLE_PATH, data, schema=schema,
+               mode=<span class="str">"overwrite"</span>, partition_by=[<span class="str">"country"</span>],
+               storage_options=STORAGE_OPTIONS)
+
+<span class="cmt"># ── UPSERT (MERGE) ──────────────────────────────────────────────────</span>
+dt = <span class="cmd">DeltaTable</span>(TABLE_PATH, storage_options=STORAGE_OPTIONS)
+new_data = pa.table({
+    <span class="str">"user_id"</span>:   [2, 4],
+    <span class="str">"name"</span>:      [<span class="str">"Bobby"</span>, <span class="str">"Dave"</span>],
+    <span class="str">"country"</span>:   [<span class="str">"DE"</span>, <span class="str">"FR"</span>],
+    <span class="str">"created_at"</span>: pa.array([1_710_000_000_000_000] * 2, type=pa.timestamp(<span class="str">"us"</span>)),
+})
+(
+    dt.<span class="cmd">merge</span>(
+        source=new_data,
+        predicate=<span class="str">"s.user_id = t.user_id"</span>,
+        source_alias=<span class="str">"s"</span>,
+        target_alias=<span class="str">"t"</span>,
+    )
+    .<span class="cmd">when_matched_update_all</span>()
+    .<span class="cmd">when_not_matched_insert_all</span>()
+    .<span class="cmd">execute</span>()
+)
+
+<span class="cmt"># ── Time travel ─────────────────────────────────────────────────────</span>
+dt_v0 = <span class="cmd">DeltaTable</span>(TABLE_PATH, version=0, storage_options=STORAGE_OPTIONS)
+<span class="cmd">print</span>(<span class="str">"Version 0:"</span>, dt_v0.<span class="cmd">to_pandas</span>())</code></pre>
+  </div>
+
+  <div class="callout">
+    <strong>Hangi format seçilmeli?</strong> Databricks/Spark ağırlıklı ekosistemler için Delta Lake en olgun seçimdir. Engine-agnostic (Trino, Flink, DuckDB) ortamlar için Iceberg tercih edilir. Near-realtime streaming upsert ihtiyacı varsa Hudi değerlendirilebilir.
+  </div>
+</section>
+
+<!-- ── S3 ──────────────────────────────────────────────────────── -->
+<section id="s3">
+  <h2><span class="num">03</span> Polars ile Hızlı Veri Dönüşümü</h2>
+  <p class="section-lead">Rust üzerine inşa edilmiş Polars, pandas'ın 5–20 katı hızında çalışır. Lazy evaluation sayesinde sorgu planı optimize edilir, bellek tüketimi azaltılır.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Eager vs Lazy</span><span class="desc">pl.read_csv() eager (anında çalışır). pl.scan_csv() lazy (sorgu planı oluşturur, .collect() ile çalıştırır).</span></div>
+    <div class="param"><span class="name">scan_parquet</span><span class="desc">Parquet dosyalarını lazy okur. Predicate pushdown ve projection pushdown otomatik uygulanır.</span></div>
+    <div class="param"><span class="name">Expressions</span><span class="desc">pl.col(), pl.lit(), pl.when().then().otherwise() ile kolon bazlı işlemler.</span></div>
+    <div class="param"><span class="name">group_by + agg</span><span class="desc">Parallel execution ile pandas groupby'dan çok daha hızlı aggregation.</span></div>
+    <div class="param"><span class="name">join</span><span class="desc">how="inner/left/outer/semi/anti/cross" — hash join paralel çalışır.</span></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>polars_pipeline.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> polars <span class="keyword">as</span> pl
+<span class="keyword">from</span> datetime <span class="keyword">import</span> date
+
+<span class="cmt"># ── Lazy pipeline (scan, filter, aggregate) ────────────────────────</span>
+events = (
+    pl.<span class="cmd">scan_parquet</span>(<span class="str">"s3://bucket/events/**/*.parquet"</span>)
+    .<span class="cmd">filter</span>(
+        (pl.col(<span class="str">"event_date"</span>) &gt;= date(2026, 1, 1)) &amp;
+        (pl.col(<span class="str">"event_type"</span>).<span class="cmd">is_in</span>([<span class="str">"purchase"</span>, <span class="str">"add_to_cart"</span>]))
+    )
+    .<span class="cmd">with_columns</span>([
+        (pl.col(<span class="str">"revenue"</span>) * pl.col(<span class="str">"quantity"</span>)).<span class="cmd">alias</span>(<span class="str">"total_value"</span>),
+        pl.col(<span class="str">"user_id"</span>).<span class="cmd">cast</span>(pl.Utf8).<span class="cmd">alias</span>(<span class="str">"user_id_str"</span>),
+    ])
+)
+
+<span class="cmt"># ── Aggregation ────────────────────────────────────────────────────</span>
+user_stats = (
+    events
+    .<span class="cmd">group_by</span>([<span class="str">"user_id"</span>, <span class="str">"event_date"</span>])
+    .<span class="cmd">agg</span>([
+        pl.col(<span class="str">"total_value"</span>).<span class="cmd">sum</span>().<span class="cmd">alias</span>(<span class="str">"daily_revenue"</span>),
+        pl.col(<span class="str">"event_type"</span>).<span class="cmd">count</span>().<span class="cmd">alias</span>(<span class="str">"event_count"</span>),
+        pl.col(<span class="str">"product_id"</span>).<span class="cmd">n_unique</span>().<span class="cmd">alias</span>(<span class="str">"unique_products"</span>),
+    ])
+    .<span class="cmd">sort</span>([<span class="str">"user_id"</span>, <span class="str">"event_date"</span>])
+)
+
+<span class="cmt"># ── Join ile kullanıcı profili ─────────────────────────────────────</span>
+users = pl.<span class="cmd">scan_parquet</span>(<span class="str">"s3://bucket/users/*.parquet"</span>).<span class="cmd">select</span>([<span class="str">"user_id"</span>, <span class="str">"country"</span>, <span class="str">"tier"</span>])
+
+result = (
+    user_stats
+    .<span class="cmd">join</span>(users, on=<span class="str">"user_id"</span>, how=<span class="str">"left"</span>)
+    .<span class="cmd">filter</span>(pl.col(<span class="str">"tier"</span>) == <span class="str">"premium"</span>)
+    .<span class="cmd">collect</span>(streaming=<span class="keyword">True</span>)  <span class="cmt"># büyük dataset için streaming mode</span>
+)
+<span class="cmd">print</span>(result.<span class="cmd">head</span>())
+
+<span class="cmt"># ── Window function (rolling 7 gün ortalama) ───────────────────────</span>
+rolling = (
+    result
+    .<span class="cmd">sort</span>([<span class="str">"user_id"</span>, <span class="str">"event_date"</span>])
+    .<span class="cmd">with_columns</span>(
+        pl.col(<span class="str">"daily_revenue"</span>)
+          .<span class="cmd">rolling_mean</span>(window_size=7)
+          .<span class="cmd">over</span>(<span class="str">"user_id"</span>)
+          .<span class="cmd">alias</span>(<span class="str">"rev_7d_avg"</span>)
+    )
+)</code></pre>
+  </div>
+</section>
+
+<!-- ── S4 ──────────────────────────────────────────────────────── -->
+<section id="s4">
+  <h2><span class="num">04</span> Spark Temel API</h2>
+  <p class="section-lead">PySpark DataFrame API, transformation vs action ayrımı ve doğru partitioning stratejisi Spark performansının temelidir.</p>
+
+  <p>
+    Spark'ta tüm işlemler <em>lazy</em> değerlendirilir. <code>filter()</code>, <code>select()</code>, <code>join()</code> gibi işlemler yalnızca bir <strong>transformation</strong> (execution planına ekleme) yapar. <code>count()</code>, <code>show()</code>, <code>write()</code> gibi işlemler ise <strong>action</strong>'dır ve planı fiziksel olarak çalıştırır.
+  </p>
+
+  <div class="code-block">
+    <div class="code-header"><span>spark_job.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">from</span> pyspark.sql <span class="keyword">import</span> SparkSession
+<span class="keyword">from</span> pyspark.sql <span class="keyword">import</span> functions <span class="keyword">as</span> F
+<span class="keyword">from</span> pyspark.sql.types <span class="keyword">import</span> StructType, StructField, StringType, DoubleType, TimestampType
+
+spark = (
+    SparkSession.<span class="cmd">builder</span>
+    .<span class="cmd">appName</span>(<span class="str">"UserFeaturePipeline"</span>)
+    .<span class="cmd">config</span>(<span class="str">"spark.sql.extensions"</span>, <span class="str">"io.delta.sql.DeltaSparkSessionExtension"</span>)
+    .<span class="cmd">config</span>(<span class="str">"spark.sql.catalog.spark_catalog"</span>, <span class="str">"org.apache.spark.sql.delta.catalog.DeltaCatalog"</span>)
+    .<span class="cmd">config</span>(<span class="str">"spark.sql.adaptive.enabled"</span>, <span class="str">"true"</span>)   <span class="cmt"># AQE — Adaptive Query Execution</span>
+    .<span class="cmd">config</span>(<span class="str">"spark.sql.shuffle.partitions"</span>, <span class="str">"200"</span>)
+    .<span class="cmd">getOrCreate</span>()
+)
+
+<span class="cmt"># ── Okuma ─────────────────────────────────────────────────────────</span>
+events = spark.read.<span class="cmd">format</span>(<span class="str">"delta"</span>).<span class="cmd">load</span>(<span class="str">"s3://bucket/silver/events"</span>)
+users  = spark.read.<span class="cmd">format</span>(<span class="str">"parquet"</span>).<span class="cmd">load</span>(<span class="str">"s3://bucket/bronze/users"</span>)
+
+<span class="cmt"># ── Transformations (lazy) ─────────────────────────────────────────</span>
+enriched = (
+    events
+    .<span class="cmd">filter</span>(F.<span class="cmd">col</span>(<span class="str">"event_type"</span>) == <span class="str">"purchase"</span>)
+    .<span class="cmd">withColumn</span>(<span class="str">"revenue_usd"</span>, F.<span class="cmd">col</span>(<span class="str">"revenue"</span>) * F.<span class="cmd">col</span>(<span class="str">"fx_rate"</span>))
+    .<span class="cmd">join</span>(users.<span class="cmd">select</span>(<span class="str">"user_id"</span>, <span class="str">"country"</span>, <span class="str">"tier"</span>), on=<span class="str">"user_id"</span>, how=<span class="str">"left"</span>)
+    .<span class="cmd">groupBy</span>(<span class="str">"user_id"</span>, <span class="str">"country"</span>)
+    .<span class="cmd">agg</span>(
+        F.<span class="cmd">sum</span>(<span class="str">"revenue_usd"</span>).<span class="cmd">alias</span>(<span class="str">"total_revenue"</span>),
+        F.<span class="cmd">count</span>(<span class="str">"*"</span>).<span class="cmd">alias</span>(<span class="str">"purchase_count"</span>),
+        F.<span class="cmd">avg</span>(<span class="str">"revenue_usd"</span>).<span class="cmd">alias</span>(<span class="str">"avg_order_value"</span>),
+    )
+)
+
+<span class="cmt"># ── Action — Delta'ya yaz ─────────────────────────────────────────</span>
+(
+    enriched
+    .<span class="cmd">repartition</span>(50, <span class="str">"country"</span>)   <span class="cmt"># partition pruning için</span>
+    .write
+    .<span class="cmd">format</span>(<span class="str">"delta"</span>)
+    .<span class="cmd">mode</span>(<span class="str">"overwrite"</span>)
+    .<span class="cmd">option</span>(<span class="str">"overwriteSchema"</span>, <span class="str">"true"</span>)
+    .<span class="cmd">partitionBy</span>(<span class="str">"country"</span>)
+    .<span class="cmd">save</span>(<span class="str">"s3://bucket/gold/user_features"</span>)
+)
+
+spark.<span class="cmd">stop</span>()</code></pre>
+  </div>
+
+  <div class="callout">
+    <strong>Shuffle sınırı:</strong> Varsayılan <code>spark.sql.shuffle.partitions=200</code> küçük veri için çok fazla, büyük veri için az olabilir. Kural: her partition yaklaşık 128 MB olmalı. AQE (Adaptive Query Execution) açıksa Spark bu değeri otomatik ayarlar.
+  </div>
+</section>
+
+<!-- ── S5 ──────────────────────────────────────────────────────── -->
+<section id="s5">
+  <h2><span class="num">05</span> Data Quality — Great Expectations &amp; Soda</h2>
+  <p class="section-lead">Veri kalitesi kontrolleri pipeline'a entegre edilmezse çöp giren çöp çıkar. Great Expectations ve Soda iki popüler seçenektir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>gx_suite.py — Great Expectations</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> great_expectations <span class="keyword">as</span> gx
+<span class="keyword">import</span> pandas <span class="keyword">as</span> pd
+
+context = gx.<span class="cmd">get_context</span>()
+
+<span class="cmt"># ── Datasource tanımla ──────────────────────────────────────────────</span>
+datasource = context.sources.<span class="cmd">add_or_update_pandas</span>(name=<span class="str">"events_ds"</span>)
+asset = datasource.<span class="cmd">add_dataframe_asset</span>(name=<span class="str">"events"</span>)
+batch_request = asset.<span class="cmd">build_batch_request</span>(dataframe=pd.<span class="cmd">read_parquet</span>(<span class="str">"events.parquet"</span>))
+
+<span class="cmt"># ── Expectation Suite ───────────────────────────────────────────────</span>
+suite = context.<span class="cmd">add_or_update_expectation_suite</span>(<span class="str">"events_suite"</span>)
+validator = context.<span class="cmd">get_validator</span>(batch_request=batch_request, expectation_suite=suite)
+
+validator.<span class="cmd">expect_column_to_exist</span>(<span class="str">"user_id"</span>)
+validator.<span class="cmd">expect_column_values_to_not_be_null</span>(<span class="str">"user_id"</span>)
+validator.<span class="cmd">expect_column_values_to_be_between</span>(<span class="str">"revenue"</span>, min_value=0, max_value=100_000)
+validator.<span class="cmd">expect_column_values_to_be_in_set</span>(<span class="str">"event_type"</span>, [<span class="str">"click"</span>, <span class="str">"purchase"</span>, <span class="str">"view"</span>])
+validator.<span class="cmd">expect_column_pair_values_to_be_equal</span>(<span class="str">"order_id"</span>, <span class="str">"order_id_copy"</span>)
+validator.<span class="cmd">expect_table_row_count_to_be_between</span>(min_value=1000, max_value=10_000_000)
+
+validator.<span class="cmd">save_expectation_suite</span>()
+
+<span class="cmt"># ── Checkpoint çalıştır ─────────────────────────────────────────────</span>
+checkpoint = context.<span class="cmd">add_or_update_checkpoint</span>(
+    name=<span class="str">"events_checkpoint"</span>,
+    validator=validator,
+)
+result = checkpoint.<span class="cmd">run</span>()
+<span class="keyword">if not</span> result[<span class="str">"success"</span>]:
+    <span class="keyword">raise</span> <span class="cmd">ValueError</span>(<span class="str">"Data quality check başarısız! Pipeline durduruluyor."</span>)</code></pre>
+  </div>
+</section>
+
+<!-- ── S6 ──────────────────────────────────────────────────────── -->
+<section id="s6">
+  <h2><span class="num">06</span> Pipeline Test Stratejisi</h2>
+  <p class="section-lead">Veri pipeline'larını test etmek yazılım testinden farklıdır: veri bağımlılığı, yan etkiler ve non-determinism zorluğu vardır.</p>
+
+  <div class="flow">
+    <pre><span class="step-num">01</span> <span class="accent">Unit Test</span>       → Saf transformation fonksiyonları küçük sabit veriyle test et
+<span class="step-num">02</span> <span class="accent">Integration</span>    → Gerçek kaynak/hedef sistemlere karşı (Docker Compose ile yerel)
+<span class="step-num">03</span> <span class="accent">Contract Test</span>  → Kaynak schema'nın beklenen sözleşmeye uyduğunu doğrula
+<span class="step-num">04</span> <span class="accent">Data Quality</span>   → Great Expectations / Soda ile beklentileri otomatik kontrol et
+<span class="step-num">05</span> <span class="accent">E2E Test</span>       → Küçük fixture dataset ile tüm pipeline'ı uçtan uca çalıştır</pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>test_transform.py — pytest</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> polars <span class="keyword">as</span> pl
+<span class="keyword">import</span> pytest
+<span class="keyword">from</span> pipeline.transforms <span class="keyword">import</span> clean_events, aggregate_daily
+
+@pytest.<span class="cmd">fixture</span>
+<span class="keyword">def</span> <span class="cmd">raw_events</span>():
+    <span class="keyword">return</span> pl.<span class="cmd">DataFrame</span>({
+        <span class="str">"user_id"</span>:    [1, 2, 2, 3, <span class="keyword">None</span>],
+        <span class="str">"event_type"</span>: [<span class="str">"click"</span>, <span class="str">"purchase"</span>, <span class="str">"bot"</span>, <span class="str">"purchase"</span>, <span class="str">"view"</span>],
+        <span class="str">"revenue"</span>:    [0.0, 49.99, 0.0, 120.0, 0.0],
+    })
+
+<span class="keyword">def</span> <span class="cmd">test_clean_removes_bot_events</span>(raw_events):
+    result = <span class="cmd">clean_events</span>(raw_events)
+    <span class="keyword">assert</span> <span class="str">"bot"</span> <span class="keyword">not in</span> result[<span class="str">"event_type"</span>].<span class="cmd">to_list</span>()
+
+<span class="keyword">def</span> <span class="cmd">test_clean_drops_null_user_id</span>(raw_events):
+    result = <span class="cmd">clean_events</span>(raw_events)
+    <span class="keyword">assert</span> result[<span class="str">"user_id"</span>].<span class="cmd">null_count</span>() == 0
+
+<span class="keyword">def</span> <span class="cmd">test_aggregate_daily_revenue</span>(raw_events):
+    clean = <span class="cmd">clean_events</span>(raw_events)
+    agg   = <span class="cmd">aggregate_daily</span>(clean)
+    user2_revenue = agg.<span class="cmd">filter</span>(pl.col(<span class="str">"user_id"</span>) == 2)[<span class="str">"total_revenue"</span>][0]
+    <span class="keyword">assert</span> user2_revenue == pytest.<span class="cmd">approx</span>(49.99, rel=1e-3)</code></pre>
+  </div>
+</section>
+
+<!-- ── S7 ──────────────────────────────────────────────────────── -->
+<section id="s7">
+  <h2><span class="num">07</span> Cost Optimization</h2>
+  <p class="section-lead">Partition pruning, Z-ordering ve compaction ile S3 okuma maliyeti ve Spark compute süresi dramatik biçimde düşürülebilir.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Partition Pruning</span><span class="desc">Parquet/Delta dosyalarını partition kolona göre dizinle; sorgu yalnızca ilgili klasörlere bakar. event_date veya country gibi sık filtrenen kolonları seç.</span></div>
+    <div class="param"><span class="name">Z-Ordering (Delta)</span><span class="desc">OPTIMIZE komutu ile sık birlikte filtrenen birden fazla kolonu (user_id + event_date) Z-order'a göre birlikte sırala, data skipping artırılır.</span></div>
+    <div class="param"><span class="name">Small File Compaction</span><span class="desc">Streaming yazıları çok sayıda küçük dosya üretir. OPTIMIZE / VACUUM ile birleştir ve gereksiz versiyonları temizle.</span></div>
+    <div class="param"><span class="name">Columnar Projection</span><span class="desc">SELECT * yerine yalnızca gereken kolonları seç; Parquet column-pruning ile okuma maliyeti kolun sayısıyla orantılı azalır.</span></div>
+    <div class="param"><span class="name">Spot / Preemptible</span><span class="desc">Batch Spark job'larında Spot Instance kullan (%70'e kadar tasarruf). Checkpointing ile yeniden başlatmayı destekle.</span></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>optimize_delta.sql — Delta Lake optimize komutları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">-- Z-ORDER ile optimize (Spark SQL / Databricks)</span>
+OPTIMIZE delta.`s3://bucket/gold/user_features`
+ZORDER BY (user_id, event_date);
+
+<span class="cmt">-- 7 günden eski versiyon dosyalarını temizle</span>
+VACUUM delta.`s3://bucket/gold/user_features` RETAIN 168 HOURS;
+
+<span class="cmt">-- Partition statistics güncelle</span>
+ANALYZE TABLE user_features COMPUTE STATISTICS FOR ALL COLUMNS;</code></pre>
+  </div>
+</section>
+
+<!-- ── S8 ──────────────────────────────────────────────────────── -->
+<section id="s8">
+  <h2><span class="num">08</span> Practical — S3 → Delta Lake → Feature Tablosu</h2>
+  <p class="section-lead">Airflow DAG ile tam uçtan uca pipeline: S3'ten ham event verisi çek, Delta Lake silver tablosuna yaz, feature engineering sonucu gold feature tablosuna yükle.</p>
+
+  <div class="flow">
+    <pre><span class="step-num">01</span> <span class="accent">S3 raw</span>         → günlük parquet dosyaları (events/date=YYYY-MM-DD/)
+<span class="step-num">02</span> <span class="accent">Extract</span>        → Polars ile oku, boyut kontrol et
+<span class="step-num">03</span> <span class="accent">Quality Check</span>  → Great Expectations ile schema &amp; range doğrula
+<span class="step-num">04</span> <span class="accent">Transform</span>      → temizle, tip dönüştür, null yönet
+<span class="step-num">05</span> <span class="accent">Silver Delta</span>   → temiz ham veri, partitionBy(event_date)
+<span class="step-num">06</span> <span class="accent">Feature Eng</span>    → 7 günlük pencere aggregation (Spark)
+<span class="step-num">07</span> <span class="accent">Gold Delta</span>     → user_features tablosu, Z-ORDER(user_id)
+<span class="step-num">08</span> <span class="accent">Feast Materialize</span> → online feature store güncelle</pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>dags/full_pipeline.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">from</span> airflow.decorators <span class="keyword">import</span> dag, task
+<span class="keyword">from</span> airflow.utils.dates <span class="keyword">import</span> days_ago
+<span class="keyword">from</span> datetime <span class="keyword">import</span> timedelta
+
+@<span class="cmd">dag</span>(
+    dag_id=<span class="str">"s3_to_feature_table"</span>,
+    schedule_interval=<span class="str">"0 3 * * *"</span>,   <span class="cmt"># her gün 03:00</span>
+    start_date=<span class="cmd">days_ago</span>(1),
+    default_args={<span class="str">"retries"</span>: 2, <span class="str">"retry_delay"</span>: timedelta(minutes=10)},
+    catchup=<span class="keyword">False</span>,
+)
+<span class="keyword">def</span> <span class="cmd">pipeline</span>():
+
+    @<span class="cmd">task</span>
+    <span class="keyword">def</span> <span class="cmd">extract</span>(ds=<span class="keyword">None</span>):
+        <span class="keyword">import</span> polars <span class="keyword">as</span> pl
+        df = pl.<span class="cmd">scan_parquet</span>(<span class="str">f"s3://raw/events/date={ds}/*.parquet"</span>).<span class="cmd">collect</span>()
+        <span class="keyword">assert</span> <span class="cmd">len</span>(df) &gt; 0, <span class="str">"Boş dataset!"</span>
+        <span class="keyword">return</span> df.<span class="cmd">write_ipc</span>(None)  <span class="cmt"># Arrow IPC bytes — XCom için serialize</span>
+
+    @<span class="cmd">task</span>
+    <span class="keyword">def</span> <span class="cmd">validate</span>(ipc_bytes: <span class="cmd">bytes</span>):
+        <span class="keyword">import</span> polars <span class="keyword">as</span> pl, io
+        df = pl.<span class="cmd">read_ipc</span>(io.<span class="cmd">BytesIO</span>(ipc_bytes))
+        required_cols = {<span class="str">"user_id"</span>, <span class="str">"event_type"</span>, <span class="str">"revenue"</span>, <span class="str">"ts"</span>}
+        <span class="keyword">assert</span> required_cols.<span class="cmd">issubset</span>(<span class="cmd">set</span>(df.columns)), <span class="str">"Eksik kolon!"</span>
+        <span class="keyword">assert</span> df[<span class="str">"revenue"</span>].<span class="cmd">min</span>() &gt;= 0, <span class="str">"Negatif revenue!"</span>
+        <span class="keyword">return</span> ipc_bytes
+
+    @<span class="cmd">task</span>
+    <span class="keyword">def</span> <span class="cmd">write_silver</span>(ipc_bytes: <span class="cmd">bytes</span>, ds=<span class="keyword">None</span>):
+        <span class="keyword">import</span> polars <span class="keyword">as</span> pl, io
+        <span class="keyword">from</span> deltalake <span class="keyword">import</span> write_deltalake
+        df = pl.<span class="cmd">read_ipc</span>(io.<span class="cmd">BytesIO</span>(ipc_bytes))
+        <span class="cmd">write_deltalake</span>(<span class="str">"s3://curated/silver/events"</span>, df.<span class="cmd">to_arrow</span>(),
+                        mode=<span class="str">"append"</span>, partition_by=[<span class="str">"event_date"</span>])
+
+    @<span class="cmd">task</span>
+    <span class="keyword">def</span> <span class="cmd">build_features</span>(ds=<span class="keyword">None</span>):
+        <span class="keyword">from</span> pyspark.sql <span class="keyword">import</span> SparkSession
+        <span class="keyword">import</span> pyspark.sql.functions <span class="keyword">as</span> F
+        spark = SparkSession.<span class="cmd">builder</span>.<span class="cmd">getOrCreate</span>()
+        df = spark.read.<span class="cmd">format</span>(<span class="str">"delta"</span>).<span class="cmd">load</span>(<span class="str">"s3://curated/silver/events"</span>)
+        features = (
+            df.<span class="cmd">groupBy</span>(<span class="str">"user_id"</span>)
+              .<span class="cmd">agg</span>(
+                F.<span class="cmd">sum</span>(<span class="str">"revenue"</span>).<span class="cmd">alias</span>(<span class="str">"ltv"</span>),
+                F.<span class="cmd">count</span>(<span class="str">"*"</span>).<span class="cmd">alias</span>(<span class="str">"total_events"</span>),
+                F.<span class="cmd">countDistinct</span>(<span class="str">"event_date"</span>).<span class="cmd">alias</span>(<span class="str">"active_days"</span>),
+              )
+        )
+        features.write.<span class="cmd">format</span>(<span class="str">"delta"</span>).<span class="cmd">mode</span>(<span class="str">"overwrite"</span>).<span class="cmd">save</span>(<span class="str">"s3://curated/gold/user_features"</span>)
+        spark.<span class="cmd">stop</span>()
+
+    raw = <span class="cmd">extract</span>()
+    validated = <span class="cmd">validate</span>(raw)
+    <span class="cmd">write_silver</span>(validated) &gt;&gt; <span class="cmd">build_features</span>()
+
+<span class="cmd">pipeline</span>()</code></pre>
+  </div>
+
+  <div class="callout">
+    <strong>XCom limiti:</strong> Airflow XCom varsayılan olarak metadata DB'de saklar (genellikle PostgreSQL). Büyük DataFrameler için XCom backend olarak S3 veya custom XCom kullanın, ya da veriye dosya path'iyle referans edin.
+  </div>
+</section>
+
+</main>

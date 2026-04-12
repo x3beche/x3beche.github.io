@@ -1,0 +1,418 @@
+---
+layout: tutorial
+title: "Feature Store — Feast & Online/Offline"
+back_url: "../data-engineering/index.html"
+back_label: "Veri Mühendisliği"
+---
+
+<header class="header">
+  <div class="meta"><span>Rehber</span><span>Veri Mühendisliği</span><span>02 · Depolama</span></div>
+  <h1>Feature Store<br><em>Feast &amp; Online/Offline.</em></h1>
+  <p class="subtitle">Training/serving skew sorununu çöz, Feast ile feature view tanımla, batch materializasyondan online serving'e, time-travel query'den feature monitoring'e tam rehber.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçerik</div>
+  <ol>
+    <li><a href="#s0">Feature Store Nedir?</a></li>
+    <li><a href="#s1">Feast Mimarisi</a></li>
+    <li><a href="#s2">Feast Kurulumu ve Feature View Tanımı</a></li>
+    <li><a href="#s3">Batch Feature Materializasyonu</a></li>
+    <li><a href="#s4">Online Serving</a></li>
+    <li><a href="#s5">Time-Travel Query (as_of)</a></li>
+    <li><a href="#s6">Feature Reuse ve Keşif</a></li>
+    <li><a href="#s7">Hopsworks ve Tecton Karşılaştırma</a></li>
+    <li><a href="#s8">Feature Monitoring ve Practical</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ── S0 ──────────────────────────────────────────────────────── -->
+<section id="s0">
+  <h2><span class="num">00</span> Feature Store Nedir?</h2>
+  <p class="section-lead">Feature store, ML feature'larının merkezi deposudur. Training ve serving sırasında aynı feature hesaplamasının kullanılmasını garanti eder.</p>
+
+  <p>
+    <em>Training/serving skew</em> problemi: model eğitiminde kullanılan feature ile production'da hesaplanan feature farklı olduğunda model performansı dramatik düşer. Örneğin eğitimde "son 7 günlük ortalama sipariş değeri" pandas ile hesaplanırken, serving'de aynı metrik SQL ile farklı şekilde hesaplanıyorsa skew oluşur.
+  </p>
+
+  <div class="flow">
+    <pre><span class="step-num">Sorun</span>  Training:  pandas groupby → 7 günlük ortalama = 42.5
+<span class="step-num">Sorun</span>  Serving:   SQL AVG() → 7 günlük ortalama = 39.1  ← FARK!
+<span class="step-num">Çözüm</span>  Feature Store → tek tanım, iki ortamda da aynı değer</pre>
+  </div>
+
+  <p>
+    <em>Point-in-time correctness</em>: Bir modeli geçmiş tarihlerdeki verilerle yeniden eğitirken, her training örneği için yalnızca o tarihe kadar bilinen feature değerleri kullanılmalıdır. Bu kural ihlal edilirse <em>data leakage</em> oluşur.
+  </p>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Feature Store Olmadan</th><th>Feature Store İle</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Her takım kendi feature hesaplama kodunu yazar</td><td>Merkezi feature registry — bir kez tanımla, her yerde kullan</td></tr>
+      <tr><td>Training/serving skew riski yüksek</td><td>Aynı feature pipeline her iki ortamda da çalışır</td></tr>
+      <tr><td>Point-in-time correctness manuel sağlanır</td><td>Otomatik time-travel query desteği</td></tr>
+      <tr><td>Feature yeniden kullanımı zor</td><td>Feature keşif ve yeniden kullanım araçları</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ── S1 ──────────────────────────────────────────────────────── -->
+<section id="s1">
+  <h2><span class="num">01</span> Feast Mimarisi</h2>
+  <p class="section-lead">Feast açık kaynak feature store'un üç temel bileşeni: registry, offline store ve online store.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Registry</span><span class="desc">Feature tanımlarının (FeatureView, Entity, DataSource) merkezi depo. Yerel dosya, S3, GCS veya SQL DB olabilir.</span></div>
+    <div class="param"><span class="name">Offline Store</span><span class="desc">Tarihsel feature verilerinin tutulduğu yer. BigQuery, Redshift, Spark, DuckDB, Parquet (yerel) desteği var. Training için kullanılır.</span></div>
+    <div class="param"><span class="name">Online Store</span><span class="desc">Düşük latency (milisaniye) ile son feature değerlerinin sunulduğu yer. Redis, DynamoDB, SQLite, Datastore desteği var. Serving için kullanılır.</span></div>
+    <div class="param"><span class="name">Materialization</span><span class="desc">Offline store'dan online store'a feature değerlerini kopyalama işlemi. feast materialize-incremental ile çalışır.</span></div>
+    <div class="param"><span class="name">Feature Server</span><span class="desc">REST API ile online feature serving. feast serve ile başlatılır.</span></div>
+  </div>
+
+  <div class="flow">
+    <pre><span class="step-num">01</span> <span class="accent">Tanım</span>          → Entity, FeatureView, DataSource Python ile tanımla
+<span class="step-num">02</span> <span class="accent">feast apply</span>    → Registry güncelle (S3/GCS/yerel)
+<span class="step-num">03</span> <span class="accent">feast materialize</span> → Offline → Online store kopyala
+<span class="step-num">04</span> <span class="accent">Training</span>       → get_historical_features() — point-in-time correct
+<span class="step-num">05</span> <span class="accent">Serving</span>        → get_online_features() — düşük latency</pre>
+  </div>
+</section>
+
+<!-- ── S2 ──────────────────────────────────────────────────────── -->
+<section id="s2">
+  <h2><span class="num">02</span> Feast Kurulumu ve Feature View Tanımı</h2>
+  <p class="section-lead">Yerel Parquet + SQLite ile geliştirme ortamı, production'da S3 + Redis kombinasyonu.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>terminal</span><span class="dot">●</span></div>
+    <pre><code>pip install feast[redis,aws]
+feast init user_behavior_store
+cd user_behavior_store
+# Dizin yapısı:
+# feature_store.yaml  — konfigürasyon
+# data/               — yerel parquet (dev)
+# feature_views.py    — feature tanımları</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>feature_store.yaml</span><span class="dot">●</span></div>
+    <pre><code>project: user_behavior_store
+registry: s3://my-feast-bucket/registry.pb
+provider: aws
+online_store:
+  type: redis
+  connection_string: "redis:6379"
+offline_store:
+  type: file   # geliştirme için; production'da bigquery veya redshift
+entity_key_serialization_version: 2</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>feature_views.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">from</span> datetime <span class="keyword">import</span> timedelta
+<span class="keyword">from</span> feast <span class="keyword">import</span> (
+    Entity, FeatureView, Field, FileSource, ValueType
+)
+<span class="keyword">from</span> feast.types <span class="keyword">import</span> Float32, Int64, String
+
+<span class="cmt"># ── Entity tanımı ───────────────────────────────────────────────────</span>
+user = <span class="cmd">Entity</span>(
+    name=<span class="str">"user_id"</span>,
+    value_type=ValueType.INT64,
+    description=<span class="str">"Kullanıcı benzersiz kimliği"</span>,
+)
+
+<span class="cmt"># ── Data Source ─────────────────────────────────────────────────────</span>
+user_events_source = <span class="cmd">FileSource</span>(
+    path=<span class="str">"s3://feature-bucket/user_events/*.parquet"</span>,
+    timestamp_field=<span class="str">"event_timestamp"</span>,
+    created_timestamp_column=<span class="str">"created"</span>,
+)
+
+<span class="cmt"># ── Feature View ────────────────────────────────────────────────────</span>
+user_behavior_fv = <span class="cmd">FeatureView</span>(
+    name=<span class="str">"user_behavior"</span>,
+    entities=[user],
+    ttl=timedelta(days=7),
+    schema=[
+        <span class="cmd">Field</span>(name=<span class="str">"total_purchases_7d"</span>,   dtype=Int64),
+        <span class="cmd">Field</span>(name=<span class="str">"avg_order_value_7d"</span>,   dtype=Float32),
+        <span class="cmd">Field</span>(name=<span class="str">"unique_products_7d"</span>,   dtype=Int64),
+        <span class="cmd">Field</span>(name=<span class="str">"days_since_last_order"</span>, dtype=Int64),
+        <span class="cmd">Field</span>(name=<span class="str">"preferred_category"</span>,    dtype=String),
+    ],
+    online=<span class="keyword">True</span>,
+    source=user_events_source,
+    tags={<span class="str">"team"</span>: <span class="str">"ml-platform"</span>, <span class="str">"owner"</span>: <span class="str">"data-science"</span>},
+)
+
+<span class="cmt"># ── Registry'ye kaydet ──────────────────────────────────────────────</span>
+<span class="cmt"># Terminal: feast apply</span></code></pre>
+  </div>
+</section>
+
+<!-- ── S3 ──────────────────────────────────────────────────────── -->
+<section id="s3">
+  <h2><span class="num">03</span> Batch Feature Materializasyonu</h2>
+  <p class="section-lead">Offline store'dan online store'a feature kopyalama. İncrementel materializasyon ile yalnızca yeni veriler kopyalanır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>materialize.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">from</span> feast <span class="keyword">import</span> FeatureStore
+<span class="keyword">from</span> datetime <span class="keyword">import</span> datetime, timedelta, timezone
+
+store = <span class="cmd">FeatureStore</span>(repo_path=<span class="str">"."</span>)
+
+<span class="cmt"># ── Tam materializasyon (ilk kez veya backfill) ─────────────────────</span>
+store.<span class="cmd">materialize</span>(
+    start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    end_date=datetime(2026, 4, 12, tzinfo=timezone.utc),
+)
+
+<span class="cmt"># ── İncrementel (her gün cron ile çalıştır) ─────────────────────────</span>
+store.<span class="cmd">materialize_incremental</span>(
+    end_date=datetime.<span class="cmd">now</span>(tz=timezone.utc),
+)
+
+<span class="cmt"># Airflow ile günlük schedule:</span>
+<span class="cmt"># feast materialize-incremental $(date -u +%Y-%m-%dT%H:%M:%S)</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <strong>TTL Ayarı:</strong> FeatureView'da <code>ttl=timedelta(days=7)</code> ile 7 günden eski feature'lar online store'da geçersiz sayılır. Online store'da yer kaplamaz. TTL, modelin stale feature'lara karşı direncini ayarlar.
+  </div>
+</section>
+
+<!-- ── S4 ──────────────────────────────────────────────────────── -->
+<section id="s4">
+  <h2><span class="num">04</span> Online Serving</h2>
+  <p class="section-lead">Düşük latency ile production'da feature okuma. Redis online store ile P99 &lt; 10ms hedeflenebilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>inference_service.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">from</span> feast <span class="keyword">import</span> FeatureStore
+<span class="keyword">import</span> pandas <span class="keyword">as</span> pd
+
+store = <span class="cmd">FeatureStore</span>(repo_path=<span class="str">"."</span>)
+
+<span class="keyword">def</span> <span class="cmd">get_user_features</span>(user_ids: list[int]) -&gt; pd.DataFrame:
+    <span class="cmt">"""Verilen user_id listesi için online feature'ları çek."""</span>
+    entity_rows = [{<span class="str">"user_id"</span>: uid} <span class="keyword">for</span> uid <span class="keyword">in</span> user_ids]
+
+    feature_vector = store.<span class="cmd">get_online_features</span>(
+        features=[
+            <span class="str">"user_behavior:total_purchases_7d"</span>,
+            <span class="str">"user_behavior:avg_order_value_7d"</span>,
+            <span class="str">"user_behavior:unique_products_7d"</span>,
+            <span class="str">"user_behavior:days_since_last_order"</span>,
+            <span class="str">"user_behavior:preferred_category"</span>,
+        ],
+        entity_rows=entity_rows,
+    )
+    <span class="keyword">return</span> feature_vector.<span class="cmd">to_df</span>()
+
+<span class="cmt"># ── FastAPI ile entegrasyon ─────────────────────────────────────────</span>
+<span class="keyword">from</span> fastapi <span class="keyword">import</span> FastAPI
+<span class="keyword">from</span> pydantic <span class="keyword">import</span> BaseModel
+<span class="keyword">import</span> numpy <span class="keyword">as</span> np, joblib
+
+app = <span class="cmd">FastAPI</span>()
+model = joblib.<span class="cmd">load</span>(<span class="str">"churn_model.pkl"</span>)
+
+<span class="keyword">class</span> <span class="cmd">PredictRequest</span>(BaseModel):
+    user_ids: list[int]
+
+@app.<span class="cmd">post</span>(<span class="str">"/predict/churn"</span>)
+<span class="keyword">async</span> <span class="keyword">def</span> <span class="cmd">predict_churn</span>(req: <span class="cmd">PredictRequest</span>):
+    features_df = <span class="cmd">get_user_features</span>(req.user_ids)
+    feature_cols = [
+        <span class="str">"total_purchases_7d"</span>, <span class="str">"avg_order_value_7d"</span>,
+        <span class="str">"unique_products_7d"</span>, <span class="str">"days_since_last_order"</span>,
+    ]
+    X = features_df[feature_cols].<span class="cmd">fillna</span>(0).<span class="cmd">values</span>
+    probs = model.<span class="cmd">predict_proba</span>(X)[:, 1]
+    <span class="keyword">return</span> {
+        <span class="str">"predictions"</span>: [
+            {<span class="str">"user_id"</span>: uid, <span class="str">"churn_prob"</span>: <span class="cmd">float</span>(p)}
+            <span class="keyword">for</span> uid, p <span class="keyword">in</span> <span class="cmd">zip</span>(req.user_ids, probs)
+        ]
+    }</code></pre>
+  </div>
+</section>
+
+<!-- ── S5 ──────────────────────────────────────────────────────── -->
+<section id="s5">
+  <h2><span class="num">05</span> Time-Travel Query (as_of)</h2>
+  <p class="section-lead">Model yeniden eğitimi sırasında data leakage'ı önlemek için her training örneği o tarihteki feature değerleriyle eşleştirilmelidir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>training_dataset.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">from</span> feast <span class="keyword">import</span> FeatureStore
+<span class="keyword">import</span> pandas <span class="keyword">as</span> pd
+
+store = <span class="cmd">FeatureStore</span>(repo_path=<span class="str">"."</span>)
+
+<span class="cmt"># ── Entity DataFrame: her satırda user_id + gözlem zamanı ───────────</span>
+entity_df = pd.<span class="cmd">DataFrame</span>({
+    <span class="str">"user_id"</span>: [101, 102, 103, 104, 105],
+    <span class="str">"event_timestamp"</span>: pd.<span class="cmd">to_datetime</span>([
+        <span class="str">"2026-01-15"</span>, <span class="str">"2026-02-03"</span>, <span class="str">"2026-02-20"</span>,
+        <span class="str">"2026-03-10"</span>, <span class="str">"2026-04-01"</span>,
+    ]),
+    <span class="str">"label"</span>: [1, 0, 1, 0, 1],  <span class="cmt"># churn etiketi</span>
+})
+
+<span class="cmt"># ── get_historical_features: her satır için as_of zamanı kullanır ───</span>
+training_df = store.<span class="cmd">get_historical_features</span>(
+    entity_df=entity_df,
+    features=[
+        <span class="str">"user_behavior:total_purchases_7d"</span>,
+        <span class="str">"user_behavior:avg_order_value_7d"</span>,
+        <span class="str">"user_behavior:unique_products_7d"</span>,
+        <span class="str">"user_behavior:days_since_last_order"</span>,
+    ],
+).<span class="cmd">to_df</span>()
+
+<span class="cmd">print</span>(training_df.<span class="cmd">head</span>())
+<span class="cmt"># Her satır, event_timestamp tarihindeki feature değerlerini içerir</span>
+<span class="cmt"># Bu point-in-time correctness garantisidir — data leakage yok</span>
+
+<span class="cmt"># ── Model eğitimi ────────────────────────────────────────────────────</span>
+<span class="keyword">from</span> sklearn.ensemble <span class="keyword">import</span> GradientBoostingClassifier
+<span class="keyword">from</span> sklearn.model_selection <span class="keyword">import</span> train_test_split
+<span class="keyword">import</span> joblib
+
+feature_cols = [
+    <span class="str">"total_purchases_7d"</span>, <span class="str">"avg_order_value_7d"</span>,
+    <span class="str">"unique_products_7d"</span>, <span class="str">"days_since_last_order"</span>,
+]
+X = training_df[feature_cols].<span class="cmd">fillna</span>(0)
+y = training_df[<span class="str">"label"</span>]
+
+X_train, X_test, y_train, y_test = <span class="cmd">train_test_split</span>(X, y, test_size=0.2, random_state=42)
+clf = <span class="cmd">GradientBoostingClassifier</span>(n_estimators=100, max_depth=4)
+clf.<span class="cmd">fit</span>(X_train, y_train)
+joblib.<span class="cmd">dump</span>(clf, <span class="str">"churn_model.pkl"</span>)</code></pre>
+  </div>
+</section>
+
+<!-- ── S6 ──────────────────────────────────────────────────────── -->
+<section id="s6">
+  <h2><span class="num">06</span> Feature Reuse ve Keşif</h2>
+  <p class="section-lead">Feature store'un en büyük değerlerinden biri: bir takımın ürettiği feature'ı diğer takımlar bulup yeniden kullanabilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>feature_discovery.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">from</span> feast <span class="keyword">import</span> FeatureStore
+
+store = <span class="cmd">FeatureStore</span>(repo_path=<span class="str">"."</span>)
+
+<span class="cmt"># ── Tüm feature view'ları listele ───────────────────────────────────</span>
+<span class="keyword">for</span> fv <span class="keyword">in</span> store.<span class="cmd">list_feature_views</span>():
+    <span class="cmd">print</span>(<span class="str">f"FeatureView: {fv.name}"</span>)
+    <span class="cmd">print</span>(<span class="str">f"  Entity: {fv.entities}"</span>)
+    <span class="cmd">print</span>(<span class="str">f"  TTL: {fv.ttl}"</span>)
+    <span class="cmd">print</span>(<span class="str">f"  Tags: {fv.tags}"</span>)
+    <span class="keyword">for</span> field <span class="keyword">in</span> fv.schema:
+        <span class="cmd">print</span>(<span class="str">f"    - {field.name}: {field.dtype}"</span>)
+
+<span class="cmt"># ── Belirli bir feature view'ı detaylandır ──────────────────────────</span>
+fv = store.<span class="cmd">get_feature_view</span>(<span class="str">"user_behavior"</span>)
+<span class="cmd">print</span>(<span class="str">f"Owner: {fv.tags.get('owner', 'bilinmiyor')}"</span>)
+<span class="cmd">print</span>(<span class="str">f"Kaynak: {fv.source.path}"</span>)
+
+<span class="cmt"># ── Data source üzerindeki feature'ları bul ─────────────────────────</span>
+<span class="keyword">for</span> ds <span class="keyword">in</span> store.<span class="cmd">list_data_sources</span>():
+    <span class="cmd">print</span>(<span class="str">f"DataSource: {ds.name} — {ds.timestamp_field}"</span>)</code></pre>
+  </div>
+
+  <div class="callout">
+    <strong>Feature Documentation:</strong> Her FeatureView ve Field için <code>description</code> parametresi doldurun. Feast UI (feast ui komutu) veya Amundsen/DataHub gibi data catalog araçlarıyla feature registry entegre edilebilir.
+  </div>
+</section>
+
+<!-- ── S7 ──────────────────────────────────────────────────────── -->
+<section id="s7">
+  <h2><span class="num">07</span> Hopsworks ve Tecton Karşılaştırma</h2>
+  <p class="section-lead">Farklı feature store çözümlerinin güçlü ve zayıf yanları.</p>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Kriter</th><th>Feast</th><th>Hopsworks</th><th>Tecton</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Lisans</td><td>Apache 2.0 (açık kaynak)</td><td>AGPL / Enterprise</td><td>SaaS (kapalı kaynak)</td></tr>
+      <tr><td>Deployment</td><td>Self-hosted (k8s, yerel)</td><td>Self-hosted / Cloud</td><td>Fully managed SaaS</td></tr>
+      <tr><td>Streaming</td><td>Sınırlı (Kafka connector)</td><td>Native streaming (Flink)</td><td>Native streaming</td></tr>
+      <tr><td>Feature Transform</td><td>Dışarıda yapılır</td><td>Dahili Spark/Python</td><td>Dahili (declarative)</td></tr>
+      <tr><td>Monitoring</td><td>Harici entegrasyon gerekir</td><td>Dahili drift detection</td><td>Dahili monitoring</td></tr>
+      <tr><td>Maliyet</td><td>Ücretsiz (altyapı maliyeti)</td><td>Orta</td><td>Yüksek</td></tr>
+      <tr><td>Uygun Senaryo</td><td>Başlangıç, maliyet odaklı</td><td>On-premise, veri gizliliği</td><td>Enterprise, tam yönetimli</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ── S8 ──────────────────────────────────────────────────────── -->
+<section id="s8">
+  <h2><span class="num">08</span> Feature Monitoring ve Practical</h2>
+  <p class="section-lead">Drift detection, freshness kontrolü ve Feast + model eğitimi + gerçek zamanlı servis bütünleşik pipeline.</p>
+
+  <h3>Feature Monitoring</h3>
+  <div class="params">
+    <div class="param"><span class="name">Data Drift</span><span class="desc">Feature dağılımının zaman içinde değişmesi. KL divergence, PSI (Population Stability Index) veya Kolmogorov-Smirnov testi ile tespit.</span></div>
+    <div class="param"><span class="name">Freshness</span><span class="desc">Online store'daki feature değerlerinin ne kadar güncel olduğu. TTL aşılmış entity'ler stale sayılır.</span></div>
+    <div class="param"><span class="name">Missing Rate</span><span class="desc">get_online_features() çağrısında null dönen entity yüzdesi. Yüksekse materializasyon veya kaynak sorun yaşıyor.</span></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>feature_monitor.py — drift detection</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> numpy <span class="keyword">as</span> np
+<span class="keyword">from</span> scipy <span class="keyword">import</span> stats
+<span class="keyword">from</span> feast <span class="keyword">import</span> FeatureStore
+<span class="keyword">import</span> pandas <span class="keyword">as</span> pd
+
+store = <span class="cmd">FeatureStore</span>(repo_path=<span class="str">"."</span>)
+
+<span class="keyword">def</span> <span class="cmd">compute_psi</span>(expected: np.ndarray, actual: np.ndarray, buckets: int = 10) -&gt; float:
+    <span class="cmt">"""Population Stability Index — PSI &lt; 0.1: stabil, 0.1–0.25: değişim var, &gt; 0.25: kritik"""</span>
+    bins = np.<span class="cmd">percentile</span>(expected, np.<span class="cmd">linspace</span>(0, 100, buckets + 1))
+    bins[0]  = -np.inf
+    bins[-1] =  np.inf
+    expected_pcts = np.<span class="cmd">histogram</span>(expected, bins=bins)[0] / <span class="cmd">len</span>(expected)
+    actual_pcts   = np.<span class="cmd">histogram</span>(actual,   bins=bins)[0] / <span class="cmd">len</span>(actual)
+    expected_pcts = np.<span class="cmd">clip</span>(expected_pcts, 1e-4, <span class="keyword">None</span>)
+    actual_pcts   = np.<span class="cmd">clip</span>(actual_pcts,   1e-4, <span class="keyword">None</span>)
+    <span class="keyword">return</span> np.<span class="cmd">sum</span>((actual_pcts - expected_pcts) * np.<span class="cmd">log</span>(actual_pcts / expected_pcts))
+
+<span class="keyword">def</span> <span class="cmd">monitor_feature_drift</span>(
+    feature_name: str,
+    baseline_df: pd.DataFrame,
+    current_df: pd.DataFrame,
+    threshold: float = 0.25,
+):
+    psi = <span class="cmd">compute_psi</span>(baseline_df[feature_name].<span class="cmd">dropna</span>().<span class="cmd">values</span>,
+                       current_df[feature_name].<span class="cmd">dropna</span>().<span class="cmd">values</span>)
+    status = <span class="str">"OK"</span> <span class="keyword">if</span> psi &lt; 0.1 <span class="keyword">else</span> (<span class="str">"UYARI"</span> <span class="keyword">if</span> psi &lt; threshold <span class="keyword">else</span> <span class="str">"KRİTİK"</span>)
+    <span class="cmd">print</span>(<span class="str">f"{feature_name}: PSI={psi:.4f} [{status}]"</span>)
+    <span class="keyword">if</span> status == <span class="str">"KRİTİK"</span>:
+        <span class="cmd">alert_slack</span>(<span class="str">f"Feature drift alarm: {feature_name} PSI={psi:.4f}"</span>)
+    <span class="keyword">return</span> psi
+
+<span class="keyword">def</span> <span class="cmd">alert_slack</span>(message: str):
+    <span class="keyword">import</span> requests
+    requests.<span class="cmd">post</span>(
+        <span class="str">"https://hooks.slack.com/services/YOUR/WEBHOOK"</span>,
+        json={<span class="str">"text"</span>: message}
+    )</code></pre>
+  </div>
+
+  <div class="callout">
+    <strong>End-to-End Özet:</strong> 1) feature_views.py ile feature tanımla → 2) feast apply → 3) feast materialize-incremental (günlük cron) → 4) get_historical_features() ile training set oluştur → 5) modeli eğit → 6) get_online_features() ile serving → 7) PSI monitörü ile drift takip et.
+  </div>
+</section>
+
+</main>

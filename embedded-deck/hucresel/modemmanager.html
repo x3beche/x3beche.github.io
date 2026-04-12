@@ -1,0 +1,794 @@
+---
+layout: tutorial
+title: "ModemManager — Unified Modem API"
+back_url: "../index.html"
+back_label: "Hücresel Bağlantı"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>HÜCRESEL BAĞLANTI</span>
+    <span>MODEMMANAGER</span>
+    <span>2026</span>
+  </div>
+  <h1>ModemManager<br><em>unified modem API.</em></h1>
+  <p class="subtitle">D-Bus daemon mimarisi, mmcli ile tam modem yönetimi, NetworkManager entegrasyonu ve systemd ile otomatik 4G bağlantısı.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">ModemManager mimarisi — D-Bus, udev, daemon</a></li>
+    <li><a href="#s1">mmcli — modem listele, durum, etkinleştir</a></li>
+    <li><a href="#s2">mmcli — bağlan ve bağlantıyı kes</a></li>
+    <li><a href="#s3">Connection profile oluşturma ve kalıcı bağlantı</a></li>
+    <li><a href="#s4">NetworkManager entegrasyonu — nmcli ile modem</a></li>
+    <li><a href="#s5">D-Bus API ile Python GDBus programatik kontrol</a></li>
+    <li><a href="#s6">Sinyal kalitesi izleme — RSSI/RSRP/RSRQ/SINR</a></li>
+    <li><a href="#s7">SMS via ModemManager</a></li>
+    <li><a href="#s8">Practical — systemd ile boot'ta otomatik 4G bağlantısı</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> ModemManager mimarisi — D-Bus, udev, daemon</h2>
+  <p class="section-lead">ModemManager, Linux'ta USB/seri/PCIe modemleri yöneten birleşik bir D-Bus daemon'ıdır. AT, QMI ve MBIM protokollerini soyutlar.</p>
+
+  <div class="flow">
+    <pre>
+  Uygulama (nmcli, mmcli, Python GDBus)
+        ↓  org.freedesktop.ModemManager1  (D-Bus)
+  <span class="field">ModemManager daemon</span>   (modemmanager.service)
+        ├── udev kuralları → modem cihaz tespiti
+        ├── AT port yönetimi  (/dev/ttyUSBx)
+        ├── QMI port yönetimi (/dev/cdc-wdmx)
+        └── MBIM port yönetimi
+        ↓
+  <span class="field">Modem donanımı</span>   (EC25, RM500Q, SIM7600)
+        ├── /dev/ttyUSB2  (AT komutları)
+        ├── /dev/cdc-wdm0 (QMI/MBIM kontrol)
+        └── /dev/wwan0    (data arayüzü)
+    </pre>
+  </div>
+
+  <h3>Kurulum</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — ModemManager kurulum</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Debian / Ubuntu</span>
+<span class="cmd">apt-get</span> install modemmanager libqmi-utils libmbim-utils
+
+<span class="cmt"># Yocto — meta-oe katmanı gerekli</span>
+<span class="cmt"># IMAGE_INSTALL += "modemmanager"</span>
+
+<span class="cmt"># Buildroot</span>
+<span class="cmt"># BR2_PACKAGE_MODEMMANAGER=y</span>
+
+<span class="cmt"># Servis durumunu kontrol et</span>
+<span class="cmd">systemctl</span> status ModemManager
+<span class="cmt"># ● ModemManager.service - Modem Manager
+#    Active: active (running) since ...
+#    Main PID: 1234 (ModemManager)</span>
+
+<span class="cmt"># Servis başlat ve etkinleştir</span>
+<span class="cmd">systemctl</span> enable --now ModemManager
+
+<span class="cmt"># Versiyon</span>
+<span class="cmd">mmcli</span> --version
+<span class="cmt"># mmcli 1.20.6</span>
+
+<span class="cmt"># Debug log (sorun giderme)</span>
+<span class="cmd">ModemManager</span> --debug 2>&amp;1 | tee /tmp/mm-debug.log</code></pre>
+  </div>
+
+  <div class="callout info">
+    <div class="label">ÖNEMLI</div>
+    <p>ModemManager çalışırken aynı anda AT portuna (<code class="inline">/dev/ttyUSB2</code>) doğrudan yazmayın. ModemManager portu kilitler ve çakışma yaşanır. Modem kontrolü için <code class="inline">mmcli</code> veya D-Bus API kullanın.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> mmcli — modem listele, durum, etkinleştir</h2>
+  <p class="section-lead">mmcli (ModemManager CLI), ModemManager'ın tüm işlevlerine komut satırından erişim sağlar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — mmcli temel kullanım</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tespit edilen modemleri listele</span>
+<span class="cmd">mmcli</span> -L
+<span class="cmt"># /org/freedesktop/ModemManager1/Modem/0 [Quectel] EC25</span>
+
+<span class="cmt"># Modem detaylı bilgisi (index 0)</span>
+<span class="cmd">mmcli</span> -m 0
+<span class="cmt"># ----------------------------------
+# General  |            dbus path: /org/.../Modem/0
+#           |            device id: abc123...
+# ----------------------------------
+# Hardware |         manufacturer: Quectel
+#           |                model: EC25
+#           |    firmware revision: EC25EFAR06A12M4G
+#           |            supported: gsm-umts, lte
+#           |              current: lte
+# ----------------------------------
+# Status   |               state: registered
+#           |         power state: on
+#           |    signal quality: 71% (recent)
+# ----------------------------------
+# Modes    |           supported: allowed: any; preferred: none
+# ----------------------------------
+# Bands    |           supported: utran-1, eutran-3, eutran-7,...
+# ----------------------------------
+# IP       |      supported methods: ipv4, ipv6, ipv4v6</span>
+
+<span class="cmt"># Modemi etkinleştir</span>
+<span class="cmd">mmcli</span> -m 0 --enable
+<span class="cmt"># successfully enabled the modem</span>
+
+<span class="cmt"># Modemi devre dışı bırak</span>
+<span class="cmd">mmcli</span> -m 0 --disable
+
+<span class="cmt"># Modemi sıfırla (reset)</span>
+<span class="cmd">mmcli</span> -m 0 --reset
+
+<span class="cmt"># SIM bilgisi</span>
+<span class="cmd">mmcli</span> -m 0 --sim-status
+<span class="cmd">mmcli</span> -i 0
+<span class="cmt"># -----------------------
+# SIM      |  dbus path: /org/.../SIM/0
+#           |  iccid: 8990101234567890
+#           |  imsi: 286011234567890
+#           |  operator code: 28601
+#           |  operator name: Turkcell</span></code></pre>
+  </div>
+
+  <h3>JSON çıktısı (script entegrasyonu)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — JSON çıktı ve jq ile ayrıştırma</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># JSON formatında çıktı al</span>
+<span class="cmd">mmcli</span> -m 0 -J | jq '.'
+
+<span class="cmt"># Sadece sinyal kalitesini al</span>
+<span class="cmd">mmcli</span> -m 0 -J | jq '.modem.generic["signal-quality"].value'
+<span class="cmt"># 71</span>
+
+<span class="cmt"># Modem durumunu al</span>
+<span class="cmd">mmcli</span> -m 0 -J | jq -r '.modem.generic.state'
+<span class="cmt"># connected</span>
+
+<span class="cmt"># IP adresini al</span>
+<span class="cmd">mmcli</span> -m 0 --bearer=0 -J | \
+  jq -r '.bearer.ipv4config.address'
+<span class="cmt"># 100.65.45.123</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> mmcli — bağlan ve bağlantıyı kes</h2>
+  <p class="section-lead">mmcli ile data bağlantısı kurma, bearer (taşıyıcı) yönetimi ve bağlantı kesme işlemleri.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — bağlantı yönetimi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Basit bağlantı (APN ile)</span>
+<span class="cmd">mmcli</span> -m 0 --simple-connect="apn=internet"
+<span class="cmt"># successfully connected the modem</span>
+
+<span class="cmt"># IPv4+IPv6 bağlantısı</span>
+<span class="cmd">mmcli</span> -m 0 --simple-connect="apn=internet,ip-type=ipv4v6"
+
+<span class="cmt"># PIN ile birlikte bağlantı</span>
+<span class="cmd">mmcli</span> -m 0 --simple-connect="apn=internet,pin=1234"
+
+<span class="cmt"># Bağlantıyı kes</span>
+<span class="cmd">mmcli</span> -m 0 --simple-disconnect
+<span class="cmt"># successfully disconnected all bearers in the modem</span>
+
+<span class="cmt"># Bearer (taşıyıcı) listesi</span>
+<span class="cmd">mmcli</span> -m 0 --list-bearers
+<span class="cmt"># /org/freedesktop/ModemManager1/Bearer/0</span>
+
+<span class="cmt"># Bearer detayları</span>
+<span class="cmd">mmcli</span> -m 0 --bearer=0
+<span class="cmt"># ----------------------------------------
+# General    |        dbus path: /org/.../Bearer/0
+# ----------------------------------------
+# Status     |     connected: yes
+#             |  disconnecting: no
+#             |       interface: wwan0
+#             |      ip timeout: 20
+# ----------------------------------------
+# Properties |             apn: internet
+#             |         roaming: allowed
+#             |      ip type: ipv4
+# ----------------------------------------
+# IPv4 config|         method: dhcp
+#             |        address: 100.65.45.123
+#             |         prefix: 30
+#             |        gateway: 100.65.45.124
+#             |            dns: 8.8.8.8, 8.8.4.4</span>
+
+<span class="cmt"># Bağlantı sonrası DHCP (dhclient veya udhcpc)</span>
+<span class="cmd">udhcpc</span> -i wwan0 -n -q
+<span class="cmd">ip</span> addr show wwan0
+<span class="cmt"># 2: wwan0: ... inet 100.65.45.123/30 ...</span>
+
+<span class="cmt"># Default route ekle</span>
+<span class="cmd">ip</span> route add default via 100.65.45.124 dev wwan0</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Connection profile oluşturma ve kalıcı bağlantı</h2>
+  <p class="section-lead">NetworkManager ile kalıcı bağlantı profilleri oluşturma — sistem yeniden başladığında otomatik bağlanmak için.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — nmcli ile 4G profil oluşturma</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Mevcut bağlantıları listele</span>
+<span class="cmd">nmcli</span> connection show
+<span class="cmt"># NAME    UUID                   TYPE  DEVICE
+# Eth0    abc-123...             eth   eth0</span>
+
+<span class="cmt"># GSM (LTE) bağlantı profili oluştur</span>
+<span class="cmd">nmcli</span> connection add \
+  type gsm \
+  con-name "4G-LTE" \
+  ifname "*" \
+  gsm.apn "internet" \
+  gsm.number "*99#" \
+  gsm.pin "1234" \
+  connection.autoconnect yes
+
+<span class="cmt"># Profili düzenle (APN değiştir)</span>
+<span class="cmd">nmcli</span> connection modify "4G-LTE" gsm.apn "super"
+
+<span class="cmt"># PIN kaldır (embedded cihazda PIN olmadan)</span>
+<span class="cmd">nmcli</span> connection modify "4G-LTE" gsm.pin ""
+
+<span class="cmt"># Bağlantıyı başlat</span>
+<span class="cmd">nmcli</span> connection up "4G-LTE"
+<span class="cmt"># Connection successfully activated</span>
+
+<span class="cmt"># Bağlantıyı durdur</span>
+<span class="cmd">nmcli</span> connection down "4G-LTE"
+
+<span class="cmt"># Bağlantı durumu</span>
+<span class="cmd">nmcli</span> device status
+<span class="cmt"># DEVICE   TYPE      STATE        CONNECTION
+# wwan0    gsm       connected    4G-LTE
+# eth0     ethernet  connected    Eth0</span></code></pre>
+  </div>
+
+  <div class="file-table">
+    <div class="ft-head">
+      <span>Profil özelliği</span>
+      <span>Değer</span>
+      <span>Açıklama</span>
+    </div>
+    <div class="ft-row">
+      <span>gsm.apn</span>
+      <span>"internet"</span>
+      <span>Operatör APN adı</span>
+    </div>
+    <div class="ft-row">
+      <span>gsm.number</span>
+      <span>"*99#"</span>
+      <span>PPP dial numarası</span>
+    </div>
+    <div class="ft-row">
+      <span>gsm.pin</span>
+      <span>"1234"</span>
+      <span>SIM PIN kodu</span>
+    </div>
+    <div class="ft-row">
+      <span>gsm.username</span>
+      <span>""</span>
+      <span>PAP/CHAP kullanıcı adı</span>
+    </div>
+    <div class="ft-row">
+      <span>gsm.password</span>
+      <span>""</span>
+      <span>PAP/CHAP şifresi</span>
+    </div>
+    <div class="ft-row">
+      <span>connection.autoconnect</span>
+      <span>yes</span>
+      <span>Otomatik bağlantı</span>
+    </div>
+    <div class="ft-row">
+      <span>connection.autoconnect-priority</span>
+      <span>0</span>
+      <span>Öncelik (yüksek = önce)</span>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> NetworkManager entegrasyonu — nmcli ile modem</h2>
+  <p class="section-lead">NetworkManager ve ModemManager birlikte çalışır. NM, MM'nin D-Bus API'sini kullanarak modem bağlantılarını yönetir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — nmcli modem yönetimi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># NetworkManager'ın modem cihazını görmesi</span>
+<span class="cmd">nmcli</span> device
+<span class="cmt"># DEVICE   TYPE      STATE         CONNECTION
+# wwan0    gsm       disconnected  --</span>
+
+<span class="cmt"># Modem detayları NM üzerinden</span>
+<span class="cmd">nmcli</span> device show wwan0
+<span class="cmt"># GENERAL.DEVICE:         wwan0
+# GENERAL.TYPE:           gsm
+# GENERAL.HWADDR:         (unknown)
+# GENERAL.MTU:            1500
+# GENERAL.STATE:          30 (disconnected)
+# GENERAL.UDI:            /sys/devices/.../usb1/.../net/wwan0</span>
+
+<span class="cmt"># Bağlantı kur</span>
+<span class="cmd">nmcli</span> device connect wwan0
+
+<span class="cmt"># WiFi ve 4G birlikte — 4G'yi yedek olarak ayarla</span>
+<span class="cmd">nmcli</span> connection modify "4G-LTE" \
+  connection.autoconnect-priority -100
+
+<span class="cmt"># NetworkManager dispatcher — bağlantı olayında script</span>
+<span class="cmt"># /etc/NetworkManager/dispatcher.d/99-lte-up</span>
+<span class="cmd">cat</span> /etc/NetworkManager/dispatcher.d/99-lte-up
+<span class="cmt"># #!/bin/bash
+# IFACE=$1
+# ACTION=$2
+# if [ "$IFACE" = "wwan0" ] &amp;&amp; [ "$ACTION" = "up" ]; then
+#     logger "4G bağlantısı kuruldu: $IFACE"
+#     # DNS ayarla
+#     echo "nameserver 8.8.8.8" > /etc/resolv.conf
+# fi</span>
+<span class="cmd">chmod</span> +x /etc/NetworkManager/dispatcher.d/99-lte-up
+
+<span class="cmt"># NM yeniden başlat (config değişikliği sonrası)</span>
+<span class="cmd">systemctl</span> restart NetworkManager</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> D-Bus API ile Python GDBus programatik kontrol</h2>
+  <p class="section-lead">Python'dan ModemManager D-Bus API'sine doğrudan erişim — mmcli olmadan modem yönetimi, bağlantı izleme ve otomasyon.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>python — mm_dbus.py</span><span class="dot">●</span></div>
+    <pre><code>#!/usr/bin/env python3
+"""
+ModemManager D-Bus API ile Python kontrolü.
+Gereksinimler: pip install PyGObject pydbus
+"""
+from pydbus import SystemBus
+from gi.repository import GLib
+import time
+
+BUS_NAME = 'org.freedesktop.ModemManager1'
+OBJ_PATH = '/org/freedesktop/ModemManager1'
+
+
+def get_modems(bus):
+    """Mevcut modemleri döndür."""
+    mm = bus.get(BUS_NAME, OBJ_PATH)
+    manager = bus.get(BUS_NAME, OBJ_PATH)[
+        'org.freedesktop.DBus.ObjectManager'
+    ]
+    objects = manager.GetManagedObjects()
+    modems = []
+    for path, ifaces in objects.items():
+        if 'org.freedesktop.ModemManager1.Modem' in ifaces:
+            modems.append(path)
+    return modems
+
+
+def get_modem_info(bus, modem_path):
+    """Modem bilgilerini al."""
+    modem = bus.get(BUS_NAME, modem_path)
+    iface = modem['org.freedesktop.ModemManager1.Modem']
+    return {
+        'manufacturer': iface.Manufacturer,
+        'model':        iface.Model,
+        'revision':     iface.Revision,
+        'imei':         iface.EquipmentIdentifier,
+        'state':        iface.State,
+        'signal':       iface.SignalQuality,
+    }
+
+
+def get_sim_info(bus, modem_path):
+    """SIM bilgisini al."""
+    modem = bus.get(BUS_NAME, modem_path)
+    iface = modem['org.freedesktop.ModemManager1.Modem']
+    sim_path = iface.Sim
+    if not sim_path or sim_path == '/':
+        return None
+    sim = bus.get(BUS_NAME, sim_path)
+    sim_iface = sim['org.freedesktop.ModemManager1.Sim']
+    return {
+        'imsi':          sim_iface.Imsi,
+        'iccid':         sim_iface.SimIdentifier,
+        'operator_name': sim_iface.OperatorName,
+        'operator_id':   sim_iface.OperatorIdentifier,
+    }
+
+
+def simple_connect(bus, modem_path, apn='internet'):
+    """Basit data bağlantısı kur."""
+    modem = bus.get(BUS_NAME, modem_path)
+    simple = modem['org.freedesktop.ModemManager1.Modem.Simple']
+    props = {
+        'apn': GLib.Variant('s', apn),
+        'ip-type': GLib.Variant('u', 1),  # 1=ipv4
+    }
+    bearer_path = simple.Connect(props)
+    return bearer_path
+
+
+def get_bearer_info(bus, bearer_path):
+    """Bearer IP bilgisini al."""
+    bearer = bus.get(BUS_NAME, bearer_path)
+    b = bearer['org.freedesktop.ModemManager1.Bearer']
+    return {
+        'connected':  b.Connected,
+        'interface':  b.Interface,
+        'ipv4':       dict(b.Ip4Config),
+    }
+
+
+def monitor_signal(bus, modem_path, interval=10, count=5):
+    """Sinyal kalitesini periyodik olarak ölç."""
+    modem = bus.get(BUS_NAME, modem_path)
+    sig_iface = modem['org.freedesktop.ModemManager1.Modem.Signal']
+    # Sinyal raporlama aralığını ayarla (saniye)
+    sig_iface.Setup(interval)
+    print(f"Sinyal izleniyor ({count}x, her {interval}s)...")
+    for _ in range(count):
+        time.sleep(interval)
+        try:
+            lte = dict(sig_iface.Lte)
+            print(f"  RSSI={lte.get('rssi','?')} dBm, "
+                  f"RSRP={lte.get('rsrp','?')} dBm, "
+                  f"RSRQ={lte.get('rsrq','?')} dB, "
+                  f"SINR={lte.get('sinr','?')} dB")
+        except Exception as e:
+            print(f"  Sinyal okunamadı: {e}")
+
+
+def main():
+    bus = SystemBus()
+    modems = get_modems(bus)
+
+    if not modems:
+        print("Modem bulunamadı! ModemManager çalışıyor mu?")
+        return
+
+    modem_path = modems[0]
+    print(f"Modem yolu: {modem_path}")
+
+    info = get_modem_info(bus, modem_path)
+    print(f"Üretici : {info['manufacturer']}")
+    print(f"Model   : {info['model']}")
+    print(f"IMEI    : {info['imei']}")
+    print(f"Durum   : {info['state']}")
+    print(f"Sinyal  : {info['signal'][0]}%")
+
+    sim = get_sim_info(bus, modem_path)
+    if sim:
+        print(f"IMSI    : {sim['imsi']}")
+        print(f"Operatör: {sim['operator_name']}")
+
+    print("\nBağlantı kuruluyor...")
+    try:
+        bearer_path = simple_connect(bus, modem_path, apn='internet')
+        binfo = get_bearer_info(bus, bearer_path)
+        print(f"Arayüz  : {binfo['interface']}")
+        print(f"IPv4    : {binfo['ipv4']}")
+    except Exception as e:
+        print(f"Bağlantı hatası: {e}")
+
+
+if __name__ == '__main__':
+    main()</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Sinyal kalitesi izleme — RSSI/RSRP/RSRQ/SINR</h2>
+  <p class="section-lead">LTE sinyal metrikleri: RSSI (toplam güç), RSRP (referans sinyal gücü), RSRQ (kalite), SINR (sinyal/gürültü oranı). Her biri farklı bilgi taşır.</p>
+
+  <div class="params">
+    <div class="param-row header">
+      <div>Metrik</div><div>Açıklama</div><div>İyi değer</div><div>Kötü değer</div>
+    </div>
+    <div class="param-row">
+      <div>RSSI</div><div>Toplam alınan sinyal gücü</div><div>≥ −70 dBm</div><div>≤ −100 dBm</div>
+    </div>
+    <div class="param-row">
+      <div>RSRP</div><div>Referans sinyal alınan güç</div><div>≥ −80 dBm</div><div>≤ −110 dBm</div>
+    </div>
+    <div class="param-row">
+      <div>RSRQ</div><div>Referans sinyal kalitesi</div><div>≥ −10 dB</div><div>≤ −20 dB</div>
+    </div>
+    <div class="param-row">
+      <div>SINR</div><div>Sinyal/Gürültü+Parazit oranı</div><div>≥ 20 dB</div><div>≤ 0 dB</div>
+    </div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — sinyal izleme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># mmcli sinyal kalitesi raporu</span>
+<span class="cmd">mmcli</span> -m 0 --signal-get
+<span class="cmt"># -------------------------
+# Signal   |         lte rssi: -71 dBm
+#           |         lte rsrq: -10 dB
+#           |         lte rsrp: -93 dBm
+#           |         lte snr: 12.8 dB</span>
+
+<span class="cmt"># Sinyal izlemeyi aktifleştir (10 saniyede bir)</span>
+<span class="cmd">mmcli</span> -m 0 --signal-setup=10
+
+<span class="cmt"># Serving cell bilgisi (AT+QENG Quectel)</span>
+<span class="cmd">mmcli</span> -m 0 --command='AT+QENG="servingcell"'
+
+<span class="cmt"># AT+QCSQ — Quectel sinyal detayları</span>
+<span class="cmd">mmcli</span> -m 0 --command='AT+QCSQ'
+<span class="cmt"># +QCSQ: "LTE",-71,-93,23,-10
+# Format: rat, rssi, rsrp, sinr, rsrq</span>
+
+<span class="cmt"># SIM7600 sinyal detayları</span>
+<span class="cmd">mmcli</span> -m 0 --command='AT+CPSI?'
+<span class="cmt"># +CPSI: LTE,Online,286-01,0xB13,33623809,231,
+#   EUTRAN-BAND3,1750,3,3,-121,-1190,-930,13</span>
+
+<span class="cmt"># Sürekli izleme script'i</span>
+<span class="cmd">watch</span> -n 5 "mmcli -m 0 --signal-get 2>&amp;1"</code></pre>
+  </div>
+
+  <h3>Python sinyal logger</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>python — signal_logger.py</span><span class="dot">●</span></div>
+    <pre><code>#!/usr/bin/env python3
+"""mmcli sinyal değerlerini CSV'ye kaydet."""
+import subprocess, json, time, csv, sys
+from datetime import datetime
+
+def get_signal():
+    r = subprocess.run(
+        ['mmcli', '-m', '0', '--signal-get', '-J'],
+        capture_output=True, text=True, timeout=10
+    )
+    if r.returncode != 0:
+        return None
+    data = json.loads(r.stdout)
+    lte = data.get('modem', {}).get('signal', {}).get('lte', {})
+    return {
+        'ts':    datetime.now().isoformat(),
+        'rssi':  lte.get('rssi', ''),
+        'rsrp':  lte.get('rsrp', ''),
+        'rsrq':  lte.get('rsrq', ''),
+        'sinr':  lte.get('snr',  ''),
+    }
+
+# Sinyal izlemeyi aktifleştir
+subprocess.run(['mmcli', '-m', '0', '--signal-setup=10'])
+
+outfile = '/tmp/lte_signal.csv'
+with open(outfile, 'w', newline='') as f:
+    w = csv.DictWriter(f, fieldnames=['ts','rssi','rsrp','rsrq','sinr'])
+    w.writeheader()
+    print(f"Sinyal loglanıyor → {outfile} (Ctrl+C ile dur)")
+    try:
+        while True:
+            sig = get_signal()
+            if sig:
+                w.writerow(sig)
+                f.flush()
+                print(f"[{sig['ts']}] "
+                      f"RSSI={sig['rssi']} RSRP={sig['rsrp']} "
+                      f"RSRQ={sig['rsrq']} SINR={sig['sinr']}")
+            time.sleep(10)
+    except KeyboardInterrupt:
+        print("\nDurduruldu.")</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> SMS via ModemManager</h2>
+  <p class="section-lead">ModemManager üzerinden SMS gönderme ve alma — AT port çakışması olmadan güvenli mesajlaşma.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — mmcli ile SMS</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># SMS oluştur ve gönder</span>
+<span class="cmd">mmcli</span> -m 0 --messaging-create-sms="number='+905001234567',text='Alarm: Sicaklik yuksek!'"
+<span class="cmt"># Successfully created new SMS:
+# /org/freedesktop/ModemManager1/SMS/0</span>
+
+<span class="cmt"># SMS'i gönder</span>
+<span class="cmd">mmcli</span> -m 0 --sms=0 --send
+<span class="cmt"># Successfully sent the SMS</span>
+
+<span class="cmt"># Gelen SMS'leri listele</span>
+<span class="cmd">mmcli</span> -m 0 --messaging-list-sms
+<span class="cmt"># /org/freedesktop/ModemManager1/SMS/1 (received)</span>
+
+<span class="cmt"># SMS içeriğini oku</span>
+<span class="cmd">mmcli</span> -m 0 --sms=1
+<span class="cmt"># ---------------------------
+# Content  |    number: +905009876543
+#           |      text: Test mesaji
+# ---------------------------
+# Properties |   pdu type: deliver
+#             |      state: received
+#             |  timestamp: 2026-01-15T10:30:00+03</span>
+
+<span class="cmt"># SMS sil</span>
+<span class="cmd">mmcli</span> -m 0 --messaging-delete-sms=1
+
+<span class="cmt"># Yeni SMS bildirimi — D-Bus sinyal izle</span>
+<span class="cmd">dbus-monitor</span> --system \
+  "type='signal',interface='org.freedesktop.ModemManager1.Modem.Messaging'"</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Practical — systemd ile boot'ta otomatik 4G bağlantısı</h2>
+  <p class="section-lead">Sistem açıldığında ModemManager'ın modemleri tespit etmesini ve NetworkManager'ın otomatik bağlanmasını sağlayan tam systemd kurulumu.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — 4G autoconnect sistemi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1. NetworkManager için 4G profil oluştur</span>
+<span class="cmd">nmcli</span> connection add \
+  type gsm \
+  con-name "4G-IoT" \
+  ifname "*" \
+  gsm.apn "internet" \
+  gsm.pin "" \
+  connection.autoconnect yes \
+  connection.autoconnect-priority 100 \
+  ipv4.method auto \
+  ipv6.method ignore
+
+<span class="cmt"># 2. Modem udev kuralı — cihaz gelince MM'yi tetikle</span>
+<span class="cmd">cat</span> /etc/udev/rules.d/99-quectel.rules
+<span class="cmt"># SUBSYSTEM=="usb", ATTRS{idVendor}=="2c7c", ATTRS{idProduct}=="0125",
+#   ACTION=="add", RUN+="/bin/systemctl restart ModemManager"</span>
+
+<span class="cmt"># 3. ModemManager servis dropin — bağlantı sonrası routing</span>
+<span class="cmd">mkdir</span> -p /etc/systemd/system/ModemManager.service.d
+<span class="cmd">cat</span> > /etc/systemd/system/ModemManager.service.d/override.conf &lt;&lt;'EOF'
+[Service]
+Environment=MM_LOGGING_LEVEL=INFO
+ExecStartPost=/bin/sleep 3
+EOF</span></code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — /usr/local/bin/4g-connect.sh</span><span class="dot">●</span></div>
+    <pre><code>#!/bin/bash
+# 4G bağlantısını güvenli şekilde kur ve doğrula
+set -e
+LOG="logger -t 4g-connect"
+
+$LOG "4G bağlantı scripti başlıyor..."
+
+# ModemManager başlayana kadar bekle
+for i in $(seq 1 30); do
+    if mmcli -L 2>/dev/null | grep -q Modem; then
+        $LOG "Modem tespit edildi"
+        break
+    fi
+    sleep 2
+done
+
+MODEM_IDX=$(mmcli -L 2>/dev/null | grep -oP '/Modem/\K\d+' | head -1)
+if [ -z "$MODEM_IDX" ]; then
+    $LOG "HATA: Modem bulunamadı"
+    exit 1
+fi
+
+# LTE kaydı bekle (maksimum 120s)
+for i in $(seq 1 60); do
+    STATE=$(mmcli -m "$MODEM_IDX" -J 2>/dev/null | \
+            python3 -c "import sys,json; \
+            d=json.load(sys.stdin); \
+            print(d['modem']['generic']['state'])" 2>/dev/null)
+    if [ "$STATE" = "registered" ] || [ "$STATE" = "connected" ]; then
+        $LOG "LTE kayıt OK (durum: $STATE)"
+        break
+    fi
+    $LOG "Bekleniyor: $STATE ($i/60)"
+    sleep 2
+done
+
+# Bağlı değilse bağlan
+if [ "$STATE" != "connected" ]; then
+    $LOG "Bağlantı kuruluyor..."
+    mmcli -m "$MODEM_IDX" --simple-connect="apn=internet"
+    sleep 5
+fi
+
+# DHCP
+IFACE=$(mmcli -m "$MODEM_IDX" --bearer=0 -J 2>/dev/null | \
+        python3 -c "import sys,json; \
+        d=json.load(sys.stdin); \
+        print(d['bearer']['status']['interface'])" 2>/dev/null)
+
+if [ -n "$IFACE" ]; then
+    $LOG "DHCP: $IFACE"
+    udhcpc -i "$IFACE" -n -q -t 10
+    IP=$(ip -4 addr show "$IFACE" | grep -oP '(?<=inet )\S+')
+    $LOG "IP: $IP"
+fi
+
+$LOG "4G bağlantısı hazır"</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>systemd — /etc/systemd/system/4g-connect.service</span><span class="dot">●</span></div>
+    <pre><code>[Unit]
+Description=4G LTE Otomatik Bağlantı
+After=ModemManager.service network.target
+Wants=ModemManager.service
+# Bağlantı kesintisinde yeniden dene
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/4g-connect.sh
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — servis etkinleştirme ve izleme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Script'i çalıştırılabilir yap</span>
+<span class="cmd">chmod</span> +x /usr/local/bin/4g-connect.sh
+
+<span class="cmt"># Servisi etkinleştir</span>
+<span class="cmd">systemctl</span> enable --now 4g-connect.service
+
+<span class="cmt"># Log izle</span>
+<span class="cmd">journalctl</span> -fu 4g-connect.service
+
+<span class="cmt"># Bağlantı durumunu kontrol et</span>
+<span class="cmd">mmcli</span> -m 0 -J | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+m = d['modem']
+print('Durum :', m['generic']['state'])
+print('Sinyal:', m['generic']['signal-quality']['value'], '%')
+"
+
+<span class="cmt"># İnternet testi</span>
+<span class="cmd">ping</span> -c 3 -I wwan0 8.8.8.8</code></pre>
+  </div>
+
+  <div class="callout info">
+    <div class="label">EMBEDDED İPUCU</div>
+    <p>NetworkManager olmayan minimal Yocto/Buildroot sistemlerde yukarıdaki script tek başına yeterlidir. ModemManager + mmcli + udhcpc kombinasyonu, NetworkManager'ın %80 işlevselliğini sadece birkaç MB ile sağlar.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

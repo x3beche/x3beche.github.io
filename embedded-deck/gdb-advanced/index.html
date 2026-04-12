@@ -1,0 +1,878 @@
+---
+layout: tutorial
+title: "GDB İleri Düzey — Python API & TUI"
+back_url: "../index.html"
+back_label: "embedded-deck"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>ARAÇLAR</span>
+    <span>DEBUG / GDB</span>
+    <span>2026</span>
+  </div>
+  <h1>GDB İleri Düzey<br><em>Python API &amp; TUI.</em></h1>
+  <p class="subtitle">GDB Python API ile özel komutlar ve pretty-printer'lar yazmaktan, TUI arayüzünden, reverse debugging ve çok süreçli senaryolara — profesyonel gömülü Linux debug rehberi.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">GDB Python API temelleri</a></li>
+    <li><a href="#s1">Pretty-printer yazma</a></li>
+    <li><a href="#s2">Custom GDB komutu</a></li>
+    <li><a href="#s3">TUI — Text User Interface</a></li>
+    <li><a href="#s4">Conditional breakpoint ve watchpoint</a></li>
+    <li><a href="#s5">Reverse debugging</a></li>
+    <li><a href="#s6">Multi-process/thread debugging</a></li>
+    <li><a href="#s7">gdb-dashboard ve pwndbg</a></li>
+    <li><a href="#s8">Pratik: Core dump analizi ve uzak debugging</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> GDB Python API temelleri</h2>
+  <p class="section-lead">GDB, Python 3 API'si aracılığıyla tam programlanabilir bir debug ortamı sunar. Özel komutlar, otomatik analiz, olay tabanlı eylemler ve pretty-printer'lar bu API ile uygulanır.</p>
+
+  <h3>gdb module'ü</h3>
+
+  <pre><code class="language-python"># GDB Python etkileşimli oturumu
+# GDB içinden: python import gdb
+
+import gdb
+
+# GDB komutunu çalıştır ve çıktıyı al
+output = gdb.execute("info registers", to_string=True)
+print(output)
+
+# İfade değerlendir
+val = gdb.parse_and_eval("sizeof(struct task_struct)")
+print(f"task_struct boyutu: {int(val)} bayt")
+
+# Değişken değeri oku
+sp_val = gdb.parse_and_eval("$sp")
+print(f"Stack pointer: 0x{int(sp_val):016x}")
+
+# Sembol adresini bul
+sym, is_field = gdb.lookup_symbol("main")
+if sym:
+    print(f"main adresi: {sym.value().address}")
+
+# Tüm frame'leri dolaş
+frame = gdb.newest_frame()
+while frame:
+    print(f"  #{frame.level()} {frame.name()} @ {frame.pc():#x}")
+    frame = frame.older()</code></pre>
+
+  <h3>Olay kancaları (event hooks)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>events.py</span><span class="dot">●</span></div>
+    <pre><code class="language-python">import gdb
+
+def on_stop(event):
+    """Hedef her durduğunda çağrılır"""
+    if isinstance(event, gdb.SignalEvent):
+        print(f"[!] Sinyal: {event.stop_signal}")
+    elif isinstance(event, gdb.BreakpointEvent):
+        bps = event.breakpoints
+        print(f"[*] Breakpoint: {[bp.location for bp in bps]}")
+
+    # O anki frame'i yazdır
+    frame = gdb.selected_frame()
+    print(f"    PC=0x{frame.pc():x}  {frame.name()}()")
+
+def on_cont(event):
+    """Hedef çalışmaya devam ettiğinde"""
+    print("[>] Devam ediyor...")
+
+def on_exited(event):
+    """Süreç sonlandığında"""
+    if hasattr(event, 'exit_code'):
+        print(f"[X] Çıkış kodu: {event.exit_code}")
+
+# Kancaları bağla
+gdb.events.stop.connect(on_stop)
+gdb.events.cont.connect(on_cont)
+gdb.events.exited.connect(on_exited)
+
+print("Olay kancaları kuruldu")</code></pre>
+  </div>
+
+  <h3>.gdbinit otomatik yükleme</h3>
+
+  <pre><code class="language-python"># ~/.gdbinit veya proje yerel .gdbinit
+# python script dosyasını yükle:
+# (gdb) source /path/to/my_helpers.py
+
+# .gdbinit'e otomatik yükleme:
+python
+import sys, os
+sys.path.insert(0, os.path.expanduser('~/.gdb'))
+import my_helpers
+end</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Pretty-printer yazma</h2>
+  <p class="section-lead">Pretty-printer'lar, GDB'nin ham bellek görünümü yerine veri yapılarını okunabilir biçimde göstermesini sağlar. C++ STL, Qt ve özel struct'lar için vazgeçilmezdir.</p>
+
+  <h3>Basit pretty-printer</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>sensor_printers.py</span><span class="dot">●</span></div>
+    <pre><code class="language-python">import gdb
+import gdb.printing
+
+class SensorDataPrinter:
+    """struct SensorData için pretty-printer"""
+
+    def __init__(self, val):
+        self.val = val
+
+    def to_string(self):
+        """Tek satır özet gösterim"""
+        channel = int(self.val['channel'])
+        raw     = int(self.val['raw_value'])
+        unit    = self.val['unit'].string()
+
+        # Ham değeri fiziksel değere çevir
+        physical = raw * 0.001
+
+        return (f"SensorData &#123;&#123; channel={channel}, "
+                f"value={physical:.3f} {unit}, "
+                f"raw=0x{raw:04x} }}")
+
+    def children(self):
+        """Alt alanları döndür (expand edildiğinde görünür)"""
+        yield ('channel',    self.val['channel'])
+        yield ('raw_value',  self.val['raw_value'])
+        yield ('unit',       self.val['unit'])
+        yield ('timestamp',  self.val['timestamp_ms'])
+        yield ('valid',      self.val['is_valid'])
+
+
+class SensorBufferPrinter:
+    """struct SensorBuffer (dairesel tampon) printer"""
+
+    def __init__(self, val):
+        self.val = val
+
+    def to_string(self):
+        head  = int(self.val['head'])
+        tail  = int(self.val['tail'])
+        size  = int(self.val['size'])
+        count = (head - tail) % size
+        return f"SensorBuffer [{count}/{size} öğe]"
+
+    def children(self):
+        head = int(self.val['head'])
+        tail = int(self.val['tail'])
+        size = int(self.val['size'])
+        buf  = self.val['data']
+
+        idx = tail
+        i   = 0
+        while idx != head:
+            yield (f'[{i}]', buf[idx])
+            idx = (idx + 1) % size
+            i  += 1
+
+    def display_hint(self):
+        return 'array'  # GDB bu bilgiyle array gibi gösterir
+
+
+def build_sensor_printers():
+    """Printer kaydedici"""
+    pp = gdb.printing.RegexpCollectionPrettyPrinter("sensor")
+    pp.add_printer('SensorData',   '^SensorData$',   SensorDataPrinter)
+    pp.add_printer('SensorBuffer', '^SensorBuffer$', SensorBufferPrinter)
+    return pp
+
+# Globale kaydet — tüm inferiorlarda aktif
+gdb.printing.register_pretty_printer(
+    None,                      # None = tüm objfiler
+    build_sensor_printers(),
+    replace=True
+)</code></pre>
+  </div>
+
+  <h3>Kullanım</h3>
+
+  <pre><code class="language-text">(gdb) source sensor_printers.py
+(gdb) p sensor
+$1 = SensorData { channel=2, value=23.450 °C, raw=0x5C3A }
+
+(gdb) p sensor_buf
+$2 = SensorBuffer [5/16 öğe]
+
+# Alt alanları göster
+(gdb) p sensor.channel
+$3 = 2
+
+# STL printer örneği (libstdc++ ile hazır gelir)
+(gdb) p my_vector
+$4 = std::vector of length 3, capacity 4 = {1, 2, 3}</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Custom GDB komutu</h2>
+  <p class="section-lead">GDB Python API'si ile özel komutlar tanımlanabilir. Bu komutlar, <code>gdb.Command</code> sınıfından türetilir ve <code>invoke()</code> metodu ile çalışır.</p>
+
+  <h3>Basit komut</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>sensor_cmd.py</span><span class="dot">●</span></div>
+    <pre><code class="language-python">import gdb
+import argparse
+
+class SensorDumpCommand(gdb.Command):
+    """
+    sensor-dump [kanal] — Sensör değerlerini güzel biçimde yazdır.
+
+    Kullanım:
+      sensor-dump         # tüm kanallar
+      sensor-dump 2       # sadece kanal 2
+      sensor-dump --raw   # ham değerler
+    """
+
+    def __init__(self):
+        super().__init__("sensor-dump",
+                         gdb.COMMAND_USER,
+                         gdb.COMPLETE_NONE)
+
+    def invoke(self, args_str, from_tty):
+        # argparse ile argümanları ayrıştır
+        parser = argparse.ArgumentParser(prog='sensor-dump',
+                                          add_help=False)
+        parser.add_argument('channel', nargs='?', type=int,
+                            default=None)
+        parser.add_argument('--raw', action='store_true')
+        try:
+            args = parser.parse_args(args_str.split() if args_str else [])
+        except SystemExit:
+            return
+
+        # Global sensör dizisini oku
+        try:
+            sensors = gdb.parse_and_eval("g_sensors")
+            count   = int(gdb.parse_and_eval("g_sensor_count"))
+        except gdb.error as e:
+            gdb.write(f"Hata: {e}\n")
+            return
+
+        gdb.write(f"{'Ch':>3} {'Raw':>8} {'Value':>10} {'Unit'}\n")
+        gdb.write("-" * 35 + "\n")
+
+        for i in range(count):
+            s = sensors[i]
+            ch  = int(s['channel'])
+            raw = int(s['raw_value'])
+            unit = s['unit'].string()
+
+            if args.channel is not None and ch != args.channel:
+                continue
+
+            if args.raw:
+                gdb.write(f"{ch:>3} {raw:#010x}\n")
+            else:
+                phys = raw * 0.001
+                gdb.write(f"{ch:>3} {raw:#010x} {phys:>10.3f} {unit}\n")
+
+    def complete(self, text, word):
+        # Tab tamamlama: kanal numaraları
+        try:
+            count = int(gdb.parse_and_eval("g_sensor_count"))
+            return [str(i) for i in range(count) if str(i).startswith(word)]
+        except Exception:
+            return []
+
+
+# Komutu kaydet
+SensorDumpCommand()</code></pre>
+  </div>
+
+  <h3>Komut kategorileri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Kategori sabiti</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>COMMAND_USER</code></td><td>Kullanıcı tanımlı genel komutlar</td></tr>
+        <tr><td><code>COMMAND_DATA</code></td><td>Veri inceleme komutları (p, x gibi)</td></tr>
+        <tr><td><code>COMMAND_BREAKPOINTS</code></td><td>Breakpoint/watchpoint komutları</td></tr>
+        <tr><td><code>COMMAND_RUNNING</code></td><td>Çalıştırma komutları (run, step, next)</td></tr>
+        <tr><td><code>COMMAND_FILES</code></td><td>Dosya/sembol yükleme komutları</td></tr>
+        <tr><td><code>COMMAND_OBSCURE</code></td><td>Nadiren kullanılan komutlar</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre><code class="language-text">(gdb) source sensor_cmd.py
+(gdb) sensor-dump
+ Ch      Raw      Value Unit
+-----------------------------------
+  0 0x00001f40     8.000 °C
+  1 0x00005c3a    23.450 °C
+  2 0x00009c40    40.000 %
+
+(gdb) sensor-dump 1 --raw
+  1 0x00005c3a</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> TUI — Text User Interface</h2>
+  <p class="section-lead">GDB TUI modu, terminal içinde çok bölmeli bir arayüz sunar: kaynak kodu, assembly, register ve komut panelleri. IDE olmayan ortamlarda (SSH, gdbserver) güçlü bir alternatiftir.</p>
+
+  <h3>TUI'yi başlatma</h3>
+
+  <pre><code class="language-bash"># TUI modunda başlat
+gdb -tui ./myprogram
+
+# Çalışırken TUI aç/kapat
+# Ctrl+X, Ctrl+A
+
+# Belirli layout ile başlat
+gdb -tui -ex "layout split" ./myprogram</code></pre>
+
+  <h3>Layout seçenekleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Komut</th><th>Görünüm</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>layout src</code></td><td>Kaynak kodu + komut paneli</td></tr>
+        <tr><td><code>layout asm</code></td><td>Assembly + komut paneli</td></tr>
+        <tr><td><code>layout regs</code></td><td>Register + kaynak/assembly paneli</td></tr>
+        <tr><td><code>layout split</code></td><td>Kaynak + assembly + komut (üç panel)</td></tr>
+        <tr><td><code>tui new-layout custom src 1 regs 1 cmd 1</code></td><td>Özel layout tanımla</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>TUI kısayolları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Ctrl+X, Ctrl+A</span><span class="desc">TUI modunu aç/kapat</span></div>
+    <div class="param"><span class="name">Ctrl+X, 1</span><span class="desc">Tek panel (kaynak veya asm)</span></div>
+    <div class="param"><span class="name">Ctrl+X, 2</span><span class="desc">İki panel</span></div>
+    <div class="param"><span class="name">Ctrl+X, o</span><span class="desc">Aktif pencereyi değiştir (focus döndür)</span></div>
+    <div class="param"><span class="name">focus cmd / src / asm</span><span class="desc">Belirli panele odaklan</span></div>
+    <div class="param"><span class="name">Ctrl+L</span><span class="desc">Ekranı yenile (karışırsa)</span></div>
+    <div class="param"><span class="name">PgUp / PgDn</span><span class="desc">Aktif paneli kaydır</span></div>
+    <div class="param"><span class="name">Ctrl+P / Ctrl+N</span><span class="desc">Komut geçmişi (cmd panelde ok tuşu yerine)</span></div>
+  </div>
+
+  <h3>TUI özelleştirme</h3>
+
+  <pre><code class="language-python"># ~/.gdbinit — TUI başlangıç ayarları
+set tui border-kind acs          # ASCII karakter çerçevesi
+set tui active-border-mode bold  # Aktif panel kalın çerçeve
+tui enable                       # Her zaman TUI aç
+layout split                     # Split layout varsayılan
+focus cmd                        # Komut paneline odaklan
+
+# Renk ayarları (GDB 9.1+)
+set style enabled on
+set style address foreground cyan
+set style function foreground yellow bold</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Conditional breakpoint ve watchpoint</h2>
+  <p class="section-lead">GDB'nin koşullu breakpoint ve watchpoint'leri, spesifik durumları yakalamak için güçlü araçlardır. Binlerce çağrıdan sadece belirli koşulda durmak development süresini dramatik kısaltır.</p>
+
+  <h3>Koşullu breakpoint</h3>
+
+  <pre><code class="language-text"># Temel koşullu breakpoint
+(gdb) break process_data if len > 1000
+(gdb) break sensor.c:147 if channel == 2 && value > 100.0
+
+# Mevcut breakpoint'e koşul ekle
+(gdb) break sensor_read
+Breakpoint 3 at 0x401234: file sensor.c, line 89.
+(gdb) condition 3 sensor_id == 0x42
+
+# Koşulu kaldır
+(gdb) condition 3
+
+# Breakpoint sayacı — N kez geçtikten sonra dur
+(gdb) ignore 3 99    # breakpoint 3'ü 99 kez atla, 100'de dur
+
+# Python ile dinamik koşul
+(gdb) break malloc
+(gdb) commands 1
+  silent
+  python
+  size = int(gdb.parse_and_eval("$rdi"))
+  if size > 4096:
+      gdb.execute("frame")
+      print(f"Büyük malloc: {size} bayt")
+      gdb.execute("continue")
+  end
+end</code></pre>
+
+  <h3>Watchpoint tipleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Komut</th><th>Tetiklenme</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>watch expr</code></td><td>Yazma — değer değiştiğinde dur</td></tr>
+        <tr><td><code>rwatch expr</code></td><td>Okuma — değer okunduğunda dur</td></tr>
+        <tr><td><code>awatch expr</code></td><td>Her erişim — okuma veya yazma</td></tr>
+        <tr><td><code>watch -l expr</code></td><td>Location watch — dereference edilmiş adres izler</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre><code class="language-text"># Global değişkeni izle
+(gdb) watch g_error_flag
+Hardware watchpoint 2: g_error_flag
+
+# Pointer ile erişilen belleği izle
+(gdb) watch *((int *)0xffff8000dead0000)
+
+# Struct alanı değişince dur
+(gdb) watch sensor.raw_value
+
+# commands block — watchpoint tetiklenince
+(gdb) watch g_state
+(gdb) commands 2
+  silent
+  printf "Durum değişti: %d -> %d\n", g_state_old, g_state
+  set g_state_old = g_state
+  backtrace 5
+  continue
+end
+
+# Koşullu watchpoint
+(gdb) watch g_buffer_idx if g_buffer_idx > BUFFER_MAX</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Reverse debugging</h2>
+  <p class="section-lead">GDB'nin reverse debugging özelliği, programın çalışmasını kayıt altına alarak geriye doğru single-step ve continue yapılmasını sağlar. Hata oluşmadan önceki ana gitmek için idealdir.</p>
+
+  <h3>record full modu</h3>
+
+  <pre><code class="language-text"># Kayıt başlat
+(gdb) run
+(gdb) record full       # Bu noktadan itibaren tüm yürütmeyi kaydet
+
+# Forward (ileri)
+(gdb) next              # normal ileri adım
+(gdb) continue          # çalıştır
+
+# Reverse
+(gdb) reverse-next      # bir önceki kaynak satırına dön
+(gdb) reverse-step      # bir önceki komuta dön (into)
+(gdb) reverse-continue  # geriye doğru bir önceki breakpoint'e koş
+(gdb) reverse-finish    # mevcut fonksiyona giriş noktasına dön
+
+# Kayıt geçmişini gör
+(gdb) show record full size
+(gdb) info record
+
+# Kayıt sınırları
+(gdb) set record full insn-number-max 500000
+(gdb) set record full memory-query off  # hafıza sınırında sor</code></pre>
+
+  <h3>record btrace — donanım destekli</h3>
+
+  <pre><code class="language-text"># Intel PT (Processor Trace) ile hardware-assisted recording
+# Daha hızlı ama sadece ileri kayıt, çok daha geniş tarih
+
+(gdb) record btrace pt     # Intel PT
+# veya
+(gdb) record btrace bts    # Branch Trace Store (eski CPU)
+
+# Çalışma geçmişini göster
+(gdb) record function-call-history /ilc
+# i = instruction number
+# l = source lines
+# c = cycle count
+
+# Instruction geçmişi
+(gdb) record instruction-history 100,120
+# 100 - 120 arası komutları göster
+
+# btrace ile reverse stepping (sınırlı)
+(gdb) reverse-step
+(gdb) reverse-next</code></pre>
+
+  <h3>Pratik senaryo: Use-After-Free tespiti</h3>
+
+  <pre><code class="language-text"># free() sonrası kullanımı tespit et
+(gdb) break free
+(gdb) commands 1
+  silent
+  set $freed_ptr = (void *)$rdi
+  continue
+end
+
+# Program crash'e gittiğinde:
+(gdb) record full
+(gdb) run
+
+# Crash noktasında:
+(gdb) reverse-continue   # crash öncesine git
+(gdb) watch *$freed_ptr  # bu adresi izle
+(gdb) reverse-continue   # bu adrese son yazan yere git</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Multi-process/thread debugging</h2>
+  <p class="section-lead">GDB, birden fazla süreç ve thread'i eşzamanlı olarak debug edebilir. Embedded Linux'ta çok süreçli sistemler, fork'lanan daemon'lar ve çok thread'li uygulamalar için vazgeçilmezdir.</p>
+
+  <h3>Thread yönetimi</h3>
+
+  <pre><code class="language-text"># Tüm thread'leri listele
+(gdb) info threads
+  Id   Target Id              Frame
+* 1    Thread 0x7f... (main)  sensor_read () at sensor.c:45
+  2    Thread 0x7e... (recv)  poll () from libc.so.6
+  3    Thread 0x7d... (proc)  pthread_cond_wait () from libpthread
+
+# Thread'e geç
+(gdb) thread 2
+
+# Tüm thread'lerde komut çalıştır
+(gdb) thread apply all backtrace
+(gdb) thread apply all bt full
+(gdb) thread apply 1 2 3 print g_error_flag
+
+# Thread adı göster
+(gdb) info threads
+# Thread 2 "sensor-recv" ...
+
+# Adı al (prctl/pthread_setname_np ile set edilmişse)
+(gdb) thread 2
+(gdb) call (char*)pthread_getname_np(pthread_self(), buf, 16)</code></pre>
+
+  <h3>Scheduler locking</h3>
+
+  <pre><code class="language-text"># Sadece mevcut thread'i çalıştır (diğerleri dondurulur)
+(gdb) set scheduler-locking on
+
+# Tüm thread'ler çalışır (varsayılan)
+(gdb) set scheduler-locking off
+
+# Sadece step modunda kilitle (continue'da serbest)
+(gdb) set scheduler-locking step
+
+# Mevcut ayarı göster
+(gdb) show scheduler-locking</code></pre>
+
+  <h3>Multi-inferior (çok süreç) debug</h3>
+
+  <pre><code class="language-text"># Fork takip modu
+(gdb) set follow-fork-mode child    # fork sonrası çocuğu takip et
+(gdb) set follow-fork-mode parent   # ebeveynde kal (varsayılan)
+
+# Her iki süreci de debug et
+(gdb) set detach-on-fork off        # fork sonrası her ikisi de durur
+
+(gdb) info inferiors
+  Num  Description       Executable
+* 1    process 12345     ./sensor-daemon
+  2    process 12346     ./sensor-daemon  (child)
+
+# Inferior'lar arasında geç
+(gdb) inferior 2
+
+# İnferior'a program ekle (running process)
+(gdb) attach 9876
+
+# Tüm inferior'lara komut uygula
+(gdb) inferior apply all print g_running
+
+# Bağlantıyı kes
+(gdb) detach inferiors 2</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> gdb-dashboard ve pwndbg</h2>
+  <p class="section-lead">gdb-dashboard ve pwndbg, GDB'yi daha okunabilir ve bilgi yoğun bir arayüze dönüştüren Python tabanlı eklentilerdir. Her ikisi de terminal içinde çalışır; kurulum basit, etki büyüktür.</p>
+
+  <h3>gdb-dashboard kurulumu</h3>
+
+  <pre><code class="language-bash"># gdb-dashboard kurulumu
+wget -P ~ https://github.com/cyrus-and/gdb-dashboard/raw/master/.gdbinit
+# veya
+curl -o ~/.gdbinit \
+    https://raw.githubusercontent.com/cyrus-and/gdb-dashboard/master/.gdbinit
+
+# Python pwndbg gereksinimleri
+pip3 install pygments
+
+# GDB başlat — dashboard otomatik yüklenir
+gdb ./myprogram</code></pre>
+
+  <h3>gdb-dashboard modülleri</h3>
+
+  <pre><code class="language-text"># Tüm dashboard modüllerini göster
+(gdb) dashboard
+
+# Belirli modülleri aç/kapat
+(gdb) dashboard source   on
+(gdb) dashboard assembly on
+(gdb) dashboard registers on
+(gdb) dashboard memory   on
+(gdb) dashboard stack    on
+(gdb) dashboard threads  off   # gerekmeyeni kapat
+
+# Tek seferlik güncelleme
+(gdb) dashboard -output /tmp/debug.txt   # dosyaya yönlendir
+
+# Renk teması
+(gdb) dashboard -style prompt '(gdb) '
+(gdb) dashboard -style style 'dark'</code></pre>
+
+  <h3>pwndbg kurulumu (güvenlik/heap analizi)</h3>
+
+  <pre><code class="language-bash">git clone https://github.com/pwndbg/pwndbg
+cd pwndbg
+./setup.sh   # ~/.gdbinit güncellenir</code></pre>
+
+  <h3>pwndbg heap analizi</h3>
+
+  <pre><code class="language-text"># pwndbg komutları
+(gdb) heap                  # heap durumunu göster
+(gdb) bins                  # serbest chunk'ları (tcache, fastbin vb.)
+(gdb) chunks                # tüm malloc chunk'ları listele
+(gdb) vmmap                 # process bellek haritası
+(gdb) canary                # stack canary değerini göster
+(gdb) checksec              # ikili güvenlik bayrakları
+
+# Gömülü sistemde bellek görüntüsü
+(gdb) vmmap
+# Permissions  Address Range              Size   Offset  File
+# r-xp   0x00400000-0x00401000   4096  0       /app
+# r--p   0x00401000-0x00402000   4096  4096    /app
+# rw-p   0x00402000-0x00403000   4096  8192    /app
+# rw-p   0x7ffd0000-0x7fff1000   135k  0       [stack]
+
+# Custom context formatter
+(gdb) set context-output auto
+(gdb) context</code></pre>
+
+  <h3>gdb-dashboard özel modül</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>~/.gdb/dashboard_sensor.py</span><span class="dot">●</span></div>
+    <pre><code class="language-python">class SensorModule(Dashboard.Module):
+    """gdb-dashboard özel modülü — sensör kanallarını gösterir"""
+
+    def label(self):
+        return 'Sensors'
+
+    def lines(self, term_width, term_height, style_changed):
+        try:
+            sensors = gdb.parse_and_eval("g_sensors")
+            count   = int(gdb.parse_and_eval("g_sensor_count"))
+        except gdb.error:
+            return [ansi('Sensör verisi yok', R.style_low)]
+
+        result = []
+        for i in range(min(count, 8)):  # max 8 göster
+            s     = sensors[i]
+            raw   = int(s['raw_value'])
+            ch    = int(s['channel'])
+            phys  = raw * 0.001
+            valid = bool(s['is_valid'])
+
+            color = R.style_high if valid else R.style_low
+            line  = f" Ch{ch:02d}: {phys:8.3f} {'✓' if valid else '✗'}"
+            result.append(ansi(line, color))
+
+        return result</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: Core dump analizi ve uzak debugging</h2>
+  <p class="section-lead">Gömülü Linux sistemlerde crash sonrası üretilen core dump dosyaları ve gdbserver ile gerçek donanım üzerinde uzak debugging, production sorunlarını çözmenin temel yöntemidir.</p>
+
+  <h3>Core dump etkinleştirme</h3>
+
+  <pre><code class="language-bash"># Embedded Linux'ta core dump aktifleştir
+ulimit -c unlimited
+
+# Core dosyası adlandırma
+echo '/tmp/core.%e.%p.%t' > /proc/sys/kernel/core_pattern
+# %e = program adı, %p = PID, %t = zaman
+
+# systemd ile core dump (coredumpctl)
+# /etc/systemd/coredump.conf:
+# Storage=external
+# ProcessSizeMax=2G
+# ExternalSizeMax=2G
+
+# Program çalıştır ve crash oluşsun
+./sensor-daemon &amp;
+kill -SIGSEGV $!   # test için
+
+ls /tmp/core.*</code></pre>
+
+  <h3>Core dump analizi</h3>
+
+  <pre><code class="language-bash"># Host sistemde analiz (hedef ile aynı kütüphaneler gerekli)
+# Cross-compile toolchain GDB'si ile
+
+aarch64-linux-gnu-gdb \
+    /path/to/sensor-daemon \
+    /tmp/core.sensor-daemon.1234.1704067200
+
+# GDB içinde:
+(gdb) bt          # backtrace — crash noktası
+(gdb) info registers
+(gdb) x/20x $sp   # stack içeriği
+
+# Tüm thread'lerin backtrace
+(gdb) thread apply all bt full
+
+# Yerel değişkenler
+(gdb) frame 3     # ilgilenilen frame'e git
+(gdb) info locals
+(gdb) info args</code></pre>
+
+  <h3>Python ile core dump analizi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>analyze_core.py</span><span class="dot">●</span></div>
+    <pre><code class="language-python">"""
+GDB Python ile otomatik core dump analiz betiği.
+Kullanım: gdb -batch -x analyze_core.py --args ./sensor-daemon core.*
+"""
+import gdb
+
+def analyze_core():
+    gdb.execute("set pagination off")
+    gdb.execute("set print pretty on")
+
+    # Temel bilgiler
+    print("=" * 60)
+    print("CORE DUMP ANALİZİ")
+    print("=" * 60)
+
+    # Crash noktası
+    frame = gdb.selected_frame()
+    print(f"\n[CRASH NOKTASI]")
+    print(f"  Fonksiyon : {frame.name()}")
+    print(f"  PC        : 0x{frame.pc():x}")
+    sal = frame.find_sal()
+    if sal.symtab:
+        print(f"  Dosya     : {sal.symtab.filename}:{sal.line}")
+
+    # Backtrace
+    print("\n[BACKTRACE]")
+    gdb.execute("bt 15")
+
+    # Tüm thread backtrace
+    print("\n[TÜM THREAD'LER]")
+    gdb.execute("thread apply all bt 5")
+
+    # Sensör durum değişkeni
+    try:
+        state = gdb.parse_and_eval("g_sensor_state")
+        print(f"\n[SENSÖR DURUMU] g_sensor_state = {state}")
+    except gdb.error:
+        print("\n[UYARI] g_sensor_state bulunamadı")
+
+    # Son hata kodu
+    try:
+        err = gdb.parse_and_eval("errno")
+        print(f"[errno] {int(err)} ({gdb.execute('call strerror(errno)', to_string=True).strip()})")
+    except Exception:
+        pass
+
+    print("\n" + "=" * 60)
+
+analyze_core()
+gdb.execute("quit")</code></pre>
+  </div>
+
+  <h3>gdbserver ile uzak debugging</h3>
+
+  <pre><code class="language-bash"># Hedef (gömülü Linux cihaz) üzerinde:
+gdbserver :3333 ./sensor-daemon
+# veya çalışan sürece bağlan:
+gdbserver :3333 --attach $(pgrep sensor-daemon)
+
+# Geliştirici makinesinde:
+aarch64-linux-gnu-gdb ./sensor-daemon
+
+(gdb) set sysroot /opt/sysroots/aarch64-linux-gnu
+(gdb) set solib-search-path /opt/sysroots/aarch64-linux-gnu/usr/lib
+(gdb) target remote 192.168.1.100:3333
+
+# Breakpoint koy ve çalıştır
+(gdb) break sensor_read
+(gdb) continue
+
+# Pretty-printer'ları yükle
+(gdb) source ~/.gdb/sensor_printers.py
+(gdb) source ~/.gdb/sensor_cmd.py
+
+# Sensör durumunu analiz et
+(gdb) sensor-dump
+(gdb) watch g_error_flag</code></pre>
+
+  <h3>Otomatik uzak debug betiği</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>remote_debug.sh</span><span class="dot">●</span></div>
+    <pre><code class="language-bash">#!/bin/bash
+# Hedef cihaza gdbserver yükle ve bağlan
+
+TARGET_IP="${1:-192.168.1.100}"
+TARGET_PORT=3333
+BINARY="sensor-daemon"
+SYSROOT="/opt/sysroots/aarch64-linux-gnu"
+
+echo "[*] $TARGET_IP üzerinde gdbserver başlatılıyor..."
+ssh root@"$TARGET_IP" "pkill gdbserver; gdbserver :$TARGET_PORT ./$BINARY &" &
+sleep 1
+
+echo "[*] GDB bağlanıyor..."
+aarch64-linux-gnu-gdb "$BINARY" \
+    -ex "set sysroot $SYSROOT" \
+    -ex "set solib-search-path $SYSROOT/usr/lib" \
+    -ex "target remote $TARGET_IP:$TARGET_PORT" \
+    -ex "source ~/.gdb/sensor_printers.py" \
+    -ex "source ~/.gdb/sensor_cmd.py" \
+    -ex "layout split" \
+    -ex "break main" \
+    -ex "continue"</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">SONUÇ</div>
+    <p>GDB Python API, tekrarlayan debug görevlerini otomatikleştirmek için güçlü bir altyapı sunar. Pretty-printer'lar ham bellek görünümünü anlamlı formatlara dönüştürür; custom komutlar proje spesifik debug araçları oluşturmanızı sağlar. Core dump analizi Python betiği ile bir CI pipeline'ına entegre edilebilir ve her regression otomatik olarak analiz edilebilir.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

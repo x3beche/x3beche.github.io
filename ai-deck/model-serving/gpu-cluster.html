@@ -1,0 +1,882 @@
+---
+layout: tutorial
+title: "GPU Cluster Yönetimi — Ray Serve & Sharding"
+back_url: "../index.html"
+back_label: "Model Serving Altyapısı"
+---
+
+<header class="header">
+  <div class="meta"><span>Rehber</span><span>Model Serving</span><span>04 · Framework</span></div>
+  <h1>GPU Cluster<br><em>Yönetimi.</em></h1>
+  <p class="subtitle">Ray Serve ile çok GPU'lu LLM deployment. Pipeline ve tensor parallelism, model sharding, autoscaling ve NCCL communication backend. 70B model production deploy.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçerik</div>
+  <ol>
+    <li><a href="#s0">Multi-GPU Serving Stratejileri</a></li>
+    <li><a href="#s1">Ray Serve Mimarisi</a></li>
+    <li><a href="#s2">Ray Serve ile LLM Deployment</a></li>
+    <li><a href="#s3">Model Sharding — Pipeline Parallelism</a></li>
+    <li><a href="#s4">Autoscaling Politikaları</a></li>
+    <li><a href="#s5">Spot Instance Stratejisi</a></li>
+    <li><a href="#s6">GPU Memory Optimizasyonu</a></li>
+    <li><a href="#s7">NCCL ve Communication Backend</a></li>
+    <li><a href="#s8">Profiling: NVTX, Nsight, dcgm-exporter</a></li>
+    <li><a href="#s9">Pratik: 70B Model Pipeline Parallelism</a></li>
+  </ol>
+</nav>
+
+<main>
+
+  <!-- ── S0: Multi-GPU Stratejileri ────────────────────────── -->
+  <section id="s0">
+    <h2><span class="num">00</span> Multi-GPU Serving Stratejileri</h2>
+    <p class="section-lead">Data parallelism, model parallelism ve tensor parallelism — hangi strateji ne zaman kullanılır?</p>
+
+    <p>
+      Büyük bir modeli veya yüksek bir yükü birden fazla GPU ile karşılamak için üç temel strateji vardır. Doğru seçim, model boyutuna, yük profiline ve donanım topolojisine göre değişir.
+    </p>
+
+    <table class="file-table">
+      <thead>
+        <tr><th>Strateji</th><th>Ne Bölünür?</th><th>İdeal Durum</th><th>Zorluk</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Data Parallelism</td><td>Veri (batch)</td><td>Model tek GPU'ya sığıyor, yük yüksek</td><td>Düşük — bağımsız kopyalar</td></tr>
+        <tr><td>Tensor Parallelism</td><td>Ağırlık matrisleri</td><td>Model tek GPU'ya sığmıyor</td><td>Orta — all-reduce gerekli</td></tr>
+        <tr><td>Pipeline Parallelism</td><td>Model katmanları</td><td>Çok katmanlı derin modeller</td><td>Yüksek — bubble overhead</td></tr>
+        <tr><td>Expert Parallelism</td><td>MoE uzmanları</td><td>Mixture-of-Experts modeller</td><td>Yüksek — load balancing</td></tr>
+      </tbody>
+    </table>
+
+    <div class="flow">
+      <pre><span class="step-num">Karar 1</span> Model &lt; tek GPU belleği? → Data Parallelism yeterli
+<span class="step-num">Karar 2</span> Model 1-4 GPU? → Tensor Parallelism (tp_size=2/4)
+<span class="step-num">Karar 3</span> Model 4+ GPU? → TP + PP kombinasyonu
+<span class="step-num">Karar 4</span> MoE model? → Expert parallelism ekle</pre>
+    </div>
+
+    <div class="callout">
+      <div class="label">ALTİN KURAL</div>
+      <p>Tensor parallelism, aynı node içindeki GPU'lar arasında NVLink ile düşük latency all-reduce yapar. Pipeline parallelism ise node'lar arası bant genişliğine daha toleranslıdır. Bu nedenle büyük cluster'larda sıklıkla TP (intra-node) + PP (inter-node) kombinasyonu kullanılır.</p>
+    </div>
+  </section>
+
+  <!-- ── S1: Ray Serve Mimarisi ─────────────────────────────── -->
+  <section id="s1">
+    <h2><span class="num">01</span> Ray Serve Mimarisi</h2>
+    <p class="section-lead">Deployment, replica ve handle kavramları — Ray Serve'in temel yapı taşları.</p>
+
+    <p>
+      Ray Serve, Ray üzerine inşa edilmiş bir model serving kütüphanesidir. <em>Deployment</em> bir servis birimini, <em>replica</em> bu servisin bir kopyasını, <em>handle</em> ise diğer deployment'lardan çağrı yapmak için kullanılan referansı temsil eder.
+    </p>
+
+    <div class="code-block">
+      <div class="code-label">bash — Ray Serve kurulumu</div>
+      <pre><code">pip install "ray[serve]"
+pip install "ray[serve,air]"    # Air ile birlikte (ML için önerilen)
+
+# Ray cluster başlat
+ray start --head --port=6379 --dashboard-port=8265
+
+# Worker node ekle
+ray start --address=HEAD_IP:6379 --num-gpus=4</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — temel Ray Serve deployment</div>
+      <pre><code">import ray
+from ray import serve
+from ray.serve.handle import DeploymentHandle
+import numpy as np
+
+ray.init(address="auto")   # mevcut cluster'a bağlan
+
+@serve.deployment(
+    name="echo-service",
+    num_replicas=2,
+    ray_actor_options={"num_cpus": 1.0, "num_gpus": 0.5},
+)
+class EchoService:
+    def __init__(self):
+        self.call_count = 0
+
+    async def __call__(self, request):
+        self.call_count += 1
+        body = await request.json()
+        return {"echo": body, "calls": self.call_count}
+
+# Deploy et
+serve.run(EchoService.bind(), route_prefix="/echo")
+
+# Test
+import requests
+resp = requests.post("http://localhost:8000/echo", json={"hello": "world"})
+print(resp.json())</code></pre>
+    </div>
+
+    <div class="params">
+      <div class="param-row">
+        <span class="param-name">num_replicas</span>
+        <span class="param-desc">Statik replica sayısı (autoscaling ile dinamik hale gelir)</span>
+      </div>
+      <div class="param-row">
+        <span class="param-name">ray_actor_options</span>
+        <span class="param-desc">Her replica için kaynak tahsisi (CPU, GPU, memory)</span>
+      </div>
+      <div class="param-row">
+        <span class="param-name">max_ongoing_requests</span>
+        <span class="param-desc">Bir replica'nın aynı anda işleyebileceği max istek sayısı</span>
+      </div>
+      <div class="param-row">
+        <span class="param-name">max_queued_requests</span>
+        <span class="param-desc">Kuyrukta bekleyebilecek maksimum istek sayısı</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── S2: Ray Serve LLM Deployment ──────────────────────── -->
+  <section id="s2">
+    <h2><span class="num">02</span> Ray Serve ile LLM Deployment</h2>
+    <p class="section-lead">vLLM + Ray Serve kombinasyonu ile ölçeklenebilir LLM serving — her replica kendi GPU'suna sahip.</p>
+
+    <div class="code-block">
+      <div class="code-label">python — vLLM + Ray Serve</div>
+      <pre><code">import ray
+from ray import serve
+from vllm import LLM, SamplingParams
+from fastapi import FastAPI
+from pydantic import BaseModel
+from typing import List, Optional
+
+ray.init()
+
+app = FastAPI()
+
+class GenerateRequest(BaseModel):
+    prompt: str
+    max_tokens: int = 512
+    temperature: float = 0.7
+    top_p: float = 0.95
+    stop: Optional[List[str]] = None
+
+@serve.deployment(
+    name="llm-service",
+    num_replicas=2,               # 2 replica = 2 GPU
+    ray_actor_options={
+        "num_gpus": 1,            # her replica 1 GPU
+        "num_cpus": 4,
+        "memory": 20 * 1024**3,  # 20 GB RAM
+    },
+    max_ongoing_requests=100,
+    graceful_shutdown_timeout_s=30,
+)
+@serve.ingress(app)
+class LLMService:
+    def __init__(self):
+        import torch
+        self.llm = LLM(
+            model="meta-llama/Meta-Llama-3-8B-Instruct",
+            tensor_parallel_size=1,
+            gpu_memory_utilization=0.90,
+            max_model_len=4096,
+            dtype="bfloat16",
+            enable_prefix_caching=True,
+        )
+        print(f"LLM hazır — GPU: {torch.cuda.current_device()}")
+
+    @app.post("/generate")
+    async def generate(self, request: GenerateRequest):
+        sampling = SamplingParams(
+            temperature=request.temperature,
+            top_p=request.top_p,
+            max_tokens=request.max_tokens,
+            stop=request.stop or [],
+        )
+        outputs = self.llm.generate([request.prompt], sampling)
+        return {
+            "text": outputs[0].outputs[0].text,
+            "tokens": len(outputs[0].outputs[0].token_ids),
+        }
+
+# Deploy et
+serve.run(LLMService.bind(), route_prefix="/llm")</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — deployment güncellemesi (zero downtime)</div>
+      <pre><code">from ray.serve.config import HTTPOptions, gRPCOptions
+
+# Replica sayısını güncelle (zero-downtime)
+serve.run(
+    LLMService.options(num_replicas=4).bind(),
+    route_prefix="/llm",
+)
+
+# Deployment durumunu sorgula
+status = serve.status()
+for name, dep in status.applications.items():
+    print(f"{name}: {dep.status}")</code></pre>
+    </div>
+  </section>
+
+  <!-- ── S3: Model Sharding ─────────────────────────────────── -->
+  <section id="s3">
+    <h2><span class="num">03</span> Model Sharding — Pipeline Parallelism</h2>
+    <p class="section-lead">70B modeli 8 GPU'ya yay — Megatron-LM tarzı katman bölümlemesi ve micro-batch pipeline.</p>
+
+    <p>
+      Pipeline parallelism'de model katmanları <em>stage</em>'lere bölünür. Her stage farklı bir GPU grubunda çalışır. Veriler stage'ler arasında micro-batch'ler halinde akar — bu sayede GPU'lar boş kalmadan ardı ardına çalışabilir.
+    </p>
+
+    <div class="code-block">
+      <div class="code-label">python — vLLM pipeline parallelism</div>
+      <pre><code">from vllm import LLM
+
+# 8 GPU: 4 TP × 2 PP
+llm = LLM(
+    model="meta-llama/Meta-Llama-3-70B-Instruct",
+    tensor_parallel_size=4,     # 4 GPU per PP stage
+    pipeline_parallel_size=2,   # 2 stages = 8 GPU total
+    max_model_len=4096,
+    gpu_memory_utilization=0.95,
+    dtype="bfloat16",
+    distributed_executor_backend="ray",  # Ray ile dağıtık
+)</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — Megatron-LM tarzı manuel sharding</div>
+      <pre><code">import torch
+import torch.distributed as dist
+from torch.distributed.pipeline.sync import Pipe
+
+def build_pipeline_model(model_config, pp_size: int):
+    """
+    Modeli pp_size kadar stage'e böl.
+    Her stage bir GPU'ya atanır.
+    """
+    layers = build_transformer_layers(model_config)   # katmanları oluştur
+    n_layers = len(layers)
+    layers_per_stage = n_layers // pp_size
+
+    stages = []
+    for i in range(pp_size):
+        start = i * layers_per_stage
+        end = start + layers_per_stage if i < pp_size - 1 else n_layers
+        stage_layers = torch.nn.Sequential(*layers[start:end])
+        stages.append(stage_layers.to(f"cuda:{i}"))
+
+    # Micro-batch boyutu: toplam batch / pipeline stage sayısı
+    micro_batch_size = 4
+    pipe_model = Pipe(
+        torch.nn.Sequential(*stages),
+        chunks=micro_batch_size,
+    )
+    return pipe_model</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — Ray Serve + pipeline parallelism</div>
+      <pre><code">import ray
+from ray import serve
+
+@serve.deployment(
+    num_replicas=1,
+    ray_actor_options={"num_gpus": 0},  # Koordinatör: GPU yok
+)
+class PipelineCoordinator:
+    def __init__(self, model_handle):
+        self.model = model_handle
+
+    async def __call__(self, request):
+        data = await request.json()
+        return await self.model.infer.remote(data["prompt"])
+
+@serve.deployment(
+    num_replicas=1,
+    ray_actor_options={"num_gpus": 8},  # Tüm GPU'lar bu replica'ya
+)
+class LargeModelShard:
+    def __init__(self):
+        # vLLM içsel olarak 8 GPU'yu pipeline parallel kullanır
+        from vllm import LLM
+        self.llm = LLM(
+            model="meta-llama/Meta-Llama-3-70B-Instruct",
+            tensor_parallel_size=4,
+            pipeline_parallel_size=2,
+            distributed_executor_backend="ray",
+        )
+
+    def infer(self, prompt: str):
+        from vllm import SamplingParams
+        outputs = self.llm.generate([prompt], SamplingParams(max_tokens=256))
+        return outputs[0].outputs[0].text
+
+shard = LargeModelShard.bind()
+coordinator = PipelineCoordinator.bind(shard)
+serve.run(coordinator, route_prefix="/generate")</code></pre>
+    </div>
+  </section>
+
+  <!-- ── S4: Autoscaling ────────────────────────────────────── -->
+  <section id="s4">
+    <h2><span class="num">04</span> Autoscaling Politikaları</h2>
+    <p class="section-lead">Ray Serve autoscale policy — target_num_ongoing_requests ile CPU/GPU kullanımına göre replica yönetimi.</p>
+
+    <div class="code-block">
+      <div class="code-label">python — autoscaling konfigürasyonu</div>
+      <pre><code">from ray import serve
+from ray.serve.config import AutoscalingConfig
+
+@serve.deployment(
+    name="autoscaled-llm",
+    autoscaling_config=AutoscalingConfig(
+        min_replicas=1,
+        max_replicas=8,
+        initial_replicas=2,
+
+        # Hedef: her replica'da max 5 eş zamanlı istek
+        target_num_ongoing_requests=5,
+
+        # Scale-up: 15s boyunca hedefin üzerindeyse replica ekle
+        upscale_delay_s=15,
+
+        # Scale-down: 300s boyunca hedefin altındaysa replica azalt
+        downscale_delay_s=300,
+
+        # Smoothing: ani değişimleri engelle
+        upscale_smoothing_factor=0.5,
+        downscale_smoothing_factor=1.0,
+
+        # Metrik lookback penceresi
+        look_back_period_s=30,
+    ),
+    ray_actor_options={"num_gpus": 1},
+    max_ongoing_requests=10,
+)
+class AutoscaledLLM:
+    def __init__(self):
+        from vllm import LLM
+        self.llm = LLM(model="meta-llama/Meta-Llama-3-8B-Instruct",
+                        gpu_memory_utilization=0.85)
+
+    async def __call__(self, request):
+        from vllm import SamplingParams
+        body = await request.json()
+        out = self.llm.generate([body["prompt"]], SamplingParams(max_tokens=256))
+        return {"text": out[0].outputs[0].text}</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — autoscaling durumunu izle</div>
+      <pre><code">import ray
+import time
+
+ray.init(address="auto")
+
+def monitor_replicas(deployment_name: str, duration_s: int = 60):
+    from ray.serve.context import _get_serve_router
+    start = time.time()
+    while time.time() - start &lt; duration_s:
+        status = serve.status()
+        for app_name, app_status in status.applications.items():
+            for dep_name, dep_status in app_status.deployments.items():
+                if deployment_name in dep_name:
+                    print(f"[{time.strftime('%H:%M:%S')}] "
+                          f"Replicas: {dep_status.replica_states}")
+        time.sleep(5)
+
+monitor_replicas("autoscaled-llm", duration_s=120)</code></pre>
+    </div>
+  </section>
+
+  <!-- ── S5: Spot Instance ──────────────────────────────────── -->
+  <section id="s5">
+    <h2><span class="num">05</span> Spot Instance Stratejisi</h2>
+    <p class="section-lead">Preemption handling, checkpoint stratejisi ve spot/on-demand hibrit cluster ile maliyet optimizasyonu.</p>
+
+    <p>
+      Spot (preemptible) instance'lar on-demand'e kıyasla %60-90 ucuzdur; ancak herhangi bir anda geri alınabilir. LLM serving için strateji, on-demand instance'larda minimum kapasiteyi korurken spot'larla yük artışını karşılamaktır.
+    </p>
+
+    <div class="code-block">
+      <div class="code-label">yaml — Ray cluster spot/on-demand karışık</div>
+      <pre><code">cluster_name: llm-cluster
+
+head_node_type: head.r6i.4xlarge
+
+available_node_types:
+  # On-demand: minimum kapasite garantisi
+  worker.ondemand.a100:
+    node_config:
+      InstanceType: p4d.24xlarge    # 8x A100
+      ImageId: ami-0abcdef123456
+    resources:
+      CPU: 96
+      GPU: 8
+      memory: 1099511627776   # 1TB
+    min_workers: 1
+    max_workers: 2
+
+  # Spot: maliyet tasarrufu
+  worker.spot.a10g:
+    node_config:
+      InstanceType: g5.12xlarge     # 4x A10G
+      ImageId: ami-0abcdef123456
+      InstanceMarketOptions:
+        MarketType: spot
+        SpotOptions:
+          MaxPrice: "4.50"
+          SpotInstanceType: persistent
+    resources:
+      CPU: 48
+      GPU: 4
+      memory: 192937051136
+    min_workers: 0
+    max_workers: 8
+    spot: true
+
+worker_start_ray_commands:
+  - ray start --address=$RAY_HEAD_IP:6379 \
+      --num-gpus=$NUM_GPUS \
+      --resources='{"spot": 1}'</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — preemption-aware deployment</div>
+      <pre><code">from ray import serve
+
+@serve.deployment(
+    autoscaling_config={
+        "min_replicas": 2,          # On-demand'de minimum 2
+        "max_replicas": 10,
+        "target_num_ongoing_requests": 5,
+    },
+    ray_actor_options={
+        "num_gpus": 1,
+        "resources": {},   # Spot veya on-demand kabul eder
+    },
+)
+class FaultTolerantLLM:
+    def __init__(self):
+        import signal, os
+        # SIGTERM yakalandığında checkpoint al
+        signal.signal(signal.SIGTERM, self._graceful_shutdown)
+
+        from vllm import LLM
+        self.llm = LLM(
+            model="meta-llama/Meta-Llama-3-8B-Instruct",
+            gpu_memory_utilization=0.85,
+        )
+        self.request_count = 0
+
+    def _graceful_shutdown(self, signum, frame):
+        """Spot preemption — temiz kapanış."""
+        import json, os
+        state = {"request_count": self.request_count}
+        with open("/tmp/checkpoint.json", "w") as f:
+            json.dump(state, f)
+        print(f"Graceful shutdown — {self.request_count} istek işlendi.")
+
+    async def __call__(self, request):
+        self.request_count += 1
+        body = await request.json()
+        from vllm import SamplingParams
+        out = self.llm.generate([body["prompt"]], SamplingParams(max_tokens=256))
+        return {"text": out[0].outputs[0].text, "req_id": self.request_count}</code></pre>
+    </div>
+
+    <div class="callout">
+      <div class="label">MALİYET TAVSİYESİ</div>
+      <p>AWS'de A100 on-demand ~$32/saat, spot ise $8-12/saat. 2 on-demand + 6 spot konfigürasyonu ile yük %80 spot üzerinde karşılanabilir; bu yapı %65 maliyet tasarrufu sağlar. Kritik model inference için on-demand guaranteed kapasitesi mutlaka tutulmalıdır.</p>
+    </div>
+  </section>
+
+  <!-- ── S6: GPU Memory Optimizasyonu ──────────────────────── -->
+  <section id="s6">
+    <h2><span class="num">06</span> GPU Memory Optimizasyonu</h2>
+    <p class="section-lead">Activation checkpointing, gradient offloading ve mixed precision ile VRAM kullanımını minimize et.</p>
+
+    <div class="code-block">
+      <div class="code-label">python — activation checkpointing</div>
+      <pre><code">import torch
+import torch.nn as nn
+from torch.utils.checkpoint import checkpoint_sequential
+
+class OptimizedTransformerLayer(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, ffn_dim: int):
+        super().__init__()
+        self.attention = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, ffn_dim),
+            nn.GELU(),
+            nn.Linear(ffn_dim, d_model),
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        # Activation checkpointing: forward sırasında aktivasyonları saklamaz
+        # backward sırasında yeniden hesaplar → VRAM tasarrufu
+        attn_out, _ = self.attention(x, x, x)
+        x = self.norm1(x + attn_out)
+        ffn_out = self.ffn(x)
+        return self.norm2(x + ffn_out)
+
+class LargeTransformer(nn.Module):
+    def __init__(self, n_layers=32, d_model=4096, n_heads=32, ffn_dim=16384):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            OptimizedTransformerLayer(d_model, n_heads, ffn_dim)
+            for _ in range(n_layers)
+        ])
+
+    def forward(self, x):
+        # checkpoint_sequential: katmanları gruplara böl, her grup checkpoint'le
+        segments = 4   # 4 gruba böl → VRAM %75 azalır, %30 daha yavaş
+        return checkpoint_sequential(self.layers, segments, x)</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — ZeRO ve gradient offloading (DeepSpeed)</div>
+      <pre><code">import deepspeed
+
+ds_config = {
+    "bf16": {"enabled": True},
+    "zero_optimization": {
+        "stage": 3,
+        "offload_optimizer": {
+            "device": "cpu",
+            "pin_memory": True,
+        },
+        "offload_param": {
+            "device": "cpu",
+            "pin_memory": True,
+        },
+        "overlap_comm": True,
+        "contiguous_gradients": True,
+        "reduce_bucket_size": 5e7,
+        "stage3_prefetch_bucket_size": 5e7,
+        "stage3_param_persistence_threshold": 1e5,
+    },
+    "gradient_accumulation_steps": 4,
+    "train_micro_batch_size_per_gpu": 2,
+}
+
+# DeepSpeed engine ile model wrap et
+model_engine, optimizer, _, _ = deepspeed.initialize(
+    model=model,
+    model_parameters=model.parameters(),
+    config=ds_config,
+)</code></pre>
+    </div>
+
+    <table class="file-table">
+      <thead>
+        <tr><th>Teknik</th><th>VRAM Tasarrufu</th><th>Hız Etkisi</th><th>Kullanım</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>FP16/BF16</td><td>%50</td><td>+%20-50 hız</td><td>Her zaman</td></tr>
+        <tr><td>Activation Checkpointing</td><td>%60-80</td><td>-%20-30 yavaş</td><td>Büyük modeller</td></tr>
+        <tr><td>Gradient Offload (CPU)</td><td>%30-50</td><td>-%40-60 yavaş</td><td>VRAM çok kısıtlıysa</td></tr>
+        <tr><td>ZeRO Stage 3</td><td>%85+</td><td>-%30-50 yavaş</td><td>Multi-node training</td></tr>
+        <tr><td>Flash Attention 2</td><td>%30</td><td>+%30-60 hız</td><td>Long context</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ── S7: NCCL ───────────────────────────────────────────── -->
+  <section id="s7">
+    <h2><span class="num">07</span> NCCL ve Communication Backend</h2>
+    <p class="section-lead">GPU'lar arası iletişim için NCCL — all-reduce, all-gather ve broadcast operasyonları.</p>
+
+    <p>
+      NCCL (NVIDIA Collective Communications Library), çok GPU'lu sistemlerde tensor iletişimini optimize eden kütüphanedir. PyTorch distributed, vLLM ve DeepSpeed dahili olarak NCCL kullanır.
+    </p>
+
+    <div class="code-block">
+      <div class="code-label">python — NCCL all-reduce örneği</div>
+      <pre><code">import torch
+import torch.distributed as dist
+import os
+
+def setup_nccl(rank: int, world_size: int):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    os.environ["NCCL_DEBUG"] = "INFO"        # debug için
+    os.environ["NCCL_SOCKET_IFNAME"] = "eth0"  # network interface
+    dist.init_process_group(
+        backend="nccl",
+        rank=rank,
+        world_size=world_size,
+    )
+    torch.cuda.set_device(rank)
+
+def all_reduce_example(rank: int, world_size: int):
+    setup_nccl(rank, world_size)
+
+    # Her GPU kendi tensorunu oluşturur
+    tensor = torch.ones(1024, 1024, device=f"cuda:{rank}") * (rank + 1)
+    print(f"Rank {rank}: tensor sum before = {tensor.sum().item()}")
+
+    # All-reduce: tüm GPU'lardaki tensorları topla
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    print(f"Rank {rank}: tensor sum after = {tensor.sum().item()}")
+
+    # All-gather: tüm GPU'lardaki tensorları birleştir
+    gathered = [torch.zeros(1024, 1024, device=f"cuda:{rank}") for _ in range(world_size)]
+    local = torch.randn(1024, 1024, device=f"cuda:{rank}")
+    dist.all_gather(gathered, local)
+
+    dist.destroy_process_group()
+
+# Çalıştır: torchrun --nproc_per_node=4 script.py</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">bash — NCCL performans ayarları</div>
+      <pre><code"># NVLink varsa — en hızlı path
+export NCCL_P2P_DISABLE=0
+export NCCL_SHM_DISABLE=0
+
+# NVLink yoksa InfiniBand kullan
+export NCCL_IB_DISABLE=0
+export NCCL_IB_HCA=mlx5_0
+
+# Büyük mesaj için socket
+export NCCL_SOCKET_NTHREADS=8
+export NCCL_NSOCKS_PERTHREAD=4
+
+# Debug loglama
+export NCCL_DEBUG=WARN    # INFO, WARN, ERROR
+
+# NCCL bandwidth testi
+./nccl-tests/build/all_reduce_perf \
+  -b 8 -e 512M -f 2 -g 4</code></pre>
+    </div>
+  </section>
+
+  <!-- ── S8: Profiling ──────────────────────────────────────── -->
+  <section id="s8">
+    <h2><span class="num">08</span> Profiling: NVTX, Nsight, dcgm-exporter</h2>
+    <p class="section-lead">GPU utilization, memory bandwidth ve kernel hotspot'larını bul — Prometheus ile sürekli izleme.</p>
+
+    <div class="code-block">
+      <div class="code-label">python — NVTX annotasyonları</div>
+      <pre><code">import torch
+import nvtx   # pip install nvtx
+
+@nvtx.annotate("tokenization", color="blue")
+def tokenize_batch(texts, tokenizer):
+    return tokenizer(texts, padding=True, truncation=True,
+                     return_tensors="pt", max_length=512)
+
+@nvtx.annotate("model_forward", color="green")
+def model_forward(model, inputs):
+    with torch.no_grad():
+        return model(**inputs)
+
+@nvtx.annotate("postprocess", color="red")
+def postprocess(outputs):
+    return outputs.logits.softmax(-1).cpu().numpy()
+
+# NVTX ile profil al:
+# nsys profile --trace cuda,nvtx python script.py</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">bash — Nsight Systems profiling</div>
+      <pre><code"># Full trace: CUDA + NVTX + OS events
+nsys profile \
+  --trace=cuda,nvtx,osrt \
+  --output=profile_report \
+  --force-overwrite=true \
+  python inference_script.py
+
+# Raporu aç
+nsys-ui profile_report.nsys-rep
+
+# CLI özeti
+nsys stats profile_report.nsys-rep \
+  --report gputrace \
+  --format csv \
+  --output gputrace.csv</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">yaml — dcgm-exporter Prometheus konfigürasyonu</div>
+      <pre><code">apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dcgm-exporter
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: dcgm-exporter
+  template:
+    metadata:
+      labels:
+        app: dcgm-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9400"
+    spec:
+      containers:
+        - name: dcgm-exporter
+          image: nvcr.io/nvidia/k8s/dcgm-exporter:3.2.6-3.1.9-ubuntu22.04
+          ports:
+            - containerPort: 9400
+          env:
+            - name: DCGM_EXPORTER_KUBERNETES_GPU_ID_TYPE
+              value: uid
+          securityContext:
+            privileged: true
+          resources:
+            limits:
+              nvidia.com/gpu: 1</code></pre>
+    </div>
+
+    <table class="file-table">
+      <thead>
+        <tr><th>Metrik</th><th>DCGM Etiketi</th><th>İdeal Değer</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>GPU Utilization</td><td>DCGM_FI_DEV_GPU_UTIL</td><td>&gt; 80%</td></tr>
+        <tr><td>Memory Utilization</td><td>DCGM_FI_DEV_MEM_COPY_UTIL</td><td>&gt; 70%</td></tr>
+        <tr><td>VRAM Used</td><td>DCGM_FI_DEV_FB_USED</td><td>Model gereksinimine göre</td></tr>
+        <tr><td>SM Clock</td><td>DCGM_FI_DEV_SM_CLOCK</td><td>Boost clock'a yakın</td></tr>
+        <tr><td>NVLink Bandwidth</td><td>DCGM_FI_PROF_NVLINK_TX_BYTES</td><td>Donanım limiti × 0.8</td></tr>
+        <tr><td>PCIe Bandwidth</td><td>DCGM_FI_PROF_PCIE_TX_BYTES</td><td>&lt; 16 GB/s</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ── S9: Pratik ─────────────────────────────────────────── -->
+  <section id="s9">
+    <h2><span class="num">09</span> Pratik: Ray Serve ile 70B Model Pipeline Parallelism</h2>
+    <p class="section-lead">8 GPU cluster'da 70B Llama-3 modelini pipeline + tensor parallelism ile deploy et ve autoscaling demosu çalıştır.</p>
+
+    <div class="code-block">
+      <div class="code-label">python — tam uygulama</div>
+      <pre><code">import ray
+from ray import serve
+from vllm import LLM, SamplingParams
+from fastapi import FastAPI
+from pydantic import BaseModel
+from typing import Optional, List
+import asyncio
+
+ray.init(address="auto")
+app = FastAPI(title="70B LLM Service")
+
+class ChatRequest(BaseModel):
+    messages: List[dict]
+    max_tokens: int = 512
+    temperature: float = 0.7
+    stream: bool = False
+
+@serve.deployment(
+    name="llama3-70b",
+    num_replicas=1,   # 1 replica = 8 GPU (tamamını kullan)
+    ray_actor_options={
+        "num_gpus": 8,
+        "num_cpus": 16,
+        "memory": 200 * 1024**3,   # 200 GB RAM
+    },
+    max_ongoing_requests=50,
+    graceful_shutdown_timeout_s=120,
+    health_check_period_s=30,
+)
+@serve.ingress(app)
+class Llama3_70B:
+    def __init__(self):
+        self.llm = LLM(
+            model="meta-llama/Meta-Llama-3-70B-Instruct",
+            tensor_parallel_size=4,
+            pipeline_parallel_size=2,
+            distributed_executor_backend="ray",
+            gpu_memory_utilization=0.95,
+            max_model_len=8192,
+            dtype="bfloat16",
+            enable_prefix_caching=True,
+            enforce_eager=False,
+        )
+        self.tokenizer = self.llm.get_tokenizer()
+        print("Llama-3 70B hazır — TP=4, PP=2")
+
+    @app.post("/chat")
+    async def chat(self, request: ChatRequest):
+        prompt = self.tokenizer.apply_chat_template(
+            request.messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        params = SamplingParams(
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+        )
+        outputs = self.llm.generate([prompt], params)
+        text = outputs[0].outputs[0].text
+        tokens = len(outputs[0].outputs[0].token_ids)
+        return {"content": text, "usage": {"completion_tokens": tokens}}
+
+    @app.get("/health")
+    def health(self):
+        return {"status": "ok", "model": "llama-3-70b"}
+
+serve.run(Llama3_70B.bind(), route_prefix="/")</code></pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">python — autoscaling yük testi</div>
+      <pre><code">import asyncio, aiohttp, time, statistics
+
+async def load_test(target_rps: int = 5, duration_s: int = 60):
+    url = "http://localhost:8000/chat"
+    payload = {
+        "messages": [{"role": "user", "content": "Python'da async programlamayı açıkla."}],
+        "max_tokens": 256,
+        "temperature": 0.7,
+    }
+    latencies = []
+    errors = 0
+    interval = 1.0 / target_rps
+
+    async def req(session, req_id):
+        start = time.perf_counter()
+        try:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(60)) as r:
+                result = await r.json()
+                latencies.append(time.perf_counter() - start)
+        except Exception as e:
+            nonlocal errors
+            errors += 1
+
+    async with aiohttp.ClientSession() as session:
+        start = time.time()
+        tasks = []
+        req_id = 0
+        while time.time() - start &lt; duration_s:
+            tasks.append(asyncio.create_task(req(session, req_id)))
+            req_id += 1
+            await asyncio.sleep(interval)
+        await asyncio.gather(*tasks)
+
+    print(f"Toplam: {req_id} istek, {errors} hata")
+    print(f"P50: {statistics.median(latencies):.2f}s")
+    print(f"P95: {sorted(latencies)[int(0.95*len(latencies))]:.2f}s")
+    print(f"P99: {sorted(latencies)[int(0.99*len(latencies))]:.2f}s")
+
+asyncio.run(load_test(target_rps=3, duration_s=120))</code></pre>
+    </div>
+
+    <div class="callout">
+      <div class="label">BEKLENEN PERFORMANS</div>
+      <p>Llama-3 70B, 8× A100 80GB (TP=4, PP=2) konfigürasyonuyla tipik olarak 300-500 token/s throughput, 2-5s TTFT (p50) sağlar. Autoscaling, 15 dakikalık warm-up gerektirdiğinden kademeli yük artışı ile test edilmelidir. Spot instance preemption oranı düşük yükte &lt;%5 kalır.</p>
+    </div>
+  </section>
+
+</main>

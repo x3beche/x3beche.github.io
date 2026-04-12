@@ -1,0 +1,840 @@
+---
+layout: tutorial
+title: "Xen ARM — dom0/domU & xl Toolchain"
+back_url: "../index.html"
+back_label: "Xen & Jailhouse"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>XEN ARM</span>
+    <span>2026</span>
+  </div>
+  <h1>Xen ARM<br><em>dom0/domU &amp; xl Toolchain</em></h1>
+  <p class="subtitle">Xen ARM mimarisi, Yocto meta-virtualization ile kurulum, xl toolchain, domU konfigürasyonu, dom0-less boot, device passthrough ve FLASK/XSM güvenlik modeli.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Xen ARM mimarisi</a></li>
+    <li><a href="#s1">Kurulum — Yocto meta-virtualization</a></li>
+    <li><a href="#s2">xl toolchain komutları</a></li>
+    <li><a href="#s3">domU konfigürasyonu — xl.cfg</a></li>
+    <li><a href="#s4">PV vs HVM — ARM'da fark</a></li>
+    <li><a href="#s5">dom0-less boot</a></li>
+    <li><a href="#s6">Device passthrough — IOMMU</a></li>
+    <li><a href="#s7">virtio-net ve virtio-blk</a></li>
+    <li><a href="#s8">FLASK/XSM güvenlik modeli</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Xen ARM mimarisi</h2>
+  <p class="section-lead">Xen, dünya üzerindeki en yaygın kullanılan açık kaynak Type-1 hypervisor'larından biridir. ARM desteği ARMv7-A (32-bit) ve ARMv8-A/v9-A (64-bit) mimarilerini kapsar.</p>
+
+  <h3>Xen katman modeli</h3>
+
+  <div class="flow">
+    <pre>
+┌─────────────────────────────────────────────────────────┐
+│                    Dom0 (Privileged Guest)               │
+│  Linux kernel + xen-blkback/netback + xl toolstack      │
+├──────────────┬──────────────────┬───────────────────────┤
+│  domU-1      │   domU-2         │   domU-N              │
+│  (Linux IVI) │   (RTOS)         │   (Android)           │
+├──────────────┴──────────────────┴───────────────────────┤
+│              Xen Hypervisor (EL2)                       │
+├─────────────────────────────────────────────────────────┤
+│              ARM SoC Hardware                           │
+└─────────────────────────────────────────────────────────┘
+    </pre>
+  </div>
+
+  <h3>Temel bileşenler</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Xen Hypervisor</span><span class="desc">EL2'de çalışan ~300KB firmware; tüm guest'lerin üzerindeki katman</span></div>
+    <div class="param"><span class="name">Dom0</span><span class="desc">Ayrıcalıklı domain — donanım sürücülerine erişir, diğer domain'leri yönetir</span></div>
+    <div class="param"><span class="name">DomU</span><span class="desc">Unprivileged guest domain — sanal I/O aracılığıyla donanıma erişir</span></div>
+    <div class="param"><span class="name">xl toolstack</span><span class="desc">Dom0 üzerinde çalışan hypervisor yönetim aracı</span></div>
+    <div class="param"><span class="name">Toolstack</span><span class="desc">xl → libxl → libxenctrl → hypercall → Xen hypervisor</span></div>
+  </div>
+
+  <h3>Boot sırası</h3>
+  <p>ARM Xen boot sırası U-Boot tarafından organize edilir. Xen hypervisor önce yüklenir, ardından dom0 guest olarak başlatılır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>U-Boot — Xen ARM boot komutu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># U-Boot bootscript: Xen + dom0 + FDT yükle</span>
+<span class="cmt"># Xen hypervisor image</span>
+fatload mmc 0:1 0x80200000 xen
+
+<span class="cmt"># Dom0 Linux kernel</span>
+fatload mmc 0:1 0x80400000 Image
+
+<span class="cmt"># Dom0 initramfs</span>
+fatload mmc 0:1 0x85000000 dom0-initramfs.cpio.gz
+
+<span class="cmt"># Xen için DTB (Xen kendi DTB'sini oluşturur)</span>
+fatload mmc 0:1 0x83000000 imx8mp-evk-xen.dtb
+
+<span class="cmt"># Xen'in yükleneceği adres, dom0 bilgileri DTB içinde</span>
+fdt addr 0x83000000
+fdt resize 4096
+
+<span class="cmt"># dom0 çekirdeğini ve ramdisk'i DTB'ye ekle</span>
+fdt set /chosen \#address-cells &lt;1&gt;
+fdt set /chosen xen,xen-bootargs "console=dtuart dtuart=serial0 dom0_mem=512M"
+fdt set /chosen xen,dom0-bootargs "console=hvc0 earlycon=xen earlyprintk=xen"
+fdt mknod /chosen dom0
+fdt set /chosen/dom0 compatible "xen,linux-zimage" "xen,multiboot-module"
+fdt set /chosen/dom0 reg &lt;0x80400000 0x2000000&gt;
+
+<span class="cmt"># Boot</span>
+booti 0x80200000 - 0x83000000</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Dom0: ayrıcalıklı guest — sürücü erişimi + xl toolstack</li>
+      <li>DomU: normal guest — sanal I/O, dom0 backend'e bağımlı</li>
+      <li>U-Boot boot sırası: Xen → DTB → dom0 kernel/initrd</li>
+      <li>EL2'de çalışan Xen ~300KB — minimal footprint</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Kurulum — Yocto meta-virtualization</h2>
+  <p class="section-lead">Xen ARM için Yocto Project'in <code>meta-virtualization</code> katmanı standart çözümdür. Bu katman Xen hypervisor recipe'si, xl toolstack ve guest yönetim araçlarını içerir.</p>
+
+  <h3>meta-virtualization kurulumu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Yocto Xen layer kurulumu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Poky dizinine git</span>
+<span class="cmd">cd</span> ~/yocto/poky
+
+<span class="cmt"># meta-virtualization klonla</span>
+<span class="cmd">git</span> clone https://git.yoctoproject.org/meta-virtualization \
+    ../meta-virtualization -b scarthgap
+
+<span class="cmt"># meta-openembedded gereksinimi</span>
+<span class="cmd">git</span> clone https://git.openembedded.org/meta-openembedded \
+    ../meta-openembedded -b scarthgap
+
+<span class="cmt"># Build ortamını başlat</span>
+<span class="cmd">source</span> oe-init-build-env build-xen
+
+<span class="cmt"># Layer'ları ekle</span>
+<span class="cmd">bitbake-layers</span> add-layer ../meta-openembedded/meta-oe
+<span class="cmd">bitbake-layers</span> add-layer ../meta-openembedded/meta-python
+<span class="cmd">bitbake-layers</span> add-layer ../meta-openembedded/meta-networking
+<span class="cmd">bitbake-layers</span> add-layer ../meta-virtualization</code></pre>
+  </div>
+
+  <h3>local.conf Xen ayarları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>conf/local.conf — Xen konfigürasyonu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Hedef makine (i.MX8M Plus EVK örneği)</span>
+MACHINE = "imx8mp-lpddr4-evk"
+
+<span class="cmt"># Xen'i image'a dahil et</span>
+DISTRO_FEATURES:append = " xen virtualization"
+
+<span class="cmt"># Kernel Xen desteğini aktifleştir</span>
+KERNEL_FEATURES:append = " features/xen/xen.scc"
+
+<span class="cmt"># Dom0 için minimum bellek</span>
+XEN_DOM0_MEM = "512M"
+
+<span class="cmt"># Xen sürümü</span>
+PREFERRED_VERSION_xen = "4.17%"
+
+<span class="cmt"># xl toolstack için paketler</span>
+IMAGE_INSTALL:append = " xen xen-xl xen-tools"
+IMAGE_INSTALL:append = " bridge-utils iptables"</code></pre>
+  </div>
+
+  <h3>Cross-compile ile manuel build</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Xen cross-compile (ARM64)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Cross-compiler hazırla</span>
+<span class="cmd">export</span> CROSS_COMPILE=aarch64-linux-gnu-
+<span class="cmd">export</span> ARCH=arm64
+
+<span class="cmt"># Xen kaynak kodu indir</span>
+<span class="cmd">git</span> clone https://xenbits.xen.org/git-http/xen.git
+<span class="cmd">cd</span> xen
+<span class="cmd">git</span> checkout RELEASE-4.17.0
+
+<span class="cmt"># Xen konfigürasyonu (ARM64)</span>
+<span class="cmd">make</span> -C xen defconfig XEN_TARGET_ARCH=arm64
+
+<span class="cmt"># Build</span>
+<span class="cmd">make</span> -j$(nproc) XEN_TARGET_ARCH=arm64 \
+     CROSS_COMPILE=aarch64-linux-gnu-
+
+<span class="cmt"># Çıktı: xen/xen — EFI veya flat binary</span>
+<span class="cmd">ls</span> -la xen/xen
+<span class="cmt"># -rwxr-xr-x 1 user user 387256 ... xen/xen</span>
+
+<span class="cmt"># Dom0 kernel için Xen konfigürasyonu</span>
+<span class="cmd">make</span> ARCH=arm64 xen_guest_defconfig
+<span class="cmd">grep</span> XEN .config
+<span class="cmt"># CONFIG_XEN=y</span>
+<span class="cmt"># CONFIG_XEN_BLKDEV_FRONTEND=y</span>
+<span class="cmt"># CONFIG_XEN_NETDEV_FRONTEND=y</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>meta-virtualization: Yocto için Xen recipe'leri — scarthgap branch</li>
+      <li>DISTRO_FEATURES += "xen virtualization" — temel aktivasyon</li>
+      <li>Cross-compile: XEN_TARGET_ARCH=arm64 — i.MX8 için aarch64</li>
+      <li>Dom0 kernel: CONFIG_XEN=y, blkdev/netdev frontend</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> xl toolchain komutları</h2>
+  <p class="section-lead">xl (Xen Light), Xen hypervisor'ı yönetmek için kullanılan komut satırı aracıdır. Dom0 üzerinde çalışır ve domain yaşam döngüsünü, ağ/disk yapılandırmasını yönetir.</p>
+
+  <h3>Temel xl komutları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — xl komut referansı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Çalışan domain'leri listele</span>
+<span class="cmd">xl</span> list
+<span class="cmt"># Name                  ID  Mem  VCPUs  State  Time(s)</span>
+<span class="cmt"># Domain-0               0  512     2   r----  120.4</span>
+<span class="cmt"># linux-domu             1  256     1   -b---   45.2</span>
+
+<span class="cmt"># Domain oluştur (cfg dosyasından)</span>
+<span class="cmd">xl</span> create /etc/xen/linux-domu.cfg
+<span class="cmt"># Parsing config from /etc/xen/linux-domu.cfg</span>
+
+<span class="cmt"># Domain oluştur ve console'a bağlan</span>
+<span class="cmd">xl</span> create /etc/xen/linux-domu.cfg -c
+
+<span class="cmt"># Domain konsol bağlantısı (Ctrl+] ile çıkış)</span>
+<span class="cmd">xl</span> console linux-domu
+
+<span class="cmt"># Domain kapat (soft shutdown)</span>
+<span class="cmd">xl</span> shutdown linux-domu
+
+<span class="cmt"># Domain zorla durdur</span>
+<span class="cmd">xl</span> destroy linux-domu
+
+<span class="cmt"># Domain duraklat</span>
+<span class="cmd">xl</span> pause linux-domu
+
+<span class="cmt"># Domain devam ettir</span>
+<span class="cmd">xl</span> unpause linux-domu
+
+<span class="cmt"># Domain'in kaynak kullanımını izle</span>
+<span class="cmd">xl</span> top
+
+<span class="cmt"># Domain bilgisi</span>
+<span class="cmd">xl</span> domid linux-domu    <span class="cmt"># ID öğren</span>
+<span class="cmd">xl</span> domname 1           <span class="cmt"># ID → isim</span>
+
+<span class="cmt"># Xen log</span>
+<span class="cmd">xl</span> dmesg
+
+<span class="cmt"># Hypervisor bilgisi</span>
+<span class="cmd">xl</span> info
+<span class="cmt"># host               : imx8mp-evk</span>
+<span class="cmt"># release            : 4.17.0</span>
+<span class="cmt"># total_memory       : 4096</span>
+<span class="cmt"># free_memory        : 3200</span></code></pre>
+  </div>
+
+  <h3>xl vcpu ve bellek yönetimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — vCPU ve bellek işlemleri</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># vCPU listesi</span>
+<span class="cmd">xl</span> vcpu-list linux-domu
+<span class="cmt"># Name     ID  VCPU CPU   State   Time(s)  Affinity (Hard)</span>
+<span class="cmt"># linux-domu 1   0   2   -b---   22.1    0-3</span>
+
+<span class="cmt"># vCPU pinning — belirli fiziksel CPU'ya bağla</span>
+<span class="cmd">xl</span> vcpu-pin linux-domu 0 2
+<span class="cmt"># vCPU 0 → fiziksel CPU 2'ye pinlendi</span>
+
+<span class="cmt"># Bellek ekleme/çıkarma (balloon sürücüsü gerekli)</span>
+<span class="cmd">xl</span> mem-set linux-domu 384  <span class="cmt"># 384 MB'a çıkar</span>
+<span class="cmd">xl</span> mem-max linux-domu 512  <span class="cmt"># maksimum 512 MB</span>
+
+<span class="cmt"># CPU scheduler bilgisi</span>
+<span class="cmd">xl</span> sched-credit         <span class="cmt"># Credit scheduler parametreleri</span>
+<span class="cmd">xl</span> sched-credit2        <span class="cmt"># Credit2 scheduler</span>
+<span class="cmd">xl</span> sched-rtds           <span class="cmt"># RTDS (real-time) scheduler</span>
+
+<span class="cmt"># RTDS scheduler — real-time domU için</span>
+<span class="cmd">xl</span> sched-rtds -d linux-domu -p 100000 -b 20000
+<span class="cmt"># period=100ms, budget=20ms (20% CPU garantisi)</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>xl list/create/destroy/console — temel domain yaşam döngüsü</li>
+      <li>xl vcpu-pin: vCPU → fiziksel CPU pinleme — deterministik scheduling</li>
+      <li>xl sched-rtds: real-time scheduler — period + budget ile CPU garantisi</li>
+      <li>xl dmesg: Xen hypervisor log — debug için kritik</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> domU konfigürasyonu — xl.cfg</h2>
+  <p class="section-lead">Her domU, bir xl.cfg konfigürasyon dosyasıyla tanımlanır. Bu dosya domU'nun bellek, CPU, disk, ağ ve kernel parametrelerini belirler.</p>
+
+  <h3>Tam xl.cfg örneği — Linux domU</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/xen/linux-domu.cfg — tam örnek</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Domain adı</span>
+name = "linux-domu"
+
+<span class="cmt"># Bellek (MB)</span>
+memory = 256
+maxmem = 512      <span class="cmt"># balloon ile bu değere kadar artabilir</span>
+
+<span class="cmt"># vCPU sayısı</span>
+vcpus = 2
+maxvcpus = 4
+
+<span class="cmt"># vCPU affinity (fiziksel CPU 2-3'e pin)</span>
+cpus = "2-3"
+
+<span class="cmt"># Kernel ve initrd (dom0 filesystem'inden)</span>
+kernel = "/boot/Image"
+ramdisk = "/boot/initramfs.cpio.gz"
+
+<span class="cmt"># Kernel komut satırı</span>
+cmdline = "console=hvc0 earlyprintk=xen loglevel=8 root=/dev/xvda rw"
+
+<span class="cmt"># Disk — blktap2 veya loopback</span>
+disk = [
+    "format=raw, vdev=xvda, access=rw, target=/var/lib/xen/images/domu.img",
+    "format=raw, vdev=xvdb, access=ro, target=/var/lib/xen/data.img"
+]
+
+<span class="cmt"># Ağ arayüzü</span>
+vif = [
+    "type=netfront, bridge=xenbr0, mac=00:16:3e:00:00:01",
+    "type=netfront, bridge=xenbr1, mac=00:16:3e:00:00:02"
+]
+
+<span class="cmt"># Sanal USB (isteğe bağlı)</span>
+<span class="cmt"># usbctrl = ["type=qusb, version=2"]</span>
+
+<span class="cmt"># GIC versiyonu (ARM)</span>
+gic_version = "v3"
+
+<span class="cmt"># IOMMU passthrough yok (varsayılan)</span>
+<span class="cmt"># passthrough = "no"</span>
+
+<span class="cmt"># Otomatik yeniden başlatma</span>
+on_poweroff = "destroy"
+on_reboot = "restart"
+on_crash = "restart"
+
+<span class="cmt"># UUID (isteğe bağlı)</span>
+<span class="cmt"># uuid = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"</span></code></pre>
+  </div>
+
+  <h3>Disk image oluşturma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — domU disk image hazırlama</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Boş disk image oluştur (2GB)</span>
+<span class="cmd">dd</span> if=/dev/zero of=/var/lib/xen/images/domu.img bs=1M count=2048
+
+<span class="cmt"># Dosya sistemi formatla</span>
+<span class="cmd">mkfs.ext4</span> /var/lib/xen/images/domu.img
+
+<span class="cmt"># Image'ı mount et ve root filesystem doldur</span>
+<span class="cmd">mkdir</span> -p /mnt/domu
+<span class="cmd">mount</span> -o loop /var/lib/xen/images/domu.img /mnt/domu
+
+<span class="cmt"># Minimal rootfs kopyala (Yocto output'undan)</span>
+<span class="cmd">tar</span> -xf core-image-minimal-imx8mp.tar.gz -C /mnt/domu
+<span class="cmd">umount</span> /mnt/domu</code></pre>
+  </div>
+
+  <h3>Network bridge kurulumu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — xenbr0 bridge kurulumu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Bridge oluştur</span>
+<span class="cmd">brctl</span> addbr xenbr0
+<span class="cmd">ip</span> link set xenbr0 up
+
+<span class="cmt"># Fiziksel arayüzü bridge'e ekle</span>
+<span class="cmd">brctl</span> addif xenbr0 eth0
+<span class="cmd">ip</span> link set eth0 up
+
+<span class="cmt"># IP adresi bridge'e ver</span>
+<span class="cmd">ip</span> addr add 192.168.1.100/24 dev xenbr0
+
+<span class="cmt"># Kalıcı /etc/network/interfaces</span>
+<span class="cmt"># auto xenbr0</span>
+<span class="cmt"># iface xenbr0 inet static</span>
+<span class="cmt">#   address 192.168.1.100</span>
+<span class="cmt">#   bridge_ports eth0</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>xl.cfg: memory/vcpus/kernel/disk/vif — domU tanım dosyası</li>
+      <li>cpus: fiziksel CPU affinity — "2-3" ile CPU pinleme</li>
+      <li>disk: raw/qcow2 format, blktap2 veya loopback</li>
+      <li>vif + xenbr0 bridge: domU ağ erişimi</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> PV vs HVM — ARM'da fark</h2>
+  <p class="section-lead">Xen'de ARM için iki temel guest türü vardır: PV (Paravirtualized) ve HVM (Hardware Virtual Machine). ARM'da full PV desteği kısıtlıdır; çoğu durumda PVH veya HVM tercih edilir.</p>
+
+  <h3>ARM'da guest türleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Tür</th><th>ARM Desteği</th><th>Stage-2 MMU</th><th>I/O</th><th>Önerilen</th></tr></thead>
+      <tbody>
+        <tr><td>PV</td><td>Sınırlı (x86 odaklı)</td><td>Yok (MMU shared)</td><td>Hypercall</td><td>Hayır (ARM)</td></tr>
+        <tr><td>HVM</td><td>Tam — hardware-assisted</td><td>Var</td><td>Emülasyon veya virtio</td><td>Evet</td></tr>
+        <tr><td>PVH</td><td>Tam — ARM64 default</td><td>Var</td><td>PV sürücüler</td><td>Evet (önerilen)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>ARM domU türü belirleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>xl.cfg — guest türü seçimi</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># ARM64'te PVH (varsayılan)</span>
+<span class="cmt"># ARM'da type belirtilmesi çoğunlukla otomatiktir</span>
+<span class="cmt"># Xen 4.17+ ile ARM64 PVH default</span>
+
+<span class="cmt"># Kernel komut satırında earlyprintk Xen üzerinden</span>
+cmdline = "console=hvc0 earlyprintk=xen"
+
+<span class="cmt"># PV sürücüler guest kernelde etkin olmalı</span>
+<span class="cmt"># CONFIG_XEN_BLKDEV_FRONTEND=y</span>
+<span class="cmt"># CONFIG_XEN_NETDEV_FRONTEND=y</span>
+<span class="cmt"># CONFIG_HVC_XEN=y  (Xen virtual console)</span>
+<span class="cmt"># CONFIG_HVC_XEN_FRONTEND=y</span></code></pre>
+  </div>
+
+  <h3>xen-blkfront ve xen-netfront</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — PV sürücü doğrulama (domU içinde)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Dom U üzerinde PV sürücüleri kontrol et</span>
+<span class="cmd">cat</span> /sys/hypervisor/type
+<span class="cmt"># xen</span>
+
+<span class="cmd">cat</span> /sys/hypervisor/version/major
+<span class="cmt"># 4</span>
+
+<span class="cmt"># Xenbus cihazları</span>
+<span class="cmd">ls</span> /sys/bus/xen/devices/
+<span class="cmt"># vbd-51712   vif-0</span>
+
+<span class="cmt"># Disk sürücüsü</span>
+<span class="cmd">lsblk</span>
+<span class="cmt"># xvda     202:0    0   2G  0 disk</span>
+<span class="cmt"># └─xvda1  202:1    0   2G  0 part /</span>
+
+<span class="cmt"># Ağ arayüzü</span>
+<span class="cmd">ip</span> link show
+<span class="cmt"># 2: eth0: ... xen_netfront</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>ARM64 Xen: PVH default — Stage-2 MMU + PV sürücüler</li>
+      <li>HVM: emülasyon + virtio I/O — değiştirilmemiş guest kernel</li>
+      <li>xen-blkfront/netfront: PV I/O — yüksek throughput</li>
+      <li>hvc0 console: Xen sanal seri port — debug için</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> dom0-less boot</h2>
+  <p class="section-lead">Xen dom0-less boot, dom0 Linux başlatılmadan doğrudan domU'ların çalıştırılmasına izin verir. Bu özellik özellikle güvenlik açısından kritik: dom0 saldırı yüzeyi tamamen ortadan kalkar.</p>
+
+  <h3>dom0-less kavramı</h3>
+  <p>Geleneksel Xen modelinde dom0 hem donanım sürücülerine erişim sağlar hem de domU'ları yönetir. dom0-less modelde bu görev U-Boot veya başka bir bootloader tarafından üstlenilir. domU'lar doğrudan Xen tarafından başlatılır.</p>
+
+  <div class="flow">
+    <pre>
+Geleneksel:   U-Boot → Xen → dom0 (Linux) → domU-1, domU-2
+dom0-less:    U-Boot → Xen → domU-1 (Linux), domU-2 (RTOS)
+    </pre>
+  </div>
+
+  <h3>Device Tree ile dom0-less konfigürasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>DTS — dom0-less Xen konfigürasyonu</span><span class="dot">●</span></div>
+    <pre><code">/ {
+    chosen {
+        xen,xen-bootargs = "console=dtuart dtuart=serial0 dom0_mem=0 bootscrub=0";
+
+        /* domU-1: Linux */
+        domU1 {
+            compatible = "xen,domain";
+            #address-cells = &lt;1&gt;;
+            #size-cells = &lt;1&gt;;
+            memory = &lt;0x1 0x00000000&gt;;    /* 256MB (lo+hi) */
+            cpus = &lt;1&gt;;
+            vpl011;  /* virtual PL011 UART */
+
+            module@1 {
+                compatible = "multiboot,kernel", "multiboot,module";
+                reg = &lt;0x47000000 0x1000000&gt;;
+                bootargs = "console=ttyAMA0 root=/dev/ram0";
+            };
+
+            module@2 {
+                compatible = "multiboot,ramdisk", "multiboot,module";
+                reg = &lt;0x48000000 0x2000000&gt;;
+            };
+        };
+
+        /* domU-2: bare-metal RTOS */
+        domU2 {
+            compatible = "xen,domain";
+            memory = &lt;0x0 0x10000000&gt;;    /* 256MB */
+            cpus = &lt;1&gt;;
+            direct-map;  /* 1:1 bellek haritası */
+
+            module@1 {
+                compatible = "multiboot,kernel", "multiboot,module";
+                reg = &lt;0x50000000 0x200000&gt;;
+            };
+        };
+    };
+};</code></pre>
+  </div>
+
+  <h3>dom0-less avantaj ve kısıtlar</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Avantaj: Güvenlik</span><span class="desc">Dom0 yok → dom0 exploit edilemez → tüm sistemi kontrol eden bir kompromi noktası yok</span></div>
+    <div class="param"><span class="name">Avantaj: Hız</span><span class="desc">Dom0 başlatma süresi yok — domU'lar boot'tan hemen sonra çalışır</span></div>
+    <div class="param"><span class="name">Kısıt: Yönetim</span><span class="desc">xl toolstack yok — runtime domain yönetimi mümkün değil, bootloader ile statik</span></div>
+    <div class="param"><span class="name">Kısıt: I/O</span><span class="desc">Dom0 backend yok — device passthrough veya ayrı driver domain gerekli</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>dom0-less: dom0 olmadan doğrudan domU boot — güvenlik artışı</li>
+      <li>Device Tree ile domU tanımı — bootloader tarafından yüklenir</li>
+      <li>vpl011: sanal UART — domU debug konsolu</li>
+      <li>Kısıt: xl toolstack yok — statik konfigürasyon zorunlu</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Device passthrough — IOMMU</h2>
+  <p class="section-lead">Device passthrough, fiziksel bir donanım aygıtını doğrudan bir domU'ya atama işlemidir. SMMU/IOMMU desteği bu özellik için zorunludur.</p>
+
+  <h3>Passthrough konfigürasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>xl.cfg — device passthrough</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># Tüm IOMMU grubunu domU'ya ata</span>
+passthrough = "full"
+
+<span class="cmt"># IOMMU grubu — /sys/kernel/iommu_groups/</span>
+<span class="cmt"># PCI device passthrough</span>
+pci = [
+    "0000:01:00.0,seize=1",    <span class="cmt"># PCIe NIC</span>
+    "0000:01:00.1,seize=1"     <span class="cmt"># aynı IOMMU grubundaki ikinci fonksiyon</span>
+]
+
+<span class="cmt"># ARM platform device passthrough (non-PCI)</span>
+dtdev = ["/soc/serial@30880000"]  <span class="cmt"># UART3 passthrough</span>
+irqs = [53, 54]                   <span class="cmt"># ilgili IRQ'lar</span>
+iomem = ["0x30880,1"]             <span class="cmt"># MMIO bölgesi (0x30880000, 1 page)</span></code></pre>
+  </div>
+
+  <h3>IOMMU grup doğrulama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — IOMMU grup ve passthrough kontrolü</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># Xen IOMMU etkinliğini kontrol et</span>
+<span class="cmd">xl</span> info | grep iommu
+<span class="cmt"># iommu                 : 1</span>
+
+<span class="cmt"># Cihaz sürücüsünü ayır (unbind)</span>
+<span class="cmd">echo</span> 0000:01:00.0 &gt; /sys/bus/pci/drivers/e1000e/unbind
+
+<span class="cmt"># Cihazı Xen pciback sürücüsüne bağla</span>
+<span class="cmd">echo</span> 0000:01:00.0 &gt; /sys/bus/pci/drivers/pciback/new_id
+
+<span class="cmt"># Alternatif: VFIO ile</span>
+<span class="cmd">modprobe</span> vfio-pci
+<span class="cmd">echo</span> "8086 1234" &gt; /sys/bus/pci/drivers/vfio-pci/new_id
+
+<span class="cmt"># Xen'de cihaz durumu</span>
+<span class="cmd">xl</span> pci-list-assignable-devices
+<span class="cmt"># 0000:01:00.0</span>
+
+<span class="cmt"># Çalışan domain'e PCI cihaz ekle (hot-plug)</span>
+<span class="cmd">xl</span> pci-attach linux-domu 0000:01:00.0</code></pre>
+  </div>
+
+  <h3>ARM platform device passthrough</h3>
+  <p>ARM SoC'larda çoğu peripheral PCI bus'ta değil, platform bus'ta bulunur. Bu cihazlar için DTDEV mekanizması kullanılır. Device tree node yolu ve ilgili MMIO + IRQ atanır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — ARM platform device passthrough kontrolü</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># SMMU stream tablosunu kontrol et</span>
+<span class="cmd">dmesg</span> | grep -i "smmu\|iommu" | head -20
+<span class="cmt"># [  0.456789] arm-smmu-v3 9050000.smmu: probing...</span>
+<span class="cmt"># [  0.456800] arm-smmu-v3 9050000.smmu: SMMUv3 features: 0x00000e73</span>
+
+<span class="cmt"># Xen dmesg'de IOMMU hata var mı?</span>
+<span class="cmd">xl</span> dmesg | grep -i "iommu\|smmu"
+<span class="cmt"># (XEN) ARM: IOMMU: 9050000 initialized</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>passthrough="full": tüm IOMMU grubu domU'ya — PCI cihazlar için</li>
+      <li>dtdev/irqs/iomem: ARM platform device passthrough — non-PCI</li>
+      <li>pciback vs vfio-pci: sürücü ayırma yöntemleri</li>
+      <li>SMMU zorunlu: passthrough için donanım IOMMU şart</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> virtio-net ve virtio-blk</h2>
+  <p class="section-lead">Virtio, Xen ve KVM gibi hypervisor'larda kullanılan standart paravirtualized I/O framework'üdür. Dom0 backend + domU frontend çiftiyle çalışır.</p>
+
+  <h3>Xen virtio mimarisi</h3>
+
+  <div class="flow">
+    <pre>
+DomU (guest):
+  virtio-net frontend sürücüsü
+       ↓ (xenbus üzerinden)
+Dom0 (host):
+  xen-netback kernel modülü
+       ↓
+  xenbr0 bridge → fiziksel NIC
+    </pre>
+  </div>
+
+  <h3>virtio-net kurulumu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — virtio-net backend (dom0)</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># Dom0'da backend modülleri</span>
+<span class="cmd">modprobe</span> xen-netback
+<span class="cmd">modprobe</span> xen-blkback
+
+<span class="cmt"># DomU oluşturulduktan sonra vif kontrol</span>
+<span class="cmd">ip</span> link show
+<span class="cmt"># vif1.0: ... xen_netback</span>
+<span class="cmt"># Bu arayüz dom0 tarafında domU'nun NIC backend'ini temsil eder</span>
+
+<span class="cmt"># DomU network performans testi</span>
+<span class="cmt"># Dom0'da iperf server</span>
+<span class="cmd">iperf3</span> -s
+
+<span class="cmt"># DomU'da iperf client</span>
+<span class="cmd">iperf3</span> -c 192.168.1.100 -t 10
+<span class="cmt"># [  5]   0.00-10.00  sec  8.50 GBytes  7.30 Gbits/sec</span></code></pre>
+  </div>
+
+  <h3>virtio-blk disk performansı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — virtio disk I/O testi</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># Dom0'da blktap2 veya xen-blkback</span>
+<span class="cmd">modprobe</span> xen-blkback
+
+<span class="cmt"># DomU içinde disk I/O testi</span>
+<span class="cmd">dd</span> if=/dev/xvda of=/dev/null bs=1M count=512 iflag=direct
+<span class="cmt"># 512+0 records out</span>
+<span class="cmt"># 536870912 bytes (537 MB) copied, 0.456 s, 1.2 GB/s</span>
+
+<span class="cmt"># fio ile daha kapsamlı test</span>
+<span class="cmd">fio</span> --name=seq-read --rw=read --bs=1M \
+    --filename=/dev/xvda --direct=1 --runtime=30
+<span class="cmt"># READ: bw=1200MiB/s (1258MB/s)</span></code></pre>
+  </div>
+
+  <h3>Grant table mekanizması</h3>
+  <p>Xen PV I/O transferlerinde <strong>grant table</strong> mekanizması kullanılır. DomU, bellek sayfalarını dom0'a "grant" eder; dom0 backend bu sayfaları doğrudan okur/yazar. Bu yaklaşım kopyasız (zero-copy) I/O sağlar.</p>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>xen-netback/blkback: dom0 backend modülleri</li>
+      <li>xen-netfront/blkfront: domU frontend sürücüleri</li>
+      <li>Grant table: zero-copy I/O için bellek paylaşımı</li>
+      <li>Performans: virtio-net ~7Gbps, virtio-blk ~1.2GB/s (i.MX8)</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> FLASK/XSM güvenlik modeli</h2>
+  <p class="section-lead">Xen Security Modules (XSM), Xen hypervisor için MAC (Mandatory Access Control) politikası uygulama çerçevesidir. FLASK (Flux Advanced Security Kernel) bu çerçevenin default implementasyonudur.</p>
+
+  <h3>XSM/FLASK mimarisi</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">XSM Framework</span><span class="desc">Xen içindeki hook altyapısı — her hypercall ve kaynak erişiminde politika kontrol edilir</span></div>
+    <div class="param"><span class="name">FLASK Module</span><span class="desc">SELinux benzeri Type Enforcement — subject/object/permission modeli</span></div>
+    <div class="param"><span class="name">Policy Database</span><span class="desc">Binary politika dosyası — domain türleri, izinler ve geçişler tanımlanır</span></div>
+    <div class="param"><span class="name">Security Labels</span><span class="desc">Her domain bir güvenlik etiketiyle (SID) ilişkilendirilir</span></div>
+  </div>
+
+  <h3>FLASK politika örneği</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>policy/flask/policy.te — XSM politikası</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># Dom türlerini tanımla</span>
+type dom0_t;
+type domu_t;
+type rtos_t;
+
+<span class="cmt"># Dom0 her şeye erişebilir (privileged)</span>
+allow dom0_t domain_t : domain { create destroy pause unpause };
+allow dom0_t domain_t : grant { map_read map_write };
+
+<span class="cmt"># DomU yalnızca kendi operasyonlarına</span>
+allow domu_t domu_t : domain { pause unpause };
+allow domu_t xen_t : xen { hypercall console_io };
+
+<span class="cmt"># RTOS domU: iletişim yasak (izolasyon)</span>
+<span class="cmt"># rtos_t → domu_t : grant { } — izin yok = denied</span>
+
+<span class="cmt"># Event channel — sadece belirli domU çiftleri</span>
+allow domu_t domu_t : event { send };
+allow rtos_t dom0_t : event { send };  <span class="cmt"># sadece dom0'a</span></code></pre>
+  </div>
+
+  <h3>FLASK etkinleştirme ve pratik</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — FLASK kurulumu ve test (i.MX8)</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># Xen bootargs: FLASK enforcing modda başlat</span>
+<span class="cmt"># /boot/extlinux.conf:</span>
+<span class="cmt"># APPEND xen.gz flask=enforcing flask_bootparam_override=1</span>
+
+<span class="cmt"># FLASK durumu kontrol</span>
+<span class="cmd">xenctl</span> -e flask getenforce
+<span class="cmt"># Enforcing</span>
+
+<span class="cmt"># Politika yükle</span>
+<span class="cmd">flask-loadpolicy</span> /etc/xen/flask.policy
+
+<span class="cmt"># Domain güvenlik label sorgula</span>
+<span class="cmd">xl</span> getenforce 1
+<span class="cmt"># Enforcing</span>
+
+<span class="cmt"># Domaine özel label (xl.cfg)</span>
+<span class="cmt"># seclabel = "system_u:system_r:domu_t"</span>
+
+<span class="cmt"># XSM ihlallerini izle</span>
+<span class="cmd">xl</span> dmesg | grep "Flask"
+<span class="cmt"># (XEN) Flask: avc:  denied  { map_read } for domid=2 target=0</span></code></pre>
+  </div>
+
+  <h3>Pratik: i.MX8 üzerinde Xen + Linux dom0 + minimal Linux domU</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — i.MX8 tam Xen test prosedürü</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># 1. Boot ve dom0 doğrulama</span>
+<span class="cmd">xl</span> info | grep -E "host|total_memory|free_memory"
+<span class="cmt"># host               : imx8mp-evk</span>
+<span class="cmt"># total_memory       : 4096</span>
+<span class="cmt"># free_memory        : 3456</span>
+
+<span class="cmt"># 2. Minimal Linux domU başlat</span>
+<span class="cmd">cat</span> &gt; /etc/xen/minimal-domu.cfg &lt;&lt; 'EOF'
+name = "minimal-linux"
+memory = 256
+vcpus = 1
+kernel = "/boot/Image"
+cmdline = "console=hvc0 init=/bin/sh"
+disk = ["format=raw,vdev=xvda,access=rw,target=/var/lib/xen/minimal.img"]
+vif = ["bridge=xenbr0"]
+EOF
+
+<span class="cmd">xl</span> create /etc/xen/minimal-domu.cfg -c
+<span class="cmt"># Parsing config from /etc/xen/minimal-domu.cfg</span>
+<span class="cmt"># (domU kernel başlıyor)</span>
+<span class="cmt"># / #  ← minimal shell</span>
+
+<span class="cmt"># 3. Dom0'dan doğrulama (başka terminalde)</span>
+<span class="cmd">xl</span> list
+<span class="cmt"># Name          ID  Mem  VCPUs  State   Time(s)</span>
+<span class="cmt"># Domain-0       0  512     2   r----   245.6</span>
+<span class="cmt"># minimal-linux  1  256     1   -b---    12.3</span>
+
+<span class="cmt"># 4. Dom0-domU ping testi</span>
+<span class="cmt"># DomU'da:</span>
+<span class="cmd">ip</span> addr add 192.168.1.200/24 dev eth0
+<span class="cmd">ip</span> link set eth0 up
+<span class="cmt"># Dom0'da:</span>
+<span class="cmd">ping</span> -c 3 192.168.1.200
+<span class="cmt"># 64 bytes from 192.168.1.200: icmp_seq=1 ttl=64 time=0.456 ms</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>XSM/FLASK: Xen için MAC politikası — SELinux benzeri Type Enforcement</li>
+      <li>FLASK enforcing: tüm domain operasyonları politikaya tabi</li>
+      <li>seclabel xl.cfg: her domain'e güvenlik etiketi atama</li>
+      <li>i.MX8 pratik: xl create + console + ping — end-to-end test</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

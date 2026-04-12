@@ -1,0 +1,659 @@
+---
+layout: tutorial
+title: "Linux FPGA Manager — Runtime Bitstream Yükleme"
+back_url: "../index.html"
+back_label: "FPGA & Linux"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>FPGA &amp; LINUX</span>
+    <span>SÜRÜCÜ</span>
+    <span>2026</span>
+  </div>
+  <h1>Linux FPGA Manager<br><em>Runtime Bitstream Yükleme</em></h1>
+  <p class="subtitle">Linux FPGA Manager subsystem, fpga_region ve fpga_bridge, Device Tree overlay akışı, tam ve kısmi yeniden yapılandırma, sysfs arayüzü ve RPi + Zynq pratik uygulaması.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Linux FPGA Manager subsystem'e genel bakış</a></li>
+    <li><a href="#s1">fpga_region ve fpga_bridge kavramları</a></li>
+    <li><a href="#s2">Device Tree overlay ile FPGA overlay</a></li>
+    <li><a href="#s3">Tam yeniden yapılandırma (full reconfiguration)</a></li>
+    <li><a href="#s4">Kısmi yeniden yapılandırma (partial reconfiguration)</a></li>
+    <li><a href="#s5">FPGA bridge etkinleştirme/devre dışı bırakma</a></li>
+    <li><a href="#s6">xilinx-pr-decoupler</a></li>
+    <li><a href="#s7">sysfs arayüzü ile yapılandırma</a></li>
+    <li><a href="#s8">Pratik: Zynq runtime DT overlay ile bitstream yükleme</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Linux FPGA Manager subsystem'e genel bakış</h2>
+  <p class="section-lead">Linux FPGA Manager subsystem (v4.7+, <code>drivers/fpga/</code>), FPGA yeniden yapılandırmasını standart bir kernel API'si üzerinden soyutlar. Her FPGA türü için özel bir driver yazmak yerine, tek bir sysfs/device tree overlay arayüzü kullanılır.</p>
+
+  <h3>Subsystem bileşenleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">fpga_manager</span><span class="desc">FPGA yapılandırma donanımına erişen alt seviye sürücü; bitstream yazmak için kullanılır</span></div>
+    <div class="param"><span class="name">fpga_region</span><span class="desc">FPGA'nın yapılandırılabilir bölgesini temsil eder; birden fazla region kısmi yeniden yapılandırmaya olanak tanır</span></div>
+    <div class="param"><span class="name">fpga_bridge</span><span class="desc">PS-PL veri yolu köprüsü; yapılandırma sırasında kapatılır, tamamlandığında açılır</span></div>
+    <div class="param"><span class="name">fpga_image_info</span><span class="desc">Bitstream meta verisi: dosya adı, flags, PR bölge bilgisi</span></div>
+  </div>
+
+  <h3>Desteklenen FPGA platformları</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Sürücü</th><th>Platform</th><th>Dosya</th></tr></thead>
+      <tbody>
+        <tr><td>zynq-fpga</td><td>Xilinx Zynq-7000</td><td>drivers/fpga/zynq-fpga.c</td></tr>
+        <tr><td>zynqmp-fpga</td><td>Zynq UltraScale+ MPSoC</td><td>drivers/fpga/zynqmp-fpga.c</td></tr>
+        <tr><td>socfpga</td><td>Intel Cyclone V SoC</td><td>drivers/fpga/socfpga.c</td></tr>
+        <tr><td>altera-ps-spi</td><td>Altera (PS-SPI)</td><td>drivers/fpga/altera-ps-spi.c</td></tr>
+        <tr><td>ice40-spi</td><td>Lattice iCE40 (SPI)</td><td>drivers/fpga/ice40-spi.c</td></tr>
+        <tr><td>xilinx-spi</td><td>Xilinx (SPI slave serial)</td><td>drivers/fpga/xilinx-spi.c</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Sysfs arayüzü</h3>
+  <div class="code-block">
+    <div class="code-header"><span>/sys/class/fpga_manager/ — temel arayüz</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># FPGA manager listeleme</span>
+ls /sys/class/fpga_manager/
+<span class="cmt"># → fpga0</span>
+
+<span class="cmt"># Mevcut durum</span>
+cat /sys/class/fpga_manager/fpga0/state
+<span class="cmt"># → operating  (yapılandırılmış ve çalışıyor)</span>
+<span class="cmt"># → unknown    (henüz yapılandırılmamış)</span>
+<span class="cmt"># → writing    (bitstream yazılıyor)</span>
+
+<span class="cmt"># İsim ve status flags</span>
+cat /sys/class/fpga_manager/fpga0/name
+cat /sys/class/fpga_manager/fpga0/status</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>FPGA Manager: kernel API ile FPGA yapılandırmasını soyutlar (v4.7+)</li>
+      <li>fpga_manager + fpga_region + fpga_bridge: üç temel kavram</li>
+      <li>zynq-fpga, zynqmp-fpga, socfpga: platform özel sürücüler</li>
+      <li>/sys/class/fpga_manager/fpga0/state: çalışma durumu izleme</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> fpga_region ve fpga_bridge kavramları</h2>
+  <p class="section-lead">fpga_region, belirli bir FPGA alanını temsil eder ve o alanı yönetmek için gerekli manager ve bridge referanslarını içerir. fpga_bridge, yapılandırma sırasında PS-PL arasındaki veri yolunu kontrol eder.</p>
+
+  <h3>fpga_region yapısı (kernel)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>include/linux/fpga/fpga-region.h (özet)</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">struct</span> fpga_region {
+    <span class="keyword">struct</span> device           dev;
+    <span class="keyword">struct</span> fpga_manager    *mgr;         <span class="cmt">/* hangi manager kullanılacak */</span>
+    <span class="keyword">struct</span> list_head        bridge_list; <span class="cmt">/* hangi bridge'ler kontrol edilecek */</span>
+    <span class="keyword">struct</span> fpga_image_info *info;        <span class="cmt">/* bitstream bilgisi */</span>
+    <span class="keyword">int</span>                   (*get_bridges)(<span class="keyword">struct</span> fpga_region *);
+    <span class="keyword">int</span>                     priv;
+};</code></pre>
+  </div>
+
+  <h3>Bridge durumları</h3>
+  <div class="params">
+    <div class="param"><span class="name">enabled (açık)</span><span class="desc">PS-PL veri yolu aktif; PL periferallere erişilebilir; normal çalışma modu</span></div>
+    <div class="param"><span class="name">disabled (kapalı)</span><span class="desc">Veri yolu kapatılmış; bitstream yazımı sırasında zorunlu; PS'i tanımsız davranıştan korur</span></div>
+  </div>
+
+  <h3>Zynq-7000 bridge listesi</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Bridge</th><th>DT compatible</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td>HP0–HP3 slave AXI</td><td>xlnx,zynq-axi-fpga-port-hp</td><td>PL→DDR yüksek performans portları</td></tr>
+        <tr><td>GP0/GP1 master AXI</td><td>xlnx,zynq-axi-fpga-port-gp</td><td>PS→PL genel amaç portları</td></tr>
+        <tr><td>ACP</td><td>xlnx,zynq-axi-fpga-port-acp</td><td>Önbellek tutarlı PL erişimi</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Bridge'in neden kapatılması gerekir?</h3>
+  <p>Bitstream yazımı sırasında PL'deki lojik tanımsız durumdadır: register'lar rastgele değerler üretebilir, DMA motorları hatalı veri yazabilir, kesme hatları çok sayıda sahte kesme üretebilir. Bridge kapatılarak PS DDR'ı ve sistem bus'ı bu durumdan korunur.</p>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>fpga_region: FPGA alanı + manager + bridge listesi — tek yapılandırma birimi</li>
+      <li>fpga_bridge: bitstream yazımı öncesi kapatılır, sonra açılır</li>
+      <li>Zynq bridge'leri: HP0–HP3, GP0/GP1, ACP portları</li>
+      <li>Bridge kapatma zorunluluğu: PL tanımsız durumdayken DDR koruması</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Device Tree overlay ile FPGA overlay</h2>
+  <p class="section-lead">Device Tree overlay (DTBO), yeni bir bitstream yüklendiğinde PL'deki yeni periferalleri tanımlamak için dinamik olarak kernel'a eklenir. Bu sayede yeniden önyükleme gerekmez.</p>
+
+  <h3>FPGA overlay DTS şablonu</h3>
+  <div class="code-block">
+    <div class="code-header"><span>fpga-overlay.dts — tam şablon</span><span class="dot">●</span></div>
+    <pre><code>/dts-v1/;
+/plugin/;  <span class="cmt">/* Overlay olduğunu belirtir */</span>
+
+/ {
+    fragment&#64;0 {
+        target = &lt;&amp;fpga_full&gt;;
+        __overlay__ {
+            <span class="cmt">/* Bitstream dosya adı (firmware/fpga/ dizininde) */</span>
+            firmware-name = <span class="str">"design_1_wrapper.bit.bin"</span>;
+        };
+    };
+
+    fragment&#64;1 {
+        target = &lt;&amp;amba&gt;;
+        __overlay__ {
+            <span class="cmt">/* PL'deki yeni AXI-Lite periferali */</span>
+            my_periph: my-periph&#64;40000000 {
+                compatible = <span class="str">"myco,my-periph-1.0"</span>;
+                reg = &lt;0x40000000 0x10000&gt;;
+                clocks = &lt;&amp;clkc 15&gt;;
+                clock-names = <span class="str">"s00_axi_aclk"</span>;
+                interrupts = &lt;0 29 4&gt;;
+                interrupt-parent = &lt;&amp;gic&gt;;
+                status = <span class="str">"okay"</span>;
+            };
+        };
+    };
+};</code></pre>
+  </div>
+
+  <h3>Bitstream formatı: .bit → .bit.bin</h3>
+  <div class="code-block">
+    <div class="code-header"><span>.bit dosyasını .bit.bin'e dönüştürme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># dd ile Xilinx .bit başlığını kaldır (ilk 96 byte genellikle başlıktır)
+# Kesin offset: xxd design.bit | head -4 ile byte swap noktasını bul</span>
+
+<span class="cmt"># Yöntem 1: bootgen (Vitis/Petalinux araçları)</span>
+bootgen -arch zynq -process_bitstream bin -image design.bit
+
+<span class="cmt"># Yöntem 2: Python ile byte swap + başlık kaldırma</span>
+python3 - &lt;&lt;'EOF'
+import struct
+
+<span class="keyword">with</span> open(<span class="str">'design.bit'</span>, <span class="str">'rb'</span>) as fin:
+    data = fin.read()
+
+<span class="cmt"># Başlık boyutunu bul (0xFF 0xFF... dizisini ara)</span>
+i = data.index(b'\xff\xff\xff\xff')
+raw = data[i:]
+
+<span class="cmt"># Her 4 byte'ı byte-swap yap (Xilinx bit-endian → byte-swap)</span>
+out = bytearray()
+<span class="keyword">for</span> k <span class="keyword">in</span> range(0, len(raw), 4):
+    chunk = raw[k:k+4]
+    <span class="keyword">if</span> len(chunk) == 4:
+        out.extend(bytes(reversed(chunk)))
+
+<span class="keyword">with</span> open(<span class="str">'design.bit.bin'</span>, <span class="str">'wb'</span>) as fout:
+    fout.write(out)
+print(f<span class="str">'Yazıldı: {len(out)} byte'</span>)
+EOF</code></pre>
+  </div>
+
+  <h3>DTBO derleme</h3>
+  <div class="code-block">
+    <div class="code-header"><span>DTBO derleme ve yükleme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># DTS → DTBO derleme</span>
+dtc -@ -I dts -O dtb -o fpga-overlay.dtbo fpga-overlay.dts
+
+<span class="cmt"># Bitstream'i firmware dizinine kopyala</span>
+cp design.bit.bin /lib/firmware/
+
+<span class="cmt"># DTBO yükleme (configfs overlay interface)</span>
+mkdir /sys/kernel/config/device-tree/overlays/fpga0
+cp fpga-overlay.dtbo /sys/kernel/config/device-tree/overlays/fpga0/dtbo
+
+<span class="cmt"># Durum kontrolü</span>
+cat /sys/kernel/config/device-tree/overlays/fpga0/status
+<span class="cmt"># → applied</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>DTBO: /plugin/ direktifiyle overlay; fragment&#64;0 bitstream, fragment&#64;1 periferaller</li>
+      <li>.bit → .bit.bin: başlık kaldırma + byte swap (bootgen veya Python)</li>
+      <li>dtc -@: overlay desteğiyle derleme (phandle referansları korunur)</li>
+      <li>configfs: /sys/kernel/config/device-tree/overlays/ — runtime DTBO yükleme</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Tam yeniden yapılandırma (full reconfiguration)</h2>
+  <p class="section-lead">Tam yeniden yapılandırma, tüm PL dokusunu yeni bir bitstream ile programlar. Tüm mevcut PL tasarımı silinir ve yenisi yüklenir.</p>
+
+  <h3>Yeniden yapılandırma akışı</h3>
+  <div class="flow">
+    <pre>
+  1. Sürücü: fpga_region_program_fpga() çağrısı
+  2. Bridge'leri devre dışı bırak (fpga_bridges_disable)
+  3. fpga_mgr_load(): bitstream → FPGA yapılandırma mantığı
+     a. state = FPGA_MGR_STATE_WRITE_INIT
+     b. state = FPGA_MGR_STATE_WRITE (chunk'lar halinde)
+     c. state = FPGA_MGR_STATE_WRITE_COMPLETE
+  4. Bridge'leri etkinleştir (fpga_bridges_enable)
+  5. fpga_region'a DT overlay'i uygula (yeni periferaller)
+  6. state = FPGA_MGR_STATE_OPERATING</pre>
+  </div>
+
+  <h3>fpga_image_info yapısı</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Kernel sürücüsü — tam yeniden yapılandırma örneği</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/fpga/fpga-mgr.h&gt;
+#include &lt;linux/fpga/fpga-region.h&gt;
+
+<span class="keyword">static</span> int load_full_bitstream(<span class="keyword">struct</span> fpga_region *region,
+                                <span class="keyword">const</span> <span class="keyword">char</span> *firmware_name)
+{
+    <span class="keyword">struct</span> fpga_image_info *info;
+    int ret;
+
+    info = fpga_image_info_alloc(&amp;region-&gt;dev);
+    <span class="keyword">if</span> (!info)
+        <span class="keyword">return</span> -ENOMEM;
+
+    info-&gt;firmware_name = devm_kstrdup(&amp;region-&gt;dev,
+                                        firmware_name, GFP_KERNEL);
+    info-&gt;flags = 0;   <span class="cmt">/* FPGA_MGR_PARTIAL_RECONFIG değil */</span>
+
+    region-&gt;info = info;
+    ret = fpga_region_program_fpga(region);
+
+    fpga_image_info_free(info);
+    <span class="keyword">return</span> ret;
+}</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>Tam yeniden yapılandırma sırasında PL üzerinde çalışan tüm DMA işlemleri, aktif kesme kaynakları ve PL bağlantılı sürücüler önceden durdurulmalıdır. Aksi hâlde sistem kilitlenmesi veya bellek bozulması yaşanabilir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Tam yapılandırma: WRITE_INIT → WRITE → WRITE_COMPLETE → OPERATING</li>
+      <li>Bridge'ler yazım öncesi kapatılır, sonra açılır</li>
+      <li>fpga_image_info: firmware_name + flags; flags=0 → tam yapılandırma</li>
+      <li>Önceki DMA/IRQ'ları durdur: sistem kilitlenmesinden kaçın</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Kısmi yeniden yapılandırma (partial reconfiguration)</h2>
+  <p class="section-lead">Kısmi Yeniden Yapılandırma (Partial Reconfiguration — PR), PL'nin yalnızca belirli bir bölümünü yeniden programlarken geri kalanın çalışmaya devam etmesini sağlar. Vivado'da özel PR akışı gerektirir.</p>
+
+  <h3>Vivado PR tasarım gereksinimleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">Statik bölge</span><span class="desc">Değişmeyen PL tasarımı — toplam bitstream ile yüklenir; AXI Interconnect ve köprüler burada</span></div>
+    <div class="param"><span class="name">Reconfigurable Partition (RP)</span><span class="desc">Pconfig primitive ile çevrili bölge; PR bitstream ile yeniden programlanabilir</span></div>
+    <div class="param"><span class="name">Reconfigurable Module (RM)</span><span class="desc">RP için farklı implementasyon; her RM için ayrı .pbit/.pbin dosyası üretilir</span></div>
+    <div class="param"><span class="name">PR Decoupler</span><span class="desc">RP'ye giren/çıkan sinyalleri yapılandırma sırasında izole eder — tanımsız sinyal yayılmasını önler</span></div>
+  </div>
+
+  <h3>Linux'ta PR yükleme</h3>
+  <div class="code-block">
+    <div class="code-header"><span>FPGA_MGR_PARTIAL_RECONFIG flag ile PR yükleme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Kısmi bitstream için flags */</span>
+info-&gt;flags = FPGA_MGR_PARTIAL_RECONFIG;
+info-&gt;firmware_name = <span class="str">"partial_rm1.bin"</span>;
+
+<span class="cmt">/* PR region için ayrı fpga_region tanımlanmış olmalı */</span>
+ret = fpga_region_program_fpga(pr_region);
+
+<span class="cmt">/* Sysfs'ten PR yükleme (configfs overlay) */</span>
+<span class="cmt"># mkdir /sys/kernel/config/device-tree/overlays/pr_rm1</span>
+<span class="cmt"># cp pr-overlay.dtbo /sys/kernel/config/device-tree/overlays/pr_rm1/dtbo</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>PR: statik bölge çalışırken RP yeniden programlanır — kesinti yok</li>
+      <li>Vivado PR flow: RP tanımla → RM implementasyonları → .pbin üret</li>
+      <li>FPGA_MGR_PARTIAL_RECONFIG: Linux'ta kısmi yükleme için flag</li>
+      <li>PR Decoupler: RP izolasyonu — tanımsız sinyal yayılması önlenir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> FPGA bridge etkinleştirme/devre dışı bırakma</h2>
+  <p class="section-lead">Linux FPGA Manager, bridge'leri otomatik yönetir. Ancak bazı durumlarda manuel bridge kontrolü gerekebilir: hata kurtarma, özel yeniden yapılandırma sekansları veya tanılama.</p>
+
+  <h3>Kernel API</h3>
+  <div class="code-block">
+    <div class="code-header"><span>fpga_bridge — kernel API (C)</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/fpga/fpga-bridge.h&gt;
+
+<span class="cmt">/* Tek bridge kontrolü */</span>
+<span class="keyword">struct</span> fpga_bridge *bridge;
+bridge = of_fpga_bridge_get(dev-&gt;of_node, NULL);
+<span class="keyword">if</span> (IS_ERR(bridge)) { <span class="cmt">/* ... */</span> }
+
+fpga_bridge_disable(bridge);    <span class="cmt">/* Veri yolunu kapat */</span>
+<span class="cmt">/* ... bitstream yükleme ... */</span>
+fpga_bridge_enable(bridge);     <span class="cmt">/* Veri yolunu aç */</span>
+fpga_bridge_put(bridge);
+
+<span class="cmt">/* Birden fazla bridge'i senkron kontrolü */</span>
+LIST_HEAD(bridge_list);
+fpga_bridge_get_to_list(dev-&gt;of_node, NULL, &amp;bridge_list);
+fpga_bridges_disable(&amp;bridge_list);
+<span class="cmt">/* ... */</span>
+fpga_bridges_enable(&amp;bridge_list);
+fpga_bridges_put(&amp;bridge_list);</code></pre>
+  </div>
+
+  <h3>Sysfs bridge kontrolü</h3>
+  <div class="code-block">
+    <div class="code-header"><span>/sys/class/fpga_bridge/ — bridge durumu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Bridge'leri listele</span>
+ls /sys/class/fpga_bridge/
+<span class="cmt"># → br0  br1  br2  br3</span>
+
+<span class="cmt"># Bridge durumu</span>
+cat /sys/class/fpga_bridge/br0/state
+<span class="cmt"># → enabled veya disabled</span>
+
+<span class="cmt"># Manuel devre dışı bırakma</span>
+echo 0 > /sys/class/fpga_bridge/br0/enable
+echo 1 > /sys/class/fpga_bridge/br0/enable</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>fpga_bridge_disable/enable: tekil bridge kontrolü</li>
+      <li>fpga_bridges_disable/enable: listedeki tüm bridge'leri atomik kontrol</li>
+      <li>/sys/class/fpga_bridge/br0/enable: sysfs üzerinden manuel kontrol</li>
+      <li>Tanımlama: of_fpga_bridge_get() — DT node'undan bridge al</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> xilinx-pr-decoupler</h2>
+  <p class="section-lead">PR Decoupler, Reconfigurable Partition ile statik bölge arasındaki sinyalleri yapılandırma sırasında izole eden bir IP bloğudur. Linux'ta <code>xlnx,pr-decoupler</code> sürücüsü ile yönetilir.</p>
+
+  <h3>PR Decoupler çalışma prensibi</h3>
+  <div class="flow">
+    <pre>
+  Statik Bölge → [PR Decoupler] → Reconfigurable Partition
+
+  Yapılandırma başlamadan önce:
+    Decoupler: sinyalleri kes (tüm girişler sabit değer)
+    Bridge: devre dışı bırak
+
+  Bitstream yazımı:
+    RP tanımsız durumda
+    Decoupler sinyalleri izole eder → statik bölge etkilenmez
+
+  Yapılandırma tamamlandıktan sonra:
+    Bridge: etkinleştir
+    Decoupler: sinyalleri geçir (normal çalışma)</pre>
+  </div>
+
+  <h3>Device Tree tanımı</h3>
+  <div class="code-block">
+    <div class="code-header"><span>PR Decoupler — DTS</span><span class="dot">●</span></div>
+    <pre><code>pr_decoupler_0: pr-decoupler&#64;40010000 {
+    compatible = <span class="str">"xlnx,pr-decoupler-1.00"</span>, <span class="str">"xlnx,pr-decoupler"</span>;
+    reg = &lt;0x40010000 0x10&gt;;
+    clocks = &lt;&amp;clkc 15&gt;;
+    clock-names = <span class="str">"aclk"</span>;
+    #fpga-bridge-cells = &lt;0&gt;;
+};
+
+<span class="cmt">/* fpga_region bu bridge'i kullanır */</span>
+fpga-region0 {
+    compatible = <span class="str">"fpga-region"</span>;
+    fpga-mgr = &lt;&amp;devcfg&gt;;
+    fpga-bridges = &lt;&amp;pr_decoupler_0&gt;;
+    #address-cells = &lt;1&gt;;
+    #size-cells = &lt;1&gt;;
+    ranges;
+};</code></pre>
+  </div>
+
+  <h3>Decoupler sysfs kontrolü</h3>
+  <div class="code-block">
+    <div class="code-header"><span>PR Decoupler — sysfs</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Decoupler'ı etkinleştir (izolasyon başlat)</span>
+echo 0 > /sys/class/fpga_bridge/pr_decoupler_0/enable
+
+<span class="cmt"># PR bitstream yükle...</span>
+
+<span class="cmt"># Decoupler'ı devre dışı bırak (normal çalışma)</span>
+echo 1 > /sys/class/fpga_bridge/pr_decoupler_0/enable</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>PR Decoupler: statik←→RP sinyal izolasyonu; yapılandırma sırasında zorunlu</li>
+      <li>xlnx,pr-decoupler: Linux sürücüsü — fpga_bridge API ile entegre</li>
+      <li>DTS: #fpga-bridge-cells = &lt;0&gt;; fpga_region'a bağlanır</li>
+      <li>Sıra: decoupler kapat → bridge kapat → bitstream → bridge aç → decoupler aç</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> sysfs arayüzü ile yapılandırma</h2>
+  <p class="section-lead">Linux FPGA Manager subsystem, sysfs üzerinden kullanıcı alanından doğrudan bitstream yüklemeye olanak tanır. Bu yöntem basit senaryolar ve hata ayıklama için uygundur.</p>
+
+  <h3>Sysfs üzerinden bitstream yükleme</h3>
+  <div class="code-block">
+    <div class="code-header"><span>sysfs — bitstream yükleme adımları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1. Bitstream'i firmware dizinine kopyala</span>
+cp design.bit.bin /lib/firmware/design.bit.bin
+
+<span class="cmt"># 2. FPGA manager'ı bul</span>
+ls /sys/class/fpga_manager/
+<span class="cmt"># → fpga0</span>
+
+<span class="cmt"># 3. Mevcut durum</span>
+cat /sys/class/fpga_manager/fpga0/state
+<span class="cmt"># → operating</span>
+
+<span class="cmt"># 4. Bitstream dosya adını yaz (yükleme başlar)</span>
+echo "design.bit.bin" > /sys/class/fpga_manager/fpga0/firmware
+
+<span class="cmt"># 5. Yükleme durumunu izle</span>
+cat /sys/class/fpga_manager/fpga0/state
+<span class="cmt"># → writing ... → operating (başarı)</span>
+<span class="cmt"># → write_err       (hata)</span></code></pre>
+  </div>
+
+  <h3>Hata durumları ve çözümleri</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Durum</th><th>Anlamı</th><th>Çözüm</th></tr></thead>
+      <tbody>
+        <tr><td>write_err</td><td>Bitstream yazımı başarısız</td><td>dmesg'i kontrol et; .bit.bin formatını doğrula</td></tr>
+        <tr><td>write_init_err</td><td>FPGA başlatma hatası</td><td>PS reset; saat frekansı kontrolü</td></tr>
+        <tr><td>write_complete_err</td><td>DONE sinyali gelmedi</td><td>Hedef cihaz eşleşmesi; bit-endian kontrolü</td></tr>
+        <tr><td>unknown</td><td>Henüz yapılandırılmamış</td><td>Normal; boot sonrası ilk yükleme öncesi</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>flags sysfs attribute</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Partial reconfiguration via sysfs flags</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># PR için flags yaz (FPGA_MGR_PARTIAL_RECONFIG = 1)</span>
+echo 1 > /sys/class/fpga_manager/fpga0/flags
+echo "partial_rm.bin" > /sys/class/fpga_manager/fpga0/firmware
+
+<span class="cmt"># Tam yapılandırma için flags sıfırla</span>
+echo 0 > /sys/class/fpga_manager/fpga0/flags</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>firmware attribute: dosya adı yazınca yükleme başlar (/lib/firmware/ aranır)</li>
+      <li>state attribute: operating/writing/write_err — durum izleme</li>
+      <li>flags attribute: 0=tam yapılandırma, 1=kısmi yapılandırma (PR)</li>
+      <li>write_err: dmesg + .bit.bin format doğrulama ile tanı</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: Zynq runtime DT overlay ile bitstream yükleme</h2>
+  <p class="section-lead">Bu bölümde Zynq-7000 tabanlı bir sistemde (veya Zynq'e bağlı Raspberry Pi senaryosunda) runtime DT overlay kullanılarak yeni bir bitstream yüklenecek ve PL'deki yeni periferale erişilecektir.</p>
+
+  <h3>Senaryo</h3>
+  <p>Zynq-7000 (ZedBoard / PYNQ-Z2) üzerinde Linux çalışıyor. Başlangıçta PL boş (veya başka bir tasarım yüklü). Çalışma sırasında yeni bir AXI-Lite LED denetleyici bitstream'i yüklenecek ve DT overlay ile periferale erişilecek.</p>
+
+  <h3>Adım 1: Kernel yapılandırması</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Gerekli kernel config seçenekleri</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># menuconfig'de etkinleştir</span>
+CONFIG_FPGA=y
+CONFIG_FPGA_MGR_ZYNQ_FPGA=y
+CONFIG_FPGA_REGION=y
+CONFIG_FPGA_BRIDGE=y
+CONFIG_OF_OVERLAY=y
+CONFIG_OF_CONFIGFS=y   <span class="cmt"># configfs DT overlay için</span></code></pre>
+  </div>
+
+  <h3>Adım 2: Bitstream hazırlama</h3>
+  <div name="code-block" class="code-block">
+    <div class="code-header"><span>Bitstream dönüştürme ve kopyalama</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Vivado'dan alınan design_1_wrapper.bit → .bit.bin</span>
+bootgen -arch zynq -process_bitstream bin \
+        -image design_1_wrapper.bit
+
+<span class="cmt"># Zynq Linux'a SCP ile kopyala</span>
+scp design_1_wrapper.bit.bin root&#64;192.168.1.1:/lib/firmware/
+
+<span class="cmt"># Zynq'te doğrula</span>
+ls -la /lib/firmware/design_1_wrapper.bit.bin</code></pre>
+  </div>
+
+  <h3>Adım 3: DT overlay oluşturma</h3>
+  <div class="code-block">
+    <div class="code-header"><span>led-fpga-overlay.dts</span><span class="dot">●</span></div>
+    <pre><code>/dts-v1/;
+/plugin/;
+
+/ {
+    fragment&#64;0 {
+        target = &lt;&amp;fpga_full&gt;;
+        __overlay__ {
+            firmware-name = <span class="str">"design_1_wrapper.bit.bin"</span>;
+        };
+    };
+
+    fragment&#64;1 {
+        target = &lt;&amp;amba&gt;;
+        __overlay__ {
+            led_ctrl: led-ctrl&#64;40000000 {
+                compatible = <span class="str">"xlnx,led-ctrl-1.0"</span>;
+                reg = &lt;0x40000000 0x10000&gt;;
+                clocks = &lt;&amp;clkc 15&gt;;
+                clock-names = <span class="str">"s00_axi_aclk"</span>;
+                status = <span class="str">"okay"</span>;
+            };
+        };
+    };
+};</code></pre>
+  </div>
+
+  <h3>Adım 4: Overlay derleme ve uygulama</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Zynq üzerinde overlay uygulama</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># DTBO derleme (çapraz derleme veya hedef üzerinde)</span>
+dtc -@ -I dts -O dtb -o led-fpga-overlay.dtbo led-fpga-overlay.dts
+
+<span class="cmt"># configfs mount (genellikle zaten mount edilmiş)</span>
+mount -t configfs configfs /sys/kernel/config
+
+<span class="cmt"># Overlay uygula</span>
+mkdir /sys/kernel/config/device-tree/overlays/led_fpga
+cp led-fpga-overlay.dtbo \
+   /sys/kernel/config/device-tree/overlays/led_fpga/dtbo
+
+<span class="cmt"># Durum kontrol</span>
+cat /sys/kernel/config/device-tree/overlays/led_fpga/status
+<span class="cmt"># → applied</span>
+
+<span class="cmt"># FPGA manager durumu</span>
+cat /sys/class/fpga_manager/fpga0/state
+<span class="cmt"># → operating</span>
+
+<span class="cmt"># Yeni periferali doğrula</span>
+ls /sys/bus/platform/devices/ | grep led
+<span class="cmt"># → 40000000.led-ctrl</span></code></pre>
+  </div>
+
+  <h3>Adım 5: LED periferalini test et</h3>
+  <div class="code-block">
+    <div class="code-header"><span>LED test — /dev/mem ile</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># devmem2 aracıyla (genellikle Zynq Linux'ta mevcut)</span>
+devmem2 0x40000000 w 0xFF   <span class="cmt"># Tüm LED'leri yak</span>
+devmem2 0x40000000 w 0x00   <span class="cmt"># Söndür</span>
+devmem2 0x40000000 w 0xAA   <span class="cmt"># Alternatif desen</span>
+
+<span class="cmt"># dmesg çıktısında overlay ve sürücü logları</span>
+dmesg | tail -20
+<span class="cmt"># [  42.123] fpga_manager fpga0: writing design_1_wrapper.bit.bin to Xilinx Zynq FPGA Manager
+# [  43.456] fpga_manager fpga0: state transition: operating</span>
+
+<span class="cmt"># Overlay'i kaldır (PL sıfırlanmaz, sadece DT kaldırılır)</span>
+rmdir /sys/kernel/config/device-tree/overlays/led_fpga</code></pre>
+  </div>
+
+  <div class="callout tip">
+    <div class="label">İPUCU</div>
+    <p>PYNQ framework (Jupyter üzerinden Python), aynı FPGA Manager subsystem'i kullanır ancak Python API'siyle sarmalar. <code>from pynq import Overlay; ol = Overlay("design.bit")</code> komutu aynı DT overlay mekanizmasını tetikler. Düşük seviye anlamak için kernel akışını öğrenmek önemlidir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Kernel config: FPGA_MGR_ZYNQ_FPGA + FPGA_REGION + OF_OVERLAY + OF_CONFIGFS</li>
+      <li>bootgen -process_bitstream bin: .bit → .bit.bin dönüşümü</li>
+      <li>configfs overlay: mkdir + cp dtbo → state: applied</li>
+      <li>Temizlik: rmdir overlay dizini — DT kaldırılır; PL yeniden yapılandırılmaz</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>
