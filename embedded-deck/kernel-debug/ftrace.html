@@ -1,0 +1,622 @@
+---
+layout: tutorial
+title: "ftrace — Kernel Fonksiyon Tracing"
+back_url: "../index.html"
+back_label: "Kernel Debug Araçları"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>KERNEL DEBUG</span>
+    <span>TRACING</span>
+    <span>2026</span>
+  </div>
+  <h1>ftrace —<br><em>kernel fonksiyon tracing.</em></h1>
+  <p class="subtitle">tracefs arayüzü üzerinden, kernel'a tek satır kod eklemeden her fonksiyonun ne zaman çağrıldığını, ne kadar sürdüğünü ve hangi çağrı zinciriyle geldiğini öğren.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">ftrace nedir — tracefs ve Mcount</a></li>
+    <li><a href="#s1">function tracer — temel kullanım</a></li>
+    <li><a href="#s2">function_graph tracer — çağrı grafiği</a></li>
+    <li><a href="#s3">set_ftrace_filter — belirli fonksiyonu izle</a></li>
+    <li><a href="#s4">trace-cmd — kullanıcı dostu sarmalayıcı</a></li>
+    <li><a href="#s5">Tracepoint'lar — statik izleme noktaları</a></li>
+    <li><a href="#s6">perf ile ftrace entegrasyonu</a></li>
+    <li><a href="#s7">kernelshark — görsel analiz</a></li>
+    <li><a href="#s8">Pratik: I2C transfer latency izleme</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> ftrace nedir — tracefs ve Mcount</h2>
+  <p class="section-lead">ftrace, Linux kernel'ın yerleşik tracing altyapısıdır. Kaynak değişikliği gerektirmeden, çalışan bir kernel'da fonksiyon düzeyinde izleme yapmanı sağlar.</p>
+
+  <p>ftrace, kernel derleme zamanında eklenen <strong>Mcount instrumentation</strong> mekanizmasına dayanır. Derleyici (<code class="inline">gcc -pg</code> veya <code class="inline">-mfentry</code>), her fonksiyonun girişine küçük bir çağrı talimatı yerleştirir. ftrace etkin olmadığında bu talimatlar <code class="inline">NOP</code> (no-operation) olarak çalışır — performans etkisi ihmal edilebilir düzeydedir. ftrace etkinleştirildiğinde ise bu NOP'lar, çalışma zamanında gerçek izleme koduna yönlendirilen <code class="inline">call</code> talimatlarına dönüşür.</p>
+
+  <h3>tracefs — kontrol arayüzü</h3>
+
+  <p>ftrace, <code class="inline">tracefs</code> dosya sistemi üzerinden kontrol edilir. Çoğu dağıtımda <code class="inline">debugfs</code> içine bağlanmıştır:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># tracefs mount durumunu kontrol et</span>
+mount | grep tracefs
+<span class="cmt"># tracefs on /sys/kernel/debug/tracing type tracefs (rw,relatime)</span>
+
+<span class="cmt"># ya da doğrudan debugfs içinde:</span>
+ls /sys/kernel/debug/tracing/
+<span class="cmt"># available_tracers  current_tracer  tracing_on  trace  set_ftrace_filter ...</span>
+
+<span class="cmt"># mount edilmemişse:</span>
+mount -t tracefs nodev /sys/kernel/tracing</code></pre>
+  </div>
+
+  <h3>Temel dosyalar</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">current_tracer</div><div class="desc">Aktif tracer'ın adı. <code class="inline">nop</code> (devre dışı), <code class="inline">function</code>, <code class="inline">function_graph</code> gibi değerler alır.</div></div>
+    <div class="param"><div class="name">available_tracers</div><div class="desc">Kernel'da derlenmiş tüm tracer'ların listesi.</div></div>
+    <div class="param"><div class="name">tracing_on</div><div class="desc">1 = tracing aktif, 0 = durduruldu. Ring buffer dolar endişesi olmadan hızlı durdurma için kullanılır.</div></div>
+    <div class="param"><div class="name">trace</div><div class="desc">Ring buffer içeriği — okunabilir metin formatında.</div></div>
+    <div class="param"><div class="name">trace_pipe</div><div class="desc">Ring buffer'dan canlı akış. <code class="inline">cat trace_pipe</code> ile gerçek zamanlı izle.</div></div>
+    <div class="param"><div class="name">set_ftrace_filter</div><div class="desc">İzlenecek fonksiyon filtresi. Boşsa tüm fonksiyonlar izlenir.</div></div>
+    <div class="param"><div class="name">set_ftrace_notrace</div><div class="desc">Bu dosyaya yazılan fonksiyonlar izlenmez — kara liste.</div></div>
+    <div class="param"><div class="name">buffer_size_kb</div><div class="desc">Her CPU başına ring buffer boyutu (KB).</div></div>
+  </div>
+
+  <h3>Gerekli kernel konfigürasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig</span><span class="dot">●</span></div>
+    <pre><code>CONFIG_FTRACE=y
+CONFIG_FUNCTION_TRACER=y
+CONFIG_FUNCTION_GRAPH_TRACER=y
+CONFIG_DYNAMIC_FTRACE=y          <span class="cmt"># NOP → call dönüşümü için gerekli</span>
+CONFIG_FTRACE_SYSCALLS=y         <span class="cmt"># sistem çağrısı tracepoint'leri</span>
+CONFIG_ENABLE_DEFAULT_TRACERS=y</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">GÜVENLIK</div>
+    <p>tracefs dosyalarına erişim için <code class="inline">root</code> veya <code class="inline">CAP_SYS_ADMIN</code> yetkisi gereklidir. Üretim sistemlerinde tracefs'i bağlamayı veya izinleri kısıtlamayı düşün: <code class="inline">chmod 700 /sys/kernel/debug/tracing</code>.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> function tracer — temel kullanım</h2>
+  <p class="section-lead">function tracer, her kernel fonksiyon çağrısını zaman damgasıyla birlikte kaydeder. En basit ve en kapsamlı tracer'dır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># tracefs dizinine geç (root olarak)</span>
+cd /sys/kernel/debug/tracing
+
+<span class="cmt"># mevcut tracer'ları listele</span>
+cat available_tracers
+<span class="cmt"># blk function_graph preemptirq irqsoff function nop</span>
+
+<span class="cmt"># function tracer'ı aktifleştir</span>
+echo function > current_tracer
+
+<span class="cmt"># tracing'i başlat</span>
+echo 1 > tracing_on
+
+<span class="cmt"># ... birkaç saniye bekle ya da tetikleyici komutu çalıştır ...</span>
+
+<span class="cmt"># tracing'i durdur</span>
+echo 0 > tracing_on
+
+<span class="cmt"># sonuçları oku</span>
+cat trace | head -50</code></pre>
+  </div>
+
+  <h3>Örnek çıktı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>trace çıktısı</span><span class="dot">●</span></div>
+    <pre><code># tracer: function
+#
+# entries-in-buffer/entries-written: 142521/142521   #P:4
+#
+#                              _-----=> irqs-off
+#                             / _----=> need-resched
+#                            | / _---=> hardirq/softirq
+#                            || / _--=> preempt-depth
+#                            ||| /
+#           TASK-PID   CPU#  ||||    TIMESTAMP  FUNCTION
+#              | |       |   ||||       |         |
+          bash-1234  [001] .... 12345.678901: mutex_lock <-do_sys_open
+          bash-1234  [001] .... 12345.678912: _raw_spin_lock <-mutex_lock
+          bash-1234  [001] .... 12345.678923: do_sys_open <-__x64_sys_openat
+          bash-1234  [001] .... 12345.678934: getname_flags <-do_sys_open</code></pre>
+  </div>
+
+  <p>Her satır: görev adı ve PID, CPU numarası, flag'ler (interrupt/preempt durumu), zaman damgası (saniye.mikrosaniye) ve fonksiyon adı ile çağıran fonksiyon.</p>
+
+  <h3>Ring buffer'ı temizle</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># buffer'ı sil, yeni bir oturum başlat</span>
+echo > trace
+
+<span class="cmt"># tracer'ı sıfırla</span>
+echo nop > current_tracer</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT — performans</div>
+    <p>Filtresiz function tracer, saniyede milyonlarca kayıt üretebilir. Ring buffer dolduğunda en eski kayıtların üzerine yazar. Uzun süreli izleme için mutlaka <code class="inline">set_ftrace_filter</code> kullan veya <code class="inline">trace_pipe</code>'ı bir dosyaya yönlendir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> function_graph tracer — çağrı grafiği</h2>
+  <p class="section-lead">function_graph tracer, fonksiyon girişini ve çıkışını kaydeder; girintili çağrı grafiği ve her fonksiyonun süresini gösterir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code>cd /sys/kernel/debug/tracing
+
+echo function_graph > current_tracer
+echo 1 > tracing_on
+<span class="cmt"># ... test işlemi ...</span>
+echo 0 > tracing_on
+cat trace | head -60</code></pre>
+  </div>
+
+  <h3>Örnek çıktı — girintili çağrı grafiği</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>trace çıktısı</span><span class="dot">●</span></div>
+    <pre><code># tracer: function_graph
+#
+# CPU  DURATION                  FUNCTION CALLS
+# |     |   |                     |   |   |   |
+ 1)               |  do_sys_open() {
+ 1)               |    getname_flags() {
+ 1)   0.842 us    |      kmem_cache_alloc();
+ 1)   1.205 us    |      strncpy_from_user();
+ 1) + 3.721 us    |    }
+ 1)               |    alloc_fd() {
+ 1)   0.543 us    |      _raw_spin_lock();
+ 1)   0.401 us    |      expand_fdtable();
+ 1)   1.802 us    |    }
+ 1) ! 102.34 us   |    path_openat();
+ 1) + 112.5 us    |  }</code></pre>
+  </div>
+
+  <p>Süre göstergesi: <code class="inline">+</code> işareti 10 µs'den uzun, <code class="inline">!</code> işareti 100 µs'den uzun, <code class="inline">$</code> işareti 1 ms'den uzun fonksiyonları vurgular. Latency analizi için son derece kullanışlıdır.</p>
+
+  <h3>İzleme derinliğini sınırla</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># sadece 3 seviye derinliğe kadar izle (çıktıyı yönetilebilir tutar)</span>
+echo 3 > max_graph_depth
+
+<span class="cmt"># belirli bir göreve göre filtrele (PID ile)</span>
+echo $$ > set_ftrace_pid   <span class="cmt"># mevcut shell'in PID'i</span>
+
+<span class="cmt"># tüm CPU'lar yerine sadece CPU 0'da izle</span>
+echo 0 > tracing_cpumask</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">KULLANIM ÖNERİSİ</div>
+    <p><code class="inline">function_graph</code> tracer, bir fonksiyonun neden yavaş çalıştığını anlamak için idealdir. <code class="inline">set_ftrace_filter</code> ile giriş fonksiyonunu belirt, <code class="inline">max_graph_depth</code> ile derinliği sınırla — böylece gürültü olmadan net bir çağrı ağacı elde edersin.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> set_ftrace_filter — belirli fonksiyonu izle</h2>
+  <p class="section-lead">Tüm kernel fonksiyonlarını izlemek yerine, yalnızca ilgilendiğin fonksiyonları seçmek hem performans hem de okunabilirlik açısından kritiktir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code>cd /sys/kernel/debug/tracing
+
+<span class="cmt"># tek bir fonksiyon izle</span>
+echo 'do_sys_open' > set_ftrace_filter
+
+<span class="cmt"># birden fazla fonksiyon (her satıra bir tane, ya da boşlukla ayır)</span>
+echo 'do_sys_open vfs_read vfs_write' > set_ftrace_filter
+
+<span class="cmt"># wildcard ile — "i2c_" ile başlayan tüm fonksiyonlar</span>
+echo 'i2c_*' > set_ftrace_filter
+
+<span class="cmt"># mevcut filtreye ekle (> yerine >>)</span>
+echo 'mutex_lock' >> set_ftrace_filter
+
+<span class="cmt"># filtreyi görüntüle</span>
+cat set_ftrace_filter
+
+<span class="cmt"># filtreyi temizle (tüm fonksiyonları izle)</span>
+echo > set_ftrace_filter</code></pre>
+  </div>
+
+  <h3>Mevcut kernel fonksiyonlarını listele</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># izlenebilir tüm fonksiyonlar</span>
+cat available_filter_functions | wc -l
+<span class="cmt"># 65432 (kernel versiyonuna göre değişir)</span>
+
+<span class="cmt"># i2c ile ilgili fonksiyonları bul</span>
+grep '^i2c_' available_filter_functions
+<span class="cmt"># i2c_transfer</span>
+<span class="cmt"># i2c_master_send</span>
+<span class="cmt"># i2c_master_recv</span>
+<span class="cmt"># i2c_smbus_read_byte_data</span>
+<span class="cmt"># ...</span>
+
+<span class="cmt"># modül fonksiyonları da izlenebilir (modül adıyla)</span>
+grep '\[my_driver\]' available_filter_functions</code></pre>
+  </div>
+
+  <h3>set_graph_function — function_graph ile birlikte</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># function_graph tracer'da yalnızca bu fonksiyondan başla</span>
+echo 'i2c_transfer' > set_graph_function
+echo function_graph > current_tracer
+echo 1 > tracing_on</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">İPUCU — modül yükleme</div>
+    <p>Kernel modülü içindeki fonksiyonlar, modül yüklendikten sonra <code class="inline">available_filter_functions</code>'a eklenir. Modülü yükle, filtreyi ayarla, sonra test et.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> trace-cmd — kullanıcı dostu sarmalayıcı</h2>
+  <p class="section-lead">trace-cmd, ftrace'in tracefs dosyalarını doğrudan yazmak yerine tek bir komutla kontrol etmeni sağlayan araçtır. Kaydı ikili formatta saklar ve raporlama yapabilir.</p>
+
+  <h3>Kurulum</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Debian/Ubuntu</span>
+apt install trace-cmd
+
+<span class="cmt"># Buildroot</span>
+BR2_PACKAGE_TRACE_CMD=y
+
+<span class="cmt"># Yocto</span>
+IMAGE_INSTALL += "trace-cmd"</code></pre>
+  </div>
+
+  <h3>Temel kayıt ve rapor</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># function tracer ile kayıt başlat (Ctrl+C ile durdur)</span>
+trace-cmd record -p function
+
+<span class="cmt"># belirli fonksiyonu filtrele</span>
+trace-cmd record -p function -l 'i2c_transfer' -- i2cget -y 1 0x50 0x00
+
+<span class="cmt"># function_graph ile derinlik sınırlı kayıt</span>
+trace-cmd record -p function_graph --max-graph-depth 4 -l 'do_sys_open' -- ls /tmp
+
+<span class="cmt"># tracepoint kayıt (olay bazlı)</span>
+trace-cmd record -e 'i2c:*' -- i2cdetect -y 1
+
+<span class="cmt"># kayıt sonucunu görüntüle (trace.dat dosyasından)</span>
+trace-cmd report
+
+<span class="cmt"># başka makinede oluşturulan trace.dat dosyasını görüntüle</span>
+trace-cmd report -i /path/to/trace.dat</code></pre>
+  </div>
+
+  <h3>trace-cmd report çıktısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash çıktısı</span><span class="dot">●</span></div>
+    <pre><code>cpus=4
+         i2cget-892   [001] 23456.789012: i2c_transfer: i2c-1 #1 a=050 f=0000 l=1 [W]
+         i2cget-892   [001] 23456.789098: i2c_transfer: i2c-1 #2 a=050 f=0001 l=1 [R]
+         i2cget-892   [001] 23456.789201: function:             i2c_transfer</code></pre>
+  </div>
+
+  <h3>Faydalı trace-cmd seçenekleri</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">-p &lt;tracer&gt;</div><div class="desc">Kullanılacak plugin: <code class="inline">function</code>, <code class="inline">function_graph</code>, <code class="inline">nop</code>.</div></div>
+    <div class="param"><div class="name">-l &lt;func&gt;</div><div class="desc">Fonksiyon filtresi — <code class="inline">set_ftrace_filter</code>'a yazar. Wildcard destekler.</div></div>
+    <div class="param"><div class="name">-e &lt;event&gt;</div><div class="desc">Tracepoint olayı etkinleştir: <code class="inline">-e 'sched:*'</code> veya <code class="inline">-e 'irq:irq_handler_entry'</code>.</div></div>
+    <div class="param"><div class="name">-P &lt;pid&gt;</div><div class="desc">Yalnızca bu PID'i izle.</div></div>
+    <div class="param"><div class="name">-b &lt;size&gt;</div><div class="desc">CPU başına ring buffer boyutu (KB).</div></div>
+    <div class="param"><div class="name">-o &lt;file&gt;</div><div class="desc">Çıktı dosyası (varsayılan: <code class="inline">trace.dat</code>).</div></div>
+    <div class="param"><div class="name">list -e</div><div class="desc">Mevcut tüm event'leri listele: <code class="inline">trace-cmd list -e</code>.</div></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Tracepoint'lar — statik izleme noktaları</h2>
+  <p class="section-lead">Tracepoint'lar, kernel kaynak koduna yerleştirilmiş statik izleme kancalarıdır. ftrace'in dinamik fonksiyon izlemesinden farklı olarak, tracepoint'lar belirli kernel olaylarını (schedule, irq, block I/O vb.) düşük overhead ile izler.</p>
+
+  <h3>Mevcut tracepoint'ları keşfet</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># tüm kullanılabilir olayları listele</span>
+cat /sys/kernel/debug/tracing/available_events | head -20
+<span class="cmt"># block:block_rq_complete</span>
+<span class="cmt"># block:block_rq_insert</span>
+<span class="cmt"># i2c:i2c_read</span>
+<span class="cmt"># i2c:i2c_write</span>
+<span class="cmt"># irq:irq_handler_entry</span>
+<span class="cmt"># sched:sched_switch</span>
+<span class="cmt"># sched:sched_wakeup</span>
+<span class="cmt"># skb:kfree_skb</span>
+
+<span class="cmt"># alt sistem bazında ara</span>
+ls /sys/kernel/debug/tracing/events/
+<span class="cmt"># block  ext4  i2c  irq  kmem  net  sched  skb  tcp  ...</span></code></pre>
+  </div>
+
+  <h3>Tracepoint etkinleştirme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code>cd /sys/kernel/debug/tracing
+
+<span class="cmt"># sched_switch tracepoint'ini etkinleştir</span>
+echo 'sched:sched_switch' > set_event
+
+<span class="cmt"># birden fazla olay</span>
+echo 'sched:sched_switch
+i2c:i2c_read
+i2c:i2c_write' > set_event
+
+<span class="cmt"># alt sistem altındaki tüm olayları etkinleştir</span>
+echo 'i2c:*' > set_event
+
+<span class="cmt"># doğrudan enable dosyasını kullanmak (daha seçici)</span>
+echo 1 > events/i2c/i2c_read/enable
+echo 1 > events/i2c/i2c_write/enable
+
+<span class="cmt"># tüm olayları devre dışı bırak</span>
+echo > set_event</code></pre>
+  </div>
+
+  <h3>Tracepoint event formatını incele</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># i2c_read event'inin alan formatı</span>
+cat /sys/kernel/debug/tracing/events/i2c/i2c_read/format
+<span class="cmt"># name: i2c_read</span>
+<span class="cmt"># ID: 312</span>
+<span class="cmt"># format:</span>
+<span class="cmt">#   field:int adapter_nr;  offset:8; size:4;</span>
+<span class="cmt">#   field:__u16 addr;      offset:12; size:2;</span>
+<span class="cmt">#   field:__u16 flags;     offset:14; size:2;</span>
+<span class="cmt">#   field:__u16 len;       offset:16; size:2;</span>
+
+<span class="cmt"># event'i filtrele — sadece adapter 1 ve adres 0x50</span>
+echo 'adapter_nr == 1 && addr == 0x50' > events/i2c/i2c_read/filter</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">TRACEPOINT vs FUNCTION</div>
+    <p>Tracepoint'lar, kernel geliştiricileri tarafından kasıtlı olarak yerleştirilen API kararlı izleme noktalarıdır. Kernel versiyonları arasında anlam değişmez. Fonksiyon izleme ise ham ve gelişigüzel — iç API'ler yeniden adlandırılabilir. Olay bazlı analiz için tracepoint'leri tercih et.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> perf ile ftrace entegrasyonu</h2>
+  <p class="section-lead">perf aracı, ftrace altyapısını kullanabilen ve buna ek olarak CPU PMU (Performance Monitoring Unit) sayaçlarına erişen güçlü bir performans analiz aracıdır.</p>
+
+  <h3>perf ftrace komutu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># function tracer ile izle</span>
+perf ftrace -G do_sys_open ls /tmp
+
+<span class="cmt"># function_graph tracer ile belirli fonksiyona odaklan</span>
+perf ftrace -T i2c_transfer -- i2cget -y 1 0x50 0x00
+
+<span class="cmt"># tracepoint olaylarını kaydet</span>
+perf record -e 'i2c:*' -- i2cget -y 1 0x50 0x00
+perf report
+
+<span class="cmt"># sched olaylarıyla CPU göç analizi</span>
+perf record -e 'sched:sched_migrate_task' -a sleep 5
+perf script</code></pre>
+  </div>
+
+  <h3>perf stat ile sayaç bazlı analiz</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># temel CPU sayaçları</span>
+perf stat -e cycles,instructions,cache-misses,cache-references ./myprogram
+
+<span class="cmt"># örnek çıktı:</span>
+<span class="cmt">#  Performance counter stats for './myprogram':</span>
+<span class="cmt">#    1,234,567,890  cycles</span>
+<span class="cmt">#    2,345,678,901  instructions    # 1.90 insn per cycle</span>
+<span class="cmt">#          123,456  cache-misses    # 2.34% of all cache refs</span>
+<span class="cmt">#        5,267,890  cache-references</span>
+<span class="cmt">#        0.456789123 seconds time elapsed</span></code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">GÖMÜLÜ SISTEMLER</div>
+    <p>ARM tabanlı gömülü sistemlerde PMU sayaçlarına erişmek için kernel'ın <code class="inline">CONFIG_HW_PERF_EVENTS=y</code> ile derlenmiş olması ve platform PMU sürücüsünün yüklü olması gerekir. Bazı minimal kernel yapılandırmalarında bu özellikler devre dışıdır.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> kernelshark — görsel analiz</h2>
+  <p class="section-lead">kernelshark, trace-cmd'nin ürettiği trace.dat dosyalarını görsel olarak incelemek için bir Qt tabanlı GUI uygulamasıdır. Zaman çizelgesi ve CPU görünümleriyle karmaşık trace verilerini anlaşılır hale getirir.</p>
+
+  <h3>Kurulum ve kullanım</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Debian/Ubuntu</span>
+apt install kernelshark
+
+<span class="cmt"># trace kaydı al (hedef sistemde)</span>
+trace-cmd record -e 'sched:*' -e 'irq:*' sleep 2
+
+<span class="cmt"># trace.dat dosyasını geliştirme makinesine kopyala</span>
+scp target:/tmp/trace.dat ./
+
+<span class="cmt"># GUI'de aç</span>
+kernelshark trace.dat</code></pre>
+  </div>
+
+  <h3>kernelshark arayüzü</h3>
+
+  <div class="flow">
+    <pre>
+┌─────────────────────────────────────────────────────────┐
+│  kernelshark                                            │
+│  ┌───────────────────────────────────────────────────┐  │
+│  │  CPU 0: ████░░░░████████░░░░░░███░░░░░░░░░░░░░   │  │
+│  │  CPU 1: ░░░░████░░░░░░░░████████░░░░░████████░   │  │
+│  │  CPU 2: ░░░░░░░░░░░░████░░░░░░░░████░░░░░░░░░░   │  │
+│  │  CPU 3: ████░░░░░░░░░░░░░░░░░░░░░░░░████████░   │  │
+│  └───────────────────────────────────────────────────┘  │
+│  ┌───────────────────────────────────────────────────┐  │
+│  │  Olaylar Listesi                 Filtre: [sched]  │  │
+│  │  23456.789012  CPU1  sched_switch  bash→kworker   │  │
+│  │  23456.789098  CPU0  irq_handler_entry  irq=32    │  │
+│  └───────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────┘
+    </pre>
+  </div>
+
+  <p>Zaman çizelgesinde belirli bir CPU'ya veya göreve yakınlaşmak, olayları filtrelemek ve latency ölçmek için tıkla-sürükle arayüzü sunar. Hedef sistemde GUI olmasa bile trace.dat dosyasını geliştirme makinesine taşıyıp orada analiz edebilirsin.</p>
+
+  <div class="callout">
+    <div class="label">GUI YOK MU?</div>
+    <p><code class="inline">trace-cmd report --cpu 0 | grep sched_switch</code> ile komut satırından da etkili analiz yapılabilir. kernelshark yalnızca görselleştirme kolaylığı sağlar.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: I2C transfer latency izleme</h2>
+  <p class="section-lead">Gerçek dünya senaryosu: bir I2C sensör sürücüsünün transfer gecikmesi beklentinin üzerinde. ftrace ile tam olarak nerede zaman harcandığını bul.</p>
+
+  <h3>Senaryo</h3>
+
+  <p>Bir BME280 basınç sensörü I2C-1 veri yolunda, adres <code class="inline">0x76</code>'da. Her okuma ~5 ms sürüyor ama spec 1 ms altında olmasını söylüyor. Neyi araştırmalıyız?</p>
+
+  <h3>Adım 1 — I2C tracepoint'lerini etkinleştir</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code">cd /sys/kernel/debug/tracing
+
+<span class="cmt"># I2C tracepoint'lerini etkinleştir</span>
+echo 1 > events/i2c/i2c_read/enable
+echo 1 > events/i2c/i2c_write/enable
+echo 1 > events/i2c/i2c_result/enable
+
+<span class="cmt"># sadece adapter 1'i filtrele</span>
+echo 'adapter_nr == 1' > events/i2c/i2c_read/filter
+echo 'adapter_nr == 1' > events/i2c/i2c_write/filter
+
+<span class="cmt"># function_graph tracer ile i2c_transfer fonksiyonunu derinlemesine izle</span>
+echo 'i2c_transfer' > set_graph_function
+echo function_graph > current_tracer
+echo 1 > tracing_on</code></pre>
+  </div>
+
+  <h3>Adım 2 — Sensör okumasını tetikle</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># BME280'den bir okuma tetikle</span>
+i2cget -y 1 0x76 0xF7
+echo 0 > tracing_on</code></pre>
+  </div>
+
+  <h3>Adım 3 — Sonuçları analiz et</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>trace çıktısı</span><span class="dot">●</span></div>
+    <pre><code">i2cget-1847 [000] 67890.123456: i2c_write: i2c-1 #1 a=076 f=0000 l=1
+i2cget-1847 [000] 67890.123460: function_graph:
+ 0)             |  i2c_transfer() {
+ 0)             |    __i2c_transfer() {
+ 0) + 15.2 us   |      i2c_smbus_xfer_emulated();
+ 0) ! 3821.5 us |      bcm2835_i2c_xfer();      /* ← burada gecikiyor */
+ 0) + 3840.1 us |    }
+ 0) + 3845.7 us |  }
+i2cget-1847 [000] 67890.127301: i2c_read: i2c-1 #2 a=076 f=0001 l=3</code></pre>
+  </div>
+
+  <h3>Adım 4 — bcm2835_i2c_xfer'i daha derin incele</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># bcm2835 I2C sürücüsüne odaklan</span>
+echo 'bcm2835_i2c_xfer' > set_graph_function
+echo 6 > max_graph_depth
+echo > trace
+echo 1 > tracing_on
+i2cget -y 1 0x76 0xF7
+echo 0 > tracing_on
+cat trace</code></pre>
+  </div>
+
+  <h3>Yorumlama ve sonuç</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Fonksiyon</th><th>Süre</th><th>Yorum</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code class="inline">i2c_transfer</code></td><td>3845 µs</td><td>Toplam süre</td></tr>
+      <tr><td><code class="inline">bcm2835_i2c_xfer</code></td><td>3821 µs</td><td>Donanım bekleme</td></tr>
+      <tr><td><code class="inline">wait_for_completion_timeout</code></td><td>3800 µs</td><td>IRQ gelene kadar bekleme — IRQ gecikme sorunu</td></tr>
+    </tbody>
+  </table>
+
+  <p>Sorun I2C donanım hızında değil, IRQ işleme gecikmesinde. <code class="inline">irq:irq_handler_entry</code> tracepoint'i ile IRQ gecikmesini ayrıca izlemek bir sonraki adım olacaktır.</p>
+
+  <div class="summary">
+    <h4>Hatırlanacaklar</h4>
+    <ul>
+      <li><code class="inline">echo function > current_tracer</code> ve <code class="inline">echo 1 > tracing_on</code> — en temel ftrace kullanımı</li>
+      <li><code class="inline">function_graph</code> tracer, fonksiyon sürelerini <code class="inline">+</code> / <code class="inline">!</code> / <code class="inline">$</code> ile vurgular</li>
+      <li><code class="inline">set_ftrace_filter</code> ile odaklan, <code class="inline">max_graph_depth</code> ile gürültüyü azalt</li>
+      <li><code class="inline">trace-cmd record/report</code> ile dosyaya kaydet, farklı makinede analiz et</li>
+      <li>Tracepoint'lar (<code class="inline">i2c:*</code>, <code class="inline">sched:*</code>) dinamik fonksiyon izlemesinden daha kararlı ve düşük overhead'lidir</li>
+      <li><code class="inline">kernelshark</code> ile GUI'de görsel zaman çizelgesi analizi</li>
+    </ul>
+  </div>
+
+  <p>Bir sonraki adım: <a href="kprobes.html" style="color: var(--accent);">kprobes rehberi</a> — çalışan kernel'a dinamik probe ekleme.</p>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

@@ -1,0 +1,932 @@
+---
+layout: tutorial
+title: "MTD · UBI · UBIFS — Flash Yönetimi"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>FLASH</span>
+    <span>2026</span>
+  </div>
+  <h1>MTD · UBI · UBIFS<br><em>Flash Yönetimi</em></h1>
+  <p class="subtitle">NOR/NAND flash belleği Linux MTD altyapısıyla yönet — UBI wear leveling, UBIFS ve Yocto ile production image üretimi.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Flash bellek temelleri</a></li>
+    <li><a href="#s1">Linux MTD subsystem</a></li>
+    <li><a href="#s2">NAND flash operasyonları</a></li>
+    <li><a href="#s3">NOR flash operasyonları</a></li>
+    <li><a href="#s4">UBI — Unsorted Block Images</a></li>
+    <li><a href="#s5">UBIFS — UBI üzerine dosya sistemi</a></li>
+    <li><a href="#s6">Partition layout tasarımı</a></li>
+    <li><a href="#s7">JFFS2 — eski alternatif</a></li>
+    <li><a href="#s8">Pratik: Yocto ile NAND image üretimi</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Flash bellek temelleri</h2>
+  <p class="section-lead">Flash bellek, blok tabanlı elektriksel olarak silinip yazılabilen kalıcı depolama teknolojisidir; NOR ve NAND iki temel mimariyi temsil eder.</p>
+
+  <h3>NOR ve NAND karşılaştırması</h3>
+  <p>NOR flash her hücreyi doğrudan adresleyebilir (random access), bu yüzden XIP (execute-in-place) için uygundur; bootloader kodunu çalıştırmak için idealdir. NAND ise page/block organizasyonuyla çok daha yüksek yoğunluk ve düşük birim maliyet sunar; büyük veri depolama için tercih edilir. Ancak NAND, üretimden gelen bad block içerebilir ve yazma sırasında da yeni bad block oluşabilir — bu ECC ve bad block yönetimini zorunlu kılar.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr>
+          <th>Özellik</th>
+          <th>NOR Flash</th>
+          <th>NAND Flash</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>Bus arayüzü</td><td>Paralel veya SPI (QSPI)</td><td>Paralel (raw) veya SPI (SPI NAND)</td></tr>
+        <tr><td>Erase boyutu</td><td>4–64 KB (sector)</td><td>64–512 KB (block = 64 × page)</td></tr>
+        <tr><td>Okuma hızı</td><td>Yüksek; XIP destekli</td><td>Daha düşük; sayfalık okuma</td></tr>
+        <tr><td>Yazma hızı</td><td>Yavaş (byte-by-byte)</td><td>Hızlı (page programlama)</td></tr>
+        <tr><td>Bad block</td><td>Yok (pratik olarak)</td><td>Var; fabrika + kullanım sürecinde</td></tr>
+        <tr><td>Kapasite</td><td>Düşük (16 MB – 1 GB tipik)</td><td>Yüksek (256 MB – 64 GB+)</td></tr>
+        <tr><td>Birim maliyet</td><td>Yüksek</td><td>Düşük</td></tr>
+        <tr><td>Tipik kullanım</td><td>Bootloader, küçük firmware</td><td>Rootfs, data partition, büyük image</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>SLC / MLC / TLC / QLC hücre tipleri</h3>
+  <p>Bir flash hücresinin kaç bit sakladığı; silme döngüsü dayanıklılığını, güvenilirliğini ve maliyetini doğrudan belirler. Endüstriyel ve güvenlik kritik uygulamalarda SLC kesinlikle tercih edilmelidir.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">SLC</span><span class="desc">1 bit/hücre — P/E cycle: 100 000+. En dayanıklı, en pahalı. Endüstriyel, otomotiv.</span></div>
+    <div class="param"><span class="name">MLC</span><span class="desc">2 bit/hücre — P/E cycle: 3 000–10 000. Denge; embedded ve tüketici depolama.</span></div>
+    <div class="param"><span class="name">TLC</span><span class="desc">3 bit/hücre — P/E cycle: 300–1 000. Düşük maliyet; tüketici SSD, eMMC.</span></div>
+    <div class="param"><span class="name">QLC</span><span class="desc">4 bit/hücre — P/E cycle: 100–300. En yoğun, en ucuz; büyük kapasiteli tüketici depolama.</span></div>
+  </div>
+
+  <h3>Page / Block / Plane yapısı</h3>
+  <p>NAND organizasyonu hiyerarşik bir yapıdan oluşur. Okuma ve yazma işlemleri <strong>page</strong> granülüründe, silme ise <strong>block</strong> granülüründe gerçekleşir — bir block içindeki tek bir page'i silmek için tüm bloğu silmek zorundasınız.</p>
+
+  <div class="flow">
+    <pre>Die → Plane → Block (erase unit) → Page (read/write unit) → Byte</pre>
+  </div>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Katman</th><th>Tipik boyut</th><th>Operasyon</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Page</td><td>2 KB – 16 KB (data) + OOB alanı</td><td>Program (write), Read</td></tr>
+        <tr><td>Block</td><td>64 – 512 pages (= 128 KB – 8 MB)</td><td>Erase</td></tr>
+        <tr><td>Plane</td><td>Binlerce block</td><td>Paralel operasyon (multi-plane)</td></tr>
+        <tr><td>Die / LUN</td><td>Birden fazla plane</td><td>Bağımsız komut kuyruğu</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Her page'in sonunda <strong>OOB (Out-of-Band)</strong> alanı bulunur — tipik olarak 64–256 byte. Bu alan ECC paritesi, bad block işaretçisi ve dosya sistemi metadata'sı için kullanılır. Linux MTD sürücüleri OOB'u otomatik yönetir.</p>
+
+  <h3>Wear leveling neden gerekli</h3>
+  <p>Flash hücrelerinin programlama/silme (P/E) döngüsü sınırlıdır. Aynı blok tekrar tekrar yazılırsa diğerlerinden çok daha hızlı aşınır ve bad block haline gelir. <strong>Wear leveling</strong>, yazmaları tüm bloklar arasında eşit dağıtarak toplam flash ömrünü maksimize eder. UBI katmanı bu görevi yazılım katmanında üstlenir; eMMC/SD kartlarda ise bu işlev donanım flash controller'ı tarafından gerçekleştirilir.</p>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Raw NAND flash üzerine doğrudan ext2/ext4 gibi block-tabanlı dosya sistemi <strong>kurmayın</strong>. Bu dosya sistemleri bad block yönetimi ve wear leveling yapmaz; veri bozulmasına ve erken arızaya yol açar. Bunun yerine UBI + UBIFS zincirini kullanın.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>NOR: random access, XIP, küçük kapasite, bootloader için ideal</li>
+      <li>NAND: yüksek kapasite, düşük maliyet, bad block yönetimi gerektirir</li>
+      <li>SLC en dayanıklı (100 K P/E); TLC/QLC tüketici ürünler için</li>
+      <li>Silme block granüllü, yazma page granüllü; wear leveling şart</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Linux MTD subsystem</h2>
+  <p class="section-lead">MTD (Memory Technology Device), Linux'un flash bellek soyutlama katmanıdır — donanım sürücüsü ile üst katman araçları arasında standart bir arayüz sağlar.</p>
+
+  <h3>/dev/mtd* ve /dev/mtdblock* farkı</h3>
+  <p>MTD subsystem iki farklı cihaz dosyası türü sunar. Bu ikisinin farkını anlamak kritik önemdedir.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">/dev/mtdN</span><span class="desc">Karakter cihazı. Ham flash erişimi: erase, read, write. ECC ve bad block bilgisi korunur. <code>flash_erase</code>, <code>nandwrite</code>, <code>nanddump</code> bu arayüzü kullanır.</span></div>
+    <div class="param"><span class="name">/dev/mtdblockN</span><span class="desc">Block cihazı emülasyonu. Bad block ve wear leveling YOKTUR. Sadece NOR flash üzerine read-only ya da çok dikkatli yazma için; NAND'da kesinlikle kullanmayın.</span></div>
+  </div>
+
+  <h3>MTD partition listesini görüntüleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kernel tarafından tanınan MTD partition'larını listele</span>
+<span class="cmd">cat</span> /proc/mtd
+<span class="cmt"># dev:    size   erasesize  name</span>
+<span class="cmt"># mtd0: 00080000 00020000 "SPL"</span>
+<span class="cmt"># mtd1: 00060000 00020000 "SPL.backup"</span>
+<span class="cmt"># mtd2: 00140000 00020000 "u-boot"</span>
+<span class="cmt"># mtd3: 00020000 00020000 "u-boot.env"</span>
+<span class="cmt"># mtd4: 00800000 00020000 "kernel"</span>
+<span class="cmt"># mtd5: 0f560000 00020000 "rootfs"</span>
+
+<span class="cmt"># mtdinfo ile daha ayrıntılı bilgi (mtd-utils paketi)</span>
+<span class="cmd">mtdinfo</span> /dev/mtd0
+<span class="cmt"># Name:                           SPL</span>
+<span class="cmt"># Type:                           nand</span>
+<span class="cmt"># Eraseblock size:                131072 bytes, 128.0 KiB</span>
+<span class="cmt"># Amount of eraseblocks:          4 (524288 bytes, 512.0 KiB)</span>
+<span class="cmt"># Minimum input/output unit size: 2048 bytes</span>
+<span class="cmt"># Sub-page size:                  512 bytes</span>
+<span class="cmt"># OOB size:                       64 bytes</span>
+<span class="cmt"># Character device major/minor:   90:0</span>
+<span class="cmt"># Bad blocks are allowed:         true</span>
+<span class="cmt"># Device is writable:             true</span>
+
+<span class="cmt"># Tüm MTD cihazlarını listele</span>
+<span class="cmd">mtdinfo</span> <span class="flag">-a</span></code></pre>
+  </div>
+
+  <h3>MTD cihaz türleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Tür</th><th>Açıklama</th><th>Örnek donanım</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>MTD_NORFLASH</td><td>CFI/JEDEC uyumlu NOR flash</td><td>Spansion S25FL, Intel StrataFlash</td></tr>
+        <tr><td>MTD_NANDFLASH</td><td>Raw NAND; page/block organizasyonlu</td><td>Micron MT29F, Samsung K9</td></tr>
+        <tr><td>MTD_SPI-NOR</td><td>SPI arayüzlü NOR (m25p80 sürücüsü)</td><td>Winbond W25Q128, Macronix MX25L</td></tr>
+        <tr><td>MTD_SPI-NAND</td><td>SPI arayüzlü NAND</td><td>Winbond W25N, GigaDevice GD5F</td></tr>
+        <tr><td>MTD_DATAFLASH</td><td>Atmel DataFlash (SPI)</td><td>AT45DB serisi</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Kernel konfigürasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig — .config / menuconfig</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># MTD altyapısını etkinleştir</span>
+<span class="field">CONFIG_MTD</span>=y
+<span class="field">CONFIG_MTD_CHAR</span>=y          <span class="cmt"># /dev/mtdN karakter cihazları</span>
+<span class="field">CONFIG_MTD_BLOCK</span>=y         <span class="cmt"># /dev/mtdblockN</span>
+
+<span class="cmt"># NAND flash desteği</span>
+<span class="field">CONFIG_MTD_NAND</span>=y
+<span class="field">CONFIG_MTD_NAND_ECC_SW_HAMMING</span>=y  <span class="cmt"># yazılım ECC (donanım yoksa)</span>
+<span class="field">CONFIG_MTD_NAND_ECC_SW_BCH</span>=y     <span class="cmt"># BCH ECC — daha güçlü</span>
+
+<span class="cmt"># SPI NOR (m25p80 sürücüsü)</span>
+<span class="field">CONFIG_MTD_SPI_NOR</span>=y
+<span class="field">CONFIG_SPI</span>=y
+<span class="field">CONFIG_SPI_MASTER</span>=y
+
+<span class="cmt"># Partition parser'ları</span>
+<span class="field">CONFIG_MTD_CMDLINE_PARTS</span>=y    <span class="cmt"># cmdline'dan partition okuma</span>
+<span class="field">CONFIG_MTD_OF_PARTS</span>=y         <span class="cmt"># Device Tree'den partition okuma (önerilen)</span>
+
+<span class="cmt"># UBI desteği</span>
+<span class="field">CONFIG_MTD_UBI</span>=y
+<span class="field">CONFIG_UBIFS_FS</span>=y</code></pre>
+  </div>
+
+  <h3>Device Tree'de MTD partition tanımı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>DTS — NAND flash partition layout</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* arch/arm/boot/dts/myboard.dts */</span>
+&amp;gpmc {
+    nand@0 {
+        <span class="field">compatible</span> = <span class="str">"ti,omap2-nand"</span>;
+        <span class="field">reg</span> = &lt;0 0 4&gt;;
+        <span class="field">nand-bus-width</span> = &lt;8&gt;;
+        <span class="field">ti,nand-ecc-opt</span> = <span class="str">"bch8"</span>;
+
+        <span class="field">#address-cells</span> = &lt;1&gt;;
+        <span class="field">#size-cells</span> = &lt;1&gt;;
+
+        partition@0 {
+            <span class="field">label</span> = <span class="str">"SPL"</span>;
+            <span class="field">reg</span> = &lt;0x0 0x80000&gt;;         <span class="cmt">/* 512 KB */</span>
+        };
+        partition@80000 {
+            <span class="field">label</span> = <span class="str">"u-boot"</span>;
+            <span class="field">reg</span> = &lt;0x80000 0x140000&gt;;    <span class="cmt">/* 1.25 MB */</span>
+        };
+        partition@1c0000 {
+            <span class="field">label</span> = <span class="str">"u-boot.env"</span>;
+            <span class="field">reg</span> = &lt;0x1c0000 0x40000&gt;;   <span class="cmt">/* 256 KB */</span>
+        };
+        partition@200000 {
+            <span class="field">label</span> = <span class="str">"kernel"</span>;
+            <span class="field">reg</span> = &lt;0x200000 0xa00000&gt;;  <span class="cmt">/* 10 MB */</span>
+        };
+        partition@c00000 {
+            <span class="field">label</span> = <span class="str">"rootfs"</span>;
+            <span class="field">reg</span> = &lt;0xc00000 0x0&gt;;       <span class="cmt">/* kalan alan */</span>
+        };
+    };
+};</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>MTD partition'larını Device Tree ile tanımlamak (<span class="field">CONFIG_MTD_OF_PARTS</span>) kernel cmdline yöntemine göre çok daha temiz ve board bağımlı konfigürasyonu yerinde tutar. Yeni tasarımlarda DTS yöntemini tercih edin.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>/dev/mtdN</code> ham karakter erişimi; <code>/dev/mtdblockN</code> blok emülasyonu — NAND'da sadece mtdN kullanın</li>
+      <li><code>cat /proc/mtd</code> ve <code>mtdinfo -a</code> partition'ları listeler</li>
+      <li>Kernel config: <code>CONFIG_MTD_NAND=y</code>, <code>CONFIG_MTD_UBI=y</code>, <code>CONFIG_UBIFS_FS=y</code></li>
+      <li>Partition layout: Device Tree tercih edilmeli</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> NAND flash operasyonları</h2>
+  <p class="section-lead">mtd-utils paketi, NAND flash üzerinde erase, write ve dump işlemleri için komut satırı araçları sağlar; bad block yönetimi bu araçlar tarafından otomatik yapılır.</p>
+
+  <h3>mtd-utils kurulumu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Host (Ubuntu/Debian)</span>
+<span class="cmd">sudo</span> apt install mtd-utils
+
+<span class="cmt"># Cross-compile (Yocto):</span>
+<span class="cmt"># IMAGE_INSTALL:append = " mtd-utils"</span>
+<span class="cmt"># Buildroot: BR2_PACKAGE_MTD=y</span></code></pre>
+  </div>
+
+  <h3>Flash erase</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — flash_erase</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm mtd0'ı sil (offset=0, count=0 → tüm partition)</span>
+<span class="cmd">flash_erase</span> /dev/mtd0 0 0
+
+<span class="cmt"># Sadece ilk 10 erase block'u sil</span>
+<span class="cmt"># Offset: 0x00000, Block count: 10</span>
+<span class="cmd">flash_erase</span> /dev/mtd0 0 10
+
+<span class="cmt"># Verbose mod — ilerleme göster</span>
+<span class="cmd">flash_erase</span> <span class="flag">--verbose</span> /dev/mtd2 0 0
+
+<span class="cmt"># JFFS2 clean marker yaz (JFFS2 mount için gerekli)</span>
+<span class="cmd">flash_erase</span> <span class="flag">--jffs2</span> /dev/mtd5 0 0</code></pre>
+  </div>
+
+  <h3>NAND'a yazma: nandwrite</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — nandwrite</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Erase ardından image yaz (en yaygın kullanım)</span>
+<span class="cmd">flash_erase</span> /dev/mtd4 0 0
+<span class="cmd">nandwrite</span> <span class="flag">-p</span> /dev/mtd4 kernel.bin
+<span class="cmt"># -p: padding — image page sınırına tamamlanır</span>
+
+<span class="cmt"># Belirli bir offset'e yaz</span>
+<span class="cmd">nandwrite</span> <span class="flag">-p</span> <span class="flag">-s</span> 0x200000 /dev/mtd4 kernel.bin
+
+<span class="cmt"># Bad block'ları atla (-c: marklanmış bad block skip)</span>
+<span class="cmd">nandwrite</span> <span class="flag">-p</span> <span class="flag">-c</span> /dev/mtd4 kernel.bin
+
+<span class="cmt"># OOB alanıyla birlikte yaz (raw mod — dikkatli kullan)</span>
+<span class="cmd">nandwrite</span> <span class="flag">--raw</span> /dev/mtd4 kernel_with_oob.bin</code></pre>
+  </div>
+
+  <h3>NAND'dan okuma: nanddump</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — nanddump</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm partition'ı dosyaya dump et</span>
+<span class="cmd">nanddump</span> /dev/mtd4 <span class="flag">-f</span> kernel_dump.bin
+
+<span class="cmt"># OOB alanı dahil dump</span>
+<span class="cmd">nanddump</span> <span class="flag">--oob</span> /dev/mtd4 <span class="flag">-f</span> full_dump.bin
+
+<span class="cmt"># Sadece belirli bir aralık: offset + uzunluk</span>
+<span class="cmd">nanddump</span> <span class="flag">-s</span> 0x0 <span class="flag">-l</span> 0x100000 /dev/mtd4 <span class="flag">-f</span> first_1MB.bin
+
+<span class="cmt"># Bad block'ları atla (-c flag)</span>
+<span class="cmd">nanddump</span> <span class="flag">-c</span> /dev/mtd4 <span class="flag">-f</span> dump_skip_bad.bin
+
+<span class="cmt"># Hexdump ile inceleme (küçük partition için)</span>
+<span class="cmd">nanddump</span> /dev/mtd0 <span class="flag">-f</span> /tmp/spl.bin <span class="flag">&amp;&amp;</span> <span class="cmd">hexdump</span> <span class="flag">-C</span> /tmp/spl.bin | <span class="cmd">head</span> <span class="flag">-40</span></code></pre>
+  </div>
+
+  <h3>Bad block yönetimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — bad block tarama</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Mevcut bad block'ları listele</span>
+<span class="cmd">nandtest</span> <span class="flag">-m</span> /dev/mtd4
+<span class="cmt"># bad eraseblock N at 0x...
+
+# mtdinfo ile bad block sayısı</span>
+<span class="cmd">mtdinfo</span> /dev/mtd4
+<span class="cmt"># Bad blocks:                     3</span>
+
+<span class="cmt"># Bad block tablosunu görüntüle (kernel dmesg)</span>
+<span class="cmd">dmesg</span> | <span class="cmd">grep</span> <span class="flag">-i</span> <span class="str">"bad block"</span>
+<span class="cmt"># [    1.234567] nand: device found, Manufacturer ID: 0x2c, Chip ID: 0xda</span>
+<span class="cmt"># [    1.234890] nand: Bad block at 0x01fe0000</span></code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p><code>nandwrite</code> ile kernel veya bootloader yazarken bad block atlama (<span class="flag">-c</span>) flag'ini kullanın. Aksi takdirde bad block üzerine yazma girişimi hata döner ve image bozulabilir. UBI kullanıyorsanız bu yönetim otomatik yapılır.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>flash_erase /dev/mtdN 0 0</code> tüm partition'ı siler</li>
+      <li><code>nandwrite -p /dev/mtdN image.bin</code> en yaygın yazma komutu</li>
+      <li><code>nanddump /dev/mtdN -f dump.bin</code> tam partition dump</li>
+      <li><code>-c</code> flag'i bad block'ları otomatik atlar</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> NOR flash operasyonları</h2>
+  <p class="section-lead">NOR flash, bad block yönetimi gerektirmez ve XIP kapasitesine sahiptir; flashcp ile doğrudan programlanabilir.</p>
+
+  <h3>flashcp ile NOR yazma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — flashcp</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># NOR flash'a firmware yaz (-v: verbose, ilerleme göster)</span>
+<span class="cmd">flashcp</span> <span class="flag">-v</span> firmware.bin /dev/mtd0
+<span class="cmt"># Flashing... (0% - 10% - ... - 100%)</span>
+<span class="cmt"># Verifying... done.</span>
+
+<span class="cmt"># flashcp hem erase hem write yapar — önceden flash_erase gerekmez</span>
+
+<span class="cmt"># SPI NOR üzerinde manuel erase + write</span>
+<span class="cmd">flash_erase</span> /dev/mtd0 0 0
+<span class="cmd">dd</span> <span class="field">if</span>=firmware.bin <span class="field">of</span>=/dev/mtd0 <span class="field">bs</span>=4096
+
+<span class="cmt"># Sadece belirli bir bölgeyi güncelle (offset ile)</span>
+<span class="cmt"># flash_erase offset'i erase block sınırına hizalamalısın</span>
+<span class="cmd">flash_erase</span> /dev/mtd0 0x10000 4   <span class="cmt"># 0x10000 offset, 4 blok sil</span>
+<span class="cmd">dd</span> <span class="field">if</span>=patch.bin <span class="field">of</span>=/dev/mtd0 <span class="field">bs</span>=4096 <span class="field">seek</span>=16 <span class="cmt"># offset=16*4096=0x10000</span></code></pre>
+  </div>
+
+  <h3>/dev/mtdblock ile raw erişim (NOR)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — mtdblock (sadece NOR)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># NOR flash'ı read-only mount et (cramfs/squashfs için)</span>
+<span class="cmd">mount</span> <span class="flag">-t</span> cramfs /dev/mtdblock2 /mnt/rom <span class="flag">-o</span> ro
+
+<span class="cmt"># squashfs NOR üzerinde</span>
+<span class="cmd">mount</span> <span class="flag">-t</span> squashfs /dev/mtdblock2 /mnt/rom <span class="flag">-o</span> ro
+
+<span class="cmt"># FAT üzerinde U-Boot environment değişkenlerini oku</span>
+<span class="cmd">mount</span> <span class="flag">-t</span> vfat /dev/mtdblock1 /mnt/env
+
+<span class="cmt"># Doğrudan okuma (cat ile ham binary)</span>
+<span class="cmd">cat</span> /dev/mtdblock0 &gt; /tmp/nor_backup.bin</code></pre>
+  </div>
+
+  <h3>CFI probe — donanım tespiti</h3>
+  <p>CFI (Common Flash Interface), NOR flash'ların parametrelerini (boyut, erase block, timing) standart bir sorgu protokolüyle raporlamasını sağlar. Linux CFI sürücüsü boot sırasında bu bilgiyi otomatik okur.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — CFI bilgisi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Boot sırasında CFI probe çıktısı (dmesg)</span>
+<span class="cmd">dmesg</span> | <span class="cmd">grep</span> <span class="flag">-i</span> <span class="str">"cfi\|nor\|flash"</span>
+<span class="cmt"># [    0.456789] physmap-flash 10000000.flash: physmap platform flash device: [mem 0x10000000-0x10ffffff]</span>
+<span class="cmt"># [    0.456800] physmap-flash 10000000.flash: Found 1 x16 devices at 0x0 in 16-bit bank. Manufacturer ID 0x000089 Chip ID 0x8801</span>
+<span class="cmt"># [    0.457000] Intel/Sharp Extended Query Table at 0x0031</span>
+<span class="cmt"># [    0.457100] Using buffer write method</span>
+<span class="cmt"># [    0.457200] physmap-flash 10000000.flash: CFI conformant device (jedec_probe)</span>
+
+<span class="cmt"># SPI NOR tespiti (m25p80 / spi-nor sürücüsü)</span>
+<span class="cmd">dmesg</span> | <span class="cmd">grep</span> <span class="flag">-i</span> <span class="str">"spi.*nor\|m25p\|w25q"</span>
+<span class="cmt"># [    1.234567] m25p80 spi0.0: w25q128 (16384 Kbytes)</span>
+<span class="cmt"># [    1.234600] 3 fixed-partitions partitions found on MTD device spi0.0</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>SPI NOR flash için Device Tree'de <span class="field">compatible = "jedec,spi-nor"</span> kullanmak, tek bir sürücüyle tüm JEDEC uyumlu cihazları kapsar. Cihaz kimliği kernel tarafından spi-nor tablosundan otomatik eşleştirilir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>flashcp -v firmware.bin /dev/mtd0</code> en güvenli NOR yazma yöntemi</li>
+      <li><code>/dev/mtdblock</code> sadece NOR'da read-only kullanım için güvenli</li>
+      <li>CFI probe: kernel boot log'unda flash kapasitesi ve geometri otomatik raporlanır</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> UBI — Unsorted Block Images</h2>
+  <p class="section-lead">UBI, ham NAND flash üzerinde wear leveling, bad block yönetimi ve I/O hata kurtarma sağlayan bir ara katmandır — UBIFS bu katman üzerine oturur.</p>
+
+  <h3>UBI mimarisi</h3>
+  <p>UBI, MTD katmanı ile dosya sistemi arasına girer. Fiziksel erase block'ları (PEB) ile mantıksal erase block'ları (LEB) arasında esnek bir eşleme tablası tutar; bu sayede wear leveling ve bad block yönetimini şeffaf biçimde gerçekleştirir.</p>
+
+  <div class="flow">
+    <pre>UBIFS / diğer FS → UBI (LEB → PEB eşleme, wear leveling) → MTD driver → NAND donanımı</pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">PEB</span><span class="desc">Physical Erase Block — donanımdaki gerçek erase bloğu. Bad olabilir.</span></div>
+    <div class="param"><span class="name">LEB</span><span class="desc">Logical Erase Block — UBI tarafından sunulan sanal blok. Bad block olmaz.</span></div>
+    <div class="param"><span class="name">EC header</span><span class="desc">Erase Count header — her PEB'de; kaç kez silindiği bilgisi, wear leveling için.</span></div>
+    <div class="param"><span class="name">VID header</span><span class="desc">Volume ID header — hangi volume ve LEB'e ait olduğunu belirtir.</span></div>
+  </div>
+
+  <h3>UBI format ve attach</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — ubiformat / ubiattach</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Adım 1: NAND partition'ı UBI için hazırla (format)</span>
+<span class="cmt"># Bu komut tüm PEB'leri siler ve EC header yazar</span>
+<span class="cmd">ubiformat</span> /dev/mtd2
+<span class="cmt"># ubiformat: mtd2 (nand), size 268435456 bytes (256.0 MiB),</span>
+<span class="cmt">#            2048 eraseblocks of 131072 bytes (128.0 KiB)</span>
+<span class="cmt"># ubiformat: formatting eraseblock 0 -- 100 % complete</span>
+
+<span class="cmt"># Verbose + minimum I/O unit belirt</span>
+<span class="cmd">ubiformat</span> <span class="flag">-v</span> <span class="flag">-s</span> 2048 /dev/mtd2
+
+<span class="cmt"># Adım 2: UBI volume'ünü kernel'a attach et</span>
+<span class="cmd">ubiattach</span> <span class="flag">-m</span> 2
+<span class="cmt"># UBI device number 0, total 2048 LEBs</span>
+<span class="cmt"># /dev/ubi0 oluşur</span>
+
+<span class="cmt"># Belirli bir UBI device numarası ata</span>
+<span class="cmd">ubiattach</span> <span class="flag">-m</span> 2 <span class="flag">-d</span> 0    <span class="cmt"># → /dev/ubi0</span>
+<span class="cmd">ubiattach</span> <span class="flag">-m</span> 3 <span class="flag">-d</span> 1    <span class="cmt"># → /dev/ubi1</span>
+
+<span class="cmt"># Detach etmek için</span>
+<span class="cmd">ubidetach</span> <span class="flag">-m</span> 2</code></pre>
+  </div>
+
+  <h3>UBI volume oluşturma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — ubimkvol</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># rootfs volume oluştur (50 MiB)</span>
+<span class="cmd">ubimkvol</span> /dev/ubi0 <span class="flag">-N</span> rootfs <span class="flag">-s</span> 50MiB
+<span class="cmt"># /dev/ubi0_0 oluşur</span>
+
+<span class="cmt"># data volume oluştur (kalan tüm alanı kullan)</span>
+<span class="cmd">ubimkvol</span> /dev/ubi0 <span class="flag">-N</span> data <span class="flag">-m</span>
+<span class="cmt"># -m: maximum available size</span>
+
+<span class="cmt"># Volume'leri listele</span>
+<span class="cmd">ubinfo</span> <span class="flag">-a</span>
+<span class="cmt"># UBI device 0, total 2048 LEBs (260046848 bytes, 248.0 MiB),</span>
+<span class="cmt"># Volume 0: rootfs, size: 400 LEBs (50 MiB)</span>
+<span class="cmt"># Volume 1: data,   size: 1595 LEBs (197.7 MiB)</span>
+
+<span class="cmt"># Volume boyutunu güncelle (sadece dynamic volume)</span>
+<span class="cmd">ubirsvol</span> /dev/ubi0_0 <span class="flag">-s</span> 80MiB
+
+<span class="cmt"># Volume sil</span>
+<span class="cmd">ubirmvol</span> /dev/ubi0 <span class="flag">-N</span> data</code></pre>
+  </div>
+
+  <h3>UBI image yazmak: ubiupdatevol</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — UBI volume'e image yazma</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Önceden hazırlanmış UBIFS image'ını volume'e yaz</span>
+<span class="cmd">ubiupdatevol</span> /dev/ubi0_0 rootfs.ubifs
+
+<span class="cmt"># İlerleme göstererek yaz</span>
+<span class="cmd">ubiupdatevol</span> <span class="flag">-s</span> $(stat <span class="flag">-c</span> <span class="str">%s</span> rootfs.ubifs) /dev/ubi0_0 rootfs.ubifs</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>UBI volume türleri: <strong>dynamic</strong> (okuma/yazma, normal kullanım) ve <strong>static</strong> (sadece okunur; CRC korumalı; kernel image gibi değişmeyen veriler için). Static volume için <code>ubimkvol --type static</code> kullanın.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>ubiformat /dev/mtdN</code> → <code>ubiattach -m N</code> → <code>ubimkvol</code> temel UBI hazırlık akışı</li>
+      <li>PEB/LEB ayrımı; EC ve VID header'lar wear leveling'in temeli</li>
+      <li>Static volume: CRC korumalı, değişmeyen veriler için</li>
+      <li><code>ubinfo -a</code> tüm volume'leri listeler</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> UBIFS — UBI üzerine dosya sistemi</h2>
+  <p class="section-lead">UBIFS, UBI logical volume üzerine kurulan log-yapılandırmalı bir dosya sistemidir; NAND flash'ın tüm özelliklerine uyum sağlar ve güç kaybında tutarlılık garantisi verir.</p>
+
+  <h3>UBIFS'in avantajları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Log-structured</span><span class="desc">Yazma her zaman boş alana gider; yerinde güncelleme olmaz. NAND doğasına uygun, yüksek yazma performansı.</span></div>
+    <div class="param"><span class="name">Journaling</span><span class="desc">Güç kaybına karşı atomik commit; fsck gerekmez, hızlı mount.</span></div>
+    <div class="param"><span class="name">Sıkıştırma</span><span class="desc">LZO, zlib veya zstd ile inline veri sıkıştırma; flash alanını verimli kullanır.</span></div>
+    <div class="param"><span class="name">Ölçeklenebilirlik</span><span class="desc">Milyonlarca dosyaya kadar iyi performans; B-tree indeksi.</span></div>
+  </div>
+
+  <h3>UBIFS mount etme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — UBIFS mount</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># UBI volume adıyla mount (ubi0:rootfs sözdizimi)</span>
+<span class="cmd">mount</span> <span class="flag">-t</span> ubifs ubi0:rootfs /mnt
+
+<span class="cmt"># Cihaz dosyasıyla mount</span>
+<span class="cmd">mount</span> <span class="flag">-t</span> ubifs /dev/ubi0_0 /mnt
+
+<span class="cmt"># Sıkıştırma seçeneğiyle mount</span>
+<span class="cmd">mount</span> <span class="flag">-t</span> ubifs <span class="flag">-o</span> compr=lzo ubi0:rootfs /mnt
+
+<span class="cmt"># /etc/fstab satırı</span>
+<span class="cmt"># ubi0:rootfs  /  ubifs  defaults,noatime  0  0</span>
+
+<span class="cmt"># Kernel cmdline ile rootfs olarak boot</span>
+<span class="cmt"># root=ubi0:rootfs rootfstype=ubifs ubi.mtd=5</span></code></pre>
+  </div>
+
+  <h3>mkfs.ubifs ile image oluşturma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — mkfs.ubifs</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># rootfs dizininden UBIFS image üret</span>
+<span class="cmt"># -r: kaynak dizin</span>
+<span class="cmt"># -m: minimum I/O birimi (page size, örn. 2048)</span>
+<span class="cmt"># -e: LEB boyutu (erase block - 2*page, örn. 131072 - 4096 = 126976 ≈ 0x1f000)</span>
+<span class="cmt"># -c: maksimum LEB sayısı (volume büyüklüğü / LEB boyutu)</span>
+<span class="cmd">mkfs.ubifs</span> \
+    <span class="flag">-r</span> /path/to/rootfs \
+    <span class="flag">-m</span> 2048 \
+    <span class="flag">-e</span> 126976 \
+    <span class="flag">-c</span> 2000 \
+    <span class="flag">-o</span> rootfs.ubifs
+
+<span class="cmt"># Sıkıştırma belirterek (varsayılan lzo)</span>
+<span class="cmd">mkfs.ubifs</span> <span class="flag">-r</span> rootfs/ <span class="flag">-m</span> 2048 <span class="flag">-e</span> 126976 <span class="flag">-c</span> 2000 \
+    <span class="flag">-x</span> lzo <span class="flag">-o</span> rootfs.ubifs
+
+<span class="cmt"># LEB boyutu hesabı:</span>
+<span class="cmt"># erase_block_size = 128 KiB = 131072 bytes</span>
+<span class="cmt"># LEB = erase_block_size - 2 * min_io_size  (EC + VID header alanı)</span>
+<span class="cmt"># LEB = 131072 - 2*2048 = 126976 bytes</span></code></pre>
+  </div>
+
+  <h3>ubinize ile UBI image üretme</h3>
+  <p>Üretim programlaması için UBIFS image'ını UBI volume metadata'sıyla birleştiren bir <code>.ubi</code> image üretilebilir — bu image tek seferde <code>ubiformat</code> ile flash'a yazılır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>ubinize.cfg — konfigürasyon dosyası</span><span class="dot">●</span></div>
+    <pre><code>[ubifs-volume]
+<span class="field">mode</span>=ubi
+<span class="field">image</span>=rootfs.ubifs
+<span class="field">vol_id</span>=0
+<span class="field">vol_size</span>=50MiB
+<span class="field">vol_type</span>=dynamic
+<span class="field">vol_name</span>=rootfs
+<span class="field">vol_flags</span>=autoresize
+
+[data-volume]
+<span class="field">mode</span>=ubi
+<span class="field">vol_id</span>=1
+<span class="field">vol_size</span>=100MiB
+<span class="field">vol_type</span>=dynamic
+<span class="field">vol_name</span>=data</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — ubinize</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># UBI image üret</span>
+<span class="cmt"># -p: PEB boyutu (erase block), -m: minimum I/O, -s: sub-page (eğer varsa)</span>
+<span class="cmd">ubinize</span> \
+    <span class="flag">-o</span> rootfs.ubi \
+    <span class="flag">-p</span> 128KiB \
+    <span class="flag">-m</span> 2048 \
+    <span class="flag">-s</span> 512 \
+    ubinize.cfg
+
+<span class="cmt"># Üretilen .ubi image'ı flash'a yaz (NAND önceden erase edilmemeli — ubiformat yapar)</span>
+<span class="cmd">ubiformat</span> /dev/mtd5 <span class="flag">-f</span> rootfs.ubi</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p><span class="field">vol_flags=autoresize</span>: Son volume, UBI attach sırasında mevcut tüm boş alanı otomatik olarak kaplar. Farklı flash kapasiteli kartlarda tek bir image ile çalışmak için kullanışlıdır.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>mount -t ubifs ubi0:rootfs /mnt</code> veya <code>root=ubi0:rootfs</code> cmdline</li>
+      <li><code>mkfs.ubifs -r rootfs/ -m 2048 -e 126976 -c 2000 -o rootfs.ubifs</code></li>
+      <li><code>ubinize</code> ile çok-volume UBI image üretimi; <code>ubiformat -f rootfs.ubi</code> ile tek adımda yaz</li>
+      <li>LEB = erase_block_size - 2 × min_io_size</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Partition layout tasarımı</h2>
+  <p class="section-lead">Flash partition layout, erase block sınırlarına hizalı olmalı, bad block rezervasyonu içermeli ve her partition'ın amacına uygun boyutlandırılmalıdır.</p>
+
+  <h3>Tipik NAND partition yapısı</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Partition</th><th>Boyut</th><th>Tür</th><th>İçerik</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>SPL</td><td>512 KB</td><td>Raw</td><td>Secondary Program Loader; ROM tarafından okunur</td></tr>
+        <tr><td>SPL.backup</td><td>512 KB</td><td>Raw</td><td>SPL yedek kopyası; güvenilirlik için</td></tr>
+        <tr><td>u-boot</td><td>1.5 MB</td><td>Raw</td><td>U-Boot binary (u-boot.img)</td></tr>
+        <tr><td>u-boot.env</td><td>256 KB</td><td>Raw</td><td>U-Boot environment değişkenleri; iki kopya önerilir</td></tr>
+        <tr><td>kernel</td><td>8–16 MB</td><td>Raw veya UBI static</td><td>zImage/Image + DTB veya FIT image</td></tr>
+        <tr><td>rootfs</td><td>50–256 MB</td><td>UBI + UBIFS</td><td>Kök dosya sistemi</td></tr>
+        <tr><td>data</td><td>kalan</td><td>UBI + UBIFS</td><td>Uygulama verisi, log, konfigürasyon</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Boyut hesaplama ve hizalama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — partition boyut hesabı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Örnek: 256 MB NAND, 128 KB erase block</span>
+<span class="cmt"># Toplam erase block sayısı</span>
+<span class="keyword">TOTAL_BLOCKS</span>=$(( 256 * 1024 * 1024 / (128 * 1024) ))
+<span class="cmt"># TOTAL_BLOCKS = 2048</span>
+
+<span class="cmt"># Bad block rezervasyonu: ~%2 önerilir</span>
+<span class="keyword">RESERVED_BAD</span>=$(( TOTAL_BLOCKS * 2 / 100 ))
+<span class="cmt"># RESERVED_BAD ≈ 40 block</span>
+
+<span class="cmt"># Kullanılabilir block sayısı</span>
+<span class="keyword">USABLE</span>=$(( TOTAL_BLOCKS - RESERVED_BAD ))
+<span class="cmt"># USABLE ≈ 2008 block = ~251 MB</span>
+
+<span class="cmt"># Her partition boyutu erase block katı olmalı</span>
+<span class="cmt"># SPL: 512 KB = 4 erase block</span>
+<span class="cmt"># u-boot: 1536 KB = 12 erase block</span>
+<span class="cmt"># kernel: 10 MB = 80 erase block</span>
+<span class="cmt"># rootfs: 128 MB = 1024 erase block</span>
+<span class="cmt"># data: kalan</span></code></pre>
+  </div>
+
+  <h3>Bad block rezervasyonu ve UBI overhead</h3>
+  <p>UBI her PEB için EC ve VID header yazar; bu 2 × min_io_size alanı kullanır. Ayrıca UBI kendi iç yönetimi için birkaç PEB rezerve eder (genellikle 20 PEB). NAND flash standartları ise üretimden gelen bad block'lar için kapasitesi başına %2'ye kadar reserve edilmesini zorunlu kılar. Bunu hesaba katmadan UBI volume boyutu belirlemeyin.</p>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>SPL ve U-Boot partition'larını <strong>kesinlikle</strong> UBI'ye dahil etmeyin. ROM bootrom UBI formatını bilmez; bu partition'lar raw olarak kalmalıdır. Yalnızca Linux'un kullandığı partition'larda (kernel sonrası) UBI uygulayın.</p>
+  </div>
+
+  <h3>U-Boot environment çift kopya</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>include/configs/myboard.h — U-Boot config</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* U-Boot environment NAND üzerinde çift kopya */</span>
+#<span class="keyword">define</span> <span class="field">CONFIG_ENV_IS_IN_NAND</span>
+#<span class="keyword">define</span> <span class="field">CONFIG_ENV_OFFSET</span>       0x1C0000   <span class="cmt">/* mtd3 başlangıcı */</span>
+#<span class="keyword">define</span> <span class="field">CONFIG_ENV_OFFSET_REDUND</span> 0x1E0000   <span class="cmt">/* yedek kopya */</span>
+#<span class="keyword">define</span> <span class="field">CONFIG_ENV_SIZE</span>         0x20000    <span class="cmt">/* 128 KB */</span>
+#<span class="keyword">define</span> <span class="field">CONFIG_ENV_RANGE</span>        0x40000    <span class="cmt">/* toplam 256 KB = 2 erase block */</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Her partition boyutu erase block katı olmalı; hizalanmamış partition sorunlara yol açar</li>
+      <li>%2 bad block rezervasyonu ve UBI iç overhead (≈20 PEB) hesaba katılmalı</li>
+      <li>SPL ve U-Boot raw partition'da kalmalı; UBI sadece Linux'un kullandığı alanlarda</li>
+      <li>U-Boot environment için çift kopya (<code>CONFIG_ENV_OFFSET_REDUND</code>) önerilir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> JFFS2 — eski alternatif</h2>
+  <p class="section-lead">JFFS2 (Journalling Flash File System 2), UBI olmadan doğrudan MTD üzerinde çalışan eski bir flash dosya sistemidir; küçük NOR flash sistemlerde hâlâ kullanılabilir.</p>
+
+  <h3>JFFS2 ne zaman tercih edilir</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Kriter</th><th>JFFS2</th><th>UBIFS</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Bağımlılık</td><td>Doğrudan MTD; UBI gerekmez</td><td>UBI katmanı zorunlu</td></tr>
+        <tr><td>Boyut</td><td>Küçük flash (&lt;32 MB) için uygun</td><td>Büyük flash için optimize</td></tr>
+        <tr><td>Mount süresi</td><td>Yavaş (log scan); büyük flash'ta çok yavaş</td><td>Hızlı; log boyutu sınırlı</td></tr>
+        <tr><td>Wear leveling</td><td>Temel, log-structured yapıdan gelir</td><td>UBI aracılığıyla daha iyi</td></tr>
+        <tr><td>Bad block</td><td>Sınırlı destek</td><td>UBI tam bad block yönetimi</td></tr>
+        <tr><td>Sıkıştırma</td><td>ZLIB, RTIME, LZO</td><td>LZO, ZLIB, ZSTD</td></tr>
+        <tr><td>Tercih senaryosu</td><td>Küçük NOR, basit sistem, legacy</td><td>NAND, büyük rootfs, yeni tasarım</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>mkfs.jffs2 ile image oluşturma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — mkfs.jffs2</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># rootfs dizininden JFFS2 image üret</span>
+<span class="cmt"># -r: kaynak dizin, -o: çıktı dosyası</span>
+<span class="cmt"># -e: erase block boyutu (NOR: 64KB, NAND: 128KB tipik)</span>
+<span class="cmt"># -p: image boyutunu erase block katına doldur</span>
+<span class="cmd">mkfs.jffs2</span> \
+    <span class="flag">-r</span> rootfs/ \
+    <span class="flag">-o</span> rootfs.jffs2 \
+    <span class="flag">-e</span> 0x10000 \
+    <span class="flag">-p</span> 0x2000000 \
+    <span class="flag">--squash</span>   <span class="cmt"># root dışı dosyaları squash et (UID/GID normalize)</span>
+
+<span class="cmt"># LZO sıkıştırma ile</span>
+<span class="cmd">mkfs.jffs2</span> <span class="flag">-r</span> rootfs/ <span class="flag">-o</span> rootfs.jffs2 <span class="flag">-e</span> 0x10000 <span class="flag">-l</span>
+<span class="cmt"># -l: little-endian (ARM için varsayılan)</span>
+
+<span class="cmt"># NAND için (128 KB erase block, no-cleanmarker)</span>
+<span class="cmd">mkfs.jffs2</span> <span class="flag">-r</span> rootfs/ <span class="flag">-o</span> rootfs.jffs2 <span class="flag">-e</span> 0x20000 \
+    <span class="flag">-n</span>            <span class="cmt"># -n: cleanmarker yazma (NAND OOB kullanır, farklı yönetim)</span>
+    <span class="flag">-l</span></code></pre>
+  </div>
+
+  <h3>JFFS2 flash'a yazma ve mount</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — JFFS2 yaz ve mount et</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># NOR flash'a yaz</span>
+<span class="cmd">flash_erase</span> <span class="flag">--jffs2</span> /dev/mtd5 0 0   <span class="cmt"># clean marker yaz</span>
+<span class="cmd">flashcp</span> <span class="flag">-v</span> rootfs.jffs2 /dev/mtd5
+
+<span class="cmt"># NAND flash'a yaz</span>
+<span class="cmd">flash_erase</span> /dev/mtd5 0 0
+<span class="cmd">nandwrite</span> <span class="flag">-p</span> /dev/mtd5 rootfs.jffs2
+
+<span class="cmt"># Mount et</span>
+<span class="cmd">mount</span> <span class="flag">-t</span> jffs2 /dev/mtdblock5 /mnt
+
+<span class="cmt"># Kernel cmdline ile boot</span>
+<span class="cmt"># root=/dev/mtdblock5 rootfstype=jffs2</span></code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>JFFS2 büyük flash partition'larında mount süresi dakikalar alabilir — başlangıçta tüm log yapısını taraması gerekir. 64 MB üzeri NAND flash için UBIFS kullanın; JFFS2'yi sadece küçük NOR partitionları veya legacy sistemler için tercih edin.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>JFFS2 küçük NOR flash veya legacy sistemler için uygun; büyük NAND'da UBIFS kullanın</li>
+      <li><code>mkfs.jffs2 -r rootfs/ -e 0x10000 -o rootfs.jffs2</code></li>
+      <li>JFFS2 mount süresi flash büyüklüğüyle orantılı olarak uzar</li>
+      <li>Yeni tasarımlarda MTD → UBI → UBIFS zincirini tercih edin</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: Yocto ile NAND image üretimi</h2>
+  <p class="section-lead">Yocto Build System, UBIFS image üretimini ve ubinize ile UBI paketlenmesini yerleşik değişkenler aracılığıyla destekler.</p>
+
+  <h3>IMAGE_FSTYPES ile flash image türleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>conf/local.conf veya distro.conf</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># UBIFS ve UBI image türlerini etkinleştir</span>
+<span class="field">IMAGE_FSTYPES</span> += <span class="str">"ubifs ubi"</span>
+
+<span class="cmt"># mkfs.ubifs parametreleri</span>
+<span class="cmt"># -m: min I/O, -e: LEB size, -c: max LEB count</span>
+<span class="field">MKUBIFS_ARGS</span> = <span class="str">"-m 2048 -e 126976 -c 2000"</span>
+
+<span class="cmt"># ubinize parametreleri</span>
+<span class="cmt"># -p: PEB size, -m: min I/O, -s: sub-page size</span>
+<span class="field">UBINIZE_ARGS</span> = <span class="str">"-p 128KiB -m 2048 -s 512"</span>
+
+<span class="cmt"># Kullanılan makine (BSP layer'dan gelir)</span>
+<span class="field">MACHINE</span> = <span class="str">"myboard"</span></code></pre>
+  </div>
+
+  <h3>Machine konfigürasyonunda NAND parametreleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>conf/machine/myboard.conf</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># NAND parametreleri — mkfs.ubifs ve ubinize için</span>
+<span class="field">MKUBIFS_ARGS</span> = <span class="str">"-m 2048 -e 126976 -c 4096"</span>
+<span class="field">UBINIZE_ARGS</span> = <span class="str">"-p 128KiB -m 2048 -s 512"</span>
+
+<span class="cmt"># Image türleri</span>
+<span class="field">IMAGE_FSTYPES</span> = <span class="str">"ubifs ubi tar.gz"</span>
+
+<span class="cmt"># Kernel image türü</span>
+<span class="field">KERNEL_IMAGETYPE</span> = <span class="str">"zImage"</span>
+
+<span class="cmt"># U-Boot yüklenecek binary</span>
+<span class="field">UBOOT_MACHINE</span> = <span class="str">"myboard_defconfig"</span>
+<span class="field">UBOOT_SUFFIX</span> = <span class="str">"img"</span></code></pre>
+  </div>
+
+  <h3>Yocto build ve çıktı dosyaları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Yocto build</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Ortamı hazırla</span>
+<span class="cmd">source</span> oe-init-build-env build/
+
+<span class="cmt"># Image build et</span>
+<span class="cmd">bitbake</span> core-image-minimal
+
+<span class="cmt"># Çıktılar:</span>
+<span class="cmd">ls</span> tmp/deploy/images/myboard/
+<span class="cmt"># core-image-minimal-myboard.ubifs  — ham UBIFS image</span>
+<span class="cmt"># core-image-minimal-myboard.ubi    — UBI paketlenmiş image</span>
+<span class="cmt"># zImage                            — kernel</span>
+<span class="cmt"># myboard.dtb                       — device tree blob</span>
+<span class="cmt"># u-boot.img                        — U-Boot binary</span>
+<span class="cmt"># MLO                               — SPL (TI AM335x)</span></code></pre>
+  </div>
+
+  <h3>Flash layout DTS binding — Yocto ile</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>recipes-kernel/linux/linux-myboard.bbappend</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kernel recipe'ye board DTS dosyasını ekle</span>
+<span class="field">FILESEXTRAPATHS</span>:prepend := <span class="str">"${THISDIR}/files:"</span>
+
+<span class="field">SRC_URI</span> += <span class="str">"file://myboard-nand-partitions.dts \
+             file://0001-add-myboard-nand-partitions.patch"</span></code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — target'a flash etme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># U-Boot üzerinden TFTP ile kernel yükle ve flash et</span>
+<span class="cmt"># (U-Boot shell üzerinde)</span>
+<span class="cmt"># setenv serverip 192.168.1.100</span>
+<span class="cmt"># setenv ipaddr 192.168.1.200</span>
+<span class="cmt"># tftp 0x82000000 zImage</span>
+<span class="cmt"># nand erase.part kernel</span>
+<span class="cmt"># nand write 0x82000000 kernel $filesize</span>
+
+<span class="cmt"># Target üzerinde (Linux çalışırken) rootfs güncelle</span>
+<span class="cmd">ubiformat</span> /dev/mtd5 <span class="flag">-f</span> core-image-minimal-myboard.ubi
+<span class="cmd">ubiattach</span> <span class="flag">-m</span> 5
+<span class="cmd">mount</span> <span class="flag">-t</span> ubifs ubi0:rootfs /mnt/newroot</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Yocto <span class="field">MKUBIFS_ARGS</span> ve <span class="field">UBINIZE_ARGS</span> değerleri, hedef NAND flash'ın geometrisine tam uymalıdır. Yanlış <code>-e</code> (LEB size) veya <code>-p</code> (PEB size) değerleriyle üretilen image mount edilemez. Bu değerleri <code>mtdinfo /dev/mtdN</code> çıktısından alın.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>IMAGE_FSTYPES += "ubifs ubi"</code> ve <code>MKUBIFS_ARGS</code> / <code>UBINIZE_ARGS</code> değişkenleri</li>
+      <li>Machine config'e NAND geometrisini girin; <code>mtdinfo</code> çıktısından alın</li>
+      <li>Build çıktısı: <code>.ubifs</code> ham image, <code>.ubi</code> UBI paketlenmiş image</li>
+      <li><code>ubiformat /dev/mtdN -f image.ubi</code> tek adımda hem format hem yaz</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

@@ -1,0 +1,618 @@
+---
+layout: tutorial
+title: "I²C — i2c-tools ile Linux'ta Erişim"
+back_url: "../index.html"
+back_label: "Seri Protokoller"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>SERİ PROTOKOLLER</span>
+    <span>I²C</span>
+    <span>2026</span>
+  </div>
+  <h1>I²C protokolü<br><em>ve i2c-tools.</em></h1>
+  <p class="subtitle">İki telden sensör, EEPROM, ADC — her şey adresle ayrılır. i2cdetect ile tara, i2cget/i2cset ile oku/yaz, smbus2 ile Python'dan kontrol et.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">I²C protokolü temelleri</a></li>
+    <li><a href="#s1">Linux I²C subsystem</a></li>
+    <li><a href="#s2">i2c-tools kurulumu ve i2cdetect</a></li>
+    <li><a href="#s3">i2cget ve i2cset</a></li>
+    <li><a href="#s4">i2cdump — register haritası dökümü</a></li>
+    <li><a href="#s5">i2ctransfer — raw message gönderme</a></li>
+    <li><a href="#s6">Python ile I²C: smbus2</a></li>
+    <li><a href="#s7">Pratik: BME280 sensör okuma</a></li>
+    <li><a href="#s8">Troubleshooting</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> I²C protokolü temelleri</h2>
+  <p class="section-lead">I²C (Inter-Integrated Circuit) — Philips'in 1982'de geliştirdiği, sadece iki tel gerektiren senkron seri protokol.</p>
+
+  <p>I²C'nin temel özellikleri onu sensör haberleşmesinde popüler yapan şeydir: 7-bit adresleme ile 112 farklı cihaz (10-bit ile 1008 cihaza kadar) aynı iki teli paylaşabilir. Her işlem master tarafından başlatılır; slave'ler sadece yanıt verir.</p>
+
+  <div class="flow">
+    <pre>
+  Master ─────────────────────────────── Slave 1 (0x48)
+         │                               Slave 2 (0x76)
+  SDA ───┤─────────────────────────────── Slave 3 (0x3C)
+  SCL ───┘
+         │←── 4.7kΩ pull-up ───→ VCC
+    </pre>
+  </div>
+
+  <h3>SDA ve SCL hatları</h3>
+  <p>Sadece iki sinyal söz konusudur:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">SDA</span><span class="desc">Serial Data — veri hattı. Hem master hem slave sürülebilir (open-drain). Pull-up direnci gereklidir.</span></div>
+    <div class="param"><span class="name">SCL</span><span class="desc">Serial Clock — saat hattı. Master tarafından üretilir. Clock stretching özelliğiyle slave saat hattını düşük tutarak master'ı bekletebilir.</span></div>
+  </div>
+
+  <h3>Pull-up dirençler</h3>
+  <p>I²C open-drain protokolüdür: her iki hat da pull-up direnci üzerinden VCC'ye bağlanır. Direnç değeri bus kapasitansına ve hıza bağlıdır:</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Hız</th><th>Önerilen R</th><th>Maks. kapasitans</th></tr></thead>
+      <tbody>
+        <tr><td>Standard Mode (100 kHz)</td><td>4.7 kΩ</td><td>400 pF</td></tr>
+        <tr><td>Fast Mode (400 kHz)</td><td>2.2 kΩ</td><td>400 pF</td></tr>
+        <tr><td>Fast-Plus (1 MHz)</td><td>1 kΩ</td><td>550 pF</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Start / Stop koşulları ve ACK/NACK</h3>
+  <p>Bir I²C transaction şu adımlarla ilerler:</p>
+  <ol>
+    <li><strong>START condition</strong>: SCL yüksekken SDA düşer.</li>
+    <li>7-bit slave adresi gönderilir, ardından 1 bit R/W (0=yaz, 1=oku).</li>
+    <li>Slave adresi tanırsa <strong>ACK</strong> (SDA'yı düşürür), tanımazsa <strong>NACK</strong> gönderir.</li>
+    <li>Veri baytları gönderilir; her bayt sonrası alıcıdan ACK beklenir.</li>
+    <li><strong>STOP condition</strong>: SCL yüksekken SDA yükselir.</li>
+    <li>Tekrarlanan START (Repeated START) ile STOP vermeden yeni transaction başlatılabilir — bu özellikle register oku işlemlerinde kullanılır.</li>
+  </ol>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p><strong>Repeated START</strong> çok önemlidir: I²C cihazlarının çoğu bir register'dan okumak için önce register adresini yazar (write transaction), ardından Repeated START ile okuma başlatır. Bu iki ayrı mesajı tek transaction içinde birleştirir.</p>
+  </div>
+
+  <h3>Multi-master</h3>
+  <p>I²C multi-master destekler: birden fazla master aynı anda bus kullanmak isterse <strong>arbitration</strong> mekanizması devreye girer. SDA'ya logic-1 süren master, diğerinin logic-0 sürdüğünü fark eder ve bus'ı bırakır. Gömülü Linux'ta genellikle tek master kullanılır.</p>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Linux I²C subsystem</h2>
+  <p class="section-lead">Linux'ta I²C desteği üç katmandan oluşur: donanım adaptörü (adapter), bağlı cihaz (client) ve driver.</p>
+
+  <div class="flow">
+    <pre>
+  Userspace     /dev/i2c-0  /dev/i2c-1  ...
+                     │
+  Kernel       i2c-dev (character device driver)
+                     │
+             i2c_adapter (bcm2835_i2c, i2c-imx, i2c-mv64xxx ...)
+                     │
+             Hardware   (SoC I²C controller register'ları)
+    </pre>
+  </div>
+
+  <h3>Kernel yapılandırması</h3>
+  <p>I²C userspace erişimi için <code class="inline">i2c-dev</code> modülü yüklü olmalıdır. Raspberry Pi ve BeagleBone gibi kartlarda genellikle varsayılan olarak aktifdir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>kernel config</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># menuconfig / defconfig içinde gerekli seçenekler:</span>
+CONFIG_I2C=y
+CONFIG_I2C_CHARDEV=y          <span class="cmt"># /dev/i2c-N erişimi için</span>
+CONFIG_I2C_BCM2835=y          <span class="cmt"># Raspberry Pi SoC adaptörü (örnek)</span>
+CONFIG_I2C_IMX=y              <span class="cmt"># NXP i.MX adaptörü (örnek)</span>
+
+<span class="cmt"># Modül olarak da derlenebilir (=m):</span>
+CONFIG_I2C_CHARDEV=m</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># i2c-dev modülünü yükle (=m ise):</span>
+<span class="cmd">sudo</span> <span class="cmd">modprobe</span> i2c-dev
+
+<span class="cmt"># Mevcut I²C adaptörlerini gör:</span>
+<span class="cmd">ls</span> <span class="path">/dev/i2c-*</span>
+<span class="cmt"># /dev/i2c-0  /dev/i2c-1</span>
+
+<span class="cmt"># i2c-dev karakteristik cihaz bilgisi:</span>
+<span class="cmd">ls</span> <span class="flag">-la</span> <span class="path">/dev/i2c-1</span>
+<span class="cmt"># crw-rw---- 1 root i2c 89, 1 Jan  1 00:00 /dev/i2c-1</span>
+
+<span class="cmt"># Kullanıcıyı i2c grubuna ekle (her seferinde sudo kullanmamak için):</span>
+<span class="cmd">sudo</span> <span class="cmd">usermod</span> <span class="flag">-aG</span> i2c <span class="str">$USER</span>
+<span class="cmt"># Oturumu yeniden aç veya: newgrp i2c</span></code></pre>
+  </div>
+
+  <h3>Device Tree bağlaması</h3>
+  <p>SoC'ye bağlı I²C slave'ler device tree'de tanımlanır. Bu sayede kernel boot sırasında ilgili driver'ı otomatik yükler.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>device-tree.dts</span><span class="dot">●</span></div>
+    <pre><code>&i2c1 {
+    clock-frequency = <400000>;   <span class="cmt">/* Fast Mode: 400 kHz */</span>
+    status = <span class="str">"okay"</span>;
+
+    bme280: bme280@76 {
+        compatible = <span class="str">"bosch,bme280"</span>;
+        reg = <0x76>;              <span class="cmt">/* 7-bit I²C adresi */</span>
+    };
+
+    eeprom@50 {
+        compatible = <span class="str">"atmel,24c32"</span>;
+        reg = <0x50>;
+        pagesize = <32>;
+    };
+};</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p><strong>i2c_adapter</strong>: SoC'nin donanım I²C controller'ını temsil eder. <strong>i2c_client</strong>: bus'a bağlı bir slave cihazı temsil eder (adres + adapter bilgisi içerir). <strong>i2c_driver</strong>: belirli bir donanım modelini destekleyen kernel driver yapısıdır.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> i2c-tools kurulumu ve i2cdetect</h2>
+  <p class="section-lead">i2c-tools paketi userspace'den I²C bus'ına doğrudan erişimi sağlayan araç seti içerir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — kurulum</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Debian / Ubuntu / Raspberry Pi OS:</span>
+<span class="cmd">sudo</span> <span class="cmd">apt</span> <span class="flag">install</span> i2c-tools
+
+<span class="cmt"># Yocto (meta-oe layer):</span>
+<span class="cmt"># IMAGE_INSTALL += "i2c-tools"</span>
+
+<span class="cmt"># Buildroot:</span>
+<span class="cmt"># BR2_PACKAGE_I2C_TOOLS=y</span>
+
+<span class="cmt"># Kurulu araçları kontrol et:</span>
+<span class="cmd">which</span> i2cdetect i2cget i2cset i2cdump i2ctransfer</code></pre>
+  </div>
+
+  <h3>i2cdetect ile bus tarama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Sistemdeki tüm I²C bus'ları listele:</span>
+<span class="cmd">i2cdetect</span> <span class="flag">-l</span>
+<span class="cmt"># i2c-0   i2c         bcm2835 (i2c@7e205000)      I2C adapter
+# i2c-1   i2c         bcm2835 (i2c@7e804000)      I2C adapter</span>
+
+<span class="cmt"># Bus 1'deki tüm cihazları tara:</span>
+<span class="cmd">sudo</span> <span class="cmd">i2cdetect</span> <span class="flag">-y</span> 1</code></pre>
+  </div>
+
+  <p>Tipik <code class="inline">i2cdetect -y 1</code> çıktısı:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>i2cdetect -y 1 çıktısı</span><span class="dot">●</span></div>
+    <pre><code>     0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f
+00:          -- -- -- -- -- -- -- -- -- -- -- -- --
+10: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+20: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+30: -- -- -- -- -- -- -- -- -- -- -- -- 3c -- -- --
+40: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+50: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+60: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+70: -- -- -- -- -- -- 76 --</code></pre>
+  </div>
+
+  <p>Bu çıktıda <code class="inline">0x3C</code> adresinde bir SSD1306 OLED ekran, <code class="inline">0x76</code> adresinde ise BME280 sensörü görünmektedir. <code class="inline">--</code> o adreste cihaz olmadığını gösterir.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">-y</span><span class="desc">Onay istemeden çalıştır (non-interactive). Script'lerde kullan.</span></div>
+    <div class="param"><span class="name">-r</span><span class="desc">SMBus read byte yerine I²C read kullan. Bazı cihazlar write probe ile bozulabilir.</span></div>
+    <div class="param"><span class="name">-a</span><span class="desc">0x00–0x7F tüm adres aralığını tara (reserved adresler dahil).</span></div>
+    <div class="param"><span class="name">-F N</span><span class="desc">Bus N'in desteklediği fonksiyonları listele (I2C_FUNC_*).</span></div>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">UYARI</div>
+    <p><code class="inline">i2cdetect</code> tarama sırasında her adrese yazma denemesi yapar. Bazı cihazlar (özellikle EEPROM ve motor sürücüler) bu yazma probundan etkilenebilir. Cihaz tipini biliyorsan <code class="inline">-r</code> seçeneğini kullan.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> i2cget ve i2cset</h2>
+  <p class="section-lead">Tek register okuma ve yazma işlemleri için kullanılan komutlar. SMBus protokol modlarını destekler.</p>
+
+  <h3>i2cget — register okuma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Sözdizimi: i2cget [-y] BUS ADDR [REG [MODE]]</span>
+
+<span class="cmt"># BME280 (0x76) chip ID register'ını oku (0xD0 = 0x60 döndürür):</span>
+<span class="cmd">sudo</span> <span class="cmd">i2cget</span> <span class="flag">-y</span> 1 0x76 0xD0
+<span class="cmt"># 0x60</span>
+
+<span class="cmt"># Word (16-bit, little-endian) okuma:</span>
+<span class="cmd">sudo</span> <span class="cmd">i2cget</span> <span class="flag">-y</span> 1 0x48 0x00 <span class="str">w</span>
+<span class="cmt"># 0x7d00  ← TMP102 sıcaklık register'ı</span>
+
+<span class="cmt"># Block okuma (SMBus block read):</span>
+<span class="cmd">sudo</span> <span class="cmd">i2cget</span> <span class="flag">-y</span> 1 0x50 0x00 <span class="str">i</span></code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">b</span><span class="desc">Byte mode (varsayılan). 1 bayt okur.</span></div>
+    <div class="param"><span class="name">w</span><span class="desc">Word mode. 2 bayt okur, little-endian sırayla döner.</span></div>
+    <div class="param"><span class="name">i</span><span class="desc">I²C block read. SMBus block read'den farklı: length byte beklenmez.</span></div>
+    <div class="param"><span class="name">s</span><span class="desc">SMBus block read. İlk bayt kaç bayt geleceğini belirtir.</span></div>
+  </div>
+
+  <h3>i2cset — register yazma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Sözdizimi: i2cset [-y] BUS ADDR REG VALUE [MODE]</span>
+
+<span class="cmt"># BME280 reset register'ına yazma (0xB6 = soft reset):</span>
+<span class="cmd">sudo</span> <span class="cmd">i2cset</span> <span class="flag">-y</span> 1 0x76 0xE0 0xB6
+
+<span class="cmt"># BME280 ctrl_meas register'ı: osrs_t=2 (2x), osrs_p=5 (16x), mode=3 (normal):</span>
+<span class="cmt"># osrs_t[7:5]=010, osrs_p[4:2]=101, mode[1:0]=11 → 0b01010111 = 0x57</span>
+<span class="cmd">sudo</span> <span class="cmd">i2cset</span> <span class="flag">-y</span> 1 0x76 0xF4 0x57
+
+<span class="cmt"># 16-bit word yazma (word mode, little-endian):</span>
+<span class="cmd">sudo</span> <span class="cmd">i2cset</span> <span class="flag">-y</span> 1 0x48 0x01 0x6000 <span class="str">w</span>
+
+<span class="cmt"># Birden fazla bayt (I²C block write):</span>
+<span class="cmd">sudo</span> <span class="cmd">i2cset</span> <span class="flag">-y</span> 1 0x50 0x00 0xAB 0xCD 0xEF <span class="str">i</span>
+
+<span class="cmt"># -e: PEC (Packet Error Check) ile CRC doğrulama:</span>
+<span class="cmd">sudo</span> <span class="cmd">i2cset</span> <span class="flag">-y</span> <span class="flag">-e</span> 1 0x60 0x05 0x01</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">UYARI</div>
+    <p>EEPROM'lara yazarken sayfa sınırlarına dikkat et. 24Cxx EEPROM'ların sayfa boyutu 8-128 bayt arasında değişir; sayfa sınırını aşan yazma işlemleri sayfa başına geri döner ve veri bozulur.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> i2cdump — register haritası dökümü</h2>
+  <p class="section-lead">Bir cihazın tüm register'larını tek seferde okuyarak görsel harita çıkaran araç.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Sözdizimi: i2cdump [-y] BUS ADDR [MODE]</span>
+
+<span class="cmt"># BME280 tüm register'larını oku (byte mode):</span>
+<span class="cmd">sudo</span> <span class="cmd">i2cdump</span> <span class="flag">-y</span> 1 0x76</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>i2cdump çıktısı (kısmi)</span><span class="dot">●</span></div>
+    <pre><code>No size specified (using byte-data access)
+     0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f    0123456789abcdef
+00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00    ................
+...
+80: a0 6b 4d 67 32 00 4a 93 5a d7 d0 0b 2f fb cf 16    .mMg2.J.Z..../..
+90: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00    ................
+a0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00    ................
+...
+d0: 60 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00    `...............
+...
+f0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 57    ...............W
+f4: 57 00 00 b6 00 00 00 00 00 00 00 00 00 00 00 00    W...............
+<span class="cmt"># 0xD0 = 0x60 → chip_id = BME280 doğrulandı
+# 0xF4 = 0x57 → ctrl_meas: osrs_t=2, osrs_p=5, mode=normal</span></code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">b</span><span class="desc">Byte data access (varsayılan). Her register'ı ayrı ayrı okur.</span></div>
+    <div class="param"><span class="name">w</span><span class="desc">Word data access. 16-bit okur.</span></div>
+    <div class="param"><span class="name">s</span><span class="desc">SMBus block read.</span></div>
+    <div class="param"><span class="name">i</span><span class="desc">I²C block read. Bazı cihazlarla daha uyumludur.</span></div>
+    <div class="param"><span class="name">c</span><span class="desc">Consecutive (ardışık): register adresi göndermeden sadece okur. FIFO tabanlı cihazlar için.</span></div>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>i2cdump çıktısında sol taraf onaltılık değer, sağ taraf ASCII karşılıklarıdır. Register adresi bilinen cihazlarda belirli satırları izlemek daha verimlidir: <code class="inline">i2cdump -y 1 0x76 | grep "^d0"</code> sadece 0xD0–0xDF satırını gösterir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> i2ctransfer — raw message gönderme</h2>
+  <p class="section-lead">SMBus protokol kısıtlamalarını aşarak ham I²C mesajları gönderir. Combined message ve custom transaction'lar için kullanılır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Sözdizimi: i2ctransfer [-y] BUS DESC [DATA] [DESC [DATA] ...]</span>
+<span class="cmt"># DESC: {r|w}LENGTH[@ADDR]</span>
+
+<span class="cmt"># Tek write: BME280'e 0xF4 = 0x57 yaz:</span>
+<span class="cmd">sudo</span> <span class="cmd">i2ctransfer</span> <span class="flag">-y</span> 1 <span class="str">w2@0x76</span> 0xF4 0x57
+
+<span class="cmt"># Combined message (write + repeated start + read):</span>
+<span class="cmt"># BME280 register 0xF7'den 8 bayt oku (ham ADC verileri):</span>
+<span class="cmd">sudo</span> <span class="cmd">i2ctransfer</span> <span class="flag">-y</span> 1 <span class="str">w1@0x76</span> 0xF7 <span class="str">r8@0x76</span>
+<span class="cmt"># 0x50 0xea 0x00 0x80 0xdc 0x00 0x6f 0xc0</span>
+
+<span class="cmt"># EEPROM 24C32: adres 0x0010'dan 4 bayt oku:</span>
+<span class="cmt"># Önce 2-bayt adres yaz (big-endian), sonra oku:</span>
+<span class="cmd">sudo</span> <span class="cmd">i2ctransfer</span> <span class="flag">-y</span> 1 <span class="str">w2@0x50</span> 0x00 0x10 <span class="str">r4@0x50</span>
+
+<span class="cmt"># Birden fazla bağımsız transaction:</span>
+<span class="cmd">sudo</span> <span class="cmd">i2ctransfer</span> <span class="flag">-y</span> 1 <span class="str">w1@0x48</span> 0x00 <span class="str">r2@0x48</span></code></pre>
+  </div>
+
+  <p>i2ctransfer, SMBus olmayan saf I²C mesajları gönderebilir. Bu özellik şu durumlarda kritiktir:</p>
+  <ul>
+    <li>SMBus'ın desteklemediği uzunluklarda block transfer (33 bayttan fazla)</li>
+    <li>10-bit adresleme kullanan cihazlar</li>
+    <li>Özel protokol gerektiren sensörler (combined message mantığı)</li>
+  </ul>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>SMBus protokolü I²C'nin bir alt kümesidir. <code class="inline">i2cget</code>/<code class="inline">i2cset</code> SMBus komutlarını kullanırken, <code class="inline">i2ctransfer</code> I2C_RDWR ioctl'ini kullanarak ham mesaj gönderir. Mevcut fonksiyon setini <code class="inline">i2cdetect -F 1</code> ile kontrol edebilirsin.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Python ile I²C: smbus2</h2>
+  <p class="section-lead">smbus2 kütüphanesi Python'dan /dev/i2c-N arayüzüne doğrudan erişim sağlar. SMBus ve I²C combined message destekler.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — kurulum</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">pip3</span> <span class="flag">install</span> smbus2
+<span class="cmt"># veya sistem paketi:</span>
+<span class="cmd">sudo</span> <span class="cmd">apt</span> <span class="flag">install</span> python3-smbus2</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>i2c_basic.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">from</span> smbus2 <span class="keyword">import</span> SMBus, i2c_msg
+
+<span class="cmt"># Bus 1'i aç (/dev/i2c-1)</span>
+<span class="keyword">with</span> SMBus(1) <span class="keyword">as</span> bus:
+
+    <span class="cmt"># Tek bayt okuma (SMBus read_byte_data):</span>
+    chip_id = bus.read_byte_data(0x76, 0xD0)
+    <span class="keyword">print</span>(<span class="str">f"Chip ID: 0x{chip_id:02X}"</span>)   <span class="cmt"># 0x60</span>
+
+    <span class="cmt"># Tek bayt yazma (SMBus write_byte_data):</span>
+    bus.write_byte_data(0x76, 0xF4, 0x57)
+
+    <span class="cmt"># 16-bit word okuma (little-endian):</span>
+    raw = bus.read_word_data(0x48, 0x00)
+    <span class="keyword">print</span>(<span class="str">f"Word: 0x{raw:04X}"</span>)
+
+    <span class="cmt"># Block okuma — 6 bayt (register 0xF7'den):</span>
+    data = bus.read_i2c_block_data(0x76, 0xF7, 6)
+    <span class="keyword">print</span>(<span class="str">f"Raw ADC: {[hex(b) for b in data]}"</span>)
+
+    <span class="cmt"># Combined message (write + repeated start + read):</span>
+    write_msg = i2c_msg.write(0x76, [0x88])   <span class="cmt"># register adresi</span>
+    read_msg  = i2c_msg.read(0x76, 24)         <span class="cmt"># 24 bayt oku</span>
+    bus.i2c_rdwr(write_msg, read_msg)
+    calib_raw = list(read_msg)
+    <span class="keyword">print</span>(<span class="str">f"Calibration bytes: {calib_raw}"</span>)</code></pre>
+  </div>
+
+  <h3>Önemli SMBus2 metodları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">read_byte(addr)</span><span class="desc">Register adresi olmadan tek bayt okur.</span></div>
+    <div class="param"><span class="name">write_byte(addr, val)</span><span class="desc">Register adresi olmadan tek bayt yazar.</span></div>
+    <div class="param"><span class="name">read_byte_data(addr, reg)</span><span class="desc">SMBus Read Byte Data: 8-bit register'dan 1 bayt okur.</span></div>
+    <div class="param"><span class="name">write_byte_data(addr, reg, val)</span><span class="desc">SMBus Write Byte Data: 8-bit register'a 1 bayt yazar.</span></div>
+    <div class="param"><span class="name">read_word_data(addr, reg)</span><span class="desc">SMBus Read Word Data: 16-bit okur, little-endian.</span></div>
+    <div class="param"><span class="name">read_i2c_block_data(addr, reg, length)</span><span class="desc">I²C block read: register adresinden başlayarak length bayt okur (max 32).</span></div>
+    <div class="param"><span class="name">write_i2c_block_data(addr, reg, data)</span><span class="desc">I²C block write: register adresinden başlayarak bayt listesi yazar.</span></div>
+    <div class="param"><span class="name">i2c_rdwr(*msgs)</span><span class="desc">Ham I²C mesajları gönder. i2c_msg.write() ve i2c_msg.read() ile oluşturulur. Combined message için kullan.</span></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Pratik: BME280 sensör okuma</h2>
+  <p class="section-lead">Bosch BME280, tek çipte sıcaklık + nem + basınç ölçen popüler bir I²C sensörüdür. Register haritası ve kalibrasyon mekanizmasını anlayarak ham veriden fiziksel değer elde edelim.</p>
+
+  <h3>BME280 register haritası (önemli register'lar)</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Register</th><th>Adı</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td>0xD0</td><td>id</td><td>Chip ID: BME280=0x60, BMP280=0x58</td></tr>
+        <tr><td>0xE0</td><td>reset</td><td>0xB6 yazılırsa soft reset</td></tr>
+        <tr><td>0xF2</td><td>ctrl_hum</td><td>Nem oversampling (osrs_h[2:0])</td></tr>
+        <tr><td>0xF3</td><td>status</td><td>measuring[3], im_update[0]</td></tr>
+        <tr><td>0xF4</td><td>ctrl_meas</td><td>osrs_t[7:5], osrs_p[4:2], mode[1:0]</td></tr>
+        <tr><td>0xF5</td><td>config</td><td>t_sb[7:5], filter[4:2], spi3w_en[0]</td></tr>
+        <tr><td>0xF7–0xF9</td><td>press_msb/lsb/xlsb</td><td>Ham basınç verisi (20-bit)</td></tr>
+        <tr><td>0xFA–0xFC</td><td>temp_msb/lsb/xlsb</td><td>Ham sıcaklık verisi (20-bit)</td></tr>
+        <tr><td>0xFD–0xFE</td><td>hum_msb/lsb</td><td>Ham nem verisi (16-bit)</td></tr>
+        <tr><td>0x88–0x9F</td><td>calib00–17</td><td>Sıcaklık/Basınç kalibrasyon verileri</td></tr>
+        <tr><td>0xE1–0xE7</td><td>calib26–32</td><td>Nem kalibrasyon verileri</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bme280_read.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> struct
+<span class="keyword">from</span> smbus2 <span class="keyword">import</span> SMBus, i2c_msg
+
+BME280_ADDR = 0x76
+I2C_BUS     = 1
+
+<span class="keyword">def</span> read_calibration(bus):
+    <span class="cmt">"""Kalibrasyon register'larını oku ve parse et."""</span>
+    <span class="cmt"># 0x88'den 24 bayt: dig_T1..T3, dig_P1..P9</span>
+    w = i2c_msg.write(BME280_ADDR, [0x88])
+    r = i2c_msg.read(BME280_ADDR, 24)
+    bus.i2c_rdwr(w, r)
+    raw = list(r)
+
+    calib = {}
+    calib[<span class="str">'T1'</span>] = struct.unpack_from(<span class="str">'&lt;H'</span>, bytes(raw[0:2]))[0]
+    calib[<span class="str">'T2'</span>] = struct.unpack_from(<span class="str">'&lt;h'</span>, bytes(raw[2:4]))[0]
+    calib[<span class="str">'T3'</span>] = struct.unpack_from(<span class="str">'&lt;h'</span>, bytes(raw[4:6]))[0]
+
+    calib[<span class="str">'P1'</span>] = struct.unpack_from(<span class="str">'&lt;H'</span>, bytes(raw[6:8]))[0]
+    calib[<span class="str">'P2'</span>] = struct.unpack_from(<span class="str">'&lt;h'</span>, bytes(raw[8:10]))[0]
+    calib[<span class="str">'P3'</span>] = struct.unpack_from(<span class="str">'&lt;h'</span>, bytes(raw[10:12]))[0]
+    calib[<span class="str">'P4'</span>] = struct.unpack_from(<span class="str">'&lt;h'</span>, bytes(raw[12:14]))[0]
+    calib[<span class="str">'P5'</span>] = struct.unpack_from(<span class="str">'&lt;h'</span>, bytes(raw[14:16]))[0]
+    calib[<span class="str">'P6'</span>] = struct.unpack_from(<span class="str">'&lt;h'</span>, bytes(raw[16:18]))[0]
+    calib[<span class="str">'P7'</span>] = struct.unpack_from(<span class="str">'&lt;h'</span>, bytes(raw[18:20]))[0]
+    calib[<span class="str">'P8'</span>] = struct.unpack_from(<span class="str">'&lt;h'</span>, bytes(raw[20:22]))[0]
+    calib[<span class="str">'P9'</span>] = struct.unpack_from(<span class="str">'&lt;h'</span>, bytes(raw[22:24]))[0]
+
+    <span class="cmt"># 0xA1: dig_H1</span>
+    calib[<span class="str">'H1'</span>] = bus.read_byte_data(BME280_ADDR, 0xA1)
+
+    <span class="cmt"># 0xE1'den 7 bayt: dig_H2..H6</span>
+    w2 = i2c_msg.write(BME280_ADDR, [0xE1])
+    r2 = i2c_msg.read(BME280_ADDR, 7)
+    bus.i2c_rdwr(w2, r2)
+    h = list(r2)
+    calib[<span class="str">'H2'</span>] = struct.unpack_from(<span class="str">'&lt;h'</span>, bytes(h[0:2]))[0]
+    calib[<span class="str">'H3'</span>] = h[2]
+    calib[<span class="str">'H4'</span>] = (h[3] &lt;&lt; 4) | (h[4] &amp; 0x0F)
+    calib[<span class="str">'H5'</span>] = (h[5] &lt;&lt; 4) | (h[4] &gt;&gt; 4)
+    calib[<span class="str">'H6'</span>] = struct.unpack_from(<span class="str">'&lt;b'</span>, bytes([h[6]]))[0]
+    <span class="keyword">return</span> calib
+
+<span class="keyword">def</span> compensate_temperature(adc_T, calib):
+    <span class="cmt">"""Bosch datasheet formülü (32-bit integer versiyonu)."""</span>
+    var1 = ((adc_T >> 3) - (calib[<span class="str">'T1'</span>] &lt;&lt; 1)) * calib[<span class="str">'T2'</span>] >> 11
+    var2 = ((adc_T >> 4) - calib[<span class="str">'T1'</span>])
+    var2 = (var2 * var2 >> 12) * calib[<span class="str">'T3'</span>] >> 14
+    t_fine = var1 + var2
+    T = (t_fine * 5 + 128) >> 8
+    <span class="keyword">return</span> T / 100.0, t_fine
+
+<span class="keyword">def</span> compensate_humidity(adc_H, t_fine, calib):
+    x = t_fine - 76800
+    x = (adc_H &lt;&lt; 14) - (calib[<span class="str">'H4'</span>] &lt;&lt; 20) - calib[<span class="str">'H5'</span>] * x
+    x = (x + 16384) >> 15
+    x = x * (((((((x * calib[<span class="str">'H6'</span>]) >> 10) *
+                  (((x * calib[<span class="str">'H3'</span>]) >> 11) + 32768)) >> 10) + 2097152) *
+                calib[<span class="str">'H2'</span>] + 8192) >> 14)
+    x = x - (((((x >> 15) ** 2) >> 7) * calib[<span class="str">'H1'</span>]) >> 4)
+    x = max(0, min(x, 419430400))
+    <span class="keyword">return</span> (x >> 12) / 1024.0
+
+<span class="keyword">with</span> SMBus(I2C_BUS) <span class="keyword">as</span> bus:
+    <span class="cmt"># Chip ID kontrol:</span>
+    chip_id = bus.read_byte_data(BME280_ADDR, 0xD0)
+    <span class="keyword">assert</span> chip_id == 0x60, <span class="str">f"BME280 değil: 0x{chip_id:02X}"</span>
+
+    <span class="cmt"># Kalibrasyon oku:</span>
+    calib = read_calibration(bus)
+
+    <span class="cmt"># Forced mode: tek ölçüm al</span>
+    bus.write_byte_data(BME280_ADDR, 0xF2, 0x01)  <span class="cmt"># ctrl_hum: osrs_h=1</span>
+    bus.write_byte_data(BME280_ADDR, 0xF4, 0x25)  <span class="cmt"># osrs_t=1, osrs_p=1, forced</span>
+
+    <span class="keyword">import</span> time; time.sleep(0.01)  <span class="cmt"># ölçüm tamamlanmasını bekle</span>
+
+    <span class="cmt"># Ham verileri oku (0xF7'den 8 bayt):</span>
+    w = i2c_msg.write(BME280_ADDR, [0xF7])
+    r = i2c_msg.read(BME280_ADDR, 8)
+    bus.i2c_rdwr(w, r)
+    d = list(r)
+
+    adc_P = (d[0] &lt;&lt; 12) | (d[1] &lt;&lt; 4) | (d[2] &gt;&gt; 4)
+    adc_T = (d[3] &lt;&lt; 12) | (d[4] &lt;&lt; 4) | (d[5] &gt;&gt; 4)
+    adc_H = (d[6] &lt;&lt; 8)  |  d[7]
+
+    temp, t_fine = compensate_temperature(adc_T, calib)
+    hum          = compensate_humidity(adc_H, t_fine, calib)
+
+    <span class="keyword">print</span>(<span class="str">f"Sıcaklık : {temp:.2f} °C"</span>)
+    <span class="keyword">print</span>(<span class="str">f"Nem      : {hum:.2f} %"</span>)</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Troubleshooting</h2>
+  <p class="section-lead">I²C sorunlarının büyük çoğunluğu pull-up değerleri, clock stretching veya bus stuck durumundan kaynaklanır.</p>
+
+  <h3>Bus stuck — SDA veya SCL sürekli düşük</h3>
+  <p>Ani güç kesintisi veya hatalı transaction sonrası slave SDA'yı düşük tutabilir. Çözüm:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — bus recovery</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1) Hata mesajını kontrol et:</span>
+<span class="cmd">dmesg</span> <span class="keyword">|</span> <span class="cmd">grep</span> i2c
+<span class="cmt"># [ 142.3] i2c i2c-1: adapter timeout</span>
+<span class="cmt"># [ 142.3] i2c i2c-1: sendbytes: error -11</span>
+
+<span class="cmt"># 2) 9 dummy clock pulse ile slave'i serbest bırak (yazılımsal):</span>
+<span class="cmd">sudo</span> <span class="cmd">i2cdetect</span> <span class="flag">-y</span> 1  <span class="cmt"># bus'ı test et</span>
+
+<span class="cmt"># 3) I²C adaptörünü kernel'den sıfırla (BCM2835 örneği):</span>
+<span class="cmd">echo</span> <span class="str">"3e804000.i2c"</span> <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="path">/sys/bus/platform/drivers/i2c-bcm2835/unbind</span>
+<span class="cmd">echo</span> <span class="str">"3e804000.i2c"</span> <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="path">/sys/bus/platform/drivers/i2c-bcm2835/bind</span></code></pre>
+  </div>
+
+  <h3>Clock stretching sorunu</h3>
+  <p>Bazı SoC'ler (özellikle Raspberry Pi BCM2835) clock stretching'i yanlış uygular. Slave yavaşsa SCL'yi düşük tutarak zaman kazanır; BCM2835 bu durumu yanlış işler. Çözüm: I²C hızını düşür.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>/boot/config.txt (Raspberry Pi)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># I²C hızını 50 kHz'e düşür (clock stretching sorunları için):</span>
+dtparam=i2c_arm=on,i2c_arm_baudrate=50000</code></pre>
+  </div>
+
+  <h3>Oscilloscope ile I²C decode</h3>
+  <p>Logic analyzer veya oscilloscope ile I²C trafiği analiz edilebilir:</p>
+  <ul>
+    <li>SDA ve SCL kanallarını ayrı ayrı bağla.</li>
+    <li>Trigger: SCL düşen kenar (falling edge) veya SDA düşen kenar (SCL yüksekken = START).</li>
+    <li>Sigrok / PulseView ile "I²C" protocol decoder seç: adres, R/W biti, ACK/NACK, data baytları otomatik decode edilir.</li>
+    <li>ACK yerine NACK görünüyorsa: yanlış adres, cihaz powered off veya bus stuck.</li>
+  </ul>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Belirti</th><th>Olası neden</th><th>Çözüm</th></tr></thead>
+      <tbody>
+        <tr><td>i2cdetect çıktısı tamamen boş (--)</td><td>Pull-up yok, cihaz beslenmiyor, SDA/SCL ters</td><td>Bağlantıları kontrol et, 4.7kΩ pull-up ekle</td></tr>
+        <tr><td>UU gösterimi (cihaz meşgul)</td><td>Kernel driver cihazı zaten açmış</td><td>Kernel driver'ı devre dışı bırak ya da i2ctransfer kullan</td></tr>
+        <tr><td>NACK alınıyor</td><td>Yanlış adres veya cihaz powered off</td><td>Datasheet'ten adresi doğrula, ADDR pinini kontrol et</td></tr>
+        <tr><td>Veri bozuk / CRC hatası</td><td>Bus hızı çok yüksek, pull-up yetersiz</td><td>Hızı düşür, pull-up direncini küçült</td></tr>
+        <tr><td>Intermittent hatalar</td><td>EMI, uzun kablo, kapasitif yük</td><td>Kablo uzunluğunu kıs, buffer IC kullan</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

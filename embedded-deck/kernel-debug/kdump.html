@@ -1,0 +1,589 @@
+---
+layout: tutorial
+title: "kdump & crash — Kernel Crash Analizi"
+back_url: "../index.html"
+back_label: "Kernel Debug Araçları"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>KERNEL DEBUG</span>
+    <span>CRASH ANALİZİ</span>
+    <span>2026</span>
+  </div>
+  <h1>kdump &amp; crash —<br><em>kernel crash analizi.</em></h1>
+  <p class="subtitle">Kernel panikten önce bir şey söylüyor. kdump o anı yakalar; crash utility o anı açar. Yeniden başlatma gerekmez — sadece olay yerinde adli tıp.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">kdump nedir — kexec ve /proc/vmcore</a></li>
+    <li><a href="#s1">kdump kurulumu — kexec-tools ve crashkernel</a></li>
+    <li><a href="#s2">makedumpfile — vmcore'u küçült</a></li>
+    <li><a href="#s3">crash utility — post-mortem analiz</a></li>
+    <li><a href="#s4">crash komutları — bt, log, ps, vm, kmem</a></li>
+    <li><a href="#s5">Kernel oops vs panic — BUG_ON ve WARN_ON</a></li>
+    <li><a href="#s6">kdump gömülü sistemlerde</a></li>
+    <li><a href="#s7">Pratik: intentional panic analizi</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> kdump nedir — kexec ve /proc/vmcore</h2>
+  <p class="section-lead">kdump, kernel panik anında sistemin bellek içeriğini diske yazan bir crash dump mekanizmasıdır. Bunu mümkün kılan kexec, normal boot sürecini atlayarak çalışmakta olan kernel'ın yerine yeni bir kernel yükler.</p>
+
+  <h3>Çalışma akışı</h3>
+
+  <div class="flow">
+    <pre>
+  Boot sırasında:
+  ┌──────────────────────────────────────────────────────┐
+  │  1. Birincil kernel boot eder                        │
+  │  2. crashkernel= parametresiyle ayrılan RAM bölgesi  │
+  │     ikincil (crash) kernel için rezerve edilir       │
+  │  3. kexec-tools crash kernel'ı bu bölgeye yükler     │
+  └──────────────────────────────────────────────────────┘
+
+  Panik anında:
+  ┌──────────────────────────────────────────────────────┐
+  │  4. Birincil kernel panik atar                       │
+  │  5. kexec mekanizması crash kernel'a geçiş yapar     │
+  │     (normal boot değil — direkt çekirdek geçişi)     │
+  │  6. Crash kernel çalışır, /proc/vmcore oluşturur     │
+  │  7. makedumpfile ile vmcore diske yazılır            │
+  │  8. Sistem yeniden başlatılabilir                    │
+  └──────────────────────────────────────────────────────┘
+
+  Analiz:
+  ┌──────────────────────────────────────────────────────┐
+  │  9. crash vmlinux vmcore.dmp                         │
+  │  10. Post-mortem analiz: bt, log, ps, vm             │
+  └──────────────────────────────────────────────────────┘
+    </pre>
+  </div>
+
+  <h3>/proc/vmcore</h3>
+
+  <p>Crash kernel çalışırken, birincil kernel'ın fiziksel belleği <code class="inline">/proc/vmcore</code> üzerinden ELF format olarak erişilebilir hale gelir. Bu dosya okunduğunda birincil kernel'ın RAM içeriği döndürülür — sürücülerin, yığın izlerinin ve global değişkenlerin anlık görüntüsü.</p>
+
+  <h3>Gerekli kernel konfigürasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig — birincil kernel</span><span class="dot">●</span></div>
+    <pre><code">CONFIG_KEXEC=y
+CONFIG_CRASH_DUMP=y
+CONFIG_PROC_VMCORE=y
+CONFIG_DEBUG_INFO=y          # crash analizi için DWARF bilgisi
+CONFIG_KALLSYMS=y
+CONFIG_KALLSYMS_ALL=y</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> kdump kurulumu</h2>
+  <p class="section-lead">kdump kurulumu üç adımdan oluşur: kexec-tools paketi, crashkernel boot parametresi ve kdump servisinin yapılandırılması.</p>
+
+  <h3>Kurulum</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Debian/Ubuntu</span><span class="dot">●</span></div>
+    <pre><code"># kexec-tools paketini kur
+apt install kexec-tools kdump-tools
+
+# servis durumunu kontrol et
+systemctl status kdump-tools
+# veya
+systemctl status kdump</code></pre>
+  </div>
+
+  <h3>crashkernel boot parametresi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — GRUB</span><span class="dot">●</span></div>
+    <pre><code"># /etc/default/grub dosyasını düzenle
+GRUB_CMDLINE_LINUX="crashkernel=256M"
+
+# GRUB'u güncelle
+update-grub
+
+# Yeniden başlat
+reboot
+
+# Rezerve edilen belleği doğrula
+cat /proc/iomem | grep 'Crash kernel'
+# 08000000-0fffffff : Crash kernel  (128 MB @ 128 MB fiziksel adres)</code></pre>
+  </div>
+
+  <h3>crashkernel değeri seçimi</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">128M</div><div class="desc">Küçük sistemler için yeterli minimum değer. Karmaşık driver stack'i olan sistemlerde az gelebilir.</div></div>
+    <div class="param"><div class="name">256M</div><div class="desc">Çoğu masaüstü ve sunucu sistemi için güvenli değer.</div></div>
+    <div class="param"><div class="name">512M</div><div class="desc">Büyük bellek ve karmaşık ağ/depolama yığınına sahip sistemler için.</div></div>
+    <div class="param"><div class="name">crashkernel=auto</div><div class="desc">Sistem RAM'ine göre otomatik hesapla (bazı dağıtımlar destekler).</div></div>
+  </div>
+
+  <h3>kdump yapılandırması</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>/etc/kdump.conf</span><span class="dot">●</span></div>
+    <pre><code"># Dump dosyasının yazılacağı yer
+path /var/crash
+
+# Kullanılacak sıkıştırma seviyesi
+core_collector makedumpfile -l --message-level 1 -d 31
+
+# Dump tamamlandıktan sonra ne yapılacak
+default reboot</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — servis başlatma</span><span class="dot">●</span></div>
+    <pre><code"># kdump servisini etkinleştir ve başlat
+systemctl enable kdump
+systemctl start kdump
+
+# Crash kernel yüklendi mi?
+cat /sys/kernel/kexec_crash_loaded
+# 1  (1 = yüklendi, 0 = yüklenmedi)</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> makedumpfile — vmcore'u küçült</h2>
+  <p class="section-lead">Ham vmcore dosyası, sistemin tüm fiziksel belleğinin kopyasıdır — 16 GB RAM'li bir sistemde 16 GB'a kadar büyüyebilir. makedumpfile, analiz için gerekli olmayan bellek sayfalarını ayıklayarak dosyayı küçültür.</p>
+
+  <h3>Dump seviyeleri (-d)</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">-d 1</div><div class="desc">Sıfır sayfaları sil (genellikle belleğin %20-30'u).</div></div>
+    <div class="param"><div class="name">-d 2</div><div class="desc">Cache sayfalarını sil.</div></div>
+    <div class="param"><div class="name">-d 4</div><div class="desc">Cache sayfaları + private sayfaları sil.</div></div>
+    <div class="param"><div class="name">-d 8</div><div class="desc">Userspace sayfalarını sil (kernel analizi için kullanılmaz).</div></div>
+    <div class="param"><div class="name">-d 16</div><div class="desc">HugeTLB sayfalarını sil.</div></div>
+    <div class="param"><div class="name">-d 31</div><div class="desc">Tümünü sil — yalnızca kernel sayfalarını sakla. En küçük dosya boyutu.</div></div>
+  </div>
+
+  <h3>Kullanım örnekleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"># Crash kernel içinde /proc/vmcore'dan dump al
+makedumpfile -l -d 31 -x /boot/vmlinux-$(uname -r) /proc/vmcore /var/crash/vmcore.dmp
+# -l = LZO sıkıştırma
+# -d 31 = yalnızca kernel sayfaları
+# -x = debug info için vmlinux
+
+# Alternatif sıkıştırma seçenekleri
+makedumpfile -c -d 31 /proc/vmcore vmcore.dmp  # zlib
+makedumpfile -z -d 31 /proc/vmcore vmcore.dmp  # snappy (en hızlı)
+
+# İnsan okunabilir boyut karşılaştırması
+ls -lh /proc/vmcore       # ham büyüklük: ~8 GB
+ls -lh /var/crash/vmcore.dmp  # sıkıştırılmış: ~80 MB</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">SADECE KERNEL SAYFASI</div>
+    <p><code class="inline">-d 31</code> ile userspace bellek (process heap/stack, shared libraries) dump'a dahil edilmez. Bu yeterlidir çünkü kernel panic analizi için kernel veri yapıları, slab tahsisleri ve kernel stack izleri gereklidir — userspace sayfaları değil.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> crash utility — post-mortem analiz</h2>
+  <p class="section-lead">crash utility, vmcore dosyasını GDB benzeri etkileşimli bir oturumda inceler. Kernel'ın debug sembollerini içeren vmlinux dosyasıyla birlikte kullanılır.</p>
+
+  <h3>Kurulum</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"># Debian/Ubuntu
+apt install crash
+
+# RHEL/CentOS
+yum install crash</code></pre>
+  </div>
+
+  <h3>crash oturumu başlatma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"># Temel kullanım
+crash /boot/vmlinux-6.6.0 /var/crash/vmcore.dmp
+
+# Debug paketinden vmlinux (önerilen)
+apt install linux-image-$(uname -r)-dbg
+crash /usr/lib/debug/boot/vmlinux-$(uname -r) vmcore.dmp
+
+# Çapraz platform analiz (ARM64 dump'ı x86 makinede analiz et)
+crash --target aarch64 /path/to/aarch64-vmlinux vmcore.dmp</code></pre>
+  </div>
+
+  <h3>crash başlangıç ekranı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>crash çıktısı</span><span class="dot">●</span></div>
+    <pre><code">      KERNEL: /boot/vmlinux-6.6.0
+    DUMPFILE: /var/crash/vmcore.dmp  [PARTIAL DUMP]
+        CPUS: 4
+        DATE: Sat Apr 12 14:32:18 2026
+      UPTIME: 02:15:43
+LOAD AVERAGE: 0.45, 0.32, 0.28
+       TASKS: 247
+    NODENAME: embedded-target
+     RELEASE: 6.6.0-rc4
+     VERSION: #1 SMP Sat Apr  5 10:00:00 UTC 2026
+     MACHINE: aarch64  (2800 Mhz)
+      MEMORY: 4 GB
+       PANIC: "Kernel panic - not syncing: sysrq triggered crash"
+         PID: 1234
+     COMMAND: "bash"
+        TASK: ffff000012345678
+         CPU: 0
+       STATE: TASK_RUNNING (PANIC)
+
+crash></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> crash komutları — bt, log, ps, vm, kmem</h2>
+  <p class="section-lead">crash utility, kernel veri yapılarını sorgulayan onlarca komut sunar. En sık kullanılan komutları bilerek başla.</p>
+
+  <h3>bt — backtrace (yığın izi)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>crash oturumu</span><span class="dot">●</span></div>
+    <pre><code">crash> bt
+PID: 1234   TASK: ffff000012345678   CPU: 0   COMMAND: "bash"
+ #0 [ffff0000123f7e20] machine_kexec at ffff8000101234ab
+ #1 [ffff0000123f7e80] __crash_kexec at ffff800010234567
+ #2 [ffff0000123f7f00] panic at ffff800010345678
+ #3 [ffff0000123f7f80] sysrq_handle_crash at ffff800012345678
+ #4 [ffff0000123f7fa0] __handle_sysrq at ffff800012345abc
+ #5 [ffff0000123f7fc0] write_sysrq_trigger at ffff800012345def
+
+crash> bt 456   # belirli PID'in yığın izi
+crash> foreach bt  # tüm görevlerin yığın izi</code></pre>
+  </div>
+
+  <h3>log — kernel ring buffer</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>crash oturumu</span><span class="dot">●</span></div>
+    <pre><code">crash> log
+[    0.000000] Booting Linux on physical CPU 0x0000000000 [0x410fd034]
+[    0.000000] Linux version 6.6.0 (gcc version 12.2.0)
+...
+[  135.123456] my_driver: başlatıldı
+[  135.234567] BUG: KASAN: slab-out-of-bounds in my_driver_write
+[  135.234890] Kernel panic - not syncing: sysrq triggered crash
+
+crash> log | tail -20  # son 20 satır</code></pre>
+  </div>
+
+  <h3>ps — süreç listesi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>crash oturumu</span><span class="dot">●</span></div>
+    <pre><code">crash> ps
+   PID    PPID  CPU  TASK        ST  %MEM   VSZ   RSS  COMM
+      0       0   0  ffff000010a  RU   0.0     0     0  [swapper/0]
+      1       0   0  ffff0000123  IN   0.1  1234   456  systemd
+    234       1   1  ffff0000456  IN   0.2  5678   789  kworker/1:2
+   1234     456   0  ffff0000789  RU   0.5 12345  2345  bash      ← panik görevi
+
+crash> ps bash   # bash süreçlerini filtrele</code></pre>
+  </div>
+
+  <h3>files — açık dosyalar</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>crash oturumu</span><span class="dot">●</span></div>
+    <pre><code">crash> files 1234
+PID: 1234   TASK: ffff000012345678   COMMAND: "bash"
+ROOT: /    CWD: /home/user
+ FD    FILE           DENTRY     INODE   TYPE  PATH
+  0  ffff000011111  ffff000022  ffff000033  CHR  /dev/tty1
+  1  ffff000044444  ffff000055  ffff000066  CHR  /dev/tty1
+  2  ffff000077777  ffff000088  ffff000099  CHR  /dev/tty1</code></pre>
+  </div>
+
+  <h3>vm — sanal bellek</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>crash oturumu</span><span class="dot">●</span></div>
+    <pre><code">crash> vm 1234
+PID: 1234   TASK: ffff000012345678   COMMAND: "bash"
+       MM   PGD  RSS  TOTAL_VM
+ffff000123  ffff000456  2345 kB  12345 kB
+
+  VMA           START       END  FLAGS  FILE
+ffff000789  00400000  00500000   r-x--  /bin/bash
+ffff000abc  00700000  00800000   rw---  /bin/bash
+ffff000def  7ffe000000  7fff000000  rwx--  [stack]</code></pre>
+  </div>
+
+  <h3>kmem — kernel bellek kullanımı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>crash oturumu</span><span class="dot">●</span></div>
+    <pre><code">crash> kmem -i
+                PAGES       TOTAL    PERCENTAGE
+   TOTAL MEM  1048576    4096 MB         ----
+        FREE   524288    2048 MB   50% of TOTAL MEM
+        USED   524288    2048 MB   50% of TOTAL MEM
+       SHARED    32768     128 MB    3% of TOTAL MEM
+
+crash> kmem -s kmalloc-64   # belirli slab cache istatistikleri
+
+crash> rd ffff000012345678   # ham bellek okuma (read data)
+crash> struct task_struct ffff000012345678  # struct göster</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Kernel oops vs panic — BUG_ON ve WARN_ON</h2>
+  <p class="section-lead">Kernel, hata durumlarında farklı şiddet seviyelerinde tepki verir. Oops kurtarılabilir bir hatayı temsil ederken, panic sistemi durdurur.</p>
+
+  <h3>Oops</h3>
+
+  <p>Kernel oops, kernel'ın kurtarılabilir gördüğü bir hata durumunda oluşur. Hatalı görev sonlandırılır ama sistem çalışmaya devam eder. NULL pointer dereference, geçersiz opcode, oops'u tetikler.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>dmesg — oops örneği</span><span class="dot">●</span></div>
+    <pre><code">[ 1234.567890] BUG: kernel NULL pointer dereference, address: 0000000000000008
+[ 1234.567900] #PF: supervisor write access in kernel mode
+[ 1234.567910] #PF: error_code(0x0002) - not-present page
+[ 1234.567920] PGD 0 P4D 0
+[ 1234.567930] Oops: 0002 [#1] PREEMPT SMP KASAN
+[ 1234.567940] CPU: 0 PID: 1234 Comm: my_app Not tainted 6.6.0
+[ 1234.567950] RIP: 0010:my_driver_write+0x30/0x80 [my_driver]
+[ 1234.567960] Call Trace:
+[ 1234.567970]  vfs_write+0x100/0x200
+[ 1234.567980]  ksys_write+0x68/0xe0</code></pre>
+  </div>
+
+  <h3>BUG_ON ve WARN_ON</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — kernel kodu</span><span class="dot">●</span></div>
+    <pre><code">#include &lt;linux/bug.h&gt;
+
+/* BUG() — panic'e eşdeğer, koşulsuz */
+if (catastrophic_error)
+    BUG();
+
+/* BUG_ON — koşullu panic */
+BUG_ON(ptr == NULL);     /* ptr NULL ise kernel panic */
+BUG_ON(len > MAX_LEN);   /* len aşılırsa kernel panic */
+
+/* WARN() — oops benzeri, ama sistem çalışmaya devam eder */
+if (suspicious_condition)
+    WARN(1, "beklenmedik durum: val=%d\n", val);
+
+/* WARN_ON — koşullu uyarı */
+WARN_ON(atomic_read(&ref) < 0);  /* negatif referans sayısı şüpheli */
+
+/* WARN_ON_ONCE — yalnızca ilk kez uyarı ver */
+WARN_ON_ONCE(deprecated_api_called);</code></pre>
+  </div>
+
+  <h3>panic_on_oops</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"># Oops oluşunca sistem panic atsın (kdump için gerekli)
+echo 1 > /proc/sys/kernel/panic_on_oops
+
+# Kalıcı ayar
+echo 'kernel.panic_on_oops = 1' >> /etc/sysctl.conf
+
+# Panic sonrası otomatik yeniden başlat (saniye)
+echo 10 > /proc/sys/kernel/panic
+
+# Boot parametresiyle
+# cmdline: panic=10 oops=panic</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> kdump gömülü sistemlerde</h2>
+  <p class="section-lead">Gömülü sistemlerde kısıtlı flash ve RAM, standart kdump kurulumunu zorlaştırır. Alternatif yaklaşımlar ve optimizasyonlar gereklidir.</p>
+
+  <h3>Zorluklar ve çözümler</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Zorluk</th><th>Çözüm</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Küçük flash (32 MB)</td><td>makedumpfile -d 31 ile sadece kernel sayfaları, ağ üzerinden dump</td></tr>
+      <tr><td>Az RAM (128 MB)</td><td>crashkernel=32M ile minimal crash kernel, stripped-down crash kernel config</td></tr>
+      <tr><td>Systemd yok</td><td>Script tabanlı init'e kdump hook ekle, /etc/init.d/kdump</td></tr>
+      <tr><td>Uzak analiz</td><td>netdump veya SSH ile vmcore'u geliştirme makinesine aktar</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Minimal crash kernel konfigürasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig — minimal crash kernel</span><span class="dot">●</span></div>
+    <pre><code">CONFIG_CRASH_DUMP=y
+CONFIG_PROC_VMCORE=y
+
+# Sürücü desteğini minimize et — sadece storage/ağ için gereken
+CONFIG_BLK_DEV_SD=y         # SCSI disk (vmcore yazmak için)
+CONFIG_EXT4_FS=y             # rootfs için
+
+# Gereksiz olanları kapat
+# CONFIG_INPUT_KEYBOARD is not set
+# CONFIG_USB_SUPPORT is not set
+# CONFIG_SOUND is not set</code></pre>
+  </div>
+
+  <h3>Network dump — netdump alternatifi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — crash kernel init script</span><span class="dot">●</span></div>
+    <pre><code">#!/bin/sh
+# Crash kernel'da çalışan minimal init scripti
+
+# Ağ arayüzünü başlat
+ip link set eth0 up
+ip addr add 192.168.1.100/24 dev eth0
+ip route add default via 192.168.1.1
+
+# makedumpfile ile ağ üzerinden dump gönder (SSH)
+makedumpfile -c -d 31 /proc/vmcore /tmp/vmcore.dmp
+scp /tmp/vmcore.dmp user@192.168.1.200:/var/crash/
+
+# Yeniden başlat
+reboot -f</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">FLASH ÖMRÜ</div>
+    <p>NAND flash tabanlı gömülü sistemlerde, crash dump'ı doğrudan flash'a yazmak wear leveling'i bozabilir ve flash ömrünü kısaltabilir. Bunun yerine RAM disk (<code class="inline">tmpfs</code>) veya ağ dump'ı kullanmak tercih edilmelidir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Pratik: intentional panic analizi</h2>
+  <p class="section-lead">Gerçek bir kernel panikini simüle edip crash utility ile analiz edelim. Bu egzersiz, gerçek bir crash durumunda ne yapacağını öğretir.</p>
+
+  <h3>Adım 1 — Kasıtlı kernel panic tetikle</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"># SysRq mekanizmasıyla kernel panic tetikle
+# (kdump servisi çalışıyor olmalı)
+echo 1 > /proc/sys/kernel/sysrq
+echo c > /proc/sysrq-trigger   # 'c' = crash
+
+# Alternatif: Python'dan
+python3 -c "
+import ctypes
+libc = ctypes.CDLL(None)
+# Bu yalnızca test ortamında çalıştır!
+"
+
+# Veya kernel modülü ile
+cat > panic_module.c << 'EOF'
+#include &lt;linux/module.h&gt;
+static int __init panic_init(void)
+{
+    panic("test panic: intentional crash for kdump demo\n");
+    return 0;
+}
+module_init(panic_init);
+MODULE_LICENSE("GPL");
+EOF</code></pre>
+  </div>
+
+  <h3>Adım 2 — Dump dosyasını bul</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — yeniden başlatma sonrası</span><span class="dot">●</span></div>
+    <pre><code"># Dump dosyasını bul
+ls -lh /var/crash/
+# drwxr-xr-x  2 root root 4.0K Apr 12 14:32 2026-04-12-14:32:18/
+
+ls -lh /var/crash/2026-04-12-14\:32\:18/
+# -rw-r--r-- 1 root root  82M Apr 12 14:32 vmcore
+# -rw-r--r-- 1 root root 1.2K Apr 12 14:32 kexec-dmesg.log</code></pre>
+  </div>
+
+  <h3>Adım 3 — crash ile analiz et</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>crash oturumu</span><span class="dot">●</span></div>
+    <pre><code">$ crash /boot/vmlinux-6.6.0 /var/crash/2026-04-12-14\:32\:18/vmcore
+
+crash> log | grep -A5 'panic'
+[ 1234.567] sysrq: SysRq : Trigger a crash
+[ 1234.568] Kernel panic - not syncing: sysrq triggered crash
+[ 1234.569] CPU: 0 PID: 1234 Comm: bash
+[ 1234.570] Hardware name: Raspberry Pi 4 Model B Rev 1.4
+
+crash> bt
+ #0 machine_kexec
+ #1 __crash_kexec
+ #2 panic
+ #3 sysrq_handle_crash
+ #4 __handle_sysrq
+ #5 write_sysrq_trigger
+
+crash> ps
+   PID    PPID  CPU  TASK        ST  COMM
+      0       0   0  ...          RU  [swapper/0]
+   1234     890   0  ffff...      RU  bash            ← panik görevi
+
+crash> kmem -i
+# Bellek kullanım istatistikleri...
+
+crash> quit</code></pre>
+  </div>
+
+  <h3>kexec-dmesg.log</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"># Crash öncesi son kernel mesajları
+cat /var/crash/*/kexec-dmesg.log | tail -20
+# Panic mesajı ve son log satırları burada —
+# crash utility'siz hızlı bir ilk bakış için ideal</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Hatırlanacaklar</h4>
+    <ul>
+      <li>kdump = kexec + crash kernel + makedumpfile — panik anında belleği yakala</li>
+      <li><code class="inline">crashkernel=256M</code> boot parametresi + <code class="inline">systemctl enable kdump</code> — kurulum iki adım</li>
+      <li><code class="inline">makedumpfile -d 31 -l</code> — yalnızca kernel sayfaları, LZO sıkıştırmalı</li>
+      <li><code class="inline">crash vmlinux vmcore</code> → <code class="inline">bt</code>, <code class="inline">log</code>, <code class="inline">ps</code> — ilk üç komut</li>
+      <li>Gömülü: crashkernel=32M, minimal crash kernel config, network dump</li>
+      <li><code class="inline">BUG_ON()</code> panik atar, <code class="inline">WARN_ON()</code> uyarır ama devam eder</li>
+    </ul>
+  </div>
+
+  <p>Bir sonraki adım: <a href="lockdep.html" style="color: var(--accent);">lockdep rehberi</a> — deadlock ve kilit sıralama ihlali tespiti.</p>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

@@ -1,0 +1,653 @@
+---
+layout: tutorial
+title: "kprobes & kretprobes — Dynamic Instrumentation"
+back_url: "../index.html"
+back_label: "Kernel Debug Araçları"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>KERNEL DEBUG</span>
+    <span>DYNAMIC INSTRUMENTATION</span>
+    <span>2026</span>
+  </div>
+  <h1>kprobes &amp; kretprobes —<br><em>dynamic instrumentation.</em></h1>
+  <p class="subtitle">Çalışan kernel'ı durdurmadan, herhangi bir fonksiyonun girişine ve çıkışına probe ekle. Kaynak değişikliği yok, yeniden derleme yok — sadece bir kernel modülü.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">kprobes nedir — breakpoint tabanlı instrumentation</a></li>
+    <li><a href="#s1">kprobe handler — pre/post/fault</a></li>
+    <li><a href="#s2">kretprobe — return value ve latency ölçümü</a></li>
+    <li><a href="#s3">/sys/kernel/debug/kprobes/ — yönetim arayüzü</a></li>
+    <li><a href="#s4">Kprobe kernel modülü — tam C örneği</a></li>
+    <li><a href="#s5">Trampoline ve blacklist — probe edilemeyen fonksiyonlar</a></li>
+    <li><a href="#s6">uprobe — userspace fonksiyon probe'u</a></li>
+    <li><a href="#s7">eBPF ile kprobe — modern yaklaşım</a></li>
+    <li><a href="#s8">Pratik: network packet drop'u bul</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> kprobes nedir</h2>
+  <p class="section-lead">kprobes, çalışan bir Linux kernel'ında herhangi bir talimata dinamik olarak izleme noktası yerleştirmeye olanak tanıyan bir altyapıdır. ftrace'in compile-time Mcount instrumentation'ından farklı olarak, kprobes çalışma zamanında breakpoint (INT3 / BRK talimatı) kullanır.</p>
+
+  <h3>Çalışma mekanizması</h3>
+
+  <div class="flow">
+    <pre>
+  Hedef fonksiyon: do_sys_open()
+  ┌────────────────────────────────────┐
+  │  1. register_kprobe() çağrılır     │
+  │  2. Kernel, hedef adresteki        │
+  │     talimatı kopyalar              │
+  │  3. Orijinal talimatı INT3 ile     │
+  │     değiştirir (x86) / BRK (ARM)  │
+  └────────────────────────────────────┘
+           ↓  CPU hedef adrese geldiğinde
+  ┌────────────────────────────────────┐
+  │  4. Breakpoint exception oluşur    │
+  │  5. kprobe handler çağrılır        │
+  │     (pre_handler)                  │
+  │  6. Orijinal talimat çalıştırılır  │
+  │     (single-step veya trampoline)  │
+  │  7. post_handler çağrılır          │
+  └────────────────────────────────────┘
+    </pre>
+  </div>
+
+  <h3>Gerekli kernel konfigürasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig</span><span class="dot">●</span></div>
+    <pre><code>CONFIG_KPROBES=y
+CONFIG_KPROBES_ON_FTRACE=y   <span class="cmt"># ftrace ile optimize edilmiş kprobe</span>
+CONFIG_KRETPROBES=y          <span class="cmt"># return probe desteği</span>
+CONFIG_KALLSYMS=y            <span class="cmt"># sembol adından adres çözümlemesi için</span>
+CONFIG_KALLSYMS_ALL=y        <span class="cmt"># tüm semboller (statik olanlar dahil)</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">KPROBES_ON_FTRACE</div>
+    <p><code class="inline">CONFIG_KPROBES_ON_FTRACE=y</code> ile, ftrace'in Mcount NOP'larına sahip fonksiyonlarda kprobe, breakpoint yerine ftrace trampoline'ini kullanır. Bu, breakpoint gecikmesini ortadan kaldırır ve overhead'i önemli ölçüde azaltır.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> kprobe handler — pre/post/fault</h2>
+  <p class="section-lead">Bir kprobe kaydederken üç adet handler fonksiyonu atayabilirsin. Her biri farklı bir noktada çağrılır.</p>
+
+  <div class="params">
+    <div class="param"><div class="name">pre_handler</div><div class="desc">Probe edilen talimat çalışmadan önce çağrılır. Argümanları, register değerlerini ve yığın içeriğini burada okuyabilirsin. 0 döndürürse normal akış devam eder.</div></div>
+    <div class="param"><div class="name">post_handler</div><div class="desc">Probe edilen talimat başarıyla çalıştıktan sonra çağrılır. Single-step sonrası yapılacak işlemler buraya gider.</div></div>
+    <div class="param"><div class="name">fault_handler</div><div class="desc">Single-step sırasında bir memory fault oluşursa çağrılır. Çoğu kprobe bu handler'ı kullanmaz; <code class="inline">NULL</code> bırakmak güvenlidir.</div></div>
+  </div>
+
+  <h3>struct kprobe</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — linux/kprobes.h</span><span class="dot">●</span></div>
+    <pre><code>struct kprobe {
+    /* Hedef: sembol adı veya adres, biri yeterli */
+    const char  *symbol_name;  /* "do_sys_open" */
+    kprobe_opcode_t *addr;     /* ya da doğrudan adres */
+    int          offset;       /* fonksiyon başından ofset (byte) */
+
+    /* Handler'lar */
+    kprobe_pre_handler_t   pre_handler;
+    kprobe_post_handler_t  post_handler;
+
+    /* Dahili — kullanıcı doldurmaz */
+    kprobe_opcode_t opcode;
+    struct arch_specific_insn ainsn;
+    u32 flags;
+};</code></pre>
+  </div>
+
+  <h3>Register/unregister API</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/kprobes.h&gt;
+
+<span class="cmt">/* kayıt: 0 başarı, negatif hata kodu */</span>
+int register_kprobe(struct kprobe *kp);
+
+<span class="cmt">/* kayıt silme */</span>
+void unregister_kprobe(struct kprobe *kp);
+
+<span class="cmt">/* dizi hâlinde kayıt */</span>
+int register_kprobes(struct kprobe **kps, int num);
+void unregister_kprobes(struct kprobe **kps, int num);</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> kretprobe — return value ve latency ölçümü</h2>
+  <p class="section-lead">kretprobe, bir fonksiyonun dönüş noktasına probe ekler. Return value'yu okumak ve fonksiyon süresi (latency) ölçmek için kullanılır.</p>
+
+  <h3>struct kretprobe</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — linux/kprobes.h</span><span class="dot">●</span></div>
+    <pre><code">struct kretprobe {
+    struct kprobe  kp;          <span class="cmt">/* temel kprobe — symbol_name buraya */</span>
+    kretprobe_handler_t handler;   <span class="cmt">/* dönüşte çağrılır */</span>
+    kretprobe_handler_t entry_handler; <span class="cmt">/* girişte çağrılır (opsiyonel) */</span>
+    int   data_size;            <span class="cmt">/* instance başına özel veri boyutu */</span>
+    int   maxactive;            <span class="cmt">/* eş zamanlı aktif instance sayısı */</span>
+};</code></pre>
+  </div>
+
+  <h3>API</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C</span><span class="dot">●</span></div>
+    <pre><code">int register_kretprobe(struct kretprobe *rp);
+void unregister_kretprobe(struct kretprobe *rp);
+
+<span class="cmt">/* handler içinde return değerini oku */</span>
+regs_return_value(regs);  <span class="cmt">/* arch bağımsız makro */</span>
+
+<span class="cmt">/* instance başına veri alanına eriş */</span>
+void *get_kretprobe_data(struct kretprobe_instance *ri);</code></pre>
+  </div>
+
+  <p>Latency ölçümü için <code class="inline">entry_handler</code>'da <code class="inline">ktime_get()</code> ile başlangıç zamanını instance veriye yaz; <code class="inline">handler</code>'da oku ve farkı hesapla.</p>
+
+  <div class="callout">
+    <div class="label">maxactive</div>
+    <p><code class="inline">maxactive</code>, eş zamanlı olarak izlenebilecek fonksiyon çağrısı sayısını belirler. 0 bırakılırsa kernel <code class="inline">NR_CPUS * 2</code> kullanır. Çok sık çağrılan fonksiyonlarda bu değerin yetersiz kalması durumunda kretprobe bazı çağrıları atlayabilir — <code class="inline">nmissed</code> alanı sayar.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> /sys/kernel/debug/kprobes/ — yönetim arayüzü</h2>
+  <p class="section-lead">Kayıtlı kprobe'ları ve kretprobe'ları sysfs/debugfs üzerinden izleyip yönetebilirsin.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code">ls /sys/kernel/debug/kprobes/
+<span class="cmt"># blacklist  enabled  list</span>
+
+<span class="cmt"># tüm kayıtlı kprobe'ları listele</span>
+cat /sys/kernel/debug/kprobes/list
+<span class="cmt"># ffffffff812a4567  k  do_sys_open+0x0  [my_kprobe_module]</span>
+<span class="cmt"># ffffffff812a4567  r  do_sys_open+0x0  [my_kprobe_module]</span>
+<span class="cmt"># k = kprobe, r = kretprobe</span>
+
+<span class="cmt"># tüm kprobe'ları devre dışı bırak (etkinleştir için echo 1)</span>
+echo 0 > /sys/kernel/debug/kprobes/enabled
+
+<span class="cmt"># probe edilemeyen (blacklist) fonksiyonlar</span>
+cat /sys/kernel/debug/kprobes/blacklist
+<span class="cmt"># ffffffff810a1234  kprobes_jump_mask_area</span>
+<span class="cmt"># ffffffff810b5678  __kprobes_text_start</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">MODÜL BAĞLAMINDA</div>
+    <p>Kayıtlı kprobe'ların hangi modüle ait olduğu köşeli parantez içinde gösterilir. Modül kaldırıldığında kprobe'lar otomatik olarak silinir — <code class="inline">unregister_kprobe()</code> çağrısı <code class="inline">module_exit</code>'te yeterlidir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Kprobe kernel modülü — tam C örneği</h2>
+  <p class="section-lead">Aşağıdaki örnek, <code class="inline">do_sys_open</code> fonksiyonunun girişini ve çıkışını izleyen, dmesg'e yazan bir kprobe + kretprobe modülüdür.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>kprobe_demo.c</span><span class="dot">●</span></div>
+    <pre><code">// SPDX-License-Identifier: GPL-2.0
+#include &lt;linux/kernel.h&gt;
+#include &lt;linux/module.h&gt;
+#include &lt;linux/kprobes.h&gt;
+#include &lt;linux/ktime.h&gt;
+
+#define TARGET_FUNC "do_sys_open"
+
+/* ── kprobe: fonksiyon girişi ─────────────────────── */
+static int pre_handler(struct kprobe *p, struct pt_regs *regs)
+{
+    /* do_sys_open(int dfd, const char __user *filename,
+     *             int flags, umode_t mode)
+     * x86-64 SysV ABI: rdi=dfd, rsi=filename, rdx=flags */
+    pr_info("kprobe: %s giriş — flags=0x%lx\n",
+            TARGET_FUNC, regs->dx);
+    return 0;
+}
+
+static void post_handler(struct kprobe *p, struct pt_regs *regs,
+                         unsigned long flags)
+{
+    pr_info("kprobe: %s sonrası — normal akış\n", TARGET_FUNC);
+}
+
+static struct kprobe kp = {
+    .symbol_name  = TARGET_FUNC,
+    .pre_handler  = pre_handler,
+    .post_handler = post_handler,
+};
+
+/* ── kretprobe: dönüş değeri + latency ───────────── */
+struct my_data {
+    ktime_t entry_time;
+};
+
+static int entry_handler(struct kretprobe_instance *ri,
+                         struct pt_regs *regs)
+{
+    struct my_data *data = get_kretprobe_data(ri);
+    data->entry_time = ktime_get();
+    return 0;
+}
+
+static int ret_handler(struct kretprobe_instance *ri,
+                       struct pt_regs *regs)
+{
+    struct my_data *data = get_kretprobe_data(ri);
+    long retval = regs_return_value(regs);
+    ktime_t delta = ktime_sub(ktime_get(), data->entry_time);
+
+    pr_info("kretprobe: %s döndü — fd=%ld, süre=%lld ns\n",
+            TARGET_FUNC, retval, ktime_to_ns(delta));
+    return 0;
+}
+
+static struct kretprobe rp = {
+    .kp.symbol_name = TARGET_FUNC,
+    .entry_handler  = entry_handler,
+    .handler        = ret_handler,
+    .data_size      = sizeof(struct my_data),
+    .maxactive      = 20,
+};
+
+/* ── init / exit ─────────────────────────────────── */
+static int __init kprobe_demo_init(void)
+{
+    int ret;
+
+    ret = register_kprobe(&kp);
+    if (ret < 0) {
+        pr_err("register_kprobe başarısız: %d\n", ret);
+        return ret;
+    }
+
+    ret = register_kretprobe(&rp);
+    if (ret < 0) {
+        pr_err("register_kretprobe başarısız: %d\n", ret);
+        unregister_kprobe(&kp);
+        return ret;
+    }
+
+    pr_info("kprobe_demo: %s üzerine probe eklendi\n", TARGET_FUNC);
+    return 0;
+}
+
+static void __exit kprobe_demo_exit(void)
+{
+    unregister_kprobe(&kp);
+    unregister_kretprobe(&rp);
+    pr_info("kprobe_demo: probe'lar kaldırıldı. nmissed=%d\n",
+            rp.nmissed);
+}
+
+module_init(kprobe_demo_init);
+module_exit(kprobe_demo_exit);
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Emirhan Pehlevan");
+MODULE_DESCRIPTION("kprobe + kretprobe demo — do_sys_open izleme");</code></pre>
+  </div>
+
+  <h3>Makefile</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Makefile</span><span class="dot">●</span></div>
+    <pre><code">obj-m := kprobe_demo.o
+
+KDIR ?= /lib/modules/$(shell uname -r)/build
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean</code></pre>
+  </div>
+
+  <h3>Derleme ve yükleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code">make
+insmod kprobe_demo.ko
+
+<span class="cmt"># bir dosya aç ve dmesg çıktısına bak</span>
+ls /tmp
+dmesg | tail -10
+<span class="cmt"># [12345.678] kprobe: do_sys_open giriş — flags=0x8000</span>
+<span class="cmt"># [12345.678] kretprobe: do_sys_open döndü — fd=5, süre=4231 ns</span>
+<span class="cmt"># [12345.678] kprobe: do_sys_open sonrası — normal akış</span>
+
+rmmod kprobe_demo</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Trampoline ve blacklist</h2>
+  <p class="section-lead">Her kernel fonksiyonu kprobe ile izlenemez. Bazı fonksiyonlar kprobe altyapısının kendisi tarafından kullanılır ve burada bir probe oluşturmak sonsuz özyinelemeye yol açar.</p>
+
+  <h3>Neden bazı fonksiyonlar probe edilemez?</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">Kprobe altyapı fonksiyonları</div><div class="desc"><code class="inline">kprobe_handler()</code>, <code class="inline">do_int3()</code>, <code class="inline">do_debug()</code> — bu fonksiyonlara probe eklemek sonsuz döngü oluşturur.</div></div>
+    <div class="param"><div class="name">__kprobes notrace niteliği</div><div class="desc">Kernel kaynak kodunda <code class="inline">__kprobes</code> veya <code class="inline">nokprobe_inline</code> ile işaretlenen fonksiyonlar. Blacklist'e otomatik eklenir.</div></div>
+    <div class="param"><div class="name">Interrupt/exception handler'ları</div><div class="desc">Bazı düşük seviyeli interrupt handler'ları probe edilemez çünkü kprobe'un kendisi de interrupt mekanizmasını kullanır.</div></div>
+    <div class="param"><div class="name">Satır içi (inline) fonksiyonlar</div><div class="desc">Derleyici inline etmişse fonksiyon bağımsız bir adrese sahip değildir; sembole göre probe eklenemez.</div></div>
+  </div>
+
+  <h3>Blacklist kontrolü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code">cat /sys/kernel/debug/kprobes/blacklist
+<span class="cmt"># ffffffff81001234  text_poke</span>
+<span class="cmt"># ffffffff81002345  kprobes_jump_mask_area</span>
+
+<span class="cmt"># register_kprobe() fonksiyon blacklist'teyse -EINVAL döner</span>
+<span class="cmt"># dmesg'de: "kprobe: Failed to register probe of..."</span></code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT — güvenlik kritik fonksiyonlar</div>
+    <p>Bazı sistemlerde kernel parametresi <code class="inline">kprobes.enabled=0</code> ile tüm kprobe'lar devre dışı bırakılabilir. Güvenlik odaklı sistemlerde (<code class="inline">CONFIG_SECURITY_LOCKDOWN</code>) kprobe desteği kilitli modda tamamen devre dışı kalabilir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> uprobe — userspace fonksiyon probe'u</h2>
+  <p class="section-lead">uprobe, kprobe'un userspace uygulamalarına karşılığıdır. Bir kullanıcı alanı programının belirli bir fonksiyonuna (veya ofsetine) probe ekleyerek kernel'dan izleyebilirsin.</p>
+
+  <h3>uprobe_events arayüzü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code">cd /sys/kernel/debug/tracing
+
+<span class="cmt"># uretprobe (return probe) ekle: bash'in readline fonksiyonu</span>
+<span class="cmt"># format: p:&lt;olay_adı&gt; &lt;binary&gt;:&lt;ofset&gt;</span>
+echo 'p:readline_entry /bin/bash:0x4a3f20' >> uprobe_events
+echo 'r:readline_ret   /bin/bash:0x4a3f20' >> uprobe_events
+
+<span class="cmt"># sembol adından ofset bul (objdump ile)</span>
+objdump -d /bin/bash | grep -A2 '&lt;readline&gt;:'
+<span class="cmt"># 4a3f20: ...  (ilk talimat adresi)</span>
+
+<span class="cmt"># uprobe'u etkinleştir</span>
+echo 1 > events/uprobes/readline_entry/enable
+echo 1 > tracing_on
+
+<span class="cmt"># bash başlat, readline tetiklenince kayıt oluşur</span>
+cat trace | grep readline</code></pre>
+  </div>
+
+  <h3>bpftrace ile uprobe</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># bpftrace ile basit userspace probe</span>
+bpftrace -e 'uprobe:/bin/bash:readline { printf("readline çağrıldı, PID=%d\n", pid); }'
+
+<span class="cmt"># return değerini oku</span>
+bpftrace -e 'uretprobe:/bin/bash:readline { printf("dönüş değeri: %s\n", str(retval)); }'</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">ASLR</div>
+    <p>Position Independent Executable (PIE) olarak derlenen binary'lerde ASLR devredeyse her çalıştırmada adresler değişir. <code class="inline">/proc/&lt;pid&gt;/maps</code> veya <code class="inline">bpftrace</code>'in sembol çözümleme desteği kullanılarak doğru ofset bulunabilir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> eBPF ile kprobe — modern yaklaşım</h2>
+  <p class="section-lead">eBPF (extended Berkeley Packet Filter), kprobe altyapısını güvenli bir sanal makine üzerinden kullanarak kernel modülü yazmadan gelişmiş izleme programları çalıştırmana olanak tanır.</p>
+
+  <h3>bpftrace ile kprobe</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># tcp_connect çağrıldığında PID ve hedef adresi yazdır</span>
+bpftrace -e '
+kprobe:tcp_connect {
+    $sk = (struct sock *)arg0;
+    printf("tcp_connect: PID=%d, daddr=%s\n",
+           pid,
+           ntop(AF_INET, $sk->__sk_common.skc_daddr));
+}'
+
+<span class="cmt"># kretprobe: vfs_read'in dönüş değerini izle</span>
+bpftrace -e '
+kretprobe:vfs_read {
+    @read_sizes = hist(retval);
+}'
+
+<span class="cmt"># do_sys_open çağrılarında dosya adını yazdır</span>
+bpftrace -e '
+kprobe:do_sys_open {
+    printf("open: PID=%d comm=%s file=%s\n",
+           pid, comm, str(arg1));
+}'</code></pre>
+  </div>
+
+  <h3>BCC (BPF Compiler Collection) ile Python</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Python — BCC</span><span class="dot">●</span></div>
+    <pre><code">#!/usr/bin/env python3
+from bcc import BPF
+
+prog = r"""
+#include <uapi/linux/ptrace.h>
+
+BPF_HASH(latency, u32, u64);
+
+int kprobe__i2c_transfer(struct pt_regs *ctx) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u64 ts  = bpf_ktime_get_ns();
+    latency.update(&pid, &ts);
+    return 0;
+}
+
+int kretprobe__i2c_transfer(struct pt_regs *ctx) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u64 *tsp = latency.lookup(&pid);
+    if (tsp) {
+        u64 delta = bpf_ktime_get_ns() - *tsp;
+        bpf_trace_printk("i2c_transfer latency: %llu ns\\n", delta);
+        latency.delete(&pid);
+    }
+    return 0;
+}
+"""
+
+b = BPF(text=prog)
+print("I2C transfer latency izleniyor... (Ctrl+C ile dur)")
+b.trace_print()</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">eBPF vs Kernel Modülü</div>
+    <p>eBPF programları kernel'ın güvenlik doğrulayıcısından (verifier) geçmek zorundadır — sonsuz döngü, geçersiz bellek erişimi gibi tehlikeli operasyonlar derleme/yükleme aşamasında reddedilir. Kernel modülü kadar güçlü değil ama üretim sistemlerinde kullanmak çok daha güvenlidir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: network packet drop'u bul</h2>
+  <p class="section-lead">Gerçek dünya senaryosu: UDP paketleri kaybolduğu bildiriliyor ama uygulama log'larında hiçbir şey görünmüyor. kprobe + kretprobe kombinasyonuyla kernel seviyesinde nereden drop olduğunu bul.</p>
+
+  <h3>Adım 1 — Drop noktalarını belirle</h3>
+
+  <p>Linux ağ yığınında paket drop'u birkaç farklı noktada gerçekleşebilir. Önce adayları listeleyelim:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># kfree_skb — paket serbest bırakma (drop sinyali)</span>
+grep 'kfree_skb' /sys/kernel/debug/tracing/available_filter_functions
+<span class="cmt"># kfree_skb</span>
+<span class="cmt"># kfree_skb_reason</span>
+
+<span class="cmt"># skb:kfree_skb tracepoint'i var mı?</span>
+ls /sys/kernel/debug/tracing/events/skb/
+<span class="cmt"># kfree_skb  skb_copy_datagram_iovec</span></code></pre>
+  </div>
+
+  <h3>Adım 2 — bpftrace ile kfree_skb izle</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># kfree_skb çağrıldığında stack trace yazdır</span>
+bpftrace -e '
+kprobe:kfree_skb {
+    @drops[kstack] = count();
+}
+END {
+    print(@drops);
+}'</code></pre>
+  </div>
+
+  <h3>Adım 3 — Tam kprobe modülü: UDP drop sayacı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>udp_drop_kprobe.c</span><span class="dot">●</span></div>
+    <pre><code">// SPDX-License-Identifier: GPL-2.0
+#include &lt;linux/kernel.h&gt;
+#include &lt;linux/module.h&gt;
+#include &lt;linux/kprobes.h&gt;
+#include &lt;linux/skbuff.h&gt;
+#include &lt;linux/udp.h&gt;
+#include &lt;linux/ip.h&gt;
+#include &lt;linux/atomic.h&gt;
+
+static atomic64_t drop_count = ATOMIC64_INIT(0);
+
+static int pre_kfree_skb(struct kprobe *p, struct pt_regs *regs)
+{
+    struct sk_buff *skb = (struct sk_buff *)regs->di; /* x86-64: rdi=arg0 */
+
+    if (!skb || skb->protocol != htons(ETH_P_IP))
+        return 0;
+
+    if (ip_hdr(skb)->protocol == IPPROTO_UDP) {
+        long count = atomic64_inc_return(&drop_count);
+        if (count % 100 == 0)  /* her 100'de bir log */
+            pr_warn("UDP drop #%ld tespit edildi\n", count);
+    }
+    return 0;
+}
+
+static struct kprobe kp_drop = {
+    .symbol_name = "kfree_skb",
+    .pre_handler = pre_kfree_skb,
+};
+
+/* kretprobe: udp_rcv'nin başarısız olduğu durumları izle */
+static int ret_udp_rcv(struct kretprobe_instance *ri,
+                       struct pt_regs *regs)
+{
+    long ret = regs_return_value(regs);
+    if (ret != 0)
+        pr_info("udp_rcv hata: %ld\n", ret);
+    return 0;
+}
+
+static struct kretprobe rp_udp = {
+    .kp.symbol_name = "udp_rcv",
+    .handler        = ret_udp_rcv,
+    .maxactive      = 32,
+};
+
+static int __init udp_drop_init(void)
+{
+    int ret;
+
+    ret = register_kprobe(&kp_drop);
+    if (ret < 0) { pr_err("kfree_skb probe kaydı başarısız: %d\n", ret); return ret; }
+
+    ret = register_kretprobe(&rp_udp);
+    if (ret < 0) {
+        pr_err("udp_rcv retprobe kaydı başarısız: %d\n", ret);
+        unregister_kprobe(&kp_drop);
+        return ret;
+    }
+
+    pr_info("UDP drop izleme başladı\n");
+    return 0;
+}
+
+static void __exit udp_drop_exit(void)
+{
+    unregister_kprobe(&kp_drop);
+    unregister_kretprobe(&rp_udp);
+    pr_info("Toplam UDP drop: %lld\n", atomic64_read(&drop_count));
+}
+
+module_init(udp_drop_init);
+module_exit(udp_drop_exit);
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("UDP drop sayacı — kprobe demo");</code></pre>
+  </div>
+
+  <h3>Çalıştırma ve yorumlama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code">insmod udp_drop_kprobe.ko
+
+<span class="cmt"># UDP trafik üret (başka bir terminalde)</span>
+iperf3 -c 192.168.1.100 -u -b 100M -t 10
+
+<span class="cmt"># drop'ları izle</span>
+dmesg -W | grep -E 'UDP drop|udp_rcv'
+<span class="cmt"># [  142.345] UDP drop #100 tespit edildi</span>
+<span class="cmt"># [  142.891] UDP drop #200 tespit edildi</span>
+<span class="cmt"># [  143.234] udp_rcv hata: -12  (ENOMEM — socket buffer dolu)</span>
+
+rmmod udp_drop_kprobe
+dmesg | tail -2
+<span class="cmt"># [  155.000] Toplam UDP drop: 347</span></code></pre>
+  </div>
+
+  <p><code class="inline">udp_rcv</code> dönüş değeri <code class="inline">-12 (ENOMEM)</code> ise sorun receive buffer boyutundadır. <code class="inline">/proc/sys/net/core/rmem_max</code> ve <code class="inline">rmem_default</code> değerlerini artırmak çözüm olabilir.</p>
+
+  <div class="summary">
+    <h4>Hatırlanacaklar</h4>
+    <ul>
+      <li>kprobe, <code class="inline">pre_handler</code> ve <code class="inline">post_handler</code> ile fonksiyon girişini izler; <code class="inline">struct pt_regs</code>'den argümanları okur</li>
+      <li>kretprobe, <code class="inline">entry_handler</code> + <code class="inline">handler</code> çiftiyle giriş zamanını saklar, dönüşte latency ve return value hesaplar</li>
+      <li><code class="inline">register_kprobe()</code> <code class="inline">-EINVAL</code> döndürürse fonksiyon blacklist'tedir</li>
+      <li><code class="inline">/sys/kernel/debug/kprobes/list</code> — aktif kprobe'ları gösterir</li>
+      <li>eBPF/bpftrace ile kernel modülü yazmadan aynı sonuca ulaşmak mümkün — üretim için daha güvenli</li>
+      <li>uprobe ile userspace fonksiyonlarını kernel seviyesinde izleyebilirsin</li>
+    </ul>
+  </div>
+
+  <p>Bir sonraki adım: <a href="printk.html" style="color: var(--accent);">printk &amp; dynamic_debug rehberi</a> — kernel loglama ve debug mesaj yönetimi.</p>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

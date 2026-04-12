@@ -1,0 +1,596 @@
+---
+layout: tutorial
+title: "PWM — Sysfs ve Kernel Driver"
+back_url: "../index.html"
+back_label: "Seri Protokoller"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>SERİ PROTOKOLLER</span>
+    <span>PWM</span>
+    <span>2026</span>
+  </div>
+  <h1>PWM — period,<br><em>duty cycle, frekans.</em></h1>
+  <p class="subtitle">Servo, motor, LED dimming — doğru period ve duty cycle her şeyin anahtarı. Linux sysfs PWM arayüzü ve kernel driver ile tam kontrol.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">PWM temelleri</a></li>
+    <li><a href="#s1">Linux PWM subsystem</a></li>
+    <li><a href="#s2">Device Tree PWM tanımı</a></li>
+    <li><a href="#s3">Sysfs PWM arayüzü</a></li>
+    <li><a href="#s4">Uygulama: servo motor</a></li>
+    <li><a href="#s5">Uygulama: LED dimming</a></li>
+    <li><a href="#s6">C ile PWM: sysfs API</a></li>
+    <li><a href="#s7">Python ile PWM: pigpio ve RPi.GPIO</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> PWM temelleri</h2>
+  <p class="section-lead">PWM (Pulse Width Modulation) — sabit frekanslı bir dijital sinyalin yüksek/düşük süre oranını değiştirerek analog benzeri kontrol sağlama tekniği.</p>
+
+  <div class="flow">
+    <pre>
+  │‾‾‾‾│    │‾‾‾‾│    │‾‾‾‾│    %50 duty cycle
+  │    │    │    │    │    │
+  ┘    └────┘    └────┘    └────
+
+  │‾‾‾‾‾‾‾│  │‾‾‾‾‾‾‾│         %70 duty cycle
+  │       │  │       │
+  ┘       └──┘       └──────────
+
+  │‾│  │‾│  │‾│  │‾│           %20 duty cycle
+  │ │  │ │  │ │  │ │
+  ┘ └──┘ └──┘ └──┘ └───────────
+    ←──── period ────►
+    </pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">Period</span><span class="desc">Bir tam dalga döngüsünün süresi. Nanosaniye cinsinden ifade edilir (sysfs API). Period = 1 / Frekans.</span></div>
+    <div class="param"><span class="name">Duty cycle</span><span class="desc">Sinyalin yüksek kaldığı süre. Nanosaniye cinsinden (sysfs). duty_cycle ≤ period olmalıdır.</span></div>
+    <div class="param"><span class="name">Frekans</span><span class="desc">Saniyedeki periyot sayısı (Hz). Frekans = 1 / Period(saniye).</span></div>
+    <div class="param"><span class="name">Duty cycle %</span><span class="desc">Duty cycle'ın period'a oranı. % = (duty_cycle / period) × 100.</span></div>
+  </div>
+
+  <h3>Kullanım senaryoları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Uygulama</th><th>Frekans</th><th>Duty cycle aralığı</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td>RC servo motor</td><td>50 Hz (20ms period)</td><td>1ms–2ms pulse (5%–10%)</td><td>Açı 0°–180° arası</td></tr>
+        <tr><td>DC motor hız</td><td>1–20 kHz</td><td>0%–100%</td><td>Yüksek frekans ses kirliliğini önler</td></tr>
+        <tr><td>LED dimming</td><td>100 Hz – 10 kHz</td><td>0%–100%</td><td>100 Hz üstünde göz titreşim görmez</td></tr>
+        <tr><td>Buzzer</td><td>1 kHz – 4 kHz</td><td>%50 sabit</td><td>Frekans tonu belirler</td></tr>
+        <tr><td>Fan kontrolü</td><td>25 kHz (PC fan standardı)</td><td>20%–100%</td><td>Minimum %20 altında fan durabilir</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p><strong>Hardware PWM vs Software PWM:</strong> Hardware PWM, SoC'nin PWM donanım bloğuyla üretilir; CPU yükü sıfıra yakın ve timing hassastır. Software PWM, kernel veya userspace'deki timer döngüsüyle GPIO pin'i toggle eder; CPU yükü yüksek ve zamanlama daha az deterministiktir. Kritik uygulamalar (servo, motor) için her zaman hardware PWM tercih et.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Linux PWM subsystem</h2>
+  <p class="section-lead">Linux PWM subsystem, donanım PWM denetleyicilerini tutarlı bir API üzerinden sunmak için kernel 3.x'te eklendi.</p>
+
+  <div class="flow">
+    <pre>
+  Userspace   /sys/class/pwm/pwmchip0/pwm0/ (sysfs)
+              veya libpwm / pigpio / RPi.GPIO (kütüphane)
+                              │
+  Kernel     pwm-sysfs.c → PWM subsystem core (pwm.c)
+                              │
+             Platform driver: pwm-bcm2835.c / pwm-imx.c / pwm-tiehrpwm.c
+                              │
+             Hardware PWM controller register'ları (SoC)
+    </pre>
+  </div>
+
+  <h3>Kernel yapılandırması</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>kernel config</span><span class="dot">●</span></div>
+    <pre><code>CONFIG_PWM=y                   <span class="cmt"># PWM subsystem</span>
+CONFIG_PWM_SYSFS=y             <span class="cmt"># /sys/class/pwm/ arayüzü</span>
+CONFIG_PWM_BCM2835=y           <span class="cmt"># Raspberry Pi BCM2835/2711 PWM</span>
+CONFIG_PWM_IMX=y               <span class="cmt"># NXP i.MX PWM</span>
+CONFIG_PWM_TIEHRPWM=y          <span class="cmt"># TI AM335x eHRPWM</span>
+CONFIG_PWM_PCA9685=m           <span class="cmt"># PCA9685 I²C PWM expander</span></code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — mevcut pwmchip'leri gör</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># PWM chip'lerini listele:</span>
+<span class="cmd">ls</span> <span class="path">/sys/class/pwm/</span>
+<span class="cmt"># pwmchip0  pwmchip2  (PWM chip'ler)</span>
+
+<span class="cmt"># Chip hakkında bilgi:</span>
+<span class="cmd">cat</span> <span class="path">/sys/class/pwm/pwmchip0/npwm</span>
+<span class="cmt"># 2  (bu chip'te 2 PWM kanalı var)</span>
+
+<span class="cmd">cat</span> <span class="path">/sys/class/pwm/pwmchip0/device/modalias</span>
+
+<span class="cmt"># Raspberry Pi'da hardware PWM etkinleştirme:</span>
+<span class="cmt"># /boot/config.txt'e ekle:</span>
+<span class="cmt"># dtoverlay=pwm          → GPIO18 (PWM0)
+# dtoverlay=pwm-2chan    → GPIO18 (PWM0) + GPIO19 (PWM1)</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Raspberry Pi 4 (BCM2711) üzerinde GPIO18 ve GPIO19 hardware PWM'i destekler. GPIO12/GPIO13 de aynı donanım bloğunu kullanır (BCM2711'de 4 kanal). SoC'ye ve pin mux yapılandırmasına göre farklı GPIO pinleri PWM olarak kullanılabilir; device tree overlay ile hangi pin'in hangi PWM kanalına bağlandığını belirle.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Device Tree PWM tanımı</h2>
+  <p class="section-lead">PWM kanallarını tüketici cihazlarla (servo, LED, fan) eşleştirmek device tree'de tanımlanır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>device-tree.dts — PWM controller tanımı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* SoC içinde PWM donanımı (genellikle mevcut): */</span>
+pwm0: pwm@7e20c000 {
+    compatible = <span class="str">"brcm,bcm2835-pwm"</span>;
+    reg = &lt;0x7e20c000 0x28&gt;;
+    clocks = &lt;&amp;clocks BCM2835_CLOCK_PWM&gt;;
+    #pwm-cells = &lt;2&gt;;             <span class="cmt">/* (channel, period_ns) */</span>
+};</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>device-tree.dts — tüketici cihaz tanımı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Servo motor bağlantısı: */</span>
+servo0 {
+    compatible = <span class="str">"pwm-servo"</span>;
+    pwms = &lt;&amp;pwm0 0 20000000 0&gt;;
+    <span class="cmt">/*       ↑chip  ↑kanal ↑period_ns(20ms) ↑flags(0=normal) */</span>
+    pwm-names = <span class="str">"servo"</span>;
+};
+
+<span class="cmt">/* LED PWM dimming: */</span>
+led_pwm {
+    compatible = <span class="str">"pwm-leds"</span>;
+    led0 {
+        label = <span class="str">"blue:status"</span>;
+        pwms = &lt;&amp;pwm0 0 1000000 0&gt;;  <span class="cmt">/* PWM0, 1ms period = 1kHz */</span>
+        max-brightness = &lt;255&gt;;
+    };
+};
+
+<span class="cmt">/* #pwm-cells değeri:
+   2 → (channel, period_ns)
+   3 → (channel, period_ns, flags)  ← flags: PWM_POLARITY_INVERTED=1 */</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Sysfs PWM arayüzü</h2>
+  <p class="section-lead">/sys/class/pwm/ altındaki dosya sistemi arayüzüyle PWM kanallarını komut satırından tam olarak kontrol edebilirsin.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — PWM kanal açma ve yapılandırma</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Adım 1: pwmchip0'da kanal 0'ı export et (aç):</span>
+<span class="keyword">echo</span> 0 <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="path">/sys/class/pwm/pwmchip0/export</span>
+<span class="cmt"># /sys/class/pwm/pwmchip0/pwm0/ dizini oluşur</span>
+
+<span class="cmt"># Adım 2: Period ayarla (nanosaniye cinsinden):
+# 50 Hz servo için: 1/50 = 0.02s = 20,000,000 ns</span>
+<span class="keyword">echo</span> 20000000 <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="path">/sys/class/pwm/pwmchip0/pwm0/period</span>
+
+<span class="cmt"># Adım 3: Duty cycle ayarla (nanosaniye, period'dan küçük olmalı):
+# 1.5ms = 1,500,000 ns → servo orta konum</span>
+<span class="keyword">echo</span> 1500000 <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="path">/sys/class/pwm/pwmchip0/pwm0/duty_cycle</span>
+
+<span class="cmt"># Adım 4: PWM'i etkinleştir:</span>
+<span class="keyword">echo</span> 1 <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="path">/sys/class/pwm/pwmchip0/pwm0/enable</span>
+
+<span class="cmt"># Mevcut değerleri oku:</span>
+<span class="cmd">cat</span> <span class="path">/sys/class/pwm/pwmchip0/pwm0/period</span>
+<span class="cmd">cat</span> <span class="path">/sys/class/pwm/pwmchip0/pwm0/duty_cycle</span>
+<span class="cmd">cat</span> <span class="path">/sys/class/pwm/pwmchip0/pwm0/enable</span>
+<span class="cmd">cat</span> <span class="path">/sys/class/pwm/pwmchip0/pwm0/polarity</span>
+
+<span class="cmt"># Polarite değiştir (enable=0 iken yapılmalı):
+# normal: yüksek → duty süresi, düşük → period - duty
+# inversed: düşük → duty süresi</span>
+<span class="keyword">echo</span> 0          <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="path">/sys/class/pwm/pwmchip0/pwm0/enable</span>
+<span class="keyword">echo</span> inversed   <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="path">/sys/class/pwm/pwmchip0/pwm0/polarity</span>
+<span class="keyword">echo</span> 1          <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="path">/sys/class/pwm/pwmchip0/pwm0/enable</span>
+
+<span class="cmt"># Kanal kapat (unexport):</span>
+<span class="keyword">echo</span> 0 <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="path">/sys/class/pwm/pwmchip0/unexport</span></code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">export</span><span class="desc">Kanal numarasını yaz → o kanal için pwmN/ dizini oluşur.</span></div>
+    <div class="param"><span class="name">unexport</span><span class="desc">Kanal numarasını yaz → pwmN/ dizini silinir ve kanal serbest kalır.</span></div>
+    <div class="param"><span class="name">period</span><span class="desc">Periyot süresi (nanosaniye). Duty cycle'dan büyük olmalı.</span></div>
+    <div class="param"><span class="name">duty_cycle</span><span class="desc">Yüksek sinyal süresi (nanosaniye). 0 ≤ duty_cycle ≤ period.</span></div>
+    <div class="param"><span class="name">enable</span><span class="desc">0: PWM devre dışı. 1: PWM aktif.</span></div>
+    <div class="param"><span class="name">polarity</span><span class="desc">"normal" veya "inversed". enable=0 iken yazılmalı.</span></div>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">UYARI</div>
+    <p><strong>Sıra önemlidir:</strong> period değerini duty_cycle'dan önce yaz. Duty cycle period'dan büyük ayarlanırsa hata döner. PWM etkinken period veya duty_cycle değiştirilmesine izin vermeyebilir (donanıma bağlı) — önce enable=0 yap.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Uygulama: servo motor</h2>
+  <p class="section-lead">RC servo motorlar 50 Hz (20ms period) kontrol sinyali bekler. Pulse genişliği açı pozisyonunu belirler.</p>
+
+  <div class="flow">
+    <pre>
+  0°        90°       180°
+  │         │         │
+  1ms       1.5ms     2ms
+  │‾│       │‾‾│      │‾‾‾│
+  │ │       │  │      │   │
+  ┘ └───────┘  └──────┘   └─────
+  ←────── 20ms period ──────────►
+    </pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — servo kontrolü</span><span class="dot">●</span></div>
+    <pre><code>PWM_PATH=<span class="path">/sys/class/pwm/pwmchip0/pwm0</span>
+
+<span class="cmt"># Export ve period ayarla (20ms = 50 Hz):</span>
+<span class="keyword">echo</span> 0          <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="path">/sys/class/pwm/pwmchip0/export</span>
+<span class="keyword">echo</span> 20000000   <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="str">$PWM_PATH</span>/period
+<span class="keyword">echo</span> 1500000    <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="str">$PWM_PATH</span>/duty_cycle  <span class="cmt"># orta konum</span>
+<span class="keyword">echo</span> 1          <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="str">$PWM_PATH</span>/enable
+
+<span class="cmt"># 0° → minimum pulse (1ms):</span>
+<span class="keyword">echo</span> 1000000 <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="str">$PWM_PATH</span>/duty_cycle
+<span class="cmd">sleep</span> 1
+
+<span class="cmt"># 90° → orta (1.5ms):</span>
+<span class="keyword">echo</span> 1500000 <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="str">$PWM_PATH</span>/duty_cycle
+<span class="cmd">sleep</span> 1
+
+<span class="cmt"># 180° → maksimum pulse (2ms):</span>
+<span class="keyword">echo</span> 2000000 <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="str">$PWM_PATH</span>/duty_cycle
+<span class="cmd">sleep</span> 1
+
+<span class="cmt"># Kapat:</span>
+<span class="keyword">echo</span> 0 <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="str">$PWM_PATH</span>/enable
+<span class="keyword">echo</span> 0 <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="path">/sys/class/pwm/pwmchip0/unexport</span></code></pre>
+  </div>
+
+  <h3>Açı → duty cycle dönüşüm formülü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>servo_calc.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">def</span> angle_to_duty_ns(angle_deg, min_pulse_us=1000, max_pulse_us=2000):
+    <span class="cmt">"""
+    Servo açısını duty cycle nanosaniyesine çevir.
+    angle_deg: 0–180
+    min_pulse_us: 0° için pulse genişliği (mikrosaniye, genellikle 1000)
+    max_pulse_us: 180° için pulse genişliği (mikrosaniye, genellikle 2000)
+    """</span>
+    angle_clamped = max(0.0, min(180.0, angle_deg))
+    pulse_us = min_pulse_us + (max_pulse_us - min_pulse_us) * angle_clamped / 180.0
+    <span class="keyword">return</span> int(pulse_us * 1000)  <span class="cmt"># mikrosaniye → nanosaniye</span>
+
+<span class="keyword">def</span> set_servo_angle(pwm_path, angle_deg):
+    duty_ns = angle_to_duty_ns(angle_deg)
+    <span class="keyword">with</span> open(<span class="str">f"{pwm_path}/duty_cycle"</span>, <span class="str">"w"</span>) <span class="keyword">as</span> f:
+        f.write(<span class="keyword">str</span>(duty_ns))
+
+<span class="cmt"># Test:</span>
+<span class="keyword">for</span> angle <span class="keyword">in</span> [0, 45, 90, 135, 180]:
+    ns = angle_to_duty_ns(angle)
+    <span class="keyword">print</span>(<span class="str">f"{angle:3d}° → {ns:7d} ns ({ns/1_000_000:.3f} ms)"</span>)
+
+<span class="cmt"># 0° →  1000000 ns (1.000 ms)
+# 45° →  1250000 ns (1.250 ms)
+# 90° →  1500000 ns (1.500 ms)
+#135° →  1750000 ns (1.750 ms)
+#180° →  2000000 ns (2.000 ms)</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Bazı servo motorların min/max pulse değerleri standart 1ms–2ms aralığından farklıdır. SG90 gibi bütçe servolar 0.5ms–2.4ms aralığında çalışabilir. 180° yerine 270° dönüş yapan servolar da mevcut. Servoyu zorlamadan önce min/max değerlerini kademeli olarak bul.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Uygulama: LED dimming</h2>
+  <p class="section-lead">PWM ile LED parlaklığını kontrol etmek, dirençle güç kaybetmeden verimli dimming sağlar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — LED dimming</span><span class="dot">●</span></div>
+    <pre><code>PWM_PATH=<span class="path">/sys/class/pwm/pwmchip0/pwm0</span>
+
+<span class="cmt"># 1 kHz LED dimming (period = 1,000,000 ns = 1ms):</span>
+<span class="keyword">echo</span> 0         <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="path">/sys/class/pwm/pwmchip0/export</span>
+<span class="keyword">echo</span> 1000000   <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="str">$PWM_PATH</span>/period
+<span class="keyword">echo</span> 0         <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="str">$PWM_PATH</span>/duty_cycle  <span class="cmt"># sönük</span>
+<span class="keyword">echo</span> 1         <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="str">$PWM_PATH</span>/enable
+
+<span class="cmt"># %25 parlaklık (250,000 ns):</span>
+<span class="keyword">echo</span> 250000  <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="str">$PWM_PATH</span>/duty_cycle
+
+<span class="cmt"># %50 parlaklık (500,000 ns):</span>
+<span class="keyword">echo</span> 500000  <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="str">$PWM_PATH</span>/duty_cycle
+
+<span class="cmt"># %100 parlaklık (tam açık):</span>
+<span class="keyword">echo</span> 1000000 <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="str">$PWM_PATH</span>/duty_cycle
+
+<span class="cmt"># Yumuşak kararma efekti (fade out):</span>
+<span class="keyword">for</span> pct <span class="keyword">in</span> 100 90 80 70 60 50 40 30 20 10 0; <span class="keyword">do</span>
+    duty_ns=$(( 1000000 * pct / 100 ))
+    <span class="keyword">echo</span> <span class="str">"$duty_ns"</span> <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="str">$PWM_PATH</span>/duty_cycle
+    <span class="cmd">sleep</span> 0.1
+<span class="keyword">done</span></code></pre>
+  </div>
+
+  <h3>PWM LED parlaklık: lineer mi, logaritmik mi?</h3>
+  <p>İnsan gözü parlaklığı logaritmik algılar. Lineer duty cycle artışı parlaklığın ani artıyormuş gibi hissettirmesine yol açar. Daha doğal görünen geçiş için gamma düzeltme veya logaritmik skala kullan:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>led_gamma.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> math
+<span class="keyword">import</span> time
+
+PWM_PATH = <span class="str">"/sys/class/pwm/pwmchip0/pwm0"</span>
+PERIOD_NS = 1_000_000   <span class="cmt"># 1 kHz</span>
+GAMMA     = 2.2
+
+<span class="keyword">def</span> write_pwm(path, value):
+    <span class="keyword">with</span> open(path, <span class="str">"w"</span>) <span class="keyword">as</span> f:
+        f.write(<span class="keyword">str</span>(value))
+
+<span class="keyword">def</span> setup_pwm():
+    <span class="keyword">with</span> open(<span class="str">"/sys/class/pwm/pwmchip0/export"</span>, <span class="str">"w"</span>) <span class="keyword">as</span> f:
+        f.write(<span class="str">"0"</span>)
+    write_pwm(<span class="str">f"{PWM_PATH}/period"</span>,     PERIOD_NS)
+    write_pwm(<span class="str">f"{PWM_PATH}/duty_cycle"</span>, 0)
+    write_pwm(<span class="str">f"{PWM_PATH}/enable"</span>,     1)
+
+<span class="keyword">def</span> set_brightness(percent):
+    <span class="cmt">"""0–100% parlaklığı gamma-düzeltilmiş duty cycle'a çevir."""</span>
+    linear = percent / 100.0
+    gamma_corrected = linear ** GAMMA
+    duty_ns = int(gamma_corrected * PERIOD_NS)
+    write_pwm(<span class="str">f"{PWM_PATH}/duty_cycle"</span>, duty_ns)
+
+setup_pwm()
+
+<span class="keyword">try</span>:
+    <span class="cmt"># Lineer fazla efekti:</span>
+    <span class="keyword">for</span> step <span class="keyword">in</span> range(101):
+        set_brightness(step)
+        time.sleep(0.02)
+    <span class="keyword">for</span> step <span class="keyword">in</span> range(100, -1, -1):
+        set_brightness(step)
+        time.sleep(0.02)
+<span class="keyword">finally</span>:
+    write_pwm(<span class="str">f"{PWM_PATH}/enable"</span>, 0)
+    <span class="keyword">with</span> open(<span class="str">"/sys/class/pwm/pwmchip0/unexport"</span>, <span class="str">"w"</span>) <span class="keyword">as</span> f:
+        f.write(<span class="str">"0"</span>)</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> C ile PWM: sysfs API</h2>
+  <p class="section-lead">Sysfs tabanlı PWM kontrolü C kodundan dosyaya yazma/okuma ile gerçekleştirilir. Düşük latency gerektirmeyen uygulamalar için yeterlidir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>pwm_sysfs.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;stdio.h&gt;
+<span class="keyword">#include</span> &lt;stdlib.h&gt;
+<span class="keyword">#include</span> &lt;string.h&gt;
+<span class="keyword">#include</span> &lt;unistd.h&gt;
+<span class="keyword">#include</span> &lt;fcntl.h&gt;
+<span class="keyword">#include</span> &lt;errno.h&gt;
+
+<span class="keyword">#define</span> PWM_BASE    <span class="str">"/sys/class/pwm/pwmchip0"</span>
+<span class="keyword">#define</span> PWM_CHANNEL 0
+
+<span class="keyword">static</span> <span class="keyword">int</span> pwm_write(<span class="keyword">const</span> <span class="keyword">char</span> *path, <span class="keyword">long long</span> val)
+{
+    <span class="keyword">char</span> buf[64];
+    snprintf(buf, <span class="keyword">sizeof</span>(buf), <span class="str">"%lld\n"</span>, val);
+
+    <span class="keyword">int</span> fd = open(path, O_WRONLY);
+    <span class="keyword">if</span> (fd &lt; 0) { perror(path); <span class="keyword">return</span> -1; }
+    <span class="keyword">int</span> ret = write(fd, buf, strlen(buf));
+    close(fd);
+    <span class="keyword">return</span> (ret &lt; 0) ? -1 : 0;
+}
+
+<span class="keyword">static</span> <span class="keyword">int</span> pwm_write_str(<span class="keyword">const</span> <span class="keyword">char</span> *path, <span class="keyword">const</span> <span class="keyword">char</span> *val)
+{
+    <span class="keyword">int</span> fd = open(path, O_WRONLY);
+    <span class="keyword">if</span> (fd &lt; 0) { perror(path); <span class="keyword">return</span> -1; }
+    <span class="keyword">int</span> ret = write(fd, val, strlen(val));
+    close(fd);
+    <span class="keyword">return</span> (ret &lt; 0) ? -1 : 0;
+}
+
+<span class="keyword">int</span> pwm_export(<span class="keyword">int</span> channel)
+{
+    <span class="keyword">return</span> pwm_write(PWM_BASE <span class="str">"/export"</span>, channel);
+}
+
+<span class="keyword">int</span> pwm_unexport(<span class="keyword">int</span> channel)
+{
+    <span class="keyword">return</span> pwm_write(PWM_BASE <span class="str">"/unexport"</span>, channel);
+}
+
+<span class="keyword">int</span> pwm_setup(<span class="keyword">int</span> ch, <span class="keyword">long long</span> period_ns, <span class="keyword">long long</span> duty_ns)
+{
+    <span class="keyword">char</span> path[128];
+
+    snprintf(path, <span class="keyword">sizeof</span>(path), PWM_BASE <span class="str">"/pwm%d/period"</span>,     ch);
+    <span class="keyword">if</span> (pwm_write(path, period_ns) &lt; 0) <span class="keyword">return</span> -1;
+
+    snprintf(path, <span class="keyword">sizeof</span>(path), PWM_BASE <span class="str">"/pwm%d/duty_cycle"</span>, ch);
+    <span class="keyword">if</span> (pwm_write(path, duty_ns)   &lt; 0) <span class="keyword">return</span> -1;
+
+    snprintf(path, <span class="keyword">sizeof</span>(path), PWM_BASE <span class="str">"/pwm%d/enable"</span>,     ch);
+    <span class="keyword">return</span> pwm_write(path, 1);
+}
+
+<span class="keyword">int</span> pwm_set_duty(<span class="keyword">int</span> ch, <span class="keyword">long long</span> duty_ns)
+{
+    <span class="keyword">char</span> path[128];
+    snprintf(path, <span class="keyword">sizeof</span>(path), PWM_BASE <span class="str">"/pwm%d/duty_cycle"</span>, ch);
+    <span class="keyword">return</span> pwm_write(path, duty_ns);
+}
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>)
+{
+    <span class="keyword">const</span> <span class="keyword">int</span>  ch        = PWM_CHANNEL;
+    <span class="keyword">const</span> <span class="keyword">long long</span> period = 20000000LL;  <span class="cmt">/* 20ms = 50 Hz servo */</span>
+
+    <span class="keyword">if</span> (pwm_export(ch) &lt; 0 &amp;&amp; errno != EBUSY) <span class="keyword">return</span> 1;
+    <span class="keyword">if</span> (pwm_setup(ch, period, 1500000LL) &lt; 0) <span class="keyword">return</span> 1;  <span class="cmt">/* 1.5ms, orta */</span>
+
+    printf(<span class="str">"Servo: 0° → 90° → 180° → 0°\n"</span>);
+
+    <span class="keyword">long long</span> angles[] = { 1000000, 1500000, 2000000, 1000000 };
+    <span class="keyword">for</span> (<span class="keyword">int</span> i = 0; i &lt; 4; i++) {
+        pwm_set_duty(ch, angles[i]);
+        sleep(1);
+    }
+
+    <span class="keyword">char</span> path[128];
+    snprintf(path, <span class="keyword">sizeof</span>(path), PWM_BASE <span class="str">"/pwm%d/enable"</span>, ch);
+    pwm_write(path, 0);
+    pwm_unexport(ch);
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — derleme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">gcc</span> <span class="flag">-Wall</span> <span class="flag">-o</span> pwm_sysfs pwm_sysfs.c
+<span class="cmd">sudo</span> ./pwm_sysfs</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Python ile PWM: pigpio ve RPi.GPIO karşılaştırması</h2>
+  <p class="section-lead">Raspberry Pi özelindeki iki kütüphane: RPi.GPIO (software PWM) ve pigpio (hardware PWM + DMA). Her ikisini karşılaştıralım.</p>
+
+  <h3>pigpio — hardware + DMA tabanlı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — pigpio kurulum ve daemon</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">sudo</span> <span class="cmd">apt</span> <span class="flag">install</span> pigpio python3-pigpio
+
+<span class="cmt"># pigpiod daemon'u başlat:</span>
+<span class="cmd">sudo</span> <span class="cmd">systemctl</span> start pigpiod
+<span class="cmd">sudo</span> <span class="cmd">systemctl</span> enable pigpiod</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>pigpio_servo.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> pigpio
+<span class="keyword">import</span> time
+
+pi = pigpio.pi()
+<span class="keyword">if not</span> pi.connected:
+    <span class="keyword">raise</span> RuntimeError(<span class="str">"pigpiod bağlanamadı"</span>)
+
+SERVO_PIN = 18   <span class="cmt"># GPIO18: hardware PWM pini</span>
+
+<span class="keyword">def</span> set_servo(pin, angle_deg):
+    <span class="cmt">"""0–180° arasında servo konumu ayarla (pigpio)."""</span>
+    pulse_us = 1000 + int(angle_deg / 180.0 * 1000)  <span class="cmt"># 1000–2000 µs</span>
+    pi.set_servo_pulsewidth(pin, pulse_us)
+
+<span class="keyword">try</span>:
+    <span class="keyword">for</span> angle <span class="keyword">in</span> [0, 45, 90, 135, 180, 90]:
+        set_servo(SERVO_PIN, angle)
+        <span class="keyword">print</span>(<span class="str">f"Açı: {angle}°"</span>)
+        time.sleep(1.0)
+<span class="keyword">finally</span>:
+    pi.set_servo_pulsewidth(SERVO_PIN, 0)   <span class="cmt"># servo servobest bırak</span>
+    pi.stop()</code></pre>
+  </div>
+
+  <h3>RPi.GPIO — software PWM</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>rpigpio_pwm.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> RPi.GPIO <span class="keyword">as</span> GPIO
+<span class="keyword">import</span> time
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+LED_PIN   = 18
+FREQ_HZ   = 1000   <span class="cmt"># 1 kHz (software PWM)</span>
+
+GPIO.setup(LED_PIN, GPIO.OUT)
+pwm = GPIO.PWM(LED_PIN, FREQ_HZ)
+pwm.start(0)   <span class="cmt"># %0 duty ile başla</span>
+
+<span class="keyword">try</span>:
+    <span class="cmt"># Fade in:</span>
+    <span class="keyword">for</span> dc <span class="keyword">in</span> range(0, 101, 5):
+        pwm.ChangeDutyCycle(dc)
+        time.sleep(0.05)
+    <span class="cmt"># Fade out:</span>
+    <span class="keyword">for</span> dc <span class="keyword">in</span> range(100, -1, -5):
+        pwm.ChangeDutyCycle(dc)
+        time.sleep(0.05)
+<span class="keyword">finally</span>:
+    pwm.stop()
+    GPIO.cleanup()</code></pre>
+  </div>
+
+  <h3>Karşılaştırma tablosu</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>RPi.GPIO (software PWM)</th><th>pigpio (DMA PWM)</th><th>sysfs (hardware PWM)</th></tr></thead>
+      <tbody>
+        <tr><td>Donanım bağımsız</td><td>Evet (herhangi GPIO)</td><td>Evet (DMA ile)</td><td>Hayır (hardware PWM pini)</td></tr>
+        <tr><td>Timing hassasiyeti</td><td>Düşük (~ms jitter)</td><td>Yüksek (~1µs jitter)</td><td>En yüksek (&lt;100ns)</td></tr>
+        <tr><td>CPU kullanımı</td><td>Yüksek (threading)</td><td>Düşük (DMA)</td><td>Sıfır (donanım)</td></tr>
+        <tr><td>Servo için uygun</td><td>Kısmen (jitter sorunlu)</td><td>Evet</td><td>Evet</td></tr>
+        <tr><td>LED dimming</td><td>Evet</td><td>Evet</td><td>Evet</td></tr>
+        <tr><td>Daemon gerektirir</td><td>Hayır</td><td>Evet (pigpiod)</td><td>Hayır</td></tr>
+        <tr><td>Frekans üst sınır</td><td>~1 kHz (pratik)</td><td>~40 kHz</td><td>SoC limitine kadar</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Servo ve motor kontrolü için <strong>pigpio</strong> veya <strong>sysfs hardware PWM</strong> tercih et. RPi.GPIO'nun software PWM'i timing jitter'ı nedeniyle servo'yu titretir ve hassas motor kontrolü için yetersiz kalır. LED dimming için software PWM yeterlidir çünkü gözün algıladığı ortalama parlaklık önemlidir, mikrosaniye jitter değil.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

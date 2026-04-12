@@ -1,0 +1,597 @@
+---
+layout: tutorial
+title: "lockdep & Hung Task — Deadlock Tespiti"
+back_url: "../index.html"
+back_label: "Kernel Debug Araçları"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>KERNEL DEBUG</span>
+    <span>SENKRONIZASYON</span>
+    <span>2026</span>
+  </div>
+  <h1>lockdep &amp; Hung Task —<br><em>deadlock tespiti.</em></h1>
+  <p class="subtitle">Kernel'ın yerleşik kilit dedektörü, deadlock'u oluşmadan önce bulur. lockdep bağımlılık grafını çizer; sen sadece raporu okursun.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">lockdep nedir — lock dependency graph</a></li>
+    <li><a href="#s1">lockdep uyarısını okumak</a></li>
+    <li><a href="#s2">Spinlock vs mutex hataları</a></li>
+    <li><a href="#s3">Hung task detector</a></li>
+    <li><a href="#s4">hung_task_timeout_secs — özelleştirme</a></li>
+    <li><a href="#s5">RCU stall — uzun read-side critical section</a></li>
+    <li><a href="#s6">lockstat — kilit çekişme istatistikleri</a></li>
+    <li><a href="#s7">Pratik: deadlock senaryo analizi</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> lockdep nedir — lock dependency graph</h2>
+  <p class="section-lead">lockdep (Lock Dependency Validator), kernel kilit alımlarını izleyerek ileride deadlock'a yol açabilecek kilit sıralama ihlallerini tespit eden bir runtime doğrulama aracıdır. Deadlock'un kendisi oluşmadan, tehlikeli kilit alım sırasını önceden saptar.</p>
+
+  <h3>Temel fikir: lock dependency graph</h3>
+
+  <div class="flow">
+    <pre>
+  Thread A: lock(L1) → lock(L2)   →  L1 → L2 bağımlılığı oluşur
+  Thread B: lock(L2) → lock(L1)   →  L2 → L1 bağımlılığı oluşur
+
+  lockdep bu grafikte çevrim (cycle) tespit eder:
+  L1 → L2 → L1  ← döngüsel bağımlılık = olası deadlock!
+
+  Gerçek deadlock Thread A ve B aynı anda çalıştığında oluşur.
+  lockdep bunu Thread B'nin ilk kez L2 → L1 yaptığında bildirir.
+    </pre>
+  </div>
+
+  <h3>lockdep özellikleri</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">Lock sınıfı</div><div class="desc">lockdep, her kilit örneğini değil <em>sınıfını</em> izler. Aynı türden tüm kilitler (örn. tüm spinlock_t örnekleri) aynı sınıfta değerlendirilir. Bu, ölçeklenebilirlik sağlar.</div></div>
+    <div class="param"><div class="name">AA deadlock</div><div class="desc">Aynı kilidi iki kez almaya çalışmak (recursion deadlock). lockdep bunu anında bildirir.</div></div>
+    <div class="param"><div class="name">AB-BA deadlock</div><div class="desc">İki farklı thread'in aynı iki kilidi ters sırada alması. Klasik deadlock senaryosu.</div></div>
+    <div class="param"><div class="name">Kilit bağlamı</div><del></del><div class="desc">Interrupt handler'da mutex kullanmak gibi geçersiz bağlam hataları.</div></div>
+  </div>
+
+  <h3>Gerekli kernel konfigürasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig</span><span class="dot">●</span></div>
+    <pre><code">CONFIG_LOCKDEP=y
+CONFIG_PROVE_LOCKING=y           # lockdep'i etkinleştirir
+CONFIG_DEBUG_LOCKDEP=y           # ek lockdep doğrulamaları
+CONFIG_LOCK_STAT=y               # kilit istatistikleri
+CONFIG_DEBUG_SPINLOCK=y          # spinlock doğrulama
+CONFIG_DEBUG_MUTEXES=y           # mutex doğrulama
+CONFIG_DEBUG_RT_MUTEXES=y
+CONFIG_DEBUG_ATOMIC_SLEEP=y      # uyku yasak bağlamda uyku kontrolü</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">PERFORMANS ETKİSİ</div>
+    <p>lockdep, her kilit alımında ve bırakımında bir bağımlılık grafiği güncellemesi yapar. Bu, yaklaşık 1.5-2x CPU overhead ve belirgin miktarda ek RAM (lock class hash tablosu) anlamına gelir. Yalnızca debug kernel'larında etkinleştir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> lockdep uyarısını okumak</h2>
+  <p class="section-lead">lockdep bir sorun tespit ettiğinde dmesg'e kapsamlı bir rapor yazar. Bu raporu sistematik olarak okumayı öğrenmek, sorunun kaynağını hızla bulmak için gereklidir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>dmesg — lockdep raporu</span><span class="dot">●</span></div>
+    <pre><code">======================================================
+WARNING: possible circular locking dependency detected
+6.6.0-rc4 #1 Not tainted
+------------------------------------------------------
+kworker/0:1/42 is trying to acquire lock:
+ffff000012345678 (&lock_B){+.+.}-{3:3}, at: func_b+0x30/0x60
+          ^           ^      ^
+          kilit adresi sınıf  kilit türü ve derinlik bilgisi
+
+but task is already holding lock:
+ffff000087654321 (&lock_A){+.+.}-{3:3}, at: func_a+0x20/0x80
+          ^
+          bu kilit zaten tutulmuş
+
+which lock already depends on the new lock.
+
+the existing dependency chain (in reverse order) is:
+
+-> #1 (&lock_B){+.+.}-{3:3}:
+       lock_acquire
+       mutex_lock_nested
+       func_b+0x30/0x60   ← lock_B alındı
+       func_entry+0x50/0xa0
+
+-> #0 (&lock_A){+.+.}-{3:3}:
+       lock_acquire
+       mutex_lock_nested
+       func_a+0x20/0x80   ← lock_A alındı
+
+other info that might help us debug this:
+ Possible unsafe locking scenario:
+
+      CPU0                    CPU1
+      ----                    ----
+ lock(&lock_A);           lock(&lock_B);
+                           lock(&lock_A);   ← CPU1 bekler
+ lock(&lock_B);   ← CPU0 bekler
+                           ↑↑↑ DEADLOCK ↑↑↑
+
+Call Trace:
+ lockdep_circular_chain_check
+ validate_chain
+ __lock_acquire
+ lock_acquire
+ mutex_lock_nested
+ func_a+0x20/0x80
+
+Stack backtrace:
+ func_a+0x20/0x80
+ my_driver_ioctl+0x60/0x100 [my_driver]
+ vfs_ioctl+0x4a/0xa0
+======================================================</code></pre>
+  </div>
+
+  <h3>Raporu okuma rehberi</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">is trying to acquire lock</div><div class="desc">Şu an alınmak istenen kilit. Bu noktada lockdep sorunu fark etti.</div></div>
+    <div class="param"><div class="name">but task is already holding lock</div><div class="desc">Görevin halihazırda tuttuğu kilit. Deadlock potansiyeli burada başlıyor.</div></div>
+    <div class="param"><div class="name">Possible unsafe locking scenario</div><div class="desc">CPU0 ve CPU1'in hangi sırada kilit aldığını gösterir. Döngüsel bağımlılığı buradan oku.</div></div>
+    <div class="param"><div class="name">Call Trace</div><div class="desc">lockdep'in uyarıyı tetiklediği noktanın yığın izi.</div></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Spinlock vs mutex hataları</h2>
+  <p class="section-lead">Kernel'da kilit türü seçimi bağlama bağlıdır. Yanlış bağlamda yanlış kilit kullanmak lockdep tarafından yakalanır.</p>
+
+  <h3>Kilit türü seçim kuralları</h3>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Bağlam</th><th>Spinlock</th><th>Mutex</th><th>Sebep</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Process context (görev)</td><td>Kullanılabilir</td><td>Tercih edilir</td><td>Mutex uyku destekler, CPU kullanmaz</td></tr>
+      <tr><td>Interrupt handler (IRQ)</td><td>Zorunlu (spin_lock_irqsave)</td><td>Yasak</td><td>IRQ bağlamında uyku yasak</td></tr>
+      <tr><td>Softirq / tasklet</td><td>Zorunlu (spin_lock_bh)</td><td>Yasak</td><td>Softirq'da uyku yasak</td></tr>
+      <tr><td>NMI handler</td><td>Yasak (deadlock riski)</td><td>Yasak</td><td>NMI her şeyi keser</td></tr>
+    </tbody>
+  </table>
+
+  <h3>IRQ bağlamında mutex kullanımı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — hatalı kod</span><span class="dot">●</span></div>
+    <pre><code">#include &lt;linux/mutex.h&gt;
+#include &lt;linux/interrupt.h&gt;
+
+static DEFINE_MUTEX(my_mutex);
+
+/* IRQ handler — bu bağlamda uyku yasak */
+static irqreturn_t my_irq_handler(int irq, void *dev_id)
+{
+    mutex_lock(&my_mutex);   /* HATA: IRQ context'te mutex kullanılamaz */
+    /* ... */
+    mutex_unlock(&my_mutex);
+    return IRQ_HANDLED;
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>dmesg — lockdep uyarısı</span><span class="dot">●</span></div>
+    <pre><code">BUG: sleeping function called from invalid context
+in_atomic(): 1, irqs_disabled(): 1, non_block: 0, pid: 0, name: swapper
+preempt_count: 1, expected: 0
+RCU nest depth: 0, expected: 0
+Call Trace:
+ __might_resched
+ __might_sleep
+ mutex_lock
+ my_irq_handler+0x30/0x60   ← IRQ handler'da mutex_lock</code></pre>
+  </div>
+
+  <h3>Düzeltilmiş kod — spinlock kullan</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — doğru kod</span><span class="dot">●</span></div>
+    <pre><code">#include &lt;linux/spinlock.h&gt;
+
+static DEFINE_SPINLOCK(my_lock);
+
+static irqreturn_t my_irq_handler(int irq, void *dev_id)
+{
+    unsigned long flags;
+
+    spin_lock_irqsave(&my_lock, flags);   /* IRQ'yu durdur + kilit al */
+    /* kritik bölge */
+    spin_unlock_irqrestore(&my_lock, flags);
+    return IRQ_HANDLED;
+}
+
+/* Process context'ten aynı kilide erişirken de irqsave kullan */
+void my_process_func(void)
+{
+    unsigned long flags;
+    spin_lock_irqsave(&my_lock, flags);   /* IRQ handler ile aynı kilit */
+    /* kritik bölge */
+    spin_unlock_irqrestore(&my_lock, flags);
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Hung task detector</h2>
+  <p class="section-lead">Hung task detector, TASK_UNINTERRUPTIBLE durumunda uzun süre bekleyen görevleri tespit eder. Bu durum genellikle deadlock, sonsuz bekleyen I/O işlemi veya kernel bug'ının belirtisidir.</p>
+
+  <h3>Konfigürasyon</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig</span><span class="dot">●</span></div>
+    <pre><code">CONFIG_DETECT_HUNG_TASK=y
+CONFIG_DEFAULT_HUNG_TASK_TIMEOUT=120  # varsayılan: 120 saniye
+CONFIG_BOOTPARAM_HUNG_TASK_PANIC=n    # sadece uyar, panic atma
+# veya panic için:
+CONFIG_BOOTPARAM_HUNG_TASK_PANIC=y</code></pre>
+  </div>
+
+  <h3>Hung task uyarısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dmesg — hung task uyarısı</span><span class="dot">●</span></div>
+    <pre><code">[ 1234.567890] INFO: task kworker/0:1:42 blocked for more than 120 seconds.
+[ 1234.567900]       Not tainted 6.6.0 #1
+[ 1234.567910] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[ 1234.567920] task:kworker/0:1     state:D stack:13696 pid:42
+[ 1234.567930] Call Trace:
+[ 1234.567940]  __schedule+0x3a4/0x9c0
+[ 1234.567950]  schedule+0x5c/0xa0
+[ 1234.567960]  schedule_preempt_disabled+0x14/0x20
+[ 1234.567970]  __mutex_lock.isra.0+0x2dc/0x4b0
+[ 1234.567980]  mutex_lock_nested+0x34/0x40
+[ 1234.567990]  my_driver_work_handler+0x44/0xa0 [my_driver]  ← burada bekleniyor
+[ 1234.568000]  process_one_work+0x17c/0x3c0</code></pre>
+  </div>
+
+  <h3>Hung task yorumlama</h3>
+
+  <p><code class="inline">state:D</code> — TASK_UNINTERRUPTIBLE (D: Deep sleep, sinyal de uyandırmaz). Bu durumun başlıca nedenleri:</p>
+
+  <div class="params">
+    <div class="param"><div class="name">Mutex/semaphore bekleme</div><div class="desc">Kilit başka bir görev tarafından tutulmuş ve asla bırakılmıyor. Deadlock senaryosu.</div></div>
+    <div class="param"><div class="name">I/O bekleme</div><div class="desc">Blok cihaz yanıt vermedi — disk arızası, firmware timeout. <code class="inline">iowait</code> yüksekse bu sebeple.</div></div>
+    <div class="param"><div class="name">NFS/network I/O</div><div class="desc">Ağ dosya sistemi isteği yanıtsız kaldı. <code class="inline">nfsd</code> veya ağ sorunu.</div></div>
+    <div class="param"><div class="name">Kernel bug</div><div class="desc">Kilit yanlış alındı ve hiç bırakılmadı.</div></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> hung_task_timeout_secs — özelleştirme</h2>
+  <p class="section-lead">Hung task detector'ün zaman aşımı sysctl ile çalışma zamanında ayarlanabilir. Farklı sistemlerin farklı bekleme toleransları vardır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"># Mevcut timeout değerini gör
+cat /proc/sys/kernel/hung_task_timeout_secs
+# 120
+
+# Zaman aşımını azalt (hızlı tespit — test için)
+echo 30 > /proc/sys/kernel/hung_task_timeout_secs
+
+# Zaman aşımını artır (uzun I/O işlemleri olan sistemler için)
+echo 300 > /proc/sys/kernel/hung_task_timeout_secs
+
+# Hung task tespitini devre dışı bırak (tavsiye edilmez)
+echo 0 > /proc/sys/kernel/hung_task_timeout_secs
+
+# Kalıcı ayar
+echo 'kernel.hung_task_timeout_secs = 60' >> /etc/sysctl.conf
+sysctl -p
+
+# Hung task panic — tespit edilince sistem dump alsın
+echo 1 > /proc/sys/kernel/hung_task_panic</code></pre>
+  </div>
+
+  <h3>Ek parametreler</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">hung_task_check_count</div><div class="desc">Her kontrol döngüsünde incelenecek görev sayısı. Çok sayıda görev olan sistemlerde overhead kontrolü için.</div></div>
+    <div class="param"><div class="name">hung_task_warnings</div><div class="desc">Kaç kez uyarı verileceği (varsayılan: 10). Sonraki uyarılar bastırılır.</div></div>
+    <div class="param"><div class="name">hung_task_all_cpu_backtrace</div><div class="desc">1 = tüm CPU'ların yığın izini yazdır. Karmaşık deadlock senaryolarında faydalı.</div></div>
+  </div>
+
+  <div class="callout">
+    <div class="label">GÖMÜLÜ SİSTEMLER</div>
+    <p>I/O yavaş veya gerçek zamanlı kısıtlamaları olan gömülü sistemlerde hung task timeout'u dikkatli ayarla. Yüksek CPU yükünde bile D durumundaki görevler normal olabilir (flash yazma, ağ I/O). Çok kısa timeout yanlış alarmlar üretir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> RCU stall — uzun read-side critical section</h2>
+  <p class="section-lead">RCU (Read-Copy-Update), kilitsiz okuma için tasarlanmış bir senkronizasyon mekanizmasıdır. Ancak read-side critical section'lar çok uzun sürerse, yazarlar beklemek zorunda kalır — RCU stall bu durumu rapor eder.</p>
+
+  <h3>RCU nedir</h3>
+
+  <div class="flow">
+    <pre>
+  Okuyucu:   rcu_read_lock() ... (kısıtlama: uyku yasak, preempt dengeli) ... rcu_read_unlock()
+  Güncelleyici: rcu_assign_pointer() ... synchronize_rcu() ... kfree(eski_nesne)
+                                              ^
+                                              Tüm okuyucular bitene kadar bekle (grace period)
+                                              Bu bekleme çok uzun sürerse: RCU stall
+    </pre>
+  </div>
+
+  <h3>Konfigürasyon</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig</span><span class="dot">●</span></div>
+    <pre><code">CONFIG_RCU_STALL_COMMON=y
+CONFIG_RCU_CPU_STALL_TIMEOUT=21    # 21 saniye (varsayılan)
+CONFIG_RCU_CPU_STALL_SUPPRESS=0    # 0 = uyarıları göster</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — çalışma zamanı</span><span class="dot">●</span></div>
+    <pre><code"># RCU stall timeout
+cat /sys/module/rcupdate/parameters/rcu_cpu_stall_timeout
+# 21
+
+# Timeout'u değiştir
+echo 60 > /sys/module/rcupdate/parameters/rcu_cpu_stall_timeout</code></pre>
+  </div>
+
+  <h3>RCU stall uyarısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dmesg — RCU stall</span><span class="dot">●</span></div>
+    <pre><code">[ 1234.567] rcu: INFO: rcu_sched self-detected stall on CPU
+[ 1234.568] rcu:     0-....: (5252 ticks this GP) idle=0002/1/0 softirq=1234/1234 fqs=5
+[ 1234.568] rcu:     (t=5252 jiffies g=12345 q=12345 ncpus=4)
+[ 1234.569] rcu: rcu_sched kthread starved for 5253 jiffies!
+[ 1234.570] Task dump for CPU 0:
+[ 1234.571] task:my_driver      state:R  running task
+[ 1234.572] Call Trace:
+[ 1234.573]  my_driver_rcu_cb+0x30/0x60 [my_driver]  ← uzun RCU callback</code></pre>
+  </div>
+
+  <h3>Yaygın RCU stall nedenleri</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">rcu_read_lock() içinde uyku</div><div class="desc">RCU okuma bölümünde <code class="inline">msleep()</code>, <code class="inline">schedule()</code> veya kilit alma. Preemptible RCU olmadıkça yasak.</div></div>
+    <div class="param"><div class="name">Uzun interrupt devre dışı bırakma</div><div class="desc">IRQ disabled durumdayken grace period ilerleyemez.</div></div>
+    <div class="param"><div class="name">Sonsuz döngü</div><div class="desc">RCU read-side içinde sonsuz döngü — grace period asla bitmez.</div></div>
+    <div class="param"><div class="name">CPU yükü</div><div class="desc">Çok yüksek CPU yükünde RCU kthread'i CPU alamayabilir.</div></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> lockstat — kilit çekişme istatistikleri</h2>
+  <p class="section-lead">lockstat, her kilit için bekleme süresini, edinim sayısını ve çekişme (contention) yüzdesini istatistiksel olarak takip eder. Performans darboğazı olan kilitleri bulmak için kullanılır.</p>
+
+  <h3>Konfigürasyon ve etkinleştirme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"># lockstat etkinleştir (CONFIG_LOCK_STAT=y gerektirir)
+echo 1 > /proc/sys/kernel/lock_stat
+
+# ... yük oluştur / test çalıştır ...
+
+# istatistikleri oku
+cat /proc/lock_stat</code></pre>
+  </div>
+
+  <h3>lock_stat çıktısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>/proc/lock_stat çıktısı</span><span class="dot">●</span></div>
+    <pre><code">lock_stat version 0.4
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                              class name    con-bounces    contentions   waittime-min   waittime-max waittime-total   waittime-avg    acq-bounces   acquisitions   holdtime-min
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                          &my_driver_lock:             0              0               0               0              0               0            145         12458            0.14
+                        acquisitions:       12458     holdtime-total:   123456.78 ns    holdtime-avg:    9.91 ns
+                   contentions:              0     waittime-total:        0.00 ns     waittime-avg:    0.00 ns</code></pre>
+  </div>
+
+  <h3>Sütun açıklamaları</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">con-bounces</div><div class="desc">Çekişme sırasında kilit başka CPU'ya geçiş sayısı (cache coherency overhead göstergesi).</div></div>
+    <div class="param"><div class="name">contentions</div><div class="desc">Kilit alınamadığı (meşgul) durum sayısı. Yüksekse yoğun rekabet var demektir.</div></div>
+    <div class="param"><div class="name">waittime-max</div><div class="desc">Kilit için en uzun bekleme süresi (ns). Latency spike'larını gösterir.</div></div>
+    <div class="param"><div class="name">acquisitions</div><div class="desc">Toplam kilit edinim sayısı.</div></div>
+    <div class="param"><div class="name">holdtime-avg</div><div class="desc">Ortalama kilit tutma süresi. Çok uzunsa kritik bölge daraltılmalı.</div></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — sıralama ve filtreleme</span><span class="dot">●</span></div>
+    <pre><code"># İstatistikleri sıfırla
+echo 0 > /proc/lock_stat
+echo 1 > /proc/lock_stat  # yeniden etkinleştir
+
+# En yüksek bekleme süreli kilitler
+cat /proc/lock_stat | sort -k8 -rn | head -20
+
+# lockstat devre dışı bırak
+echo 0 > /proc/lock_stat</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Pratik: deadlock senaryo analizi</h2>
+  <p class="section-lead">Gerçek dünya senaryosu: iki kaynak kilidi (bus_lock ve device_lock) iki farklı kod yolunda ters sırada alınıyor. lockdep bu durumu tespit edecek ve rapor üretecek.</p>
+
+  <h3>Deadlock modülü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>deadlock_demo.c</span><span class="dot">●</span></div>
+    <pre><code">#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+#include &lt;linux/module.h&gt;
+#include &lt;linux/mutex.h&gt;
+#include &lt;linux/kthread.h&gt;
+#include &lt;linux/delay.h&gt;
+
+static DEFINE_MUTEX(bus_lock);
+static DEFINE_MUTEX(device_lock);
+
+/* Thread A: bus_lock → device_lock sırasıyla alır */
+static int thread_a_func(void *data)
+{
+    pr_info("Thread A: bus_lock alınıyor...\n");
+    mutex_lock(&bus_lock);
+    pr_info("Thread A: bus_lock alındı. 100ms bekleniyor...\n");
+    msleep(100);  /* Thread B'nin device_lock almasına fırsat ver */
+
+    pr_info("Thread A: device_lock alınıyor...\n");
+    mutex_lock(&device_lock);  /* lockdep BURAYI yakalar */
+    pr_info("Thread A: her iki kilit alındı (bu satıra ulaşılamaz)\n");
+
+    mutex_unlock(&device_lock);
+    mutex_unlock(&bus_lock);
+    return 0;
+}
+
+/* Thread B: device_lock → bus_lock sırasıyla alır (ters sıra!) */
+static int thread_b_func(void *data)
+{
+    msleep(50);  /* Thread A'nın bus_lock almasına fırsat ver */
+
+    pr_info("Thread B: device_lock alınıyor...\n");
+    mutex_lock(&device_lock);
+    pr_info("Thread B: device_lock alındı. bus_lock alınıyor...\n");
+    mutex_lock(&bus_lock);     /* lockdep BURAYI yakalar: AB-BA sırası */
+    pr_info("Thread B: her iki kilit alındı (bu satıra ulaşılamaz)\n");
+
+    mutex_unlock(&bus_lock);
+    mutex_unlock(&device_lock);
+    return 0;
+}
+
+static struct task_struct *ta, *tb;
+
+static int __init deadlock_init(void)
+{
+    pr_info("deadlock_demo başlatıldı\n");
+    ta = kthread_run(thread_a_func, NULL, "deadlock-a");
+    tb = kthread_run(thread_b_func, NULL, "deadlock-b");
+    return 0;
+}
+
+static void __exit deadlock_exit(void)
+{
+    /* Gerçekte deadlock oluşacağından bu kısma ulaşılamaz */
+    pr_info("deadlock_demo kaldırıldı\n");
+}
+
+module_init(deadlock_init);
+module_exit(deadlock_exit);
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("lockdep deadlock tespiti demo");</code></pre>
+  </div>
+
+  <h3>Modülü yükle ve lockdep raporunu gözlemle</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code">insmod deadlock_demo.ko
+dmesg | grep -A 60 'circular locking'</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>dmesg — beklenen lockdep raporu</span><span class="dot">●</span></div>
+    <pre><code">======================================================
+WARNING: possible circular locking dependency detected
+------------------------------------------------------
+deadlock-b/1235 is trying to acquire lock:
+ffffffff82345678 (bus_lock){+.+.}-{3:3}, at: thread_b_func+0x5c/0x80
+
+but task is already holding lock:
+ffffffff82345690 (device_lock){+.+.}-{3:3}, at: thread_b_func+0x30/0x80
+
+which lock already depends on the new lock.
+
+Possible unsafe locking scenario:
+      CPU0 (deadlock-a)        CPU1 (deadlock-b)
+      -----------------        -----------------
+ lock(bus_lock);          lock(device_lock);
+                           lock(bus_lock);     ← burada bekler
+ lock(device_lock);  ← burada bekler
+           ↑↑↑ DEADLOCK ↑↑↑
+
+Call Trace:
+ thread_b_func+0x5c/0x80 [deadlock_demo]
+======================================================</code></pre>
+  </div>
+
+  <h3>Çözüm — sabit kilit sırası</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — düzeltilmiş thread_b_func</span><span class="dot">●</span></div>
+    <pre><code"">/* KURAL: Her zaman bus_lock → device_lock sırasıyla al */
+static int thread_b_func_fixed(void *data)
+{
+    msleep(50);
+
+    /* bus_lock her zaman ÖNCE alınır — tüm kod yollarında tutarlı sıra */
+    mutex_lock(&bus_lock);
+    mutex_lock(&device_lock);
+
+    /* kritik bölge */
+
+    mutex_unlock(&device_lock);
+    mutex_unlock(&bus_lock);
+    return 0;
+}</code></pre>
+  </div>
+
+  <h3>lockdep ile test doğrulama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"># Düzeltilmiş modülü yükle
+insmod deadlock_fixed.ko
+sleep 1
+dmesg | grep -c 'circular locking'
+# 0  ← lockdep uyarısı yok → kilit sırası tutarlı</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Hatırlanacaklar</h4>
+    <ul>
+      <li>lockdep, deadlock olmadan önce kilit sırası döngüsünü tespit eder — <code class="inline">CONFIG_PROVE_LOCKING=y</code></li>
+      <li>Rapordaki "Possible unsafe locking scenario" bölümü, hangi CPU'nun hangi sırayla kilit aldığını gösterir</li>
+      <li>IRQ bağlamında mutex kullanmak <code class="inline">BUG: sleeping function called from invalid context</code> üretir</li>
+      <li>Hung task = <code class="inline">state:D</code> + uzun süre — deadlock, I/O timeout veya kernel bug</li>
+      <li><code class="inline">echo 60 > /proc/sys/kernel/hung_task_timeout_secs</code> — gömülü sistemler için timeout ayarı</li>
+      <li>RCU stall = grace period bitmeden okuyucu çok uzun süre meşgul — rcu_read_lock() içinde uyku yasak</li>
+      <li>lockstat: <code class="inline">/proc/lock_stat</code> — kilit başına bekleme süresi ve çekişme istatistikleri</li>
+    </ul>
+  </div>
+
+  <p>Kernel debug rehberlerinin tümüne dön: <a href="../index.html" style="color: var(--accent);">Kernel Debug Araçları katalogu</a>.</p>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

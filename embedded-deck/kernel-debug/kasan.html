@@ -1,0 +1,556 @@
+---
+layout: tutorial
+title: "KASAN · UBSAN · KMSAN — Kernel Sanitizers"
+back_url: "../index.html"
+back_label: "Kernel Debug Araçları"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>KERNEL DEBUG</span>
+    <span>MEMORY SAFETY</span>
+    <span>2026</span>
+  </div>
+  <h1>KASAN · UBSAN · KMSAN —<br><em>kernel sanitizers.</em></h1>
+  <p class="subtitle">Compile-time instrumentation ile kernel memory hatalarını, undefined behavior'ı ve veri yarışlarını üretim öncesinde bul. Bug'ın iz bıraktığı yerde seni bekliyor.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Kernel sanitizer'lar nedir</a></li>
+    <li><a href="#s1">KASAN — Kernel Address Sanitizer</a></li>
+    <li><a href="#s2">KASAN bug raporu okumak</a></li>
+    <li><a href="#s3">KASAN modları — generic vs tag-based</a></li>
+    <li><a href="#s4">UBSAN — Undefined Behavior Sanitizer</a></li>
+    <li><a href="#s5">KMSAN — Kernel Memory Sanitizer</a></li>
+    <li><a href="#s6">KCSAN — Kernel Concurrency Sanitizer</a></li>
+    <li><a href="#s7">Sanitizer performans maliyeti</a></li>
+    <li><a href="#s8">Pratik: KASAN ile driver bug bul</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Kernel sanitizer'lar nedir</h2>
+  <p class="section-lead">Kernel sanitizer'lar, derleme zamanında kaynak koduna ek kontrol talimatları ekleyen araçlardır. Çalışma zamanında bellek erişimlerini, tip dönüşümlerini ve veri yarışlarını izleyerek hataları hemen bulurlar.</p>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Sanitizer</th><th>Tespit ettiği hatalar</th><th>Overhead</th><th>Kernel config</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>KASAN</td><td>Out-of-bounds, use-after-free, use-after-return</td><td>~2x bellek, ~2x CPU</td><td><code class="inline">CONFIG_KASAN=y</code></td></tr>
+      <tr><td>UBSAN</td><td>Signed overflow, shift exponent, array index OOB, null deref</td><td>~1.1x CPU</td><td><code class="inline">CONFIG_UBSAN=y</code></td></tr>
+      <tr><td>KMSAN</td><td>Başlatılmamış bellek kullanımı</td><td>~3x bellek, ~3x CPU</td><td><code class="inline">CONFIG_KMSAN=y</code></td></tr>
+      <tr><td>KCSAN</td><td>Veri yarışı (data race), lock-free erişim hataları</td><td>~1.5x CPU</td><td><code class="inline">CONFIG_KCSAN=y</code></td></tr>
+    </tbody>
+  </table>
+
+  <h3>Ortak özellikler</h3>
+
+  <div class="callout">
+    <div class="label">KULLANIM MODELİ</div>
+    <p>Sanitizer'lar <strong>debug kernel</strong>'lar için tasarlanmıştır. Üretim kernel'ına eklenmez. Tipik akış: syzkaller fuzzing ortamı veya özel test platformu → sanitizer kernel → hata raporu → kaynak düzeltme → yeniden test. ARM MTE donanım desteğiyle KASAN üretim kullanımına yaklaşmaktadır.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> KASAN — Kernel Address Sanitizer</h2>
+  <p class="section-lead">KASAN, heap/stack/global bellek erişimlerini shadow memory ile izler. Her byte için 1-bit gölge bellek tutar ve her erişimde bu gölge bayta bakarak erişimin geçerli olup olmadığını kontrol eder.</p>
+
+  <h3>Shadow memory modeli</h3>
+
+  <div class="flow">
+    <pre>
+  Normal bellek alanı:       0x00000000 — 0x7fffffff
+  KASAN shadow alanı:        0xdffffc00 — 0xffffffff
+                             (1/8 oranında, 8 byte → 1 shadow byte)
+
+  Shadow byte anlamı:
+  0x00  → 8 byte tamamen erişilebilir
+  0x01–0x07 → ilk N byte erişilebilir, geri kalanlar zehirli
+  0xFA  → heap left redzone
+  0xFB  → heap right redzone
+  0xFC  → use-after-free (freed memory)
+  0xFD  → stack left redzone
+  0xFE  → global redzone
+    </pre>
+  </div>
+
+  <h3>Kernel konfigürasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig</span><span class="dot">●</span></div>
+    <pre><code">CONFIG_KASAN=y
+CONFIG_KASAN_GENERIC=y         # generic mod (x86, ARM64 vb.)
+CONFIG_KASAN_OUTLINE=y         # inline yerine fonksiyon çağrısı (daha küçük ikili)
+# veya
+CONFIG_KASAN_INLINE=y          # her erişim noktasına instrumentation (daha hızlı)
+
+# Stack ve global değişkenleri de izle
+CONFIG_KASAN_STACK=1
+
+# Birden fazla hata bulmak için (ilkinde durmak yerine)
+CONFIG_KASAN_MULTI_SHOT=y</code></pre>
+  </div>
+
+  <h3>Out-of-bounds örneği</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — kasıtlı bug</span><span class="dot">●</span></div>
+    <pre><code">/* Bu kod KASAN tarafından yakalanır */
+char *buf = kmalloc(16, GFP_KERNEL);
+buf[16] = 'X';   /* out-of-bounds: 16 byte tahsis, 17. byte'a yazma */
+kfree(buf);
+
+buf[0] = 'Y';    /* use-after-free: kfree sonrası erişim */</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> KASAN bug raporu okumak</h2>
+  <p class="section-lead">KASAN bir hata tespit ettiğinde dmesg'e ayrıntılı bir rapor yazar. Bu raporu okumayı öğrenmek, hatayı hızlıca bulmak için kritiktir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>dmesg — KASAN bug raporu</span><span class="dot">●</span></div>
+    <pre><code">==================================================================
+BUG: KASAN: slab-out-of-bounds in my_driver_write+0x4c/0xa0 [my_driver]
+Write of size 1 at addr ffff888012345670 by task kworker/0:1/42
+                  ^          ^              ^          ^
+                  erişim tipi boyut         adres       görev
+
+CPU: 0 PID: 42 Comm: kworker/0:1 Not tainted 6.6.0-rc4 #1
+
+Hardware name: QEMU Standard PC
+
+Call Trace:
+ dump_stack_lvl+0x64/0x83
+ print_report+0x165/0x4b0
+ kasan_report+0xbb/0x1f0
+ kasan_check_range+0x100/0x1a0
+ my_driver_write+0x4c/0xa0 [my_driver]   ← HATANIN OLDUĞU FONKSİYON
+ spi_sync+0x2a/0x60
+ spi_write+0x1e/0x30
+ ...
+
+Allocated by task 42:
+ __kmalloc+0x2a/0x60
+ my_driver_probe+0x88/0x120 [my_driver]   ← TAHSIS NOKTASI
+
+The buggy address belongs to the object at ffff888012345660
+ which belongs to the cache kmalloc-16 of size 16
+The buggy address is located 16 bytes to the right of
+ 16-byte region [ffff888012345660, ffff888012345670)
+                                        ^
+                                        Tahsis edilen alanın tam sonu
+
+Memory state around the buggy address:
+ ffff888012345640: fa fb fb fb fc fc fc fc
+ ffff888012345660: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ ffff888012345670: fc fc fc fc fc fc fc fc   ← fc = right redzone
+                  ^
+                  Erişim bu adrese yapıldı
+==================================================================</code></pre>
+  </div>
+
+  <h3>Rapor bileşenleri</h3>
+
+  <div class="params">
+    <div class="param"><div class="name">BUG tipi</div><div class="desc"><code class="inline">slab-out-of-bounds</code>: heap tampon taşması. <code class="inline">use-after-free</code>: serbest bırakılmış belleğe erişim. <code class="inline">stack-out-of-bounds</code>: stack buffer taşması.</div></div>
+    <div class="param"><div class="name">Access type/size</div><div class="desc">Read mi Write mi, kaç byte etkilendi.</div></div>
+    <div class="param"><div class="name">Call Trace</div><div class="desc">Hatanın nerede oluştuğunu gösteren yığın izi. Genellikle üçüncü veya dördüncü çerçeve asıl hatayı işaret eder.</div></div>
+    <div class="param"><div class="name">Allocated by</div><div class="desc">Belleğin nerede tahsis edildiği — genellikle probe veya init fonksiyonunda.</div></div>
+    <div class="param"><div class="name">Memory state</div><div class="desc">Shadow byte haritası. <code class="inline">00</code>=temiz, <code class="inline">fa</code>=left redzone, <code class="inline">fc</code>=right redzone/freed.</div></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> KASAN modları</h2>
+  <p class="section-lead">KASAN, üç farklı modda çalışabilir. Her birinin farklı overhead'i ve platform gereksinimleri vardır.</p>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Mod</th><th>Mekanizma</th><th>Platform</th><th>Overhead</th><th>Kullanım</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Generic KASAN</td><td>Shadow memory + compiler instrumentation</td><td>x86, ARM64, MIPS, RISC-V</td><td>~2x RAM</td><td>Debug kernel</td></tr>
+      <tr><td>SW Tag-based</td><td>ARM64 TBI (Top Byte Ignore) + 8-bit tag</td><td>ARM64</td><td>~1.5x RAM</td><td>Debug kernel</td></tr>
+      <tr><td>HW Tag-based (MTE)</td><td>ARM Memory Tagging Extension</td><td>ARM64 v8.5+</td><td>~0% CPU ek yük</td><td>Üretim adayı</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Hardware Tag-based KASAN (MTE)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig — ARM MTE</span><span class="dot">●</span></div>
+    <pre><code">CONFIG_KASAN=y
+CONFIG_KASAN_HW_TAGS=y    # ARM MTE gerektirir
+# CONFIG_KASAN_GENERIC is not set
+
+# u-boot veya kernel cmdline parametresi
+# kasan.mode=async  — asenkron mod, daha düşük overhead
+# kasan.mode=sync   — senkron mod, daha kesin konum bilgisi
+# kasan.mode=asymm  — karma mod</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">MTE GÖMÜLEBİLİR SISTEMLER</div>
+    <p>Cortex-A55 ve üzeri çekirdekler (Raspberry Pi 5'in Cortex-A76'sı dahil) MTE destekler. Gömülü sistemlerde üretim kalitesinde memory safety için MTE tabanlı KASAN gelecek vaat ediyor — yaklaşık sıfır runtime overhead ile.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> UBSAN — Undefined Behavior Sanitizer</h2>
+  <p class="section-lead">UBSAN, C standardının "undefined behavior" olarak tanımladığı durumları çalışma zamanında tespit eder. Derleyici varsayımlarına dayanan sessiz hatalar (taşan imzalı tamsayılar, geçersiz kaydırmalar vb.) burada yakalanır.</p>
+
+  <h3>Konfigürasyon</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig</span><span class="dot">●</span></div>
+    <pre><code">CONFIG_UBSAN=y
+CONFIG_UBSAN_TRAP=y         # UB tespit edilince kernel trap atar (önerilen)
+# veya
+CONFIG_UBSAN_SANITIZE_ALL=y # tüm kaynak dosyalarını instrumentation'a dahil et
+
+# Belirli UB türleri
+CONFIG_UBSAN_BOUNDS=y       # dizi sınırı aşımı
+CONFIG_UBSAN_SHIFT=y        # geçersiz bit kaydırma
+CONFIG_UBSAN_INTEGER_WRAP=y # işaretli tamsayı taşması</code></pre>
+  </div>
+
+  <h3>UBSAN'ın yakaladığı hatalar</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — UBSAN örnekleri</span><span class="dot">●</span></div>
+    <pre><code">/* İşaretli tamsayı taşması (UB) */
+int a = INT_MAX;
+a = a + 1;   /* UBSAN: signed integer overflow */
+
+/* Geçersiz bit kaydırma */
+uint32_t x = 1;
+x = x << 32; /* UBSAN: shift exponent >= width */
+x = x << -1; /* UBSAN: shift exponent is negative */
+
+/* Dizi sınırı dışı indeks */
+int arr[8];
+arr[8] = 0;  /* UBSAN: index 8 out of bounds for type 'int[8]' */
+
+/* NULL pointer dereference */
+int *p = NULL;
+*p = 5;      /* UBSAN: null pointer dereference */</code></pre>
+  </div>
+
+  <h3>UBSAN raporu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dmesg — UBSAN raporu</span><span class="dot">●</span></div>
+    <pre><code">================================================================================
+UBSAN: signed-integer-overflow in drivers/my_driver/my_driver.c:142:14
+s32 overflowed: 2147483647 + 1 cannot be represented in type 's32 (int)'
+
+CPU: 1 PID: 1234 Comm: my_app Not tainted 6.6.0
+
+Call Trace:
+ dump_stack_lvl
+ ubsan_epilogue
+ handle_overflow
+ my_driver_calc+0x8e/0xc0 [my_driver]   ← 142. satır
+ my_driver_ioctl+0x44/0x90 [my_driver]
+================================================================================</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> KMSAN — Kernel Memory Sanitizer</h2>
+  <p class="section-lead">KMSAN, başlatılmamış (uninitialized) bellek kullanımını tespit eder. Kernel stack veya heap belleği başlatmadan kullanan kod, güvenlik açıklarına ve gizli bilgi sızıntısına yol açabilir.</p>
+
+  <h3>Konfigürasyon</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig</span><span class="dot">●</span></div>
+    <pre><code">CONFIG_KMSAN=y
+# Not: KMSAN, KASAN ile aynı anda etkinleştirilemez
+# Not: x86-64 ve ARM64 destekler (6.1+ kernel)</code></pre>
+  </div>
+
+  <h3>KMSAN'ın yakaladığı hatalar</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — başlatılmamış bellek</span><span class="dot">●</span></div>
+    <pre><code">/* Başlatılmamış stack değişkeni */
+int my_func(void)
+{
+    int result;           /* başlatılmadı */
+    if (some_condition())
+        result = 42;
+    return result;        /* KMSAN: result başlatılmamış olabilir */
+}
+
+/* Başlatılmamış yapı alanı */
+struct my_msg {
+    int type;
+    int value;
+    char pad[4];          /* doldurma — başlatılmamış */
+};
+
+struct my_msg msg;
+msg.type = 1;
+msg.value = 2;
+/* msg.pad başlatılmamış */
+copy_to_user(ubuf, &msg, sizeof(msg));  /* KMSAN: pad başlatılmamış */</code></pre>
+  </div>
+
+  <h3>KMSAN raporu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dmesg — KMSAN raporu</span><span class="dot">●</span></div>
+    <pre><code">=====================================================
+BUG: KMSAN: uninit-value in copy_to_user+0x7d/0xc0
+  Uninit was created at:
+   stack_depot_save
+   kmsan_save_stack_with_flags
+   my_ioctl_handler+0x3c/0x80 [my_driver]   ← başlatılmamış bölge
+
+  Uninit was used at:
+   copy_to_user+0x7d/0xc0
+   my_ioctl_handler+0x65/0x80 [my_driver]   ← kullanım noktası
+=====================================================</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">GÜVENLİK ÖNEMİ</div>
+    <p>Başlatılmamış kernel belleğini userspace'e kopyalamak (<code class="inline">copy_to_user</code>), kernel stack veya heap içeriğini ifşa edebilir. Bu tür bilgi sızıntısı (information disclosure) KASLR gibi güvenlik mekanizmalarını atlamamıza olanak tanır. KMSAN bu hataları otomatik olarak bulur.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> KCSAN — Kernel Concurrency Sanitizer</h2>
+  <p class="section-lead">KCSAN, kilit olmadan yapılan bellek erişimlerini (data race) tespit eder. Iki thread'in aynı bellek konumuna eş zamanlı erişmesi ve en az birinin yazmak olması durumunda uyarı verir.</p>
+
+  <h3>Konfigürasyon</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig</span><span class="dot">●</span></div>
+    <pre><code">CONFIG_KCSAN=y
+CONFIG_KCSAN_REPORT_ONCE_IN_MS=3000  # en fazla 3 saniyede bir rapor
+CONFIG_KCSAN_UDELAY_TASK=80          # task bağlamında rastgele gecikme (µs)
+CONFIG_KCSAN_UDELAY_INTERRUPT=20     # interrupt bağlamında gecikme (µs)</code></pre>
+  </div>
+
+  <h3>KCSAN mekanizması</h3>
+
+  <p>KCSAN, rastgele seçilen bellek erişimlerinde kısa süreli "watchpoint" yerleştirir. Başka bir CPU eş zamanlı olarak aynı adrese erişirse iki erişim arasında veri yarışı olduğu sonucuna varır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — data race örneği</span><span class="dot">●</span></div>
+    <pre><code">/* Kilit olmadan iki thread aynı değişkene yazıyor */
+int shared_counter = 0;   /* global, kilitsiz */
+
+/* Thread 1 */
+void increment(void) { shared_counter++; }   /* data race */
+
+/* Thread 2 */
+void decrement(void) { shared_counter--; }   /* data race */
+
+/* Doğru yaklaşım: atomik işlem veya kilit */
+atomic_t shared_counter = ATOMIC_INIT(0);
+void increment(void) { atomic_inc(&shared_counter); }  /* güvenli */</code></pre>
+  </div>
+
+  <h3>KCSAN raporu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dmesg — KCSAN raporu</span><span class="dot">●</span></div>
+    <pre><code">==================================================================
+BUG: KCSAN: data-race in increment+0x14/0x20 / decrement+0x14/0x20
+
+write to 0xffffffff82345678 of 4 bytes by task 123 on cpu 1:
+ increment+0x14/0x20
+
+read to 0xffffffff82345678 of 4 bytes by task 456 on cpu 0:
+ decrement+0x14/0x20
+==================================================================</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">READ_ONCE / WRITE_ONCE</div>
+    <p>Kasıtlı olarak kilitsiz erişim yapıyorsanız (lock-free programming) <code class="inline">READ_ONCE()</code> ve <code class="inline">WRITE_ONCE()</code> makrolarını kullanın. KCSAN bu makroları gördüğünde raporlamayı atlar — erişimin kasıtlı olduğu anlaşılır.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Sanitizer performans maliyeti</h2>
+  <p class="section-lead">Sanitizer'ların performans etkisi, hangi sanitizer'ın kullanıldığına ve hedef platforma göre önemli ölçüde değişir. Bu bilgi, hangi sanitizer'ın hangi ortamda kullanılacağını belirlemek için kritiktir.</p>
+
+  <table class="file-table">
+    <thead>
+      <tr><th>Sanitizer</th><th>CPU overhead</th><th>Bellek overhead</th><th>Kod boyutu</th><th>Üretim?</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>KASAN Generic</td><td>~1.5–2x</td><td>~2x (shadow)</td><td>~1.5x</td><td>Hayır</td></tr>
+      <tr><td>KASAN SW Tag</td><td>~1.2–1.5x</td><td>~1.5x</td><td>~1.3x</td><td>Hayır</td></tr>
+      <tr><td>KASAN HW (MTE)</td><td>~1.02x</td><td>minimal</td><td>~1.1x</td><td>Aday</td></tr>
+      <tr><td>UBSAN</td><td>~1.05–1.15x</td><td>minimal</td><td>~1.2x</td><td>Hayır</td></tr>
+      <tr><td>KMSAN</td><td>~2.5–3x</td><td>~3x</td><td>~2x</td><td>Hayır</td></tr>
+      <tr><td>KCSAN</td><td>~1.3–1.5x</td><td>minimal</td><td>~1.15x</td><td>Hayır</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Gömülü sistemlerde sanitizer kullanımı</h3>
+
+  <div class="callout warn">
+    <div class="label">FLASH VE RAM KISITLARI</div>
+    <p>KASAN Generic için shadow memory, kernel'ın kullandığı RAM'ın ~1/8'i kadar ek alan gerektirir. 128 MB RAM'li bir sistem için 16 MB shadow bellek demektir. Bellek kısıtlı gömülü sistemlerde bu kabul edilemez olabilir. KASAN HW (MTE) bu sorunu çözer ama ARM v8.5+ gerektirir.</p>
+  </div>
+
+  <h3>Sanitizer kernel yapılandırma stratejisi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig — debug kernel</span><span class="dot">●</span></div>
+    <pre><code"># Ayrı bir debug kernel yapılandırması oluştur
+# (üretim .config dosyasından türetilmiş, sanitizer'lar ekli)
+
+# Üretim .config al
+cp /path/to/production.config .config
+
+# Sanitizer'ları ekle
+scripts/config --enable CONFIG_KASAN
+scripts/config --enable CONFIG_KASAN_GENERIC
+scripts/config --enable CONFIG_UBSAN
+scripts/config --enable CONFIG_KASAN_MULTI_SHOT
+
+# Debug build yap (üretim kernel'ı etkilemez)
+make -j$(nproc) LOCALVERSION="-kasan-debug"</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Pratik: KASAN ile driver bug bul</h2>
+  <p class="section-lead">Gerçek dünya senaryosu: bir DMA buffer yönetimi sürücüsünde zaman zaman kernel oops'u oluşuyor ama tetikleme koşulları tutarsız. KASAN ile sistematik bulma.</p>
+
+  <h3>Kasıtlı out-of-bounds bug içeren sürücü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>buggy_dma_driver.c</span><span class="dot">●</span></div>
+    <pre><code">#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+#include &lt;linux/module.h&gt;
+#include &lt;linux/slab.h&gt;
+#include &lt;linux/string.h&gt;
+
+#define BUF_SIZE 64
+
+static char *dma_buf;
+
+static int __init buggy_init(void)
+{
+    int i;
+
+    dma_buf = kmalloc(BUF_SIZE, GFP_KERNEL);
+    if (!dma_buf)
+        return -ENOMEM;
+
+    pr_info("DMA buffer tahsis edildi: %p, boyut=%d\n", dma_buf, BUF_SIZE);
+
+    /* BUG: döngü sınırı 1 fazla — 65. byte'a yazıyor */
+    for (i = 0; i <= BUF_SIZE; i++)   /* <= yerine < olmalıydı */
+        dma_buf[i] = (char)(i & 0xFF);
+
+    pr_info("Buffer başlatıldı\n");
+    return 0;
+}
+
+static void __exit buggy_exit(void)
+{
+    kfree(dma_buf);
+    pr_info("DMA buffer serbest bırakıldı\n");
+}
+
+module_init(buggy_init);
+module_exit(buggy_exit);
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Kasıtlı OOB bug — KASAN demo");</code></pre>
+  </div>
+
+  <h3>KASAN raporunu tetikle ve oku</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code">insmod buggy_dma_driver.ko
+dmesg | grep -A 40 'BUG: KASAN'</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>dmesg — KASAN çıktısı</span><span class="dot">●</span></div>
+    <pre><code">==================================================================
+BUG: KASAN: slab-out-of-bounds in buggy_init+0x68/0xa4 [buggy_dma_driver]
+Write of size 1 at addr ffff000012ab8040 by task insmod/1234
+
+CPU: 0 PID: 1234 Comm: insmod
+
+Call Trace:
+ kasan_report
+ __asan_report_store1_noabort
+ buggy_init+0x68/0xa4 [buggy_dma_driver]  ← 65. byte yazma
+ do_init_module
+
+Allocated by task 1234:
+ kmalloc_trace
+ buggy_init+0x30/0xa4 [buggy_dma_driver]  ← BUF_SIZE=64 tahsis
+
+The buggy address is located 0 bytes to the right of
+ 64-byte region [ffff000012ab8000, ffff000012ab8040)
+                                        ^
+                                        ffff...8040 = tam sınır
+
+Memory state:
+ ffff000012ab8000: 00 00 00 00 00 00 00 00   ← temiz (initialized)
+ ffff000012ab8020: 00 00 00 00 00 00 00 00
+ ffff000012ab8040: fc fc fc fc fc fc fc fc   ← right redzone
+                  ^
+                  KASAN'ın işaret ettiği adres
+==================================================================</code></pre>
+  </div>
+
+  <h3>Hatayı düzelt ve doğrula</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — düzeltilmiş kod</span><span class="dot">●</span></div>
+    <pre><code">/* BUG: for (i = 0; i <= BUF_SIZE; i++) */
+/* FIX: */
+for (i = 0; i < BUF_SIZE; i++)   /* < ile BUF_SIZE dahil değil */
+    dma_buf[i] = (char)(i & 0xFF);</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Hatırlanacaklar</h4>
+    <ul>
+      <li>KASAN Generic: shadow memory ile out-of-bounds ve use-after-free — debug kernel için standart</li>
+      <li>KASAN raporu: BUG tipi → Call Trace → "Allocated by" → Memory state — bu sıraya göre oku</li>
+      <li>KASAN HW (MTE): ARM v8.5+ için yaklaşık sıfır overhead — üretim adayı</li>
+      <li>UBSAN: signed overflow, shift exponent, dizi indeksi — C UB'yi çalışma zamanında yakala</li>
+      <li>KMSAN: başlatılmamış bellek → bilgi sızıntısı güvenlik açığı — <code class="inline">copy_to_user</code> öncesi kontrol et</li>
+      <li>KCSAN: data race — kilitsiz paylaşılan erişimi <code class="inline">READ_ONCE/WRITE_ONCE</code> veya atomik işlemlerle belgele</li>
+      <li>Sanitizer kernel = ayrı bir debug build — üretim kernel'ını etkilemez</li>
+    </ul>
+  </div>
+
+  <p>Bir sonraki adım: <a href="kdump.html" style="color: var(--accent);">kdump &amp; crash rehberi</a> — kernel crash sonrası analiz.</p>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

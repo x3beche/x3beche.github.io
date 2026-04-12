@@ -1,0 +1,571 @@
+---
+layout: tutorial
+title: "SPI — spidev ile Linux Arayüzü"
+back_url: "../index.html"
+back_label: "Seri Protokoller"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>SERİ PROTOKOLLER</span>
+    <span>SPI</span>
+    <span>2026</span>
+  </div>
+  <h1>SPI protokolü<br><em>ve spidev.</em></h1>
+  <p class="subtitle">Dört tel, full-duplex, gigabit hızlara çıkabilen senkron bus. /dev/spidevX.Y üzerinden C ioctl veya Python spidev kütüphanesiyle doğrudan kontrol.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">SPI protokolü — temel kavramlar</a></li>
+    <li><a href="#s1">Linux spidev driver</a></li>
+    <li><a href="#s2">/dev/spidev arayüzü</a></li>
+    <li><a href="#s3">C ile SPI: ioctl API</a></li>
+    <li><a href="#s4">Python ile SPI: spidev kütüphanesi</a></li>
+    <li><a href="#s5">Pratik: W25Q32 NOR Flash okuma</a></li>
+    <li><a href="#s6">SPI ile LCD/TFT sürme</a></li>
+    <li><a href="#s7">Troubleshooting</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> SPI protokolü — temel kavramlar</h2>
+  <p class="section-lead">SPI (Serial Peripheral Interface) — Motorola'nın tasarladığı, dört telli, full-duplex senkron seri protokol.</p>
+
+  <div class="flow">
+    <pre>
+  Master                          Slave 0 (CS0)
+  ┌──────────┐    MOSI ──────────►┌──────────┐
+  │          │    MISO ◄──────────│          │
+  │          │    SCK  ──────────►│          │
+  │          │    CS0  ──────────►└──────────┘
+  │          │
+  │          │    MOSI ──────────►┌──────────┐
+  │          │    MISO ◄──────────│  Slave 1 │
+  │          │    SCK  ──────────►│  (CS1)   │
+  └──────────┘    CS1  ──────────►└──────────┘
+    </pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">MOSI</span><span class="desc">Master Out Slave In — master'dan slave'e veri hattı.</span></div>
+    <div class="param"><span class="name">MISO</span><span class="desc">Master In Slave Out — slave'den master'a veri hattı.</span></div>
+    <div class="param"><span class="name">SCK</span><span class="desc">Serial Clock — master tarafından üretilir.</span></div>
+    <div class="param"><span class="name">CS/SS</span><span class="desc">Chip Select / Slave Select — düşük (active-low) olduğunda slave seçilir.</span></div>
+  </div>
+
+  <h3>CPOL ve CPHA — dört çalışma modu</h3>
+  <p>SPI'nın hangi saat kenarında veri örneklendiği ve saat boştayken seviyesi CPOL ve CPHA parametreleriyle belirlenir:</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Mod</th><th>CPOL</th><th>CPHA</th><th>Saat boştayken</th><th>Örnekleme kenarı</th><th>Cihaz örnekleri</th></tr></thead>
+      <tbody>
+        <tr><td>0</td><td>0</td><td>0</td><td>Düşük</td><td>Yükselen kenar</td><td>W25Qxx NOR Flash, SD kart, MAX7219</td></tr>
+        <tr><td>1</td><td>0</td><td>1</td><td>Düşük</td><td>Düşen kenar</td><td>MCP3208 ADC</td></tr>
+        <tr><td>2</td><td>1</td><td>0</td><td>Yüksek</td><td>Düşen kenar</td><td>Nadir kullanılır</td></tr>
+        <tr><td>3</td><td>1</td><td>1</td><td>Yüksek</td><td>Yükselen kenar</td><td>BMI160, bazı TFT driverları</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Full-duplex transfer</h3>
+  <p>SPI gerçek anlamda full-duplex çalışır: MOSI ve MISO eş zamanlı aktiftir. Her SCK pulsunda master bir bit gönderirken slave de bir bit gönderir. Bu nedenle SPI işlemleri "transfer" olarak adlandırılır — okuma veya yazma değil. Slave'e komut gönderirken MISO üzerindeki veri anlamsızdır; komuttan sonra gelen yanıtta ise MOSI'ye gönderilen dummy baytlar anlamsızdır.</p>
+
+  <h3>Multi-slave — daisy chain</h3>
+  <p>Her slave için ayrı CS hattı gerekir. Daisy-chain bağlantısında MOSI→Slave1→MISO→Slave2 zinciri kurulabilir fakat bu konfigürasyon pratikte nadiren kullanılır.</p>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Linux spidev driver</h2>
+  <p class="section-lead">spidev, SPI controller'ını userspace'e character device olarak açan generic Linux driver'ıdır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>kernel config</span><span class="dot">●</span></div>
+    <pre><code>CONFIG_SPI=y
+CONFIG_SPI_SPIDEV=y            <span class="cmt"># /dev/spidevX.Y erişimi için</span>
+CONFIG_SPI_BCM2835=y           <span class="cmt"># Raspberry Pi SPI controller</span>
+CONFIG_SPI_IMX=y               <span class="cmt"># NXP i.MX SPI controller</span>
+CONFIG_SPI_OMAP2_MCSPI=y       <span class="cmt"># TI OMAP/AM335x</span></code></pre>
+  </div>
+
+  <h3>Device Tree binding</h3>
+  <p>spidev driver'ı otomatik yüklemek için device tree'de <code class="inline">compatible</code> değeri olarak ROHM DH2228FV veya benzer "dummy" bir değer kullanılır. Bu, gerçek bir cihaz driver'ı olmayan kullanım içindir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>device-tree.dts</span><span class="dot">●</span></div>
+    <pre><code>&spi0 {
+    status = <span class="str">"okay"</span>;
+    #address-cells = <1>;
+    #size-cells = <0>;
+
+    <span class="cmt">/* CS0: W25Q32 NOR Flash */</span>
+    flash@0 {
+        compatible = <span class="str">"rohm,dh2228fv"</span>;  <span class="cmt">/* spidev için dummy ID */</span>
+        reg = <0>;                         <span class="cmt">/* CS0 */</span>
+        spi-max-frequency = <10000000>;    <span class="cmt">/* 10 MHz */</span>
+        spi-cpol;                         <span class="cmt">/* CPOL=1 ise ekle */</span>
+        spi-cpha;                         <span class="cmt">/* CPHA=1 ise ekle */</span>
+    };
+
+    <span class="cmt">/* CS1: başka bir slave */</span>
+    sensor@1 {
+        compatible = <span class="str">"rohm,dh2228fv"</span>;
+        reg = <1>;
+        spi-max-frequency = <1000000>;
+    };
+};</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — yükleme ve kontrol</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># spidev modülünü yükle (=m ise):</span>
+<span class="cmd">sudo</span> <span class="cmd">modprobe</span> spidev
+
+<span class="cmt"># Mevcut spidev cihazlarını listele:</span>
+<span class="cmd">ls</span> <span class="path">/dev/spidev*</span>
+<span class="cmt"># /dev/spidev0.0  /dev/spidev0.1</span>
+
+<span class="cmt"># Raspberry Pi'da spidev aktifleştirme:</span>
+<span class="cmd">sudo</span> <span class="cmd">raspi-config</span>
+<span class="cmt"># Interfacing Options → SPI → Enable</span>
+<span class="cmt"># VEYA /boot/config.txt'e ekle:</span>
+<span class="cmt"># dtparam=spi=on</span>
+
+<span class="cmt"># Kullanıcıyı spi grubuna ekle:</span>
+<span class="cmd">sudo</span> <span class="cmd">usermod</span> <span class="flag">-aG</span> spi <span class="str">$USER</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Adlandırma: <code class="inline">/dev/spidev0.0</code> → bus 0, CS 0. <code class="inline">/dev/spidev0.1</code> → bus 0, CS 1. <code class="inline">/dev/spidev1.0</code> → bus 1, CS 0. Bus ve CS numaraları device tree'deki <code class="inline">reg</code> değerine karşılık gelir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> /dev/spidev arayüzü</h2>
+  <p class="section-lead">spidev character device'ı standard open/close/read/write/ioctl arayüzü sunar. Major number 153'tür.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Karakter cihaz bilgisi:</span>
+<span class="cmd">ls</span> <span class="flag">-la</span> <span class="path">/dev/spidev0.0</span>
+<span class="cmt"># crw-rw---- 1 root spi 153, 0 Jan  1 00:00 /dev/spidev0.0</span>
+<span class="cmt">#               ↑                ↑
+#               group=spi        major=153, minor=0</span>
+
+<span class="cmt"># sysfs üzerinden SPI cihaz bilgisi:</span>
+<span class="cmd">ls</span> <span class="path">/sys/class/spidev/</span>
+<span class="cmt"># spidev0.0  spidev0.1</span>
+
+<span class="cmd">cat</span> <span class="path">/sys/class/spidev/spidev0.0/device/modalias</span>
+<span class="cmt"># spi:dh2228fv</span>
+
+<span class="cmt"># Basit test — düşük seviye okuma (sadece MISO'dan veri alır):</span>
+<span class="cmd">sudo</span> <span class="cmd">dd</span> <span class="keyword">if</span>=<span class="path">/dev/spidev0.0</span> bs=4 count=1 2>/dev/null <span class="keyword">|</span> <span class="cmd">xxd</span>
+<span class="cmt"># 00000000: ff ff ff ff  ....  (CS düşürülmeden okunur, faydasız)</span></code></pre>
+  </div>
+
+  <p>Raw read/write sistem çağrıları CS'yi kontrol etmez ve transfer parametrelerini dikkate almaz. Her zaman ioctl ile SPI_IOC_MESSAGE(n) kullan.</p>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> C ile SPI: ioctl API</h2>
+  <p class="section-lead">Linux SPI ioctl API, <code class="inline">&lt;linux/spi/spidev.h&gt;</code> başlık dosyasında tanımlanır. Tam kontrolü C kodu ile sağlar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>spi_example.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;stdio.h&gt;
+<span class="keyword">#include</span> &lt;stdlib.h&gt;
+<span class="keyword">#include</span> &lt;string.h&gt;
+<span class="keyword">#include</span> &lt;unistd.h&gt;
+<span class="keyword">#include</span> &lt;fcntl.h&gt;
+<span class="keyword">#include</span> &lt;sys/ioctl.h&gt;
+<span class="keyword">#include</span> &lt;linux/spi/spidev.h&gt;
+
+<span class="keyword">#define</span> SPI_DEVICE   <span class="str">"/dev/spidev0.0"</span>
+<span class="keyword">#define</span> SPI_SPEED_HZ  10000000UL    <span class="cmt">/* 10 MHz */</span>
+<span class="keyword">#define</span> SPI_BITS_PER_WORD  8
+
+<span class="keyword">int</span> spi_init(<span class="keyword">int</span> *fd_out)
+{
+    <span class="keyword">int</span> fd = open(SPI_DEVICE, O_RDWR);
+    <span class="keyword">if</span> (fd &lt; 0) { perror(<span class="str">"open spidev"</span>); <span class="keyword">return</span> -1; }
+
+    <span class="keyword">uint8_t</span>  mode  = SPI_MODE_0;  <span class="cmt">/* CPOL=0, CPHA=0 */</span>
+    <span class="keyword">uint8_t</span>  bits  = SPI_BITS_PER_WORD;
+    <span class="keyword">uint32_t</span> speed = SPI_SPEED_HZ;
+
+    <span class="keyword">if</span> (ioctl(fd, SPI_IOC_WR_MODE,          &amp;mode)  &lt; 0) goto err;
+    <span class="keyword">if</span> (ioctl(fd, SPI_IOC_WR_BITS_PER_WORD, &amp;bits)  &lt; 0) goto err;
+    <span class="keyword">if</span> (ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ,  &amp;speed) &lt; 0) goto err;
+
+    *fd_out = fd;
+    <span class="keyword">return</span> 0;
+err:
+    perror(<span class="str">"ioctl"</span>); close(fd); <span class="keyword">return</span> -1;
+}
+
+<span class="keyword">int</span> spi_transfer(<span class="keyword">int</span> fd,
+                 <span class="keyword">const</span> <span class="keyword">uint8_t</span> *tx, <span class="keyword">uint8_t</span> *rx, <span class="keyword">size_t</span> len)
+{
+    <span class="keyword">struct</span> spi_ioc_transfer tr = {
+        .tx_buf        = (<span class="keyword">unsigned</span> <span class="keyword">long</span>)tx,
+        .rx_buf        = (<span class="keyword">unsigned</span> <span class="keyword">long</span>)rx,
+        .len           = len,
+        .speed_hz      = SPI_SPEED_HZ,
+        .delay_usecs   = 0,
+        .bits_per_word = SPI_BITS_PER_WORD,
+        .cs_change     = 0,
+    };
+    <span class="keyword">return</span> ioctl(fd, SPI_IOC_MESSAGE(1), &amp;tr);
+}
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>)
+{
+    <span class="keyword">int</span> fd;
+    <span class="keyword">if</span> (spi_init(&amp;fd) &lt; 0) <span class="keyword">return</span> 1;
+
+    <span class="cmt">/* W25Q32 JEDEC ID oku: 0x9F komutu, 3 dummy bayt */</span>
+    <span class="keyword">uint8_t</span> tx[4] = { 0x9F, 0x00, 0x00, 0x00 };
+    <span class="keyword">uint8_t</span> rx[4] = { 0 };
+
+    <span class="keyword">if</span> (spi_transfer(fd, tx, rx, 4) &lt; 0) {
+        perror(<span class="str">"spi_transfer"</span>); close(fd); <span class="keyword">return</span> 1;
+    }
+
+    printf(<span class="str">"Manufacturer : 0x%02X\n"</span>, rx[1]);  <span class="cmt">/* 0xEF = Winbond */</span>
+    printf(<span class="str">"Memory type  : 0x%02X\n"</span>, rx[2]);  <span class="cmt">/* 0x40 = W25Q  */</span>
+    printf(<span class="str">"Capacity     : 0x%02X\n"</span>, rx[3]);  <span class="cmt">/* 0x16 = 32Mbit */</span>
+
+    close(fd);
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — derleme ve çalıştırma</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">gcc</span> <span class="flag">-Wall</span> <span class="flag">-o</span> spi_example spi_example.c
+<span class="cmd">sudo</span> ./spi_example
+<span class="cmt"># Manufacturer : 0xEF
+# Memory type  : 0x40
+# Capacity     : 0x16</span></code></pre>
+  </div>
+
+  <h3>Çoklu transfer — SPI_IOC_MESSAGE(n)</h3>
+  <p>CS'yi yükseltmeden birden fazla transfer yapabilmek için spi_ioc_transfer dizisi kullanılır:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>multi_transfer.c (kısmi)</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">struct</span> spi_ioc_transfer transfers[2];
+memset(transfers, 0, <span class="keyword">sizeof</span>(transfers));
+
+<span class="cmt">/* Transfer 1: komut + adres gönder */</span>
+<span class="keyword">uint8_t</span> cmd[4] = { 0x03, 0x00, 0x00, 0x00 };  <span class="cmt">/* Read Data + adres 0x000000 */</span>
+transfers[0].tx_buf        = (<span class="keyword">unsigned</span> <span class="keyword">long</span>)cmd;
+transfers[0].rx_buf        = 0;
+transfers[0].len           = 4;
+transfers[0].cs_change     = 0;  <span class="cmt">/* CS yükseltme — transfer 2'ye geç */</span>
+
+<span class="cmt">/* Transfer 2: 256 bayt oku */</span>
+<span class="keyword">uint8_t</span> data[256];
+<span class="keyword">uint8_t</span> dummy[256];
+memset(dummy, 0xFF, 256);
+transfers[1].tx_buf        = (<span class="keyword">unsigned</span> <span class="keyword">long</span>)dummy;
+transfers[1].rx_buf        = (<span class="keyword">unsigned</span> <span class="keyword">long</span>)data;
+transfers[1].len           = 256;
+transfers[1].cs_change     = 1;  <span class="cmt">/* işlem bitti, CS yükselt */</span>
+
+<span class="keyword">int</span> ret = ioctl(fd, SPI_IOC_MESSAGE(2), transfers);
+<span class="keyword">if</span> (ret &lt; 0) perror(<span class="str">"SPI_IOC_MESSAGE"</span>);</code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">SPI_IOC_WR_MODE</span><span class="desc">SPI mod yaz (SPI_MODE_0..3). SPI_MODE_3 için SPI_CPOL|SPI_CPHA kullan.</span></div>
+    <div class="param"><span class="name">SPI_IOC_RD_MODE</span><span class="desc">Mevcut modu oku.</span></div>
+    <div class="param"><span class="name">SPI_IOC_WR_MAX_SPEED_HZ</span><span class="desc">Maksimum SCK frekansını Hz cinsinden ayarla.</span></div>
+    <div class="param"><span class="name">SPI_IOC_WR_BITS_PER_WORD</span><span class="desc">Word uzunluğunu ayarla (genellikle 8).</span></div>
+    <div class="param"><span class="name">SPI_IOC_MESSAGE(n)</span><span class="desc">n adet spi_ioc_transfer yapısından oluşan dizi ile transfer başlat.</span></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Python ile SPI: spidev kütüphanesi</h2>
+  <p class="section-lead">Python spidev modülü, Linux spidev ioctl API'sini Python'a saran C extension'dır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — kurulum</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">pip3</span> <span class="flag">install</span> spidev
+<span class="cmt"># veya:</span>
+<span class="cmd">sudo</span> <span class="cmd">apt</span> <span class="flag">install</span> python3-spidev</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>spi_python.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> spidev
+
+<span class="cmt"># Bus 0, CS 0 aç:</span>
+spi = spidev.SpiDev()
+spi.open(0, 0)                  <span class="cmt"># (bus, device/CS)</span>
+
+<span class="cmt"># SPI parametreleri ayarla:</span>
+spi.max_speed_hz = 10_000_000   <span class="cmt"># 10 MHz</span>
+spi.mode = 0                    <span class="cmt"># CPOL=0, CPHA=0</span>
+spi.bits_per_word = 8
+spi.lsbfirst = False            <span class="cmt"># MSB first</span>
+
+<span class="keyword">try</span>:
+    <span class="cmt"># W25Q32 JEDEC ID oku:</span>
+    resp = spi.xfer2([0x9F, 0x00, 0x00, 0x00])
+    <span class="keyword">print</span>(<span class="str">f"JEDEC ID: {[hex(b) for b in resp]}"</span>)
+    <span class="cmt"># [0xff, 0xef, 0x40, 0x16]</span>
+
+    <span class="cmt"># Adres 0x000000'dan 16 bayt oku:</span>
+    <span class="cmt"># Read Data komutu (0x03) + 3 byte adres + 16 dummy</span>
+    cmd = [0x03, 0x00, 0x00, 0x00] + [0x00] * 16
+    result = spi.xfer2(cmd)
+    data = result[4:]            <span class="cmt"># ilk 4 bayt komut/adres echo</span>
+    <span class="keyword">print</span>(<span class="str">f"Data: {[hex(b) for b in data]}"</span>)
+
+    <span class="cmt"># writebytes2 — sadece yaz, okuma yok (tx_buf optimize):</span>
+    spi.writebytes2([0x06])      <span class="cmt"># Write Enable (WREN)</span>
+
+    <span class="cmt"># xfer — xfer2'den farkı: CS transferler arası yükselir</span>
+    <span class="cmt"># xfer2 — tek CS assertion ile tüm baytları gönderir (tercih et)</span>
+
+<span class="keyword">finally</span>:
+    spi.close()</code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">xfer(data)</span><span class="desc">Her bayt arasında CS geçici olarak yükselir. Çoğu cihaz için yanlış davranış.</span></div>
+    <div class="param"><span class="name">xfer2(data)</span><span class="desc">Tüm baytları tek CS assertion ile gönderir. Genellikle bu kullanılmalıdır.</span></div>
+    <div class="param"><span class="name">xfer3(data)</span><span class="desc">xfer2 gibi ama büyük transferleri parçalamaz (spidev &gt;= 3.5).</span></div>
+    <div class="param"><span class="name">writebytes(data)</span><span class="desc">Sadece yazar, okuma arabelleği oluşturmaz.</span></div>
+    <div class="param"><span class="name">readbytes(n)</span><span class="desc">n adet 0xFF göndererek n bayt okur.</span></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Pratik: W25Q32 NOR Flash okuma</h2>
+  <p class="section-lead">Winbond W25Q32 — 32 Mbit (4 MB) NOR Flash. SPI Mode 0 veya Mode 3. Maks. 104 MHz saat hızı. Bootloader veya filesytem depolama olarak yaygın kullanılır.</p>
+
+  <h3>Temel komutlar</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Komut</th><th>Hex</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td>JEDEC ID</td><td>0x9F</td><td>Manufacturer ID (1B) + Memory Type (1B) + Capacity (1B)</td></tr>
+        <tr><td>Read Status Reg 1</td><td>0x05</td><td>WIP[0], WEL[1], BP[4:2], TB[5], SEC[6], SRP[7]</td></tr>
+        <tr><td>Write Enable</td><td>0x06</td><td>WEL bitini set et (yazma/silme öncesi gerekli)</td></tr>
+        <tr><td>Read Data</td><td>0x03</td><td>3 byte adres + istenen sayıda bayt oku (max SCK: 50 MHz)</td></tr>
+        <tr><td>Fast Read</td><td>0x0B</td><td>3 byte adres + 1 dummy byte + oku (max SCK: 104 MHz)</td></tr>
+        <tr><td>Page Program</td><td>0x02</td><td>256 byte'a kadar yaz (önce WREN, sayfayı silmeden)</td></tr>
+        <tr><td>Sector Erase</td><td>0x20</td><td>4 KB sektörü sil (0xFF'e doldurur)</td></tr>
+        <tr><td>Chip Erase</td><td>0xC7</td><td>Tüm flash'ı sil (~30 sn)</td></tr>
+        <tr><td>Power Down</td><td>0xB9</td><td>Düşük güç moduna gir</td></tr>
+        <tr><td>Release Power Down</td><td>0xAB</td><td>Güç modundan çık</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>w25q32_read.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> spidev
+<span class="keyword">import</span> sys
+
+<span class="keyword">def</span> w25q32_jedec_id(spi):
+    resp = spi.xfer2([0x9F, 0x00, 0x00, 0x00])
+    mfr  = resp[1]
+    mtype = resp[2]
+    cap  = resp[3]
+    <span class="keyword">print</span>(<span class="str">f"JEDEC: Mfr=0x{mfr:02X} Type=0x{mtype:02X} Cap=0x{cap:02X}"</span>)
+    cap_mb = (1 &lt;&lt; (cap - 0x10))
+    <span class="keyword">print</span>(<span class="str">f"       → Winbond W25Q{cap_mb}FV ({cap_mb} Mbit)"</span>)
+
+<span class="keyword">def</span> w25q32_wait_ready(spi):
+    <span class="keyword">while True</span>:
+        sr = spi.xfer2([0x05, 0x00])[1]
+        <span class="keyword">if not</span> (sr &amp; 0x01):   <span class="cmt"># WIP=0: işlem tamamlandı</span>
+            <span class="keyword">break</span>
+
+<span class="keyword">def</span> w25q32_read(spi, addr, length):
+    <span class="cmt">"""Fast Read: 3-byte adres + 1 dummy byte + length byte oku."""</span>
+    cmd = [
+        0x0B,
+        (addr &gt;&gt; 16) &amp; 0xFF,
+        (addr &gt;&gt;  8) &amp; 0xFF,
+         addr        &amp; 0xFF,
+        0x00          <span class="cmt"># dummy byte</span>
+    ] + [0x00] * length
+    resp = spi.xfer2(cmd)
+    <span class="keyword">return</span> bytes(resp[5:])   <span class="cmt"># ilk 5 bayt komut+adres+dummy echo</span>
+
+<span class="keyword">def</span> w25q32_read_status(spi):
+    sr1 = spi.xfer2([0x05, 0x00])[1]
+    sr2 = spi.xfer2([0x35, 0x00])[1]
+    <span class="keyword">print</span>(<span class="str">f"SR1=0x{sr1:02X} (WIP={sr1&amp;1} WEL={(sr1>>1)&1})"</span>)
+    <span class="keyword">print</span>(<span class="str">f"SR2=0x{sr2:02X}"</span>)
+
+spi = spidev.SpiDev()
+spi.open(0, 0)
+spi.max_speed_hz = 10_000_000
+spi.mode = 0
+
+<span class="keyword">try</span>:
+    w25q32_jedec_id(spi)
+    w25q32_read_status(spi)
+    data = w25q32_read(spi, 0x000000, 16)
+    <span class="keyword">print</span>(<span class="str">f"İlk 16 bayt: {data.hex(' ')}"</span>)
+
+    <span class="cmt"># Sayfanın başına bakıyoruz: silerek 0xFF dolmuş mu?</span>
+    <span class="keyword">if</span> all(b == 0xFF <span class="keyword">for</span> b <span class="keyword">in</span> data):
+        <span class="keyword">print</span>(<span class="str">"Sektör silinmiş (0xFF)"</span>)
+    <span class="keyword">else</span>:
+        <span class="keyword">print</span>(<span class="str">"Sektörde veri mevcut"</span>)
+<span class="keyword">finally</span>:
+    spi.close()</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> SPI ile LCD/TFT sürme</h2>
+  <p class="section-lead">TFT LCD'ler (ILI9341, ST7789 vb.) SPI üzerinden çalışır ve komut/veri ayrımı için ekstra bir DC (Data/Command) pini kullanır.</p>
+
+  <div class="flow">
+    <pre>
+  SoC                          TFT LCD
+  ┌────────────┐    MOSI ──────►┌──────────┐
+  │            │    SCK  ──────►│ ILI9341  │
+  │            │    CS   ──────►│          │
+  │            │    DC   ──────►│ D/CX pin │
+  │            │    RST  ──────►│          │
+  └────────────┘                └──────────┘
+    DC=0 → Command frame
+    DC=1 → Data frame
+    </pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>tft_init.py (ILI9341 temel init)</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> spidev
+<span class="keyword">import</span> gpiod
+<span class="keyword">import</span> time
+
+SPI_BUS = 0
+SPI_CS  = 0
+DC_CHIP = <span class="str">"gpiochip0"</span>
+DC_LINE = 24   <span class="cmt"># GPIO24 → DC pin</span>
+RST_LINE = 25  <span class="cmt"># GPIO25 → RST pin</span>
+
+<span class="cmt"># GPIO kurulumu (DC ve RST):</span>
+chip = gpiod.Chip(DC_CHIP)
+dc_line  = chip.get_line(DC_LINE)
+rst_line = chip.get_line(RST_LINE)
+dc_line.request(consumer=<span class="str">"tft"</span>, type=gpiod.LINE_REQ_DIR_OUT, default_vals=[0])
+rst_line.request(consumer=<span class="str">"tft"</span>, type=gpiod.LINE_REQ_DIR_OUT, default_vals=[1])
+
+spi = spidev.SpiDev()
+spi.open(SPI_BUS, SPI_CS)
+spi.max_speed_hz = 40_000_000
+spi.mode = 0
+
+<span class="keyword">def</span> send_command(cmd, data=None):
+    dc_line.set_value(0)          <span class="cmt"># DC=0: komut</span>
+    spi.xfer2([cmd])
+    <span class="keyword">if</span> data:
+        dc_line.set_value(1)      <span class="cmt"># DC=1: veri</span>
+        spi.xfer2(list(data))
+
+<span class="cmt"># Hardware reset:</span>
+rst_line.set_value(0); time.sleep(0.05)
+rst_line.set_value(1); time.sleep(0.15)
+
+<span class="cmt"># ILI9341 başlatma dizisi:</span>
+send_command(0x01)         <span class="cmt"># Software Reset</span>
+time.sleep(0.12)
+send_command(0x11)         <span class="cmt"># Sleep Out</span>
+time.sleep(0.12)
+send_command(0x3A, [0x55]) <span class="cmt"># COLMOD: 16-bit color (RGB565)</span>
+send_command(0x36, [0x48]) <span class="cmt"># MADCTL: column/row order</span>
+send_command(0x29)         <span class="cmt"># Display On</span>
+
+<span class="keyword">print</span>(<span class="str">"ILI9341 başlatıldı."</span>)
+spi.close()</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Linux'ta <code class="inline">fbtft</code> kernel driver'ı ILI9341, ST7789, ST7735 ve benzeri LCD'ler için hazır driver sağlar. Device tree üzerinden yapılandırılınca <code class="inline">/dev/fb0</code> olarak görünür ve framebuffer araçlarıyla (fbi, mplayer) kullanılabilir. Doğrudan spidev kullanmak daha düşük gecikme sunar.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Troubleshooting</h2>
+  <p class="section-lead">SPI sorunlarının büyük çoğunluğu yanlış CPOL/CPHA, CS timing veya hız kaynaklıdır.</p>
+
+  <h3>Clock polarity hataları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — mod testi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Python ile mod sırayla dene:</span>
+<span class="keyword">import</span> spidev
+spi = spidev.SpiDev()
+spi.open(0, 0)
+spi.max_speed_hz = 1_000_000   <span class="cmt"># düşük hızdan başla</span>
+
+<span class="keyword">for</span> mode <span class="keyword">in</span> [0, 1, 2, 3]:
+    spi.mode = mode
+    resp = spi.xfer2([0x9F, 0x00, 0x00, 0x00])
+    <span class="keyword">print</span>(<span class="str">f"Mode {mode}: {[hex(b) for b in resp]}"</span>)
+    <span class="cmt"># Doğru moddaki yanıt anlamlı JEDEC ID verecektir</span>
+
+spi.close()</code></pre>
+  </div>
+
+  <h3>Oscilloscope ile SPI decode</h3>
+  <ul>
+    <li>MOSI, MISO, SCK, CS kanallarını bağla.</li>
+    <li>Trigger: CS düşen kenar (falling edge).</li>
+    <li>Sigrok / PulseView → "SPI" decoder → CPOL, CPHA, bit order seç.</li>
+    <li>Her transaction'ı hexadecimal olarak decode eder.</li>
+  </ul>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Belirti</th><th>Olası neden</th><th>Çözüm</th></tr></thead>
+      <tbody>
+        <tr><td>MISO sürekli 0xFF</td><td>Yanlış CPOL/CPHA modu</td><td>Datasheet'ten modu doğrula, 4 modu dene</td></tr>
+        <tr><td>MISO sürekli 0x00</td><td>MISO hattı GND'ye kısa, cihaz beslenmiyor</td><td>Bağlantıları kontrol et</td></tr>
+        <tr><td>İlk bayt doğru, sonrakiler bozuk</td><td>CS timing yetersiz, saat fazla hızlı</td><td>Hızı düşür, cs_change ve delay_usecs ayarla</td></tr>
+        <tr><td>open() ENOENT hatası</td><td>/dev/spidevX.Y yok</td><td>CONFIG_SPI_SPIDEV=y ve device tree binding kontrol et</td></tr>
+        <tr><td>open() EACCES hatası</td><td>Kullanıcı spi grubunda değil</td><td>sudo usermod -aG spi $USER + oturumu yenile</td></tr>
+        <tr><td>ioctl EINVAL</td><td>Desteklenmeyen hız veya mod</td><td>SoC'nin maks. hızını ve desteklenen modları kontrol et</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Bazı SoC'ler (örn. Raspberry Pi BCM2835) SPI_MODE_1 ve SPI_MODE_2'yi desteklemez veya donanım limitleri nedeniyle yüksek hızlarda timing sorunları yaşar. Güvenli başlangıç hızı: 1 MHz. Cihazın çalıştığından emin olduktan sonra hızı kademeli artır.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

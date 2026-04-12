@@ -1,0 +1,552 @@
+---
+layout: tutorial
+title: "1-Wire — DS18B20 Sıcaklık Sensörü"
+back_url: "../index.html"
+back_label: "Seri Protokoller"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>SERİ PROTOKOLLER</span>
+    <span>1-Wire</span>
+    <span>2026</span>
+  </div>
+  <h1>1-Wire protokolü<br><em>ve DS18B20.</em></h1>
+  <p class="subtitle">Tek telden onlarca sensör — hepsi seri, hepsi kendi 64-bit ROM koduyla ayrılmış. w1_gpio driver ve /sys/bus/w1/ ile sıcaklık okuma.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">1-Wire protokolü temelleri</a></li>
+    <li><a href="#s1">Linux w1 subsystem</a></li>
+    <li><a href="#s2">/sys/bus/w1/devices/ arayüzü</a></li>
+    <li><a href="#s3">DS18B20 okuma — w1_slave dosyası</a></li>
+    <li><a href="#s4">Birden fazla sensör</a></li>
+    <li><a href="#s5">Python ile DS18B20 okuma</a></li>
+    <li><a href="#s6">Dönüşüm hesaplama</a></li>
+    <li><a href="#s7">Troubleshooting</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> 1-Wire protokolü temelleri</h2>
+  <p class="section-lead">1-Wire — Dallas Semiconductor (şimdi Maxim/Analog Devices) tarafından geliştirilen, tek tel üzerinden hem güç hem de veri taşıyan seri protokol.</p>
+
+  <div class="flow">
+    <pre>
+  SoC GPIO pin              1-Wire Bus (DQ)
+       │                         │
+       ├── 4.7 kΩ ──── VCC      ─┤─ DS18B20 (0x28-XXXXXXXXXXXX)
+       │                         │─ DS18B20 (0x28-YYYYYYYYYYYY)
+       │                         │─ DS18B20 (0x28-ZZZZZZZZZZZZ)
+       │                         │
+       GND ─────────────────────── GND (tüm sensörler)
+    </pre>
+  </div>
+
+  <h3>Temel özellikler</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Tek tel (DQ)</span><span class="desc">Veri ve optionally güç aynı hattan taşınır. Ground hattı hariç sadece bir sinyal teli gerekir.</span></div>
+    <div class="param"><span class="name">Parasite power</span><span class="desc">Sensörler harici güç kaynağı olmadan DQ hattının pull-up kapasitöründen beslenebilir. Ayrı VCC bağlantısı olmadan çalışır, fakat bazı kısıtlamalar getirir.</span></div>
+    <div class="param"><span class="name">ROM kod (64-bit)</span><span class="desc">Her cihazın fabrikada programlanan benzersiz 64-bit tanımlayıcısı. 8-bit family code + 48-bit serial number + 8-bit CRC.</span></div>
+    <div class="param"><span class="name">Reset/presence pulse</span><span class="desc">Her transaction reset pulse ile başlar: master DQ'yu 480µs düşürür, bırakır. Cihazlar 15-60µs sonra presence pulse göndererek varlıklarını bildirir.</span></div>
+    <div class="param"><span class="name">Hız</span><span class="desc">Standard: ~15 kbps. Overdrive mode: ~125 kbps. Uzun kablo için standard mod kullanılır.</span></div>
+  </div>
+
+  <h3>ROM kod yapısı</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Bit</th><th>Alan</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td>[7:0]</td><td>Family code</td><td>Cihaz tipi. DS18B20 = 0x28, DS18S20 = 0x10, DS2431 (EEPROM) = 0x2D</td></tr>
+        <tr><td>[55:8]</td><td>Serial number</td><td>48-bit benzersiz seri numara</td></tr>
+        <tr><td>[63:56]</td><td>CRC</td><td>İlk 56 bitin CRC-8 doğrulama değeri</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Temel komutlar</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Komut</th><th>Hex</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td>Search ROM</td><td>0xF0</td><td>Bus'taki tüm cihazların ROM kodlarını keşfet</td></tr>
+        <tr><td>Read ROM</td><td>0x33</td><td>Tek cihaz varsa ROM kodunu oku (multi-drop'ta kullanılmaz)</td></tr>
+        <tr><td>Match ROM</td><td>0x55</td><td>64-bit ROM kodu ile belirli bir cihazı seç</td></tr>
+        <tr><td>Skip ROM</td><td>0xCC</td><td>Tüm cihazlara broadcast. Tek cihaz veya eş zamanlı dönüşüm için.</td></tr>
+        <tr><td>Convert T</td><td>0x44</td><td>DS18B20: sıcaklık dönüşümünü başlat</td></tr>
+        <tr><td>Read Scratchpad</td><td>0xBE</td><td>DS18B20: 9-byte scratchpad belleği oku</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Linux w1 subsystem</h2>
+  <p class="section-lead">Linux'ta 1-Wire desteği w1 (wire-one) subsystem üzerinden sağlanır. w1_gpio driver, herhangi bir GPIO pinini 1-Wire bus master olarak kullanır.</p>
+
+  <div class="flow">
+    <pre>
+  Userspace      /sys/bus/w1/devices/28-xxxxxxxxxxxx/w1_slave
+                              │
+  Kernel         w1_therm driver   (DS18B20 family)
+                              │
+                     w1 bus master (wire1.c)
+                              │
+                      w1_gpio driver
+                              │
+                    GPIO pin (kernel GPIO API)
+    </pre>
+  </div>
+
+  <h3>Kernel yapılandırması</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>kernel config</span><span class="dot">●</span></div>
+    <pre><code>CONFIG_W1=y                   <span class="cmt"># 1-Wire subsystem</span>
+CONFIG_W1_MASTER_GPIO=y       <span class="cmt"># GPIO tabanlı master</span>
+CONFIG_W1_SLAVE_THERM=y       <span class="cmt"># DS18B20 / DS18S20 / DS1822 / DS28EA00</span>
+CONFIG_W1_SLAVE_DS2431=m      <span class="cmt"># DS2431 EEPROM (opsiyonel)</span></code></pre>
+  </div>
+
+  <h3>Device Tree tanımı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>device-tree.dts</span><span class="dot">●</span></div>
+    <pre><code>/ {
+    onewire: w1 {
+        compatible = <span class="str">"w1-gpio"</span>;
+        gpios = &lt;&amp;gpio 4 0&gt;;         <span class="cmt">/* GPIO4, active-high */</span>
+        pinctrl-names = <span class="str">"default"</span>;
+        pinctrl-0 = &lt;&amp;w1_pins&gt;;
+    };
+};
+
+&amp;gpio {
+    w1_pins: w1_pins {
+        brcm,pins = &lt;4&gt;;
+        brcm,function = &lt;0&gt;;         <span class="cmt">/* GPIO input */</span>
+        brcm,pull = &lt;0&gt;;             <span class="cmt"># pull none (harici 4.7kΩ var) */</span>
+    };
+};</code></pre>
+  </div>
+
+  <h3>Raspberry Pi'da etkinleştirme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>/boot/config.txt (Raspberry Pi)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1-Wire GPIO4 üzerinde etkinleştir:</span>
+dtoverlay=w1-gpio
+
+<span class="cmt"># Farklı pin (GPIO2) kullanmak için:</span>
+dtoverlay=w1-gpio,gpiopin=2
+
+<span class="cmt"># Parasite power desteği:</span>
+dtoverlay=w1-gpio,pullup=on</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — modül yükleme ve kontrol</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Modülleri yükle (=m ise):</span>
+<span class="cmd">sudo</span> <span class="cmd">modprobe</span> w1-gpio
+<span class="cmd">sudo</span> <span class="cmd">modprobe</span> w1-therm
+
+<span class="cmt"># Yüklenen modülleri kontrol et:</span>
+<span class="cmd">lsmod</span> <span class="keyword">|</span> <span class="cmd">grep</span> w1
+
+<span class="cmt"># Kernel mesajlarını izle:</span>
+<span class="cmd">dmesg</span> <span class="keyword">|</span> <span class="cmd">grep</span> w1
+<span class="cmt"># [ 5.2] Driver for 1-wire Dallas network protocol.
+# [ 5.3] gpio-4 (w1): device address: 28-00000xxxxxx</span>
+
+<span class="cmt"># w1 bus master durumu:</span>
+<span class="cmd">ls</span> <span class="path">/sys/bus/w1/devices/</span>
+<span class="cmt"># 28-00000xxxxxxx  w1_bus_master1</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> /sys/bus/w1/devices/ arayüzü</h2>
+  <p class="section-lead">Kernel, 1-Wire cihazlarını /sys/bus/w1/devices/ altında ROM kodu ile adlandırarak gösterir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm 1-Wire cihazlarını listele:</span>
+<span class="cmd">ls</span> <span class="path">/sys/bus/w1/devices/</span>
+<span class="cmt"># 28-00000a123456  28-00000b789abc  w1_bus_master1</span>
+
+<span class="cmt"># ROM kodu formatı: {family_code}-{48bit_serial}
+# 28 → DS18B20 family code
+# 00000a123456 → 48-bit seri numarası (hex, 6 bayt)</span>
+
+<span class="cmt"># Belirli cihazın dosyalarını gör:</span>
+<span class="cmd">ls</span> <span class="path">/sys/bus/w1/devices/28-00000a123456/</span>
+<span class="cmt"># driver  id  name  power  subsystem  uevent  w1_slave</span>
+
+<span class="cmt"># Cihaz adı (family):</span>
+<span class="cmd">cat</span> <span class="path">/sys/bus/w1/devices/28-00000a123456/name</span>
+<span class="cmt"># 28-00000a123456</span>
+
+<span class="cmt"># w1_bus_master1 altında tarama ayarları:</span>
+<span class="cmd">ls</span> <span class="path">/sys/bus/w1/devices/w1_bus_master1/</span>
+<span class="cmt"># max_slave_count  search_count  slave_count  timeout  w1_master_name</span>
+
+<span class="cmt"># Bağlı cihaz sayısı:</span>
+<span class="cmd">cat</span> <span class="path">/sys/bus/w1/devices/w1_bus_master1/slave_count</span>
+<span class="cmt"># 2</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>w1 driver, bağlı cihazları otomatik olarak yaklaşık her 10 saniyede bir tarar. Yeni bir sensör takıldığında /sys/bus/w1/devices/ altında otomatik olarak görünür. Tarama sıklığını <code class="inline">/sys/bus/w1/devices/w1_bus_master1/timeout</code> dosyasına yazarak değiştirebilirsin (saniye cinsinden).</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> DS18B20 okuma — w1_slave dosyası</h2>
+  <p class="section-lead">w1_therm driver, sıcaklık ölçümü ve ham veriyi w1_slave dosyası üzerinden sunar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># w1_slave dosyasını oku:</span>
+<span class="cmd">cat</span> <span class="path">/sys/bus/w1/devices/28-00000a123456/w1_slave</span></code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>w1_slave dosyası çıktısı</span><span class="dot">●</span></div>
+    <pre><code>50 05 4b 46 7f ff 0c 10 1c : crc=1c YES
+50 05 4b 46 7f ff 0c 10 1c t=21312</code></pre>
+  </div>
+
+  <p>Çıktı formatını yorumlayalım:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">50 05 4b 46 7f ff 0c 10 1c</span><span class="desc">DS18B20 scratchpad belleğinin 9 baytı (hex). Byte0-1: sıcaklık, Byte2-3: alarm eşiği, Byte4: configuration, Byte5-7: reserved, Byte8: CRC.</span></div>
+    <div class="param"><span class="name">crc=1c YES</span><span class="desc">CRC-8 hesaplanan değer ve doğrulama durumu. YES=CRC doğru, NO=veri bozuk. NO ise okumayı tekrarla.</span></div>
+    <div class="param"><span class="name">t=21312</span><span class="desc">Sıcaklık değeri: 1/1000 °C cinsinden. 21312 → 21.312 °C. Doğrudan kullanılabilir.</span></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — sıcaklık oku</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Sıcaklığı tek satırda oku:</span>
+<span class="cmd">awk</span> <span class="str">'/YES/{found=1} found{match($0,/t=([0-9-]+)/,a); if(a[1]!="") printf "%.3f C\n", a[1]/1000; exit}'</span> \
+  <span class="path">/sys/bus/w1/devices/28-00000a123456/w1_slave</span>
+<span class="cmt"># 21.312 C</span>
+
+<span class="cmt"># CRC hatasını filtrele:</span>
+<span class="cmd">awk</span> <span class="str">'/YES/{found=1} found{match($0,/t=([0-9-]+)/,a); if(a[1]!="") printf "%.3f\n", a[1]/1000}'</span> \
+  <span class="path">/sys/bus/w1/devices/28-00000a123456/w1_slave</span>
+
+<span class="cmt"># Sürekli izleme (her 2 saniye):</span>
+<span class="keyword">while</span> <span class="keyword">true</span>; <span class="keyword">do</span>
+  <span class="cmd">cat</span> <span class="path">/sys/bus/w1/devices/28-00000a123456/w1_slave</span> <span class="keyword">|</span> \
+    <span class="cmd">grep</span> <span class="str">'t='</span> <span class="keyword">|</span> <span class="cmd">awk</span> <span class="flag">-F</span><span class="str">'='</span> <span class="str">'{printf "%.3f C\n", $2/1000}'</span>
+  <span class="cmd">sleep</span> 2
+<span class="keyword">done</span></code></pre>
+  </div>
+
+  <h3>temperature dosyası (daha yeni kernel'lar)</h3>
+  <p>Linux 5.0+ kernel'larda w1_therm driver, <code class="inline">temperature</code> adında ek bir sysfs dosyası sunar:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Doğrudan sıcaklık (millidegree Celsius):</span>
+<span class="cmd">cat</span> <span class="path">/sys/bus/w1/devices/28-00000a123456/temperature</span>
+<span class="cmt"># 21312</span>
+
+<span class="cmt"># Python tarzı hesap:</span>
+<span class="keyword">echo</span> <span class="str">"$(cat /sys/bus/w1/devices/28-00000a123456/temperature) / 1000"</span> <span class="keyword">|</span> <span class="cmd">bc</span> <span class="flag">-l</span>
+<span class="cmt"># 21.312</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Birden fazla sensör</h2>
+  <p class="section-lead">1-Wire'ın en güçlü özelliği: tüm sensörler aynı iki teli (DQ + GND) paylaşır, her biri ROM kodu ile ayrılır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — tüm sensörleri tara ve oku</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm DS18B20 sensörlerini bul ve oku:</span>
+<span class="keyword">for</span> sensor <span class="keyword">in</span> <span class="path">/sys/bus/w1/devices/28-*/</span>; <span class="keyword">do</span>
+    id=$(basename <span class="str">"$sensor"</span>)
+    raw=$(<span class="cmd">cat</span> <span class="str">"${sensor}w1_slave"</span> 2>/dev/null)
+
+    <span class="cmt"># CRC kontrolü:</span>
+    <span class="keyword">if</span> <span class="cmd">echo</span> <span class="str">"$raw"</span> <span class="keyword">|</span> <span class="cmd">grep</span> <span class="flag">-q</span> <span class="str">"YES"</span>; <span class="keyword">then</span>
+        temp=$(<span class="cmd">echo</span> <span class="str">"$raw"</span> <span class="keyword">|</span> <span class="cmd">grep</span> <span class="str">'t='</span> <span class="keyword">|</span> <span class="cmd">awk</span> <span class="flag">-F</span><span class="str">'='</span> <span class="str">'{printf "%.3f", $2/1000}'</span>)
+        <span class="keyword">echo</span> <span class="str">"$id : ${temp} °C"</span>
+    <span class="keyword">else</span>
+        <span class="keyword">echo</span> <span class="str">"$id : CRC HATASI"</span>
+    <span class="keyword">fi</span>
+<span class="keyword">done</span>
+<span class="cmt"># 28-00000a123456 : 21.312 °C
+# 28-00000b789abc : 23.875 °C
+# 28-00000c001122 : 19.500 °C</span></code></pre>
+  </div>
+
+  <h3>Parasite power ile 4.7 kΩ pull-up önemi</h3>
+  <p>Parasite power modunda DS18B20, DQ hattının yüksek seviyesinden enerji depolar. Sıcaklık dönüşümü sırasında (~750ms) DQ hattından yüksek akım çekilir. Bu nedenle:</p>
+  <ul>
+    <li>4.7 kΩ pull-up direnci <strong>kesinlikle gereklidir</strong>. Daha büyük direnç (10 kΩ) yeterli akımı sağlayamaz ve dönüşüm başarısız olur.</li>
+    <li>Parasite power ile birden fazla sensör kullanırken güç yetersizliği daha belirgin olur. 3 veya daha fazla sensör için ayrı VCC bağlantısı önerilir.</li>
+    <li>Ayrı VCC kullanıldığında 4.7 kΩ pull-up hâlâ gereklidir (bus sinyalizasyonu için).</li>
+  </ul>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Bağlantı tipi</th><th>Sensör sayısı</th><th>Pull-up</th><th>Not</th></tr></thead>
+      <tbody>
+        <tr><td>Parasite power</td><td>1-3</td><td>4.7 kΩ → 3.3V veya 5V</td><td>Sadece DQ + GND gerekir</td></tr>
+        <tr><td>Parasite power</td><td>4+</td><td>4.7 kΩ + güçlendirilmiş sürücü</td><td>Sorunlu, ayrı VCC önerilir</td></tr>
+        <tr><td>Ayrı VCC (3.3V)</td><td>Sınırsız (pratikte 32)</td><td>4.7 kΩ → 3.3V</td><td>Önerilen bağlantı</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Python ile DS18B20 okuma</h2>
+  <p class="section-lead">İki yöntem: hazır w1thermsensor kütüphanesi veya doğrudan dosya parse.</p>
+
+  <h3>w1thermsensor kütüphanesi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — kurulum</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">pip3</span> <span class="flag">install</span> w1thermsensor</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>w1thermsensor_example.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">from</span> w1thermsensor <span class="keyword">import</span> W1ThermSensor, Sensor
+
+<span class="cmt"># Tüm sensörleri bul:</span>
+<span class="keyword">for</span> sensor <span class="keyword">in</span> W1ThermSensor.get_available_sensors():
+    <span class="keyword">print</span>(<span class="str">f"ID: {sensor.id}  Tip: {sensor.name}"</span>)
+    <span class="keyword">print</span>(<span class="str">f"  Sıcaklık: {sensor.get_temperature():.3f} °C"</span>)
+    <span class="keyword">print</span>(<span class="str">f"  Fahrenheit: {sensor.get_temperature(W1ThermSensor.DEGREES_F):.3f} °F"</span>)
+
+<span class="cmt"># Belirli bir sensörü ID ile bul:</span>
+sensor = W1ThermSensor(sensor_type=Sensor.DS18B20, sensor_id=<span class="str">"00000a123456"</span>)
+temp = sensor.get_temperature()
+<span class="keyword">print</span>(<span class="str">f"Belirli sensör: {temp:.2f} °C"</span>)
+
+<span class="cmt"># Çözünürlük ayarı (9, 10, 11, 12 bit):</span>
+sensor.set_precision(12)
+<span class="keyword">print</span>(<span class="str">f"12-bit çözünürlük: {sensor.get_temperature():.4f} °C"</span>)</code></pre>
+  </div>
+
+  <h3>Ham dosya parse (kütüphanesiz)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>ds18b20_raw.py</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">import</span> os
+<span class="keyword">import</span> glob
+<span class="keyword">import</span> time
+
+W1_BASE = <span class="str">"/sys/bus/w1/devices"</span>
+
+<span class="keyword">def</span> find_sensors():
+    <span class="cmt">"""28-* ile başlayan tüm cihaz dizinlerini bul."""</span>
+    <span class="keyword">return</span> glob.glob(os.path.join(W1_BASE, <span class="str">"28-*"</span>))
+
+<span class="keyword">def</span> read_temp(device_path, retries=3):
+    <span class="cmt">"""w1_slave dosyasını parse et, CRC hatasında tekrar dene."""</span>
+    w1_file = os.path.join(device_path, <span class="str">"w1_slave"</span>)
+
+    <span class="keyword">for</span> attempt <span class="keyword">in</span> range(retries):
+        <span class="keyword">try</span>:
+            <span class="keyword">with</span> open(w1_file, <span class="str">"r"</span>) <span class="keyword">as</span> f:
+                lines = f.readlines()
+
+            <span class="keyword">if</span> len(lines) &lt; 2:
+                <span class="keyword">raise</span> ValueError(<span class="str">"Yetersiz satır"</span>)
+
+            <span class="cmt"># Satır 1: "xx xx xx ... : crc=xx YES/NO"</span>
+            <span class="keyword">if</span> <span class="str">"YES"</span> <span class="keyword">not in</span> lines[0]:
+                <span class="keyword">if</span> attempt &lt; retries - 1:
+                    time.sleep(0.1)
+                    <span class="keyword">continue</span>
+                <span class="keyword">raise</span> ValueError(<span class="str">f"CRC hatası (deneme {attempt+1}/{retries})"</span>)
+
+            <span class="cmt"># Satır 2: "xx xx ... t=NNNNN"</span>
+            pos = lines[1].find(<span class="str">"t="</span>)
+            <span class="keyword">if</span> pos == -1:
+                <span class="keyword">raise</span> ValueError(<span class="str">"t= bulunamadı"</span>)
+
+            raw_temp = <span class="keyword">int</span>(lines[1][pos+2:].strip())
+            <span class="keyword">return</span> raw_temp / 1000.0   <span class="cmt"># °C</span>
+
+        <span class="keyword">except</span> OSError <span class="keyword">as</span> e:
+            <span class="keyword">raise</span> IOError(<span class="str">f"Dosya okuma hatası: {e}"</span>)
+
+    <span class="keyword">raise</span> ValueError(<span class="str">"Tüm denemeler başarısız"</span>)
+
+sensors = find_sensors()
+<span class="keyword">if not</span> sensors:
+    <span class="keyword">print</span>(<span class="str">"Hiç DS18B20 bulunamadı. Bağlantı ve modül yüklemesini kontrol et."</span>)
+<span class="keyword">else</span>:
+    <span class="keyword">for</span> s <span class="keyword">in</span> sensors:
+        name = os.path.basename(s)
+        <span class="keyword">try</span>:
+            temp = read_temp(s)
+            <span class="keyword">print</span>(<span class="str">f"{name}: {temp:.3f} °C"</span>)
+        <span class="keyword">except</span> (ValueError, IOError) <span class="keyword">as</span> e:
+            <span class="keyword">print</span>(<span class="str">f"{name}: HATA — {e}"</span>)</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Dönüşüm hesaplama</h2>
+  <p class="section-lead">w1_slave dosyasındaki t= değeri kernel tarafından hesaplanmış °C×1000 değeridir. Ancak ham scratchpad verisini kendin parse etmek istersen dönüşüm formülü şöyledir.</p>
+
+  <h3>DS18B20 çözünürlük ve dönüşüm süresi</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Çözünürlük</th><th>Bit</th><th>Adım (°C)</th><th>Dönüşüm süresi (maks.)</th></tr></thead>
+      <tbody>
+        <tr><td>9-bit</td><td>Configuration=0x1F</td><td>0.5 °C</td><td>93.75 ms</td></tr>
+        <tr><td>10-bit</td><td>Configuration=0x3F</td><td>0.25 °C</td><td>187.5 ms</td></tr>
+        <tr><td>11-bit</td><td>Configuration=0x5F</td><td>0.125 °C</td><td>375 ms</td></tr>
+        <tr><td>12-bit (varsayılan)</td><td>Configuration=0x7F</td><td>0.0625 °C</td><td>750 ms</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>ds18b20_manual.py — scratchpad parse</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">def</span> parse_scratchpad(hex_bytes_str):
+    <span class="cmt">"""
+    w1_slave'nin birinci satırındaki hex baytlarını parse et.
+    Örnek: "50 05 4b 46 7f ff 0c 10 1c"
+    """</span>
+    raw = [int(x, 16) <span class="keyword">for</span> x <span class="keyword">in</span> hex_bytes_str.strip().split()]
+    <span class="keyword">if</span> len(raw) != 9:
+        <span class="keyword">raise</span> ValueError(<span class="str">f"Beklenen 9 bayt, alınan {len(raw)}"</span>)
+
+    <span class="cmt"># CRC-8 doğrulama (Dallas/Maxim CRC8):</span>
+    crc = 0
+    <span class="keyword">for</span> byte <span class="keyword">in</span> raw[:8]:
+        <span class="keyword">for</span> _ <span class="keyword">in</span> range(8):
+            bit = (crc ^ byte) &amp; 1
+            crc &gt;&gt;= 1
+            <span class="keyword">if</span> bit:
+                crc ^= 0x8C
+            byte &gt;&gt;= 1
+    <span class="keyword">if</span> crc != raw[8]:
+        <span class="keyword">raise</span> ValueError(<span class="str">f"CRC hatası: hesaplanan=0x{crc:02X} beklenen=0x{raw[8]:02X}"</span>)
+
+    <span class="cmt"># Sıcaklık hesabı (Byte0=LSB, Byte1=MSB):</span>
+    temp_raw = (raw[1] &lt;&lt; 8) | raw[0]
+
+    <span class="cmt"># İşaretli 16-bit integer (two's complement):</span>
+    <span class="keyword">if</span> temp_raw &gt; 32767:
+        temp_raw -= 65536
+
+    temp_c = temp_raw / 16.0   <span class="cmt"># 12-bit için ÷16 (0.0625°C adım)</span>
+
+    <span class="cmt"># Yapılandırma register'dan çözünürlük al:</span>
+    resolution_bits = 9 + ((raw[4] &gt;&gt; 5) &amp; 0x03)
+    <span class="cmt"># Byte4[6:5]: 00=9bit, 01=10bit, 10=11bit, 11=12bit</span>
+
+    <span class="cmt"># Düşük bitler çözünürlüğe göre anlamsızdır, maskele:</span>
+    mask = {9: 0xFFF8, 10: 0xFFFC, 11: 0xFFFE, 12: 0xFFFF}
+    temp_raw_masked = temp_raw &amp; mask[resolution_bits]
+    temp_c_final = temp_raw_masked / 16.0
+
+    <span class="keyword">return</span> {
+        <span class="str">"temperature_c"</span>  : temp_c_final,
+        <span class="str">"resolution_bits"</span>: resolution_bits,
+        <span class="str">"alarm_high"</span>     : raw[2],
+        <span class="str">"alarm_low"</span>      : raw[3],
+    }
+
+<span class="cmt"># Örnek kullanım:</span>
+result = parse_scratchpad(<span class="str">"50 05 4b 46 7f ff 0c 10 1c"</span>)
+<span class="keyword">print</span>(<span class="str">f"Sıcaklık  : {result['temperature_c']:.4f} °C"</span>)
+<span class="keyword">print</span>(<span class="str">f"Çözünürlük: {result['resolution_bits']}-bit"</span>)
+<span class="cmt"># Sıcaklık  : 21.3125 °C
+# Çözünürlük: 12-bit</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Scratchpad bayt 0-1: 12-bit çözünürlükte 4 bit kesirli kısım içerir (0.0625°C hassasiyet). 9-bit çözünürlükte yalnızca 1 kesirli bit anlamlıdır; kalan 3 bit belirsizdir ve maskelenmelidir. Kernel w1_therm driver her zaman 12-bit varsayılan hassasiyetle okur (yapılandırılmadıkça).</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Troubleshooting</h2>
+  <p class="section-lead">1-Wire sorunlarının büyük çoğunluğu pull-up eksikliği veya yanlış değeri, parasite power yetersizliği ve CRC hatalarından kaynaklanır.</p>
+
+  <h3>Hata teşhis adımları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — teşhis</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1) w1 modüllerinin yüklü olduğunu kontrol et:</span>
+<span class="cmd">lsmod</span> <span class="keyword">|</span> <span class="cmd">grep</span> w1
+<span class="cmt"># w1_therm    24576  0
+# w1_gpio     16384  0
+# wire        36864  2 w1_therm,w1_gpio</span>
+
+<span class="cmt"># 2) Kernel mesajlarını kontrol et:</span>
+<span class="cmd">dmesg</span> <span class="keyword">|</span> <span class="cmd">grep</span> <span class="flag">-i</span> <span class="str">'w1\|wire'</span>
+
+<span class="cmt"># 3) Bus master var mı?</span>
+<span class="cmd">ls</span> <span class="path">/sys/bus/w1/devices/</span>
+<span class="cmt"># Sadece w1_bus_master1 görünüyorsa sensör bulunamıyor demektir.</span>
+
+<span class="cmt"># 4) Manuel bus tarama zorla:</span>
+<span class="keyword">echo</span> 1 <span class="keyword">|</span> <span class="cmd">sudo</span> <span class="cmd">tee</span> <span class="path">/sys/bus/w1/devices/w1_bus_master1/search</span>
+
+<span class="cmt"># 5) CRC hata sayısını izle:</span>
+<span class="keyword">while</span> <span class="keyword">true</span>; <span class="keyword">do</span>
+  result=$(<span class="cmd">cat</span> <span class="path">/sys/bus/w1/devices/28-*/w1_slave</span> 2>/dev/null <span class="keyword">|</span> <span class="cmd">grep</span> <span class="str">'NO\|YES'</span>)
+  <span class="keyword">echo</span> <span class="str">"$(date): $result"</span>
+  <span class="cmd">sleep</span> 1
+<span class="keyword">done</span></code></pre>
+  </div>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Belirti</th><th>Olası neden</th><th>Çözüm</th></tr></thead>
+      <tbody>
+        <tr><td>/sys/bus/w1/devices/ boş (sadece bus_master)</td><td>Pull-up eksik veya çok büyük, sensör beslenmiyor</td><td>4.7 kΩ pull-up ekle; VCC bağlantısını kontrol et</td></tr>
+        <tr><td>Aralıklı CRC hatası (bazen YES, bazen NO)</td><td>Pull-up yetersiz, kablo çok uzun, EMI</td><td>4.7 kΩ → 3.3 kΩ değiştir; kablo uzunluğunu kıs</td></tr>
+        <tr><td>t=85000 (85°C) sabit</td><td>Dönüşüm başlamadı; Convert T komutu verilmedi</td><td>w1_therm modülü sorunlu; modprobe w1_therm tekrar yükle</td></tr>
+        <tr><td>t=-4096 veya saçma değer</td><td>Parasite power yetersiz akım</td><td>Ayrı VCC bağla; parasite güç kaldır</td></tr>
+        <tr><td>Birden fazla sensör ama sadece biri görünür</td><td>Adres çakışması (çok nadir) veya yetersiz pull-up</td><td>Pull-up direncini küçült; timeout süresini artır</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">UYARI</div>
+    <p>t=85000 değeri (85°C) DS18B20'nin power-on reset değeridir ve sensörün dönüşüm yapmadan okunduğunu gösterir. Bu değeri gerçek sıcaklık olarak işleme alma. Sürekli 85°C görmek, Convert T komutunun gitmediğine veya parasite power sorununun olduğuna işaret eder.</p>
+  </div>
+
+  <h3>Parasite power sorunları</h3>
+  <p>Parasite power modunda dönüşüm sırasında (~750ms) DQ hattından tipik olarak 1.5mA'e kadar akım çekilir. DQ hattının 4.7kΩ pull-up ile VCC'den sağlayabileceği akım: (3.3V - 1.2V) / 4700Ω ≈ 450µA. Bu yeterli değildir.</p>
+  <p>Çözüm: Dönüşüm sırasında DQ hattını güçlü pull-up ile sür. Bazı SoC'lerin GPIO'su push-pull çıkış olarak yapılandırılabilir; bu durumda DQ dönüşüm süresince yüksek tutulabilir. Alternatif olarak harici MOSFET veya doğrudan VCC bağlantısı kullan.</p>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

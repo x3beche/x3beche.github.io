@@ -1,0 +1,1157 @@
+---
+layout: tutorial
+title: "Docker &amp; Containers — Embedded Build Ortamı"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>DOCKER</span>
+    <span>2026</span>
+  </div>
+  <h1>Docker &amp; Containers<br><em>Embedded Build Ortamı</em></h1>
+  <p class="subtitle">tekrarlanabilir cross-compile ortamı, multi-arch image üretimi ve deterministik Yocto/Buildroot build'leri için container teknolojisi.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Container nedir</a></li>
+    <li><a href="#s1">Docker temelleri</a></li>
+    <li><a href="#s2">Dockerfile yazımı</a></li>
+    <li><a href="#s3">Volume ve bind mount</a></li>
+    <li><a href="#s4">Ağ</a></li>
+    <li><a href="#s5">Multi-arch build</a></li>
+    <li><a href="#s6">Embedded build environment</a></li>
+    <li><a href="#s7">Docker Compose</a></li>
+    <li><a href="#s8">Registry</a></li>
+    <li><a href="#s9">Pratik: Yocto/Buildroot build container</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Container nedir</h2>
+  <p class="section-lead">Container, Linux çekirdeğinin namespace ve cgroup mekanizmalarını kullanarak birbirinden izole edilmiş, hafif sanal ortamlardır.</p>
+
+  <h3>Temel Linux mekanizmaları</h3>
+  <p>Docker'ın altında üç temel kernel özelliği yatar. <strong>Namespace</strong>'ler her container'a ayrı PID, network, mount, UTS, IPC ve user namespace görünümü verir — container kendi dünyasında çalışıyor zanneder. <strong>Cgroup</strong>'lar (Control Groups) CPU, bellek, I/O ve ağ bant genişliği gibi kaynakların container başına sınırlandırılmasını sağlar. <strong>OverlayFS</strong> ise katmanlı bir dosya sistemi oluşturur: her image katmanı read-only olarak birikir, container yazma işlemi yalnızca en üst yazılabilir katmana yönlenir.</p>
+
+  <div class="flow">
+    <pre>Dockerfile → image katmanları (OverlayFS) → container (namespace + cgroup izolasyonu) → process</pre>
+  </div>
+
+  <h3>VM vs Container karşılaştırması</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Özellik</th><th>Sanal Makine (VM)</th><th>Container</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Başlangıç süresi</td><td>30 saniye – 2 dakika</td><td>100 ms – 1 saniye</td></tr>
+        <tr><td>Overhead</td><td>Yüksek — hypervisor + guest OS</td><td>Düşük — kernel paylaşılır</td></tr>
+        <tr><td>Boyut</td><td>GB mertebesinde disk</td><td>MB – birkaç yüz MB</td></tr>
+        <tr><td>İzolasyon</td><td>Güçlü — ayrı kernel</td><td>Orta — namespace izolasyonu</td></tr>
+        <tr><td>Taşınabilirlik</td><td>Büyük image, yavaş aktarım</td><td>Katmanlı, registry üzerinden hızlı</td></tr>
+        <tr><td>Mimari emülasyonu</td><td>QEMU gibi tam emülatör gerekir</td><td>buildx + QEMU user-static ile multi-arch</td></tr>
+        <tr><td>Donanım erişimi</td><td>VirtIO, USB passthrough</td><td>--device, --privileged ile sınırlı</td></tr>
+        <tr><td>Üretim kullanımı</td><td>Tam OS izolasyonu gereken senaryolar</td><td>Microservice, CI/CD, build ortamı</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Embedded geliştirici için değeri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Tekrarlanabilir build</span><span class="desc">Host OS bağımsız — Ubuntu 20.04, 22.04, Debian veya Arch'ta aynı container aynı sonucu üretir</span></div>
+    <div class="param"><span class="name">Toolchain yönetimi</span><span class="desc">arm-linux-gnueabihf-gcc, aarch64-linux-gnu-gcc farklı sürümleri çakışma olmadan yan yana kullanılır</span></div>
+    <div class="param"><span class="name">Multi-arch</span><span class="desc">buildx ile tek komutla ARM32, ARM64, RISC-V image'ları aynı anda üretilir</span></div>
+    <div class="param"><span class="name">CI tutarlılığı</span><span class="desc">Geliştiricinin lokal ortamı = CI ortamı = aynı container image</span></div>
+    <div class="param"><span class="name">Yocto / Buildroot</span><span class="desc">Gereken host bağımlılıkları container'da izole edilir; host sistemi kirlenmez</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Container = namespace (izolasyon) + cgroup (kaynak kısıtlama) + OverlayFS (katmanlı FS)</li>
+      <li>VM: güçlü izolasyon, ağır; Container: hafif, hızlı, taşınabilir</li>
+      <li>Embedded için: tekrarlanabilir cross-compile ortamı, multi-arch image, CI tutarlılığı</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Docker temelleri</h2>
+  <p class="section-lead">Docker'ın temel komutları — image yönetimi, container çalıştırma, inceleme ve temizlik.</p>
+
+  <h3>Kurulum</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Docker Engine kurulumu (Ubuntu)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Resmi Docker repository ekle</span>
+<span class="cmd">sudo</span> apt-get update
+<span class="cmd">sudo</span> apt-get install -y ca-certificates curl gnupg
+<span class="cmd">sudo</span> install -m 0755 -d /etc/apt/keyrings
+<span class="cmd">curl</span> <span class="flag">-fsSL</span> https://download.docker.com/linux/ubuntu/gpg \
+  | <span class="cmd">sudo</span> gpg <span class="flag">--dearmor</span> <span class="flag">-o</span> /etc/apt/keyrings/docker.gpg
+<span class="cmd">echo</span> \
+  <span class="str">"deb [arch=$(dpkg --print-architecture) \
+  signed-by=/etc/apt/keyrings/docker.gpg] \
+  https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release &amp;&amp; echo "$VERSION_CODENAME") stable"</span> \
+  | <span class="cmd">sudo</span> tee /etc/apt/sources.list.d/docker.list &gt; /dev/null
+
+<span class="cmd">sudo</span> apt-get update
+<span class="cmd">sudo</span> apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
+
+<span class="cmt"># Sudo olmadan Docker kullan</span>
+<span class="cmd">sudo</span> usermod <span class="flag">-aG</span> docker $(whoami)
+<span class="cmt"># Çıkış yap ve tekrar giriş yap</span></code></pre>
+  </div>
+
+  <h3>Image yönetimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — image komutları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Image indir</span>
+<span class="cmd">docker</span> pull ubuntu:22.04
+<span class="cmd">docker</span> pull debian:12-slim
+
+<span class="cmt"># Yerel image listesi</span>
+<span class="cmd">docker</span> images
+<span class="cmt"># REPOSITORY   TAG        IMAGE ID       CREATED        SIZE</span>
+<span class="cmt"># ubuntu       22.04      a6be0dcb2575   3 weeks ago    77.8MB</span>
+<span class="cmt"># debian       12-slim    c5e5c75af97e   3 weeks ago    74.8MB</span>
+
+<span class="cmt"># Image bilgisi</span>
+<span class="cmd">docker</span> inspect ubuntu:22.04
+
+<span class="cmt"># Image sil</span>
+<span class="cmd">docker</span> rmi ubuntu:22.04
+
+<span class="cmt"># Kullanılmayan image'ları temizle</span>
+<span class="cmd">docker</span> image prune <span class="flag">-a</span></code></pre>
+  </div>
+
+  <h3>Container çalıştırma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — docker run</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tek seferlik container (çıkışta silinir)</span>
+<span class="cmd">docker</span> run <span class="flag">--rm</span> ubuntu:22.04 uname <span class="flag">-a</span>
+
+<span class="cmt"># İnteraktif bash shell</span>
+<span class="cmd">docker</span> run <span class="flag">--rm</span> <span class="flag">-it</span> ubuntu:22.04 bash
+
+<span class="cmt"># Arka planda çalıştır (daemon)</span>
+<span class="cmd">docker</span> run <span class="flag">-d</span> <span class="flag">--name</span> my-server nginx:alpine
+<span class="cmt"># d7a3f1b09e2c8f6...</span>
+
+<span class="cmt"># Çalışan container listesi</span>
+<span class="cmd">docker</span> ps
+
+<span class="cmt"># Tüm container'lar (durmuş dahil)</span>
+<span class="cmd">docker</span> ps <span class="flag">-a</span>
+
+<span class="cmt"># Çalışan container'a komut gönder</span>
+<span class="cmd">docker</span> exec <span class="flag">-it</span> my-server sh
+
+<span class="cmt"># Container durdur / başlat / sil</span>
+<span class="cmd">docker</span> stop my-server
+<span class="cmd">docker</span> start my-server
+<span class="cmd">docker</span> rm my-server
+
+<span class="cmt"># Container logları</span>
+<span class="cmd">docker</span> logs <span class="flag">-f</span> my-server</code></pre>
+  </div>
+
+  <h3>Katman sistemi</h3>
+  <p>Her Docker image, değişmez (immutable) OverlayFS katmanlarının birikimidir. <code>FROM ubuntu:22.04</code> temel katmanı getirir; her <code>RUN</code> komutu yeni bir katman ekler. Container çalışırken en üste yazılabilir (writable) ince bir katman eklenir. Container silindiğinde bu katman da silinir — kalıcı veri için volume kullanılmalıdır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — katman inceleme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Image katmanlarını görüntüle</span>
+<span class="cmd">docker</span> history ubuntu:22.04
+<span class="cmt"># IMAGE          CREATED        CREATED BY                                      SIZE</span>
+<span class="cmt"># a6be0dcb2575   3 weeks ago    /bin/sh -c #(nop)  CMD ["bash"]                 0B</span>
+<span class="cmt"># &lt;missing&gt;      3 weeks ago    /bin/sh -c #(nop) ADD file:...                  77.8MB</span>
+
+<span class="cmt"># Katman ID'lerini ve boyutları detaylı görüntüle</span>
+<span class="cmd">docker</span> inspect ubuntu:22.04 <span class="flag">--format</span> <span class="str">'{{range .RootFS.Layers}}{{println .}}{{end}}'</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>docker pull</code>, <code>docker images</code>, <code>docker rmi</code>: image yaşam döngüsü</li>
+      <li><code>docker run --rm -it ubuntu:22.04 bash</code>: tek seferlik interaktif container</li>
+      <li><code>docker exec -it</code>: çalışan container'a bağlan</li>
+      <li>OverlayFS katmanları: immutable base + yazılabilir container katmanı</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Dockerfile yazımı</h2>
+  <p class="section-lead">Dockerfile direktifleri, katman optimizasyonu ve multi-stage build ile küçük üretim image'ı oluşturma.</p>
+
+  <h3>Temel direktifler</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Direktif</th><th>Açıklama</th><th>Örnek</th></tr></thead>
+      <tbody>
+        <tr><td><code>FROM</code></td><td>Temel image</td><td><code>FROM ubuntu:22.04</code></td></tr>
+        <tr><td><code>RUN</code></td><td>Komut çalıştır (yeni katman)</td><td><code>RUN apt-get install -y gcc</code></td></tr>
+        <tr><td><code>COPY</code></td><td>Host → container dosya kopyala</td><td><code>COPY src/ /app/src/</code></td></tr>
+        <tr><td><code>ADD</code></td><td>COPY + URL + tar açma</td><td><code>ADD https://... /tmp/</code></td></tr>
+        <tr><td><code>ENV</code></td><td>Ortam değişkeni tanımla</td><td><code>ENV CROSS=aarch64-linux-gnu-</code></td></tr>
+        <tr><td><code>WORKDIR</code></td><td>Çalışma dizini ayarla</td><td><code>WORKDIR /build</code></td></tr>
+        <tr><td><code>ARG</code></td><td>Build-time değişken</td><td><code>ARG GCC_VERSION=13</code></td></tr>
+        <tr><td><code>CMD</code></td><td>Varsayılan komut (override edilebilir)</td><td><code>CMD ["/bin/bash"]</code></td></tr>
+        <tr><td><code>ENTRYPOINT</code></td><td>Sabit komut (CMD argüman olur)</td><td><code>ENTRYPOINT ["make"]</code></td></tr>
+        <tr><td><code>EXPOSE</code></td><td>Port bildirgesi (belgesel)</td><td><code>EXPOSE 8080</code></td></tr>
+        <tr><td><code>USER</code></td><td>Çalışma kullanıcısı</td><td><code>USER builder</code></td></tr>
+        <tr><td><code>VOLUME</code></td><td>Mount noktası bildirgesi</td><td><code>VOLUME ["/data"]</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>İyi bir Dockerfile örneği</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Dockerfile — cross-compile builder</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># syntax=docker/dockerfile:1</span>
+<span class="keyword">FROM</span> ubuntu:22.04 AS base
+
+<span class="cmt"># Build arg — toolchain prefix değiştirilebilir</span>
+<span class="keyword">ARG</span> DEBIAN_FRONTEND=noninteractive
+<span class="keyword">ARG</span> CROSS_ARCH=aarch64
+
+<span class="cmt"># Katman birleştirme: tek RUN = tek katman</span>
+<span class="keyword">RUN</span> apt-get update &amp;&amp; apt-get install -y --no-install-recommends \
+    gcc-${CROSS_ARCH}-linux-gnu \
+    g++-${CROSS_ARCH}-linux-gnu \
+    make cmake ninja-build \
+    pkg-config ca-certificates \
+    git curl wget file \
+  &amp;&amp; rm -rf /var/lib/apt/lists/*
+
+<span class="cmt"># Ortam değişkenleri</span>
+<span class="keyword">ENV</span> CROSS_COMPILE=${CROSS_ARCH}-linux-gnu-
+<span class="keyword">ENV</span> ARCH=arm64
+<span class="keyword">ENV</span> PKG_CONFIG_PATH=/usr/${CROSS_ARCH}-linux-gnu/lib/pkgconfig
+
+<span class="keyword">WORKDIR</span> /build
+
+<span class="cmt"># Root olmayan kullanıcı (güvenlik)</span>
+<span class="keyword">RUN</span> useradd -m -u 1000 builder
+<span class="keyword">USER</span> builder
+
+<span class="keyword">CMD</span> ["/bin/bash"]</code></pre>
+  </div>
+
+  <h3>Multi-stage build</h3>
+  <p>Multi-stage build, büyük build araçlarını içeren bir "builder" stage'i ile yalnızca üretilen binary'yi içeren küçük bir "runtime" stage'ini ayırır. Sonuç image'ı yalnızca çalıştırmak için gerekenleri taşır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>Dockerfile — multi-stage: build + minimal runtime</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ── Stage 1: Builder ──────────────────────────────────</span>
+<span class="keyword">FROM</span> ubuntu:22.04 AS builder
+
+<span class="keyword">ARG</span> DEBIAN_FRONTEND=noninteractive
+<span class="keyword">RUN</span> apt-get update &amp;&amp; apt-get install -y --no-install-recommends \
+    gcc-aarch64-linux-gnu make libssl-dev \
+  &amp;&amp; rm -rf /var/lib/apt/lists/*
+
+<span class="keyword">WORKDIR</span> /src
+<span class="keyword">COPY</span> . .
+
+<span class="cmt"># Statik binary derle</span>
+<span class="keyword">RUN</span> aarch64-linux-gnu-gcc \
+    -static -O2 \
+    -o /out/app \
+    main.c \
+  &amp;&amp; aarch64-linux-gnu-strip /out/app
+
+<span class="cmt"># ── Stage 2: Runtime (scratch — yalnızca binary) ──────</span>
+<span class="keyword">FROM</span> scratch AS runtime
+
+<span class="keyword">COPY</span> --from=builder /out/app /app
+
+<span class="keyword">ENTRYPOINT</span> ["/app"]
+
+<span class="cmt"># Build: docker build --target runtime -t my-app:arm64 .</span>
+<span class="cmt"># Sonuç image boyutu: yalnızca binary kadar (~500 KB)</span></code></pre>
+  </div>
+
+  <h3>Image build ve etiketleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — docker build</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Temel build</span>
+<span class="cmd">docker</span> build <span class="flag">-t</span> my-builder:latest .
+
+<span class="cmt"># Build arg ile</span>
+<span class="cmd">docker</span> build \
+  <span class="flag">--build-arg</span> CROSS_ARCH=arm \
+  <span class="flag">-t</span> my-builder:arm32 .
+
+<span class="cmt"># Belirli stage'e kadar build</span>
+<span class="cmd">docker</span> build <span class="flag">--target</span> builder <span class="flag">-t</span> my-builder:full .
+
+<span class="cmt"># Build cache'i atla</span>
+<span class="cmd">docker</span> build <span class="flag">--no-cache</span> <span class="flag">-t</span> my-builder:fresh .
+
+<span class="cmt"># BuildKit ile paralel build (önerilir)</span>
+<span class="field">DOCKER_BUILDKIT</span>=1 <span class="cmd">docker</span> build <span class="flag">-t</span> my-builder:latest .</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Dockerfile'da <code>RUN</code> komutlarını <code>&amp;&amp;</code> ile birleştirmek ve sonuna <code>rm -rf /var/lib/apt/lists/*</code> eklemek katman sayısını ve image boyutunu önemli ölçüde azaltır. Her ayrı <code>RUN</code> satırı yeni bir OverlayFS katmanı oluşturur ve bu katmanlar silinmiş dosyaları bile kapasiteye sayar.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Temel direktifler: FROM, RUN, COPY, ENV, WORKDIR, ARG, CMD, ENTRYPOINT</li>
+      <li>RUN komutlarını birleştir + <code>rm -rf /var/lib/apt/lists/*</code>: küçük katman</li>
+      <li>Multi-stage build: builder stage → runtime stage (scratch) — minimal image</li>
+      <li><code>docker build --build-arg CROSS_ARCH=arm -t my-builder:arm32 .</code>: parametrik build</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Volume ve bind mount</h2>
+  <p class="section-lead">Container dışında kalıcı veri tutma yöntemleri — named volume, bind mount ve tmpfs arasındaki farklar.</p>
+
+  <h3>Bind mount</h3>
+  <p>Host dosya sisteminin belirli bir dizini container içine monte edilir. Kaynak kodu geliştirme ve build ortamları için idealdir: host'ta değiştirilen dosyalar anında container içinde görünür.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — bind mount kullanımı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># -v /host/path:/container/path</span>
+<span class="cmt"># Mevcut dizini /build olarak monte et</span>
+<span class="cmd">docker</span> run <span class="flag">--rm</span> <span class="flag">-it</span> \
+  <span class="flag">-v</span> <span class="str">"$(pwd):/build"</span> \
+  my-builder:latest \
+  make <span class="flag">-C</span> /build <span class="flag">-j$(nproc)</span>
+
+<span class="cmt"># Read-only mount (kaynak kod değiştirilmesin)</span>
+<span class="cmd">docker</span> run <span class="flag">--rm</span> \
+  <span class="flag">-v</span> <span class="str">"$(pwd)/src:/build/src:ro"</span> \
+  <span class="flag">-v</span> <span class="str">"$(pwd)/output:/build/output"</span> \
+  my-builder:latest \
+  make <span class="flag">-C</span> /build
+
+<span class="cmt"># Yeni sözdizimi (--mount)</span>
+<span class="cmd">docker</span> run <span class="flag">--rm</span> \
+  <span class="flag">--mount</span> <span class="str">"type=bind,source=$(pwd),target=/build"</span> \
+  my-builder:latest bash</code></pre>
+  </div>
+
+  <h3>Named volume</h3>
+  <p>Docker tarafından yönetilen kalıcı veri depolama. Container silinse bile volume verisi korunur. sstate-cache ve dl/ dizinleri gibi build artifact'leri için idealdir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — named volume</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Volume oluştur</span>
+<span class="cmd">docker</span> volume create yocto-sstate
+<span class="cmd">docker</span> volume create buildroot-dl
+
+<span class="cmt"># Volume listesi</span>
+<span class="cmd">docker</span> volume ls
+
+<span class="cmt"># Volume ile container çalıştır</span>
+<span class="cmd">docker</span> run <span class="flag">--rm</span> \
+  <span class="flag">-v</span> yocto-sstate:/build/sstate-cache \
+  <span class="flag">-v</span> buildroot-dl:/build/dl \
+  <span class="flag">-v</span> <span class="str">"$(pwd):/build/src:ro"</span> \
+  yocto-builder:latest \
+  bitbake core-image-minimal
+
+<span class="cmt"># Volume bilgisi</span>
+<span class="cmd">docker</span> volume inspect yocto-sstate
+<span class="cmt"># "Mountpoint": "/var/lib/docker/volumes/yocto-sstate/_data"</span>
+
+<span class="cmt"># Volume sil</span>
+<span class="cmd">docker</span> volume rm yocto-sstate
+
+<span class="cmt"># Kullanılmayan volume'ları temizle</span>
+<span class="cmd">docker</span> volume prune</code></pre>
+  </div>
+
+  <h3>Bind mount vs Named volume karşılaştırması</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>Bind Mount</th><th>Named Volume</th></tr></thead>
+      <tbody>
+        <tr><td>Host konumu</td><td>Kullanıcı tarafından belirlenir</td><td>Docker tarafından yönetilir (<code>/var/lib/docker/volumes/</code>)</td></tr>
+        <tr><td>Taşınabilirlik</td><td>Host yola bağımlı</td><td>Taşınabilir — isimle referans</td></tr>
+        <tr><td>Performans</td><td>Linux'ta yüksek; macOS'ta düşük</td><td>Linux'ta yüksek</td></tr>
+        <tr><td>Yedekleme</td><td>Normal dosya yedekleme</td><td><code>docker run --rm -v vol:/data ubuntu tar czf - /data</code></td></tr>
+        <tr><td>Kullanım</td><td>Kaynak kod, konfigürasyon</td><td>Build cache, veritabanı verisi</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>tmpfs mount</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — tmpfs (bellekte geçici dosya sistemi)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># /tmp ve /run gibi geçici dizinler için ideal</span>
+<span class="cmt"># Container silindiğinde veri kaybolur</span>
+<span class="cmd">docker</span> run <span class="flag">--rm</span> \
+  <span class="flag">--tmpfs</span> /tmp:rw,size=512m,mode=1777 \
+  my-builder:latest bash
+
+<span class="cmt"># --mount sözdizimi ile</span>
+<span class="cmd">docker</span> run <span class="flag">--rm</span> \
+  <span class="flag">--mount</span> <span class="str">"type=tmpfs,target=/tmp,tmpfs-size=512m"</span> \
+  my-builder:latest bash</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Bind mount (<code>-v $(pwd):/build</code>): kaynak kodu için — host değişikliği anında yansır</li>
+      <li>Named volume (<code>docker volume create</code>): build cache, sstate, dl/ için — container'dan bağımsız kalıcı veri</li>
+      <li>tmpfs (<code>--tmpfs /tmp</code>): geçici, bellekte — I/O yoğun işlemler için hızlı</li>
+      <li><code>:ro</code> son eki: read-only mount — kaynak korunur</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Ağ</h2>
+  <p class="section-lead">Docker ağ modları — bridge, host, none; custom network oluşturma ve container-to-container iletişim.</p>
+
+  <h3>Ağ sürücüleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Sürücü</th><th>Açıklama</th><th>Kullanım</th></tr></thead>
+      <tbody>
+        <tr><td><code>bridge</code></td><td>Varsayılan — docker0 köprüsü üzerinde NAT</td><td>Bağımsız container'lar, port publish</td></tr>
+        <tr><td><code>host</code></td><td>Host ağ stack'ini paylaş — izolasyon yok</td><td>Performans kritik, ağ araçları testi</td></tr>
+        <tr><td><code>none</code></td><td>Ağ arayüzü yok — tamamen izole</td><td>Ağ erişimi gerektirmeyen build işlemleri</td></tr>
+        <tr><td><code>overlay</code></td><td>Swarm multi-host ağı</td><td>Docker Swarm cluster</td></tr>
+        <tr><td><code>macvlan</code></td><td>Container'a doğrudan MAC adresi ata</td><td>Legacy uygulamalar, L2 ağ erişimi</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Port publish ve bridge ağı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — port publish</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Host port 8080 → container port 80</span>
+<span class="cmd">docker</span> run <span class="flag">-d</span> <span class="flag">-p</span> 8080:80 nginx:alpine
+
+<span class="cmt"># Belirli interface'e bind</span>
+<span class="cmd">docker</span> run <span class="flag">-d</span> <span class="flag">-p</span> 127.0.0.1:8080:80 nginx:alpine
+
+<span class="cmt"># Tüm EXPOSE edilen portları rastgele yayınla</span>
+<span class="cmd">docker</span> run <span class="flag">-d</span> <span class="flag">-P</span> nginx:alpine
+
+<span class="cmt"># Çalışan port mappingleri görüntüle</span>
+<span class="cmd">docker</span> port my-container
+
+<span class="cmt"># Host ağını paylaş (Linux only)</span>
+<span class="cmd">docker</span> run <span class="flag">--rm</span> <span class="flag">--network</span> host nginx:alpine</code></pre>
+  </div>
+
+  <h3>Custom network ve container-to-container iletişim</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — custom bridge network</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Custom bridge network oluştur</span>
+<span class="cmd">docker</span> network create \
+  <span class="flag">--driver</span> bridge \
+  <span class="flag">--subnet</span> 172.20.0.0/16 \
+  <span class="flag">--ip-range</span> 172.20.240.0/20 \
+  build-net
+
+<span class="cmt"># Container'ları aynı ağa bağla</span>
+<span class="cmd">docker</span> run <span class="flag">-d</span> <span class="flag">--name</span> registry \
+  <span class="flag">--network</span> build-net \
+  registry:2
+
+<span class="cmd">docker</span> run <span class="flag">--rm</span> <span class="flag">--network</span> build-net \
+  my-builder:latest \
+  curl http://registry:5000/v2/_catalog
+
+<span class="cmt"># Aynı custom network'teki container'lar</span>
+<span class="cmt"># birbirlerine isimle (DNS) erişebilir</span>
+
+<span class="cmt"># Network listesi</span>
+<span class="cmd">docker</span> network ls
+
+<span class="cmt"># Network bilgisi</span>
+<span class="cmd">docker</span> network inspect build-net
+
+<span class="cmt"># Temizlik</span>
+<span class="cmd">docker</span> network rm build-net</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Bridge (varsayılan): NAT + port publish; host: izolasyon yok, maksimum performans</li>
+      <li><code>-p 8080:80</code>: host 8080 → container 80; <code>-P</code>: tüm EXPOSE portları otomatik publish</li>
+      <li>Custom bridge network: aynı ağdaki container'lar DNS ile birbirini bulur</li>
+      <li>Build ortamları için: <code>--network none</code> — ağ erişimi gerektirmeyen deterministik build</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Multi-arch build</h2>
+  <p class="section-lead">Docker buildx ile ARM32, ARM64, RISC-V image'larını tek komutla üretme — embedded geliştirme için kritik özellik.</p>
+
+  <h3>Neden multi-arch?</h3>
+  <p>Embedded sistemlerde çalışacak container image'ları hedef mimari için derlenmiş binary içermelidir. <code>docker buildx</code>, QEMU user-static ve binfmt_misc kullanarak x86-64 host üzerinde farklı mimariler için image üretir ve aynı tag'e birden fazla mimariyi paketler (manifest list).</p>
+
+  <h3>buildx ve QEMU kurulumu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — buildx kurulumu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Docker Buildx eklentisi (modern Docker'da dahili gelir)</span>
+<span class="cmd">docker</span> buildx version
+<span class="cmt"># github.com/docker/buildx v0.13.1 ...</span>
+
+<span class="cmt"># QEMU user-static kur (farklı mimari binary çalıştırma için)</span>
+<span class="cmd">sudo</span> apt-get install -y qemu-user-static binfmt-support
+
+<span class="cmt"># binfmt_misc kayıt (QEMU user-static ile otomatik)</span>
+<span class="cmd">docker</span> run <span class="flag">--rm</span> <span class="flag">--privileged</span> \
+  multiarch/qemu-user-static <span class="flag">--reset</span> <span class="flag">-p</span> yes
+
+<span class="cmt"># Binfmt kayıtlarını doğrula</span>
+<span class="cmd">ls</span> /proc/sys/fs/binfmt_misc/ | <span class="cmd">grep</span> qemu
+<span class="cmt"># qemu-aarch64</span>
+<span class="cmt"># qemu-arm</span>
+<span class="cmt"># qemu-riscv64</span>
+<span class="cmt"># ...</span>
+
+<span class="cmt"># Multi-arch builder oluştur</span>
+<span class="cmd">docker</span> buildx create \
+  <span class="flag">--name</span> multiarch-builder \
+  <span class="flag">--driver</span> docker-container \
+  <span class="flag">--use</span>
+
+<span class="cmt"># Builder'ı başlat ve mimarileri doğrula</span>
+<span class="cmd">docker</span> buildx inspect <span class="flag">--bootstrap</span>
+<span class="cmt"># Platforms: linux/amd64, linux/arm64, linux/arm/v7, linux/arm/v6, linux/riscv64</span></code></pre>
+  </div>
+
+  <h3>Multi-arch image build ve push</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — multi-platform build</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ARM64 + ARM32v7 için image oluştur ve registry'e push et</span>
+<span class="cmd">docker</span> buildx build \
+  <span class="flag">--platform</span> linux/arm64,linux/arm/v7 \
+  <span class="flag">-t</span> ghcr.io/myorg/my-app:latest \
+  <span class="flag">--push</span> \
+  .
+
+<span class="cmt"># Geniş platform listesi (amd64 dahil)</span>
+<span class="cmd">docker</span> buildx build \
+  <span class="flag">--platform</span> linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v6 \
+  <span class="flag">-t</span> ghcr.io/myorg/my-app:1.0.0 \
+  <span class="flag">-t</span> ghcr.io/myorg/my-app:latest \
+  <span class="flag">--push</span> .
+
+<span class="cmt"># Push etmeden yerel test (belirli platform)</span>
+<span class="cmd">docker</span> buildx build \
+  <span class="flag">--platform</span> linux/arm64 \
+  <span class="flag">--output</span> <span class="str">"type=docker,name=my-app:arm64-test"</span> \
+  <span class="flag">--load</span> \
+  .
+
+<span class="cmt"># Manifest list incele</span>
+<span class="cmd">docker</span> buildx imagetools inspect ghcr.io/myorg/my-app:latest</code></pre>
+  </div>
+
+  <h3>Multi-arch Dockerfile — TARGETARCH ile platform tespiti</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Dockerfile — TARGETARCH kullanımı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># syntax=docker/dockerfile:1</span>
+<span class="keyword">FROM</span> ubuntu:22.04
+
+<span class="cmt"># Buildx tarafından otomatik doldurulur</span>
+<span class="keyword">ARG</span> TARGETARCH
+<span class="keyword">ARG</span> TARGETVARIANT
+
+<span class="keyword">RUN</span> apt-get update &amp;&amp; apt-get install -y --no-install-recommends \
+    curl ca-certificates \
+  &amp;&amp; rm -rf /var/lib/apt/lists/*
+
+<span class="cmt"># Mimariye göre farklı binary indir</span>
+<span class="keyword">RUN</span> case "${TARGETARCH}${TARGETVARIANT}" in \
+      "arm64")   ARCH_SLUG="aarch64"  ;; \
+      "armv7")   ARCH_SLUG="armv7l"   ;; \
+      "amd64")   ARCH_SLUG="x86_64"   ;; \
+      *)         echo "Unsupported: ${TARGETARCH}"; exit 1 ;; \
+    esac \
+  &amp;&amp; curl -Lo /usr/local/bin/my-tool \
+      "https://example.com/releases/${ARCH_SLUG}/my-tool" \
+  &amp;&amp; chmod +x /usr/local/bin/my-tool
+
+<span class="keyword">ENTRYPOINT</span> ["/usr/local/bin/my-tool"]</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">UYARI</div>
+    <p>QEMU user-static ile ARM binary çalıştırma, native x86-64'e göre <strong>5–10x yavaştır</strong>. Multi-arch Dockerfile'da C derleme gerektiren <code>RUN</code> adımları için cross-compilation tercih edin: <code>RUN apt-get install -y gcc-aarch64-linux-gnu &amp;&amp; aarch64-linux-gnu-gcc -O2 -o app main.c</code>. Bu yaklaşım hem daha hızlıdır hem de QEMU bağımlılığını ortadan kaldırır.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>docker buildx create --use</code>: multi-arch builder etkinleştir</li>
+      <li><code>multiarch/qemu-user-static --reset -p yes</code>: binfmt_misc ile ARM binary çalıştırma</li>
+      <li><code>--platform linux/arm64,linux/arm/v7</code>: tek build komutuyla çift mimari</li>
+      <li>TARGETARCH değişkeni: Dockerfile içinde hedef mimariyi algıla</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Embedded build environment</h2>
+  <p class="section-lead">Cross-toolchain içeren Docker image oluşturma ve kaynak kodu bind mount ile container içinde derleme — tekrarlanabilir embedded build ortamı.</p>
+
+  <h3>Cross-toolchain Dockerfile</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Dockerfile.arm-builder — ARM32 + ARM64 toolchain</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># syntax=docker/dockerfile:1</span>
+<span class="keyword">FROM</span> ubuntu:22.04
+
+<span class="keyword">ARG</span> DEBIAN_FRONTEND=noninteractive
+
+<span class="keyword">RUN</span> apt-get update &amp;&amp; apt-get install -y --no-install-recommends \
+    <span class="cmt"># ARM 32-bit hard-float toolchain</span>
+    gcc-arm-linux-gnueabihf \
+    g++-arm-linux-gnueabihf \
+    <span class="cmt"># ARM 64-bit toolchain</span>
+    gcc-aarch64-linux-gnu \
+    g++-aarch64-linux-gnu \
+    <span class="cmt"># Build araçları</span>
+    make cmake ninja-build \
+    autoconf automake libtool \
+    pkg-config bc flex bison \
+    <span class="cmt"># Kernel araçları</span>
+    libssl-dev libncurses-dev \
+    <span class="cmt"># Genel yardımcılar</span>
+    git wget curl file xz-utils \
+    ca-certificates python3 python3-pip \
+  &amp;&amp; rm -rf /var/lib/apt/lists/*
+
+<span class="cmt"># ARM32 ve ARM64 için symlink'ler</span>
+<span class="keyword">ENV</span> CC_ARM32=arm-linux-gnueabihf-gcc
+<span class="keyword">ENV</span> CXX_ARM32=arm-linux-gnueabihf-g++
+<span class="keyword">ENV</span> CC_ARM64=aarch64-linux-gnu-gcc
+<span class="keyword">ENV</span> CXX_ARM64=aarch64-linux-gnu-g++
+
+<span class="keyword">WORKDIR</span> /build
+
+<span class="cmt"># Root olmayan kullanıcı — host UID ile eşleştir</span>
+<span class="keyword">ARG</span> UID=1000
+<span class="keyword">ARG</span> GID=1000
+<span class="keyword">RUN</span> groupadd -g ${GID} builder \
+  &amp;&amp; useradd -m -u ${UID} -g builder builder
+
+<span class="keyword">USER</span> builder
+<span class="keyword">CMD</span> ["/bin/bash"]</code></pre>
+  </div>
+
+  <h3>Build ve kullanım</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — builder image kullanımı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Image oluştur (host UID geçirerek — dosya izinleri için)</span>
+<span class="cmd">docker</span> build \
+  <span class="flag">--build-arg</span> <span class="field">UID</span>=$(id -u) \
+  <span class="flag">--build-arg</span> <span class="field">GID</span>=$(id -g) \
+  <span class="flag">-f</span> Dockerfile.arm-builder \
+  <span class="flag">-t</span> arm-builder:latest .
+
+<span class="cmt"># Kaynak kodu bind mount ile ARM64 derle</span>
+<span class="cmd">docker</span> run <span class="flag">--rm</span> \
+  <span class="flag">-v</span> <span class="str">"$(pwd):/build"</span> \
+  arm-builder:latest \
+  aarch64-linux-gnu-gcc <span class="flag">-O2</span> <span class="flag">-o</span> /build/app_arm64 /build/src/main.c
+
+<span class="cmt"># Makefile projesi için</span>
+<span class="cmd">docker</span> run <span class="flag">--rm</span> \
+  <span class="flag">-v</span> <span class="str">"$(pwd):/build"</span> \
+  arm-builder:latest \
+  make <span class="flag">-C</span> /build \
+    <span class="field">CROSS_COMPILE</span>=aarch64-linux-gnu- \
+    <span class="field">ARCH</span>=arm64 \
+    <span class="flag">-j$(nproc)</span>
+
+<span class="cmt"># CMake projesi için</span>
+<span class="cmd">docker</span> run <span class="flag">--rm</span> \
+  <span class="flag">-v</span> <span class="str">"$(pwd):/build"</span> \
+  arm-builder:latest \
+  bash <span class="flag">-c</span> <span class="str">"cmake -B /build/build-arm64 \
+    -DCMAKE_TOOLCHAIN_FILE=/build/cmake/arm64-toolchain.cmake \
+    -DCMAKE_BUILD_TYPE=Release /build \
+  &amp;&amp; cmake --build /build/build-arm64 -j$(nproc)"</span>
+
+<span class="cmt"># Derlenen binary'nin mimarisini doğrula</span>
+<span class="cmd">file</span> app_arm64
+<span class="cmt"># app_arm64: ELF 64-bit LSB pie executable, ARM aarch64, ...</span></code></pre>
+  </div>
+
+  <h3>CMake toolchain dosyası</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>cmake/arm64-toolchain.cmake</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># CMake cross-compilation toolchain — AArch64</span>
+<span class="keyword">set</span>(CMAKE_SYSTEM_NAME Linux)
+<span class="keyword">set</span>(CMAKE_SYSTEM_PROCESSOR aarch64)
+
+<span class="keyword">set</span>(CROSS_PREFIX aarch64-linux-gnu-)
+
+<span class="keyword">set</span>(CMAKE_C_COMPILER   ${CROSS_PREFIX}gcc)
+<span class="keyword">set</span>(CMAKE_CXX_COMPILER ${CROSS_PREFIX}g++)
+<span class="keyword">set</span>(CMAKE_AR           ${CROSS_PREFIX}ar)
+<span class="keyword">set</span>(CMAKE_STRIP        ${CROSS_PREFIX}strip)
+
+<span class="keyword">set</span>(CMAKE_FIND_ROOT_PATH  /usr/aarch64-linux-gnu)
+<span class="keyword">set</span>(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+<span class="keyword">set</span>(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+<span class="keyword">set</span>(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+
+<span class="cmt"># Cortex-A53 optimizasyonu</span>
+<span class="keyword">set</span>(CMAKE_C_FLAGS   <span class="str">"-mcpu=cortex-a53 -O2"</span>)
+<span class="keyword">set</span>(CMAKE_CXX_FLAGS <span class="str">"-mcpu=cortex-a53 -O2"</span>)</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>ARM32 + ARM64 cross-toolchain tek Dockerfile'da — <code>gcc-arm-linux-gnueabihf</code> + <code>gcc-aarch64-linux-gnu</code></li>
+      <li><code>--build-arg UID=$(id -u)</code>: container içindeki dosya izinleri host kullanıcısıyla eşleşir</li>
+      <li>Bind mount + <code>aarch64-linux-gnu-gcc</code>: host dizinini container içinde derle, sonuç host'ta</li>
+      <li>CMake toolchain dosyası: cross-compile için sysroot ve prefix tanımı</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Docker Compose</h2>
+  <p class="section-lead">Çok servisli ortamları YAML ile tanımlama — build sunucusu, registry, sstate cache servisi gibi embedded geliştirme altyapısının Compose ile yönetimi.</p>
+
+  <h3>docker-compose.yml yapısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>docker-compose.yml — embedded build stack</span><span class="dot">●</span></div>
+    <pre><code><span class="field">services</span>:
+
+  <span class="cmt"># ── Cross-compile builder ──────────────────────────</span>
+  <span class="field">builder</span>:
+    <span class="field">build</span>:
+      <span class="field">context</span>: .
+      <span class="field">dockerfile</span>: Dockerfile.arm-builder
+      <span class="field">args</span>:
+        <span class="field">UID</span>: <span class="str">"${UID:-1000}"</span>
+        <span class="field">GID</span>: <span class="str">"${GID:-1000}"</span>
+    <span class="field">volumes</span>:
+      - <span class="str">"./src:/build/src:ro"</span>
+      - <span class="str">"./output:/build/output"</span>
+      - buildroot-dl:/build/dl
+    <span class="field">environment</span>:
+      - <span class="field">CROSS_COMPILE</span>=aarch64-linux-gnu-
+      - <span class="field">ARCH</span>=arm64
+    <span class="field">working_dir</span>: /build
+    <span class="field">command</span>: make -j4
+
+  <span class="cmt"># ── Özel Docker registry ──────────────────────────</span>
+  <span class="field">registry</span>:
+    <span class="field">image</span>: registry:2
+    <span class="field">ports</span>:
+      - <span class="str">"5000:5000"</span>
+    <span class="field">volumes</span>:
+      - registry-data:/var/lib/registry
+    <span class="field">environment</span>:
+      <span class="field">REGISTRY_STORAGE_DELETE_ENABLED</span>: <span class="str">"true"</span>
+    <span class="field">healthcheck</span>:
+      <span class="field">test</span>: [<span class="str">"CMD"</span>, <span class="str">"wget"</span>, <span class="str">"-q"</span>, <span class="str">"--spider"</span>, <span class="str">"http://localhost:5000/v2/"</span>]
+      <span class="field">interval</span>: 10s
+      <span class="field">timeout</span>: 5s
+      <span class="field">retries</span>: 3
+
+  <span class="cmt"># ── Build artifact sunucusu ────────────────────────</span>
+  <span class="field">artifact-server</span>:
+    <span class="field">image</span>: nginx:alpine
+    <span class="field">ports</span>:
+      - <span class="str">"8080:80"</span>
+    <span class="field">volumes</span>:
+      - <span class="str">"./output:/usr/share/nginx/html:ro"</span>
+    <span class="field">depends_on</span>:
+      <span class="field">builder</span>:
+        <span class="field">condition</span>: service_completed_successfully
+
+<span class="field">volumes</span>:
+  <span class="field">buildroot-dl</span>:
+  <span class="field">registry-data</span>:</code></pre>
+  </div>
+
+  <h3>Compose komutları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — docker compose</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm servisleri başlat</span>
+<span class="cmd">docker</span> compose up <span class="flag">-d</span>
+
+<span class="cmt"># Build ve başlat (image yeniden oluştur)</span>
+<span class="cmd">docker</span> compose up <span class="flag">--build</span> <span class="flag">-d</span>
+
+<span class="cmt"># Yalnızca builder servisini çalıştır (tek seferlik)</span>
+<span class="cmd">docker</span> compose run <span class="flag">--rm</span> builder
+
+<span class="cmt"># Servis logları</span>
+<span class="cmd">docker</span> compose logs <span class="flag">-f</span> builder
+
+<span class="cmt"># Servis durumu</span>
+<span class="cmd">docker</span> compose ps
+
+<span class="cmt"># Tüm servisleri durdur</span>
+<span class="cmd">docker</span> compose down
+
+<span class="cmt"># Volume'larla birlikte temizle</span>
+<span class="cmd">docker</span> compose down <span class="flag">-v</span></code></pre>
+  </div>
+
+  <h3>Health check ile depends_on</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>docker-compose.yml — sağlık kontrolü</span><span class="dot">●</span></div>
+    <pre><code><span class="field">services</span>:
+  <span class="field">sstate-server</span>:
+    <span class="field">image</span>: nginx:alpine
+    <span class="field">healthcheck</span>:
+      <span class="field">test</span>: [<span class="str">"CMD"</span>, <span class="str">"wget"</span>, <span class="str">"-q"</span>, <span class="str">"--spider"</span>, <span class="str">"http://localhost/"</span>]
+      <span class="field">interval</span>: 5s
+      <span class="field">timeout</span>: 3s
+      <span class="field">retries</span>: 5
+      <span class="field">start_period</span>: 10s
+
+  <span class="field">yocto-builder</span>:
+    <span class="field">build</span>: .
+    <span class="field">depends_on</span>:
+      <span class="field">sstate-server</span>:
+        <span class="field">condition</span>: service_healthy
+    <span class="field">environment</span>:
+      - <span class="field">SSTATE_MIRROR</span>=http://sstate-server/sstate-cache</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>docker-compose.yml: servisleri, volume'ları ve bağımlılıkları tek dosyada tanımla</li>
+      <li><code>depends_on: condition: service_healthy</code>: servis sağlıklı olana kadar bekle</li>
+      <li><code>docker compose run --rm builder</code>: tek seferlik build komutu çalıştırma</li>
+      <li>Named volume'lar Compose dışında da kalıcıdır — birden fazla Compose dosyası paylaşabilir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Registry</h2>
+  <p class="section-lead">Docker Hub, GitHub Container Registry ve özel registry kullanımı — embedded build image'larını ekiple paylaşma.</p>
+
+  <h3>Docker Hub</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Docker Hub push/pull</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Oturum aç</span>
+<span class="cmd">docker</span> login
+<span class="cmt"># Username: myusername</span>
+<span class="cmt"># Password: ...</span>
+<span class="cmt"># Login Succeeded</span>
+
+<span class="cmt"># Image etiketle (Docker Hub formatı: kullanıcı/repo:tag)</span>
+<span class="cmd">docker</span> tag arm-builder:latest myusername/arm-builder:latest
+<span class="cmd">docker</span> tag arm-builder:latest myusername/arm-builder:22.04-gcc13
+
+<span class="cmt"># Push</span>
+<span class="cmd">docker</span> push myusername/arm-builder:latest
+<span class="cmd">docker</span> push myusername/arm-builder:22.04-gcc13
+
+<span class="cmt"># Pull</span>
+<span class="cmd">docker</span> pull myusername/arm-builder:latest</code></pre>
+  </div>
+
+  <h3>GitHub Container Registry (ghcr.io)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — ghcr.io</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># GitHub Personal Access Token ile oturum aç</span>
+<span class="cmt"># Token izinleri: read:packages, write:packages, delete:packages</span>
+<span class="cmd">echo</span> <span class="str">"${GITHUB_TOKEN}"</span> | <span class="cmd">docker</span> login ghcr.io \
+  <span class="flag">-u</span> myusername <span class="flag">--password-stdin</span>
+
+<span class="cmt"># Image etiketle (ghcr.io/org/repo:tag)</span>
+<span class="cmd">docker</span> tag arm-builder:latest \
+  ghcr.io/myorg/arm-builder:latest
+
+<span class="cmt"># Push</span>
+<span class="cmd">docker</span> push ghcr.io/myorg/arm-builder:latest
+
+<span class="cmt"># Multi-arch push buildx ile</span>
+<span class="cmd">docker</span> buildx build \
+  <span class="flag">--platform</span> linux/amd64,linux/arm64 \
+  <span class="flag">-t</span> ghcr.io/myorg/arm-builder:latest \
+  <span class="flag">--push</span> .
+
+<span class="cmt"># GitHub Actions'ta GITHUB_TOKEN ile otomatik login</span>
+<span class="cmt"># - uses: docker/login-action@v3</span>
+<span class="cmt">#   with:</span>
+<span class="cmt">#     registry: ghcr.io</span>
+<span class="cmt">#     username: ${{ github.actor }}</span>
+<span class="cmt">#     password: ${{ secrets.GITHUB_TOKEN }}</span></code></pre>
+  </div>
+
+  <h3>Özel (private) registry</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — yerel registry kurulumu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Registry container başlat</span>
+<span class="cmd">docker</span> run <span class="flag">-d</span> \
+  <span class="flag">--name</span> local-registry \
+  <span class="flag">--restart</span> always \
+  <span class="flag">-p</span> 5000:5000 \
+  <span class="flag">-v</span> registry-data:/var/lib/registry \
+  registry:2
+
+<span class="cmt"># Image push</span>
+<span class="cmd">docker</span> tag arm-builder:latest localhost:5000/arm-builder:latest
+<span class="cmd">docker</span> push localhost:5000/arm-builder:latest
+
+<span class="cmt"># Image pull</span>
+<span class="cmd">docker</span> pull localhost:5000/arm-builder:latest
+
+<span class="cmt"># Registry catalog</span>
+<span class="cmd">curl</span> http://localhost:5000/v2/_catalog
+<span class="cmt"># {"repositories":["arm-builder"]}</span>
+
+<span class="cmt"># Tag listesi</span>
+<span class="cmd">curl</span> http://localhost:5000/v2/arm-builder/tags/list
+<span class="cmt"># {"name":"arm-builder","tags":["latest"]}</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Özel registry TLS sertifikası olmadan çalıştığında Docker <strong>insecure registry</strong> olarak işaretlenmesini gerektirir. <code>/etc/docker/daemon.json</code> dosyasına <code>{"insecure-registries": ["192.168.1.100:5000"]}</code> ekleyin ve <code>sudo systemctl restart docker</code> ile yeniden başlatın. Üretim ortamlarında her zaman TLS kullanın.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Docker Hub: <code>docker login</code> → <code>docker tag</code> → <code>docker push</code></li>
+      <li>ghcr.io: GITHUB_TOKEN ile login — GitHub Actions pipeline ile entegre</li>
+      <li>Özel registry: <code>docker run registry:2 -p 5000:5000</code> — yerel ağda paylaşım</li>
+      <li>Multi-arch push: <code>docker buildx build --platform ... --push</code> — manifest list</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 09 ═══════════════════ -->
+<section id="s9">
+  <h2><span class="num">09</span> Pratik: Yocto/Buildroot build container</h2>
+  <p class="section-lead">Yocto Project gereksinimlerini içeren Docker image, sstate-cache volume mount ve CI'da deterministik build — ekip genelinde tekrarlanabilir embedded build ortamı.</p>
+
+  <h3>Yocto builder Dockerfile</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Dockerfile.yocto — Scarthgap (5.0 LTS) builder</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># syntax=docker/dockerfile:1</span>
+<span class="keyword">FROM</span> ubuntu:22.04
+
+<span class="keyword">ARG</span> DEBIAN_FRONTEND=noninteractive
+
+<span class="cmt"># Yocto Scarthgap resmi bağımlılıkları</span>
+<span class="keyword">RUN</span> apt-get update &amp;&amp; apt-get install -y --no-install-recommends \
+    gawk wget git diffstat unzip texinfo gcc \
+    build-essential chrpath socat cpio python3 \
+    python3-pip python3-pexpect xz-utils debianutils \
+    iputils-ping python3-git python3-jinja2 \
+    python3-subunit zstd liblz4-tool file \
+    libacl1 libegl1-mesa libsdl1.2-dev \
+    pylint xterm \
+  &amp;&amp; rm -rf /var/lib/apt/lists/*
+
+<span class="cmt"># repo tool (Android repo)</span>
+<span class="keyword">RUN</span> curl -o /usr/local/bin/repo \
+    https://storage.googleapis.com/git-repo-downloads/repo \
+  &amp;&amp; chmod a+x /usr/local/bin/repo
+
+<span class="cmt"># Host UID ile eşleşen kullanıcı</span>
+<span class="keyword">ARG</span> UID=1000
+<span class="keyword">ARG</span> GID=1000
+<span class="keyword">RUN</span> groupadd -g ${GID} yocto \
+  &amp;&amp; useradd -m -u ${UID} -g yocto -s /bin/bash yocto \
+  &amp;&amp; echo "yocto ALL=(ALL) NOPASSWD: ALL" &gt;&gt; /etc/sudoers
+
+<span class="cmt"># Git config (BitBake için gerekli)</span>
+<span class="keyword">RUN</span> git config --system user.email "ci@build.local" \
+  &amp;&amp; git config --system user.name "Yocto CI"
+
+<span class="keyword">USER</span> yocto
+<span class="keyword">WORKDIR</span> /build
+
+<span class="keyword">CMD</span> ["/bin/bash"]</code></pre>
+  </div>
+
+  <h3>Build scripti ve volume yapısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Yocto container build</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Image oluştur</span>
+<span class="cmd">docker</span> build \
+  <span class="flag">--build-arg</span> <span class="field">UID</span>=$(id -u) \
+  <span class="flag">--build-arg</span> <span class="field">GID</span>=$(id -g) \
+  <span class="flag">-f</span> Dockerfile.yocto \
+  <span class="flag">-t</span> yocto-builder:scarthgap .
+
+<span class="cmt"># Kalıcı volume'lar oluştur</span>
+<span class="cmd">docker</span> volume create yocto-sstate    <span class="cmt"># sstate-cache (~20–50 GB)</span>
+<span class="cmd">docker</span> volume create yocto-downloads <span class="cmt"># indirilen kaynaklar (~5–10 GB)</span>
+
+<span class="cmt"># Yocto build çalıştır</span>
+<span class="cmd">docker</span> run <span class="flag">--rm</span> <span class="flag">-it</span> \
+  <span class="flag">-v</span> <span class="str">"$(pwd)/poky:/build/poky:ro"</span> \
+  <span class="flag">-v</span> <span class="str">"$(pwd)/meta-custom:/build/meta-custom:ro"</span> \
+  <span class="flag">-v</span> yocto-sstate:/build/build/sstate-cache \
+  <span class="flag">-v</span> yocto-downloads:/build/build/downloads \
+  <span class="flag">-v</span> <span class="str">"$(pwd)/output:/build/output"</span> \
+  yocto-builder:scarthgap \
+  bash <span class="flag">-c</span> <span class="str">"
+    source /build/poky/oe-init-build-env /build/build
+    bitbake core-image-minimal 2&gt;&amp;1 | tee /build/output/build.log
+  "</span></code></pre>
+  </div>
+
+  <h3>local.conf container yapılandırması</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>build/conf/local.conf — container içi ayarlar</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Makine tanımı</span>
+<span class="field">MACHINE</span> = <span class="str">"qemuarm64"</span>
+
+<span class="cmt"># Paralel build (container CPU sayısına göre)</span>
+<span class="field">BB_NUMBER_THREADS</span> = <span class="str">"4"</span>
+<span class="field">PARALLEL_MAKE</span> = <span class="str">"-j 4"</span>
+
+<span class="cmt"># sstate-cache dizini (volume mount noktası)</span>
+<span class="field">SSTATE_DIR</span> = <span class="str">"/build/build/sstate-cache"</span>
+
+<span class="cmt"># Downloads dizini (volume mount noktası)</span>
+<span class="field">DL_DIR</span> = <span class="str">"/build/build/downloads"</span>
+
+<span class="cmt"># CI modunda interaktif sorulardan kaçın</span>
+<span class="field">CONNECTIVITY_CHECK_URIS</span> = <span class="str">""</span>
+
+<span class="cmt"># Disk alanı uyarı eşiği</span>
+<span class="field">BB_DISKMON_DIRS</span> = <span class="str">"\
+  STOPTASKS,/build,1G,100K \
+  ABORT,/build,100M,1K"</span></code></pre>
+  </div>
+
+  <h3>GitHub Actions CI entegrasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>.github/workflows/yocto-build.yml</span><span class="dot">●</span></div>
+    <pre><code><span class="field">name</span>: <span class="str">Yocto Build CI</span>
+
+<span class="field">on</span>:
+  <span class="field">push</span>:
+    <span class="field">paths</span>: [<span class="str">'meta-custom/**'</span>]
+
+<span class="field">jobs</span>:
+  <span class="field">yocto-build</span>:
+    <span class="field">runs-on</span>: ubuntu-22.04
+    <span class="field">steps</span>:
+      - <span class="field">uses</span>: actions/checkout@v4
+        <span class="field">with</span>:
+          <span class="field">submodules</span>: recursive
+
+      - <span class="field">name</span>: <span class="str">Cache sstate (GitHub Actions cache)</span>
+        <span class="field">uses</span>: actions/cache@v4
+        <span class="field">with</span>:
+          <span class="field">path</span>: sstate-cache
+          <span class="field">key</span>: <span class="str">yocto-sstate-${{ hashFiles('meta-custom/**/*.bb') }}</span>
+          <span class="field">restore-keys</span>: yocto-sstate-
+
+      - <span class="field">name</span>: <span class="str">Build Yocto image</span>
+        <span class="field">run</span>: |
+          docker build \
+            --build-arg UID=$(id -u) \
+            --build-arg GID=$(id -g) \
+            -f Dockerfile.yocto \
+            -t yocto-builder:ci .
+
+          docker run --rm \
+            -v "$(pwd):/build/workspace:ro" \
+            -v "$(pwd)/sstate-cache:/build/build/sstate-cache" \
+            -v "$(pwd)/artifacts:/build/output" \
+            yocto-builder:ci \
+            bash -c "
+              source /build/workspace/poky/oe-init-build-env /build/build
+              cp /build/workspace/conf/local.conf conf/local.conf
+              bitbake core-image-minimal
+              cp tmp/deploy/images/qemuarm64/* /build/output/
+            "
+
+      - <span class="field">name</span>: <span class="str">Upload artifacts</span>
+        <span class="field">uses</span>: actions/upload-artifact@v4
+        <span class="field">with</span>:
+          <span class="field">name</span>: yocto-images
+          <span class="field">path</span>: artifacts/</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Yocto ilk build büyük bir sstate-cache oluşturur (20–50 GB). GitHub Actions'ın ücretsiz katmanında 10 GB cache sınırı bulunur. Büyük sstate cache için <strong>self-hosted runner</strong> veya sstate-cache'i ayrı bir artifact sunucusunda barındırmak daha verimlidir. <code>SSTATE_MIRRORS</code> değişkeniyle harici sstate mirror tanımlanabilir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Yocto Scarthgap için tüm bağımlılıkları içeren Dockerfile — resmi bağımlılık listesi</li>
+      <li>sstate-cache ve downloads için named volume — build'ler arası paylaşım, hız</li>
+      <li>GitHub Actions: actions/cache ile sstate-cache persist etme</li>
+      <li><code>--build-arg UID=$(id -u)</code>: dosya izin sorunu olmadan host dizinine yazma</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

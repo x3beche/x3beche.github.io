@@ -1,0 +1,1475 @@
+---
+layout: tutorial
+title: "eBPF — Kernel Gözlemlenebilirlik"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>EBPF</span>
+    <span>2026</span>
+  </div>
+  <h1>eBPF<br><em>Kernel Gözlemlenebilirlik</em></h1>
+  <p class="subtitle">kernel'ı yeniden derlemeden tracing, ağ analizi ve güvenlik politikaları — BPF virtual machine, verifier ve JIT compiler.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">eBPF nedir</a></li>
+    <li><a href="#s1">eBPF program türleri</a></li>
+    <li><a href="#s2">bpftrace — tek satır tracing</a></li>
+    <li><a href="#s3">bpftrace araçları</a></li>
+    <li><a href="#s4">BCC — BPF Compiler Collection</a></li>
+    <li><a href="#s5">libbpf ve CO-RE</a></li>
+    <li><a href="#s6">BPF Maps</a></li>
+    <li><a href="#s7">XDP — eXpress Data Path</a></li>
+    <li><a href="#s8">eBPF güvenlik</a></li>
+    <li><a href="#s9">Pratik: HTTP latency tracker</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> eBPF nedir</h2>
+  <p class="section-lead">eBPF (extended Berkeley Packet Filter), Linux kernel'ını yeniden derlemek veya modül yazmak zorunda kalmadan kernel içinde güvenli program çalıştırmayı sağlayan devrimsel bir altyapıdır.</p>
+
+  <h3>Temel fikir</h3>
+  <p>Geleneksel yaklaşımda kernel davranışını değiştirmek için ya kernel modülü yazılır (güvenlik riski, karmaşıklık) ya da kernel kaynak kodu değiştirilerek yeniden derlenir (uzun süre, dağıtım bağımlılığı). eBPF bunların hiçbirini gerektirmez: kullanıcı alanında yazılan küçük programlar kernel'a yüklenir, doğrulanır (verifier) ve JIT derleme ile native makine koduna çevrilir. Kernel belirli noktalarda (hook) bu programları çalıştırır.</p>
+
+  <div class="flow">
+    <pre>eBPF C kodu → LLVM/Clang → BPF bytecode → kernel verifier → JIT compiler → native kod → hook noktasında çalışır</pre>
+  </div>
+
+  <h3>BPF sanal makinesi</h3>
+  <p>BPF sanal makinesi 64-bit RISC mimarisiyle modellenmiştir. 11 adet 64-bit genel amaçlı kayıt (r0–r10), 512 byte'lık stack ve sınırlı sayıda instruction set içerir. Bu kısıtlamalar kasıtlıdır: <strong>verifier</strong> programın sonlanacağını (döngü yokluğu), bellek sınırlarını aşmadığını ve güvenli helper'lar dışında kernel fonksiyon çağırmadığını ispat etmek için bu kısıtları kullanır.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Bileşen</th><th>Görev</th></tr></thead>
+      <tbody>
+        <tr><td>BPF Verifier</td><td>Programın güvenli olduğunu statik analiz ile kanıtlar — sonsuz döngü yok, OOB erişim yok</td></tr>
+        <tr><td>JIT Compiler</td><td>BPF bytecode → x86-64 / ARM64 / RISC-V native kod; %0 interpreter overhead</td></tr>
+        <tr><td>BPF Maps</td><td>Kernel-userspace arası paylaşılan veri yapıları — hash, array, ring buffer</td></tr>
+        <tr><td>BPF Helpers</td><td>Kernel'ın güvenli API'si — <code>bpf_ktime_get_ns()</code>, <code>bpf_map_lookup_elem()</code> vb.</td></tr>
+        <tr><td>BTF (BPF Type Format)</td><td>Kernel veri yapısı tip bilgisi — CO-RE (Compile Once Run Everywhere) için temel</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Güvenlik garantileri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Sonlanma garantisi</span><span class="desc">Verifier DAG analizi ile programın mutlaka sonlanacağını ispatlar — kernel askıya alınamaz</span></div>
+    <div class="param"><span class="name">Bellek güvenliği</span><span class="desc">Her pointer erişimi null kontrolü ve sınır doğrulaması gerektirir — buffer overflow imkansız</span></div>
+    <div class="param"><span class="name">Ayrıcalık gerektirme</span><span class="desc">CAP_BPF veya CAP_SYS_ADMIN gerekli — rastgele kullanıcı kod çalıştıramaz</span></div>
+    <div class="param"><span class="name">Kısıtlı API</span><span class="desc">Yalnızca onaylı BPF helper fonksiyonlar çağrılabilir — keyfi kernel fonksiyon erişimi yok</span></div>
+  </div>
+
+  <h3>Kullanım senaryoları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Alan</th><th>Örnek</th><th>Araç</th></tr></thead>
+      <tbody>
+        <tr><td>Tracing / Profiling</td><td>Hangi fonksiyon ne kadar sürüyor, CPU hotspot</td><td>bpftrace, BCC, perf</td></tr>
+        <tr><td>Ağ</td><td>DDoS mitigation, load balancing, paket filtreleme</td><td>XDP, TC, Cilium</td></tr>
+        <tr><td>Güvenlik</td><td>Syscall filtreleme, LSM politikası, sandbox</td><td>Seccomp-BPF, BPF-LSM</td></tr>
+        <tr><td>Gözlemlenebilirlik</td><td>Service mesh telemetry, container ağ izleme</td><td>Cilium, Pixie, Falco</td></tr>
+        <tr><td>Performans</td><td>Disk I/O latency, scheduler analizi</td><td>BCC biolatency, runqlat</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>eBPF, kernel 3.18'de temel özelliklerle tanıtıldı. Modern eBPF özellikleri (BPF ringbuf, CO-RE, BPF LSM, BPF iterator) kernel 5.8+ gerektirir. Üretim sistemleri için <strong>kernel 5.15 LTS veya üzeri</strong> önerilir. Kernel versiyonunu doğrulamak için: <code>uname -r</code>.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>eBPF = kernel modülü gücü + verifier güvenliği — yeniden derleme gerekmez</li>
+      <li>BPF VM → verifier (güvenlik) → JIT (performans) → hook noktasında çalışır</li>
+      <li>Tracing, ağ, güvenlik, gözlemlenebilirlik — tek altyapı, çok kullanım</li>
+      <li>Kernel 5.15+ LTS önerilir; modern CO-RE için BTF desteği gerekli</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> eBPF program türleri</h2>
+  <p class="section-lead">Her eBPF program türü farklı bir kernel hook noktasına bağlanır — doğru türü seçmek hem çalışma garantisi hem de erişilebilecek veri için belirleyicidir.</p>
+
+  <h3>Program türleri tablosu</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Tür</th><th>Hook noktası</th><th>Tetiklenme</th><th>Kullanım</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>kprobe</code></td><td>Kernel fonksiyon girişi</td><td>Herhangi kernel fonksiyon çağrıldığında</td><td>Kernel davranışı izleme, argüman okuma</td></tr>
+        <tr><td><code>kretprobe</code></td><td>Kernel fonksiyon dönüşü</td><td>Fonksiyon return ettiğinde</td><td>Return değeri okuma, latency ölçüm</td></tr>
+        <tr><td><code>tracepoint</code></td><td>Statik kernel tracepoint</td><td>Kernel önceden tanımlanmış nokta</td><td>Stabil API, kernel güncellemelerinde kırılmaz</td></tr>
+        <tr><td><code>uprobe</code></td><td>Userspace fonksiyon girişi</td><td>Belirtilen process fonksiyon çağırır</td><td>Uygulama tracing, Python/Go runtime izleme</td></tr>
+        <tr><td><code>uretprobe</code></td><td>Userspace fonksiyon dönüşü</td><td>Userspace fonksiyon return</td><td>Uygulama latency ölçümü</td></tr>
+        <tr><td><code>XDP</code></td><td>NIC sürücüsü (skb öncesi)</td><td>Her gelen paket</td><td>Yüksek hızlı paket filtreleme, DDoS</td></tr>
+        <tr><td><code>TC</code> (Traffic Control)</td><td>Network stack ingress/egress</td><td>Her paket</td><td>Paket manipülasyon, QoS, NAT</td></tr>
+        <tr><td><code>socket filter</code></td><td>Socket seviyesi</td><td>Socket üzerinden geçen paket</td><td>Seccomp-BPF, özel paket filtreleme</td></tr>
+        <tr><td><code>LSM</code> (BPF-LSM)</td><td>Linux Security Module hook</td><td>Güvenlik kararı gerektiğinde</td><td>Politika zorlama, sandboxing (kernel 5.7+)</td></tr>
+        <tr><td><code>perf_event</code></td><td>Donanım/yazılım sayacı</td><td>PMU event veya timer</td><td>CPU profiling, hardware counter okuma</td></tr>
+        <tr><td><code>cgroup</code></td><td>Cgroup hook noktaları</td><td>Process cgroup geçişleri</td><td>Container ağ politikası</td></tr>
+        <tr><td><code>fentry/fexit</code></td><td>Kernel fonksiyon (BTF ile)</td><td>Fonksiyon giriş/çıkış</td><td>kprobe gibi ama daha hızlı, CO-RE uyumlu</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>kprobe vs tracepoint — hangisini seç</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">kprobe</span><span class="desc">Herhangi kernel fonksiyona bağlanabilir — güçlü ama kernel güncellemelerinde fonksiyon imzası değişebilir</span></div>
+    <div class="param"><span class="name">tracepoint</span><span class="desc">Kernel geliştiricilerinin kasıtlı koyduğu stabil nokta — ABI garantisi var, kernel versiyonları arası taşınabilir</span></div>
+    <div class="param"><span class="name">fentry/fexit</span><span class="desc">BTF destekli kprobe alternatifi — daha düşük overhead, tip bilgisi mevcut, CO-RE uyumlu</span></div>
+    <div class="param"><span class="name">uprobe</span><span class="desc">Kullanıcı alanı binary'lerine — process PID veya binary yolu ile bağlanır, dlopen ile yüklenen kütüphaneleri de yakalar</span></div>
+  </div>
+
+  <h3>Mevcut tracepoint'leri listeleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — tracepoint keşfi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm tracepoint kategorileri</span>
+<span class="cmd">ls</span> /sys/kernel/debug/tracing/events/
+<span class="cmt"># block  ext4  irq  kmem  net  sched  signal  skb  sock  syscalls  task  ...</span>
+
+<span class="cmt"># Syscall tracepoint'leri</span>
+<span class="cmd">ls</span> /sys/kernel/debug/tracing/events/syscalls/ | <span class="cmd">grep</span> open
+<span class="cmt"># sys_enter_open  sys_exit_open  sys_enter_openat  sys_exit_openat</span>
+
+<span class="cmt"># Tracepoint format bilgisi</span>
+<span class="cmd">cat</span> /sys/kernel/debug/tracing/events/syscalls/sys_enter_openat/format
+<span class="cmt"># name: sys_enter_openat</span>
+<span class="cmt"># ID: 612</span>
+<span class="cmt"># format:</span>
+<span class="cmt">#   field:int __syscall_nr;  offset:8; size:4;</span>
+<span class="cmt">#   field:int dfd;           offset:16; size:8;</span>
+<span class="cmt">#   field:const char * filename; offset:24; size:8;</span>
+<span class="cmt">#   field:int flags;         offset:32; size:8;</span>
+
+<span class="cmt"># bpftrace ile tracepoint listesi</span>
+<span class="cmd">bpftrace</span> <span class="flag">-l</span> <span class="str">'tracepoint:syscalls:*open*'</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>kprobe: herhangi kernel fonksiyon — güçlü ama kararsız ABI</li>
+      <li>tracepoint: stabil API, kernel versiyonları arası taşınabilir — tercih edilmeli</li>
+      <li>XDP: NIC sürücüsünde paket işleme — en yüksek performanslı ağ hook</li>
+      <li>fentry/fexit: BTF tabanlı modern kprobe alternatifi, CO-RE uyumlu</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> bpftrace — tek satır tracing</h2>
+  <p class="section-lead">bpftrace, AWK benzeri bir dil ile kernel ve uygulama davranışını anlık olarak incelemenizi sağlayan yüksek seviyeli eBPF ön yüzüdür.</p>
+
+  <h3>Kurulum</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — bpftrace kurulumu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Ubuntu 22.04+</span>
+<span class="cmd">sudo</span> apt-get install -y bpftrace
+
+<span class="cmt"># Versiyon kontrolü</span>
+<span class="cmd">bpftrace</span> <span class="flag">--version</span>
+<span class="cmt"># bpftrace v0.20.4</span>
+
+<span class="cmt"># Kernel BTF desteğini doğrula</span>
+<span class="cmd">ls</span> /sys/kernel/btf/vmlinux
+<span class="cmt"># /sys/kernel/btf/vmlinux</span>
+
+<span class="cmt"># Kernel debug FS monte edilmeli</span>
+<span class="cmd">sudo</span> mount <span class="flag">-t</span> debugfs none /sys/kernel/debug</code></pre>
+  </div>
+
+  <h3>Temel sözdizimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bpftrace — sözdizimi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Genel form: probe /filtre/ { aksiyon }</span>
+<span class="cmt"># probe: kprobe:fonksiyon, tracepoint:kategori:olay, interval:s:N</span>
+
+<span class="cmt"># Açılan dosyaları yazdır</span>
+<span class="cmd">sudo</span> bpftrace <span class="flag">-e</span> <span class="str">'kprobe:do_sys_openat2 { printf("%s\n", str(arg1)); }'</span>
+
+<span class="cmt"># Tracepoint ile (daha stabil)</span>
+<span class="cmd">sudo</span> bpftrace <span class="flag">-e</span> <span class="str">'
+  tracepoint:syscalls:sys_enter_openat {
+    printf("pid=%d comm=%s file=%s\n",
+      pid, comm, str(args->filename));
+  }
+'</span>
+
+<span class="cmt"># Belirli prosesi izle</span>
+<span class="cmd">sudo</span> bpftrace <span class="flag">-e</span> <span class="str">'
+  tracepoint:syscalls:sys_enter_openat
+  /comm == "nginx"/ {
+    printf("%s\n", str(args->filename));
+  }
+'</span></code></pre>
+  </div>
+
+  <h3>Yararlı yerleşik değişkenler</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Değişken</th><th>Tip</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td><code>pid</code></td><td>int</td><td>Process ID</td></tr>
+        <tr><td><code>tid</code></td><td>int</td><td>Thread ID</td></tr>
+        <tr><td><code>comm</code></td><td>string</td><td>Process adı (ilk 16 karakter)</td></tr>
+        <tr><td><code>uid</code></td><td>int</td><td>User ID</td></tr>
+        <tr><td><code>cpu</code></td><td>int</td><td>CPU numarası</td></tr>
+        <tr><td><code>nsecs</code></td><td>uint64</td><td>Boot'tan bu yana nanosaniye</td></tr>
+        <tr><td><code>elapsed</code></td><td>uint64</td><td>Program başlangıcından bu yana ns</td></tr>
+        <tr><td><code>args</code></td><td>struct</td><td>Tracepoint argümanları (BTF ile tipli)</td></tr>
+        <tr><td><code>retval</code></td><td>int64</td><td>Fonksiyon return değeri (kretprobe)</td></tr>
+        <tr><td><code>curtask</code></td><td>task_struct*</td><td>Mevcut task_struct pointer</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Probe sözdizimi örnekleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bpftrace — probe örnekleri</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># kprobe: kernel fonksiyon girişi</span>
+<span class="cmd">sudo</span> bpftrace <span class="flag">-e</span> <span class="str">'kprobe:tcp_connect { printf("TCP connect: pid=%d\n", pid); }'</span>
+
+<span class="cmt"># kretprobe: return değeri oku</span>
+<span class="cmd">sudo</span> bpftrace <span class="flag">-e</span> <span class="str">'kretprobe:sys_read { printf("read() = %d\n", retval); }'</span>
+
+<span class="cmt"># tracepoint: stabil API</span>
+<span class="cmd">sudo</span> bpftrace <span class="flag">-e</span> <span class="str">'tracepoint:sched:sched_process_exec { printf("%s exec\n", str(args->filename)); }'</span>
+
+<span class="cmt"># uprobe: kullanıcı alanı fonksiyon</span>
+<span class="cmd">sudo</span> bpftrace <span class="flag">-e</span> <span class="str">'uprobe:/usr/lib/x86_64-linux-gnu/libssl.so.3:SSL_write { printf("SSL write: pid=%d\n", pid); }'</span>
+
+<span class="cmt"># interval: periyodik yazdırma</span>
+<span class="cmd">sudo</span> bpftrace <span class="flag">-e</span> <span class="str">'interval:s:1 { printf("--- 1 saniye ---\n"); }'</span>
+
+<span class="cmt"># BEGIN/END: başlangıç ve bitiş hook'ları</span>
+<span class="cmd">sudo</span> bpftrace <span class="flag">-e</span> <span class="str">'
+  BEGIN { printf("Tracing başladı\n"); }
+  END   { printf("Tracing bitti\n"); }
+  kprobe:do_nanosleep { printf("sleep: pid=%d\n", pid); }
+'</span>
+
+<span class="cmt"># Probe listesi — eşleşen probe'ları listele</span>
+<span class="cmd">sudo</span> bpftrace <span class="flag">-l</span> <span class="str">'kprobe:tcp_*'</span>
+<span class="cmd">sudo</span> bpftrace <span class="flag">-l</span> <span class="str">'tracepoint:net:*'</span></code></pre>
+  </div>
+
+  <h3>Map (toplama) kullanımı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bpftrace — histogram ve count</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Syscall sayısı — process başına</span>
+<span class="cmd">sudo</span> bpftrace <span class="flag">-e</span> <span class="str">'
+  tracepoint:raw_syscalls:sys_enter {
+    @syscalls[comm] = count();
+  }
+  interval:s:5 { print(@syscalls); clear(@syscalls); }
+'</span>
+
+<span class="cmt"># read() latency histogramı</span>
+<span class="cmd">sudo</span> bpftrace <span class="flag">-e</span> <span class="str">'
+  kprobe:vfs_read   { @start[tid] = nsecs; }
+  kretprobe:vfs_read
+  /@start[tid]/ {
+    @lat_us = hist((nsecs - @start[tid]) / 1000);
+    delete(@start[tid]);
+  }
+  interval:s:5 { print(@lat_us); }
+'</span>
+
+<span class="cmt"># Stack trace ile CPU hotspot</span>
+<span class="cmd">sudo</span> bpftrace <span class="flag">-e</span> <span class="str">'
+  profile:hz:99 {
+    @[kstack] = count();
+  }
+  interval:s:10 { print(@); exit(); }
+'</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>bpftrace -e 'kprobe:func { printf(...); }'</code>: tek satır kernel tracing</li>
+      <li>Yerleşik değişkenler: pid, comm, nsecs, args, retval</li>
+      <li><code>@map[key] = count()</code>, <code>hist()</code>: bpftrace içi aggregation map</li>
+      <li><code>bpftrace -l 'kprobe:tcp_*'</code>: eşleşen probe noktalarını listele</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> bpftrace araçları</h2>
+  <p class="section-lead">BCC ve bpftrace ile gelen hazır araçlar — sistem davranışını anında görüntüleme için kullanıma hazır one-liner'lar ve araçlar.</p>
+
+  <h3>opensnoop — dosya açma izleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — opensnoop</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># opensnoop.bt — tüm dosya açma işlemlerini izle</span>
+<span class="cmd">sudo</span> bpftrace <span class="flag">-e</span> <span class="str">'
+  tracepoint:syscalls:sys_enter_openat {
+    printf("%-6d %-16s %s\n", pid, comm, str(args->filename));
+  }
+'</span>
+
+<span class="cmt"># Örnek çıktı:</span>
+<span class="cmt"># PID    COMM             FILE</span>
+<span class="cmt"># 1234   nginx            /etc/nginx/nginx.conf</span>
+<span class="cmt"># 1235   python3          /usr/lib/python3.11/re.py</span>
+<span class="cmt"># 1236   bash             /proc/1236/stat</span>
+
+<span class="cmt"># BCC sürümü (daha zengin çıktı)</span>
+<span class="cmd">sudo</span> /usr/share/bcc/tools/opensnoop</code></pre>
+  </div>
+
+  <h3>execsnoop — process çalıştırma izleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — execsnoop</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Her exec() çağrısını yakala</span>
+<span class="cmd">sudo</span> bpftrace <span class="flag">-e</span> <span class="str">'
+  tracepoint:syscalls:sys_enter_execve {
+    printf("%-6d %-16s %s\n", pid, comm, str(args->filename));
+  }
+'</span>
+
+<span class="cmt"># Örnek çıktı:</span>
+<span class="cmt"># PID    COMM             EXE</span>
+<span class="cmt"># 4521   bash             /usr/bin/ls</span>
+<span class="cmt"># 4522   ls               /usr/bin/ls</span>
+<span class="cmt"># 4523   make             /usr/bin/gcc</span></code></pre>
+  </div>
+
+  <h3>tcpconnect — TCP bağlantı izleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — tcpconnect</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm yeni TCP bağlantıları</span>
+<span class="cmd">sudo</span> bpftrace <span class="flag">-e</span> <span class="str">'
+  kprobe:tcp_connect {
+    $sk = (struct sock *)arg0;
+    printf("%-6d %-16s → %s:%d\n",
+      pid, comm,
+      ntop(AF_INET, $sk->__sk_common.skc_daddr),
+      $sk->__sk_common.skc_dport);
+  }
+'</span>
+
+<span class="cmt"># Örnek çıktı:</span>
+<span class="cmt"># PID    COMM             DST              PORT</span>
+<span class="cmt"># 8901   curl             93.184.216.34    80</span>
+<span class="cmt"># 8902   apt              91.189.91.38     80</span></code></pre>
+  </div>
+
+  <h3>biolatency — disk I/O latency histogramı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — biolatency</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Disk I/O gecikme dağılımı (10 saniye)</span>
+<span class="cmd">sudo</span> bpftrace <span class="flag">-e</span> <span class="str">'
+  tracepoint:block:block_rq_issue   { @start[args->sector] = nsecs; }
+  tracepoint:block:block_rq_complete
+  /@start[args->sector]/ {
+    @latency_us = hist((nsecs - @start[args->sector]) / 1000);
+    delete(@start[args->sector]);
+  }
+  interval:s:10 { print(@latency_us); exit(); }
+'</span>
+
+<span class="cmt"># Örnek çıktı:</span>
+<span class="cmt"># @latency_us:</span>
+<span class="cmt"># [8, 16)              245 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@</span>
+<span class="cmt"># [16, 32)             512 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@</span>
+<span class="cmt"># [32, 64)              97 |@@@@@@@@@@</span>
+<span class="cmt"># [64, 128)             12 |@</span></code></pre>
+  </div>
+
+  <h3>runqlat — scheduler gecikme ölçümü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — run queue latency</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Process'in CPU'ya ne kadar bekleyeceğini ölç</span>
+<span class="cmd">sudo</span> bpftrace <span class="flag">-e</span> <span class="str">'
+  tracepoint:sched:sched_wakeup,
+  tracepoint:sched:sched_wakeup_new {
+    @qtime[args->pid] = nsecs;
+  }
+  tracepoint:sched:sched_switch {
+    if (args->prev_state == TASK_RUNNING) {
+      @qtime[args->prev_pid] = nsecs;
+    }
+    $ns = @qtime[args->next_pid];
+    if ($ns) {
+      @runqlat_us = hist((nsecs - $ns) / 1000);
+      delete(@qtime[args->next_pid]);
+    }
+  }
+  interval:s:5 { print(@runqlat_us); exit(); }
+'</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>opensnoop: tüm dosya açma işlemlerini gerçek zamanlı göster</li>
+      <li>execsnoop: her yeni process başlatmayı yakala</li>
+      <li>tcpconnect: yeni TCP bağlantılarını izle — hedef IP + port</li>
+      <li>biolatency: disk I/O gecikme histogramı; runqlat: scheduler gecikme dağılımı</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> BCC — BPF Compiler Collection</h2>
+  <p class="section-lead">BCC, Python ön yüzüyle C BPF programı yazmayı kolaylaştıran bir çerçevedir — kprobe bağlama, histogram toplama ve kullanıcı alanına veri gönderme.</p>
+
+  <h3>Kurulum</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — BCC kurulumu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Ubuntu 22.04</span>
+<span class="cmd">sudo</span> apt-get install -y bpfcc-tools python3-bpfcc linux-headers-$(uname -r)
+
+<span class="cmt"># BCC Python modülü</span>
+<span class="cmd">python3</span> <span class="flag">-c</span> <span class="str">"from bcc import BPF; print('BCC OK')"</span>
+
+<span class="cmt"># Hazır BCC araçları</span>
+<span class="cmd">ls</span> /usr/share/bcc/tools/
+<span class="cmt"># biolatency  execsnoop  opensnoop  tcpconnect  tcptop  profile  ...</span></code></pre>
+  </div>
+
+  <h3>İlk BCC programı — syscall sayacı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Python — syscall_count.py</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">#!/usr/bin/env python3</span>
+<span class="keyword">from</span> bcc <span class="keyword">import</span> BPF
+<span class="keyword">import</span> time
+
+<span class="cmt"># BPF C programı (string olarak)</span>
+bpf_program = <span class="str">"""
+#include &lt;uapi/linux/ptrace.h&gt;
+
+BPF_HASH(syscall_count, u32, u64);
+
+TRACEPOINT_PROBE(raw_syscalls, sys_enter) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u64 *count = syscall_count.lookup(&pid);
+    if (count) {
+        (*count)++;
+    } else {
+        u64 init = 1;
+        syscall_count.update(&pid, &init);
+    }
+    return 0;
+}
+"""</span>
+
+<span class="cmt"># BPF programını derle ve yükle</span>
+b = BPF(text=bpf_program)
+
+print(<span class="str">"Syscall sayılıyor... (Ctrl+C ile dur)"</span>)
+time.sleep(5)
+
+<span class="cmt"># Sonuçları oku ve yazdır</span>
+print(<span class="str">f"{'PID':<8} {'Syscall Sayısı'}"</span>)
+for pid, count in sorted(b[<span class="str">"syscall_count"</span>].items(),
+                         key=lambda x: x[1].value, reverse=True)[:10]:
+    print(<span class="str">f"{pid.value:<8} {count.value}"</span>)</code></pre>
+  </div>
+
+  <h3>kprobe bağlama ve perf buffer</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Python — open_tracer.py</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">#!/usr/bin/env python3</span>
+<span class="keyword">from</span> bcc <span class="keyword">import</span> BPF
+<span class="keyword">import</span> ctypes
+
+bpf_text = <span class="str">"""
+#include &lt;uapi/linux/ptrace.h&gt;
+#include &lt;linux/sched.h&gt;
+
+struct event_t {
+    u32  pid;
+    char comm[TASK_COMM_LEN];
+    char fname[256];
+};
+
+BPF_PERF_OUTPUT(events);
+
+int trace_openat(struct pt_regs *ctx, int dfd,
+                 const char __user *filename, int flags) {
+    struct event_t ev = {};
+    ev.pid = bpf_get_current_pid_tgid() >> 32;
+    bpf_get_current_comm(&ev.comm, sizeof(ev.comm));
+    bpf_probe_read_user_str(&ev.fname, sizeof(ev.fname), filename);
+    events.perf_submit(ctx, &ev, sizeof(ev));
+    return 0;
+}
+"""</span>
+
+b = BPF(text=bpf_text)
+b.attach_kprobe(event=<span class="str">"do_sys_openat2"</span>, fn_name=<span class="str">"trace_openat"</span>)
+
+<span class="keyword">class</span> Event(ctypes.Structure):
+    _fields_ = [
+        (<span class="str">"pid"</span>,  ctypes.c_uint),
+        (<span class="str">"comm"</span>, ctypes.c_char * 16),
+        (<span class="str">"fname"</span>, ctypes.c_char * 256),
+    ]
+
+<span class="keyword">def</span> print_event(cpu, data, size):
+    ev = ctypes.cast(data, ctypes.POINTER(Event)).contents
+    print(<span class="str">f"{ev.pid:<8} {ev.comm.decode():<16} {ev.fname.decode()}"</span>)
+
+b[<span class="str">"events"</span>].open_perf_buffer(print_event)
+print(<span class="str">"Dosya açma izleniyor..."</span>)
+<span class="keyword">while</span> True:
+    b.perf_buffer_poll()</code></pre>
+  </div>
+
+  <h3>BPF_HISTOGRAM ile latency ölçümü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Python — read_latency.py (BPF_HISTOGRAM)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">#!/usr/bin/env python3</span>
+<span class="keyword">from</span> bcc <span class="keyword">import</span> BPF
+<span class="keyword">import</span> time
+
+bpf_text = <span class="str">"""
+#include &lt;uapi/linux/ptrace.h&gt;
+
+BPF_HASH(start, u32, u64);
+BPF_HISTOGRAM(dist, u64);
+
+int kprobe__vfs_read(struct pt_regs *ctx) {
+    u32 tid = bpf_get_current_pid_tgid();
+    u64 ts = bpf_ktime_get_ns();
+    start.update(&tid, &ts);
+    return 0;
+}
+
+int kretprobe__vfs_read(struct pt_regs *ctx) {
+    u32 tid = bpf_get_current_pid_tgid();
+    u64 *tsp = start.lookup(&tid);
+    if (tsp) {
+        u64 delta_us = (bpf_ktime_get_ns() - *tsp) / 1000;
+        dist.increment(bpf_log2l(delta_us));
+        start.delete(&tid);
+    }
+    return 0;
+}
+"""</span>
+
+b = BPF(text=bpf_text)
+print(<span class="str">"vfs_read() latency ölçülüyor (10 sn)..."</span>)
+time.sleep(10)
+b[<span class="str">"dist"</span>].print_log2_hist(<span class="str">"usecs"</span>)</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>BCC = Python ön yüzü + C BPF kodu — hızlı geliştirme, dinamik derleme</li>
+      <li><code>BPF_HASH</code>, <code>BPF_PERF_OUTPUT</code>, <code>BPF_HISTOGRAM</code>: built-in BCC map makroları</li>
+      <li><code>b.attach_kprobe()</code>: Python'dan kernel fonksiyona kprobe bağlama</li>
+      <li><code>perf_buffer_poll()</code>: kernel → userspace olay akışı (düşük overhead)</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> libbpf ve CO-RE</h2>
+  <p class="section-lead">libbpf ve CO-RE (Compile Once — Run Everywhere) ile kernel versiyonundan bağımsız taşınabilir eBPF programları yazma.</p>
+
+  <h3>CO-RE neden gerekli</h3>
+  <p>BCC her çalıştırmada kernel'a özgü header dosyaları ile BPF kodunu dinamik olarak derler — bu üretim sistemlerinde hem yavaş hem de risklidir (clang/llvm hedef sistemde kurulu olmalı). CO-RE ise geliştirme makinesinde bir kez derlenen BPF programını farklı kernel versiyonlarında çalıştırır. Bu, BTF (BPF Type Format) ile mümkün olur: kernel, veri yapısı tip bilgisini BTF formatında expose eder; libbpf bu bilgiyle binary'deki field offset'lerini çalışma anında ayarlar.</p>
+
+  <div class="flow">
+    <pre>BPF C + BTF annotations → Clang (geliştirme makinesinde) → .o (BTF dahil) → hedef kernel libbpf CO-RE relocate → yükle</pre>
+  </div>
+
+  <h3>Kurulum</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — libbpf + bpftool kurulumu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># libbpf geliştirme kütüphanesi</span>
+<span class="cmd">sudo</span> apt-get install -y \
+  libbpf-dev \
+  clang \
+  llvm \
+  linux-headers-$(uname -r)
+
+<span class="cmt"># bpftool — BPF program / map yönetimi + skeleton üretimi</span>
+<span class="cmd">sudo</span> apt-get install -y linux-tools-$(uname -r)
+
+<span class="cmt"># Versiyon</span>
+<span class="cmd">bpftool</span> version
+<span class="cmt"># bpftool v7.3.0</span>
+
+<span class="cmt"># Sistem BTF desteğini doğrula</span>
+<span class="cmd">bpftool</span> btf dump file /sys/kernel/btf/vmlinux format raw | <span class="cmd">head</span> <span class="flag">-2</span>
+<span class="cmt"># [1] INT int size=4 bits_offset=0 nr_bits=32 encoding=SIGNED</span></code></pre>
+  </div>
+
+  <h3>CO-RE BPF programı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — openat_tracer.bpf.c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">// SPDX-License-Identifier: GPL-2.0</span>
+<span class="keyword">#include</span> <span class="str">"vmlinux.h"</span>          <span class="cmt">// bpftool ile üretilir: bpftool btf dump file vmlinux</span>
+<span class="keyword">#include</span> <span class="str">&lt;bpf/bpf_helpers.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;bpf/bpf_tracing.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;bpf/bpf_core_read.h&gt;</span>
+
+<span class="keyword">struct</span> event {
+    __u32  pid;
+    __u32  uid;
+    <span class="keyword">char</span>   comm[16];
+    <span class="keyword">char</span>   fname[256];
+};
+
+<span class="cmt">// Ring buffer map — düşük overhead, büyük event akışı için</span>
+<span class="keyword">struct</span> {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024);  <span class="cmt">// 256 KB ring buffer</span>
+} events SEC(<span class="str">".maps"</span>);
+
+SEC(<span class="str">"tracepoint/syscalls/sys_enter_openat"</span>)
+<span class="keyword">int</span> trace_openat(<span class="keyword">struct</span> trace_event_raw_sys_enter *ctx)
+{
+    <span class="keyword">struct</span> event *e;
+    <span class="keyword">const</span> <span class="keyword">char</span> *fname_ptr;
+
+    e = bpf_ringbuf_reserve(&events, <span class="keyword">sizeof</span>(*e), 0);
+    <span class="keyword">if</span> (!e)
+        <span class="keyword">return</span> 0;
+
+    e->pid = bpf_get_current_pid_tgid() >> 32;
+    e->uid = bpf_get_current_uid_gid() &amp; 0xFFFFFFFF;
+    bpf_get_current_comm(&e->comm, <span class="keyword">sizeof</span>(e->comm));
+
+    <span class="cmt">// ctx->args[1] = filename pointer</span>
+    fname_ptr = (<span class="keyword">const</span> <span class="keyword">char</span> *)BPF_CORE_READ(ctx, args[1]);
+    bpf_probe_read_user_str(e->fname, <span class="keyword">sizeof</span>(e->fname), fname_ptr);
+
+    bpf_ringbuf_submit(e, 0);
+    <span class="keyword">return</span> 0;
+}
+
+<span class="keyword">char</span> LICENSE[] SEC(<span class="str">"license"</span>) = <span class="str">"GPL"</span>;</code></pre>
+  </div>
+
+  <h3>Skeleton üretimi ve userspace yükleyici</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — derleme ve skeleton</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># vmlinux.h üret (bir kez, kernel başına)</span>
+<span class="cmd">bpftool</span> btf dump file /sys/kernel/btf/vmlinux format c &gt; vmlinux.h
+
+<span class="cmt"># BPF programını derle</span>
+<span class="cmd">clang</span> <span class="flag">-g</span> <span class="flag">-O2</span> <span class="flag">-target</span> bpf \
+  <span class="flag">-D__TARGET_ARCH_x86</span> \
+  <span class="flag">-I/usr/include/bpf</span> \
+  <span class="flag">-c</span> openat_tracer.bpf.c \
+  <span class="flag">-o</span> openat_tracer.bpf.o
+
+<span class="cmt"># Skeleton oluştur (C header)</span>
+<span class="cmd">bpftool</span> gen skeleton openat_tracer.bpf.o &gt; openat_tracer.skel.h
+
+<span class="cmt"># Skeleton içeriği (otomatik üretilen fonksiyonlar):</span>
+<span class="cmt"># openat_tracer_bpf__open()   → BPF obje aç</span>
+<span class="cmt"># openat_tracer_bpf__load()   → kernel'a yükle</span>
+<span class="cmt"># openat_tracer_bpf__attach() → hook noktasına bağla</span>
+<span class="cmt"># openat_tracer_bpf__destroy() → temizle</span></code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — openat_tracer.c (userspace loader)</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">&lt;stdio.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;signal.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;bpf/libbpf.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">"openat_tracer.skel.h"</span>
+
+<span class="keyword">static</span> <span class="keyword">volatile</span> <span class="keyword">bool</span> running = <span class="keyword">true</span>;
+
+<span class="keyword">static</span> <span class="keyword">int</span> handle_event(<span class="keyword">void</span> *ctx, <span class="keyword">void</span> *data, size_t sz)
+{
+    <span class="keyword">struct</span> event *e = data;
+    printf(<span class="str">"pid=%-6u uid=%-6u comm=%-16s file=%s\n"</span>,
+           e->pid, e->uid, e->comm, e->fname);
+    <span class="keyword">return</span> 0;
+}
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>)
+{
+    <span class="keyword">struct</span> openat_tracer_bpf *skel;
+    <span class="keyword">struct</span> ring_buffer *rb;
+    <span class="keyword">int</span> err;
+
+    <span class="cmt">/* Skeleton aç, yükle, bağla */</span>
+    skel = openat_tracer_bpf__open_and_load();
+    <span class="keyword">if</span> (!skel) { fprintf(stderr, <span class="str">"load failed\n"</span>); <span class="keyword">return</span> 1; }
+
+    err = openat_tracer_bpf__attach(skel);
+    <span class="keyword">if</span> (err) { fprintf(stderr, <span class="str">"attach failed\n"</span>); <span class="keyword">goto</span> cleanup; }
+
+    <span class="cmt">/* Ring buffer consumer */</span>
+    rb = ring_buffer__new(bpf_map__fd(skel->maps.events), handle_event, NULL, NULL);
+    <span class="keyword">if</span> (!rb) { err = -1; <span class="keyword">goto</span> cleanup; }
+
+    printf(<span class="str">"Tracing openat()... Ctrl+C ile dur\n"</span>);
+    <span class="keyword">while</span> (running)
+        ring_buffer__poll(rb, 100);
+
+    ring_buffer__free(rb);
+cleanup:
+    openat_tracer_bpf__destroy(skel);
+    <span class="keyword">return</span> err;
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>CO-RE: geliştirme makinesinde derle, farklı kernel'larda çalıştır — BTF ile field offset yeniden konumlandırma</li>
+      <li><code>bpftool btf dump → vmlinux.h</code>: tüm kernel tipleri tek header</li>
+      <li><code>bpftool gen skeleton</code>: otomatik open/load/attach/destroy C API üretir</li>
+      <li><code>BPF_MAP_TYPE_RINGBUF</code>: yüksek throughput event akışı için modern alternatif</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> BPF Maps</h2>
+  <p class="section-lead">BPF map'leri, kernel BPF programları ile kullanıcı alanı arasındaki paylaşılan veri yapılarıdır — sayaç, histogram, event akışı ve durum takibi için.</p>
+
+  <h3>Map türleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Tür</th><th>Açıklama</th><th>Kullanım</th></tr></thead>
+      <tbody>
+        <tr><td><code>BPF_MAP_TYPE_HASH</code></td><td>Hash tablosu — key/value çifti</td><td>PID bazlı timestamp, sayaç</td></tr>
+        <tr><td><code>BPF_MAP_TYPE_ARRAY</code></td><td>Sabit boyutlu dizi, indeks = key</td><td>CPU başına sayaç, konfigürasyon</td></tr>
+        <tr><td><code>BPF_MAP_TYPE_PERCPU_HASH</code></td><td>CPU başına hash — kilit gerektirmez</td><td>Yüksek performanslı sayaç</td></tr>
+        <tr><td><code>BPF_MAP_TYPE_PERCPU_ARRAY</code></td><td>CPU başına dizi</td><td>Per-CPU istatistik</td></tr>
+        <tr><td><code>BPF_MAP_TYPE_LRU_HASH</code></td><td>LRU tahliyeli hash</td><td>Bağlantı takibi, sınırlı bellek</td></tr>
+        <tr><td><code>BPF_MAP_TYPE_PERF_EVENT_ARRAY</code></td><td>Perf ring buffer</td><td>Event streaming (eski yöntem)</td></tr>
+        <tr><td><code>BPF_MAP_TYPE_RINGBUF</code></td><td>Paylaşımlı ring buffer (kernel 5.8+)</td><td>Yüksek throughput event akışı</td></tr>
+        <tr><td><code>BPF_MAP_TYPE_STACK_TRACE</code></td><td>Stack iz depolama</td><td>CPU profiling, flame graph</td></tr>
+        <tr><td><code>BPF_MAP_TYPE_PROG_ARRAY</code></td><td>BPF program referans dizisi</td><td>tail call — program zincirleme</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Hash map kullanımı (kernel tarafı)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — BPF hash map (kernel)</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">"vmlinux.h"</span>
+<span class="keyword">#include</span> <span class="str">&lt;bpf/bpf_helpers.h&gt;</span>
+
+<span class="cmt">// pid → u64 sayaç hash map</span>
+<span class="keyword">struct</span> {
+    __uint(type,        BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key,   __u32);   <span class="cmt">// PID</span>
+    __type(value, __u64);   <span class="cmt">// syscall sayısı</span>
+} pid_syscall_count SEC(<span class="str">".maps"</span>);
+
+SEC(<span class="str">"tracepoint/raw_syscalls/sys_enter"</span>)
+<span class="keyword">int</span> count_syscalls(<span class="keyword">struct</span> trace_event_raw_sys_enter *ctx)
+{
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    __u64 *count = bpf_map_lookup_elem(&pid_syscall_count, &pid);
+
+    <span class="keyword">if</span> (count) {
+        __sync_fetch_and_add(count, 1);
+    } <span class="keyword">else</span> {
+        __u64 init = 1;
+        bpf_map_update_elem(&pid_syscall_count, &pid, &init, BPF_ANY);
+    }
+    <span class="keyword">return</span> 0;
+}
+
+<span class="keyword">char</span> LICENSE[] SEC(<span class="str">"license"</span>) = <span class="str">"GPL"</span>;</code></pre>
+  </div>
+
+  <h3>Map okuma (kullanıcı alanı)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — map okuma (userspace)</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">&lt;bpf/libbpf.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;bpf/bpf.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">"syscall_count.skel.h"</span>
+
+<span class="cmt">/* ... skel yükleme ve attach sonrası ... */</span>
+
+<span class="keyword">int</span> map_fd = bpf_map__fd(skel->maps.pid_syscall_count);
+__u32 pid = 0, next_pid;
+__u64 count;
+
+<span class="cmt">/* Hash map'i iterate et */</span>
+<span class="keyword">while</span> (bpf_map_get_next_key(map_fd, &pid, &next_pid) == 0) {
+    <span class="keyword">if</span> (bpf_map_lookup_elem(map_fd, &next_pid, &count) == 0) {
+        printf(<span class="str">"pid=%u count=%llu\n"</span>, next_pid, count);
+    }
+    pid = next_pid;
+}
+
+<span class="cmt">/* Belirli key için değer oku */</span>
+__u32 target_pid = 1234;
+<span class="keyword">if</span> (bpf_map_lookup_elem(map_fd, &target_pid, &count) == 0)
+    printf(<span class="str">"pid %u: %llu syscall\n"</span>, target_pid, count);
+
+<span class="cmt">/* Key sil */</span>
+bpf_map_delete_elem(map_fd, &target_pid);</code></pre>
+  </div>
+
+  <h3>Ring buffer — yüksek throughput event akışı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — ring buffer (kernel + userspace)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* === Kernel tarafı === */</span>
+<span class="keyword">struct</span> {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 24);  <span class="cmt">/* 16 MB */</span>
+} rb SEC(<span class="str">".maps"</span>);
+
+<span class="cmt">/* Event gönder */</span>
+<span class="keyword">struct</span> my_event *e = bpf_ringbuf_reserve(&rb, <span class="keyword">sizeof</span>(*e), 0);
+<span class="keyword">if</span> (e) {
+    e->pid = bpf_get_current_pid_tgid() >> 32;
+    bpf_ringbuf_submit(e, 0);   <span class="cmt">/* veya bpf_ringbuf_discard(e, 0) */</span>
+}
+
+<span class="cmt">/* === Userspace tarafı === */</span>
+<span class="keyword">static</span> <span class="keyword">int</span> handle_event(<span class="keyword">void</span> *ctx, <span class="keyword">void</span> *data, size_t sz) {
+    <span class="keyword">struct</span> my_event *e = data;
+    printf(<span class="str">"event: pid=%u\n"</span>, e->pid);
+    <span class="keyword">return</span> 0;
+}
+
+<span class="keyword">struct</span> ring_buffer *rb_consumer = ring_buffer__new(
+    bpf_map__fd(skel->maps.rb),
+    handle_event, NULL, NULL
+);
+
+<span class="keyword">while</span> (running)
+    ring_buffer__poll(rb_consumer, 100 <span class="cmt">/* timeout ms */</span>);</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>HASH: key/value genel amaçlı depolama; ARRAY: indeks bazlı sabit boyut</li>
+      <li>PERCPU_HASH/ARRAY: atomik olmadan yüksek hızlı sayaç — per-CPU güncelleme</li>
+      <li>RINGBUF (kernel 5.8+): yüksek throughput event akışı — PERF_EVENT_ARRAY'in modern halefi</li>
+      <li><code>bpf_map_get_next_key()</code>: userspace'den map iterate etme — tüm kayıtları okuma</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> XDP — eXpress Data Path</h2>
+  <p class="section-lead">XDP, ağ paketlerini kernel ağ yığınına girmeden önce NIC sürücüsü seviyesinde işleme alır — saniyede 10+ milyon paket işleyebilen en yüksek performanslı Linux ağ hook'u.</p>
+
+  <h3>XDP aksiyon kararları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Aksiyon</th><th>Değer</th><th>Sonuç</th></tr></thead>
+      <tbody>
+        <tr><td><code>XDP_ABORTED</code></td><td>0</td><td>Program hatası — paketi düşür, tracepoint tetikle</td></tr>
+        <tr><td><code>XDP_DROP</code></td><td>1</td><td>Paketi düşür — DDoS mitigation için en hızlı yol</td></tr>
+        <tr><td><code>XDP_PASS</code></td><td>2</td><td>Paketi kernel ağ yığınına ilet — normal işlem</td></tr>
+        <tr><td><code>XDP_TX</code></td><td>3</td><td>Paketi aynı ağ kartından geri gönder</td></tr>
+        <tr><td><code>XDP_REDIRECT</code></td><td>4</td><td>Paketi başka bir ağ arabirimine yönlendir</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>XDP paket sayacı — temel örnek</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — xdp_counter.bpf.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">"vmlinux.h"</span>
+<span class="keyword">#include</span> <span class="str">&lt;bpf/bpf_helpers.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;bpf/bpf_endian.h&gt;</span>
+
+<span class="keyword">struct</span> {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key,   __u32);
+    __type(value, __u64);
+} pkt_count SEC(<span class="str">".maps"</span>);
+
+SEC(<span class="str">"xdp"</span>)
+<span class="keyword">int</span> xdp_counter(<span class="keyword">struct</span> xdp_md *ctx)
+{
+    <span class="keyword">void</span> *data     = (<span class="keyword">void</span> *)(<span class="keyword">long</span>)ctx->data;
+    <span class="keyword">void</span> *data_end = (<span class="keyword">void</span> *)(<span class="keyword">long</span>)ctx->data_end;
+
+    <span class="cmt">/* Ethernet başlığı sınır kontrolü */</span>
+    <span class="keyword">struct</span> ethhdr *eth = data;
+    <span class="keyword">if</span> (((<span class="keyword">void</span> *)eth + <span class="keyword">sizeof</span>(*eth)) > data_end)
+        <span class="keyword">return</span> XDP_ABORTED;
+
+    <span class="cmt">/* Paketi say */</span>
+    __u32 key = 0;
+    __u64 *count = bpf_map_lookup_elem(&pkt_count, &key);
+    <span class="keyword">if</span> (count)
+        (*count)++;
+
+    <span class="keyword">return</span> XDP_PASS;
+}
+
+<span class="keyword">char</span> LICENSE[] SEC(<span class="str">"license"</span>) = <span class="str">"GPL"</span>;</code></pre>
+  </div>
+
+  <h3>XDP ile basit DDoS mitigation (kaynak IP engelle)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — xdp_block.bpf.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">"vmlinux.h"</span>
+<span class="keyword">#include</span> <span class="str">&lt;bpf/bpf_helpers.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;bpf/bpf_endian.h&gt;</span>
+
+<span class="cmt">/* Engellenen IP'ler seti */</span>
+<span class="keyword">struct</span> {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 1024);
+    __type(key,   __u32);   <span class="cmt">/* src IP (network byte order) */</span>
+    __type(value, __u8);    <span class="cmt">/* 1 = engelle */</span>
+} blocklist SEC(<span class="str">".maps"</span>);
+
+SEC(<span class="str">"xdp"</span>)
+<span class="keyword">int</span> xdp_block_ip(<span class="keyword">struct</span> xdp_md *ctx)
+{
+    <span class="keyword">void</span> *data     = (<span class="keyword">void</span> *)(<span class="keyword">long</span>)ctx->data;
+    <span class="keyword">void</span> *data_end = (<span class="keyword">void</span> *)(<span class="keyword">long</span>)ctx->data_end;
+
+    <span class="keyword">struct</span> ethhdr *eth = data;
+    <span class="keyword">if</span> (((<span class="keyword">void</span> *)eth + <span class="keyword">sizeof</span>(*eth)) > data_end)
+        <span class="keyword">return</span> XDP_ABORTED;
+
+    <span class="cmt">/* Yalnızca IPv4 paketlerine bak */</span>
+    <span class="keyword">if</span> (bpf_ntohs(eth->h_proto) != ETH_P_IP)
+        <span class="keyword">return</span> XDP_PASS;
+
+    <span class="keyword">struct</span> iphdr *iph = (<span class="keyword">struct</span> iphdr *)(eth + 1);
+    <span class="keyword">if</span> (((<span class="keyword">void</span> *)iph + <span class="keyword">sizeof</span>(*iph)) > data_end)
+        <span class="keyword">return</span> XDP_ABORTED;
+
+    __u32 src_ip = iph->saddr;
+    __u8 *blocked = bpf_map_lookup_elem(&blocklist, &src_ip);
+    <span class="keyword">if</span> (blocked &amp;&amp; *blocked == 1)
+        <span class="keyword">return</span> XDP_DROP;
+
+    <span class="keyword">return</span> XDP_PASS;
+}
+
+<span class="keyword">char</span> LICENSE[] SEC(<span class="str">"license"</span>) = <span class="str">"GPL"</span>;</code></pre>
+  </div>
+
+  <h3>XDP programını yükleme ve yönetme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — XDP yükleme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ip link ile XDP programı yükle</span>
+<span class="cmd">sudo</span> ip link set eth0 xdp obj xdp_block.bpf.o sec xdp
+
+<span class="cmt"># Yüklü XDP programını görüntüle</span>
+<span class="cmd">ip</span> link show eth0
+<span class="cmt"># 2: eth0: &lt;BROADCAST,MULTICAST,UP&gt; ...</span>
+<span class="cmt">#    link/ether ... brd ...</span>
+<span class="cmt">#    prog/xdp id 42 tag ab12cd34ef56 jited</span>
+
+<span class="cmt"># XDP programını kaldır</span>
+<span class="cmd">sudo</span> ip link set eth0 xdp off
+
+<span class="cmt"># bpftool ile XDP yükle (daha detaylı kontrol)</span>
+<span class="cmd">sudo</span> bpftool prog load xdp_block.bpf.o /sys/fs/bpf/xdp_block
+<span class="cmd">sudo</span> bpftool net attach xdp id $(bpftool prog show name xdp_block_ip | awk '/^[0-9]/{print $1}') dev eth0
+
+<span class="cmt"># IP engelle (map'e ekle)</span>
+<span class="cmd">sudo</span> bpftool map update name blocklist \
+  key hex c0 a8 01 64 \   <span class="cmt"># 192.168.1.100 (network byte order)</span>
+  value hex 01
+
+<span class="cmt"># Map içeriğini görüntüle</span>
+<span class="cmd">sudo</span> bpftool map dump name blocklist</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">UYARI</div>
+    <p>XDP programı yanlış yazıldığında tüm ağ bağlantısı kesilebilir. Geliştirme aşamasında <code>XDP_PASS</code> varsayılan aksiyonu kullanın ve gerçek donanım yerine QEMU veya <code>veth</code> (virtual ethernet) çiftleri üzerinde test edin. Üretim sistemine yüklemeden önce <code>ip link set eth0 xdpgeneric</code> (generic/slower) modda test edin.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>XDP_DROP: NIC seviyesinde paket düşürme — DDoS için en hızlı yol</li>
+      <li>Sınır kontrolü zorunlu: verifier her pointer erişiminde data_end kontrolü ister</li>
+      <li><code>ip link set eth0 xdp obj prog.o sec xdp</code>: XDP yükleme komutu</li>
+      <li>LRU_HASH map: sınırlı bellekte büyük bağlantı/IP takibi</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> eBPF güvenlik</h2>
+  <p class="section-lead">Seccomp-BPF, BPF-LSM ve capability gereksinimleri — eBPF'i güvenlik için kullanma ve eBPF'i güvenli çalıştırma.</p>
+
+  <h3>Capability gereksinimleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Capability</th><th>İzin verilen işlem</th><th>Ne zaman gerekli</th></tr></thead>
+      <tbody>
+        <tr><td><code>CAP_BPF</code></td><td>Privileged BPF programları yükle, map oluştur</td><td>Kernel 5.8+ — bpftool, libbpf için</td></tr>
+        <tr><td><code>CAP_PERFMON</code></td><td>Perf event monitörü, kprobe/tracepoint bağlama</td><td>Kernel 5.8+ — tracing programlar</td></tr>
+        <tr><td><code>CAP_NET_ADMIN</code></td><td>XDP, TC BPF program yükleme</td><td>Ağ BPF programları</td></tr>
+        <tr><td><code>CAP_SYS_ADMIN</code></td><td>Her şey dahil — eski yöntem</td><td>Kernel &lt; 5.8 veya root benzeri erişim</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Seccomp-BPF — syscall sandboxing</h3>
+  <p>Seccomp-BPF, process'in hangi syscall'ları çağırabileceğini BPF programıyla kısıtlar. Her syscall çağrısında BPF programı çalışır ve izin verir, reddeder veya sinyal gönderir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — seccomp BPF filtresi</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">&lt;seccomp.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;unistd.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdio.h&gt;</span>
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>)
+{
+    <span class="cmt">/* libseccomp ile BPF filtresi oluştur */</span>
+    scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_KILL_PROCESS);
+
+    <span class="cmt">/* İzin verilen syscall'lar — whitelist */</span>
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(read),   0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(write),  0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(close),  0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(exit_group), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(mmap),   0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(brk),    0);
+
+    <span class="cmt">/* Filtreyi uygula */</span>
+    seccomp_load(ctx);
+    seccomp_release(ctx);
+
+    <span class="cmt">/* Artık yalnızca izin verilen syscall'lar çağrılabilir */</span>
+    write(STDOUT_FILENO, <span class="str">"Sandbox aktif\n"</span>, 14);
+
+    <span class="cmt">/* Bu satır SIGKILL ile öldürür (execve izinde değil) */</span>
+    <span class="cmt">/* execve("/bin/sh", NULL, NULL); */</span>
+
+    <span class="keyword">return</span> 0;
+}
+<span class="cmt">/* Derleme: gcc -o sandbox sandbox.c -lseccomp */</span></code></pre>
+  </div>
+
+  <h3>BPF-LSM — Linux Security Module hook</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — bpf_lsm_file_open.bpf.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">"vmlinux.h"</span>
+<span class="keyword">#include</span> <span class="str">&lt;bpf/bpf_helpers.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;bpf/bpf_tracing.h&gt;</span>
+
+<span class="cmt">/* Kernel config: CONFIG_BPF_LSM=y ve security= ayarında "bpf" olmalı */</span>
+
+SEC(<span class="str">"lsm/file_open"</span>)
+<span class="keyword">int</span> BPF_PROG(restrict_file_open, <span class="keyword">struct</span> file *file)
+{
+    <span class="keyword">struct</span> inode *inode = BPF_CORE_READ(file, f_inode);
+    umode_t mode = BPF_CORE_READ(inode, i_mode);
+
+    <span class="cmt">/* Set-UID binary açılmasını logla */</span>
+    <span class="keyword">if</span> (mode &amp; S_ISUID) {
+        bpf_printk(<span class="str">"LSM: SUID file open pid=%d\n"</span>,
+                   bpf_get_current_pid_tgid() >> 32);
+    }
+
+    <span class="keyword">return</span> 0; <span class="cmt">/* 0 = izin ver; -EPERM = reddet */</span>
+}
+
+<span class="keyword">char</span> LICENSE[] SEC(<span class="str">"license"</span>) = <span class="str">"GPL"</span>;</code></pre>
+  </div>
+
+  <h3>Unprivileged BPF kısıtlama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — kernel BPF güvenlik ayarları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Unprivileged BPF'i tamamen kapat</span>
+<span class="cmd">sudo</span> sysctl <span class="flag">-w</span> kernel.unprivileged_bpf_disabled=1
+<span class="cmt"># kernel.unprivileged_bpf_disabled = 1</span>
+<span class="cmt"># Kalıcı yapmak için: /etc/sysctl.d/99-bpf.conf</span>
+
+<span class="cmt"># JIT hardening (spectre mitigations)</span>
+<span class="cmd">sudo</span> sysctl <span class="flag">-w</span> net.core.bpf_jit_harden=2
+<span class="cmt"># 0 = hardening yok</span>
+<span class="cmt"># 1 = ayrıcalıksız kullanıcılar için hardening</span>
+<span class="cmt"># 2 = tüm kullanıcılar için hardening</span>
+
+<span class="cmt"># Yüklü BPF programlarını listele</span>
+<span class="cmd">sudo</span> bpftool prog show
+<span class="cmt"># 42: xdp  name xdp_block_ip  tag ab12cd34ef56  jited</span>
+<span class="cmt">#     loaded_at 2026-01-15T14:30:00+0300  uid 0</span>
+<span class="cmt">#     xlated 1024B  jited 576B  memlock 4096B  map_ids 5</span>
+
+<span class="cmt"># Program bytecode + JIT disassembly</span>
+<span class="cmd">sudo</span> bpftool prog dump jited name xdp_block_ip</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Kernel 5.8+: CAP_BPF + CAP_PERFMON — root olmadan güvenli BPF</li>
+      <li>Seccomp-BPF: process'e syscall whitelist — container ve uygulama sandboxing</li>
+      <li>BPF-LSM: Linux güvenlik kararlarına hook — kernel module gerektirmeden politika</li>
+      <li><code>kernel.unprivileged_bpf_disabled=1</code>: üretim sistemlerinde BPF'i kısıtla</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 09 ═══════════════════ -->
+<section id="s9">
+  <h2><span class="num">09</span> Pratik: HTTP latency tracker</h2>
+  <p class="section-lead">tcp_sendmsg ve tcp_recvmsg arasındaki süreyi kprobe ile ölçme — bpftrace one-liner'dan libbpf CO-RE C programına evrim.</p>
+
+  <h3>Strateji</h3>
+
+  <div class="flow">
+    <pre>tcp_sendmsg() çağrıldı → zaman damgası kaydet → tcp_recvmsg() döndü → delta hesapla → histograma ekle</pre>
+  </div>
+
+  <h3>Adım 1: bpftrace one-liner ile kavram kanıtı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — bpftrace HTTP latency (one-liner)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># TCP send → recv arası süreyi ölç</span>
+<span class="cmd">sudo</span> bpftrace <span class="flag">-e</span> <span class="str">'
+  kprobe:tcp_sendmsg {
+    @send_ts[tid] = nsecs;
+  }
+
+  kretprobe:tcp_recvmsg
+  /@send_ts[tid]/ {
+    $delta_us = (nsecs - @send_ts[tid]) / 1000;
+    @latency_us = hist($delta_us);
+    delete(@send_ts[tid]);
+  }
+
+  interval:s:5 {
+    print(@latency_us);
+    clear(@latency_us);
+  }
+'</span>
+
+<span class="cmt"># Örnek çıktı (5 saniyede bir):</span>
+<span class="cmt"># @latency_us:</span>
+<span class="cmt"># [32, 64)              3 |@</span>
+<span class="cmt"># [64, 128)            47 |@@@@@@@@@@@@@@@@@@</span>
+<span class="cmt"># [128, 256)          112 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@</span>
+<span class="cmt"># [256, 512)           23 |@@@@@@@@@</span>
+<span class="cmt"># [512, 1K)             4 |@</span></code></pre>
+  </div>
+
+  <h3>Adım 2: BCC Python ile process filtreli versiyon</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Python — http_latency_bcc.py</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">#!/usr/bin/env python3</span>
+<span class="keyword">from</span> bcc <span class="keyword">import</span> BPF
+<span class="keyword">import</span> argparse, time
+
+parser = argparse.ArgumentParser()
+parser.add_argument(<span class="str">"--pid"</span>, type=int, default=0, help=<span class="str">"Filter by PID"</span>)
+args = parser.parse_args()
+
+bpf_text = <span class="str">"""
+#include &lt;uapi/linux/ptrace.h&gt;
+#include &lt;net/sock.h&gt;
+
+BPF_HASH(start_ts, u32, u64);   // tid → send timestamp
+BPF_HISTOGRAM(dist, u64);       // latency histogram (log2 us)
+
+int kprobe__tcp_sendmsg(struct pt_regs *ctx, struct sock *sk,
+                        struct msghdr *msg, size_t size) {
+    u32 tid = bpf_get_current_pid_tgid();
+    FILTER_PID
+    u64 ts = bpf_ktime_get_ns();
+    start_ts.update(&tid, &ts);
+    return 0;
+}
+
+int kretprobe__tcp_recvmsg(struct pt_regs *ctx) {
+    u32 tid = bpf_get_current_pid_tgid();
+    u64 *tsp = start_ts.lookup(&tid);
+    if (tsp == 0) return 0;
+    u64 delta_us = (bpf_ktime_get_ns() - *tsp) / 1000;
+    dist.increment(bpf_log2l(delta_us));
+    start_ts.delete(&tid);
+    return 0;
+}
+"""</span>
+
+pid_filter = <span class="str">""</span>
+<span class="keyword">if</span> args.pid:
+    pid_filter = <span class="str">f"""
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    if (pid != {args.pid}) return 0;
+    """</span>
+
+bpf_text = bpf_text.replace(<span class="str">"FILTER_PID"</span>, pid_filter)
+b = BPF(text=bpf_text)
+
+print(<span class="str">f"HTTP latency izleniyor"</span>
+      + (<span class="str">f" (pid={args.pid})"</span> <span class="keyword">if</span> args.pid <span class="keyword">else</span> <span class="str">""</span>)
+      + <span class="str">"... Ctrl+C"</span>)
+
+<span class="keyword">try</span>:
+    <span class="keyword">while</span> True:
+        time.sleep(5)
+        print(<span class="str">"\n--- Son 5 saniye ---"</span>)
+        b[<span class="str">"dist"</span>].print_log2_hist(<span class="str">"usecs"</span>)
+        b[<span class="str">"dist"</span>].clear()
+<span class="keyword">except</span> KeyboardInterrupt:
+    pass</code></pre>
+  </div>
+
+  <h3>Adım 3: libbpf CO-RE C programı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — http_latency.bpf.c (kernel)</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">"vmlinux.h"</span>
+<span class="keyword">#include</span> <span class="str">&lt;bpf/bpf_helpers.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;bpf/bpf_tracing.h&gt;</span>
+
+<span class="keyword">#define</span> MAX_ENTRIES 8192
+<span class="keyword">#define</span> HIST_SLOTS  26    <span class="cmt">/* log2(usec) = 0..25 (1 ns .. ~33 s) */</span>
+
+<span class="keyword">struct</span> {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key,   __u32);   <span class="cmt">/* tid */</span>
+    __type(value, __u64);   <span class="cmt">/* send timestamp (ns) */</span>
+} start SEC(<span class="str">".maps"</span>);
+
+<span class="keyword">struct</span> {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, HIST_SLOTS);
+    __type(key,   __u32);
+    __type(value, __u64);
+} latency_hist SEC(<span class="str">".maps"</span>);
+
+<span class="keyword">static</span> <span class="keyword">inline</span> __u32 log2(__u64 v)
+{
+    __u32 r = 0;
+    <span class="keyword">if</span> (v > 0xFFFFFFFF) { v >>= 32; r += 32; }
+    <span class="keyword">if</span> (v > 0x0000FFFF) { v >>= 16; r += 16; }
+    <span class="keyword">if</span> (v > 0x000000FF) { v >>=  8; r +=  8; }
+    <span class="keyword">if</span> (v > 0x0000000F) { v >>=  4; r +=  4; }
+    <span class="keyword">if</span> (v > 0x00000003) { v >>=  2; r +=  2; }
+    <span class="keyword">if</span> (v > 0x00000001) {           r +=  1; }
+    <span class="keyword">return</span> r;
+}
+
+SEC(<span class="str">"kprobe/tcp_sendmsg"</span>)
+<span class="keyword">int</span> BPF_KPROBE(tcp_sendmsg_entry)
+{
+    __u32 tid = bpf_get_current_pid_tgid();
+    __u64 ts  = bpf_ktime_get_ns();
+    bpf_map_update_elem(&start, &tid, &ts, BPF_ANY);
+    <span class="keyword">return</span> 0;
+}
+
+SEC(<span class="str">"kretprobe/tcp_recvmsg"</span>)
+<span class="keyword">int</span> BPF_KRETPROBE(tcp_recvmsg_exit)
+{
+    __u32 tid  = bpf_get_current_pid_tgid();
+    __u64 *tsp = bpf_map_lookup_elem(&start, &tid);
+    <span class="keyword">if</span> (!tsp)
+        <span class="keyword">return</span> 0;
+
+    __u64 delta_us = (bpf_ktime_get_ns() - *tsp) / 1000;
+    bpf_map_delete_elem(&start, &tid);
+
+    __u32 slot = log2(delta_us);
+    <span class="keyword">if</span> (slot >= HIST_SLOTS)
+        slot = HIST_SLOTS - 1;
+
+    __u64 *cnt = bpf_map_lookup_elem(&latency_hist, &slot);
+    <span class="keyword">if</span> (cnt)
+        __sync_fetch_and_add(cnt, 1);
+
+    <span class="keyword">return</span> 0;
+}
+
+<span class="keyword">char</span> LICENSE[] SEC(<span class="str">"license"</span>) = <span class="str">"GPL"</span>;</code></pre>
+  </div>
+
+  <h3>Userspace yükleyici ve histogram yazdırma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — http_latency.c (userspace)</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">&lt;stdio.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;unistd.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;signal.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;math.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;bpf/libbpf.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">&lt;bpf/bpf.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">"http_latency.skel.h"</span>
+
+<span class="keyword">#define</span> HIST_SLOTS 26
+
+<span class="keyword">static</span> <span class="keyword">volatile</span> <span class="keyword">bool</span> running = <span class="keyword">true</span>;
+
+<span class="keyword">static</span> <span class="keyword">void</span> print_hist(<span class="keyword">int</span> map_fd)
+{
+    __u32 key;
+    __u64 val, max_val = 0;
+    __u64 vals[HIST_SLOTS] = {};
+
+    <span class="keyword">for</span> (key = 0; key < HIST_SLOTS; key++) {
+        <span class="keyword">if</span> (!bpf_map_lookup_elem(map_fd, &key, &val))
+            vals[key] = val;
+        <span class="keyword">if</span> (vals[key] > max_val) max_val = vals[key];
+    }
+
+    printf(<span class="str">"\n%-20s %10s %-40s\n"</span>, <span class="str">"usecs"</span>, <span class="str">"count"</span>, <span class="str">"distribution"</span>);
+    <span class="keyword">for</span> (key = 0; key < HIST_SLOTS; key++) {
+        <span class="keyword">if</span> (!vals[key]) <span class="keyword">continue</span>;
+        __u64 lo = (key == 0) ? 0 : (1ULL << (key-1));
+        __u64 hi = (1ULL << key) - 1;
+        <span class="keyword">int</span>  stars = max_val ? (vals[key] * 40 / max_val) : 0;
+        printf(<span class="str">"[%8llu, %8llu) %10llu |"</span>, lo, hi, vals[key]);
+        <span class="keyword">for</span> (<span class="keyword">int</span> i = 0; i < stars; i++) putchar(<span class="str">'@'</span>);
+        putchar(<span class="str">'\n'</span>);
+    }
+
+    <span class="cmt">/* Temizle */</span>
+    __u64 zero = 0;
+    <span class="keyword">for</span> (key = 0; key < HIST_SLOTS; key++)
+        bpf_map_update_elem(map_fd, &key, &zero, BPF_ANY);
+}
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>)
+{
+    <span class="keyword">struct</span> http_latency_bpf *skel;
+
+    skel = http_latency_bpf__open_and_load();
+    <span class="keyword">if</span> (!skel) { fprintf(stderr, <span class="str">"load failed\n"</span>); <span class="keyword">return</span> 1; }
+    <span class="keyword">if</span> (http_latency_bpf__attach(skel)) {
+        fprintf(stderr, <span class="str">"attach failed\n"</span>); <span class="keyword">goto</span> cleanup;
+    }
+
+    printf(<span class="str">"HTTP latency izleniyor (5 sn)...\n"</span>);
+    <span class="keyword">while</span> (running) {
+        sleep(5);
+        print_hist(bpf_map__fd(skel->maps.latency_hist));
+    }
+
+cleanup:
+    http_latency_bpf__destroy(skel);
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <h3>Derleme ve çalıştırma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Makefile — http_latency</span><span class="dot">●</span></div>
+    <pre><code><span class="field">CLANG</span> := clang
+<span class="field">CC</span>    := gcc
+<span class="field">ARCH</span>  := $(shell uname -m | sed 's/x86_64/x86/')
+
+<span class="field">CFLAGS</span> := -g -Wall -I/usr/include/bpf
+<span class="field">LDFLAGS</span> := -lbpf -lelf -lz
+
+<span class="field">all</span>: vmlinux.h http_latency.skel.h http_latency
+
+<span class="field">vmlinux.h</span>:
+	bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+
+<span class="field">http_latency.bpf.o</span>: http_latency.bpf.c vmlinux.h
+	$(CLANG) -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) \
+	  -I/usr/include/bpf -c $&lt; -o $@
+
+<span class="field">http_latency.skel.h</span>: http_latency.bpf.o
+	bpftool gen skeleton $&lt; > $@
+
+<span class="field">http_latency</span>: http_latency.c http_latency.skel.h
+	$(CC) $(CFLAGS) -o $@ $&lt; $(LDFLAGS) -lm
+
+<span class="field">clean</span>:
+	rm -f vmlinux.h *.o *.skel.h http_latency
+
+<span class="cmt"># Derleme</span>
+<span class="cmt"># make</span>
+<span class="cmt"># sudo ./http_latency</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Bu örnekte tcp_sendmsg → tcp_recvmsg latency, aynı thread'deki bir HTTP istek-yanıt döngüsünü ölçer. Gerçek HTTP latency için uprobe ile kullanıcı alanı HTTP kütüphanesinin gönder/al fonksiyonlarını izlemek daha doğru sonuç verir. <code>bpftrace -l 'uprobe:/usr/lib/*/libcurl.so*:curl_*'</code> ile libcurl fonksiyonlarını keşfedebilirsiniz.</p>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">UYARI</div>
+    <p>tcp_sendmsg ve tcp_recvmsg kernel fonksiyon isimleri kernel versiyonları arasında değişebilir (örneğin <code>tcp_sendmsg_locked</code>). Kprobe bağlamadan önce <code>bpftrace -l 'kprobe:tcp_send*'</code> ile mevcut sembol adlarını doğrulayın. Stabil alternatif: <code>tracepoint:tcp:tcp_probe</code> veya <code>tracepoint:sock:inet_sock_set_state</code>.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Adım 1 bpftrace one-liner: kavram kanıtı, 5 dakikada histogram çıktısı</li>
+      <li>Adım 2 BCC Python: process filtresi, dinamik derleme, iteratif geliştirme</li>
+      <li>Adım 3 libbpf CO-RE: üretim kalitesi, kernel bağımsız, clang runtime gerektirmez</li>
+      <li>Evrim: one-liner → BCC → libbpf CO-RE — karmaşıklık gerektikçe geçiş yap</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

@@ -1,0 +1,996 @@
+---
+layout: tutorial
+title: "Secure Boot &amp; TPM — Güven Zinciri"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>GÜVENLİK</span>
+    <span>2026</span>
+  </div>
+  <h1>Secure Boot &amp; TPM<br><em>Güven Zinciri</em></h1>
+  <p class="subtitle">ROM'dan user-space'e her boot aşamasını imzala ve doğrula — HAB, FIT imzalama, TPM, OP-TEE ve dm-verity ile tam chain of trust.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Güven zinciri ve tehdit modeli</a></li>
+    <li><a href="#s1">Asimetrik imzalama temelleri</a></li>
+    <li><a href="#s2">U-Boot FIT image imzalama</a></li>
+    <li><a href="#s3">NXP HAB — i.MX Secure Boot</a></li>
+    <li><a href="#s4">TI AM335x Secure Boot</a></li>
+    <li><a href="#s5">TPM 2.0 temelleri</a></li>
+    <li><a href="#s6">Measured Boot ve IMA</a></li>
+    <li><a href="#s7">OP-TEE ve TrustZone</a></li>
+    <li><a href="#s8">dm-verity ile rootfs bütünlüğü</a></li>
+    <li><a href="#s9">Pratik: Raspberry Pi Secure Boot</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Güven zinciri ve tehdit modeli</h2>
+  <p class="section-lead">Secure Boot'un amacı, sistem açılış sürecinin her adımında yetkisiz veya değiştirilmiş yazılımın çalıştırılmasını engellemektir.</p>
+
+  <h3>Boot chain: ROM'dan init'e</h3>
+  <p>Güven zinciri, fabrikada programlanan ve değiştirilemez olan ROM bootrom'dan başlar. Her aşama bir sonraki aşamanın kriptografik imzasını doğrular; doğrulama başarısız olursa boot durur.</p>
+
+  <div class="flow">
+    <pre>ROM bootrom (immutable, SoC içi)
+     │  ↳ public key hash OTP fuse'da saklı
+     ▼
+SPL / FSBL (imzalı)
+     │  ↳ ROM tarafından doğrulandı
+     ▼
+U-Boot (imzalı FIT veya HAB ile korunan)
+     │  ↳ SPL tarafından doğrulandı
+     ▼
+Linux Kernel + DTB (FIT image içinde imzalı)
+     │  ↳ U-Boot tarafından doğrulandı
+     ▼
+Init / systemd (dm-verity ile korunan rootfs'ten)
+     │  ↳ Kernel hash tree doğrulaması</pre>
+  </div>
+
+  <h3>Tehdit modeli</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Tehdit</th><th>Saldırı vektörü</th><th>Karşı önlem</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Fiziksel erişim</td><td>Flash'a trojanize firmware yazma, JTAG debug</td><td>HAB fuse (JTAG devre dışı), Secure Boot</td></tr>
+        <tr><td>Yazılım saldırısı</td><td>OTA güncellemede kötü amaçlı image</td><td>FIT imza doğrulama, rollback counter</td></tr>
+        <tr><td>Supply chain</td><td>Üretim sürecinde değiştirilmiş binary</td><td>SRK hash fuse, reproducible build</td></tr>
+        <tr><td>Rootfs manipülasyonu</td><td>Çalışan sistemde dosya sistemi değiştirme</td><td>dm-verity, read-only rootfs</td></tr>
+        <tr><td>Ölçüm sahteciliği</td><td>TPM PCR değerlerini sahte raporlama</td><td>Remote attestation, signed quote</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Güven kökleri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">OTP / eFuse</span><span class="desc">Bir kez programlanabilen fuse bit'leri; public key hash burada saklanır. Değiştirilemez — fiziksel güven kökü.</span></div>
+    <div class="param"><span class="name">Secure Element</span><span class="desc">ATECC608A gibi donanım güvenlik çipi; private key asla CPU'ya çıkmaz.</span></div>
+    <div class="param"><span class="name">TPM 2.0</span><span class="desc">Trusted Platform Module; ölçüm zincirini PCR'larda saklar, remote attestation imzalar.</span></div>
+    <div class="param"><span class="name">TrustZone / OP-TEE</span><span class="desc">ARM TrustZone; secure key storage ve güvenli kriptografik operasyonlar için izole execution environment.</span></div>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Secure Boot, şifreleme değildir — <strong>bütünlük ve özgünlük</strong> doğrulamasıdır. Disk şifreleme (dm-crypt, LUKS) ile birleştirildiğinde hem bütünlük hem gizlilik sağlanır. Bunlar birbirini tamamlayan farklı güvenlik katmanlarıdır.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Güven zinciri ROM'dan başlar; her aşama bir sonrakini doğrular</li>
+      <li>OTP fuse değiştirilemez fiziksel güven köküdür</li>
+      <li>Tehdit modeli: fiziksel erişim, yazılım saldırısı, supply chain, rootfs manipülasyonu</li>
+      <li>Secure Boot = bütünlük; dm-crypt = gizlilik; ikisi birlikte kullanılabilir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Asimetrik imzalama temelleri</h2>
+  <p class="section-lead">Secure Boot, asimetrik kriptografi üzerine kuruludur: private key ile imzala, public key ile doğrula — doğrulama tarafı private key'i asla görmez.</p>
+
+  <h3>Algoritma karşılaştırması</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Algoritma</th><th>Anahtar boyutu</th><th>İmza boyutu</th><th>Güvenlik</th><th>Performans</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>RSA-2048</td><td>2048 bit</td><td>256 byte</td><td>112-bit eşdeğer</td><td>Orta; yaygın</td></tr>
+        <tr><td>RSA-4096</td><td>4096 bit</td><td>512 byte</td><td>140-bit eşdeğer</td><td>Yavaş; uzun vadeli</td></tr>
+        <tr><td>ECDSA P-256</td><td>256 bit</td><td>64 byte</td><td>128-bit eşdeğer</td><td>Hızlı; küçük imza</td></tr>
+        <tr><td>ECDSA P-384</td><td>384 bit</td><td>96 byte</td><td>192-bit eşdeğer</td><td>Hızlı; yüksek güvenlik</td></tr>
+        <tr><td>Ed25519</td><td>256 bit</td><td>64 byte</td><td>128-bit eşdeğer</td><td>Çok hızlı; modern</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Anahtar üretimi ve sertifika</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — OpenSSL anahtar üretimi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># RSA-2048 private key üret</span>
+<span class="cmd">openssl</span> genrsa <span class="flag">-out</span> dev.key 2048
+
+<span class="cmt"># RSA-4096 private key (daha uzun vadeli)</span>
+<span class="cmd">openssl</span> genrsa <span class="flag">-out</span> prod.key 4096
+
+<span class="cmt"># ECDSA P-256 (küçük cihazlar için ideal)</span>
+<span class="cmd">openssl</span> ecparam <span class="flag">-name</span> prime256v1 <span class="flag">-genkey</span> <span class="flag">-noout</span> <span class="flag">-out</span> ec.key
+
+<span class="cmt"># Self-signed X.509 sertifikası üret (10 yıl geçerli)</span>
+<span class="cmd">openssl</span> req <span class="flag">-new</span> <span class="flag">-x509</span> \
+    <span class="flag">-key</span> dev.key \
+    <span class="flag">-out</span> dev.crt \
+    <span class="flag">-days</span> 3650 \
+    <span class="flag">-subj</span> <span class="str">"/CN=Embedded Secure Boot Key/O=MyCompany/C=TR"</span>
+
+<span class="cmt"># Sertifikayı DER formatına dönüştür (U-Boot için)</span>
+<span class="cmd">openssl</span> x509 <span class="flag">-in</span> dev.crt <span class="flag">-outform</span> DER <span class="flag">-out</span> dev.crt.der
+
+<span class="cmt"># Public key'i DER olarak çıkar</span>
+<span class="cmd">openssl</span> rsa <span class="flag">-in</span> dev.key <span class="flag">-pubout</span> <span class="flag">-outform</span> DER <span class="flag">-out</span> dev.pub.der
+
+<span class="cmt"># İmza doğrulama — manuel test</span>
+<span class="cmd">openssl</span> dgst <span class="flag">-sha256</span> <span class="flag">-sign</span> dev.key <span class="flag">-out</span> image.sig image.bin
+<span class="cmd">openssl</span> dgst <span class="flag">-sha256</span> <span class="flag">-verify</span> dev.pub.der <span class="flag">-signature</span> image.sig image.bin</code></pre>
+  </div>
+
+  <h3>PEM ve DER formatları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">PEM</span><span class="desc">Base64 kodlanmış, ASCII metin. -----BEGIN...----- sarmalayıcıları ile. İnsan okunabilir, birleştirilebilir.</span></div>
+    <div class="param"><span class="name">DER</span><span class="desc">Ham binary ASN.1 kodlaması. Daha küçük, donanım ve bootloader araçları tarafından tercih edilir.</span></div>
+  </div>
+
+  <h3>Hash algoritması seçimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — hash hesaplama</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># SHA-256: en yaygın, U-Boot ve HAB tarafından desteklenir</span>
+<span class="cmd">openssl</span> dgst <span class="flag">-sha256</span> image.bin
+
+<span class="cmt"># SHA-384: daha yüksek güvenlik seviyesi</span>
+<span class="cmd">openssl</span> dgst <span class="flag">-sha384</span> image.bin
+
+<span class="cmt"># SHA-512: TPM PCR extend için de kullanılır</span>
+<span class="cmd">openssl</span> dgst <span class="flag">-sha512</span> image.bin
+
+<span class="cmt"># MD5 KULLANMAYIN — güvenlik uygulamaları için cryptographically broken</span></code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>Private key'leri güvenli bir HSM (Hardware Security Module) veya en azından şifrelenmiş bir vault'ta saklayın. Build sunucusunda plain-text private key bırakmayın. Üretim key'leri için ayrı, air-gapped bir imzalama ortamı kullanmayı düşünün.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>RSA-2048 yaygın; ECDSA P-256 küçük imza ve hız için; Ed25519 modern alternatif</li>
+      <li><code>openssl genrsa -out dev.key 2048</code> ve <code>openssl req -x509</code> ile sertifika üretimi</li>
+      <li>PEM: metin, insan okunabilir; DER: binary, bootloader araçları için</li>
+      <li>Hash: SHA-256 minimum, SHA-384 yüksek güvenlik için</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> U-Boot FIT image imzalama</h2>
+  <p class="section-lead">FIT (Flattened Image Tree) formatı, kernel, DTB ve ramdisk'i tek bir imzalı pakette birleştirir; U-Boot bu paketin imzasını doğrulayarak güvenli boot sağlar.</p>
+
+  <h3>FIT image anatomisi — ITS dosyası</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>my.its — Image Tree Source</span><span class="dot">●</span></div>
+    <pre><code>/dts-v1/;
+
+/ {
+    <span class="field">description</span> = <span class="str">"Signed kernel + dtb + ramdisk"</span>;
+    <span class="field">#address-cells</span> = &lt;1&gt;;
+
+    images {
+        kernel@1 {
+            <span class="field">description</span> = <span class="str">"Linux Kernel"</span>;
+            <span class="field">data</span> = /incbin/(<span class="str">"zImage"</span>);
+            <span class="field">type</span> = <span class="str">"kernel"</span>;
+            <span class="field">arch</span> = <span class="str">"arm"</span>;
+            <span class="field">os</span> = <span class="str">"linux"</span>;
+            <span class="field">compression</span> = <span class="str">"none"</span>;
+            <span class="field">load</span> = &lt;0x80008000&gt;;
+            <span class="field">entry</span> = &lt;0x80008000&gt;;
+            hash@1 {
+                <span class="field">algo</span> = <span class="str">"sha256"</span>;
+            };
+        };
+        fdt@1 {
+            <span class="field">description</span> = <span class="str">"MyBoard Device Tree"</span>;
+            <span class="field">data</span> = /incbin/(<span class="str">"myboard.dtb"</span>);
+            <span class="field">type</span> = <span class="str">"flat_dt"</span>;
+            <span class="field">arch</span> = <span class="str">"arm"</span>;
+            <span class="field">compression</span> = <span class="str">"none"</span>;
+            hash@1 {
+                <span class="field">algo</span> = <span class="str">"sha256"</span>;
+            };
+        };
+        ramdisk@1 {
+            <span class="field">description</span> = <span class="str">"Initial ramdisk"</span>;
+            <span class="field">data</span> = /incbin/(<span class="str">"initrd.cpio.gz"</span>);
+            <span class="field">type</span> = <span class="str">"ramdisk"</span>;
+            <span class="field">arch</span> = <span class="str">"arm"</span>;
+            <span class="field">os</span> = <span class="str">"linux"</span>;
+            <span class="field">compression</span> = <span class="str">"gzip"</span>;
+            hash@1 {
+                <span class="field">algo</span> = <span class="str">"sha256"</span>;
+            };
+        };
+    };
+
+    configurations {
+        <span class="field">default</span> = <span class="str">"conf@1"</span>;
+        conf@1 {
+            <span class="field">description</span> = <span class="str">"Boot config with signature"</span>;
+            <span class="field">kernel</span> = <span class="str">"kernel@1"</span>;
+            <span class="field">fdt</span> = <span class="str">"fdt@1"</span>;
+            <span class="field">ramdisk</span> = <span class="str">"ramdisk@1"</span>;
+            signature@1 {
+                <span class="field">algo</span> = <span class="str">"sha256,rsa2048"</span>;
+                <span class="field">key-name-hint</span> = <span class="str">"dev"</span>;
+                <span class="field">sign-images</span> = <span class="str">"kernel"</span>, <span class="str">"fdt"</span>, <span class="str">"ramdisk"</span>;
+            };
+        };
+    };
+};</code></pre>
+  </div>
+
+  <h3>FIT image oluşturma ve imzalama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — mkimage ile imzalama</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Anahtar dizini oluştur</span>
+<span class="cmd">mkdir</span> <span class="flag">-p</span> keys/
+<span class="cmd">openssl</span> genrsa <span class="flag">-out</span> keys/dev.key 2048
+<span class="cmd">openssl</span> req <span class="flag">-new</span> <span class="flag">-x509</span> <span class="flag">-key</span> keys/dev.key <span class="flag">-out</span> keys/dev.crt \
+    <span class="flag">-days</span> 3650 <span class="flag">-subj</span> <span class="str">"/CN=FIT Signing Key"</span>
+
+<span class="cmt"># FIT image oluştur ve imzala</span>
+<span class="cmt"># -f: ITS dosyası</span>
+<span class="cmt"># -k: anahtar dizini (dev.key ve dev.crt burada)</span>
+<span class="cmt"># -K: public key'in gömüleceği U-Boot DTB</span>
+<span class="cmt"># -r: required (doğrulama zorunlu kıl)</span>
+<span class="cmd">mkimage</span> <span class="flag">-f</span> my.its <span class="flag">-k</span> keys/ <span class="flag">-K</span> u-boot.dtb <span class="flag">-r</span> my.fit
+
+<span class="cmt"># İmzalanmış FIT'i doğrula</span>
+<span class="cmd">mkimage</span> <span class="flag">-l</span> my.fit
+<span class="cmt"># FIT description: Signed kernel + dtb + ramdisk</span>
+<span class="cmt"># ...  Signature:  sha256,rsa2048:dev  OK</span>
+
+<span class="cmt"># U-Boot DTB'ye gömülmüş public key'i doğrula</span>
+<span class="cmd">fdtdump</span> u-boot.dtb | <span class="cmd">grep</span> <span class="flag">-A</span> 5 <span class="str">"signature"</span></code></pre>
+  </div>
+
+  <h3>U-Boot Kconfig — FIT imza desteği</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig — U-Boot .config</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># FIT imza doğrulama</span>
+<span class="field">CONFIG_FIT</span>=y
+<span class="field">CONFIG_FIT_SIGNATURE</span>=y
+<span class="field">CONFIG_FIT_VERBOSE</span>=y             <span class="cmt"># doğrulama detaylarını logla</span>
+<span class="field">CONFIG_RSA</span>=y
+<span class="field">CONFIG_RSA_SOFTWARE_EXP</span>=y        <span class="cmt"># yazılım RSA (donanım yoksa)</span>
+<span class="field">CONFIG_SHA256</span>=y
+
+<span class="cmt"># Sadece imzalı image'a izin ver (unsigned image'ı reddet)</span>
+<span class="field">CONFIG_IMAGE_FORMAT_LEGACY</span>=n     <span class="cmt"># eski mkimage formatını devre dışı bırak</span>
+
+<span class="cmt"># U-Boot ortam değişkeni: sadece verified boot</span>
+<span class="cmt"># bootcmd=bootm ${loadaddr}#conf@1</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Public key, <code>mkimage -K u-boot.dtb</code> komutuyla U-Boot'un kendi DTB'sine gömülür. Bu DTB daha sonra U-Boot binary'siyle birleştirilerek flash'a yazılır. Böylece U-Boot her boot'ta aynı public key'le doğrulama yapar — key'i ayrı bir partition'da tutmaya gerek yoktur.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>ITS dosyası: kernel + DTB + ramdisk + imza konfigürasyonunu tanımlar</li>
+      <li><code>mkimage -f my.its -k keys/ -K u-boot.dtb -r my.fit</code> imzalı FIT üretir</li>
+      <li>Public key U-Boot DTB'sine gömülür; <code>CONFIG_FIT_SIGNATURE=y</code> zorunlu</li>
+      <li><code>mkimage -l my.fit</code> imza doğrulamasını görsel olarak raporlar</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> NXP HAB — i.MX Secure Boot</h2>
+  <p class="section-lead">NXP'nin HAB (High Assurance Boot) mekanizması, i.MX SoC'larda ROM bootrom seviyesinde imza doğrulaması sağlar; OTP fuse'lar ile cihaz kilitlenir.</p>
+
+  <h3>HAB mimarisi</h3>
+  <p>HAB, SoC ROM'una entegre edilmiş bir kriptografik kütüphanedir. ROM, SPL veya U-Boot binary'sini yüklemeden önce CSF (Command Sequence File) yapısını okur ve imzaları doğrular. Doğrulama başarısız olursa boot durur veya (Open device modunda) sadece uyarı verir.</p>
+
+  <div class="flow">
+    <pre>SRK Key Pair (CST ile üretilir)
+     → SRK Hash → OTP Fuse'a yazılır
+     → CSF + imzalı binary → flash'a yazılır
+     → ROM boot → HAB doğrulama → SPL çalışır</pre>
+  </div>
+
+  <h3>CST ile anahtar ve imza üretimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — NXP Code Signing Tool (CST)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># CST NXP web sitesinden indir: https://www.nxp.com/webapp/sps/download/license.jsp?colCode=IMX_CST_TOOL</span>
+<span class="cmd">tar</span> <span class="flag">xf</span> cst-3.3.2.tar.gz
+<span class="cmd">cd</span> cst-3.3.2/
+
+<span class="cmt"># PKI ağacı oluştur (SRK + CSF + IMG key'ler)</span>
+<span class="cmd">cd</span> keys/
+<span class="cmd">./hab4_pki_tree.sh</span>
+<span class="cmt"># Do you want to use an existing CA key (y/n)?: n</span>
+<span class="cmt"># Enter key length in bits for PKI tree: 2048</span>
+<span class="cmt"># Enter PKI tree duration (years): 10</span>
+<span class="cmt"># How many Super Root Keys should be generated? 4</span>
+
+<span class="cmt"># SRK hash üret (OTP'ye yazılacak değer)</span>
+<span class="cmd">./srktool</span> <span class="flag">-h</span> 4 <span class="flag">-t</span> SRK_1_2_3_4_table.bin \
+    <span class="flag">-e</span> SRK_1_2_3_4_fuse.bin \
+    <span class="flag">-d</span> sha256 \
+    <span class="flag">-f</span> 1 \
+    SRK1_sha256_2048_65537_v3_ca_crt.pem \
+    SRK2_sha256_2048_65537_v3_ca_crt.pem \
+    SRK3_sha256_2048_65537_v3_ca_crt.pem \
+    SRK4_sha256_2048_65537_v3_ca_crt.pem
+
+<span class="cmt"># SRK fuse değerini görüntüle</span>
+<span class="cmd">hexdump</span> <span class="flag">-C</span> SRK_1_2_3_4_fuse.bin</code></pre>
+  </div>
+
+  <h3>CSF dosyası ve imzalama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>u-boot-csf.txt — Command Sequence File</span><span class="dot">●</span></div>
+    <pre><code>[Header]
+    <span class="field">Version</span> = 4.2
+    <span class="field">Hash Algorithm</span> = sha256
+    <span class="field">Engine</span> = CAAM
+    <span class="field">Engine Configuration</span> = 0
+    <span class="field">Certificate Format</span> = X509
+    <span class="field">Signature Format</span> = CMS
+
+[Install SRK]
+    <span class="field">File</span> = <span class="str">"../crts/SRK_1_2_3_4_table.bin"</span>
+    <span class="field">Source index</span> = 0
+
+[Install CSFK]
+    <span class="field">File</span> = <span class="str">"../crts/CSF1_1_sha256_2048_65537_v3_usr_crt.pem"</span>
+
+[Authenticate CSF]
+
+[Install Key]
+    <span class="field">Verification index</span> = 0
+    <span class="field">Target index</span> = 2
+    <span class="field">File</span> = <span class="str">"../crts/IMG1_1_sha256_2048_65537_v3_usr_crt.pem"</span>
+
+[Authenticate Data]
+    <span class="field">Verification index</span> = 2
+    <span class="field">Blocks</span> = 0x877ff400 0x000 0x00096000 <span class="str">"u-boot-dtb.imx"</span></code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — CST ile imzala</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># CSF binary üret</span>
+<span class="cmd">./cst/linux64/bin/cst</span> <span class="flag">-i</span> u-boot-csf.txt <span class="flag">-o</span> u-boot-csf.bin
+
+<span class="cmt"># U-Boot binary'sine CSF ekle</span>
+<span class="cmd">objcopy</span> <span class="flag">--gap-fill</span>=0xff <span class="flag">--pad-to</span>=0x96000 u-boot-dtb.imx u-boot-padded.imx
+<span class="cmd">cat</span> u-boot-padded.imx u-boot-csf.bin &gt; u-boot-signed.imx</code></pre>
+  </div>
+
+  <h3>hab_status ve fuse işlemleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>U-Boot shell — HAB durumu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># HAB event log sorgula — U-Boot konsolunda</span>
+=&gt; hab_status
+<span class="cmt"># Secure boot disabled</span>
+<span class="cmt"># No HAB Events Found!</span>
+<span class="cmt"># (Tüm imzalar geçerliyse; hata varsa event gösterir)</span>
+
+<span class="cmt"># SRK hash fuse'larını yaz (GERİ ALINAMAZ!)</span>
+<span class="cmt"># fuse prog bankNo wordNo value</span>
+=&gt; fuse prog 3 0 0x<span class="str">AABBCCDD</span>   <span class="cmt"># SRK_HASH[0]</span>
+=&gt; fuse prog 3 1 0x<span class="str">EEFF0011</span>   <span class="cmt"># SRK_HASH[1]</span>
+<span class="cmt"># ... (toplam 8 word)</span>
+
+<span class="cmt"># SEC_CONFIG[1] fuse'unu set et — cihazı KAPAT (Closed device)</span>
+<span class="cmt"># Bu işlemden sonra imzasız binary'ler çalışmaz!</span>
+=&gt; fuse prog 0 6 0x00000002   <span class="cmt"># SEC_CONFIG[1] = Closed</span></code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>OTP fuse programlama <strong>geri alınamaz</strong>. <code>SEC_CONFIG[1]</code> fuse'unu set etmeden önce imzalı binary'nin doğru çalıştığından kesinlikle emin olun. Yanlış SRK hash ile cihazı kapatırsanız cihaz kalıcı olarak brick olur.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>HAB: ROM seviyesinde imza doğrulama; CSF binary U-Boot'a eklenir</li>
+      <li>CST ile SRK key pair üret; srktool ile fuse hash hesapla</li>
+      <li><code>hab_status</code> U-Boot konsolunda doğrulama durumunu raporlar</li>
+      <li>SEC_CONFIG fuse: Open → Closed geçişi geri alınamaz</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> TI AM335x Secure Boot</h2>
+  <p class="section-lead">TI AM335x SoC'larda ROM bootrom, SPL'yi (MLO) X.509 sertifikasıyla doğrular; tisdk signing workflow bu süreci otomatikleştirir.</p>
+
+  <h3>AM335x ROM boot süreci</h3>
+  <p>AM335x ROM'u, MLO (SPL) binary'sini NAND, SD veya eMMC'den yüklerken Secure Boot etkinse X.509 sertifika doğrulaması gerçekleştirir. Sertifika binary'nin başına eklenir; ROM bu yapıyı otomatik tanır.</p>
+
+  <div class="flow">
+    <pre>ROM → SRAM'a MLO yükle → X.509 header oku → RSA imzayı doğrula → SHAHash doğrula → SPL çalıştır</pre>
+  </div>
+
+  <h3>tiboot3.bin imzalama workflow</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — TI signing tool</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># TI SDK'dan k3-image-gen veya tisdk signing araçlarını edin</span>
+<span class="cmt"># https://git.ti.com/cgit/security-development-tools/core-secdev-k3/</span>
+
+<span class="cmd">git</span> clone https://git.ti.com/git/security-development-tools/core-secdev-k3.git
+<span class="cmd">cd</span> core-secdev-k3/
+
+<span class="cmt"># Anahtar çifti oluştur</span>
+<span class="cmd">openssl</span> genrsa <span class="flag">-out</span> custMpk.pem 4096
+
+<span class="cmt"># tiboot3.bin (SPL for AM625/AM64x) imzala</span>
+<span class="cmd">python3</span> scripts/gen_x509_cert.py \
+    <span class="flag">-b</span> tiboot3.bin \
+    <span class="flag">-o</span> tiboot3-signed.bin \
+    <span class="flag">-k</span> custMpk.pem \
+    <span class="flag">-d</span> sha512
+
+<span class="cmt"># AM335x için MLO imzalama (eski yöntem)</span>
+<span class="cmd">python3</span> scripts/create-boot-certificate.py \
+    <span class="flag">--key</span> custMpk.pem \
+    <span class="flag">--image</span> u-boot-spl.bin \
+    <span class="flag">--output</span> MLO-signed</code></pre>
+  </div>
+
+  <h3>eFuse programlama (AM335x)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — OTP fuse (CTRL_MODULE)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Hedef üzerinde; mpk-hash OTP'ye yaz</span>
+<span class="cmt"># AM335x: EFUSE_SMA (0x44E10600) — software-locked after write</span>
+
+<span class="cmt"># devmem ile eFuse okuma (sadece programlanmamışsa)</span>
+<span class="cmd">devmem</span> 0x44E10600 32    <span class="cmt"># EFUSE okuma</span>
+
+<span class="cmt"># TI ROM sboot_enable bit'ini set et</span>
+<span class="cmt"># Bu işlem için TI'ın eHSM servisini veya özel JTAG scriptini kullanın</span>
+<span class="cmt"># Detaylar: SPRUHF5 (AM335x TRM) Section 26.3 — Secure Boot</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>TI AM335x ve daha yeni K3 serisi SoC'larda (AM62x, AM64x) güvenli boot konfigürasyonu TRM (Technical Reference Manual) belgelerine ve TI'ın Secure Development Tools paketine göre yapılır. Her SoC serisi için signing format farklıdır — her zaman hedef SoC'un TRM'ini inceleyin.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>AM335x ROM, MLO binary'sini X.509 header + RSA imzayla doğrular</li>
+      <li><code>gen_x509_cert.py</code> veya <code>create-boot-certificate.py</code> ile imzalama</li>
+      <li>eFuse programlama; TI SPRUHF5 TRM Section 26.3 referans alın</li>
+      <li>K3 serisi (AM62x, AM64x) farklı signing format — SoC TRM'ini takip edin</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> TPM 2.0 temelleri</h2>
+  <p class="section-lead">TPM (Trusted Platform Module), kriptografik ölçümleri saklayan, anahtar üretip koruyan ve uzaktan doğrulama imzalayan donanım güvenlik modülüdür.</p>
+
+  <h3>TPM 2.0 mimarisi</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">PCR</span><span class="desc">Platform Configuration Register — 24 adet, 256-bit. Sadece extend edilebilir (reset'e kadar). Boot ölçümlerini saklar.</span></div>
+    <div class="param"><span class="name">EK</span><span class="desc">Endorsement Key — fabrikada üretilen, cihaza özgü asimetrik anahtar çifti. Cihaz kimlik kanıtı için.</span></div>
+    <div class="param"><span class="name">SRK</span><span class="desc">Storage Root Key — TPM içindeki anahtar hiyerarşisinin kökü. Diğer anahtarlar bunun altında saklanır.</span></div>
+    <div class="param"><span class="name">AK</span><span class="desc">Attestation Key — quote (ölçüm imzası) için kullanılan anahtar. EK'dan türetilir.</span></div>
+    <div class="param"><span class="name">NV Index</span><span class="desc">Non-Volatile storage — TPM içinde küçük veri saklamak için (örn. rollback counter, policy hash).</span></div>
+  </div>
+
+  <h3>PCR extend işlemi</h3>
+  <p>PCR register'larına değer yazmak <strong>extend</strong> işlemiyle olur — mevcut değerin üstüne yazılmaz, hash zinciriyle güncellenir: <code>PCR_new = SHA256(PCR_old || measurement)</code>. Bu sayede ölçüm geçmişi değiştirilemez biçimde korunur.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — tpm2-tools</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># tpm2-tools kurulumu</span>
+<span class="cmd">sudo</span> apt install tpm2-tools
+
+<span class="cmt"># TPM2 cihazını listele</span>
+<span class="cmd">ls</span> /dev/tpm*
+<span class="cmt"># /dev/tpm0   /dev/tpmrm0</span>
+
+<span class="cmt"># Tüm PCR değerlerini oku</span>
+<span class="cmd">tpm2_pcrread</span>
+<span class="cmt"># sha256:</span>
+<span class="cmt">#   0 : 0x7D5F...  (BIOS/ROM measurement)</span>
+<span class="cmt">#   1 : 0x8A2B...  (BIOS config)</span>
+<span class="cmt">#   7 : 0x0000...  (Secure Boot state)</span>
+
+<span class="cmt"># Belirli PCR'ları oku</span>
+<span class="cmd">tpm2_pcrread</span> sha256:0,1,7
+
+<span class="cmt"># Manuel PCR extend (test için)</span>
+<span class="cmd">tpm2_pcrextend</span> 14:sha256=<span class="str">$(sha256sum myfile.bin | cut -d' ' -f1)</span>
+
+<span class="cmt"># Quote — PCR değerlerini TPM ile imzala (remote attestation)</span>
+<span class="cmt"># Önce bir Attestation Key oluştur</span>
+<span class="cmd">tpm2_createprimary</span> <span class="flag">-C</span> e <span class="flag">-c</span> primary.ctx
+<span class="cmd">tpm2_create</span> <span class="flag">-G</span> ecc <span class="flag">-u</span> ak.pub <span class="flag">-r</span> ak.priv <span class="flag">-C</span> primary.ctx
+<span class="cmd">tpm2_load</span> <span class="flag">-C</span> primary.ctx <span class="flag">-u</span> ak.pub <span class="flag">-r</span> ak.priv <span class="flag">-c</span> ak.ctx
+
+<span class="cmt"># PCR 0,1,7 quote'unu al</span>
+<span class="cmd">tpm2_quote</span> \
+    <span class="flag">-c</span> ak.ctx \
+    <span class="flag">-l</span> sha256:0,1,7 \
+    <span class="flag">-q</span> <span class="str">$(openssl rand -hex 20)</span> \
+    <span class="flag">-m</span> quote.msg \
+    <span class="flag">-s</span> quote.sig \
+    <span class="flag">-o</span> pcrs.out</code></pre>
+  </div>
+
+  <h3>TPM ile anahtar yönetimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — TPM sealed key</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># PCR değerlerine bağlı (sealed) anahtar oluştur</span>
+<span class="cmt"># Sadece PCR 0 ve 7 belirli değerlerdeyken seal açılabilir</span>
+<span class="cmd">tpm2_createpolicy</span> <span class="flag">--policy-pcr</span> <span class="flag">-l</span> sha256:0,7 <span class="flag">-L</span> pcr.policy
+
+<span class="cmd">tpm2_create</span> \
+    <span class="flag">-C</span> primary.ctx \
+    <span class="flag">-i</span> my-secret.bin \
+    <span class="flag">-u</span> sealed.pub \
+    <span class="flag">-r</span> sealed.priv \
+    <span class="flag">-L</span> pcr.policy
+
+<span class="cmt"># Seal açma (PCR değerleri eşleşirse)</span>
+<span class="cmd">tpm2_load</span> <span class="flag">-C</span> primary.ctx <span class="flag">-u</span> sealed.pub <span class="flag">-r</span> sealed.priv <span class="flag">-c</span> sealed.ctx
+<span class="cmd">tpm2_unseal</span> <span class="flag">-c</span> sealed.ctx <span class="flag">--auth</span> session:policy.session</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>PCR = extend-only hash zinciri; değiştirilemez ölçüm geçmişi</li>
+      <li><code>tpm2_pcrread</code> / <code>tpm2_pcrextend</code> / <code>tpm2_quote</code> temel komutlar</li>
+      <li>Sealed key: belirli PCR değerlerine bağlı; sistem değiştirilirse açılmaz</li>
+      <li><code>/dev/tpm0</code>: ham erişim; <code>/dev/tpmrm0</code>: resource manager aracılığıyla</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Measured Boot ve IMA</h2>
+  <p class="section-lead">Measured Boot, boot sürecinin her aşamasını TPM PCR'larına kaydederek sistem durumunun kriptografik kanıtını oluşturur; IMA bu ölçümü çalışma zamanına taşır.</p>
+
+  <h3>Boot aşamalarının PCR dağılımı</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>PCR</th><th>Ölçülen içerik</th><th>Kim extend eder</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>PCR 0</td><td>SRTM (ROM code, BIOS/SBL)</td><td>ROM / donanım</td></tr>
+        <tr><td>PCR 1</td><td>BIOS/EFI konfigürasyonu</td><td>Firmware</td></tr>
+        <tr><td>PCR 7</td><td>Secure Boot state ve sertifikalar</td><td>UEFI / U-Boot</td></tr>
+        <tr><td>PCR 8–9</td><td>GRUB / bootloader komutları</td><td>Bootloader</td></tr>
+        <tr><td>PCR 10</td><td>IMA (Linux runtime ölçümler)</td><td>Linux kernel IMA</td></tr>
+        <tr><td>PCR 14</td><td>Özel uygulama ölçümleri</td><td>Uygulama / systemd</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>IMA — Integrity Measurement Architecture</h3>
+  <p>IMA, Linux kernel'ının her çalıştırılan dosyayı (ve isteğe bağlı olarak okunan dosyaları) hash'leyerek PCR 10'a extend ettiği bir altyapıdır. Bu sayede çalışma zamanı bütünlüğü de TPM üzerinden kanıtlanabilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — IMA konfigürasyon ve log</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kernel config — IMA etkinleştirme</span>
+<span class="cmt"># CONFIG_IMA=y</span>
+<span class="cmt"># CONFIG_IMA_MEASURE_PCR_IDX=10</span>
+<span class="cmt"># CONFIG_IMA_APPRAISE=y</span>
+<span class="cmt"># CONFIG_INTEGRITY_SIGNATURE=y</span>
+
+<span class="cmt"># Kernel cmdline — IMA politikası</span>
+<span class="cmt"># ima_policy=tcb  (trusted computing base: tüm exec + mmap ölç)</span>
+
+<span class="cmt"># IMA ölçüm log'unu görüntüle</span>
+<span class="cmd">cat</span> /sys/kernel/security/integrity/ima/ascii_runtime_measurements
+<span class="cmt"># 10 sha256:... ima-ng sha256:... /usr/sbin/sshd</span>
+<span class="cmt"># 10 sha256:... ima-ng sha256:... /lib/x86_64-linux-gnu/libpam.so.0</span>
+
+<span class="cmt"># TPM PCR 10 değerini oku</span>
+<span class="cmd">tpm2_pcrread</span> sha256:10
+<span class="cmt"># Bu değer IMA log'unun tüm extend işlemlerinin sonucudur</span>
+
+<span class="cmt"># IMA appraise: dosya imzalarını zorla</span>
+<span class="cmt"># Kernel cmdline: ima_appraise=enforce</span>
+<span class="cmt"># Her çalıştırılabilir dosyanın xattr'ında IMA imzası olmalı:</span>
+<span class="cmd">evmctl</span> ima_sign <span class="flag">--key</span> /etc/keys/signing_key.pem /usr/bin/myapp</code></pre>
+  </div>
+
+  <h3>Kernel security sysfs</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — security sysfs</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Mevcut TPM cihazını listele</span>
+<span class="cmd">ls</span> /sys/kernel/security/tpm0/
+<span class="cmt"># ascii_bios_measurements</span>
+<span class="cmt"># binary_bios_measurements</span>
+
+<span class="cmt"># IMA politika dosyası</span>
+<span class="cmd">cat</span> /sys/kernel/security/integrity/ima/policy
+
+<span class="cmt"># securityfs mount edilmemişse</span>
+<span class="cmd">mount</span> <span class="flag">-t</span> securityfs securityfs /sys/kernel/security</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>IMA log'u büyük sistemlerde hızla büyür. Üretim sistemlerinde IMA politikasını yalnızca kritik binary'leri (init, sshd, web server) kapsayacak şekilde daraltın. Tüm dosya sistemi için IMA appraise I/O performansını etkileyebilir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>PCR dağılımı: 0=ROM, 7=Secure Boot, 10=IMA çalışma zamanı</li>
+      <li>IMA her çalıştırılan dosyayı hash'leyerek PCR 10'a extend eder</li>
+      <li><code>/sys/kernel/security/integrity/ima/ascii_runtime_measurements</code> log dosyası</li>
+      <li>IMA appraise: <code>evmctl ima_sign</code> ile dosyalara xattr imza eklenir</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> OP-TEE ve TrustZone</h2>
+  <p class="section-lead">ARM TrustZone, işlemciyi Normal World ve Secure World olarak ikiye ayırır; OP-TEE bu Secure World'de çalışan açık kaynaklı TEE implementasyonudur.</p>
+
+  <h3>TrustZone mimarisi</h3>
+
+  <div class="flow">
+    <pre>Normal World (REE)                    Secure World (TEE)
+──────────────────────                ──────────────────────
+Linux kernel                          OP-TEE OS
+User applications                     Trusted Applications (TA)
+tee-supplicant (user daemon)  ←SMC→  OP-TEE core
+                                       Secure storage
+                                       Crypto operations</pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">SMC</span><span class="desc">Secure Monitor Call — Normal World'den Secure World'e geçiş kapısı. IRQ/FIQ yönetimi de burada.</span></div>
+    <div class="param"><span class="name">TEE</span><span class="desc">Trusted Execution Environment — Secure World'deki izole çalışma ortamı.</span></div>
+    <div class="param"><span class="name">TA</span><span class="desc">Trusted Application — Secure World'de çalışan küçük uygulama; şifreli ve imzalı binary.</span></div>
+    <div class="param"><span class="name">tee-supplicant</span><span class="desc">Normal World'de çalışan user-space daemon; OP-TEE'nin dosya sistemi erişimine aracılık eder.</span></div>
+    <div class="param"><span class="name">Secure Storage</span><span class="desc">OP-TEE'nin şifrelenmiş, bütünlük korumalı kalıcı depolama alanı; key ve credential'lar için.</span></div>
+  </div>
+
+  <h3>OP-TEE build ve entegrasyon</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — OP-TEE derleme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># OP-TEE OS deposu</span>
+<span class="cmd">git</span> clone https://github.com/OP-TEE/optee_os.git
+<span class="cmd">cd</span> optee_os/
+
+<span class="cmt"># Raspberry Pi 3 için build (CFG_ARM64_core=y ile 64-bit)</span>
+<span class="cmd">make</span> <span class="field">PLATFORM</span>=rpi3 \
+     <span class="field">CFG_ARM64_core</span>=y \
+     <span class="field">CROSS_COMPILE64</span>=aarch64-linux-gnu- \
+     <span class="field">CROSS_COMPILE</span>=arm-linux-gnueabihf-
+
+<span class="cmt"># AM335x (BeagleBone Black)</span>
+<span class="cmd">make</span> <span class="field">PLATFORM</span>=ti-am43xx \
+     <span class="field">CROSS_COMPILE</span>=arm-linux-gnueabihf-
+
+<span class="cmt"># Çıktı: tee-pager_v2.bin, tee.elf</span>
+<span class="cmd">ls</span> out/arm-plat-rpi3/core/
+<span class="cmt"># tee.elf  tee-pager_v2.bin  tee-header_v2.bin  tee-pageable_v2.bin</span></code></pre>
+  </div>
+
+  <h3>Trusted Application geliştirme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — TA iskeleti (ta_entry.c)</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;tee_internal_api.h&gt;
+#include &lt;tee_internal_api_extensions.h&gt;
+
+<span class="cmt">/* TA UUID — uuidgen ile benzersiz üret */</span>
+#define TA_MY_UUID { 0x8aaaf200, 0x2450, 0x11e4, \
+    { 0xab, 0xe2, 0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b } }
+
+TEE_Result TA_CreateEntryPoint(<span class="keyword">void</span>) {
+    <span class="keyword">return</span> TEE_SUCCESS;
+}
+
+<span class="keyword">void</span> TA_DestroyEntryPoint(<span class="keyword">void</span>) { }
+
+TEE_Result TA_OpenSessionEntryPoint(uint32_t paramTypes,
+                                     TEE_Param params[4],
+                                     <span class="keyword">void</span> **sessionCtx) {
+    <span class="keyword">return</span> TEE_SUCCESS;
+}
+
+<span class="keyword">void</span> TA_CloseSessionEntryPoint(<span class="keyword">void</span> *sessionCtx) { }
+
+TEE_Result TA_InvokeCommandEntryPoint(<span class="keyword">void</span> *sessionCtx,
+                                       uint32_t commandID,
+                                       uint32_t paramTypes,
+                                       TEE_Param params[4]) {
+    <span class="keyword">switch</span> (commandID) {
+    <span class="keyword">case</span> 0: <span class="cmt">/* Örnek: AES şifreleme */</span>
+        <span class="cmt">/* ... TEE_AllocateOperation, TEE_CipherDoFinal ... */</span>
+        <span class="keyword">return</span> TEE_SUCCESS;
+    <span class="keyword">default</span>:
+        <span class="keyword">return</span> TEE_ERROR_NOT_SUPPORTED;
+    }
+}</code></pre>
+  </div>
+
+  <h3>tee-supplicant ve Linux sürücüsü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — OP-TEE Linux entegrasyonu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kernel config</span>
+<span class="cmt"># CONFIG_TEE=y</span>
+<span class="cmt"># CONFIG_OPTEE=y</span>
+
+<span class="cmt"># tee-supplicant daemon'ı başlat (systemd ile)</span>
+<span class="cmd">systemctl</span> start tee-supplicant
+
+<span class="cmt"># TEE cihaz dosyası</span>
+<span class="cmd">ls</span> /dev/tee*
+<span class="cmt"># /dev/tee0  /dev/teepriv0</span>
+
+<span class="cmt"># optee_client ile CA test uygulaması çalıştır</span>
+<span class="cmd">xtest</span>   <span class="cmt"># OP-TEE test suite</span>
+
+<span class="cmt"># Secure storage konumu (tee-supplicant'ın yönettiği)</span>
+<span class="cmd">ls</span> /data/tee/
+<span class="cmt"># dirf.db  dirf.db.bak  (şifrelenmiş TA storage)</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>TrustZone: Normal World (Linux) / Secure World (OP-TEE) donanım izolasyonu</li>
+      <li>SMC ile Normal World → Secure World geçişi; tee-supplicant aracılık eder</li>
+      <li>TA: Secure World'de çalışan imzalı mini uygulama; TEE Internal API ile yazılır</li>
+      <li>Secure Storage: OP-TEE şifreli kalıcı depolama; private key ve credential'lar için</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> dm-verity ile rootfs bütünlüğü</h2>
+  <p class="section-lead">dm-verity, Linux Device Mapper katmanında rootfs'in her bloğunu okurken hash doğrulaması yapar; değiştirilmiş bir blok I/O hatasıyla reddedilir.</p>
+
+  <h3>dm-verity çalışma prensibi</h3>
+  <p>dm-verity, Merkle hash tree kullanır. Her 4 KB veri bloğu için bir hash hesaplanır; bu hash'ler bir üst katmanda gruplanarak hash'lenir; ağaç tepesindeki <strong>root hash</strong> kernel cmdline'a veya imzalı bir yapıya gömülür. Root hash değişemeyeceğinden, dosya sistemi üzerindeki herhangi bir değişiklik anında tespit edilir.</p>
+
+  <div class="flow">
+    <pre>root hash (kernel cmdline / signed) → hash tree → data blocks (rootfs)</pre>
+  </div>
+
+  <h3>veritysetup ile dm-verity image üretme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — veritysetup</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># cryptsetup/veritysetup kurulumu</span>
+<span class="cmd">sudo</span> apt install cryptsetup
+
+<span class="cmt"># squashfs rootfs oluştur (read-only, dm-verity ile uyumlu)</span>
+<span class="cmd">mksquashfs</span> rootfs/ rootfs.squashfs <span class="flag">-comp</span> lz4 <span class="flag">-noappend</span>
+
+<span class="cmt"># dm-verity hash tree oluştur</span>
+<span class="cmt"># --data-block-size: 4096 (sayfa boyutu)</span>
+<span class="cmt"># --hash-block-size: 4096</span>
+<span class="cmt"># Çıktı: rootfs.hash (hash tree), root hash değeri stdout'a</span>
+<span class="cmd">veritysetup</span> format \
+    rootfs.squashfs \
+    rootfs.hash \
+    <span class="flag">--data-block-size</span>=4096 \
+    <span class="flag">--hash-block-size</span>=4096 \
+    <span class="flag">--hash</span>=sha256
+<span class="cmt"># Root hash: 7d5f8a...c3b2 (bu değeri kernel cmdline'a koy)</span>
+
+<span class="cmt"># dm-verity cihazı aç (çalışan sistemde test)</span>
+<span class="cmd">veritysetup</span> open \
+    rootfs.squashfs vroot \
+    rootfs.hash \
+    7d5f8a...c3b2   <span class="cmt"># root hash buraya</span>
+
+<span class="cmt"># Doğrulanmış rootfs'i mount et</span>
+<span class="cmd">mount</span> <span class="flag">-t</span> squashfs <span class="flag">-o</span> ro /dev/mapper/vroot /mnt</code></pre>
+  </div>
+
+  <h3>Kernel cmdline ile dm-verity rootfs</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>U-Boot env — bootargs</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># U-Boot environment</span>
+setenv bootargs <span class="str">"root=/dev/dm-0 \
+  dm-mod.create=\"vroot,,0,ro, \
+    0 $(rootfssize_sectors) verity 1 \
+    /dev/mmcblk0p2 /dev/mmcblk0p3 \
+    4096 4096 $(rootfs_blocks) 1 sha256 \
+    7d5f8a...c3b2 salt\" \
+  rootfstype=squashfs rootflags=ro"</span></code></pre>
+  </div>
+
+  <div class="code-block">
+    <div name="bash — verity doğrulama testi" class="code-header"><span>bash — verity doğrulama testi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Hash tree doğrulamasını aç (çalışan sistemde)</span>
+<span class="cmd">veritysetup</span> verify rootfs.squashfs rootfs.hash 7d5f8a...c3b2
+<span class="cmt"># Verification succeeded.</span>
+
+<span class="cmt"># Kernel dm-verity log (dmesg)</span>
+<span class="cmd">dmesg</span> | <span class="cmd">grep</span> <span class="flag">-i</span> <span class="str">"verity"</span>
+<span class="cmt"># [    3.456789] device-mapper: verity: sha256 using implementation "sha256-generic"</span>
+<span class="cmt"># [    3.456900] device-mapper: verity: 253:0: Root hash: 7d5f...</span></code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>dm-verity rootfs salt-okunur olmalıdır — herhangi bir yazma girişimi doğrulama hatasına ve I/O reddiyle sonuçlanır. Yazılabilir veri için ayrı bir partition (UBI+UBIFS veya ext4) kullanın; rootfs'in üstüne <code>overlayfs</code> ile yazılabilir katman ekleyebilirsiniz.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>dm-verity Merkle hash tree ile her veri bloğunu okuma anında doğrular</li>
+      <li><code>veritysetup format rootfs.squashfs rootfs.hash</code> hash tree üretir</li>
+      <li>Root hash kernel cmdline veya imzalı image'a gömülür</li>
+      <li>dm-verity rootfs salt-okunur; yazılabilir veri için ayrı partition kullanın</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 09 ═══════════════════ -->
+<section id="s9">
+  <h2><span class="num">09</span> Pratik: Raspberry Pi Secure Boot</h2>
+  <p class="section-lead">Raspberry Pi 4/5, OTP fuse ile imzalı boot loader zorunluluğu sağlar; HAB olmayan platformlarda U-Boot FIT imzalama zinciri ile benzer güvence elde edilir.</p>
+
+  <h3>Raspberry Pi 4 OTP Secure Boot</h3>
+  <p>Raspberry Pi 4, BCM2711 SoC'undaki OTP'ye programlanan bir RSA public key hash ile boot loader doğrulamasını destekler. Bu özellik Raspberry Pi Foundation tarafından 2021 sonrasında duyurulmuş olup üretim kullanımı için resmi araçlarla yapılandırılır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Pi 4 Secure Boot anahtar üretimi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># rpi-eeprom deposu (raspberry pi secure boot araçları)</span>
+<span class="cmd">git</span> clone https://github.com/raspberrypi/usbboot.git
+<span class="cmd">cd</span> usbboot/secure-boot-example/
+
+<span class="cmt"># RSA-2048 anahtar üret</span>
+<span class="cmd">openssl</span> genrsa <span class="flag">-out</span> private.pem 2048
+<span class="cmd">openssl</span> rsa <span class="flag">-in</span> private.pem <span class="flag">-pubout</span> <span class="flag">-out</span> public.pem
+
+<span class="cmt"># Public key hash hesapla (OTP'ye yazılacak)</span>
+<span class="cmd">python3</span> ../tools/rpi-eeprom-digest \
+    <span class="flag">-i</span> public.pem \
+    <span class="flag">-o</span> public_key_hash.bin
+
+<span class="cmt"># rpi-eeprom-config ile OTP'ye yaz (device'ı Pi'ye bağlayın)</span>
+<span class="cmd">sudo</span> rpi-eeprom-config --otp-public-key public.pem \
+    <span class="flag">--apply</span> /lib/firmware/raspberrypi/bootloader/stable/pieeprom-2024-10-22.bin</code></pre>
+  </div>
+
+  <h3>Boot loader ve kernel imzalama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Pi boot image imzalama</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># rpi-eeprom-digest ile bootloader imzala</span>
+<span class="cmd">python3</span> usbboot/tools/rpi-eeprom-digest \
+    <span class="flag">-i</span> pieeprom.bin \
+    <span class="flag">-o</span> pieeprom.signed.bin \
+    <span class="flag">-k</span> private.pem
+
+<span class="cmt"># Raspberry Pi üzerinde durum sorgula</span>
+<span class="cmd">vcgencmd</span> bootloader_config | <span class="cmd">grep</span> <span class="flag">-i</span> <span class="str">"secure"</span>
+<span class="cmt"># SECURE_BOOT_REQUIRED=0  (0=disabled, 1=enabled)</span>
+
+<span class="cmt"># OTP durum okuma</span>
+<span class="cmd">vcgencmd</span> otp_dump | <span class="cmd">grep</span> <span class="str">"66:"</span>
+<span class="cmt"># 66:00000000  (secure boot OTP word)</span></code></pre>
+  </div>
+
+  <h3>HAB'sız platformlarda U-Boot FIT ile güven zinciri</h3>
+  <p>HAB gibi donanım destekli ROM doğrulaması olmayan platformlarda (Pi 3 gibi), güven zinciri U-Boot FIT imzalamasıyla sağlanabilir. Bu yaklaşım ROM seviyesinde değil U-Boot seviyesinde koruma sağlar — dolayısıyla U-Boot binary'sinin kendisi değiştirilebilir. Gerçek güvenlik için OTP mekanizması zorunludur.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — Pi üzerinde U-Boot FIT imzalama tam akış</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1. Anahtar üret</span>
+<span class="cmd">mkdir</span> <span class="flag">-p</span> keys/
+<span class="cmd">openssl</span> genrsa <span class="flag">-out</span> keys/dev.key 2048
+<span class="cmd">openssl</span> req <span class="flag">-new</span> <span class="flag">-x509</span> <span class="flag">-key</span> keys/dev.key \
+    <span class="flag">-out</span> keys/dev.crt <span class="flag">-days</span> 3650 <span class="flag">-subj</span> <span class="str">"/CN=Pi Boot Key"</span>
+
+<span class="cmt"># 2. U-Boot build (Pi için)</span>
+<span class="keyword">export</span> <span class="field">ARCH</span>=arm64
+<span class="keyword">export</span> <span class="field">CROSS_COMPILE</span>=aarch64-linux-gnu-
+<span class="cmd">make</span> rpi_4_defconfig
+<span class="cmt"># menuconfig: FIT_SIGNATURE=y, RSA=y, CONFIG_OF_CONTROL=y</span>
+<span class="cmd">make</span> -j$(nproc)
+
+<span class="cmt"># 3. FIT image oluştur ve imzala (public key u-boot.dtb'ye gömülür)</span>
+<span class="cmd">mkimage</span> <span class="flag">-f</span> pi4.its <span class="flag">-k</span> keys/ <span class="flag">-K</span> arch/arm64/dts/broadcom/bcm2711-rpi-4-b.dtb \
+    <span class="flag">-r</span> pi4-signed.fit
+
+<span class="cmt"># 4. Kopyala</span>
+<span class="cmd">cp</span> u-boot.bin /boot/
+<span class="cmd">cp</span> pi4-signed.fit /boot/
+
+<span class="cmt"># 5. config.txt'de U-Boot'u bootloader olarak ayarla</span>
+<span class="cmt"># kernel=u-boot.bin</span>
+<span class="cmt"># arm_64bit=1</span>
+<span class="cmt"># enable_uart=1</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Raspberry Pi'nin kendi ROM'u kapalı kaynak ve imzasız binary'lere izin verir. Gerçek üretim güvenliği için Raspberry Pi 4/5'in OTP Secure Boot özelliği veya benzer donanım kilitlemesi (fuse, eFuse) gereklidir. Sadece U-Boot FIT imzalama, U-Boot binary'sinin kendisini korumaz.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Pi 4 OTP Secure Boot: RSA-2048 public key hash OTP'ye yazılır; boot loader imzalanır</li>
+      <li><code>rpi-eeprom-digest</code> ile imzalama; <code>vcgencmd otp_dump</code> ile durum kontrolü</li>
+      <li>HAB'sız platformlarda U-Boot FIT imzalama U-Boot sonrası zinciri korur</li>
+      <li>Tam güvenlik için OTP/fuse mekanizması zorunlu; sadece FIT imzalama yeterli değil</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>
