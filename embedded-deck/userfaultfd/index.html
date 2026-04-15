@@ -1,0 +1,1053 @@
+---
+layout: tutorial
+title: "userfaultfd — Userspace Sayfa Hata Yönetimi"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>BELLEK / UFFD</span>
+    <span>2026</span>
+  </div>
+  <h1>userfaultfd<br><em>Userspace Sayfa Hata Yönetimi</em></h1>
+  <p class="subtitle">Linux userfaultfd API ile kullanıcı alanında sayfa hata işleyicisi yaz — live migration, checkpoint/restore, copy-on-write izleme ve fuzzing için güçlü bellek sanallaştırma altyapısı.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">userfaultfd neden var — kullanım senaryoları</a></li>
+    <li><a href="#s1">userfaultfd API — userfaultfd(), UFFDIO_API, UFFDIO_REGISTER</a></li>
+    <li><a href="#s2">Sayfa hatası yakalama — uffd_msg okuma ve fault address</a></li>
+    <li><a href="#s3">Hata yanıtları — UFFDIO_COPY, UFFDIO_ZEROPAGE, UFFDIO_CONTINUE</a></li>
+    <li><a href="#s4">Write-protect modu — CoW izleme</a></li>
+    <li><a href="#s5">Minor fault modu — paylaşımlı bellek ve hugetlb</a></li>
+    <li><a href="#s6">Bellek şişirmesi (balloon) — MADV_DONTNEED kombinasyonu</a></li>
+    <li><a href="#s7">CRIU ve userfaultfd — checkpoint/restore entegrasyonu</a></li>
+    <li><a href="#s8">Hata ayıklama ve güvenlik kısıtları</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> userfaultfd neden var — kullanım senaryoları</h2>
+  <p class="section-lead">userfaultfd (UFFD), kullanıcı alanının belirli bellek bölgeleri için sayfa hatalarını yakalamasına ve yanıt vermesine olanak tanır. Kernel sayfa hatası işleyicisi devreye girmeden önce kullanıcı alanı çağrılır; bu mekanizma güçlü bellek sanallaştırma senaryolarını mümkün kılar.</p>
+
+  <h3>Geleneksel sayfa hata mekanizması</h3>
+  <p>Normal Linux bellek modelinde bir işlem mmap'lenmiş ancak henüz fiziksel sayfası olmayan bir adrese eriştiğinde donanım (MMU) bir page fault exception üretir. Kernel bu hatayı yakalar, uygun fiziksel sayfayı ayırır veya dosyadan yükler ve sayfa tablosunu günceller. Tüm bu işlem uygulama kodunun bilgisi dışında gerçekleşir. <strong>userfaultfd ise bu akışa kullanıcı alanını dahil eder.</strong></p>
+
+  <div class="flow">
+    <pre>Geleneksel akış:
+  Uygulama → belleğe erişir → MMU page fault → kernel handler → sayfa ayır → devam
+
+userfaultfd akışı:
+  Uygulama → belleğe erişir → MMU page fault → kernel handler
+    → "Bu adres UFFD bölgesinde!" → uffd fd'ye mesaj yaz
+    → Uygulama uffd thread'i mesajı okur
+    → Hangi sayfayı koyacağına karar verir (ağdan getir, decompress et, sıfırla...)
+    → UFFDIO_COPY ile sayfayı yerleştir
+    → Kernel: fault eden thread devam eder</pre>
+  </div>
+
+  <h3>Neden ihtiyaç var — kullanım senaryoları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">VM live migration</span><span class="desc">Sanal makineyi durdurma olmaksızın başka bir fiziksel makineye taşı. VM çalışırken bellek kopyalanır; erişilen ama henüz kopyalanmamış sayfalar UFFD ile on-demand transfer edilir</span></div>
+    <div class="param"><span class="name">Checkpoint/Restore (CRIU)</span><span class="desc">Sürecin belleğini diske yaz; sonra geri yükle. UFFD ile lazy restore: yalnızca gerçekten erişilen sayfalar diskten yüklenir, tüm bellek önceden restore edilmez</span></div>
+    <div class="param"><span class="name">Garbage collection optimizasyonu</span><span class="desc">JVM ve .NET çalışma zamanları, write-protect modunu kullanarak nesne mutasyonlarını izler; GC yalnızca değişen sayfaları tarar</span></div>
+    <div class="param"><span class="name">Fuzzing (coverage-guided)</span><span class="desc">AFL++ gibi fuzzer'lar UFFD ile fork-server yerine sayfa düzeyinde snapshot alabilir; her test vakasında sadece değişen sayfalar restore edilir</span></div>
+    <div class="param"><span class="name">Bellek şişirmesi (balloon)</span><span class="desc">Sanallaştırma ortamında VM'den bellek geri almak için boş sayfa erişimlerini yakala; fiziksel belleği ana makineye iade et</span></div>
+    <div class="param"><span class="name">Post-copy live migration</span><span class="desc">VM hedefte çok erken başlatılır; eksik sayfalar kaynaktan UFFD on-demand olarak çekilir. Pre-copy'ye kıyasla çok daha hızlı başlangıç</span></div>
+  </div>
+
+  <h3>Kernel sürümü ve özellik matrisi</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>Minimum Kernel</th><th>Not</th></tr></thead>
+      <tbody>
+        <tr><td>Temel UFFD (MISSING fault)</td><td>4.3</td><td>Anonim bellek</td></tr>
+        <tr><td>File-backed UFFD</td><td>4.11</td><td>tmpfs, shmem</td></tr>
+        <tr><td>Write-protect modu</td><td>5.7</td><td>UFFDIO_WRITEPROTECT</td></tr>
+        <tr><td>Minor fault modu</td><td>5.13</td><td>hugetlb; 5.14 shmem</td></tr>
+        <tr><td>UFFD_FEATURE_THREAD_ID</td><td>5.14</td><td>Hangi thread fault ettiği</td></tr>
+        <tr><td>UFFD_FEATURE_WP_HUGETLBFS</td><td>5.19</td><td>Hugetlbfs write-protect</td></tr>
+        <tr><td>UFFD_FEATURE_WP_UNPOPULATED</td><td>6.4</td><td>Boş sayfalar da WP olabilir</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> userfaultfd API — userfaultfd(), UFFDIO_API, UFFDIO_REGISTER</h2>
+  <p class="section-lead">userfaultfd API üç temel adımdan oluşur: fd oluşturma, API anlaşması ve izlenecek bellek bölgelerini kaydetme. Kayıt sonrasında o bölgeye yapılan hatalar fd üzerinden kullanıcı alanına iletilir.</p>
+
+  <h3>Kurulum: userfaultfd() sistem çağrısı</h3>
+
+<pre><code>#include &lt;linux/userfaultfd.h&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;string.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;pthread.h&gt;
+#include &lt;errno.h&gt;
+
+/* userfaultfd() wrapper (bazı libc'lerde eksik) */
+static int userfaultfd_open(int flags)
+{
+    /* Kernel 5.11+: /dev/userfaultfd veya UFFD_USER_MODE_ONLY flag */
+    int fd = (int)syscall(SYS_userfaultfd, flags);
+    if (fd &lt; 0 &amp;&amp; errno == ENOSYS) {
+        /* /dev/userfaultfd ile dene (kernel 5.11+) */
+        fd = open("/dev/userfaultfd", O_RDWR | O_CLOEXEC);
+    }
+    return fd;
+}
+
+int setup_uffd(void)
+{
+    int uffd;
+
+    /* O_NONBLOCK: read() bloklamaz — poll/epoll ile kullanılabilir */
+    /* O_CLOEXEC: fork sonrası child'da fd kapanır */
+    uffd = userfaultfd_open(O_CLOEXEC | O_NONBLOCK);
+    if (uffd &lt; 0) {
+        perror("userfaultfd");
+        return -1;
+    }
+    return uffd;
+}
+</code></pre>
+
+  <h3>UFFDIO_API: API anlaşması ve özellik müzakeresi</h3>
+
+<pre><code>int negotiate_uffd_api(int uffd, uint64_t *features_out)
+{
+    struct uffdio_api uffdio_api = {
+        .api = UFFD_API,  /* sabit: 0xAA */
+        /* İstenen özellikler: */
+        .features = UFFD_FEATURE_PAGEFAULT_FLAG_WP   /* write-protect desteği */
+                  | UFFD_FEATURE_MISSING_SHMEM        /* shmem missing fault */
+                  | UFFD_FEATURE_MISSING_HUGETLBFS    /* hugetlb missing fault */
+                  | UFFD_FEATURE_THREAD_ID,           /* fault eden thread TID */
+    };
+
+    if (ioctl(uffd, UFFDIO_API, &amp;uffdio_api) &lt; 0) {
+        perror("UFFDIO_API");
+        return -1;
+    }
+
+    /* Kernel desteklediği özellikleri geri yazar */
+    printf("UFFD API versiyonu: 0x%llx\n", uffdio_api.api);
+    printf("Desteklenen özellikler: 0x%llx\n", uffdio_api.features);
+
+    if (features_out)
+        *features_out = uffdio_api.features;
+
+    return 0;
+}
+</code></pre>
+
+  <h3>UFFDIO_REGISTER: bellek bölgesi kaydetme</h3>
+
+<pre><code>int register_memory_region(int uffd, void *addr, size_t len,
+                            bool write_protect, bool minor_mode)
+{
+    struct uffdio_register reg = {
+        .range = {
+            .start = (uint64_t)addr,
+            .len   = len,
+        },
+        /* Hangi hata türleri yakalanacak? */
+        .mode  = UFFDIO_REGISTER_MODE_MISSING,  /* sayfa yok hatası */
+    };
+
+    if (write_protect)
+        reg.mode |= UFFDIO_REGISTER_MODE_WP;    /* yazma koruması ihlali */
+    if (minor_mode)
+        reg.mode |= UFFDIO_REGISTER_MODE_MINOR; /* minor fault (5.13+) */
+
+    if (ioctl(uffd, UFFDIO_REGISTER, &amp;reg) &lt; 0) {
+        perror("UFFDIO_REGISTER");
+        return -1;
+    }
+
+    /* reg.ioctls: hangi ioctl komutlarının desteklendiği */
+    printf("Desteklenen ioctls: 0x%llx\n", reg.ioctls);
+    return 0;
+}
+
+/* Kaydı iptal et */
+int unregister_region(int uffd, void *addr, size_t len)
+{
+    struct uffdio_range range = {
+        .start = (uint64_t)addr,
+        .len   = len,
+    };
+    return ioctl(uffd, UFFDIO_UNREGISTER, &amp;range);
+}
+</code></pre>
+
+  <h3>İzleme modu özeti</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Mod</th><th>Flag</th><th>Tetikleyici</th><th>Yanıt ioctl</th></tr></thead>
+      <tbody>
+        <tr><td>MISSING</td><td>UFFDIO_REGISTER_MODE_MISSING</td><td>Fiziksel sayfa olmayan adrese erişim</td><td>UFFDIO_COPY, UFFDIO_ZEROPAGE</td></tr>
+        <tr><td>WP (write-protect)</td><td>UFFDIO_REGISTER_MODE_WP</td><td>Write-protected sayfaya yazma</td><td>UFFDIO_WRITEPROTECT (kaldır)</td></tr>
+        <tr><td>MINOR</td><td>UFFDIO_REGISTER_MODE_MINOR</td><td>Sayfa var ama tlb map yok (shared mem)</td><td>UFFDIO_CONTINUE</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Sayfa hatası yakalama — uffd_msg okuma ve fault address</h2>
+  <p class="section-lead">Kayıtlı bölgede sayfa hatası oluştuğunda kernel, fault eden thread'i dondurur ve userfaultfd fd'ye bir mesaj yazar. Handler thread bu mesajı okuyarak hangi adresin ne tür bir hata ürettiğini öğrenir.</p>
+
+  <h3>uffd_msg yapısı</h3>
+
+<pre><code>/* linux/userfaultfd.h'dan */
+struct uffd_msg {
+    __u8  event;          /* UFFD_EVENT_PAGEFAULT, UFFD_EVENT_FORK, vb. */
+    __u8  reserved1;
+    __u16 reserved2;
+    __u32 reserved3;
+    union {
+        struct {
+            __u64 flags;   /* UFFD_PAGEFAULT_FLAG_WRITE, UFFD_PAGEFAULT_FLAG_WP */
+            __u64 address; /* fault eden sanal adres (sayfa hizalı) */
+            union {
+                __u32 ptid; /* fault eden thread TID (THREAD_ID özelliği varsa) */
+            } feat;
+        } pagefault;
+        struct {
+            __u32 ufd; /* child'ın uffd fd'si (fork event'te) */
+        } fork;
+        struct {
+            __u64 from;
+            __u64 to;
+            __u64 len;
+        } remap;
+        /* ... */
+    } arg;
+};
+</code></pre>
+
+  <h3>Handler thread — temel yapı</h3>
+
+<pre><code>struct uffd_handler_ctx {
+    int    uffd;
+    void  *base_addr;    /* izlenen bölgenin başı */
+    size_t region_len;
+    /* ... uygulama bağlamı */
+};
+
+static void *uffd_handler_thread(void *arg)
+{
+    struct uffd_handler_ctx *ctx = arg;
+    int uffd = ctx-&gt;uffd;
+    struct pollfd pfd = { .fd = uffd, .events = POLLIN };
+
+    while (1) {
+        /* Sayfa hatası gelene kadar bekle */
+        int ret = poll(&amp;pfd, 1, -1 /* sonsuz */);
+        if (ret &lt; 0) {
+            if (errno == EINTR) continue;
+            perror("poll");
+            break;
+        }
+
+        /* Mesajı oku */
+        struct uffd_msg msg;
+        ssize_t nread = read(uffd, &amp;msg, sizeof(msg));
+        if (nread != sizeof(msg)) {
+            if (nread &lt; 0 &amp;&amp; errno == EAGAIN) continue;
+            perror("read uffd_msg");
+            break;
+        }
+
+        /* Event türüne göre işle */
+        switch (msg.event) {
+        case UFFD_EVENT_PAGEFAULT:
+            handle_pagefault(ctx, &amp;msg);
+            break;
+
+        case UFFD_EVENT_FORK:
+            /* fork() sonrası child için yeni uffd */
+            handle_fork_event(ctx, msg.arg.fork.ufd);
+            break;
+
+        case UFFD_EVENT_REMAP:
+            /* mremap sonrası adres değişimi */
+            handle_remap_event(ctx, &amp;msg.arg.remap);
+            break;
+
+        case UFFD_EVENT_REMOVE:
+            /* MADV_DONTNEED veya MADV_FREE */
+            break;
+
+        case UFFD_EVENT_UNMAP:
+            /* munmap */
+            break;
+        }
+    }
+    return NULL;
+}
+</code></pre>
+
+  <h3>Pagefault mesajını ayrıştırma</h3>
+
+<pre><code>static void handle_pagefault(struct uffd_handler_ctx *ctx,
+                               const struct uffd_msg *msg)
+{
+    uint64_t fault_addr  = msg-&gt;arg.pagefault.address;
+    uint64_t fault_flags = msg-&gt;arg.pagefault.flags;
+    uint32_t fault_tid   = msg-&gt;arg.pagefault.feat.ptid;
+
+    /* Sayfa hizalı adres */
+    uint64_t page_addr = fault_addr &amp; ~(PAGE_SIZE - 1);
+
+    /* Hata türünü belirle */
+    bool is_write    = !!(fault_flags &amp; UFFD_PAGEFAULT_FLAG_WRITE);
+    bool is_wp_fault = !!(fault_flags &amp; UFFD_PAGEFAULT_FLAG_WP);
+    bool is_minor    = !!(fault_flags &amp; UFFD_PAGEFAULT_FLAG_MINOR);
+
+    printf("Sayfa hatası: addr=0x%lx write=%d wp=%d minor=%d tid=%u\n",
+           fault_addr, is_write, is_wp_fault, is_minor, fault_tid);
+
+    /* Hangi sayfanın gerektiğini hesapla */
+    size_t page_offset = page_addr - (uint64_t)ctx-&gt;base_addr;
+    size_t page_index  = page_offset / PAGE_SIZE;
+
+    if (is_wp_fault) {
+        /* Yazma koruması: sayfayı yazılabilir yap */
+        handle_wp_fault(ctx, page_addr);
+    } else if (is_minor) {
+        /* Minor fault: sayfa var, harita yok */
+        handle_minor_fault(ctx, page_addr);
+    } else {
+        /* Missing fault: sayfayı sağla */
+        provide_page(ctx, page_addr, page_index, is_write);
+    }
+}
+</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Hata yanıtları — UFFDIO_COPY, UFFDIO_ZEROPAGE, UFFDIO_CONTINUE</h2>
+  <p class="section-lead">Handler, sayfa hatasını aldıktan sonra üç yöntemden biriyle yanıt vermelidir: başka bir bellekten kopyalama, sıfır sayfa sağlama veya mevcut sayfanın haritasını oluşturma. Yanıt gelene kadar fault eden thread bloklanmış kalır.</p>
+
+  <h3>UFFDIO_COPY — bellekten sayfa kopyalama</h3>
+
+<pre><code>static int provide_page_copy(int uffd, void *dst_addr,
+                              const void *src_page, int write_protect)
+{
+    struct uffdio_copy copy = {
+        .dst  = (uint64_t)dst_addr,  /* hata eden sayfa adresi (hizalı) */
+        .src  = (uint64_t)src_page,  /* kopyalanacak kaynak sayfa */
+        .len  = PAGE_SIZE,
+        .mode = write_protect ? UFFDIO_COPY_MODE_WP : 0,
+        /* UFFDIO_COPY_MODE_WP: kopyalandıktan sonra sayfa write-protected olur */
+        /* UFFDIO_COPY_MODE_DONTWAKE: fault eden thread'i uyandırma (batch için) */
+    };
+
+    if (ioctl(uffd, UFFDIO_COPY, &amp;copy) &lt; 0) {
+        if (errno == EEXIST) {
+            /* Başka bir thread zaten bu sayfayı sağladı — yarış durumu */
+            return 0;
+        }
+        perror("UFFDIO_COPY");
+        return -1;
+    }
+
+    /* copy.copy: gerçekte kopyalanan byte sayısı */
+    return 0;
+}
+</code></pre>
+
+  <h3>UFFDIO_ZEROPAGE — sıfır sayfa sağlama</h3>
+
+<pre><code>static int provide_zero_page(int uffd, void *addr)
+{
+    struct uffdio_zeropage zp = {
+        .range = {
+            .start = (uint64_t)addr,
+            .len   = PAGE_SIZE,
+        },
+        .mode = 0,
+        /* UFFDIO_ZEROPAGE_MODE_DONTWAKE: toplu işlem için */
+    };
+
+    if (ioctl(uffd, UFFDIO_ZEROPAGE, &amp;zp) &lt; 0) {
+        if (errno == EEXIST) return 0;  /* zaten sağlanmış */
+        perror("UFFDIO_ZEROPAGE");
+        return -1;
+    }
+    return 0;
+}
+</code></pre>
+
+  <h3>UFFDIO_CONTINUE — minor fault yanıtı</h3>
+
+<pre><code>/* Minor fault: sayfa fiziksel bellekte var (paylaşımlı bellek gibi)
+   ama bu süreç için sayfa tablosuna henüz eklenmemiş.
+   UFFDIO_CONTINUE mevcut sayfayı sayfa tablosuna ekler. */
+static int continue_page_mapping(int uffd, void *addr)
+{
+    struct uffdio_continue cont = {
+        .range = {
+            .start = (uint64_t)addr,
+            .len   = PAGE_SIZE,
+        },
+        .mode = 0,
+        /* UFFDIO_CONTINUE_MODE_WP: ekledikten sonra write-protected yap */
+        /* UFFDIO_CONTINUE_MODE_DONTWAKE: toplu işlem için */
+    };
+
+    if (ioctl(uffd, UFFDIO_CONTINUE, &amp;cont) &lt; 0) {
+        if (errno == EEXIST) return 0;
+        perror("UFFDIO_CONTINUE");
+        return -1;
+    }
+    return 0;
+}
+</code></pre>
+
+  <h3>DONTWAKE ve toplu uyandırma</h3>
+
+<pre><code>/* Birden fazla sayfa sağla — sonuncusunda uyandır */
+void provide_range_batched(int uffd, void *base, size_t npages,
+                            void *src_pages)
+{
+    for (size_t i = 0; i &lt; npages; i++) {
+        void *dst = (char *)base + i * PAGE_SIZE;
+        void *src = (char *)src_pages + i * PAGE_SIZE;
+        bool last = (i == npages - 1);
+
+        struct uffdio_copy copy = {
+            .dst  = (uint64_t)dst,
+            .src  = (uint64_t)src,
+            .len  = PAGE_SIZE,
+            /* Son sayfa değilse uyandırma */
+            .mode = last ? 0 : UFFDIO_COPY_MODE_DONTWAKE,
+        };
+        ioctl(uffd, UFFDIO_COPY, &amp;copy);
+    }
+
+    /* DONTWAKE kullandıysak explicit wake gerekir */
+    /* (son COPY zaten wake etti; aşağıdaki sadece örnek) */
+}
+
+/* Manuel uyandırma */
+static int wake_thread(int uffd, void *addr, size_t len)
+{
+    struct uffdio_range range = {
+        .start = (uint64_t)addr,
+        .len   = len,
+    };
+    return ioctl(uffd, UFFDIO_WAKE, &amp;range);
+}
+</code></pre>
+
+  <h3>Yanıt yanıt senaryoları özeti</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Senaryo</th><th>Kullanılan ioctl</th><th>Kaynak</th></tr></thead>
+      <tbody>
+        <tr><td>İlk erişim — sıfır bellek isteniyor</td><td>UFFDIO_ZEROPAGE</td><td>Kernel sıfır sayfa sağlar</td></tr>
+        <tr><td>Live migration — uzaktan sayfa al</td><td>UFFDIO_COPY</td><td>Ağdan alınan veri</td></tr>
+        <tr><td>Checkpoint restore — diskten oku</td><td>UFFDIO_COPY</td><td>Dosyadan okunan sayfa</td></tr>
+        <tr><td>Shared memory minor fault</td><td>UFFDIO_CONTINUE</td><td>Mevcut fiziksel sayfa</td></tr>
+        <tr><td>Write-protect ihlali sonrası</td><td>UFFDIO_WRITEPROTECT (kaldır)</td><td>Korumayı kaldır</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Write-protect modu — CoW izleme</h2>
+  <p class="section-lead">Write-protect modu, fiziksel sayfa varken üzerine yazılmasını engeller ve yazma girişimini UFFD'e bildirir. Bu mekanizma, bir bellek bölgesinin hangi sayfalarının değiştirildiğini izlemek için ideal bir copy-on-write sağlayıcısı oluşturur.</p>
+
+  <h3>Write-protect kaydı</h3>
+
+<pre><code>/* Bellek bölgesini write-protect modunda kaydet */
+int register_wp_region(int uffd, void *addr, size_t len)
+{
+    struct uffdio_register reg = {
+        .range = { .start = (uint64_t)addr, .len = len },
+        .mode  = UFFDIO_REGISTER_MODE_MISSING
+               | UFFDIO_REGISTER_MODE_WP,
+    };
+    return ioctl(uffd, UFFDIO_REGISTER, &amp;reg);
+}
+
+/* Mevcut (dolu) sayfaları write-protect et */
+int writeprotect_range(int uffd, void *addr, size_t len)
+{
+    struct uffdio_writeprotect wp = {
+        .range = { .start = (uint64_t)addr, .len = len },
+        .mode  = UFFDIO_WRITEPROTECT_MODE_WP,  /* korumayı etkinleştir */
+    };
+    return ioctl(uffd, UFFDIO_WRITEPROTECT, &amp;wp);
+}
+
+/* Write-protect'i kaldır (yazma hatasına yanıt olarak) */
+int remove_writeprotect(int uffd, void *addr, size_t len)
+{
+    struct uffdio_writeprotect wp = {
+        .range = { .start = (uint64_t)addr, .len = len },
+        .mode  = 0,  /* 0 = koru kaldır; DONTWAKE olmadan thread uyandırılır */
+    };
+    return ioctl(uffd, UFFDIO_WRITEPROTECT, &amp;wp);
+}
+</code></pre>
+
+  <h3>Dirty page izleme — GC örüntüsü</h3>
+
+<pre><code>/* Tüm belleği WP ile işaretle → yalnızca değişenleri bul */
+#define HEAP_SIZE  (64 * 1024 * 1024)  /* 64 MB yığın */
+
+struct heap_tracker {
+    int      uffd;
+    void    *heap;
+    uint8_t *dirty_bitmap;   /* her bit bir sayfa */
+    size_t   npages;
+    pthread_mutex_t lock;
+};
+
+void *heap_tracker_create(size_t size)
+{
+    struct heap_tracker *ht = calloc(1, sizeof(*ht));
+    ht-&gt;npages       = size / PAGE_SIZE;
+    ht-&gt;dirty_bitmap = calloc(1, (ht-&gt;npages + 7) / 8);
+    ht-&gt;heap         = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                            MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    ht-&gt;uffd         = userfaultfd_open(O_CLOEXEC | O_NONBLOCK);
+
+    struct uffdio_api api = { .api = UFFD_API,
+                               .features = UFFD_FEATURE_PAGEFAULT_FLAG_WP };
+    ioctl(ht-&gt;uffd, UFFDIO_API, &amp;api);
+    register_wp_region(ht-&gt;uffd, ht-&gt;heap, size);
+
+    /* Başlangıçta tüm sayfalar WP değil — ilk erişimde missing fault gelir */
+    /* UFFDIO_COPY ile sağla + WP flag = sağlandıktan hemen write-protected */
+    return ht;
+}
+
+/* Handler'da WP fault geldiğinde: */
+static void handle_wp_fault_gc(struct heap_tracker *ht,
+                                 uint64_t fault_addr)
+{
+    uint64_t page_addr = fault_addr &amp; ~(PAGE_SIZE - 1);
+    size_t   idx       = (page_addr - (uint64_t)ht-&gt;heap) / PAGE_SIZE;
+
+    pthread_mutex_lock(&amp;ht-&gt;lock);
+
+    /* Dirty bitmap'de işaretle */
+    ht-&gt;dirty_bitmap[idx / 8] |= (1 &lt;&lt; (idx % 8));
+
+    pthread_mutex_unlock(&amp;ht-&gt;lock);
+
+    /* Korumayı kaldır — yazma işlemi devam edebilir */
+    remove_writeprotect(ht-&gt;uffd, (void *)page_addr, PAGE_SIZE);
+}
+
+/* GC döngüsünde: dirty sayfaları tara, temizle, WP'yi yeniden etkinleştir */
+void gc_scan_and_reset(struct heap_tracker *ht)
+{
+    for (size_t i = 0; i &lt; ht-&gt;npages; i++) {
+        if (ht-&gt;dirty_bitmap[i / 8] &amp; (1 &lt;&lt; (i % 8))) {
+            void *page = (char *)ht-&gt;heap + i * PAGE_SIZE;
+            scan_page_for_gc(page);
+            ht-&gt;dirty_bitmap[i / 8] &amp;= ~(1 &lt;&lt; (i % 8));
+            writeprotect_range(ht-&gt;uffd, page, PAGE_SIZE);
+        }
+    }
+}
+</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Minor fault modu — paylaşımlı bellek ve hugetlb</h2>
+  <p class="section-lead">Minor fault modu, fiziksel sayfanın bellekte var olduğu ancak bu sayfanın o sürecin sayfa tablosuna henüz eklenmediği durumları yakalar. Paylaşımlı bellek (shmem, hugetlbfs) üzerine kurulan live migration ve CRIU senaryolarında kritik öneme sahiptir.</p>
+
+  <h3>Minor fault senaryosu</h3>
+
+  <div class="flow">
+    <pre>Post-copy live migration örneği:
+  1. Kaynak VM çalışıyor; bellek uzaktaki makineye kopyalanıyor
+  2. Hedef VM başlatıldı; tüm sayfalar shared memory'de "var" (sıfır veya eski değer)
+  3. Hedef VM sayfaya erişiyor → sayfa fiziksel bellekte var ama sayfa tablosuna eklenmemiş
+  4. MINOR fault → UFFD handler çağrılır
+  5. Handler: bu sayfa güncel mi? Hayır → uzak makineden al, COPY ile güncelle
+                                 Evet → UFFDIO_CONTINUE ile mevcut sayfayı eşle</pre>
+  </div>
+
+  <h3>Minor fault kaydı ve yanıtı</h3>
+
+<pre><code>/* tmpfs / shmem üzerinde minor fault */
+int fd = memfd_create("shared_heap", MFD_CLOEXEC);
+ftruncate(fd, REGION_SIZE);
+
+void *addr = mmap(NULL, REGION_SIZE, PROT_READ | PROT_WRITE,
+                  MAP_SHARED, fd, 0);
+
+/* Minor mode kayıt (kernel 5.14+ shmem için) */
+struct uffdio_register reg = {
+    .range = { .start = (uint64_t)addr, .len = REGION_SIZE },
+    .mode  = UFFDIO_REGISTER_MODE_MINOR,
+};
+ioctl(uffd, UFFDIO_REGISTER, &amp;reg);
+
+/* Sayfayı önceden fiziksel belleğe yükle (punch-in) */
+void *fill_buf = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
+                       MAP_SHARED, fd, page_offset);
+memcpy(fill_buf, source_data, PAGE_SIZE);
+munmap(fill_buf, PAGE_SIZE);
+
+/* Handler'da minor fault geldiğinde:
+   - Sayfa güncellenmiş mi kontrol et
+   - Güncel değilse: UFFDIO_COPY ile yeni içerik yaz
+   - Güncel ise: UFFDIO_CONTINUE ile mevcut sayfayı eşle */
+static void handle_minor(int uffd, uint64_t fault_addr,
+                          bool page_is_current)
+{
+    uint64_t page_addr = fault_addr &amp; ~(PAGE_SIZE - 1);
+
+    if (!page_is_current) {
+        /* Güncel sayfayı sağla */
+        void *new_page = fetch_page_from_source(fault_addr);
+        struct uffdio_copy copy = {
+            .dst = page_addr,
+            .src = (uint64_t)new_page,
+            .len = PAGE_SIZE,
+        };
+        ioctl(uffd, UFFDIO_COPY, &amp;copy);
+        free(new_page);
+    } else {
+        /* Mevcut sayfa yeterli — sadece eşle */
+        struct uffdio_continue cont = {
+            .range = { .start = page_addr, .len = PAGE_SIZE },
+        };
+        ioctl(uffd, UFFDIO_CONTINUE, &amp;cont);
+    }
+}
+</code></pre>
+
+  <h3>Hugetlbfs minor fault</h3>
+  <p>Kernel 5.13'te hugetlbfs için minor fault desteği eklendi; tmpfs/shmem desteği 5.14'te geldi. Büyük sayfa (2 MB veya 1 GB) kullanan VM workload'larında page fault frekansı dramatik düşer; her page fault çözümü de daha büyük granülaritede gerçekleşir, bu da hem latency hem de throughput açısından avantaj sağlar.</p>
+
+<pre><code>/* 2 MB huge page ile minor fault */
+void *huge_addr = mmap(NULL, HUGE_SIZE, PROT_READ | PROT_WRITE,
+                        MAP_ANONYMOUS | MAP_HUGETLB | MAP_PRIVATE,
+                        -1, 0);
+
+struct uffdio_register reg = {
+    .range = { .start = (uint64_t)huge_addr, .len = HUGE_SIZE },
+    .mode  = UFFDIO_REGISTER_MODE_MISSING
+           | UFFDIO_REGISTER_MODE_MINOR,  /* kernel 5.13+ */
+};
+ioctl(uffd, UFFDIO_REGISTER, &amp;reg);
+
+/* UFFDIO_COPY ile huge page sağlama: len = 2 MB */
+struct uffdio_copy copy = {
+    .dst = page_addr,
+    .src = (uint64_t)src_huge_page,
+    .len = HPAGE_PMD_SIZE,  /* 2 * 1024 * 1024 */
+};
+ioctl(uffd, UFFDIO_COPY, &amp;copy);
+</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Bellek şişirmesi (balloon) — MADV_DONTNEED kombinasyonu</h2>
+  <p class="section-lead">Bellek balonu (balloon driver), sanallaştırma ortamlarında hypervisor'ın VM'den fiziksel bellek geri almasını sağlar. userfaultfd bu mekanizmanın kullanıcı alanı uygulamasında temel rol oynar.</p>
+
+  <h3>Klasik balloon driver vs userfaultfd balloon</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>Kernel balloon driver</th><th>userfaultfd balloon</th></tr></thead>
+      <tbody>
+        <tr><td>Kernel modülü gereksinimi</td><td>Evet (virtio-balloon vb.)</td><td>Hayır</td></tr>
+        <tr><td>Granülarite</td><td>Sayfa (4 KB)</td><td>Sayfa (4 KB) veya hugetlb</td></tr>
+        <tr><td>Uygulama farkındalığı</td><td>Hayır — uygulama bilmez</td><td>Evet — UFFD ile erişim anında tespit</td></tr>
+        <tr><td>Geri alma hızı</td><td>Hızlı (kernel doğrudan)</td><td>Biraz daha yavaş (user round-trip)</td></tr>
+        <tr><td>Esneklik</td><td>Düşük</td><td>Yüksek — politika user-space'de</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>userfaultfd balloon uygulaması</h3>
+
+<pre><code>struct balloon_ctx {
+    int    uffd;
+    void  *balloon_region;  /* "şişirilen" bellek bölgesi */
+    size_t balloon_size;
+    bool   inflated;        /* şu an şişirilmiş mi? */
+};
+
+/* Bölgeyi balloon moduna al */
+int balloon_inflate(struct balloon_ctx *ctx, size_t size)
+{
+    ctx-&gt;balloon_region = mmap(NULL, size,
+                                PROT_READ | PROT_WRITE,
+                                MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    ctx-&gt;balloon_size = size;
+
+    /* UFFD kaydet */
+    register_memory_region(ctx-&gt;uffd, ctx-&gt;balloon_region,
+                            size, false, false);
+
+    /* Fiziksel sayfaları serbest bırak — hypervisor'a iade */
+    madvise(ctx-&gt;balloon_region, size, MADV_DONTNEED);
+    /* Artık sayfalar erişilirse MISSING fault üretir */
+
+    ctx-&gt;inflated = true;
+    return 0;
+}
+
+/* Balloon şişirilmiş bölgeye erişim geldiğinde — handler */
+static void handle_balloon_fault(struct balloon_ctx *ctx,
+                                  uint64_t fault_addr)
+{
+    uint64_t page_addr = fault_addr &amp; ~(PAGE_SIZE - 1);
+
+    if (ctx-&gt;inflated) {
+        /* VM belleğe ihtiyaç duydu — balloon'u söndür */
+        balloon_deflate_page(ctx, page_addr);
+    }
+
+    /* Sıfır sayfa sağla */
+    provide_zero_page(ctx-&gt;uffd, (void *)page_addr);
+}
+
+/* Balloon söndürme: bellek geri alınıyor */
+int balloon_deflate(struct balloon_ctx *ctx)
+{
+    ctx-&gt;inflated = false;
+
+    /* Bölgeyi UFFD'den çıkar */
+    unregister_region(ctx-&gt;uffd, ctx-&gt;balloon_region,
+                       ctx-&gt;balloon_size);
+
+    /* Belleği tekrar kullanılabilir kıl */
+    /* (Sayfalar zaten DONTNEED ile geri alındı;
+        yeni erişimlerde kernel sıfır sayfa ayırır) */
+    munmap(ctx-&gt;balloon_region, ctx-&gt;balloon_size);
+    ctx-&gt;balloon_region = NULL;
+    return 0;
+}
+</code></pre>
+
+  <h3>MADV_DONTNEED ile sayfa geri alma akışı</h3>
+
+  <div class="flow">
+    <pre>1. mmap() ile büyük bölge ayır (anonim, özel)
+2. Kullanıcı uygulama sayfaları kullanmaya başlar → fiziksel sayfa atanır
+3. balloon_inflate() çağrılır → MADV_DONTNEED: fiziksel sayfalar kernel'a iade edilir
+   → VM bellek footprint küçülür → hypervisor fiziksel RAM'i geri alır
+4. Uygulama balloon bölgesine erişirse → MISSING fault → UFFD handler
+5. Handler: sıfır sayfa sağlar + gerekirse notify hypervisor
+6. balloon_deflate(): balloon kaldırılır → bölge normal bellek olarak kullanılır</pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> CRIU ve userfaultfd — checkpoint/restore entegrasyonu</h2>
+  <p class="section-lead">CRIU (Checkpoint/Restore In Userspace), çalışan süreçleri dondurarak tüm durumlarını diske yazar ve sonra geri yükler. userfaultfd ile lazy restore: restore edilen süreç hemen çalışmaya başlar; bellek sayfaları sadece erişildikçe yüklenir.</p>
+
+  <h3>CRIU lazy restore mimarisi</h3>
+
+  <div class="flow">
+    <pre>Checkpoint:
+  1. CRIU süreci dondurur (SIGSTOP veya ptrace)
+  2. /proc/PID/maps → bellek haritası
+  3. Her bellek bölgesi için sayfaları oku ve dosyaya yaz
+  4. FD'ler, register'lar, soketler, timer'lar... hepsi diske
+
+Lazy Restore:
+  1. CRIU yeni süreç oluşturur (exec + personality)
+  2. Bellek bölgelerini mmap ile oluşturur (içerik yok)
+  3. userfaultfd ile tüm bölgeleri kaydet
+  4. LAZY daemon (lzd): uffd handler thread + CRIU server iletişimi
+  5. Süreç çalışmaya başlar
+  6. Sayfaya erişildiğinde: MISSING fault → lzd → sayfayı diskten oku → UFFDIO_COPY
+  7. Süreç devam eder (sadece gerçekten erişilen sayfalar yüklendi)</pre>
+  </div>
+
+  <h3>Lazy restore handler implementasyonu</h3>
+
+<pre><code>/* CRIU lazy daemon: sayfa sunucusuyla iletişim */
+struct lazy_pages_ctx {
+    int    uffd;
+    int    page_server_fd;  /* CRIU page server bağlantısı */
+    void  *restore_base;
+    size_t restore_size;
+};
+
+static void *lazy_handler_thread(void *arg)
+{
+    struct lazy_pages_ctx *ctx = arg;
+    struct pollfd pfds[2] = {
+        { .fd = ctx-&gt;uffd,            .events = POLLIN },
+        { .fd = ctx-&gt;page_server_fd,  .events = POLLIN },
+    };
+
+    while (1) {
+        poll(pfds, 2, -1);
+
+        if (pfds[0].revents &amp; POLLIN) {
+            /* Sayfa hatası */
+            struct uffd_msg msg;
+            read(ctx-&gt;uffd, &amp;msg, sizeof(msg));
+
+            if (msg.event == UFFD_EVENT_PAGEFAULT) {
+                uint64_t fault_addr = msg.arg.pagefault.address;
+                uint64_t page_addr  = fault_addr &amp; ~(PAGE_SIZE - 1);
+
+                /* Page server'dan sayfayı iste */
+                request_page(ctx-&gt;page_server_fd, page_addr);
+
+                /* Sayfayı al */
+                char page_buf[PAGE_SIZE];
+                recv_page(ctx-&gt;page_server_fd, page_buf);
+
+                /* Sürece sağla */
+                struct uffdio_copy copy = {
+                    .dst = page_addr,
+                    .src = (uint64_t)page_buf,
+                    .len = PAGE_SIZE,
+                };
+                ioctl(ctx-&gt;uffd, UFFDIO_COPY, &amp;copy);
+            }
+        }
+
+        if (pfds[1].revents &amp; POLLIN) {
+            /* Page server'dan proaktif push: ön yükleme */
+            prefetch_page(ctx);
+        }
+    }
+    return NULL;
+}
+</code></pre>
+
+  <h3>Post-copy live migration ile UFFD</h3>
+
+<pre><code>/* Post-copy: VM hedefte başladı, bellek hâlâ kaynakta */
+struct postcopy_ctx {
+    int     uffd;
+    int     remote_fd;   /* kaynak makinaya bağlantı */
+    void   *vm_memory;
+    size_t  vm_mem_size;
+    /* Hangi sayfaların transferi tamamlandı */
+    uint8_t *page_bitmap;
+};
+
+static void handle_postcopy_fault(struct postcopy_ctx *ctx,
+                                    uint64_t fault_addr)
+{
+    uint64_t page_addr  = fault_addr &amp; ~(PAGE_SIZE - 1);
+    size_t   page_index = (page_addr - (uint64_t)ctx-&gt;vm_memory)
+                        / PAGE_SIZE;
+
+    if (page_bitmap_test(ctx-&gt;page_bitmap, page_index)) {
+        /* Sayfa zaten transfer edildi ama UFFD hâlâ aktif
+           (arka planda transfer sürerken ikinci erişim) */
+        struct uffdio_continue cont = {
+            .range = { .start = page_addr, .len = PAGE_SIZE },
+        };
+        ioctl(ctx-&gt;uffd, UFFDIO_CONTINUE, &amp;cont);
+        return;
+    }
+
+    /* Sayfayı uzak makineden iste — yüksek öncelikli */
+    char page_buf[PAGE_SIZE];
+    request_urgent_page(ctx-&gt;remote_fd, page_addr, page_buf);
+
+    struct uffdio_copy copy = {
+        .dst = page_addr,
+        .src = (uint64_t)page_buf,
+        .len = PAGE_SIZE,
+    };
+    ioctl(ctx-&gt;uffd, UFFDIO_COPY, &amp;copy);
+    page_bitmap_set(ctx-&gt;page_bitmap, page_index);
+}
+</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Hata ayıklama ve güvenlik kısıtları</h2>
+  <p class="section-lead">userfaultfd, güçlü bir mekanizma olmakla birlikte güvenlik açısından dikkatli kullanılmasını gerektirir. Kernel, kullanıcı programların kötüye kullanımını önlemek için çeşitli kısıtlamalar uygular; hata ayıklama için /proc, strace ve yardımcı araçlar kullanılır.</p>
+
+  <h3>Güvenlik kısıtları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">unprivileged_userfaultfd</span><span class="desc">/proc/sys/vm/unprivileged_userfaultfd — 0 ise yalnızca root/CAP_SYS_PTRACE userfaultfd açabilir; 1 ise tüm kullanıcılara açık. Gömülü üretim sistemlerinde 0 önerilir</span></div>
+    <div class="param"><span class="name">UFFD_USER_MODE_ONLY</span><span class="desc">userfaultfd() flag'i — kernel-space sayfa hatalarını yakalamasını engeller; yalnızca user-space kökenli hataları bildirir. Güvenlik için önerilir</span></div>
+    <div class="param"><span class="name">Kernel sayfa hatası reddi</span><span class="desc">copy_from_user() gibi kernel fonksiyonları kayıtlı UFFD bölgesine erişirse kernel hatayı askıya almak yerine EFAULT döner — servis kesintisi riski</span></div>
+    <div class="param"><span class="name">Handler timeout'u</span><span class="desc">Handler yanıt vermezse fault eden thread sonsuza dek bloklanır. Handler'da zaman aşımı mekanizması ve fallback mutlaka olmalıdır</span></div>
+  </div>
+
+  <h3>Güvenli userfaultfd açma</h3>
+
+<pre><code>/* Güvenli açma: kernel-mode fault'ları reddet */
+int safe_userfaultfd_open(void)
+{
+    int fd;
+
+    /* Kernel 5.11+: UFFD_USER_MODE_ONLY ile sadece user-space hataları */
+    fd = (int)syscall(SYS_userfaultfd,
+                      O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
+    if (fd &gt;= 0) return fd;
+
+    /* Eski kernel: UFFD_USER_MODE_ONLY yok — normal aç */
+    if (errno == EINVAL)
+        fd = (int)syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+
+    /* /dev/userfaultfd (kernel 5.11+ alternatif) */
+    if (fd &lt; 0)
+        fd = open("/dev/userfaultfd", O_RDWR | O_CLOEXEC | O_NONBLOCK);
+
+    return fd;
+}
+
+/* unprivileged_userfaultfd değerini kontrol et */
+static int check_uffd_privilege(void)
+{
+    FILE *f = fopen("/proc/sys/vm/unprivileged_userfaultfd", "r");
+    if (!f) return -1;
+    int val;
+    fscanf(f, "%d", &amp;val);
+    fclose(f);
+    if (val == 0 &amp;&amp; geteuid() != 0) {
+        fprintf(stderr, "userfaultfd: root veya CAP_SYS_PTRACE gerekli\n");
+        fprintf(stderr, "echo 1 | sudo tee /proc/sys/vm/unprivileged_userfaultfd\n");
+        return -1;
+    }
+    return 0;
+}
+</code></pre>
+
+  <h3>Hata ayıklama araçları ve teknikleri</h3>
+
+<pre><code>/* /proc/PID/smaps ile UFFD bölgelerini görüntüle */
+/* sudo cat /proc/PID/smaps | grep -A 20 "VmFlags.*uf" */
+
+/* strace ile UFFD sistem çağrılarını izle */
+/* strace -e userfaultfd,ioctl,read,poll ./myprogram */
+
+/* perf ile sayfa hata istatistikleri */
+/* perf stat -e page-faults,minor-faults,major-faults ./myprogram */
+
+/* uffd bölgelerini listele */
+void dump_uffd_regions(void *addr, size_t size)
+{
+    FILE *maps = fopen("/proc/self/smaps", "r");
+    char line[256];
+    uintptr_t start, end;
+    char perms[8], dev[8];
+    uint64_t offset, inode;
+    char name[128] = "";
+
+    while (fgets(line, sizeof(line), maps)) {
+        if (sscanf(line, "%lx-%lx %7s %lx %7s %lu %127s",
+                   &amp;start, &amp;end, perms, &amp;offset,
+                   dev, &amp;inode, name) &gt;= 6) {
+            if (start == (uintptr_t)addr) {
+                printf("Bölge: %lx-%lx %s\n", start, end, perms);
+            }
+        }
+        /* VmFlags satırında "uf" = userfaultfd kayıtlı */
+        if (strstr(line, "VmFlags") &amp;&amp; strstr(line, "uf"))
+            printf("  UFFD kayıtlı: %s", line);
+    }
+    fclose(maps);
+}
+</code></pre>
+
+  <h3>Yaygın hatalar ve çözümleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Hata</th><th>Neden</th><th>Çözüm</th></tr></thead>
+      <tbody>
+        <tr><td>EPERM (userfaultfd)</td><td>unprivileged_userfaultfd=0 ve root değil</td><td>sysctl ayarla veya root çalıştır</td></tr>
+        <tr><td>EINVAL (UFFDIO_API)</td><td>Yanlış api versiyonu veya desteklenmeyen feature</td><td>features maskesini features &amp; desteklenen ile maskele</td></tr>
+        <tr><td>EEXIST (UFFDIO_COPY)</td><td>Başka thread aynı sayfayı sağladı</td><td>Yarış koşulu — hata değil, yok say</td></tr>
+        <tr><td>ENOENT (UFFDIO_COPY)</td><td>Adres UFFD bölgesinde kayıtlı değil</td><td>UFFDIO_REGISTER kontrolü</td></tr>
+        <tr><td>EINVAL (UFFDIO_REGISTER)</td><td>Adres sayfa hizalı değil veya len=0</td><td>Adres ve len'i PAGE_SIZE'a hizala</td></tr>
+        <tr><td>Thread sonsuza dek bloklanıyor</td><td>Handler çöktü veya yanıt vermedi</td><td>Handler'da watchdog thread; DONTWAKE + WAKE ile manuel kontrol</td></tr>
+        <tr><td>EFAULT (syscall)</td><td>Kayıtlı UFFD bölgesine kernel erişimi</td><td>UFFD_USER_MODE_ONLY kullan; kernel erişimli bölgeleri kaydetme</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Tam kurulum özeti</h3>
+
+<pre><code>/* Tam userfaultfd kurulum şablonu */
+int uffd_full_setup(void **region_out, size_t size)
+{
+    /* 1. Yetki kontrolü */
+    if (check_uffd_privilege() &lt; 0) return -1;
+
+    /* 2. userfaultfd aç */
+    int uffd = safe_userfaultfd_open();
+    if (uffd &lt; 0) return -1;
+
+    /* 3. API anlaşması */
+    uint64_t features;
+    if (negotiate_uffd_api(uffd, &amp;features) &lt; 0) goto err;
+
+    /* 4. Bellek bölgesi oluştur */
+    void *region = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                         MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (region == MAP_FAILED) goto err;
+
+    /* 5. Bölgeyi kaydet */
+    if (register_memory_region(uffd, region, size, false, false) &lt; 0)
+        goto err_mmap;
+
+    /* 6. Handler thread başlat */
+    struct uffd_handler_ctx *ctx = calloc(1, sizeof(*ctx));
+    ctx-&gt;uffd       = uffd;
+    ctx-&gt;base_addr  = region;
+    ctx-&gt;region_len = size;
+
+    pthread_t handler_tid;
+    pthread_create(&amp;handler_tid, NULL, uffd_handler_thread, ctx);
+    pthread_detach(handler_tid);
+
+    *region_out = region;
+    return uffd;
+
+err_mmap:
+    munmap(region, size);
+err:
+    close(uffd);
+    return -1;
+}
+</code></pre>
+
+</section>
+
+</main>

@@ -1,0 +1,830 @@
+---
+layout: tutorial
+title: "IMA/EVM — Linux Bütünlük Ölçüm Mimarisi"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>GÜVENLİK</span>
+    <span>2026</span>
+  </div>
+  <h1>IMA/EVM<br><em>Linux Bütünlük Ölçüm Mimarisi</em></h1>
+  <p class="subtitle">Dosya bütünlüğünü çalışma zamanında zorlayan IMA ve EVM alt sistemleri — hash politikası, imzalama, TPM entegrasyonu ve uzak tasdik.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">IMA/EVM neden var</a></li>
+    <li><a href="#s1">IMA mimarisi</a></li>
+    <li><a href="#s2">IMA politikası</a></li>
+    <li><a href="#s3">IMA appraisal</a></li>
+    <li><a href="#s4">EVM ve HMAC</a></li>
+    <li><a href="#s5">Kernel modül imzalama</a></li>
+    <li><a href="#s6">Yocto/Buildroot entegrasyonu</a></li>
+    <li><a href="#s7">Remote attestation ile IMA</a></li>
+    <li><a href="#s8">Hata ayıklama</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> IMA/EVM neden var</h2>
+  <p class="section-lead">Geleneksel dosya sistemi izinleri (DAC) ve hatta SELinux/AppArmor (MAC) bir dosyanın <em>içeriğinin</em> değişmediğini garanti etmez. IMA bu boşluğu kapatır.</p>
+
+  <h3>Tehdit modeli</h3>
+  <p>Bir saldırgan root erişimi olmadan bile bazı senaryolarda kritik ikili dosyaları veya konfigürasyon dosyalarını değiştirebilir:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Fiziksel erişim</span><span class="desc">JTAG/UART üzerinden flash yazımı, SD kart çıkararak rootfs değişikliği</span></div>
+    <div class="param"><span class="name">Yazılım güvenlik açığı</span><span class="desc">Arabellek taşması veya path traversal ile /etc/passwd veya /sbin/init üzerine yazma</span></div>
+    <div class="param"><span class="name">Tedarik zinciri</span><span class="desc">Üretim hattında cihaza yüklenen firmware'in beklenen firmware olmadığı durum</span></div>
+    <div class="param"><span class="name">Privileged kötü amaçlı yazılım</span><span class="desc">Cihazda çalışan ve sistem ikili dosyalarını değiştiren rootkit</span></div>
+  </div>
+
+  <h3>Boot-time vs runtime bütünlük</h3>
+
+  <div class="flow">
+    <pre>
+UEFI Secure Boot / U-Boot Verified Boot
+        │
+        ▼
+  Bootloader imzası doğrulanır
+        │
+        ▼
+  Kernel imzası doğrulanır
+        │
+        ▼
+  ┌─────────────────────────────────┐
+  │  IMA: çalışma zamanı ölçümü     │
+  │  - Her dosya erişiminde hash    │
+  │  - PCR extend → TPM             │
+  │  - Appraisal: politikaya göre   │
+  │    erişime izin ver / reddet    │
+  └─────────────────────────────────┘
+        │
+        ▼
+  EVM: extended meta-data bütünlüğü
+  (security.ima + diğer xattr'ların HMAC'i)</pre>
+  </div>
+
+  <h3>IMA/EVM hangi katmanda çalışır</h3>
+  <p>IMA, Linux Security Module (LSM) çerçevesi içinde <strong>integrity subsystem</strong> olarak uygulanır. Herhangi bir dosya açma/yürütme/mmap olayında tetiklenen hook'lar sayesinde ölçüm veya doğrulama gerçekleştirilir. Bu sayede kullanıcı alanı değişikliği gerektirmez.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Alt sistem</th><th>Sorumluluk</th><th>Kernel seçeneği</th></tr></thead>
+      <tbody>
+        <tr><td>IMA measurement</td><td>Her erişilen dosyanın SHA-256 hash'ini /sys/kernel/security/ima/ascii_runtime_measurements'a yazar</td><td>CONFIG_IMA</td></tr>
+        <tr><td>IMA appraisal</td><td>security.ima xattr ile saklanan referans hash'i karşılaştırır; eşleşmezse erişimi reddeder</td><td>CONFIG_IMA_APPRAISAL</td></tr>
+        <tr><td>IMA audit</td><td>Her ölçüm olayını audit alt sistemine iletir</td><td>CONFIG_IMA_AUDIT</td></tr>
+        <tr><td>EVM</td><td>security.ima ve diğer güvenlik xattr'larının HMAC veya asimetrik imzasını doğrular</td><td>CONFIG_EVM</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>IMA, çalışma zamanında dosya içeriği bütünlüğünü ölçer ve zorlayabilir</li>
+      <li>EVM, genişletilmiş xattr bütünlüğünü HMAC veya asimetrik imzayla korur</li>
+      <li>Secure Boot + IMA birlikte tam bir bütünlük zinciri oluşturur</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> IMA mimarisi</h2>
+  <p class="section-lead">IMA üç işlem modunda çalışır: measurement (ölçüm), appraisal (doğrulama) ve audit (denetim). Bu modlar birbirini dışlamaz; politika dosyasıyla kombinlenebilir.</p>
+
+  <h3>Measurement modu</h3>
+  <p>Her dosya erişiminde (exec, mmap, open) dosyanın SHA-256 hash'i hesaplanır ve ölçüm günlüğüne eklenir. Günlük, TPM PCR-10 değerine de extend edilir; böylece günlüğün geriye dönük olarak değiştirilemeyeceği TPM donanımıyla garanti altına alınır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Ölçüm günlüğünü oku (her satır: PCR-sha256, template-hash, template-name, file-hash, filename)</span>
+cat /sys/kernel/security/ima/ascii_runtime_measurements | head -5
+
+<span class="cmt"># Örnek çıktı:</span>
+<span class="cmt"># 10 abc123... ima-ng sha256:def456...::/usr/bin/sshd</span>
+<span class="cmt"># 10 bcd234... ima-ng sha256:ef5678...::/lib/x86_64-linux-gnu/libc.so.6</span>
+
+<span class="cmt"># PCR-10 mevcut değerini göster (tpm2-tools)</span>
+tpm2_pcrread sha256:10</code></pre>
+  </div>
+
+  <h3>Appraisal modu</h3>
+  <p>Appraisal modunda kernel, dosyaya erişim izni vermeden önce <code>security.ima</code> genişletilmiş özelliğindeki (xattr) referans hash veya imzayı kontrol eder. Eşleşme başarısız olursa erişim <code>EACCES</code> ile reddedilir.</p>
+
+  <div class="flow">
+    <pre>
+open("/usr/bin/sshd")
+        │
+        ▼
+  IMA hook tetiklenir
+        │
+        ├─ security.ima xattr var mı?
+        │         │
+        │    HAYIR │                 EVET
+        │         ▼                  ▼
+        │   ima_appraise=fix    hash karşılaştır
+        │   yeni hash yaz       eşleşiyor mu?
+        │                        │         │
+        │                      EVET       HAYIR
+        │                        │         │
+        │                   erişim ver  EACCES</pre>
+  </div>
+
+  <h3>Audit modu</h3>
+  <p>Appraisal sonucundan bağımsız olarak her ölçüm olayını Linux audit sistemine gönderir. <code>ausearch -m INTEGRITY_DATA</code> ile sorgulanabilir.</p>
+
+  <h3>Template formatları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Template</th><th>İçerik</th><th>Kullanım</th></tr></thead>
+      <tbody>
+        <tr><td>ima</td><td>SHA-1 hash + dosya adı</td><td>Eski kerneller, önerilmez</td></tr>
+        <tr><td>ima-ng</td><td>Algoritma + hash + dosya adı</td><td>Varsayılan, SHA-256 desteği</td></tr>
+        <tr><td>ima-sig</td><td>ima-ng + imza alanı</td><td>Asimetrik imza doğrulaması</td></tr>
+        <tr><td>ima-buf</td><td>ima-ng + veri tamponu</td><td>KEY_CHECK, CRITICAL_DATA</td></tr>
+        <tr><td>ima-modsig</td><td>ima-ng + kernel modsig</td><td>Modül imzalama</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Kernel konfigürasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig</span><span class="dot">●</span></div>
+    <pre><code>CONFIG_INTEGRITY=y
+CONFIG_IMA=y
+CONFIG_IMA_MEASURE_PCR_IDX=10
+CONFIG_IMA_NG_TEMPLATE=y
+CONFIG_IMA_DEFAULT_TEMPLATE="ima-ng"
+CONFIG_IMA_DEFAULT_HASH="sha256"
+CONFIG_IMA_APPRAISAL=y
+CONFIG_IMA_APPRAISAL_MODSIG=y
+CONFIG_IMA_TRUSTED_KEYRING=y
+CONFIG_IMA_KEYRINGS_PERMIT_SIGNED_BY_BUILTIN_OR_SECONDARY=y
+CONFIG_EVM=y
+CONFIG_EVM_ATTR_FSUUID=y
+CONFIG_EVM_EXTRA_SMACK_XATTRS=n   <span class="cmt"># Smack kullanmıyorsanız</span>
+CONFIG_TRUSTED_KEYS=y             <span class="cmt"># TPM ile trusted key</span>
+CONFIG_ENCRYPTED_KEYS=y</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Measurement: hash günlüğü + TPM PCR extend — pasif izleme</li>
+      <li>Appraisal: security.ima xattr karşılaştırması — erişim kontrol</li>
+      <li>Audit: audit sistemine entegrasyon — log tabanlı uyum</li>
+      <li>ima-ng + SHA-256 üretim için önerilen template/hash kombinasyonudur</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> IMA politikası</h2>
+  <p class="section-lead">IMA politikası hangi dosyaların ölçüleceğini, doğrulanacağını ve denetleneceğini tanımlayan kural setleridir. Kernel içinde yerleşik politikalar vardır; özel politika <code>/sys/kernel/security/ima/policy</code>'ye yazılarak yüklenir.</p>
+
+  <h3>Yerleşik politikalar</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">ima_policy=tcb</span><span class="desc">TCB (Trusted Computing Base) politikası: tüm çalıştırılabilir dosyaları, kütüphaneleri, kernel modüllerini ve IMA politika dosyasını ölçer. Üretim başlangıcı için önerilir.</span></div>
+    <div class="param"><span class="name">ima_policy=appraise_tcb</span><span class="desc">tcb politikasına ek olarak appraisal zorlaması ekler — tüm TCB dosyalarında security.ima xattr aranır.</span></div>
+    <div class="param"><span class="name">ima_policy=secure_boot</span><span class="desc">Güvenli önyükleme için optimize edilmiş: kernel modülleri ve firmware için imza gerektirir.</span></div>
+    <div class="param"><span class="name">ima_policy=critical_data</span><span class="desc">Kernel kritik veri yapıları için ölçüm ekler (5.12+).</span></div>
+  </div>
+
+  <h3>Özel politika kuralı sözdizimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>ima-policy</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Genel biçim:</span>
+<span class="cmt"># action [condition ...] [template=TEMPLATE] [pcr=N]</span>
+<span class="cmt">#</span>
+<span class="cmt"># action: measure | dont_measure | appraise | dont_appraise | audit | dont_audit</span>
+<span class="cmt"># condition örnekleri:</span>
+<span class="cmt">#   func=FILE_CHECK | BPRM_CHECK | MMAP_CHECK | MODULE_CHECK | FIRMWARE_CHECK</span>
+<span class="cmt">#   mask=MAY_READ | MAY_WRITE | MAY_EXEC | MAY_APPEND</span>
+<span class="cmt">#   fsmagic=0xEF53  (ext4) | 0x6969 (nfs) | 0x9123683E (btrfs)</span>
+<span class="cmt">#   uid=0 | euid=0 | fowner=0</span>
+<span class="cmt">#   obj_type=exec_t  (SELinux)</span>
+
+<span class="cmt"># Tüm çalıştırmalar için ölçüm (root da dahil)</span>
+measure func=BPRM_CHECK mask=MAY_EXEC
+
+<span class="cmt"># Kernel modülleri için ölçüm</span>
+measure func=MODULE_CHECK
+
+<span class="cmt"># Firmware için ölçüm</span>
+measure func=FIRMWARE_CHECK
+
+<span class="cmt"># Root tarafından okunan tüm dosyaları ölç</span>
+measure func=FILE_CHECK mask=MAY_READ uid=0
+
+<span class="cmt"># /etc altındaki tüm dosyaları doğrula (appraisal)</span>
+appraise func=FILE_CHECK fowner=0 appraise_type=imasig
+
+<span class="cmt"># NFS üzerindeki dosyaları ölçme (performans)</span>
+dont_measure fsmagic=0x6969
+
+<span class="cmt"># tmpfs üzerindeki dosyaları appraisal'dan muaf tut</span>
+dont_appraise fsmagic=0x01021994
+
+<span class="cmt"># İmzalı modülleri appraise et, diğerlerini reddet</span>
+appraise func=MODULE_CHECK appraise_type=imasig</code></pre>
+  </div>
+
+  <h3>Politikayı çalışma zamanında yükleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Politika dosyasını hazırla</span>
+cat /etc/ima/ima-policy.conf
+
+<span class="cmt"># Kernel'e yükle (sadece bir kez yapılabilir; reboot gerekir değişiklik için)</span>
+sudo sh -c 'cat /etc/ima/ima-policy.conf &gt; /sys/kernel/security/ima/policy'
+
+<span class="cmt"># Yüklenen politikayı doğrula</span>
+cat /sys/kernel/security/ima/policy
+
+<span class="cmt"># Kernel parametresi ile önyüklemede yükle</span>
+<span class="cmt"># /boot/cmdline: ima_policy=tcb ima_appraise=fix</span>
+
+<span class="cmt"># ima_appraise modu:</span>
+<span class="cmt">#   off   — appraisal devre dışı</span>
+<span class="cmt">#   log   — başarısızlığı logla, erişime izin ver</span>
+<span class="cmt">#   fix   — eksik xattr varsa yaz, doğrulama yapma (geçiş dönemi)</span>
+<span class="cmt">#   enforce — doğrulama zorunlu, başarısızlık = EACCES</span></code></pre>
+  </div>
+
+  <h3>Politika öncelik sırası</h3>
+  <p>Kurallar yukarıdan aşağıya değerlendirilir; <strong>ilk eşleşen kural uygulanır</strong>. <code>dont_measure</code> ve <code>dont_appraise</code> kuralları, daha özel kurallardan önce konumlandırılmalıdır. Aksi hâlde muafiyet kuralları hiçbir zaman eşleşmez.</p>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Yerleşik politikalar: tcb, appraise_tcb, secure_boot — kernel parametresiyle aktif edilir</li>
+      <li>Özel politika: /sys/kernel/security/ima/policy dosyasına yazılarak yüklenir, tek seferlik</li>
+      <li>Kural bileşenleri: action + func + mask + fsmagic + uid + fowner + appraise_type</li>
+      <li>ima_appraise=fix geçiş döneminde hash'leri yazarken enforce moduna geçişi kolaylaştırır</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> IMA appraisal</h2>
+  <p class="section-lead">IMA appraisal modu, her dosyanın <code>security.ima</code> genişletilmiş özelliğini okur ve içerik hash'ini karşılaştırır. İmzalı appraisal, asimetrik anahtar ile doğrulama ekler.</p>
+
+  <h3>security.ima xattr yapısı</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Tür</th><th>Bayt 0 (header)</th><th>İçerik</th><th>Kullanım</th></tr></thead>
+      <tbody>
+        <tr><td>IMA_DIGSIG_V1</td><td>0x01</td><td>RSA imza (2048b)</td><td>Eski, önerilmez</td></tr>
+        <tr><td>IMA_DIGSIG_V2</td><td>0x03</td><td>key_id (4B) + imza boyutu (2B) + imza</td><td>Güncel asimetrik imza</td></tr>
+        <tr><td>IMA_DIGSIG_V3</td><td>0x04</td><td>EVM HMAC ile birleşik</td><td>EVM ile entegre</td></tr>
+        <tr><td>IMA_XATTR_DIGEST</td><td>0x02</td><td>SHA-1/256 hash (ham)</td><td>İmzasız hash</td></tr>
+        <tr><td>IMA_XATTR_DIGEST_NG</td><td>0x04</td><td>algorID (1B) + hash</td><td>Çoklu algoritma desteği</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Hash tabanlı appraisal kurulumu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ima-evm-utils kurulumu</span>
+apt-get install ima-evm-utils   <span class="cmt"># Debian/Ubuntu</span>
+
+<span class="cmt"># Tekil dosya için hash hesapla ve xattr'a yaz</span>
+evmctl ima_hash /usr/bin/sshd
+
+<span class="cmt"># Dosya sistemindeki tüm dosyalar için hash'leri yaz (fix modu)</span>
+<span class="cmt"># Önce ima_appraise=fix ile boot edin, sonra:</span>
+find / -fstype ext4 \( -type f -o -type l \) -exec evmctl ima_hash {} \; 2&gt;/dev/null
+
+<span class="cmt"># xattr içeriğini doğrula</span>
+getfattr -n security.ima --only-values -e hex /usr/bin/sshd
+<span class="cmt"># Çıktı: 0x04 (NG tipi) + 0x04 (sha256) + hash_bytes</span>
+
+<span class="cmt"># evmctl ile doğrulama</span>
+evmctl ima_verify /usr/bin/sshd</code></pre>
+  </div>
+
+  <h3>İmzalı appraisal (IMA_DIGSIG_V2)</h3>
+  <p>Hash tabanlı appraisal, root erişimi olan bir saldırganın hash'i değiştirip xattr'ı güncelleyebileceği bir açığa sahiptir. Asimetrik imza bu sorunu giderir: özel anahtar yalnızca build sunucusundadır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1. IMA imzalama anahtarı oluştur</span>
+openssl genrsa -out ima-key.pem 4096
+openssl req -new -x509 -key ima-key.pem \
+  -out ima-cert.pem \
+  -days 3650 \
+  -subj "/CN=IMA Signing Key/O=MyOrg"
+
+<span class="cmt"># 2. Dosyayı imzala</span>
+evmctl sign --imasig --key ima-key.pem /usr/bin/sshd
+
+<span class="cmt"># 3. Sertifikayı kernel anahtarlığına ekle (önyükleme sırasında)</span>
+<span class="cmt"># initramfs içinde veya kernel komut satırında:</span>
+evmctl import ima-cert.pem $(keyctl show @.ima | awk '/ima/{print $1}')
+
+<span class="cmt"># 4. Veya sertifikayı kernel'e göm (derleme zamanında)</span>
+<span class="cmt"># IMA_TRUSTED_KEYRING=y + sertifika DER olarak eklenir</span>
+openssl x509 -in ima-cert.pem -outform DER -out ima-cert.der
+<span class="cmt"># certs/signing_key.pem ile birlikte kernel kaynak dizinine koy</span>
+
+<span class="cmt"># 5. Politikada imza zorunluluğu belirt</span>
+<span class="cmt"># appraise func=BPRM_CHECK appraise_type=imasig</span></code></pre>
+  </div>
+
+  <h3>Appraisal başarısızlık nedenleri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">EACCES: missing xattr</span><span class="desc">Dosyada security.ima xattr yok; enforce modunda erişim reddedilir. Fix: evmctl ima_hash veya evmctl sign ile xattr ekle</span></div>
+    <div class="param"><span class="name">EACCES: invalid hash</span><span class="desc">Dosya içeriği xattr'daki hash ile eşleşmiyor; dosya değiştirilmiş veya bozulmuş</span></div>
+    <div class="param"><span class="name">EACCES: unknown key</span><span class="desc">İmza bilinmeyen bir anahtarla oluşturulmuş; sertifika .ima anahtarlığında değil</span></div>
+    <div class="param"><span class="name">ESTALE: immutable flag</span><span class="desc">Dosya sistemi salt okunur; xattr yazılamaz. Fix: ro mount'ta ima_appraise=log kullan</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Hash appraisal: evmctl ima_hash — kolay kurulum ancak root saldırısına açık</li>
+      <li>İmzalı appraisal: evmctl sign — özel anahtar build sunucusunda, cihazda yalnızca public sertifika</li>
+      <li>ima_appraise=fix → enforce geçişi: önce tüm dosyalara hash yaz, sonra zorlamayı etkinleştir</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> EVM ve HMAC</h2>
+  <p class="section-lead">EVM (Extended Verification Module), bir dosyanın güvenlik genişletilmiş özelliklerinin (security.ima, security.selinux, security.smack vb.) bütününü tek bir HMAC veya asimetrik imza ile korur.</p>
+
+  <h3>EVM'in koruduğu alanlar</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">security.ima</span><span class="desc">IMA hash veya imzası — içerik bütünlüğü</span></div>
+    <div class="param"><span class="name">security.selinux</span><span class="desc">SELinux bağlamı — etiket bütünlüğü</span></div>
+    <div class="param"><span class="name">security.smack</span><span class="desc">Smack etiketi (aktifse)</span></div>
+    <div class="param"><span class="name">security.capability</span><span class="desc">Dosya capability değerleri (setcap)</span></div>
+    <div class="param"><span class="name">İnode meta-data</span><span class="desc">uid, gid, mode, inode numarası, dosya sistemi UUID (EVM_ATTR_FSUUID=y ise)</span></div>
+  </div>
+
+  <h3>EVM HMAC anahtarı oluşturma (TPM trusted key)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1. TPM trusted key oluştur (kernel 5.0+)</span>
+<span class="cmt"># initramfs içinde veya boot script'te çalıştır:</span>
+
+<span class="cmt"># TPM'de yeni bir trusted key oluştur</span>
+keyctl add trusted evm-key "new 32" @s
+EVM_KEYID=$(keyctl show @s | awk '/evm-key/{print $1}')
+
+<span class="cmt"># Anahtarı blob olarak kaydet (her boot'ta TPM'den geri yüklemek için)</span>
+keyctl pipe $EVM_KEYID &gt; /etc/keys/evm-trusted.blob
+
+<span class="cmt"># 2. Alternatif: yazılım anahtarı (TPM yoksa, üretim için önerilmez)</span>
+keyctl add user evm-key "$(dd if=/dev/urandom bs=32 count=1 2&gt;/dev/null | xxd -p)" @s
+
+<span class="cmt"># 3. EVM'i etkinleştir</span>
+echo 1 &gt; /sys/kernel/security/evm
+
+<span class="cmt"># EVM etkinleştirme değerleri:</span>
+<span class="cmt">#   1 = HMAC (TPM trusted/encrypted key)</span>
+<span class="cmt">#   2 = Asimetrik imza doğrulaması</span>
+<span class="cmt">#   6 = Her ikisi (HMAC + asimetrik)</span></code></pre>
+  </div>
+
+  <h3>EVM xattr'larını yazma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Dosya sistemi için EVM HMAC değerlerini hesapla ve yaz</span>
+<span class="cmt"># (EVM anahtarı yüklenmiş ve EVM etkin olmalı)</span>
+evmctl sign --hmac /usr/bin/sshd
+
+<span class="cmt"># Toplu imzalama (tüm dosya sistemi)</span>
+find / -fstype ext4 -type f -exec evmctl sign --hmac {} \; 2&gt;/dev/null
+
+<span class="cmt"># security.evm xattr içeriğini gör</span>
+getfattr -n security.evm --only-values -e hex /usr/bin/sshd
+
+<span class="cmt"># EVM durumunu kontrol et</span>
+cat /sys/kernel/security/evm
+<span class="cmt"># 3 = EVM_INIT_HMAC | EVM_INIT_X509 (her iki mod aktif)</span></code></pre>
+  </div>
+
+  <h3>TPM ile anahtar zinciri</h3>
+
+  <div class="flow">
+    <pre>
+TPM SRK (Storage Root Key)
+        │  sealed-by
+        ▼
+  evm-trusted.blob  ←──── /etc/keys/evm-trusted.blob
+        │  unseal (PCR-10 değeri doğruysa)
+        ▼
+  EVM HMAC anahtarı (kernel keyring @s)
+        │  HMAC-SHA256
+        ▼
+  security.evm = HMAC(security.ima ‖ security.selinux ‖ inode_meta)</pre>
+  </div>
+
+  <p>Anahtarın PCR değerlerine bağlanması (<strong>sealed key</strong>), cihaz üzerinde değişiklik yapılırsa TPM'in anahtarı açmamasını sağlar — tam bütünlük zinciri.</p>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>EVM, tüm güvenlik xattr'larını ve inode meta-datasını tek HMAC ile korur</li>
+      <li>TPM trusted key: PCR değerlerine bağlı, cihaz dışına çıkamaz</li>
+      <li>EVM etkinleştirme: echo 1 &gt; /sys/kernel/security/evm (tek seferlik, reboot gerekir sıfırlama için)</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> Kernel modül imzalama</h2>
+  <p class="section-lead">IMA, kernel modüllerini de kapsayan bir bütünlük zinciri kurar. <code>CONFIG_MODULE_SIG_FORCE</code> ile imzasız modül yüklemesi engellenir; IMA ile birlikte ölçüm günlüğüne de eklenir.</p>
+
+  <h3>Kernel modül imzalama altyapısı</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">CONFIG_MODULE_SIG</span><span class="desc">Modül imzalama desteğini etkinleştirir; imzalı modüller tercih edilir ancak zorunlu değildir</span></div>
+    <div class="param"><span class="name">CONFIG_MODULE_SIG_FORCE</span><span class="desc">İmzasız modül yüklemesini tamamen engeller; üretim için önerilir</span></div>
+    <div class="param"><span class="name">CONFIG_MODULE_SIG_SHA256</span><span class="desc">SHA-256 ile imzalama (önerilir; SHA-1 yerine)</span></div>
+    <div class="param"><span class="name">CONFIG_MODULE_SIG_KEY</span><span class="desc">Modül imzalama anahtarının yolu; varsayılan certs/signing_key.pem</span></div>
+    <div class="param"><span class="name">CONFIG_SYSTEM_TRUSTED_KEYRING</span><span class="desc">Güvenilir sertifika keyring; built-in CA sertifikaları buraya eklenir</span></div>
+  </div>
+
+  <h3>Modül imzalama anahtarı ve sertifika oluşturma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kernel kaynak dizininde otomatik üretim (make modules_sign sırasında yapılır)</span>
+<span class="cmt"># Veya manuel:</span>
+
+<span class="cmt"># 1. Özel anahtar + kendi kendine imzalı sertifika</span>
+openssl req -new -x509 -newkey rsa:4096 \
+  -keyout signing_key.pem \
+  -out signing_cert.pem \
+  -days 3650 \
+  -subj "/CN=Kernel Module Signing Key" \
+  -nodes
+
+<span class="cmt"># 2. Modülü imzala (kernel scripts/sign-file kullanır)</span>
+scripts/sign-file sha256 signing_key.pem signing_cert.pem drivers/mydriver/mydriver.ko
+
+<span class="cmt"># 3. İmzayı doğrula</span>
+modinfo mydriver.ko | grep signer
+<span class="cmt"># signer: Kernel Module Signing Key</span>
+
+<span class="cmt"># 4. Sertifikayı kernel anahtarlığına göm</span>
+<span class="cmt"># Kconfig: CONFIG_MODULE_SIG_KEY="certs/signing_key.pem"</span>
+<span class="cmt"># Veya CONFIG_SYSTEM_EXTRA_CERTIFICATE ile ek sertifika ekle</span>
+
+<span class="cmt"># Yüklü modüllerin imza durumunu kontrol et</span>
+cat /proc/modules | awk '{print $1, $5}'
+<span class="cmt"># E = imzalı, O = imzasız (out-of-tree), F = force-loaded</span></code></pre>
+  </div>
+
+  <h3>IMA ile modül ölçümü (ima-modsig)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>ima-policy</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># IMA politikasına modül ölçüm kuralı ekle</span>
+measure func=MODULE_CHECK template=ima-modsig
+appraise func=MODULE_CHECK appraise_type=imasig|modsig
+
+<span class="cmt"># ima-modsig: modül içindeki yerleşik imzayı ölçüm günlüğüne ekler</span>
+<span class="cmt"># Bu sayede modülün dosya sistemi imzası + modül içi imzası birlikte izlenir</span></code></pre>
+  </div>
+
+  <h3>Dışarıdan yüklenen modüller (DKMS)</h3>
+  <p>DKMS modülleri kernel güncellendikçe yeniden derlenir ve imzalanmalıdır. DKMS konfigürasyonuna imzalama adımı eklenmezse <code>MODULE_SIG_FORCE</code> aktifken modül yükleme başarısız olur.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># /etc/dkms/framework.conf içine ekle:</span>
+sign_tool="/lib/modules/$(uname -r)/build/scripts/sign-file"
+mok_signing_key="/var/lib/shim-signed/mok/MOK.priv"
+mok_certificate="/var/lib/shim-signed/mok/MOK.der"
+
+<span class="cmt"># MOK (Machine Owner Key) ile UEFI Secure Boot + DKMS entegrasyonu</span>
+mokutil --import MOK.der   <span class="cmt"># Reboot sonrası MOK Manager ile onayla</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>MODULE_SIG_FORCE: imzasız modül yüklemeyi engeller</li>
+      <li>scripts/sign-file: modülü sha256 + RSA ile imzalar</li>
+      <li>ima-modsig template: modül içi imzayı IMA günlüğüne ekler</li>
+      <li>DKMS: her kernel güncellemesinde otomatik yeniden imzalama ayarlanmalı</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> Yocto/Buildroot entegrasyonu</h2>
+  <p class="section-lead">Üretim görüntüsüne IMA/EVM desteği eklemek için ima-evm-utils paketi, imzalama anahtarları ve doğru kernel konfigürasyonu gerekir.</p>
+
+  <h3>Yocto entegrasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>local.conf / distro.conf</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># meta-security layer'ı ekle (ima-evm-utils burada)</span>
+<span class="cmt"># bblayers.conf:</span>
+<span class="cmt"># BBLAYERS += "${BSPDIR}/sources/meta-security"</span>
+
+<span class="cmt"># Kernel konfigürasyon parçası oluştur</span>
+<span class="cmt"># meta-YOUR-layer/recipes-kernel/linux/linux-%.bbappend:</span>
+<span class="cmt"># SRC_URI += "file://ima-evm.cfg"</span>
+
+<span class="cmt"># ima-evm.cfg içeriği:</span>
+CONFIG_INTEGRITY=y
+CONFIG_IMA=y
+CONFIG_IMA_NG_TEMPLATE=y
+CONFIG_IMA_DEFAULT_HASH="sha256"
+CONFIG_IMA_APPRAISAL=y
+CONFIG_IMA_TRUSTED_KEYRING=y
+CONFIG_EVM=y
+CONFIG_EVM_ATTR_FSUUID=y
+CONFIG_TRUSTED_KEYS=y
+CONFIG_ENCRYPTED_KEYS=y
+CONFIG_MODULE_SIG=y
+CONFIG_MODULE_SIG_FORCE=y
+CONFIG_MODULE_SIG_SHA256=y</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>image recipe (.bb)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Image recipe'ye ekle</span>
+IMAGE_INSTALL:append = " ima-evm-utils keyutils"
+
+<span class="cmt"># IMA politika dosyasını kök dosya sistemine koy</span>
+IMAGE_INSTALL:append = " ima-policy"
+
+<span class="cmt"># ima-policy recipe (meta-YOUR-layer/recipes-security/ima-policy/ima-policy.bb):</span>
+SUMMARY = "IMA runtime policy"
+LICENSE = "MIT"
+SRC_URI = "file://ima-policy.conf"
+
+do_install() {
+    install -d ${D}/etc/ima
+    install -m 0644 ${WORKDIR}/ima-policy.conf ${D}/etc/ima/ima-policy.conf
+}
+
+<span class="cmt"># Initramfs içinde EVM anahtarı oluşturma (initramfs hook)</span>
+<span class="cmt"># /etc/initramfs-tools/scripts/init-bottom/evm-setup:</span>
+<span class="cmt"># keyctl add trusted evm-key "load $(cat /etc/keys/evm-trusted.blob | xxd -p | tr -d '\n')" @s</span>
+<span class="cmt"># echo 1 &gt; /sys/kernel/security/evm</span></code></pre>
+  </div>
+
+  <h3>Buildroot entegrasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Buildroot menuconfig</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Target packages -&gt; Security -&gt; ima-evm-utils</span>
+BR2_PACKAGE_IMA_EVM_UTILS=y
+BR2_PACKAGE_KEYUTILS=y
+
+<span class="cmt"># Kernel konfigürasyonu için:</span>
+<span class="cmt"># linux/linux.config dosyasına yukarıdaki CONFIG değerlerini ekle</span>
+
+<span class="cmt"># Post-image script ile imzalama (board/myboard/post-image.sh):</span>
+#!/bin/bash
+ROOTFS="$1/rootfs.ext4"
+MOUNT_DIR=$(mktemp -d)
+mount -o loop "$ROOTFS" "$MOUNT_DIR"
+
+find "$MOUNT_DIR" -type f \( -perm /111 -o -name "*.so*" \) | while read f; do
+    evmctl ima_hash "$f" 2&gt;/dev/null || true
+done
+
+umount "$MOUNT_DIR"
+rmdir "$MOUNT_DIR"</code></pre>
+  </div>
+
+  <h3>Anahtar dağıtımı ve güvenlik</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Build-time imzalama</span><span class="desc">Özel anahtar yalnızca CI/CD sunucusunda; cihazlara sadece imzalanmış rootfs gönderilir</span></div>
+    <div class="param"><span class="name">Sertifika gömme</span><span class="desc">Public sertifika kernel içine gömülür (CONFIG_SYSTEM_TRUSTED_KEYS) — cihazda değiştirilemez</span></div>
+    <div class="param"><span class="name">TPM sealed key</span><span class="desc">EVM HMAC anahtarı TPM'de PCR değerlerine bağlı saklanır — cihaz dışına çıkamaz</span></div>
+    <div class="param"><span class="name">HSM entegrasyonu</span><span class="desc">Büyük ölçekli üretim için imzalama HSM (PKCS#11) üzerinden yapılır</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Yocto: meta-security layer'ı + kernel cfg parçası + ima-policy recipe</li>
+      <li>Buildroot: BR2_PACKAGE_IMA_EVM_UTILS + post-image imzalama scripti</li>
+      <li>Özel anahtar CI sunucusunda; public sertifika kernel'e gömülü</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> Remote attestation ile IMA</h2>
+  <p class="section-lead">IMA ölçüm günlüğü + TPM quote mekanizması, uzaktaki bir sunucunun cihazın bütünlük durumunu doğrulamasını sağlar. Bu yaklaşım, IETF RATS mimarisinin temelini oluşturur.</p>
+
+  <h3>Attestation akışı</h3>
+
+  <div class="flow">
+    <pre>
+Attestation Sunucusu (Verifier)
+        │  1. Nonce gönder (replay saldırısı engeli)
+        ▼
+Cihaz (Attester)
+        │  2. TPM2_Quote(PCR-10, nonce) → TPM imzalı PCR alıntısı
+        │  3. IMA ascii_runtime_measurements günlüğünü ekle
+        │  4. EK sertifikası + AK sertifikası ekle
+        ▼
+Attestation Sunucusu
+        │  5. TPM imzasını doğrula (EK/AK chain)
+        │  6. PCR-10'u günlükten yeniden hesapla
+        │  7. Günlükteki her dosya hash'ini referansla karşılaştır
+        │  8. PASS/FAIL kararı ver</pre>
+  </div>
+
+  <h3>TPM2 quote alma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># tpm2-tools ile PCR quote al</span>
+
+<span class="cmt"># 1. Attestation Key (AK) oluştur</span>
+tpm2_createek -c ek.ctx -G rsa -u ek.pub
+tpm2_createak -C ek.ctx -c ak.ctx -u ak.pub -n ak.name
+
+<span class="cmt"># 2. Nonce ile PCR-10 alıntısı al</span>
+NONCE="$(openssl rand -hex 20)"
+tpm2_quote \
+  --key-context ak.ctx \
+  --pcr-list sha256:10 \
+  --message pcr_quote.msg \
+  --signature pcr_quote.sig \
+  --qualification "$NONCE" \
+  --pcrs_output pcr_values.out
+
+<span class="cmt"># 3. IMA günlüğünü al</span>
+cp /sys/kernel/security/ima/ascii_runtime_measurements ima-log.txt
+
+<span class="cmt"># 4. Sunucuya gönder (örn. curl ile)</span>
+curl -X POST https://attestation-server/api/attest \
+  -F "quote=@pcr_quote.msg" \
+  -F "sig=@pcr_quote.sig" \
+  -F "imalog=@ima-log.txt" \
+  -F "nonce=$NONCE"</code></pre>
+  </div>
+
+  <h3>PCR extend hesabı (sunucu tarafı doğrulama)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>python3</span><span class="dot">●</span></div>
+    <pre><code>import hashlib
+
+def sha256(data: bytes) -&gt; bytes:
+    return hashlib.sha256(data).digest()
+
+def pcr_extend(current_pcr: bytes, new_value: bytes) -&gt; bytes:
+    # TPM PCR extend: SHA-256(current || new)
+    return sha256(current_pcr + new_value)
+
+def verify_ima_log(log_lines: list[str], expected_pcr: bytes) -&gt; bool:
+    pcr = bytes(32)  # PCR başlangıç değeri: 32 sıfır byte
+    for line in log_lines:
+        parts = line.strip().split()
+        if len(parts) &lt; 2:
+            continue
+        template_hash_hex = parts[1]
+        template_hash = bytes.fromhex(template_hash_hex)
+        pcr = pcr_extend(pcr, template_hash)
+    return pcr == expected_pcr</code></pre>
+  </div>
+
+  <h3>Keylime — açık kaynak remote attestation</h3>
+  <p><strong>Keylime</strong>, IMA + TPM tabanlı uzak tasdik için geliştirilmiş açık kaynaklı bir çerçevedir. CNCF projesi statüsündedir.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">keylime_verifier</span><span class="desc">Sunucu tarafı: cihazlardan düzenli aralıklarla quote + IMA günlüğü alır, doğrular</span></div>
+    <div class="param"><span class="name">keylime_registrar</span><span class="desc">Cihaz kayıt servisi: EK sertifikası + AK'yı kaydeder</span></div>
+    <div class="param"><span class="name">keylime_agent</span><span class="desc">Cihaz tarafı: TPM işlemlerini gerçekleştirir, günlüğü iletir</span></div>
+    <div class="param"><span class="name">allowlist</span><span class="desc">Beklenen dosya hash'lerinin listesi; verifier bu listeyle karşılaştırır</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>TPM quote: PCR-10 değerini nonce ile imzalar, replay saldırısını engeller</li>
+      <li>Sunucu tarafı: günlükten PCR'ı yeniden hesapla, TPM quote ile karşılaştır</li>
+      <li>Keylime: production-grade açık kaynak uzak tasdik çerçevesi (CNCF)</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Hata ayıklama</h2>
+  <p class="section-lead">IMA/EVM sorunları genellikle erişim reddedilen dosyalar, eksik xattr'lar veya yanlış politika kuralları şeklinde ortaya çıkar. Bu bölüm tanı araçlarını ve yaygın sorunları ele alır.</p>
+
+  <h3>IMA sysfs arayüzü</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Dosya</th><th>İçerik</th></tr></thead>
+      <tbody>
+        <tr><td>/sys/kernel/security/ima/policy</td><td>Yüklü politikayı göster / yeni politika yükle (yazma)</td></tr>
+        <tr><td>/sys/kernel/security/ima/ascii_runtime_measurements</td><td>İnsan okunabilir ölçüm günlüğü</td></tr>
+        <tr><td>/sys/kernel/security/ima/binary_runtime_measurements</td><td>TPM ile uyumlu ikili ölçüm günlüğü</td></tr>
+        <tr><td>/sys/kernel/security/ima/runtime_measurements_count</td><td>Toplam ölçüm sayısı</td></tr>
+        <tr><td>/sys/kernel/security/ima/violations</td><td>Politika ihlali sayısı</td></tr>
+        <tr><td>/sys/kernel/security/evm</td><td>EVM durumu (0=devre dışı, 1=HMAC, 2=asimetrik, 3=her ikisi)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Yaygın hataların tanısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1. Politika ihlali sayısını izle</span>
+watch -n 1 cat /sys/kernel/security/ima/violations
+
+<span class="cmt"># 2. Kernel log'unda IMA mesajlarını filtrele</span>
+dmesg | grep -i "ima:"
+<span class="cmt"># Örnek: ima: appraise_measurement: &lt;filename&gt;: No such xattr</span>
+<span class="cmt"># Örnek: ima: appraise_measurement: &lt;filename&gt;: hash mismatch</span>
+
+<span class="cmt"># 3. Audit günlüğünde IMA olaylarını ara</span>
+ausearch -m INTEGRITY_DATA -ts recent
+ausearch -m INTEGRITY_PCR -ts recent
+<span class="cmt"># INTEGRITY_DATA: appraisal başarısızlığı</span>
+<span class="cmt"># INTEGRITY_PCR: PCR extend olayı</span>
+
+<span class="cmt"># 4. Belirli bir dosyanın xattr durumunu kontrol et</span>
+getfattr -n security.ima -e hex /usr/bin/sshd
+getfattr -n security.evm -e hex /usr/bin/sshd
+
+<span class="cmt"># 5. Dosyanın mevcut hash'ini hesapla ve xattr ile karşılaştır</span>
+sha256sum /usr/bin/sshd
+evmctl ima_verify /usr/bin/sshd
+
+<span class="cmt"># 6. IMA anahtarlığını kontrol et</span>
+keyctl show %keyring:.ima
+keyctl show %keyring:.evm
+
+<span class="cmt"># 7. Politika kurallarını yeniden yükle (geliştirme sırasında)</span>
+<span class="cmt"># Yükleme tek seferlik! Değişiklik için reboot gerekir.</span>
+<span class="cmt"># Test için: ima_appraise=log boot parametresiyle başlayın</span></code></pre>
+  </div>
+
+  <h3>Sorun giderme tablosu</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Belirti</th><th>Olası neden</th><th>Çözüm</th></tr></thead>
+      <tbody>
+        <tr><td>Program çalışmıyor, EACCES</td><td>security.ima xattr eksik</td><td>ima_appraise=fix ile boot, evmctl ima_hash çalıştır</td></tr>
+        <tr><td>Program çalışmıyor, hash mismatch</td><td>Dosya güncellendi, xattr eski</td><td>evmctl ima_hash ile xattr'ı güncelle</td></tr>
+        <tr><td>Tüm sistem boot edemiyor</td><td>ima_appraise=enforce + xattr eksik</td><td>ima_appraise=fix veya ima_appraise=log ile boot</td></tr>
+        <tr><td>EVM EACCES</td><td>EVM anahtarı keyring'de yok</td><td>initramfs'te keyctl add adımını kontrol et</td></tr>
+        <tr><td>violations sayısı artıyor</td><td>Politika çok geniş veya dosya sistemi bozuk</td><td>dmesg ve ausearch ile hangi dosya ihlal ediyor bul</td></tr>
+        <tr><td>Modül yüklenemiyor</td><td>MODULE_SIG_FORCE + imzasız modül</td><td>scripts/sign-file ile modülü imzala</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>IMA performans etkisi</h3>
+  <p>Her dosya açıldığında SHA-256 hesabı gerçekleştirilir. Bu, I/O yoğun iş yüklerinde %5–15 performans kaybına yol açabilir. Azaltma stratejileri:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">dont_measure kuralları</span><span class="desc">tmpfs, procfs, sysfs gibi sanal dosya sistemlerini ölçüm dışı bırak</span></div>
+    <div class="param"><span class="name">Hash önbellekleme</span><span class="desc">Kernel, değişmemiş dosyaların hash'ini inode önbelleğinde saklar; tekrar hesaplamaz</span></div>
+    <div class="param"><span class="name">Seçici politika</span><span class="desc">Tüm FILE_CHECK yerine yalnızca BPRM_CHECK + MODULE_CHECK ölç</span></div>
+    <div class="param"><span class="name">fs.verity</span><span class="desc">fs-verity ile IMA entegrasyonu: verity hash'i IMA'ya aktarır, I/O hash'i elimine eder</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>/sys/kernel/security/ima/ : politika, günlük, ihlal sayacı</li>
+      <li>dmesg | grep "ima:" ve ausearch -m INTEGRITY_DATA ile hızlı tanı</li>
+      <li>Boot sorunlarında ima_appraise=log veya ima_appraise=fix ile başla</li>
+      <li>Performans: dont_measure ile sanal dosya sistemlerini muaf tut, seçici politika kullan</li>
+    </ul>
+  </div>
+</section>
+
+</main>

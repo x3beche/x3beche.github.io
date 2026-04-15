@@ -1,0 +1,980 @@
+---
+layout: tutorial
+title: "devfreq — CPU Dışı Cihaz Dinamik Frekans Ölçekleme"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>GÜÇ YÖNETİMİ</span>
+    <span>2026</span>
+  </div>
+  <h1>devfreq<br><em>CPU Dışı Cihaz Dinamik Frekans Ölçekleme</em></h1>
+  <p class="subtitle">GPU, DDR bellek ve interconnect için Linux güç yönetimi çerçevesi — OPP tablosu, governor ve thermal entegrasyonu.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">devfreq neden var</a></li>
+    <li><a href="#s1">devfreq framework mimarisi</a></li>
+    <li><a href="#s2">OPP (Operating Performance Point)</a></li>
+    <li><a href="#s3">Yerleşik governor'lar</a></li>
+    <li><a href="#s4">devfreq sürücüsü yazımı</a></li>
+    <li><a href="#s5">Passive governor</a></li>
+    <li><a href="#s6">Thermal + devfreq entegrasyonu</a></li>
+    <li><a href="#s7">SoC örnekleri</a></li>
+    <li><a href="#s8">Hata ayıklama</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> devfreq neden var</h2>
+  <p class="section-lead">Modern SoC'larda CPU dışında da frekans/gerilim ölçeklemesi gereken çok sayıda bileşen bulunur; devfreq bu bileşenler için CPUfreq'e benzer bir çerçeve sağlar.</p>
+
+  <h3>CPU dışı DVFS ihtiyacı</h3>
+  <p>DVFS (Dynamic Voltage and Frequency Scaling) yalnızca işlemci için değil, pek çok SoC bileşeni için kritiktir:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">GPU</span><span class="desc">3D işlemci, video kod çözücü ve görüntü işleme birimi — yük ile orantılı frekans ve gerilim değişimi güç tüketimini %40–60 azaltabilir</span></div>
+    <div class="param"><span class="name">DDR bellek</span><span class="desc">Bellek frekansı, bant genişliği ve güç tüketimini doğrudan etkiler; düşük CPU yükünde DDR frekansını düşürmek önemli enerji tasarrufu sağlar</span></div>
+    <div class="param"><span class="name">Interconnect (NoC/fabric)</span><span class="desc">SoC iç veri yollarının bant genişliği; yüksek DDR transferleri gerektiren durumlarda frekans artırılmalı, boşta düşürülmeli</span></div>
+    <div class="param"><span class="name">ISP / DSP</span><span class="desc">Görüntü işleme ve sinyal işleme bloklarının kamera çözünürlüğüne ve kare hızına göre dinamik ölçekleme ihtiyacı</span></div>
+    <div class="param"><span class="name">USB / PCIe PHY</span><span class="desc">Yüksek hız arabirimlerinin güç durumları, bağlantı hızı ile orantılı frekans gereksinimleri</span></div>
+  </div>
+
+  <h3>CPUfreq ile karşılaştırma</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Özellik</th><th>CPUfreq</th><th>devfreq</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Hedef donanım</td><td>Yalnızca CPU çekirdekleri</td><td>GPU, DDR, interconnect, ISP, DSP</td></tr>
+        <tr><td>Governor tipleri</td><td>ondemand, schedutil, conservative</td><td>simple_ondemand, powersave, performance, passive, userspace</td></tr>
+        <tr><td>Yük ölçümü</td><td>idle time, scheduler stats</td><td>get_dev_status() callback — cihaza özgü</td></tr>
+        <tr><td>OPP entegrasyonu</td><td>cpufreq_driver OPP tablosu</td><td>dev_pm_opp_* API'si</td></tr>
+        <tr><td>Thermal cooling</td><td>cpufreq_cooling_register</td><td>devfreq_cooling_register</td></tr>
+        <tr><td>Çoklu cihaz bağlantısı</td><td>Yok (her CPU bağımsız)</td><td>passive governor — parent/child ilişkisi</td></tr>
+        <tr><td>Sysfs arayüzü</td><td>/sys/devices/system/cpu/cpufreq/</td><td>/sys/class/devfreq/</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Güç tasarrufu potansiyeli</h3>
+  <div class="flow">
+    <pre>
+Boştaki bir SoC'nin güç profili (örnek: Exynos 5422):
+  CPU kümesi:    ~180 mW  (CPUfreq ile ölçekleme: ~50 mW)
+  Mali-T628 GPU: ~120 mW  (devfreq ile ölçekleme: ~20 mW)
+  DDR3 bellek:   ~90 mW   (devfreq ile ölçekleme: ~35 mW)
+  Interconnect:  ~40 mW   (devfreq ile ölçekleme: ~15 mW)
+
+  devfreq + CPUfreq birlikte: toplam güç ~%45 azalır
+    </pre>
+  </div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> devfreq framework mimarisi</h2>
+  <p class="section-lead">devfreq çerçevesi üç temel bileşenden oluşur: cihaz profili (devfreq_dev_profile), governor ve OPP tablosu.</p>
+
+  <h3>Yazılım katman diyagramı</h3>
+
+  <div class="flow">
+    <pre>
+Kullanıcı alanı
+  /sys/class/devfreq/&lt;dev&gt;/
+        │ sysfs okuma/yazma
+        ▼
+┌───────────────────────────────────┐
+│         devfreq core              │
+│  devfreq_add_device()             │
+│  devfreq_update_stats()           │
+│  devfreq_monitor_start()          │
+├───────────────────────────────────┤
+│         Governor katmanı          │
+│  simple_ondemand / passive /      │
+│  powersave / performance          │
+│  devfreq_governor.get_target_freq │
+├───────────────────────────────────┤
+│         OPP tablosu               │
+│  dev_pm_opp_add() / DT opp-table  │
+│  dev_pm_opp_get_opp_count()       │
+├───────────────────────────────────┤
+│         Cihaz sürücüsü            │
+│  devfreq_dev_profile.target()     │
+│  devfreq_dev_profile.get_dev_status│
+└───────────────────────────────────┘
+        │
+        ▼
+  Donanım (CLK, regulator çerçevesi)
+  clk_set_rate() + regulator_set_voltage()
+    </pre>
+  </div>
+
+  <h3>devfreq_dev_profile yapısı</h3>
+<pre><code>#include &lt;linux/devfreq.h&gt;
+
+/*
+ * devfreq_dev_profile — sürücünün devfreq core'a
+ * sağladığı callback'ler ve parametreler
+ */
+struct devfreq_dev_profile {
+    unsigned long   initial_freq;   /* başlangıç frekansı */
+    unsigned int    polling_ms;     /* governor polling aralığı (ms) */
+
+    /* Frekans ayarla — sürücü implement eder */
+    int (*target)(struct device *dev,
+                  unsigned long *freq,
+                  u32 flags);
+
+    /* Mevcut yük istatistikleri — governor okur */
+    int (*get_dev_status)(struct device *dev,
+                          struct devfreq_dev_status *stat);
+
+    /* Mevcut frekansı oku */
+    int (*get_cur_freq)(struct device *dev,
+                        unsigned long *freq);
+
+    /* Kullanılabilir frekans tablosu */
+    unsigned long   *freq_table;
+    unsigned int    max_state;
+};</code></pre>
+
+  <h3>devfreq_dev_status: yük ölçümü</h3>
+<pre><code>struct devfreq_dev_status {
+    unsigned long   total_time;    /* ölçüm penceresi (µs veya cycle) */
+    unsigned long   busy_time;     /* meşgul geçen süre */
+    unsigned long   current_frequency; /* şu anki frekans */
+    void            *private_data; /* governor'a özel veri */
+};
+
+/* Yük yüzdesi: busy_time / total_time * 100 */</code></pre>
+
+  <h3>devfreq lifecycle</h3>
+  <div class="flow">
+    <pre>
+platform_driver probe()
+      │
+      ├─ OPP tablosunu oluştur (DT veya kod)
+      ├─ devfreq_dev_profile doldur
+      │
+      ▼
+devfreq_add_device()
+      │
+      ├─ Governor seç (ör. simple_ondemand)
+      ├─ devfreq_monitor_start() — periyodik polling timer
+      │
+      ▼
+Governor polling (polling_ms aralığıyla)
+      │
+      ├─ get_dev_status() çağır
+      ├─ Yük hesapla
+      ├─ Hedef frekans seç (OPP tablosundan)
+      │
+      ▼
+profile-&gt;target(dev, &amp;freq, flags)
+      │
+      ├─ clk_set_rate()
+      └─ regulator_set_voltage()
+    </pre>
+  </div>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> OPP (Operating Performance Point)</h2>
+  <p class="section-lead">OPP tablosu, bir cihazın desteklediği frekans-gerilim çiftlerini tanımlar; Device Tree binding veya kod aracılığıyla oluşturulabilir.</p>
+
+  <h3>Device Tree OPP tablosu</h3>
+<pre><code>/* arch/arm64/boot/dts/vendor/soc.dtsi */
+
+gpu: gpu@13000000 {
+    compatible = "arm,mali-t628";
+    reg = &lt;0x13000000 0x4000&gt;;
+    clocks = &lt;&amp;clock CLK_GPU&gt;;
+    clock-names = "clk_g3d";
+
+    operating-points-v2 = &lt;&amp;gpu_opp_table&gt;;
+
+    devfreq,min-freq = &lt;160000000&gt;;
+    devfreq,max-freq = &lt;600000000&gt;;
+};
+
+gpu_opp_table: opp-table-gpu {
+    compatible = "operating-points-v2";
+    opp-shared;
+
+    opp-160000000 {
+        opp-hz = /bits/ 64 &lt;160000000&gt;;
+        opp-microvolt = &lt;800000&gt;;
+    };
+    opp-266000000 {
+        opp-hz = /bits/ 64 &lt;266000000&gt;;
+        opp-microvolt = &lt;875000&gt;;
+    };
+    opp-350000000 {
+        opp-hz = /bits/ 64 &lt;350000000&gt;;
+        opp-microvolt = &lt;912500&gt;;
+    };
+    opp-480000000 {
+        opp-hz = /bits/ 64 &lt;480000000&gt;;
+        opp-microvolt = &lt;962500&gt;;
+    };
+    opp-600000000 {
+        opp-hz = /bits/ 64 &lt;600000000&gt;;
+        opp-microvolt = &lt;1000000&gt;;
+    };
+};</code></pre>
+
+  <h3>Kod ile OPP ekleme</h3>
+<pre><code>#include &lt;linux/pm_opp.h&gt;
+
+static const struct {
+    unsigned long freq;
+    unsigned long volt;
+} gpu_opps[] = {
+    { 160000000, 800000  },
+    { 266000000, 875000  },
+    { 350000000, 912500  },
+    { 480000000, 962500  },
+    { 600000000, 1000000 },
+};
+
+static int gpu_opp_init(struct device *dev)
+{
+    int i, ret;
+
+    for (i = 0; i &lt; ARRAY_SIZE(gpu_opps); i++) {
+        ret = dev_pm_opp_add(dev,
+                             gpu_opps[i].freq,
+                             gpu_opps[i].volt);
+        if (ret) {
+            dev_err(dev, "OPP eklenemedi %lu Hz: %d\n",
+                    gpu_opps[i].freq, ret);
+            goto err_remove;
+        }
+    }
+    return 0;
+
+err_remove:
+    dev_pm_opp_remove_all_dynamic(dev);
+    return ret;
+}</code></pre>
+
+  <h3>OPP çerçevesi API'si</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">dev_pm_opp_add(dev, freq, volt)</span><span class="desc">Dinamik OPP ekler; Device Tree OPP'leri of_dev_pm_opp_add() ile otomatik eklenir</span></div>
+    <div class="param"><span class="name">dev_pm_opp_remove(dev, freq)</span><span class="desc">Belirli frekansa ait OPP'yi kaldırır</span></div>
+    <div class="param"><span class="name">dev_pm_opp_get_opp_count(dev)</span><span class="desc">Etkin OPP sayısını döner</span></div>
+    <div class="param"><span class="name">dev_pm_opp_find_freq_ceil(dev, freq)</span><span class="desc">İstenen frekansın üstündeki en yakın OPP'yi bulur (yuvarlama yukarı)</span></div>
+    <div class="param"><span class="name">dev_pm_opp_find_freq_floor(dev, freq)</span><span class="desc">İstenen frekansın altındaki en yakın OPP'yi bulur (yuvarlama aşağı)</span></div>
+    <div class="param"><span class="name">dev_pm_opp_set_rate(dev, target_freq)</span><span class="desc">OPP tablosundan frekans seçer, clk_set_rate + regulator_set_voltage çağırır</span></div>
+  </div>
+
+  <h3>OPP notifier</h3>
+<pre><code>/* Frekans değişimlerini dinle */
+static int gpu_opp_notifier(struct notifier_block *nb,
+                             unsigned long event, void *data)
+{
+    struct dev_pm_opp_notifier_block *opp_nb =
+        container_of(nb, struct dev_pm_opp_notifier_block, nb);
+    struct dev_pm_opp *opp = data;
+
+    if (event == OPP_EVENT_ENABLE)
+        dev_dbg(opp_nb-&gt;dev, "OPP etkinleşti: %lu Hz\n",
+                dev_pm_opp_get_freq(opp));
+    return NOTIFY_OK;
+}
+
+struct dev_pm_opp_notifier_block gpu_opp_nb = {
+    .nb.notifier_call = gpu_opp_notifier,
+};
+
+dev_pm_opp_register_notifier(dev, &amp;gpu_opp_nb.nb);</code></pre>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> Yerleşik governor'lar</h2>
+  <p class="section-lead">devfreq framework dört yerleşik governor içerir; her biri farklı güç-performans dengesi için tasarlanmıştır.</p>
+
+  <h3>simple_ondemand</h3>
+  <p>En yaygın kullanılan governor. Cihazın yüklenmesine bakarak frekansı dinamik olarak ayarlar. Yük eşiği aşılınca maksimum frekansa çıkar, düşünce kademeli olarak azaltır.</p>
+
+<pre><code>/* simple_ondemand parametreleri */
+struct devfreq_simple_ondemand_data {
+    unsigned int upthreshold;      /* varsayılan %90 */
+    unsigned int downdifferential; /* varsayılan %5  */
+};
+
+static struct devfreq_simple_ondemand_data gpu_gov_data = {
+    .upthreshold      = 85,
+    .downdifferential = 10,
+};
+
+struct devfreq *df = devfreq_add_device(dev,
+                                         &amp;gpu_profile,
+                                         DEVFREQ_GOV_SIMPLE_ONDEMAND,
+                                         &amp;gpu_gov_data);</code></pre>
+
+  <h3>powersave ve performance</h3>
+<pre><code>/* powersave: daima minimum OPP */
+struct devfreq *df_ps = devfreq_add_device(dev, &amp;profile,
+                                            DEVFREQ_GOV_POWERSAVE, NULL);
+
+/* performance: daima maksimum OPP */
+struct devfreq *df_pf = devfreq_add_device(dev, &amp;profile,
+                                            DEVFREQ_GOV_PERFORMANCE, NULL);
+
+/* Çalışma zamanında governor değiştirme (sysfs) */
+/* echo powersave &gt; /sys/class/devfreq/13000000.gpu/governor */</code></pre>
+
+  <h3>userspace governor</h3>
+<pre><code>/* Kullanıcı alanından frekans kontrolü */
+struct devfreq *df = devfreq_add_device(dev, &amp;profile,
+                                         DEVFREQ_GOV_USERSPACE, NULL);
+
+/* Kullanıcı alanında:
+ * echo 350000000 &gt; /sys/class/devfreq/13000000.gpu/userspace/set_freq
+ */</code></pre>
+
+  <h3>Governor karşılaştırması</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Governor</th><th>Davranış</th><th>Güç tasarrufu</th><th>Kullanım alanı</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>simple_ondemand</td><td>Yük tabanlı dinamik</td><td>İyi (%30–50)</td><td>GPU, genel amaçlı</td></tr>
+        <tr><td>powersave</td><td>Daima minimum</td><td>Maksimum</td><td>Pil tasarrufu modu</td></tr>
+        <tr><td>performance</td><td>Daima maksimum</td><td>Yok</td><td>Benchmark, geliştirme</td></tr>
+        <tr><td>userspace</td><td>Kullanıcı kontrolü</td><td>Kullanıcıya bağlı</td><td>Özel güç yönetimi, test</td></tr>
+        <tr><td>passive</td><td>Parent cihaza bağlı</td><td>İyi</td><td>DDR/interconnect, CPU'ya bağımlı</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Governor sysfs arayüzü</h3>
+<pre><code># Mevcut governor
+cat /sys/class/devfreq/13000000.gpu/governor
+# simple_ondemand
+
+# Governor değiştir
+echo performance &gt; /sys/class/devfreq/13000000.gpu/governor
+
+# ondemand parametrelerini ayarla
+echo 80 &gt; /sys/class/devfreq/13000000.gpu/upthreshold
+
+# Polling aralığı (ms)
+echo 100 &gt; /sys/class/devfreq/13000000.gpu/polling_interval</code></pre>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> devfreq sürücüsü yazımı</h2>
+  <p class="section-lead">Özel bir SoC bileşeni için devfreq sürücüsü yazmak; target callback, get_dev_status ve OPP entegrasyonunu içerir.</p>
+
+  <h3>Tam devfreq sürücüsü iskelet</h3>
+<pre><code>#include &lt;linux/module.h&gt;
+#include &lt;linux/platform_device.h&gt;
+#include &lt;linux/devfreq.h&gt;
+#include &lt;linux/pm_opp.h&gt;
+#include &lt;linux/clk.h&gt;
+#include &lt;linux/regulator/consumer.h&gt;
+
+struct my_devfreq_data {
+    struct device       *dev;
+    struct devfreq      *devfreq;
+    struct clk          *clk;
+    struct regulator    *vdd;
+    void __iomem        *perf_regs;
+    u64                  last_total;
+    u64                  last_busy;
+};
+
+static void read_hw_counters(struct my_devfreq_data *priv,
+                              u64 *total, u64 *busy)
+{
+    *total = readl(priv-&gt;perf_regs + 0x00);
+    *busy  = readl(priv-&gt;perf_regs + 0x04);
+    writel(0, priv-&gt;perf_regs + 0x08);
+}
+
+static int my_get_dev_status(struct device *dev,
+                              struct devfreq_dev_status *stat)
+{
+    struct my_devfreq_data *priv = dev_get_drvdata(dev);
+    u64 total, busy;
+
+    read_hw_counters(priv, &amp;total, &amp;busy);
+
+    stat-&gt;current_frequency = clk_get_rate(priv-&gt;clk);
+    stat-&gt;total_time = total - priv-&gt;last_total;
+    stat-&gt;busy_time  = busy  - priv-&gt;last_busy;
+
+    priv-&gt;last_total = total;
+    priv-&gt;last_busy  = busy;
+
+    return 0;
+}
+
+static int my_target(struct device *dev,
+                     unsigned long *freq,
+                     u32 flags)
+{
+    struct my_devfreq_data *priv = dev_get_drvdata(dev);
+    struct dev_pm_opp *opp;
+    unsigned long target_volt;
+    int ret;
+
+    opp = devfreq_recommended_opp(dev, freq, flags);
+    if (IS_ERR(opp)) return PTR_ERR(opp);
+
+    target_volt = dev_pm_opp_get_voltage(opp);
+    dev_pm_opp_put(opp);
+
+    if (*freq &gt; clk_get_rate(priv-&gt;clk)) {
+        ret = regulator_set_voltage(priv-&gt;vdd,
+                                    target_volt, target_volt);
+        if (ret) return ret;
+    }
+
+    ret = clk_set_rate(priv-&gt;clk, *freq);
+    if (ret) return ret;
+
+    if (*freq &lt; clk_get_rate(priv-&gt;clk))
+        regulator_set_voltage(priv-&gt;vdd, target_volt, target_volt);
+
+    return 0;
+}
+
+static int my_get_cur_freq(struct device *dev, unsigned long *freq)
+{
+    struct my_devfreq_data *priv = dev_get_drvdata(dev);
+    *freq = clk_get_rate(priv-&gt;clk);
+    return 0;
+}
+
+static struct devfreq_dev_profile my_devfreq_profile = {
+    .initial_freq   = 160000000,
+    .polling_ms     = 50,
+    .target         = my_target,
+    .get_dev_status = my_get_dev_status,
+    .get_cur_freq   = my_get_cur_freq,
+};
+
+static int my_devfreq_probe(struct platform_device *pdev)
+{
+    struct device *dev = &amp;pdev-&gt;dev;
+    struct my_devfreq_data *priv;
+    struct devfreq_simple_ondemand_data *gov_data;
+    int ret;
+
+    priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+    if (!priv) return -ENOMEM;
+    priv-&gt;dev = dev;
+
+    priv-&gt;clk = devm_clk_get(dev, "core");
+    if (IS_ERR(priv-&gt;clk)) return PTR_ERR(priv-&gt;clk);
+
+    priv-&gt;vdd = devm_regulator_get(dev, "vdd-core");
+    if (IS_ERR(priv-&gt;vdd)) return PTR_ERR(priv-&gt;vdd);
+
+    priv-&gt;perf_regs = devm_platform_ioremap_resource(pdev, 1);
+    if (IS_ERR(priv-&gt;perf_regs)) return PTR_ERR(priv-&gt;perf_regs);
+
+    ret = devm_pm_opp_of_add_table(dev);
+    if (ret) {
+        dev_err(dev, "OPP tablosu yüklenemedi: %d\n", ret);
+        return ret;
+    }
+
+    dev_set_drvdata(dev, priv);
+
+    gov_data = devm_kzalloc(dev, sizeof(*gov_data), GFP_KERNEL);
+    gov_data-&gt;upthreshold = 85;
+    gov_data-&gt;downdifferential = 10;
+
+    priv-&gt;devfreq = devm_devfreq_add_device(dev,
+                                              &amp;my_devfreq_profile,
+                                              DEVFREQ_GOV_SIMPLE_ONDEMAND,
+                                              gov_data);
+    if (IS_ERR(priv-&gt;devfreq)) {
+        dev_err(dev, "devfreq eklenemedi\n");
+        return PTR_ERR(priv-&gt;devfreq);
+    }
+
+    dev_info(dev, "devfreq başlatıldı: %lu Hz\n",
+             clk_get_rate(priv-&gt;clk));
+    return 0;
+}
+
+static const struct of_device_id my_devfreq_of_match[] = {
+    { .compatible = "vendor,my-gpu" },
+    { }
+};
+
+static struct platform_driver my_devfreq_driver = {
+    .probe  = my_devfreq_probe,
+    .driver = {
+        .name           = "my-devfreq",
+        .of_match_table = my_devfreq_of_match,
+    },
+};
+module_platform_driver(my_devfreq_driver);
+MODULE_LICENSE("GPL");</code></pre>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> Passive governor</h2>
+  <p class="section-lead">Passive governor, bir devfreq cihazının frekansını başka bir devfreq cihazına (parent) veya CPUfreq'e bağlar; DDR ve interconnect gibi CPU'ya bağımlı bileşenler için kullanılır.</p>
+
+  <h3>Passive governor kavramı</h3>
+  <p>DDR frekansı CPU frekansına yakından bağlıdır: düşük CPU frekansında yüksek DDR frekansı anlamsız güç tüketimidir, yüksek CPU frekansında ise düşük DDR frekansı darboğaz oluşturur.</p>
+
+  <div class="flow">
+    <pre>
+CPUfreq (parent)              DDR devfreq (child)
+  CPU: 400 MHz    ───────────→   DDR: 400 MHz
+  CPU: 800 MHz    ───────────→   DDR: 800 MHz
+  CPU: 1.6 GHz    ───────────→   DDR: 1600 MHz
+
+  Parent frekans değişimi → passive governor → child frekans güncellenir
+    </pre>
+  </div>
+
+  <h3>devfreq_passive_data yapısı</h3>
+<pre><code>#include &lt;linux/devfreq-event.h&gt;
+
+struct devfreq_passive_data {
+    struct devfreq  *parent;    /* NULL = CPUfreq'i dinle */
+
+    int (*get_target_freq)(struct devfreq *devfreq,
+                           unsigned long *freq);
+};
+
+/* DDR devfreq sürücüsünde: CPUfreq'e pasif bağlanma */
+static struct devfreq_passive_data ddr_passive_data = {
+    .parent = NULL,
+};
+
+struct devfreq *ddr_df = devfreq_add_device(dev,
+                                             &amp;ddr_profile,
+                                             DEVFREQ_GOV_PASSIVE,
+                                             &amp;ddr_passive_data);</code></pre>
+
+  <h3>Parent-child frekans eşleme tablosu (DT)</h3>
+<pre><code>/* arch/arm64/boot/dts/vendor/board.dts */
+
+dmc: dmc@10000000 {
+    compatible = "vendor,ddr-ctrl";
+    operating-points-v2 = &lt;&amp;ddr_opp_table&gt;;
+    devfreq-events = &lt;&amp;ddr_perf&gt;;
+};
+
+ddr_opp_table: opp-table-ddr {
+    compatible = "operating-points-v2";
+
+    opp-400000000 {
+        opp-hz = /bits/ 64 &lt;400000000&gt;;
+        opp-microvolt = &lt;1100000&gt;;
+        required-opps = &lt;&amp;cpu_opp_400mhz&gt;;
+    };
+    opp-800000000 {
+        opp-hz = /bits/ 64 &lt;800000000&gt;;
+        opp-microvolt = &lt;1150000&gt;;
+        required-opps = &lt;&amp;cpu_opp_800mhz&gt;;
+    };
+    opp-1600000000 {
+        opp-hz = /bits/ 64 &lt;1600000000&gt;;
+        opp-microvolt = &lt;1200000&gt;;
+        required-opps = &lt;&amp;cpu_opp_1600mhz&gt;;
+    };
+};</code></pre>
+
+  <h3>Özel frekans dönüşüm fonksiyonu</h3>
+<pre><code>/* CPU 1 GHz → DDR 800 MHz gibi özel eşleme */
+static int custom_freq_mapping(struct devfreq *devfreq,
+                                unsigned long *freq)
+{
+    unsigned long cpu_freq = *(unsigned long *)devfreq-&gt;data;
+
+    if (cpu_freq &lt;= 400000000)
+        *freq = 400000000;
+    else if (cpu_freq &lt;= 800000000)
+        *freq = 533000000;
+    else if (cpu_freq &lt;= 1200000000)
+        *freq = 800000000;
+    else
+        *freq = 1600000000;
+
+    return 0;
+}
+
+static struct devfreq_passive_data custom_passive = {
+    .parent          = NULL,
+    .get_target_freq = custom_freq_mapping,
+};</code></pre>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> Thermal + devfreq entegrasyonu</h2>
+  <p class="section-lead">devfreq cooling device, GPU veya DDR sıcaklığı belirli eşiği aşınca frekansı otomatik düşürerek termal koruma sağlar.</p>
+
+  <h3>devfreq_cooling_register</h3>
+<pre><code>#include &lt;linux/devfreq_cooling.h&gt;
+
+struct thermal_cooling_device *cdev;
+
+/* devfreq cihazını thermal cooling olarak kaydet */
+cdev = devfreq_cooling_em_register(devfreq, em_dev);
+if (IS_ERR(cdev)) {
+    dev_err(dev, "thermal cooling kaydı başarısız: %ld\n",
+            PTR_ERR(cdev));
+    return PTR_ERR(cdev);
+}
+
+/* Energy Model olmadan (daha basit) */
+cdev = devfreq_cooling_register(devfreq);
+
+/* Temizleme */
+devfreq_cooling_unregister(cdev);</code></pre>
+
+  <h3>Device Tree thermal zone tanımı</h3>
+<pre><code>/* Thermal zone — GPU için */
+thermal-zones {
+    gpu-thermal {
+        polling-delay-passive = &lt;100&gt;;
+        polling-delay          = &lt;1000&gt;;
+
+        thermal-sensors = &lt;&amp;gpu_tsens&gt;;
+
+        trips {
+            gpu_alert: gpu-alert {
+                temperature = &lt;75000&gt;;
+                hysteresis  = &lt;2000&gt;;
+                type        = "passive";
+            };
+            gpu_crit: gpu-crit {
+                temperature = &lt;95000&gt;;
+                hysteresis  = &lt;5000&gt;;
+                type        = "critical";
+            };
+        };
+
+        cooling-maps {
+            map0 {
+                trip         = &lt;&amp;gpu_alert&gt;;
+                cooling-device = &lt;&amp;gpu
+                    THERMAL_NO_LIMIT
+                    THERMAL_NO_LIMIT&gt;;
+            };
+        };
+    };
+};</code></pre>
+
+  <h3>Thermal state eşleme</h3>
+<pre><code>/*
+ * devfreq cooling: OPP sayısı = thermal state sayısı
+ * state 0 = maksimum frekans (en az kısıtlama)
+ * state N = minimum frekans (en fazla kısıtlama)
+ *
+ * 5 OPP ile 5 thermal state örneği:
+ * state 0: 600 MHz — normal
+ * state 1: 480 MHz — 75°C uyarı
+ * state 2: 350 MHz
+ * state 3: 266 MHz
+ * state 4: 160 MHz — termal acil
+ */
+
+cat /sys/class/thermal/cooling_device0/cur_state
+cat /sys/class/thermal/cooling_device0/max_state</code></pre>
+
+  <h3>Power-aware governor ile thermal</h3>
+<pre><code>/* devfreq + EM (Energy Model) ile güç bütçesi */
+#include &lt;linux/energy_model.h&gt;
+
+static int my_gpu_em_probe(struct device *dev)
+{
+    struct em_data_callback cb = {
+        .active_power = gpu_active_power,
+    };
+
+    return em_dev_register_perf_domain(dev,
+                                        gpu_opp_count,
+                                        &amp;cb, cpu_mask, false);
+}
+
+cdev = devfreq_cooling_em_register(devfreq, em_dev);
+/*
+ * Thermal framework sadece frekansı değil
+ * gerçek güç tüketimini baz alarak kısıtlar.
+ * CPU + GPU + DDR güç bütçesi birlikte yönetilir.
+ */</code></pre>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> SoC örnekleri</h2>
+  <p class="section-lead">Mali GPU, Exynos DDR, Rockchip RK3399 ve i.MX8M gibi farklı SoC ailelerindeki devfreq implementasyonlarının incelenmesi.</p>
+
+  <h3>Mali GPU devfreq — Panfrost (mainline)</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Sürücü dosyası</th><th>Hedef donanım</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>drivers/gpu/drm/panfrost/panfrost_devfreq.c</td><td>Mali Midgard/Bifrost (T600, T700, G31–G76)</td></tr>
+        <tr><td>drivers/gpu/drm/lima/lima_devfreq.c</td><td>Mali 400/450 (eski nesil)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+<pre><code>/* Panfrost devfreq implementasyonu özeti */
+
+static int panfrost_devfreq_target(struct device *dev,
+                                    unsigned long *freq, u32 flags)
+{
+    struct panfrost_device *pfdev = dev_get_drvdata(dev);
+    struct dev_pm_opp *opp;
+    int err;
+
+    opp = devfreq_recommended_opp(dev, freq, flags);
+    if (IS_ERR(opp)) return PTR_ERR(opp);
+    dev_pm_opp_put(opp);
+
+    err = dev_pm_opp_set_rate(dev, *freq);
+    return err;
+}
+
+static void panfrost_devfreq_get_status(
+        struct panfrost_device *pfdev,
+        struct devfreq_dev_status *stat)
+{
+    stat-&gt;current_frequency = clk_get_rate(pfdev-&gt;clock);
+    panfrost_cycle_counter_get(pfdev);
+    stat-&gt;busy_time  = pfdev-&gt;devfreq.busy_time;
+    stat-&gt;total_time = pfdev-&gt;devfreq.total_time;
+    pfdev-&gt;devfreq.busy_time  = 0;
+    pfdev-&gt;devfreq.total_time = 0;
+}</code></pre>
+
+  <h3>Exynos DDR devfreq (exynos-bus)</h3>
+<pre><code>/* drivers/devfreq/exynos-bus.c
+ *
+ * Exynos PPMU (Platform Performance Monitoring Unit) donanımını
+ * kullanarak gerçek bus yük ölçümü yapar.
+ * PPMU okuma → yük hesabı → governor kararı
+ */
+
+/* DT yapılandırması (Samsung Exynos 5422) */
+/*
+bus_wcore: bus-wcore {
+    compatible = "samsung,exynos-bus";
+    clocks = &lt;&amp;clock CLK_ACLK_G2D_333&gt;;
+    clock-names = "bus";
+    operating-points-v2 = &lt;&amp;bus_wcore_opp_table&gt;;
+    devfreq-events = &lt;&amp;ppmu_event0_3&gt;;
+    samsung,data-ratio = &lt;4&gt;;
+    status = "okay";
+};
+*/</code></pre>
+
+  <h3>Rockchip RK3399 DDR devfreq</h3>
+<pre><code>/* drivers/devfreq/rk3399_dmc.c
+ *
+ * RK3399: ATF (ARM Trusted Firmware) SMCCC üzerinden frekans değişimi.
+ * DRAM kontrolörü EL3'te yönetilir; Linux sürücüsü ATF'ye istek gönderir.
+ */
+
+static int rk3399_dmcfreq_target(struct device *dev,
+                                  unsigned long *freq, u32 flags)
+{
+    struct rk3399_dmcfreq *dmcfreq = dev_get_drvdata(dev);
+    struct dev_pm_opp *opp;
+    unsigned long target_volt, target_rate;
+    int err;
+
+    opp = devfreq_recommended_opp(dev, freq, flags);
+    if (IS_ERR(opp)) return PTR_ERR(opp);
+    target_rate = dev_pm_opp_get_freq(opp);
+    target_volt = dev_pm_opp_get_voltage(opp);
+    dev_pm_opp_put(opp);
+
+    /* ATF SMCCC ile DDR frekansını değiştir */
+    rockchip_ddr_set_auto_self_refresh(0);
+    err = clk_set_rate(dmcfreq-&gt;dmc_clk, target_rate);
+    rockchip_ddr_set_auto_self_refresh(1);
+
+    return err;
+}
+
+/* DT */
+/*
+dmc: dmc {
+    compatible = "rockchip,rk3399-dmc";
+    devfreq-events = &lt;&amp;dfi&gt;;
+    clocks = &lt;&amp;cru SCLK_DDRCLK&gt;;
+    clock-names = "dmc_clk";
+    operating-points-v2 = &lt;&amp;dmc_opp_table&gt;;
+    center-supply = &lt;&amp;ppvar_centerlogic&gt;;
+    rockchip,pmu = &lt;&amp;pmu&gt;;
+};
+*/</code></pre>
+
+  <h3>i.MX8M DDR devfreq</h3>
+<pre><code>/* drivers/devfreq/imx8m-ddrc.c
+ *
+ * i.MX8M: DDR frequency scaling via GPC + DDRC sürücüsü.
+ * Frekans değişimi TCM'de çalışan firmware ile yapılır;
+ * A53 çekirdekleri değişim sırasında kısa süre duraklatılır.
+ *
+ * CONFIG_ARM_IMX8M_DDRC_DEVFREQ=y gerektirir
+ */
+
+/* DT — i.MX8MQ */
+/*
+ddrc: memory-controller@3d400000 {
+    compatible = "fsl,imx8mq-ddrc", "fsl,imx8m-ddrc";
+    reg = &lt;0x3d400000 0x400000&gt;;
+    clock-names = "core", "pll", "alt", "apb";
+    clocks = &lt;&amp;clk IMX8MQ_CLK_DRAM_CORE&gt;,
+             &lt;&amp;clk IMX8MQ_DRAM_PLL&gt;,
+             &lt;&amp;clk IMX8MQ_CLK_DRAM_ALT&gt;,
+             &lt;&amp;clk IMX8MQ_CLK_DRAM_APB&gt;;
+    operating-points-v2 = &lt;&amp;ddr_opp_table&gt;;
+};
+*/</code></pre>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Hata ayıklama</h2>
+  <p class="section-lead">/sys/class/devfreq/ sysfs arayüzü, trans_stat ve OPP debugfs dosyaları devfreq sorunlarını teşhis etmek için gerekli bilgileri sağlar.</p>
+
+  <h3>/sys/class/devfreq/ arayüzü</h3>
+<pre><code># Sistemdeki tüm devfreq cihazlarını listele
+ls /sys/class/devfreq/
+# 13000000.gpu  ff9a0000.dmc  ffe80000.interconnect
+
+# Mevcut frekans
+cat /sys/class/devfreq/13000000.gpu/cur_freq
+# 350000000
+
+# Minimum/maksimum frekans sınırları
+cat /sys/class/devfreq/13000000.gpu/min_freq
+cat /sys/class/devfreq/13000000.gpu/max_freq
+
+# Mevcut governor
+cat /sys/class/devfreq/13000000.gpu/governor
+
+# Tüm kullanılabilir governor'lar
+cat /sys/class/devfreq/13000000.gpu/available_governors
+# simple_ondemand powersave performance userspace passive
+
+# Kullanılabilir frekanslar (OPP tablosundan)
+cat /sys/class/devfreq/13000000.gpu/available_frequencies
+# 160000000 266000000 350000000 480000000 600000000</code></pre>
+
+  <h3>trans_stat: geçiş istatistikleri</h3>
+<pre><code># Frekans geçiş matrisi
+cat /sys/class/devfreq/13000000.gpu/trans_stat
+
+# Örnek çıktı:
+#      From  :   To
+#           :  160MHz  266MHz  350MHz  480MHz  600MHz  time(ms)
+# 160000000 :       0     245      12       3       1    45231
+# 266000000 :     189       0     301      45       8    12340
+# 350000000 :       8     287       0     123      34     8765
+# 480000000 :       1      32     108       0      87     3421
+# 600000000 :       0       5      28      91       0     1234
+
+# Trans_stat sıfırla
+echo 0 &gt; /sys/class/devfreq/13000000.gpu/trans_stat</code></pre>
+
+  <h3>OPP debugfs</h3>
+<pre><code># OPP debugfs (CONFIG_DEBUG_FS=y gerektirir)
+ls /sys/kernel/debug/opp/
+
+# Belirli cihazın OPP tablosu
+cat /sys/kernel/debug/opp/13000000.gpu/opp_summary
+
+# Örnek çıktı:
+# device                rate(Hz)    volt(uV)    enabled
+# 13000000.gpu         160000000     800000       true
+# 13000000.gpu         266000000     875000       true
+# 13000000.gpu         350000000     912500       true
+# 13000000.gpu         480000000     962500       true
+# 13000000.gpu         600000000    1000000       true</code></pre>
+
+  <h3>devfreq olaylarını izleme</h3>
+<pre><code># ftrace ile devfreq frekans değişimlerini takip et
+echo 1 &gt; /sys/kernel/debug/tracing/events/devfreq/devfreq_frequency/enable
+
+cat /sys/kernel/debug/tracing/trace | grep devfreq_frequency
+
+# Örnek çıktı:
+#  kworker/1:2  [001]  1234.567: devfreq_frequency:
+#      dev=13000000.gpu freq=350000000 prev=266000000
+
+# Güç olayları
+echo 1 &gt; /sys/kernel/debug/tracing/events/power/enable</code></pre>
+
+  <h3>Hızlı tanı betiği</h3>
+<pre><code>#!/bin/sh
+# devfreq sistem sağlık kontrolü
+
+echo "=== devfreq Cihazları ==="
+for dev in /sys/class/devfreq/*/; do
+    name=$(basename "$dev")
+    cur=$(cat "$dev/cur_freq" 2&gt;/dev/null)
+    gov=$(cat "$dev/governor" 2&gt;/dev/null)
+    printf "%-30s  cur=%-12s  gov=%s\n" "$name" "$cur" "$gov"
+done
+
+echo ""
+echo "=== Frekans Sınırları ==="
+for dev in /sys/class/devfreq/*/; do
+    name=$(basename "$dev")
+    min=$(cat "$dev/min_freq" 2&gt;/dev/null)
+    max=$(cat "$dev/max_freq" 2&gt;/dev/null)
+    printf "%-30s  min=%-12s  max=%s\n" "$name" "$min" "$max"
+done
+
+echo ""
+echo "=== Thermal Cooling Durumu ==="
+for cdev in /sys/class/thermal/cooling_device*/; do
+    type=$(cat "$cdev/type" 2&gt;/dev/null)
+    cur=$(cat "$cdev/cur_state" 2&gt;/dev/null)
+    max=$(cat "$cdev/max_state" 2&gt;/dev/null)
+    if echo "$type" | grep -qi "devfreq\|gpu\|ddr"; then
+        printf "%-40s  state=%s/%s\n" "$type" "$cur" "$max"
+    fi
+done</code></pre>
+
+  <h3>Yaygın sorunlar</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Belirti</th><th>Neden</th><th>Çözüm</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>cur_freq hiç değişmiyor</td><td>Governor donmuş, get_dev_status hatalı</td><td>polling_ms kontrol et; dmesg'e bak; governor değiştir</td></tr>
+        <tr><td>devfreq_add_device -EINVAL</td><td>OPP tablosu boş veya profil eksik</td><td>dev_pm_opp_get_opp_count() pozitif olduğunu doğrula</td></tr>
+        <tr><td>Frekans maksimumda takılı</td><td>performance governor veya thermal cooling</td><td>governor ve thermal cur_state kontrol et</td></tr>
+        <tr><td>Yüksek güç tüketimi</td><td>performance governor aktif</td><td>simple_ondemand'e geç; upthreshold düşür</td></tr>
+        <tr><td>OPP tablosu DT'den yüklenmiyor</td><td>of_dev_pm_opp_add_table hatası</td><td>DT compatible ve phandle bağlantısını kontrol et</td></tr>
+        <tr><td>Thermal kısıtlama çalışmıyor</td><td>cooling device kaydı eksik</td><td>devfreq_cooling_register() çağrısını ve thermal zone trip binding'i doğrula</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+</main>

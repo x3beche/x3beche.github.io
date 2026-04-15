@@ -1,0 +1,837 @@
+---
+layout: tutorial
+title: "TPM2 — Donanımsal Güven Kökü"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>GÜVENLİK</span>
+    <span>2026</span>
+  </div>
+  <h1>TPM2<br><em>Donanımsal Güven Kökü</em></h1>
+  <p class="subtitle">PCR ölçümleri, sealing/unsealing, remote attestation, LUKS disk şifreleme — Linux üzerinde TPM2 eksiksiz rehber.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">TPM2 nedir — donanımsal güven kökü</a></li>
+    <li><a href="#s1">TPM2 mimarisi — PCR, NV, anahtar hiyerarşisi</a></li>
+    <li><a href="#s2">Linux TPM2 sürücüsü</a></li>
+    <li><a href="#s3">tpm2-tools temel komutlar</a></li>
+    <li><a href="#s4">Anahtar hiyerarşisi ve key oluşturma</a></li>
+    <li><a href="#s5">Sealing ve Unsealing — PCR policy</a></li>
+    <li><a href="#s6">Remote Attestation</a></li>
+    <li><a href="#s7">LUKS + TPM2 otomatik disk şifre çözme</a></li>
+    <li><a href="#s8">Hata ayıklama ve test</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> TPM2 nedir — donanımsal güven kökü</h2>
+  <p class="section-lead">Trusted Platform Module (TPM), kriptografik anahtarları ve ölçümleri koruyan, tamper-evident bir güvenlik yardımcı işlemcisidir; TCG (Trusted Computing Group) tarafından standartlaştırılmıştır.</p>
+
+  <h3>Neden TPM gereklidir</h3>
+  <p>Yazılım tabanlı güvenlik çözümleri, işletim sistemi tehlikeye girdiğinde de tehlikeye girer. TPM'in anahtarları ve sırları donanım içinde koruması saldırı yüzeyini köklü biçimde azaltır.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Güven kökü (Root of Trust)</span><span class="desc">Endorsement Key (EK) fabrikada üretilir ve asla TPM'i terk edemez; donanım kimliğinin temeli</span></div>
+    <div class="param"><span class="name">Platform ölçümü</span><span class="desc">Boot aşamalarının hash'leri PCR register'larına kaydedilir — platform durumunun kanıtı</span></div>
+    <div class="param"><span class="name">Mühürlü depolama (Sealing)</span><span class="desc">Veri, yalnızca belirli PCR değerleri geçerliyse açılabilen bir zarfla şifrelenir</span></div>
+    <div class="param"><span class="name">Remote Attestation</span><span class="desc">TPM imzalı PCR quote'u uzak tarafa gönderilerek platform güvenilirliği kanıtlanır</span></div>
+    <div class="param"><span class="name">Rastgele sayı üreteci</span><span class="desc">Donanım entropi kaynağı — öngörülemeyen kriptografik rastgele değerler</span></div>
+  </div>
+
+  <h3>TPM2 ve TPM1.2 farkları</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Özellik</th><th>TPM 1.2</th><th>TPM 2.0</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Algoritma esnekliği</td><td>Sadece SHA-1, RSA-2048</td><td>SHA-256/384/512, AES, ECC, ECDSA</td></tr>
+        <tr><td>PCR sayısı</td><td>24 (bank yok)</td><td>24 × N bank (her hash için ayrı bank)</td></tr>
+        <tr><td>Anahtar hiyerarşisi</td><td>SRK (Storage Root Key) tek hiyerarşi</td><td>3 bağımsız hiyerarşi: endorsement, storage, platform</td></tr>
+        <tr><td>Politika sistemi</td><td>PCR tek koşul</td><td>Karmaşık politika ağacı (AND/OR/temporal)</td></tr>
+        <tr><td>NV depolama</td><td>Kısıtlı</td><td>Zengin NV tip sistemi (counter, bitfield, extend)</td></tr>
+        <tr><td>Linux kernel desteği</td><td>CONFIG_TCG_TPM</td><td>CONFIG_TCG_TPM + CONFIG_TCG_TIS/CRB</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>TPM2 form faktörleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">Discrete TPM (dTPM)</span><span class="desc">Bağımsız SPI/I2C/LPC çipli — Infineon SLB9670, STMicro ST33, Microchip ATECC serisi</span></div>
+    <div class="param"><span class="name">Firmware TPM (fTPM)</span><span class="desc">AMD PSP / Intel PTT içinde çalışır — ayrı donanım yok, TEE içinde yazılım TPM</span></div>
+    <div class="param"><span class="name">Software TPM (swtpm)</span><span class="desc">QEMU geliştirme ortamı için — libtpms tabanlı, production'da kullanılmaz</span></div>
+    <div class="param"><span class="name">Integrated TPM (iTPM)</span><span class="desc">SoC içinde yerleşik — bazı ARM, Qualcomm ve NXP platformları</span></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> TPM2 mimarisi — PCR, NV, anahtar hiyerarşisi</h2>
+  <p class="section-lead">TPM2, Platform Configuration Register'lar (PCR), Non-Volatile depolama (NV) ve üç katmanlı anahtar hiyerarşisinden oluşan bir güvenlik işlemcisidir.</p>
+
+  <h3>PCR (Platform Configuration Register)</h3>
+  <p>PCR, sadece <em>extend</em> işlemiyle güncellenebilen tek yönlü register'lardır. Extend: <code>PCR_new = Hash(PCR_old || new_measurement)</code></p>
+
+  <div class="flow">
+    <pre>
+Boot aşaması     PCR  Hash banka    Ölçülen içerik
+──────────────   ───  ──────────    ──────────────────────────
+UEFI/BIOS        0    SHA-256       Core BIOS kodu
+UEFI/BIOS        1    SHA-256       BIOS konfigürasyonu
+Option ROMs      2    SHA-256       Seçenek ROM kodu
+Option ROMs      3    SHA-256       Seçenek ROM konfigürasyonu
+IBL              4    SHA-256       MBR / GPT boot kodu
+IBL              5    SHA-256       Boot Manager konfigürasyonu
+State            6    SHA-256       Platform üreticisi spesifik
+Secure Boot      7    SHA-256       Secure Boot politika değişkenleri
+Kernel/IMA      10    SHA-256       Linux IMA ölçümleri
+─────────────────────────────────────────────────────────────
+PCR 8, 9, 11-23 → kullanıcı uygulamalarına açık</pre>
+  </div>
+
+  <h3>Anahtar hiyerarşisi</h3>
+  <div class="flow">
+    <pre>
+                    TPM Seeds (donanım içi, asla çıkmaz)
+                           │
+          ┌────────────────┼────────────────┐
+          ▼                ▼                ▼
+  Endorsement          Storage          Platform
+  Hierarchy (EH)      Hierarchy (SH)   Hierarchy (PH)
+          │                │
+          ▼                ▼
+  Endorsement Key   Storage Root Key (SRK)
+  (EK) — cihaz         │
+  kimliği              ├── Child Key 1 (signing)
+  EK cert fabrika      ├── Child Key 2 (encryption)
+  CA'sından gelir      └── Nested Key (key wrapping)</pre>
+  </div>
+
+  <h3>NV (Non-Volatile) depolama</h3>
+  <p>TPM2'nin dahili kalıcı depolama alanıdır. Platform bilgileri, politika hash'leri ve küçük veri parçaları burada tutulur.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>NV tipi</th><th>TPMA_NV bayrağı</th><th>Kullanım</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Ordinary</td><td>-</td><td>Genel amaçlı okuma/yazma</td></tr>
+        <tr><td>Counter</td><td>TPMA_NV_COUNTER</td><td>Monoton artan sayaç — anti-rollback</td></tr>
+        <tr><td>Bits</td><td>TPMA_NV_BITS</td><td>64-bit bit alanı — OR ile güncellenir</td></tr>
+        <tr><td>Extend</td><td>TPMA_NV_EXTEND</td><td>PCR benzeri extend — log için</td></tr>
+        <tr><td>PIN pass</td><td>TPMA_NV_PIN_PASS</td><td>PIN doğrulama sayacı</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Linux TPM2 sürücüsü</h2>
+  <p class="section-lead">Linux çekirdeği TPM2'yi <code>/dev/tpm0</code> ve <code>/dev/tpmrm0</code> aygıt dosyaları üzerinden sunar; farklı donanım arayüzleri için ayrı sürücü modülleri kullanılır.</p>
+
+  <h3>Kernel konfigürasyonu</h3>
+  <pre><code># .config
+CONFIG_TCG_TPM=y             # Temel TPM altyapısı
+CONFIG_TCG_TIS=y             # TIS (TPM Interface Specification) — LPC/SPI
+CONFIG_TCG_CRB=y             # CRB (Command Response Buffer) — MMIO/ACPI
+CONFIG_TCG_TIS_SPI=y         # SPI bağlantılı TPM (dTPM)
+CONFIG_TCG_TIS_I2C=y         # I2C bağlantılı TPM (bazı dTPM'ler)
+CONFIG_TCG_TIS_I2C_CR50=y    # Google Cr50/Ti50 Chromebook TPM
+CONFIG_TCG_VTPM_PROXY=y      # Virtual TPM proxy (konteyner için)
+CONFIG_TCG_FTPM_TEE=y        # fTPM — ARM TEE içinde firmware TPM</code></pre>
+
+  <h3>/dev/tpm0 ve /dev/tpmrm0 farkı</h3>
+  <div class="params">
+    <div class="param"><span class="name">/dev/tpm0</span><span class="desc">Ham TPM erişimi — tek kullanıcı, session yönetimi uygulamaya ait; root gerektirir</span></div>
+    <div class="param"><span class="name">/dev/tpmrm0</span><span class="desc">Resource Manager — çok süreçli erişim, kernel TPM RM session çakışmalarını yönetir; tss2 grubu ile erişilir</span></div>
+  </div>
+
+  <pre><code># TPM2 varlığını doğrula
+ls -la /dev/tpm*
+# crw-rw---- 1 root tss 10, 224 Apr 15 09:00 /dev/tpm0
+# crw-rw---- 1 root tss 10, 223 Apr 15 09:00 /dev/tpmrm0
+
+# Kullanıcıyı tss grubuna ekle (root olmadan kullanım)
+sudo usermod -aG tss $USER
+
+# Sürücü bilgisi
+cat /sys/class/tpm/tpm0/tpm_version_major  # 2
+cat /sys/class/tpm/tpm0/pcr-sha256/0       # PCR-0 değeri
+
+# Kernel mesajları
+dmesg | grep -i tpm</code></pre>
+
+  <h3>SPI dTPM için device tree tanımı</h3>
+  <pre><code>/* board.dts — Infineon SLB9670 SPI TPM */
+&amp;spi1 {
+    status = "okay";
+    tpm@0 {
+        compatible = "infineon,slb9670", "tcg,tpm_tis-spi";
+        reg = &lt;0&gt;;                      /* CS0 */
+        spi-max-frequency = &lt;10000000&gt;; /* 10 MHz max */
+        interrupt-parent = &lt;&amp;gpio3&gt;;
+        interrupts = &lt;12 IRQ_TYPE_LEVEL_LOW&gt;;
+        reset-gpios = &lt;&amp;gpio3 11 GPIO_ACTIVE_LOW&gt;;
+    };
+};</code></pre>
+
+  <h3>I2C dTPM için device tree tanımı</h3>
+  <pre><code>/* board.dts — STMicro ST33 I2C TPM */
+&amp;i2c2 {
+    status = "okay";
+    tpm@2e {
+        compatible = "st,st33htpm-i2c";
+        reg = &lt;0x2e&gt;;
+        interrupt-parent = &lt;&amp;gpio2&gt;;
+        interrupts = &lt;6 IRQ_TYPE_LEVEL_LOW&gt;;
+    };
+};</code></pre>
+
+  <h3>QEMU swtpm — geliştirme ortamı</h3>
+  <pre><code># swtpm kur
+sudo apt install swtpm swtpm-tools
+
+# State dizini oluştur ve TPM başlat
+mkdir /tmp/mytpm
+swtpm socket \
+  --tpmstate dir=/tmp/mytpm \
+  --ctrl type=unixio,path=/tmp/mytpm/swtpm-sock \
+  --log level=20 \
+  --tpm2 &amp;
+
+# QEMU'ya bağla
+qemu-system-aarch64 \
+  -chardev socket,id=chrtpm,path=/tmp/mytpm/swtpm-sock \
+  -tpmdev emulator,id=tpm0,chardev=chrtpm \
+  -device tpm-tis-device,tpmdev=tpm0 \
+  [diğer QEMU seçenekleri]</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> tpm2-tools temel komutlar</h2>
+  <p class="section-lead">tpm2-tools paketi, TPM2 işlemlerini komut satırından yapmanızı sağlayan araçların koleksiyonudur; her komut bir TPM2 komutuna birebir karşılık gelir.</p>
+
+  <h3>Kurulum</h3>
+  <pre><code>sudo apt install tpm2-tools libtss2-dev
+
+# Versiyon kontrol
+tpm2_getcap --version
+
+# /dev/tpmrm0 kullanımı için TCTI ortam değişkeni
+export TPM2TOOLS_TCTI="device:/dev/tpmrm0"</code></pre>
+
+  <h3>Temel sorgulama komutları</h3>
+  <pre><code># TPM2 yeteneklerini sorgula
+tpm2_getcap properties-fixed    # Sabit özellikler (firmware ver, PCR count)
+tpm2_getcap properties-variable # Değişken özellikler
+tpm2_getcap algorithms          # Desteklenen algoritmalar
+tpm2_getcap handles-persistent  # Kalıcı anahtar handle listesi
+
+# TPM2 donanımsal rastgele sayı üret
+tpm2_getrandom 32 --hex          # 32 byte hex olarak
+tpm2_getrandom 64 -o /tmp/rand   # 64 byte dosyaya yaz
+
+# PCR değerlerini oku
+tpm2_pcrread                     # Tüm PCR bankları (SHA-1 + SHA-256)
+tpm2_pcrread sha256              # Sadece SHA-256 bankı
+tpm2_pcrread sha256:0,1,7       # Seçili PCR'lar
+tpm2_pcrread sha256:10 | sha256sum  # PCR-10 değerini doğrula</code></pre>
+
+  <h3>NV okuma/yazma</h3>
+  <pre><code># NV index tanımla (0x01500001 — kullanıcı alanı başlangıcı)
+tpm2_nvdefine \
+  0x01500001 \
+  --hierarchy owner \
+  --size 32 \
+  --attributes "ownerwrite|ownerread"
+
+# NV'ye yaz
+echo -n "gizli_veri_12345678901234567" | \
+  tpm2_nvwrite 0x01500001 --input -
+
+# NV'den oku
+tpm2_nvread 0x01500001 --size 32
+
+# NV index bilgisi
+tpm2_nvreadpublic 0x01500001
+
+# NV index sil
+tpm2_nvundefine 0x01500001
+
+# Monoton sayaç NV (anti-replay)
+tpm2_nvdefine 0x01500010 \
+  --hierarchy owner \
+  --size 8 \
+  --attributes "ownerwrite|ownerread|nt=counter"
+tpm2_nvincrement 0x01500010      # Sayacı artır
+tpm2_nvread 0x01500010           # Mevcut sayacı oku</code></pre>
+
+  <h3>TPM2 event log okuma</h3>
+  <pre><code># UEFI/BIOS'un PCR extend ettiği event log
+tpm2_eventlog /sys/kernel/security/tpm0/binary_bios_measurements
+
+# Event log parse çıktısı (özet):
+# PCRIndex: 0, EventType: EV_EFI_VARIABLE_BOOT
+#   SHA256: a1b2c3d4...
+#   VariableName: Boot0001
+# PCRIndex: 7, EventType: EV_EFI_VARIABLE_AUTHORITY
+#   SHA256: e5f6a7b8...
+#   VariableName: db (Secure Boot DB)</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Anahtar hiyerarşisi ve key oluşturma</h2>
+  <p class="section-lead">TPM2 anahtar hiyerarşisinde primary key kök, child key'ler ise yaprakları oluşturur; anahtarlar TPM dışına şifreli "context" olarak taşınabilir.</p>
+
+  <h3>Primary key oluşturma</h3>
+  <pre><code># Storage hiyerarşisinde RSA-2048 primary key
+tpm2_createprimary \
+  --hierarchy owner \
+  --key-algorithm rsa2048 \
+  --hash-algorithm sha256 \
+  --key-context /tmp/primary.ctx
+
+# ECC P-256 primary key (daha hızlı, daha küçük)
+tpm2_createprimary \
+  --hierarchy owner \
+  --key-algorithm ecc256 \
+  --hash-algorithm sha256 \
+  --key-context /tmp/primary_ecc.ctx
+
+# Primary key'i kalıcı handle'a kaydet (boot sonrasında kullanım)
+tpm2_evictcontrol \
+  --hierarchy owner \
+  --object-context /tmp/primary.ctx \
+  0x81000001              # kalıcı handle
+# Artık 0x81000001 her zaman erişilebilir
+
+# Kalıcı handle listesi
+tpm2_getcap handles-persistent</code></pre>
+
+  <h3>Child key oluşturma</h3>
+  <pre><code># İmzalama anahtarı (ECC P-256, restricted signing)
+tpm2_create \
+  --parent-context /tmp/primary.ctx \
+  --key-algorithm ecc256 \
+  --hash-algorithm sha256 \
+  --attributes "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|sign" \
+  --private /tmp/signing.priv \
+  --public  /tmp/signing.pub
+
+# Şifreleme/şifre çözme anahtarı (RSA-2048)
+tpm2_create \
+  --parent-context /tmp/primary.ctx \
+  --key-algorithm rsa2048 \
+  --hash-algorithm sha256 \
+  --attributes "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|decrypt" \
+  --private /tmp/encrypt.priv \
+  --public  /tmp/encrypt.pub
+
+# Anahtarı yükle (kullanım için context gerekli)
+tpm2_load \
+  --parent-context /tmp/primary.ctx \
+  --private /tmp/signing.priv \
+  --public  /tmp/signing.pub \
+  --key-context /tmp/signing.ctx
+
+# İmzalama
+echo "imzalanacak mesaj" | sha256sum -b | awk '{print $1}' | \
+  xxd -r -p > /tmp/msg.hash
+tpm2_sign \
+  --key-context /tmp/signing.ctx \
+  --hash-algorithm sha256 \
+  --scheme ecdsa \
+  --message /tmp/msg.hash \
+  --signature /tmp/msg.sig
+
+# İmzayı doğrula
+tpm2_verifysignature \
+  --key-context /tmp/signing.ctx \
+  --hash-algorithm sha256 \
+  --message /tmp/msg.hash \
+  --signature /tmp/msg.sig</code></pre>
+
+  <h3>Endorsement Key ve EK sertifikası</h3>
+  <pre><code># EK oluştur (genellikle fabrikada hazır, tekrar oluşturulabilir)
+tpm2_createek \
+  --ek-context /tmp/ek.ctx \
+  --key-algorithm rsa2048 \
+  --public /tmp/ek.pub
+
+# EK sertifikasını NV'den oku (fabrika CA imzalı)
+# RSA-2048 EK cert: NV index 0x01C00002
+tpm2_nvread 0x01C00002 -o /tmp/ek_cert.der
+
+# EK sertifikasını PEM'e çevir
+openssl x509 -inform DER -in /tmp/ek_cert.der -out /tmp/ek_cert.pem
+openssl x509 -in /tmp/ek_cert.pem -text -noout</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Sealing ve Unsealing — PCR policy</h2>
+  <p class="section-lead">Sealing (mühürleme), bir veriyi belirli PCR değerleriyle kilitler; yalnızca bu PCR değerleri korunursa veri açılabilir (unseal). Disk şifreleme anahtarlarını saklamak için idealdir.</p>
+
+  <h3>Basit sealing (PCR policy olmadan)</h3>
+  <pre><code># Seal: sırrı TPM'e kilitle
+echo "disk_sifreleme_parolasi_abc123" | \
+  tpm2_create \
+    --parent-context /tmp/primary.ctx \
+    --sealing-input - \
+    --private /tmp/sealed.priv \
+    --public  /tmp/sealed.pub
+
+# Unseal: sırrı geri al
+tpm2_load \
+  --parent-context /tmp/primary.ctx \
+  --private /tmp/sealed.priv \
+  --public  /tmp/sealed.pub \
+  --key-context /tmp/sealed.ctx
+
+tpm2_unseal --object-context /tmp/sealed.ctx</code></pre>
+
+  <h3>PCR policy ile sealing</h3>
+  <pre><code"># 1. Mevcut PCR değerlerini kaydet (seal sırasında)
+tpm2_pcrread sha256:0,1,7 -o /tmp/pcr_values.bin
+
+# 2. PCR policy oluştur — PCR 0, 1, 7 değerleri eşleşmeli
+tpm2_startauthsession --session /tmp/session.ctx --policy-session
+
+tpm2_policypcr \
+  --session /tmp/session.ctx \
+  --pcr-list sha256:0,1,7 \
+  --pcr-digest /tmp/pcr_values.bin \
+  --policy /tmp/pcr_policy.bin
+
+tpm2_flushcontext /tmp/session.ctx
+
+# 3. Policy ile seal et
+tpm2_create \
+  --parent-context /tmp/primary.ctx \
+  --sealing-input /tmp/secret.bin \
+  --policy /tmp/pcr_policy.bin \
+  --private /tmp/sealed_pcr.priv \
+  --public  /tmp/sealed_pcr.pub
+
+# 4. Unseal — aynı PCR değerleri gerekmeli
+tpm2_load \
+  --parent-context /tmp/primary.ctx \
+  --private /tmp/sealed_pcr.priv \
+  --public  /tmp/sealed_pcr.pub \
+  --key-context /tmp/sealed_pcr.ctx
+
+tpm2_startauthsession --session /tmp/unseal_session.ctx --policy-session
+
+tpm2_policypcr \
+  --session /tmp/unseal_session.ctx \
+  --pcr-list sha256:0,1,7
+
+tpm2_unseal \
+  --object-context /tmp/sealed_pcr.ctx \
+  --auth session:/tmp/unseal_session.ctx
+
+tpm2_flushcontext /tmp/unseal_session.ctx</code></pre>
+
+  <h3>Karmaşık politika — PCR AND parola</h3>
+  <pre><code># PCR VE parola koşulunu birleştir (PolicyAND)
+# Her iki koşul da sağlanmadan unseal olmaz
+
+tpm2_startauthsession --session /tmp/trial.ctx --policy-session
+
+# PCR koşulu
+tpm2_policypcr \
+  --session /tmp/trial.ctx \
+  --pcr-list sha256:7
+
+# Parola koşulu
+tpm2_policyauthvalue --session /tmp/trial.ctx
+
+# Politikayı kaydet
+tpm2_policysaved --session /tmp/trial.ctx \
+  --output /tmp/compound_policy.bin
+
+tpm2_flushcontext /tmp/trial.ctx
+
+# Bu politikayla seal et
+tpm2_create \
+  --parent-context /tmp/primary.ctx \
+  --sealing-input /tmp/secret.bin \
+  --policy /tmp/compound_policy.bin \
+  --key-auth secretpassword \
+  --private /tmp/sealed_compound.priv \
+  --public  /tmp/sealed_compound.pub</code></pre>
+
+  <h3>Boot sırasında otomatik unseal scripti</h3>
+  <pre><code>#!/bin/bash
+# /usr/local/bin/tpm2-unseal-key.sh
+
+PRIMARY_CTX=/run/tpm/primary.ctx
+SEALED_PRIV=/etc/tpm2/sealed.priv
+SEALED_PUB=/etc/tpm2/sealed.pub
+
+mkdir -p /run/tpm
+
+# Primary key yükle (kalıcı handle)
+tpm2_readpublic -c 0x81000001 -o $PRIMARY_CTX 2>/dev/null || \
+  tpm2_createprimary -C owner -G rsa2048 -c $PRIMARY_CTX
+
+# Sealed key yükle
+tpm2_load -C $PRIMARY_CTX \
+  -r $SEALED_PRIV -u $SEALED_PUB \
+  -c /run/tpm/sealed.ctx
+
+# PCR session aç ve unseal yap
+tpm2_startauthsession -S /run/tpm/session.ctx --policy-session
+tpm2_policypcr -S /run/tpm/session.ctx -l sha256:0,1,7
+tpm2_unseal -c /run/tpm/sealed.ctx \
+  -p session:/run/tpm/session.ctx
+tpm2_flushcontext /run/tpm/session.ctx</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Remote Attestation</h2>
+  <p class="section-lead">Remote Attestation, bir cihazın platform durumunu (PCR değerleri) uzak bir doğrulayıcıya TPM imzalı kanıtlarla ispat etmesini sağlar.</p>
+
+  <h3>Attestation mimarisi</h3>
+  <div class="flow">
+    <pre>
+Attester (Cihaz)                    Verifier (Sunucu)
+────────────────                    ─────────────────
+                    ←── challenge (nonce) ───
+
+1. AK (Attestation Key) oluştur
+2. AK public key gönder ──────────────────────&gt;
+                         &lt;─── EK challenge ───
+3. EK ile AK kimliğini kanıtla
+   (MakeCredential / ActivateCredential)
+4. AK sertifikası al ─────────────────────────&gt;
+
+                    ←── quote_nonce ──────────
+
+5. TPM2_Quote:
+   - PCR değerlerini imzala (AK ile)
+   - Signing: TPMS_ATTEST yapısı
+   - signature: ECDSA/RSASSA
+
+   quote + signature + PCR_log ──────────────&gt;
+
+                                6. Doğrula:
+                                   - AK sertifikasını kontrol et
+                                   - TPMS_ATTEST içindeki nonce eşleş?
+                                   - PCR değerleri referans ile uyuşuyor?
+                                   - Event log tutarlı?
+                                   → Güven kararı</pre>
+  </div>
+
+  <h3>Attestation Key (AK) oluşturma</h3>
+  <pre><code># Restricted imzalama anahtarı (AK) oluştur
+# restricted flag: sadece TPM iç yapıları imzalayabilir (TPMS_ATTEST gibi)
+tpm2_createak \
+  --ek-context /tmp/ek.ctx \
+  --ak-context /tmp/ak.ctx \
+  --key-algorithm rsa2048 \
+  --hash-algorithm sha256 \
+  --sign-algorithm rsassa \
+  --public /tmp/ak.pub \
+  --private /tmp/ak.priv
+
+# AK'yı kalıcı handle'a kaydet
+tpm2_evictcontrol -C owner -c /tmp/ak.ctx 0x81010001</code></pre>
+
+  <h3>PCR Quote oluşturma</h3>
+  <pre><code"># Verifier'dan nonce al (replay koruması için)
+NONCE=$(openssl rand -hex 20)
+echo "$NONCE" > /tmp/nonce.hex
+
+# PCR 0-7 ve 10'u imzala (AK özel anahtarıyla)
+tpm2_quote \
+  --key-context 0x81010001 \
+  --pcr-list sha256:0,1,2,3,4,5,6,7,10 \
+  --qualification "$NONCE" \
+  --message /tmp/quote.msg \
+  --signature /tmp/quote.sig \
+  --pcrs /tmp/quote.pcrs \
+  --attestation /tmp/quote.attest
+
+# Event log ekle (verifier hash zincirini doğrulamak için)
+cp /sys/kernel/security/tpm0/binary_bios_measurements /tmp/eventlog.bin
+
+# Verifier'a gönder: quote.attest + quote.sig + quote.pcrs + eventlog.bin
+# (genellikle attestation protocol üzerinden: Keylime, rats-tls vb.)</code></pre>
+
+  <h3>Verifier tarafında doğrulama</h3>
+  <pre><code># tpm2_checkquote ile basit doğrulama
+tpm2_checkquote \
+  --public /tmp/ak.pub \
+  --message /tmp/quote.msg \
+  --signature /tmp/quote.sig \
+  --pcrs /tmp/quote.pcrs \
+  --qualification "$NONCE"
+
+# Başarılı çıktı:
+# pcrs:
+#   sha256:
+#     0 : 0xd9fa6f8b...
+#     7 : 0x6a3d9f2c...
+# sig: OK
+# qualification: OK
+
+# Python ile programatik doğrulama (tpm2-pytss)
+# pip install tpm2-pytss
+</code></pre>
+
+  <h3>Keylime — üretime hazır attestation framework</h3>
+  <pre><code># Keylime kurulumu
+pip install keylime
+
+# Verifier (sunucu)
+keylime_verifier --config /etc/keylime/verifier.conf &amp;
+
+# Registrar (AK kayıt sunucusu)
+keylime_registrar --config /etc/keylime/registrar.conf &amp;
+
+# Agent (cihaz tarafı)
+keylime_agent --config /etc/keylime/agent.conf &amp;
+
+# Cihazı kaydet ve politika ata
+keylime_tenant \
+  --command add \
+  --agent-ip 192.168.1.100 \
+  --tpm-policy '{"22":["0000000000000000000000000000000000000000000000000000000000000000"]}' \
+  --allowlist /etc/keylime/allowlist.txt</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> LUKS + TPM2 otomatik disk şifre çözme</h2>
+  <p class="section-lead">LUKS2 şifreli diskin açılma parolasını TPM2 ile mühürleyerek boot sırasında kullanıcı müdahalesi olmadan otomatik şifre çözme sağlanır.</p>
+
+  <h3>clevis ile LUKS+TPM2 entegrasyonu</h3>
+  <div class="flow">
+    <pre>
+Boot zamanı akışı:
+──────────────────
+initramfs başlar
+    │
+    ▼
+clevis-initrd-luks
+    │
+    ▼
+clevis decrypt tpm2 (LUKS slot meta verisini okur)
+    │  → TPM2 unseal (PCR policy doğrulama)
+    │  → LUKS passphrase geri döner
+    ▼
+cryptsetup luksOpen /dev/sda2 → /dev/mapper/root
+    │
+    ▼
+rootfs mount → systemd init</pre>
+  </div>
+
+  <h3>clevis kurulumu ve bağlama</h3>
+  <pre><code"># Bağımlılıklar
+sudo apt install clevis clevis-tpm2 clevis-luks clevis-initramfs
+
+# Mevcut LUKS2 cihazını TPM2'ye bağla
+# PCR 0,1,7 politikası ile (UEFI + Secure Boot PCR'ları)
+sudo clevis luks bind -d /dev/sda2 tpm2 \
+  '{"pcr_ids":"0,1,7","pcr_bank":"sha256"}'
+
+# Parola girmeniz istenir (mevcut LUKS slot parolası)
+
+# Bağlamayı listele
+sudo clevis luks list -d /dev/sda2
+# 1: tpm2 '{"hash":"sha256","key":"ecc","pcr_bank":"sha256","pcr_ids":"0,1,7"}'
+
+# initramfs güncelle
+sudo update-initramfs -u
+
+# Test: manuel olarak dene
+sudo clevis decrypt tpm2 &lt; /tmp/jwe_token
+# (Başarılıysa LUKS passphrase çıkar)</code></pre>
+
+  <h3>tpm2-pkcs11 ile LUKS entegrasyonu</h3>
+  <pre><code># tpm2-pkcs11 kur
+sudo apt install tpm2-pkcs11 tpm2-pkcs11-tools
+
+# Token başlat
+tpm2_ptool init
+tpm2_ptool addtoken \
+  --pid=1 \
+  --sopin=adminpin \
+  --userpin=userpin \
+  --label="mytoken"
+
+# Anahtar ekle
+tpm2_ptool addkey \
+  --algorithm=ecc256 \
+  --label="mytoken" \
+  --userpin=userpin
+
+# PKCS11 module listesi
+pkcs11-tool --module /usr/lib/x86_64-linux-gnu/libtpm2_pkcs11.so \
+  --list-objects --login --pin userpin</code></pre>
+
+  <h3>systemd-cryptenroll (systemd 248+)</h3>
+  <pre><code"># systemd-cryptenroll modern ve bütünleşik yaklaşım
+# TPM2 PCR policy ile LUKS2 kaydı
+sudo systemd-cryptenroll \
+  --tpm2-device=auto \
+  --tpm2-pcrs=0+1+7 \
+  /dev/sda2
+
+# Kayıtlı slotları listele
+sudo systemd-cryptenroll --list-devices
+
+# /etc/crypttab girdisi (otomatik unlock)
+# luks-uuid UUID=... - tpm2-device=auto,tpm2-pcrs=0+1+7
+
+# crypttab örneği:
+# root UUID=1234-5678 - luks,tpm2-device=auto,tpm2-pcrs=0+1+7
+
+# Slotu kaldır
+sudo systemd-cryptenroll --wipe-slot=tpm2 /dev/sda2</code></pre>
+
+  <h3>PCR değişikliği durumu (firmware güncellemesi)</h3>
+  <p>Firmware güncellemesi PCR 0, 1, 7 değerlerini değiştirebilir; bu durumda TPM2 unseal başarısız olur ve disk açılamaz. Güncelleme öncesi yeniden seal etmek gerekir.</p>
+
+  <pre><code"># Firmware güncellemesi öncesi adımlar:
+# 1. Mevcut LUKS parolasıyla yedek slot oluştur
+sudo cryptsetup luksAddKey /dev/sda2
+
+# 2. TPM2 slot kaldır
+sudo systemd-cryptenroll --wipe-slot=tpm2 /dev/sda2
+
+# 3. Firmware güncelle ve yeniden boot at
+
+# 4. Yeni PCR değerleriyle TPM2'ye yeniden kaydet
+sudo systemd-cryptenroll \
+  --tpm2-device=auto \
+  --tpm2-pcrs=0+1+7 \
+  /dev/sda2
+
+# 5. Yedek LUKS slot kaldır
+sudo cryptsetup luksKillSlot /dev/sda2 &lt;slot_numarasi&gt;</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Hata ayıklama ve test</h2>
+  <p class="section-lead">TPM2 sorunlarını teşhis etmek için kernel mesajları, tpm2_selftest, tpm2-tools debug modu ve tpm2-tss loglama mekanizmaları kullanılır.</p>
+
+  <h3>TPM2 self-test</h3>
+  <pre><code># TPM2 yerleşik self-test çalıştır
+tpm2_selftest --full
+
+# Test sonuçlarını sorgula
+tpm2_gettestresult
+
+# Çıktı yorumu:
+# rc: TPM2_RC_SUCCESS (0x000) — tüm testler geçti
+# rc: TPM2_RC_TESTING  (0x90A) — testler devam ediyor
+# rc: TPM2_RC_FAILURE  (0x101) — test başarısız — donanım arızası</code></pre>
+
+  <h3>Kernel sürücü logları</h3>
+  <pre><code"># TPM2 sürücü mesajları
+dmesg | grep -iE "tpm|tis|crb"
+
+# Tipik başarılı mesajlar:
+# [    2.145] tpm_tis 00:06: 1.2 TPM (device-id 0x0, rev-id 78)
+# [    2.147] tpm tpm0: TPM2.0 (device-id 0x1B, rev-id 16)
+
+# CRB arayüzü için
+dmesg | grep crb
+# [    1.890] tpm_crb MSFT0101:00: found TPM in CRB mode
+
+# SPI sürücüsü için
+dmesg | grep tis_spi
+# [    3.201] tpm_tis_spi spi1.0: 2.0 TPM (device-id 0x1B, rev-id 0x16)
+
+# Sysfs üzerinden TPM bilgileri
+cat /sys/class/tpm/tpm0/tpm_version_major
+cat /sys/class/tpm/tpm0/firmware_version
+cat /sys/class/tpm/tpm0/pcr-sha256/0</code></pre>
+
+  <h3>tpm2-tss loglama</h3>
+  <pre><code"># tpm2-tss kütüphane loglama seviyesi (ESYS/FAPI)
+export TSS2_LOG=all+TRACE     # Tüm katmanlar, en ayrıntılı
+export TSS2_LOG=esys+DEBUG    # Sadece ESYS katmanı debug
+export TSS2_LOG=tcti+INFO     # TCTI transport katmanı info
+
+# TCTI loglama (komut/yanıt byte akışı)
+export TPM2TOOLS_TCTI="device:/dev/tpmrm0"
+tpm2_getrandom 8 --hex 2&gt;&amp;1 | head -30
+
+# Syslog'a log gönder
+export TSS2_LOG=all+NOTICE+syslog</code></pre>
+
+  <h3>Yaygın hatalar ve çözümler</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Hata mesajı</th><th>Neden</th><th>Çözüm</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>ERROR:tcti:tcti_device_transmit: Device write failed with error: 16</td><td>TPM cihazı meşgul ya da başka süreç kullanıyor</td><td>/dev/tpmrm0 yerine /dev/tpmrm0 kullan, tpm2-abrmd daemon durdur</td></tr>
+        <tr><td>0x0922 TPM2_RC_PCR_CHANGED</td><td>Unseal sırasında PCR değerleri seal anındakinden farklı</td><td>Boot sonrası PCR log kontrol et, firmware güncellemesinden sonra yeniden seal et</td></tr>
+        <tr><td>0x0984 TPM2_RC_LOCKOUT</td><td>Çok fazla başarısız yetkilendirme denemesi</td><td>tpm2_dictionaryattacklockreset ile kilidi aç (owner şifresi gerekir)</td></tr>
+        <tr><td>0x0142 TPM2_RC_NV_UNAVAILABLE</td><td>NV bellek dolu ya da platform lock aktif</td><td>Gereksiz NV index sil: tpm2_nvundefine</td></tr>
+        <tr><td>/dev/tpm0 bulunamıyor</td><td>Sürücü yüklenmemiş ya da donanım bağlı değil</td><td>lsmod | grep tpm, dmesg kontrol et, device tree/ACPI tablosu doğrula</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>tpm2-pytss ile programatik test</h3>
+  <pre><code"># pip install tpm2-pytss
+from tpm2_pytss import *
+from tpm2_pytss.types import *
+
+with ESAPI() as tpm:
+    # PCR oku
+    _, pcr_data, _ = tpm.pcr_read("sha256:0,7")
+    for i, pcr in enumerate(pcr_data):
+        print(f"PCR-{i}: {bytes(pcr).hex()}")
+
+    # Rastgele üret
+    rand = tpm.get_random(32)
+    print(f"Random: {bytes(rand).hex()}")
+
+    # TPM özellikleri
+    caps, _, _ = tpm.get_capability(
+        TPM2_CAP.TPM_PROPERTIES,
+        TPM2_PT.FIRMWARE_VERSION_1, 1)
+    fw = caps.data.tpmProperties[0].value
+    print(f"Firmware: {fw >> 16}.{fw &amp; 0xFFFF}")</code></pre>
+
+  <h3>PCR değişim takibi — IMA ile entegrasyon</h3>
+  <pre><code"># IMA'nın PCR-10'u extend ettiğini izle
+# Kernel başlatma ile
+grep "ima" /proc/cmdline
+# ima_policy=appraise_tcb ima_template=ima-ng
+
+# IMA ölçüm logunu izle
+cat /sys/kernel/security/ima/ascii_runtime_measurements | head -5
+# 10 a1b2... ima-ng sha256:c3d4... /usr/bin/python3
+
+# PCR-10 güncel değeri
+tpm2_pcrread sha256:10
+
+# IMA ile PCR extend sayısı
+wc -l /sys/kernel/security/ima/ascii_runtime_measurements</code></pre>
+</section>
+
+</main>

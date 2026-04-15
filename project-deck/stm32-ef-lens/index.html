@@ -1,0 +1,1099 @@
+---
+layout: tutorial
+title: "STM32 ile Canon EF Lens Kontrolü — NUCLEO-L432KC"
+back_url: "../index.html"
+back_label: "Project Deck"
+---
+<header class="header">
+  <div class="meta">
+    <span>UYGULAMA RAPORU</span>
+    <span>DONANIM · STM32 · SPI</span>
+    <span>NUCLEO-L432KC</span>
+    <span>2026</span>
+  </div>
+  <h1>STM32 ile Canon EF<br><em>Lens Kontrolü.</em></h1>
+  <p class="subtitle">NUCLEO-L432KC'yi doğrudan Canon EF lensin mount kontaklarına bağlayarak kamerasız focus ve diyafram kontrolü. 74AHCT125 seviye çevirici, SPI Mode 3, HAL sürücü kodu ve UART komut arayüzü — donanımdan koda eksiksiz rehber.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Genel Bakış — STM32, Lens ve Aralarındaki Bağlantı</a></li>
+    <li><a href="#s1">Canon EF Mount Pinout — 8 Kontak, Voltajlar, Fiziksel Konum</a></li>
+    <li><a href="#s2">NUCLEO-L432KC Pin Haritası — Hangi Pin Nereye?</a></li>
+    <li><a href="#s3">Devre Şeması — 74AHCT125, Voltaj Bölücü ve 6 V Güç Kaynağı</a></li>
+    <li><a href="#s4">SPI Mode 3 — Neden Bu Ayarlar, Nasıl Çalışır?</a></li>
+    <li><a href="#s5">CubeMX Konfigürasyonu — SPI1, USART2 ve Saat Ağacı</a></li>
+    <li><a href="#s6">Canon EF Protokolü — Komut Formatı ve Bilinen Byte Dizileri</a></li>
+    <li><a href="#s7">ef_lens Sürücü Katmanı — Tam C Kodu</a></li>
+    <li><a href="#s8">UART Komut Arayüzü — Seri Konsoldan Lens Kontrolü</a></li>
+    <li><a href="#s9">Özet ve Sorun Giderme</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Genel Bakış — STM32, Lens ve Aralarındaki Bağlantı</h2>
+  <p class="section-lead">Canon EF lensler focus ve diyaframlarını 3 sinyal hattı üzerinden elektronik olarak kontrol eder. Bu hatları bir kamera gövdesi yerine STM32 sürdüğünde lens kameradan habersiz olarak tam olarak itaat eder.</p>
+
+  <h3>Ne yapıyoruz?</h3>
+  <p>STM32, Canon EF mount üzerindeki 3 sinyal hattına (Dclk · Dout · Din) doğrudan bağlanır ve SPI Master olarak çalışır. PC'den UART üzerinden gönderilen komutlar (ör. <code class="inline">f+ 200</code>, <code class="inline">a 5.6</code>) STM32 tarafından Canon EF byte dizilerine çevrilip lense iletilir.</p>
+
+  <div class="flow">
+    <pre>
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                     Genel sistem akışı                          │
+  └─────────────────────────────────────────────────────────────────┘
+
+  PC / Terminal                                        Canon EF Lens
+  (PuTTY, minicom)                                    (herhangi EF/EF-S)
+       │                                                      │
+       │  USB — ST-Link VCP                                   │
+       │  115200 baud                                         │
+       ▼                                                      │
+  ┌────────────────────────────────────────┐                  │
+  │         NUCLEO-L432KC                  │                  │
+  │                                        │                  │
+  │  USART2 ──► CLI parser                 │                  │
+  │                │                       │                  │
+  │                ▼                       │                  │
+  │           ef_lens.c                   │  3 sinyal hattı  │
+  │                │                       │  (5 V CMOS)      │
+  │                ▼                       │                  │
+  │           SPI1 Master ────────────────►├── Dclk ─────────►│
+  │                                        ├── Dout ─────────►│
+  │                                        │◄─ Din  ──────────│
+  │                                        │                  │
+  │  VBUS (5 V) ──────────────────────────►├── VDD  ─────────►│
+  │  Boost (6 V) ─────────────────────────►├── VBAT ─────────►│
+  │  GND ─────────────────────────────────►├── GND  ─────────►│
+  └────────────────────────────────────────┘                  │
+                                                              │</pre>
+  </div>
+
+  <h3>Kamera gerekmez</h3>
+  <p>STM32 lensin bakış açısından tam olarak bir Canon kamera gövdesidir: clock'u o üretir, komutları o gönderir, yanıtları o okur. Lens bu ayrımı yapamaz.</p>
+
+  <h3>Bu rapordaki dosyalar</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Dosya</th><th>Rol</th></tr></thead>
+      <tbody>
+        <tr><td>Core/Inc/ef_lens.h</td><td>EF protokol sabitleri, struct tanımları, fonksiyon prototipleri</td></tr>
+        <tr><td>Core/Src/ef_lens.c</td><td>SPI transaction motoru, tüm EF komut implementasyonları</td></tr>
+        <tr><td>Core/Src/main.c</td><td>UART CLI döngüsü, printf yönlendirmesi</td></tr>
+        <tr><td>*.ioc</td><td>CubeMX: SPI1 Mode 3, USART2, 80 MHz PLL</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Canon EF Mount Pinout — 7 Kontak, Voltajlar, Fiziksel Konum</h2>
+  <p class="section-lead">Canon EF-S mount lensin arkasında 7 altın kaplama kontak bulunur: iki güç hattı, iki toprak ve üç sinyal hattı. Kamera cephesinden bakışta soldan sağa sıralanır: Vbat · A_GND · VDD · Dout · Din · Dclk · D_GND.</p>
+
+  <h3>Resmi pinout diyagramı</h3>
+  <figure style="margin:0 0 1.5rem;text-align:center;">
+    <img src="canon-ef-s-pinout1.png"
+         alt="Canon EF-S mount kontak pinout — kamera cephesinden görünüm"
+         style="max-width:100%;border:1px solid #333;border-radius:4px;background:#fff;padding:8px;">
+    <figcaption style="margin-top:.5rem;font-size:.8rem;color:#888;">Canon EF-S mount kontak düzeni — kamera cephesinden (face) görünüm</figcaption>
+  </figure>
+
+  <h3>Kontak sırası (kamera cephesinden, soldan sağa)</h3>
+  <div class="flow">
+    <pre>
+  Kamera cephesinden görünüm — lensin arka yüzüne bakış:
+
+    ╔═══════════════════════════════════════════════════════╗
+    ║                                                       ║
+    ║   ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐
+    ║   │Vbat │ │A_GND│ │ VDD │ │Dout │ │ Din │ │Dclk │ │D_GND│
+    ║   └─────┘ └─────┘ └─────┘ └─────┘ └─────┘ └─────┘ └─────┘
+    ║
+    ╚═══════════════════════════════════════════════════════╝
+
+   Vbat:  ~6 V  Motor güç                A_GND: 0 V  Motor toprağı
+   VDD:    5 V  Mantık beslemesi         D_GND: 0 V  Dijital toprak
+   Dout:   5 V  STM32 → Lens  (MOSI)    Din:   5 V  Lens → STM32 (MISO)
+   Dclk:   5 V  STM32 → Lens  (SCK)</pre>
+  </div>
+
+  <h3>Pin tablosu</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Kontak</th><th>Sinyal</th><th>Voltaj</th><th>Yön</th><th>İşlev</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>1</strong></td><td><strong>Vbat</strong></td><td>~6 V</td>
+          <td>STM32 → Lens</td>
+          <td>Focus motor güç kaynağı (Focusing Motor Power). USM / STM motorlar bu hattan beslenir. MT3608 boost converter veya 4×AA pil.</td>
+        </tr>
+        <tr>
+          <td><strong>2</strong></td><td><strong>A_GND</strong></td><td>0 V</td>
+          <td>—</td>
+          <td>Motor toprağı (Motor Ground). Vbat geri dönüş hattı. STM32 GND'ye bağlanır.</td>
+        </tr>
+        <tr>
+          <td><strong>3</strong></td><td><strong>VDD</strong></td><td>5 V</td>
+          <td>STM32 → Lens</td>
+          <td>Lens dijital güç (Lens Digital Power). Lens MCU ve sinyal devresi beslemesi. USB VBUS doğrudan kullanılabilir.</td>
+        </tr>
+        <tr>
+          <td><strong>4</strong></td><td><strong>Dout</strong></td><td>5 V CMOS</td>
+          <td>STM32 → Lens</td>
+          <td>SPI Data Camera Output — kamera/STM32'nin lense gönderdiği veri (MOSI). Komut byte'ları bu hattan gönderilir.</td>
+        </tr>
+        <tr>
+          <td><strong>5</strong></td><td><strong>Din</strong></td><td>5 V CMOS</td>
+          <td>Lens → STM32</td>
+          <td>SPI Data Camera Input — lensin kameraya/STM32'ye gönderdiği yanıt (MISO). Lens yanıtları bu hattan okunur.</td>
+        </tr>
+        <tr>
+          <td><strong>6</strong></td><td><strong>Dclk</strong></td><td>5 V CMOS</td>
+          <td>STM32 → Lens</td>
+          <td>SPI Clock and signalisation — senkron seri saat. STM32 üretir, lens alır. Idle HIGH (SPI Mode 3).</td>
+        </tr>
+        <tr>
+          <td><strong>7</strong></td><td><strong>D_GND</strong></td><td>0 V</td>
+          <td>—</td>
+          <td>Dijital sinyal toprağı (Lens Digital Ground). A_GND'den bağımsız, gürültü yalıtımı için ayrı tutulur.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">VOLTAJ ÖZETİ</div>
+    <p><strong>VDD = 5 V</strong> (mantık), <strong>Vbat = 6 V</strong> (motor), <strong>sinyal hatları (Dout · Din · Dclk) = 5 V CMOS.</strong> STM32L432KC 3.3 V çıkışı üretir; Dout ve Dclk için 74AHCT125 seviye çevirici, Vbat için 6 V boost converter veya 4×AA pil gerekir.</p>
+  </div>
+
+  <h3>Konektör seçenekleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">EF uzatma tüpü</span><span class="desc">Aliexpress "Canon EF extension tube" — plastik halkaya kontak pimler yerleşiktir, üzerine ince kablo lehimlenir. En pratik yöntem, ~80–150 ₺.</span></div>
+    <div class="param"><span class="name">EF PCB konektörü</span><span class="desc">Aliexpress "Canon EF mount electrical contact board" — pad'lere direkt lehimlenebilir. En temiz çözüm, ~150–200 ₺.</span></div>
+    <div class="param"><span class="name">Kırık body cap</span><span class="desc">Canon EF body kapağının kontak şeridi dremel ile çıkarılır, kablolar lehimlenir. Ücretsiz ama hassas çalışma gerektirir.</span></div>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">RF MOUNT UYARISI</div>
+    <p>Canon RF mount (EOS R serisi) tamamen farklı protokol kullanır: farklı pin sayısı, farklı voltajlar, farklı komut seti. EF-M mount da farklıdır. Bu rehber yalnızca klasik <strong>EF ve EF-S</strong> lenslere uygulanır.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> NUCLEO-L432KC Pin Haritası — Hangi Pin Nereye?</h2>
+  <p class="section-lead">NUCLEO-L432KC, Arduino Nano uyumlu başlık pinlerine sahip küçük bir geliştirme kartıdır. SPI1 çevrimi PA5/PA6/PA7 pinlerine, USART2 ise PA2/PA3 pinlerine yönlendirilmiştir.</p>
+
+  <h3>NUCLEO-L432KC kart düzeni</h3>
+  <div class="flow">
+    <pre>
+                   NUCLEO-L432KC
+              ┌──────────────────────┐
+    USB/ST-Link│  ┌──────────────┐   │
+    (VCP+güç) ─┤  │  STM32L432KC │   │
+              │  └──────────────┘   │
+              │                      │
+     CN3 (sol)│                      │CN4 (sağ)
+    ═══════════                      ════════════
+    D1  PA2 TX│                      │PA5  D13  SCK  ← SPI1_SCK  → Dclk
+    D0  PA3 RX│                      │PA6  D12  MISO ← SPI1_MISO ← Din
+        PA4   │                      │PA7  D11  MOSI ← SPI1_MOSI → Dout
+        PB0   │                      │PB0  D10  (CS — kullanılmaz)
+        PB7   │                      │
+        PB6   │                      │
+    5V  VBUS──┤                      ├── 5V (VDD'ye)
+    GND       │                      ├── GND
+    3V3       │                      │
+              └──────────────────────┘
+
+  PA2 (TX) → ST-Link → USB → PC terminal (115200 baud)
+  PA3 (RX) → ST-Link → USB → PC terminal</pre>
+  </div>
+
+  <h3>SPI1 pin ataması</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>STM32 Pin</th><th>Arduino Etiketi</th><th>SPI Fonksiyonu</th><th>→</th><th>Canon EF Sinyali</th><th>Kontak #</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><strong>PA5</strong></td><td>D13</td><td>SPI1_SCK</td><td>→</td><td>Dclk (saat)</td><td>6</td></tr>
+        <tr><td><strong>PA7</strong></td><td>D11</td><td>SPI1_MOSI</td><td>→</td><td>Dout (veri: STM32→lens)</td><td>4</td></tr>
+        <tr><td><strong>PA6</strong></td><td>D12</td><td>SPI1_MISO</td><td>←</td><td>Din (veri: lens→STM32)</td><td>5</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Güç pinleri</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>NUCLEO Pin</th><th>Voltaj</th><th>→</th><th>Canon EF Pin</th><th>Sinyal</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>5V (VBUS)</td><td>5 V</td><td>→</td><td>Kontak 3</td><td>VDD (mantık beslemesi)</td></tr>
+        <tr><td>Boost çıkışı</td><td>6 V</td><td>→</td><td>Kontak 1</td><td>Vbat (motor beslemesi)</td></tr>
+        <tr><td>GND</td><td>0 V</td><td>→</td><td>Kontak 2</td><td>A_GND (motor toprağı)</td></tr>
+        <tr><td>GND</td><td>0 V</td><td>→</td><td>Kontak 7</td><td>D_GND (sinyal toprağı)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">FT PİN — PA6 (MISO)</div>
+    <p>STM32L432KC veri sayfasına göre PA6 <strong>FT (Five-Volt Tolerant)</strong> giriş pinidir. Lens'ten gelen 5 V Din sinyalini doğrudan alabilir. Buna rağmen voltaj bölücü kullanmak MCU ömrü açısından iyi bir pratiktir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Devre Şeması — 74AHCT125, Voltaj Bölücü ve 6 V Güç Kaynağı</h2>
+  <p class="section-lead">STM32 3.3 V GPIO çıkışı üretir; Canon EF mount 5 V CMOS seviyesi bekler. Dout ve Dclk çıkış hatları için 74AHCT125 seviye çevirici, Din giriş hattı için voltaj bölücü ve lens motoru için 6 V kaynak gereklidir.</p>
+
+  <h3>Neden seviye çevirici?</h3>
+  <div class="params">
+    <div class="param"><span class="name">STM32 GPIO çıkışı</span><span class="desc">Her zaman <strong>3.3 V</strong>. PA5 ve PA7 çıkış pinleridir; FT olsalar bile çıkış voltajları 3.3 V'tur.</span></div>
+    <div class="param"><span class="name">Canon EF giriş eşiği</span><span class="desc">5 V CMOS: yüksek seviye eşiği <strong>≥ 3.5 V</strong>. 3.3 V bu eşiği güvenli şekilde geçemez — lens Dclk ve Dout'u doğru okuyamayabilir.</span></div>
+    <div class="param"><span class="name">Çözüm</span><span class="desc">74AHCT125: 3.3 V girişi alıp 5 V çıkış verir. VCC = 5 V olduğunda AHCT serisi 3.3 V'u HIGH olarak kabul eder, 5 V çıkışı garantiler.</span></div>
+  </div>
+
+  <h3>74AHCT125 — devre bağlantısı</h3>
+  <div class="flow">
+    <pre>
+  74AHCT125 (DIP-14 veya SOIC-14) iç yapısı:
+  Her kapı: 1 giriş (nA) + 1 output enable (nOE, active LOW) + 1 çıkış (nY)
+
+   ┌─────────────────────────────────────┐
+   │           74AHCT125                 │
+   │                                     │
+   │  VCC ── 14 (5V bağlanır)           │
+   │  GND ──  7                          │
+   │                                     │
+   │  1OE ──  1 → GND (her zaman aktif) │
+   │  1A  ──  2 ← PA5  (SCK,  3.3V)    │
+   │  1Y  ──  3 → Dclk (Canon kontak 6) │ → 5V çıkış
+   │                                     │
+   │  2OE ──  4 → GND (her zaman aktif) │
+   │  2A  ──  5 ← PA7  (MOSI, 3.3V)    │
+   │  2Y  ──  6 → Dout (Canon kontak 4) │ → 5V çıkış
+   │                                     │
+   │  3A, 3OE, 3Y, 4A, 4OE, 4Y:        │
+   │    kullanılmaz (bağlama veya float) │
+   └─────────────────────────────────────┘
+
+  Din → PA6 (MISO) için voltaj bölücü:
+
+  Canon kontak 5 (Din, 5V)
+          │
+         10 kΩ
+          │
+          ├──────── PA6 (MISO, 3.3V max input)
+          │
+         20 kΩ
+          │
+         GND
+
+  Bölücü çıkışı = 5V × 20/(10+20) = 3.33 V ✓</pre>
+  </div>
+
+  <h3>6 V motor güç kaynağı (VBAT)</h3>
+  <p>USB VBUS 5 V verir; lens USM motoru için <strong>6 V</strong> gerekir. Düşük voltajda motor yeterli tork üretemez, odak atlar veya hiç hareket etmez.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Yöntem</th><th>Maliyet</th><th>Notlar</th></tr></thead>
+      <tbody>
+        <tr><td><strong>MT3608 boost modülü</strong></td><td>~20 ₺</td><td>USB 5V → ayarlanabilir boost. Trimpotu çevirerek tam 6.00 V'a getir. Aliexpress: "MT3608 step up module". En pratik çözüm.</td></tr>
+        <tr><td><strong>4 × AA alkalin pil</strong></td><td>~15 ₺</td><td>Yeni pilde 6.4 V, kullanıldıkça düşer. Prototip için yeterli ama düzensiz voltaj.</td></tr>
+        <tr><td><strong>IP2312 + Li-Ion 2S</strong></td><td>~80 ₺</td><td>Şarj edilebilir, sabit voltaj. Taşınabilir setup için ideal.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">MT3608 AYARI</div>
+    <p>MT3608'in çıkışına multimetre bağla, trimpotu yavaşça saat yönünde çevir. Tam olarak <strong>6.00 V</strong>'ta durdur. 6.5 V üzeri lens motor sürücüsüne kalıcı hasar verebilir.</p>
+  </div>
+
+  <h3>Tam bağlantı şeması</h3>
+  <div class="flow">
+    <pre>
+  NUCLEO-L432KC                74AHCT125           Canon EF Mount
+  ─────────────                ─────────           ──────────────
+
+  PA5 (D13, SCK ) ────────────► 1A → 1Y ──────────► kontak 6  Dclk
+  PA7 (D11, MOSI) ────────────► 2A → 2Y ──────────► kontak 4  Dout
+  PA6 (D12, MISO) ◄──[10k+20k]───────────────────── kontak 5  Din
+                                      ▲
+                       VCC(5V)────────┘ (74AHCT125 VCC)
+
+  5V  (VBUS) ──────────────────────────────────────► kontak 3  VDD
+  MT3608 (6V) ─────────────────────────────────────► kontak 1  Vbat
+  GND ─────────────────────────────────────────────► kontak 2  A_GND
+  GND ─────────────────────────────────────────────► kontak 7  D_GND
+
+  Güç sırası: VDD (5V) önce → Vbat (6V) sonra</pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">GÜÇ SIRASI</div>
+    <p>Canon lenslerin büyük çoğunluğu VDD'nin önce gelmesini bekler: önce 5 V mantık gerilimi, ardından 6 V motor gerilimi. Ters sıra lens firmware'ini undefined state'e sokabilir. Pratik uygulama: VBUS (VDD) her zaman açık, VBAT hattına küçük bir anahtar veya jumper koy.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> SPI Mode 3 — Neden Bu Ayarlar, Nasıl Çalışır?</h2>
+  <p class="section-lead">Canon EF low-side protokolü elektriksel olarak tam olarak SPI Mode 3'tür: clock idle HIGH, veriler clock'un yükselen kenarında örneklenir. Chip select yoktur, yarı-çift yönlü akış STM32'nin full-duplex SPI'ı ile yönetilir.</p>
+
+  <h3>SPI mod matrisi</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Mod</th><th>CPOL</th><th>CPHA</th><th>Clock idle</th><th>Örnekleme</th></tr></thead>
+      <tbody>
+        <tr><td>0</td><td>0</td><td>0</td><td>LOW</td><td>Yükselen kenar</td></tr>
+        <tr><td>1</td><td>0</td><td>1</td><td>LOW</td><td>Düşen kenar</td></tr>
+        <tr><td>2</td><td>1</td><td>0</td><td>HIGH</td><td>Düşen kenar</td></tr>
+        <tr><td><strong>3</strong></td><td><strong>1</strong></td><td><strong>1</strong></td><td><strong>HIGH</strong></td><td><strong>Yükselen kenar</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Canon EF: Dclk idle HIGH → CPOL=1. Veri yükselen kenarda latçlanır → CPHA=1. Sonuç: <strong>Mode 3</strong>.</p>
+
+  <h3>Zamanlama diyagramı</h3>
+  <div class="flow">
+    <pre>
+  Örnek — 0xEB baytının iletimi (lens ID, binary: 1110 1011)
+
+        İşlem:    7    6    5    4    3    2    1    0
+                  MSB                            LSB
+
+  Dclk  ‾‾‾‾‾|___|‾|___|‾|___|‾|___|‾|___|‾|___|‾|___|‾|___|‾‾‾‾‾
+              ↑                                             ↑
+           idle HIGH                                    idle HIGH
+
+  Dout  ─────╔═══╗ ╔═══╗ ╔═══╗ ╔═══╗ ╔═══╗ ╔╗  ╔═══╗ ╔═══╗─────
+  (MOSI)     ║ 1 ║ ║ 1 ║ ║ 1 ║ ║ 0 ║ ║ 1 ║ ║0║ ║ 1 ║ ║ 1 ║
+             ╚═══╝ ╚═══╝ ╚═══╝ ╚═══╝ ╚═══╝ ╚╝  ╚═══╝ ╚═══╝
+
+  Din   ─────╔════════════════════════════════════════════╗────
+  (MISO)     ║  lens yanıtı (önceki komutun sonucu)       ║
+             ╚════════════════════════════════════════════╝
+
+              ↑ Her bit Dclk düşen kenarda değişir,
+                yükselen kenarda örneklenir (CPHA=1) </pre>
+  </div>
+
+  <h3>Saat frekansı</h3>
+  <p>STM32L432KC @ 80 MHz. Canon EF tolerans bandı: <strong>62.5 – 125 kHz</strong>.</p>
+
+  <div class="flow">
+    <pre>
+  SPI1 prescaler seçenekleri (80 MHz PCLK):
+
+  Prescaler │ Frekans    │ Canon EF uyumu
+  ──────────┼────────────┼──────────────────
+      256   │  312.5 kHz │ ✗  Çok hızlı
+      512   │  156.3 kHz │ ✗  Sınırın üstünde
+     1024   │   78.1 kHz │ ✓  Tam ortada ← SEÇ
+     2048   │   39.1 kHz │ ✗  Gereksiz yavaş</pre>
+  </div>
+
+  <h3>Chip select yok</h3>
+  <p>Canon EF'de CS (chip select / NSS) yoktur. STM32 SPI1'de NSS <strong>Software</strong> moduna alınır ve hiçbir pin CS olarak atanmaz. Clock yükselince lens transaction başladığını anlar, idle HIGH'a dönünce biter.</p>
+
+  <h3>Half-duplex yönetimi</h3>
+  <p>Canon EF fiziksel olarak half-duplex gibi davranır: komut gönderirken lens susarken, yanıt alırken STM32 anlamlı veri göndermez. STM32 SPI1 full-duplex modunda çalışır; bu fark şöyle yönetilir:</p>
+  <div class="params">
+    <div class="param"><span class="name">Komut gönderme</span><span class="desc">MOSI'dan gerçek byte'lar gönderilir. Aynı anda MISO'dan gelen veriler dummy tampona alınır, yok sayılır.</span></div>
+    <div class="param"><span class="name">Yanıt okuma</span><span class="desc">MOSI'dan 0x00 dummy byte'lar gönderilir — yalnızca Dclk üretmek için. MISO'dan lens yanıtı okunur.</span></div>
+    <div class="param"><span class="name">Byte arası gecikme</span><span class="desc">Lens MCU her byte'ı işlemek için 5–15 µs'ye ihtiyaç duyar. Her byte arasına <strong>~5 µs</strong> gecikme eklenir.</span></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> CubeMX Konfigürasyonu — SPI1, USART2 ve Saat Ağacı</h2>
+  <p class="section-lead">STM32CubeMX ile çevre birimi yapılandırması yapılır, HAL başlatma kodu üretilir. Board seçimi: <strong>NUCLEO-L432KC</strong>.</p>
+
+  <h3>1 — Saat ağacı: 80 MHz</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Clock Configuration</span><span class="dot">●</span></div>
+    <pre><code>PLL Source  : HSI (16 MHz)
+PLL/M       : 1   → 16 MHz
+PLL/N       : ×10 → 160 MHz
+PLL/R       : /2  → 80 MHz
+SYSCLK      : 80 MHz
+AHB Prescaler  : /1 → HCLK  = 80 MHz
+APB1 Prescaler : /1 → PCLK1 = 80 MHz  ← SPI1 buradan beslenecek
+APB2 Prescaler : /1 → PCLK2 = 80 MHz</code></pre>
+  </div>
+
+  <h3>2 — SPI1 ayarları</h3>
+  <div class="params">
+    <div class="param"><span class="name">Mode</span><span class="desc">Full-Duplex Master</span></div>
+    <div class="param"><span class="name">Hardware NSS Signal</span><span class="desc"><strong>Disable</strong> — Canon EF'de CS yoktur</span></div>
+    <div class="param"><span class="name">Frame Format</span><span class="desc">Motorola</span></div>
+    <div class="param"><span class="name">Data Size</span><span class="desc">8 Bits</span></div>
+    <div class="param"><span class="name">First Bit</span><span class="desc">MSB First</span></div>
+    <div class="param"><span class="name">Clock Polarity (CPOL)</span><span class="desc"><strong>High</strong></span></div>
+    <div class="param"><span class="name">Clock Phase (CPHA)</span><span class="desc"><strong>2 Edge</strong> ← CPOL=1 + CPHA=1 = Mode 3</span></div>
+    <div class="param"><span class="name">Prescaler</span><span class="desc"><strong>1024</strong> → 78.125 kHz</span></div>
+    <div class="param"><span class="name">CRC Calculation</span><span class="desc">Disabled</span></div>
+  </div>
+
+  <h3>3 — USART2 ayarları</h3>
+  <div class="params">
+    <div class="param"><span class="name">Mode</span><span class="desc">Asynchronous</span></div>
+    <div class="param"><span class="name">Baud Rate</span><span class="desc">115200</span></div>
+    <div class="param"><span class="name">Word Length</span><span class="desc">8 Bits</span></div>
+    <div class="param"><span class="name">Parity</span><span class="desc">None</span></div>
+    <div class="param"><span class="name">Stop Bits</span><span class="desc">1</span></div>
+    <div class="param"><span class="name">Pinler</span><span class="desc">PA2 = TX (ST-Link'e), PA3 = RX (ST-Link'ten) — otomatik atanır</span></div>
+  </div>
+
+  <h3>4 — Üretilen başlatma kodu</h3>
+  <div class="code-block">
+    <div class="code-header"><span>main.c — MX_SPI1_Init() (CubeMX üretimi)</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">static void</span> MX_SPI1_Init(<span class="keyword">void</span>)
+{
+    hspi1.Instance               = SPI1;
+    hspi1.Init.Mode              = SPI_MODE_MASTER;
+    hspi1.Init.Direction         = SPI_DIRECTION_2LINES;   <span class="cmt">/* full-duplex */</span>
+    hspi1.Init.DataSize          = SPI_DATASIZE_8BIT;
+    hspi1.Init.CLKPolarity       = SPI_POLARITY_HIGH;      <span class="cmt">/* CPOL = 1 */</span>
+    hspi1.Init.CLKPhase          = SPI_PHASE_2EDGE;        <span class="cmt">/* CPHA = 1 → Mode 3 */</span>
+    hspi1.Init.NSS               = SPI_NSS_SOFT;           <span class="cmt">/* CS yok */</span>
+    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_1024; <span class="cmt">/* 78.125 kHz */</span>
+    hspi1.Init.FirstBit          = SPI_FIRSTBIT_MSB;
+    hspi1.Init.TIMode            = SPI_TIMODE_DISABLE;
+    hspi1.Init.CRCCalculation    = SPI_CRCCALCULATION_DISABLE;
+    HAL_SPI_Init(&amp;hspi1);
+}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">KAYAN NOKTA printf</div>
+    <p>Diyafram değerlerini yazdırmak için (<code class="inline">f/%.1f</code>) kayan nokta printf desteği gerekir. CubeMX Project Manager → Advanced Settings → <em>"Use float with printf from newlib-nano"</em> kutusunu işaretle. Yoksa diyafram çıktıları boş gelir.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Canon EF Protokolü — Komut Formatı ve Bilinen Byte Dizileri</h2>
+  <p class="section-lead">Canon EF low-side protokolü resmi olarak belgelenmemiştir. Buradaki komutlar Magic Lantern, OpenEF ve çeşitli topluluk RE projelerinden derlenen kamuya açık bilgiye dayanır. Standart EF/EF-S lenslerin büyük çoğunluğunda çalışır.</p>
+
+  <h3>Transaction yapısı</h3>
+  <div class="flow">
+    <pre>
+  Her Canon EF işlemi şu sırayı izler:
+
+  ① STM32 → Lens : komut byte'ı gönderilir  (Dout hattı, 1 byte)
+  ② 5–20 µs beklenir                         (lens MCU işleme süresi)
+  ③ STM32 → Lens : varsa parametre byte'ları  (yine Dout, N byte)
+  ④ 20 µs beklenir
+  ⑤ Lens → STM32 : yanıt byte'ları okunur    (Din hattı, M byte)
+                   (STM32 dummy 0x00 gönderir, Dclk üretmek için)
+  ⑥ ≥ 1 ms beklenir → sonraki transaction</pre>
+  </div>
+
+  <h3>Komut tablosu</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Byte</th><th>Komut</th><th>Parametre</th><th>Yanıt</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td><code class="inline">0x0A</code></td><td>INIT</td><td>—</td><td>8–16 byte</td><td>Lens başlatma. Lens ID, tip bayrakları, diyafram aralığı, focal length.</td></tr>
+        <tr><td><code class="inline">0x0D</code></td><td>STATUS</td><td>—</td><td>4 byte</td><td>Anlık durum: motor hareketli mi, encoder pozisyonu.</td></tr>
+        <tr><td><code class="inline">0x44</code></td><td>FOCUS MOVE</td><td>yön + hız + 2× adım</td><td>1 byte ACK</td><td>Focus motoru belirli adım hareket ettir.</td></tr>
+        <tr><td><code class="inline">0x06</code></td><td>FOCUS STOP</td><td>—</td><td>1 byte ACK</td><td>Hareket eden focus motorunu durdur.</td></tr>
+        <tr><td><code class="inline">0xA0</code></td><td>FOCUS INF</td><td>—</td><td>1 byte ACK</td><td>Focus motorunu sonsuz yönünde tam hızda çalıştır.</td></tr>
+        <tr><td><code class="inline">0xB0</code></td><td>FOCUS NEAR</td><td>—</td><td>1 byte ACK</td><td>Focus motorunu minimum yönünde tam hızda çalıştır.</td></tr>
+        <tr><td><code class="inline">0x13</code></td><td>APERTURE</td><td>Av × 8 (1 byte)</td><td>1 byte ACK</td><td>Diyafram bıçaklarını ayarla.</td></tr>
+        <tr><td><code class="inline">0x72</code></td><td>APERTURE OPEN</td><td>—</td><td>1 byte ACK</td><td>Diyaframı tam açık konuma getir.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>FOCUS MOVE byte formatı</h3>
+  <div class="flow">
+    <pre>
+  Gönderilen 5 byte:
+
+  ┌────────┬────────┬────────┬────────┬────────┐
+  │  0x44  │  yön   │  hız   │ adım H │ adım L │
+  └────────┴────────┴────────┴────────┴────────┘
+     komut   0=yakın  1=yavaş  16-bit adım sayısı
+             1=uzak   4=hızlı  MSB önce
+
+  Örnek — 300 adım uzağa, hız 2:
+  0x44  0x01  0x02  0x01  0x2C</pre>
+  </div>
+
+  <h3>INIT yanıt formatı ve decode</h3>
+  <div class="flow">
+    <pre>
+  0x0A komutuna gelen 8 byte yanıt (EF v1 standart lensler):
+
+  ┌──────┬──────┬────────┬────────┬──────┬──────┬──────┬──────┐
+  │ [0]  │ [1]  │  [2]   │  [3]   │ [4]  │ [5]  │ [6]  │ [7]  │
+  │ tip  │ lens │ Ap_max │ Ap_min │  FL  │  FL  │  ?   │  ?   │
+  │bayrak│  ID  │ (Av×8) │ (Av×8) │  lo  │  hi  │      │      │
+  └──────┴──────┴────────┴────────┴──────┴──────┴──────┴──────┘
+
+  Tip bayrağı [0] bitleri:
+    bit 1 → USM motor (1 = var)
+    bit 2 → IS (image stabilizer, 1 = var)
+    bit 3 → Full-time manual focus (1 = var)
+
+  Av × 8 → f-stop: fstop = 2^(Av/2)
+    0x08 = 8  → Av=1.0 → f/1.4
+    0x20 = 32 → Av=4.0 → f/4.0
+    0x30 = 48 → Av=6.0 → f/8.0
+    0x48 = 72 → Av=9.0 → f/22.6
+
+  Örnek — Canon EF 50mm f/1.4 USM yanıtı:
+  02  EB  08  60  32  00  00  00
+  ↑   ↑   ↑   ↑   ↑
+  │   │   │   │   └── 0x32 = 50 → 50mm ✓
+  │   │   │   └────── 0x60 = 96 → Av=12 → f/22.6 ✓
+  │   │   └────────── 0x08 = 8  → Av=1  → f/1.4  ✓
+  │   └────────────── 0xEB = lens ID
+  └────────────────── 0x02 = USM var, IS yok</pre>
+  </div>
+
+  <h3>Diyafram Av kodlaması</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>f-stop</th><th>Av</th><th>Wire byte (Av × 8)</th><th>Hex</th></tr></thead>
+      <tbody>
+        <tr><td>f/1.4</td><td>1.0</td><td>8</td><td>0x08</td></tr>
+        <tr><td>f/2.0</td><td>2.0</td><td>16</td><td>0x10</td></tr>
+        <tr><td>f/2.8</td><td>3.0</td><td>24</td><td>0x18</td></tr>
+        <tr><td>f/4.0</td><td>4.0</td><td>32</td><td>0x20</td></tr>
+        <tr><td>f/5.6</td><td>5.0</td><td>40</td><td>0x28</td></tr>
+        <tr><td>f/8.0</td><td>6.0</td><td>48</td><td>0x30</td></tr>
+        <tr><td>f/11.0</td><td>7.0</td><td>56</td><td>0x38</td></tr>
+        <tr><td>f/16.0</td><td>8.0</td><td>64</td><td>0x40</td></tr>
+        <tr><td>f/22.0</td><td>9.0</td><td>72</td><td>0x48</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> ef_lens Sürücü Katmanı — Tam C Kodu</h2>
+  <p class="section-lead">Tüm Canon EF protokol mantığı iki dosyada toplanır. Transaction motoru her byte gönderimini bireysel olarak yönetir; byte'lar arası DWT tabanlı µs gecikme lens MCU'nun işleme süresini garanti altına alır.</p>
+
+  <h3>ef_lens.h</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Core/Inc/ef_lens.h</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#ifndef</span> EF_LENS_H
+<span class="keyword">#define</span> EF_LENS_H
+
+<span class="keyword">#include</span> <span class="str">"main.h"</span>
+<span class="keyword">#include</span> &lt;stdint.h&gt;
+<span class="keyword">#include</span> &lt;stdbool.h&gt;
+
+<span class="cmt">/* ── Komut byte'ları ──────────────────────────────────────────── */</span>
+<span class="keyword">#define</span> EF_CMD_INIT          0x0A
+<span class="keyword">#define</span> EF_CMD_STATUS        0x0D
+<span class="keyword">#define</span> EF_CMD_FOCUS_MOVE    0x44
+<span class="keyword">#define</span> EF_CMD_FOCUS_STOP    0x06
+<span class="keyword">#define</span> EF_CMD_FOCUS_INF     0xA0
+<span class="keyword">#define</span> EF_CMD_FOCUS_NEAR    0xB0
+<span class="keyword">#define</span> EF_CMD_APERTURE      0x13
+<span class="keyword">#define</span> EF_CMD_APERTURE_OPEN 0x72
+
+<span class="cmt">/* ── Focus yön sabitleri ──────────────────────────────────────── */</span>
+<span class="keyword">#define</span> EF_DIR_NEAR  0x00
+<span class="keyword">#define</span> EF_DIR_FAR   0x01
+
+<span class="cmt">/* ── Lens bilgi yapısı ────────────────────────────────────────── */</span>
+<span class="keyword">typedef struct</span> {
+    uint8_t  lens_id;
+    uint8_t  type_flags;
+    float    aperture_max;     <span class="cmt">/* f-stop, ör. 1.4 */</span>
+    float    aperture_min;     <span class="cmt">/* f-stop, ör. 22.6 */</span>
+    uint16_t focal_length_mm;
+    bool     has_usm;
+    bool     has_is;
+    uint8_t  raw[16];          <span class="cmt">/* ham INIT yanıtı */</span>
+} ef_lens_info_t;
+
+<span class="cmt">/* ── API ──────────────────────────────────────────────────────── */</span>
+HAL_StatusTypeDef ef_init(SPI_HandleTypeDef *hspi);
+HAL_StatusTypeDef ef_get_info(ef_lens_info_t *out);
+HAL_StatusTypeDef ef_focus_move(uint8_t dir, uint8_t speed, uint16_t steps);
+HAL_StatusTypeDef ef_focus_stop(void);
+HAL_StatusTypeDef ef_focus_inf(void);
+HAL_StatusTypeDef ef_focus_near(void);
+HAL_StatusTypeDef ef_aperture_set(float fstop);
+HAL_StatusTypeDef ef_aperture_open(void);
+HAL_StatusTypeDef ef_status_read(uint8_t *buf, uint8_t len);
+
+<span class="keyword">#endif</span></code></pre>
+  </div>
+
+  <h3>ef_lens.c — transaction motoru</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Core/Src/ef_lens.c — DWT + transaction katmanı</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> <span class="str">"ef_lens.h"</span>
+<span class="keyword">#include</span> &lt;math.h&gt;
+<span class="keyword">#include</span> &lt;string.h&gt;
+
+<span class="keyword">static</span> SPI_HandleTypeDef *_spi;
+
+<span class="cmt">/* ── µs gecikmesi (DWT cycle counter) ────────────────────────── */</span>
+<span class="keyword">static void</span> dwt_enable(<span class="keyword">void</span>)
+{
+    CoreDebug-&gt;DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT-&gt;CYCCNT = 0;
+    DWT-&gt;CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+<span class="keyword">static void</span> delay_us(uint32_t us)
+{
+    uint32_t start = DWT-&gt;CYCCNT;
+    uint32_t ticks = us * (SystemCoreClock / 1000000UL);
+    <span class="keyword">while</span> ((DWT-&gt;CYCCNT - start) &lt; ticks);
+}
+
+<span class="cmt">/*
+ * ef_send — tek byte gönder, dummy byte al (yanıt yok sayılır)
+ * ef_recv — dummy byte gönder (Dclk üret), yanıt byte'ı al
+ */</span>
+<span class="keyword">static</span> HAL_StatusTypeDef ef_send(uint8_t b)
+{
+    uint8_t dummy;
+    <span class="keyword">return</span> HAL_SPI_TransmitReceive(_spi, &amp;b, &amp;dummy, 1, 10);
+}
+
+<span class="keyword">static</span> HAL_StatusTypeDef ef_recv(uint8_t *b)
+{
+    uint8_t zero = 0x00;
+    <span class="keyword">return</span> HAL_SPI_TransmitReceive(_spi, &amp;zero, b, 1, 10);
+}
+
+<span class="cmt">/*
+ * ef_cmd — genel transaction:
+ *   komut gönder → parametre gönder → yanıt al
+ *   Her byte arasına 5 µs, komut/yanıt arasına 20 µs eklenir.
+ */</span>
+<span class="keyword">static</span> HAL_StatusTypeDef ef_cmd(uint8_t cmd,
+                                   <span class="keyword">const</span> uint8_t *params, uint8_t plen,
+                                   uint8_t *rx,          uint8_t rlen)
+{
+    HAL_StatusTypeDef ret;
+
+    ret = ef_send(cmd);
+    <span class="keyword">if</span> (ret != HAL_OK) <span class="keyword">return</span> ret;
+
+    <span class="keyword">for</span> (uint8_t i = 0; i &lt; plen; i++) {
+        delay_us(5);
+        ret = ef_send(params[i]);
+        <span class="keyword">if</span> (ret != HAL_OK) <span class="keyword">return</span> ret;
+    }
+
+    delay_us(20);
+
+    <span class="keyword">for</span> (uint8_t i = 0; i &lt; rlen; i++) {
+        ret = ef_recv(&amp;rx[i]);
+        <span class="keyword">if</span> (ret != HAL_OK) <span class="keyword">return</span> ret;
+        delay_us(5);
+    }
+
+    HAL_Delay(1);  <span class="cmt">/* transaction bitiş boşluğu */</span>
+    <span class="keyword">return</span> HAL_OK;
+}</code></pre>
+  </div>
+
+  <h3>ef_lens.c — yüksek seviye komutlar</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Core/Src/ef_lens.c — init, bilgi, focus, diyafram</span><span class="dot">●</span></div>
+    <pre><code>HAL_StatusTypeDef ef_init(SPI_HandleTypeDef *hspi)
+{
+    _spi = hspi;
+    dwt_enable();
+
+    <span class="cmt">/*
+     * Lens güç aldıktan sonra MCU'sunun boot etmesi için bekle.
+     * USM serisi ~500 ms, STM serisi ~200 ms.
+     * 600 ms tüm EF/EF-S lenslerde güvenlidir.
+     */</span>
+    HAL_Delay(600);
+
+    uint8_t rx[8];
+    <span class="keyword">return</span> ef_cmd(EF_CMD_INIT, NULL, 0, rx, 8);
+}
+
+HAL_StatusTypeDef ef_get_info(ef_lens_info_t *out)
+{
+    uint8_t rx[16] = {0};
+    HAL_StatusTypeDef ret = ef_cmd(EF_CMD_INIT, NULL, 0, rx, 16);
+    <span class="keyword">if</span> (ret != HAL_OK) <span class="keyword">return</span> ret;
+
+    memcpy(out-&gt;raw, rx, 16);
+    out-&gt;type_flags      = rx[0];
+    out-&gt;lens_id         = rx[1];
+    out-&gt;focal_length_mm = (uint16_t)rx[4] | ((uint16_t)rx[5] &lt;&lt; 8);
+    out-&gt;has_usm         = (rx[0] &amp; 0x02) != 0;
+    out-&gt;has_is          = (rx[0] &amp; 0x04) != 0;
+
+    <span class="cmt">/* Av × 8 → f-stop: fstop = 2^(Av/2) */</span>
+    out-&gt;aperture_max = powf(2.0f, (rx[2] / 8.0f) / 2.0f);
+    out-&gt;aperture_min = powf(2.0f, (rx[3] / 8.0f) / 2.0f);
+
+    <span class="keyword">return</span> HAL_OK;
+}
+
+HAL_StatusTypeDef ef_focus_move(uint8_t dir, uint8_t speed, uint16_t steps)
+{
+    uint8_t p[4] = { dir, speed,
+                     (uint8_t)(steps &gt;&gt; 8),
+                     (uint8_t)(steps &amp; 0xFF) };
+    uint8_t rx[1];
+    <span class="keyword">return</span> ef_cmd(EF_CMD_FOCUS_MOVE, p, 4, rx, 1);
+}
+
+HAL_StatusTypeDef ef_focus_stop(void)
+{
+    uint8_t rx[1];
+    <span class="keyword">return</span> ef_cmd(EF_CMD_FOCUS_STOP, NULL, 0, rx, 1);
+}
+
+HAL_StatusTypeDef ef_focus_inf(void)
+{
+    uint8_t rx[1];
+    <span class="keyword">return</span> ef_cmd(EF_CMD_FOCUS_INF, NULL, 0, rx, 1);
+}
+
+HAL_StatusTypeDef ef_focus_near(void)
+{
+    uint8_t rx[1];
+    <span class="keyword">return</span> ef_cmd(EF_CMD_FOCUS_NEAR, NULL, 0, rx, 1);
+}
+
+HAL_StatusTypeDef ef_aperture_set(float fstop)
+{
+    <span class="cmt">/*
+     * f-stop → Av → wire byte:
+     *   Av   = 2 × log2(fstop)
+     *   wire = round(Av × 8)
+     *
+     *   f/1.4 → wire = 8
+     *   f/5.6 → wire = 40
+     *   f/16  → wire = 64
+     */</span>
+    <span class="keyword">float</span>   av   = 2.0f * (logf(fstop) / logf(2.0f));
+    uint8_t wire = (uint8_t)(av * 8.0f + 0.5f);
+
+    uint8_t p[1] = { wire };
+    uint8_t rx[1];
+    HAL_StatusTypeDef ret = ef_cmd(EF_CMD_APERTURE, p, 1, rx, 1);
+    <span class="keyword">if</span> (ret != HAL_OK) <span class="keyword">return</span> ret;
+
+    HAL_Delay(80);  <span class="cmt">/* diyafram bıçakları kapanana kadar bekle */</span>
+    <span class="keyword">return</span> HAL_OK;
+}
+
+HAL_StatusTypeDef ef_aperture_open(void)
+{
+    uint8_t rx[1];
+    <span class="keyword">return</span> ef_cmd(EF_CMD_APERTURE_OPEN, NULL, 0, rx, 1);
+}
+
+HAL_StatusTypeDef ef_status_read(uint8_t *buf, uint8_t len)
+{
+    <span class="keyword">if</span> (len &gt; 32) len = 32;
+    <span class="keyword">return</span> ef_cmd(EF_CMD_STATUS, NULL, 0, buf, len);
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> UART Komut Arayüzü — Seri Konsoldan Lens Kontrolü</h2>
+  <p class="section-lead">USART2, ST-Link virtual COM port üzerinden PC'ye bağlıdır. PuTTY, minicom veya herhangi bir terminal programıyla 115200 baud bağlanıp komut gönderilebilir.</p>
+
+  <h3>printf yönlendirmesi</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Core/Src/main.c — newlib hook</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Bu fonksiyon syscalls.c içine veya doğrudan main.c'ye yazılabilir */</span>
+<span class="keyword">int</span> __io_putchar(<span class="keyword">int</span> ch)
+{
+    HAL_UART_Transmit(&amp;huart2, (uint8_t *)&amp;ch, 1, 10);
+    <span class="keyword">return</span> ch;
+}
+
+<span class="keyword">static void</span> uprint(<span class="keyword">const char</span> *s)
+{
+    HAL_UART_Transmit(&amp;huart2, (<span class="keyword">const</span> uint8_t *)s, strlen(s), 200);
+}</code></pre>
+  </div>
+
+  <h3>CLI ana döngüsü</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Core/Src/main.c — process_cmd() ve app_main()</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">static char</span>    rx_buf[64];
+<span class="keyword">static uint8_t</span> rx_idx = 0;
+
+<span class="keyword">static void</span> process_cmd(<span class="keyword">char</span> *line)
+{
+    <span class="keyword">char</span> *tok = strtok(line, <span class="str">" \r\n"</span>);
+    <span class="keyword">if</span> (!tok) <span class="keyword">return</span>;
+
+    <span class="keyword">if</span> (strcmp(tok, <span class="str">"?"</span>) == 0 || strcmp(tok, <span class="str">"h"</span>) == 0) {
+        uprint(<span class="str">"\r\n--- Canon EF Lens Kontrolu ---\r\n"</span>);
+        uprint(<span class="str">"info          : Lens bilgisi\r\n"</span>);
+        uprint(<span class="str">"fi            : Focus sonsuza\r\n"</span>);
+        uprint(<span class="str">"fn            : Focus minimuma\r\n"</span>);
+        uprint(<span class="str">"f+ &lt;n&gt; [hiz] : N adim uzaga (hiz 1-4)\r\n"</span>);
+        uprint(<span class="str">"f- &lt;n&gt; [hiz] : N adim yakina\r\n"</span>);
+        uprint(<span class="str">"fs            : Motoru durdur\r\n"</span>);
+        uprint(<span class="str">"a &lt;fstop&gt;    : Diyafram ayarla (a 5.6)\r\n"</span>);
+        uprint(<span class="str">"ao            : Diyafram tam ac\r\n"</span>);
+        uprint(<span class="str">"st [n]        : Ham durum (n byte)\r\n"</span>);
+        uprint(<span class="str">"------------------------------\r\n"</span>);
+
+    } <span class="keyword">else if</span> (strcmp(tok, <span class="str">"info"</span>) == 0) {
+        ef_lens_info_t info = {0};
+        <span class="keyword">if</span> (ef_get_info(&amp;info) == HAL_OK) {
+            printf(<span class="str">"Lens ID   : 0x%02X\r\n"</span>,  info.lens_id);
+            printf(<span class="str">"Focal len : %d mm\r\n"</span>,    info.focal_length_mm);
+            printf(<span class="str">"Diyafram  : f/%.1f - f/%.1f\r\n"</span>,
+                   info.aperture_max, info.aperture_min);
+            printf(<span class="str">"USM: %s  IS: %s\r\n"</span>,
+                   info.has_usm ? <span class="str">"EVET"</span> : <span class="str">"HAYIR"</span>,
+                   info.has_is  ? <span class="str">"EVET"</span> : <span class="str">"HAYIR"</span>);
+            uprint(<span class="str">"Ham yanit : "</span>);
+            <span class="keyword">for</span> (<span class="keyword">int</span> i = 0; i &lt; 8; i++)
+                printf(<span class="str">"%02X "</span>, info.raw[i]);
+            uprint(<span class="str">"\r\n"</span>);
+        } <span class="keyword">else</span> {
+            uprint(<span class="str">"HATA: lens yanit vermedi\r\n"</span>);
+        }
+
+    } <span class="keyword">else if</span> (strcmp(tok, <span class="str">"fi"</span>) == 0) {
+        ef_focus_inf();
+        uprint(<span class="str">"Focus → sonsuz\r\n"</span>);
+
+    } <span class="keyword">else if</span> (strcmp(tok, <span class="str">"fn"</span>) == 0) {
+        ef_focus_near();
+        uprint(<span class="str">"Focus → minimum\r\n"</span>);
+
+    } <span class="keyword">else if</span> (strcmp(tok, <span class="str">"f+"</span>) == 0) {
+        <span class="keyword">char</span> *ns = strtok(NULL, <span class="str">" "</span>);
+        <span class="keyword">char</span> *ss = strtok(NULL, <span class="str">" "</span>);
+        uint16_t steps = ns ? (uint16_t)atoi(ns) : 100;
+        uint8_t  speed = ss ? (uint8_t)atoi(ss)  : 2;
+        ef_focus_move(EF_DIR_FAR, speed, steps);
+        printf(<span class="str">"FAR %u adim hiz=%u\r\n"</span>, steps, speed);
+
+    } <span class="keyword">else if</span> (strcmp(tok, <span class="str">"f-"</span>) == 0) {
+        <span class="keyword">char</span> *ns = strtok(NULL, <span class="str">" "</span>);
+        <span class="keyword">char</span> *ss = strtok(NULL, <span class="str">" "</span>);
+        uint16_t steps = ns ? (uint16_t)atoi(ns) : 100;
+        uint8_t  speed = ss ? (uint8_t)atoi(ss)  : 2;
+        ef_focus_move(EF_DIR_NEAR, speed, steps);
+        printf(<span class="str">"NEAR %u adim hiz=%u\r\n"</span>, steps, speed);
+
+    } <span class="keyword">else if</span> (strcmp(tok, <span class="str">"fs"</span>) == 0) {
+        ef_focus_stop();
+        uprint(<span class="str">"STOP\r\n"</span>);
+
+    } <span class="keyword">else if</span> (strcmp(tok, <span class="str">"a"</span>) == 0) {
+        <span class="keyword">char</span> *fs = strtok(NULL, <span class="str">" "</span>);
+        <span class="keyword">if</span> (!fs) { uprint(<span class="str">"Kullanim: a &lt;fstop&gt;\r\n"</span>); <span class="keyword">return</span>; }
+        <span class="keyword">float</span> fstop = strtof(fs, NULL);
+        <span class="keyword">if</span> (fstop &lt; 1.0f || fstop &gt; 32.0f) {
+            uprint(<span class="str">"Gecersiz fstop\r\n"</span>); <span class="keyword">return</span>;
+        }
+        ef_aperture_set(fstop);
+        printf(<span class="str">"Diyafram f/%.1f\r\n"</span>, fstop);
+
+    } <span class="keyword">else if</span> (strcmp(tok, <span class="str">"ao"</span>) == 0) {
+        ef_aperture_open();
+        uprint(<span class="str">"Diyafram tam acik\r\n"</span>);
+
+    } <span class="keyword">else if</span> (strcmp(tok, <span class="str">"st"</span>) == 0) {
+        <span class="keyword">char</span> *ns = strtok(NULL, <span class="str">" "</span>);
+        uint8_t n   = ns ? (uint8_t)atoi(ns) : 4;
+        uint8_t buf[32] = {0};
+        <span class="keyword">if</span> (ef_status_read(buf, n) == HAL_OK) {
+            printf(<span class="str">"Status: "</span>);
+            <span class="keyword">for</span> (uint8_t i = 0; i &lt; n; i++)
+                printf(<span class="str">"%02X "</span>, buf[i]);
+            uprint(<span class="str">"\r\n"</span>);
+        } <span class="keyword">else</span> {
+            uprint(<span class="str">"HATA\r\n"</span>);
+        }
+
+    } <span class="keyword">else</span> {
+        printf(<span class="str">"? → %s\r\n"</span>, tok);
+    }
+
+    uprint(<span class="str">"&gt; "</span>);
+}
+
+<span class="keyword">void</span> app_main(<span class="keyword">void</span>)
+{
+    uprint(<span class="str">"\r\nCanon EF / NUCLEO-L432KC\r\n"</span>);
+    uprint(<span class="str">"SPI1 78kHz Mode3 | USART2 115200\r\n"</span>);
+
+    <span class="keyword">if</span> (ef_init(&amp;hspi1) == HAL_OK)
+        uprint(<span class="str">"Lens HAZIR. '?' yaz.\r\n&gt; "</span>);
+    <span class="keyword">else</span>
+        uprint(<span class="str">"Lens yanit vermedi. Baglanti kontrol et.\r\n&gt; "</span>);
+
+    uint8_t ch;
+    <span class="keyword">while</span> (1) {
+        <span class="keyword">if</span> (HAL_UART_Receive(&amp;huart2, &amp;ch, 1, 1) == HAL_OK) {
+            HAL_UART_Transmit(&amp;huart2, &amp;ch, 1, 5);
+            <span class="keyword">if</span> (ch == <span class="str">'\r'</span> || ch == <span class="str">'\n'</span>) {
+                rx_buf[rx_idx] = <span class="str">'\0'</span>;
+                uprint(<span class="str">"\r\n"</span>);
+                <span class="keyword">if</span> (rx_idx &gt; 0) process_cmd(rx_buf);
+                rx_idx = 0;
+            } <span class="keyword">else if</span> (ch == 0x7F &amp;&amp; rx_idx &gt; 0) {
+                rx_idx--;
+            } <span class="keyword">else if</span> (rx_idx &lt; <span class="keyword">sizeof</span>(rx_buf) - 1) {
+                rx_buf[rx_idx++] = ch;
+            }
+        }
+    }
+}</code></pre>
+  </div>
+
+  <h3>Örnek oturum</h3>
+  <div class="code-block">
+    <div class="code-header"><span>PuTTY · COM3 · 115200-8N1</span><span class="dot">●</span></div>
+    <pre><code>Canon EF / NUCLEO-L432KC
+SPI1 78kHz Mode3 | USART2 115200
+Lens HAZIR. '?' yaz.
+&gt; info
+Lens ID   : 0xEB
+Focal len : 50 mm
+Diyafram  : f/1.4 - f/22.6
+USM: EVET  IS: HAYIR
+Ham yanit : 02 EB 08 60 32 00 00 00
+
+&gt; ao
+Diyafram tam acik
+
+&gt; a 5.6
+Diyafram f/5.6
+
+&gt; fi
+Focus → sonsuz
+
+&gt; f- 300 2
+NEAR 300 adim hiz=2
+
+&gt; f- 300 2
+NEAR 300 adim hiz=2
+
+&gt; st
+Status: 00 05 7B 00
+
+&gt; fn
+Focus → minimum</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 09 ═══════════════════ -->
+<section id="s9">
+  <h2><span class="num">09</span> Özet ve Sorun Giderme</h2>
+  <p class="section-lead">Hızlı başvuru kartı ve kurulumda karşılaşılan yaygın sorunların çözümleri.</p>
+
+  <div class="summary">
+
+  <h3>Tam bağlantı tablosu</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>NUCLEO</th><th>Ara Eleman</th><th>Canon EF</th><th>Sinyal</th></tr></thead>
+      <tbody>
+        <tr><td>PA5 / D13</td><td>74AHCT125 1A → 1Y</td><td>Kontak 6 — Dclk</td><td>Saat (SCK)</td></tr>
+        <tr><td>PA7 / D11</td><td>74AHCT125 2A → 2Y</td><td>Kontak 4 — Dout</td><td>Veri gönder (MOSI)</td></tr>
+        <tr><td>PA6 / D12</td><td>10 kΩ + 20 kΩ bölücü</td><td>Kontak 5 — Din</td><td>Veri al (MISO)</td></tr>
+        <tr><td>5V (VBUS)</td><td>—</td><td>Kontak 3 — VDD</td><td>Mantık beslemesi</td></tr>
+        <tr><td>MT3608 çıkışı</td><td>6.00 V ayarlı</td><td>Kontak 1 — Vbat</td><td>Motor beslemesi</td></tr>
+        <tr><td>GND</td><td>—</td><td>Kontak 2 — A_GND</td><td>Motor toprağı</td></tr>
+        <tr><td>GND</td><td>—</td><td>Kontak 7 — D_GND</td><td>Dijital toprak</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>CubeMX SPI1 özeti</h3>
+  <div class="params">
+    <div class="param"><span class="name">Mode</span><span class="desc">Full-Duplex Master</span></div>
+    <div class="param"><span class="name">CPOL / CPHA</span><span class="desc">HIGH / 2 Edge = <strong>Mode 3</strong></span></div>
+    <div class="param"><span class="name">Prescaler</span><span class="desc">1024 → <strong>78.125 kHz</strong></span></div>
+    <div class="param"><span class="name">First Bit</span><span class="desc">MSB First</span></div>
+    <div class="param"><span class="name">NSS</span><span class="desc">Software (CS yok)</span></div>
+  </div>
+
+  <h3>Sorun giderme</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Belirti</th><th>Olası neden</th><th>Çözüm</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>info → 00 00 00 00</td>
+          <td>Din hattı okunmuyor</td>
+          <td>PA6'yı ölç: idle ~3.3 V görünmeli. Voltaj bölücü bağlantısını kontrol et.</td>
+        </tr>
+        <tr>
+          <td>Lens yanıt vermiyor (HAL_ERROR)</td>
+          <td>Dclk/Dout seviyesi yetersiz</td>
+          <td>74AHCT125 VCC'nin 5 V'ta olduğunu ölç. 1OE ve 2OE GND'de mi kontrol et.</td>
+        </tr>
+        <tr>
+          <td>Focus komutu gidiyor ama motor hareket etmiyor</td>
+          <td>VBAT düşük</td>
+          <td>MT3608 çıkışını ölç: tam 6.00 V olmalı. 5.5 V altında USM motor tork üretemez.</td>
+        </tr>
+        <tr>
+          <td>Diyafram ayarlanmıyor</td>
+          <td>Lens beklenmedik başlangıç durumunda</td>
+          <td>Önce <code class="inline">ao</code> (tam aç) gönder, ardından <code class="inline">a 5.6</code> dene.</td>
+        </tr>
+        <tr>
+          <td>printf float basmıyor</td>
+          <td>Newlib-nano float desteği kapalı</td>
+          <td>CubeMX → Project Manager → "Use float with printf" kutusunu işaretle.</td>
+        </tr>
+        <tr>
+          <td>Lens hazır mesajı çıkıyor ama komutlar yanıtsız</td>
+          <td>Güç sırası yanlış</td>
+          <td>VDD önce, VBAT sonra. Lensi söküp takarak veya VBAT'ı kapatıp açarak dene.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Diyafram Av hızlı tablo</h3>
+  <div class="flow">
+    <pre>
+  f/1.4 → 0x08   f/4.0 → 0x20   f/11  → 0x38
+  f/2.0 → 0x10   f/5.6 → 0x28   f/16  → 0x40
+  f/2.8 → 0x18   f/8.0 → 0x30   f/22  → 0x48</pre>
+  </div>
+
+  </div><!-- /summary -->
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

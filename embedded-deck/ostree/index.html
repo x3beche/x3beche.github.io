@@ -1,0 +1,696 @@
+---
+layout: tutorial
+title: "OSTree — Atomik İşletim Sistemi Güncellemeleri"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>OTA GÜNCELLEME</span>
+    <span>2026</span>
+  </div>
+  <h1>OSTree<br><em>Atomik İşletim Sistemi Güncellemeleri</em></h1>
+  <p class="subtitle">OSTree'nin git benzeri dosya sistemi depolaması ile gömülü cihazlarda atomik, geri alınabilir OTA güncellemeleri ve A/B boot entegrasyonu.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">OSTree neden?</a></li>
+    <li><a href="#s1">OSTree mimarisi</a></li>
+    <li><a href="#s2">Depo oluşturma ve yayımlama</a></li>
+    <li><a href="#s3">İstemci tarafı güncelleme</a></li>
+    <li><a href="#s4">A/B boot entegrasyonu</a></li>
+    <li><a href="#s5">Yocto ile OSTree</a></li>
+    <li><a href="#s6">Flatpak ve OSTree ilişkisi</a></li>
+    <li><a href="#s7">Delta güncellemeleri</a></li>
+    <li><a href="#s8">Gömülü senaryo: Raspberry Pi OTA demo</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> OSTree neden?</h2>
+  <p class="section-lead">Geleneksel paket tabanlı güncelleme sistemleri (dpkg, rpm, opkg) gömülü cihazlarda güvenilirlik sorunları yaratır. OSTree, dosya sistemi düzeyinde atomik commit modeliyle bu sorunları ortadan kaldırır.</p>
+
+  <h3>Geleneksel güncellemelerin sorunları</h3>
+  <p>Bir gömülü cihazda <code>apt upgrade</code> çalışırken güç kesilirse, sistem yarı güncellenmiş bir durumda kalır. Bazı paketler yeni sürümde, bazıları eskisinde, bazı konfigürasyon dosyaları tutarsız durumdadır. Bu durumdan kurtulmak bazen fabrika resetine giden bir yol olabilir — özellikle saha cihazlarında kabul edilemez bir senaryodur.</p>
+
+  <div class="flow">
+    <pre>
+Geleneksel dpkg/rpm güncelleme riski:
+
+  Güncelleme başladı
+      |
+      v
+  Paket 1 güncellendi (yeni)
+  Paket 2 güncellendi (yeni)
+  Paket 3 GÜNCELLENİYOR ...  &lt;-- GÜÇ KESİLDİ
+      |
+      v
+  Sistem tutarsız: paket 3 bozuk, bağımlılıklar çözümsüz
+  Kurtarma: fabrika reset gerekebilir
+    </pre>
+  </div>
+
+  <h3>OSTree'nin atomik commit modeli</h3>
+  <p>OSTree, tüm güncellemeyi tek bir atomik işlem olarak ele alır. Güncelleme tamamlanmadan bir sonraki önyükleme ile etkinleşmez. Güç kesilirse cihaz eski sürümden açılmaya devam eder:</p>
+
+  <div class="flow">
+    <pre>
+OSTree güncelleme akışı:
+
+  Yeni deployment indirildi (mevcut sürüm çalışmaya devam eder)
+      |
+      v
+  Bootloader config güncellendi (sonraki açılışta yeni sürümü dene)
+      |
+      v
+  Cihaz yeniden başlatıldı
+      |-- Başarılı? --> Yeni sürüm aktif, eski sürüm yedekte
+      `-- Başarısız?--> Bootloader eski sürüme geri döner (rollback)
+    </pre>
+  </div>
+
+  <h3>OSTree ve rakip yaklaşımlar</h3>
+  <div class="file-table">
+    <table>
+      <tr><th>Özellik</th><th>OSTree</th><th>RAUC</th><th>SWUpdate</th><th>Mender</th></tr>
+      <tr><td>Depolama modeli</td><td>Content-addressable FS</td><td>A/B bölüm</td><td>A/B bölüm</td><td>A/B bölüm</td></tr>
+      <tr><td>Delta güncelleme</td><td>Evet (static delta)</td><td>Hayır</td><td>Evet (bsdiff)</td><td>Evet</td></tr>
+      <tr><td>Disk kullanımı</td><td>Hardlink paylaşımı — verimli</td><td>2x boyut</td><td>2x boyut</td><td>2x boyut</td></tr>
+      <tr><td>Uygulama güncellemesi</td><td>Flatpak ile birlikte</td><td>Yok</td><td>Yok</td><td>Yok</td></tr>
+      <tr><td>Yocto desteği</td><td>meta-updater</td><td>meta-rauc</td><td>meta-swupdate</td><td>meta-mender</td></tr>
+    </table>
+  </div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> OSTree mimarisi</h2>
+  <p class="section-lead">OSTree, Git'e benzer şekilde içerik adreslenebilir (content-addressable) bir nesne deposu kullanır. Dosyalar SHA256 özetleriyle tanımlanır ve hardlink'ler aracılığıyla paylaşılır.</p>
+
+  <h3>Nesne deposu yapısı</h3>
+  <div class="flow">
+    <pre>
+/ostree/repo/
+├── config                   # Depo yapılandırması
+├── objects/
+│   ├── 00/                  # SHA256'nın ilk 2 hex karakteri
+│   │   └── abcdef...        # Nesne dosyası (file/dirtree/dirmeta/commit)
+│   ├── 1a/
+│   └── ...
+├── refs/
+│   ├── heads/               # Yerel dallar
+│   └── remotes/             # Uzak depo refs
+└── tmp/                     # Geçici işlemler
+    </pre>
+  </div>
+
+  <h3>Nesne tipleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">file nesnesi</span><span class="desc">Tek dosyanın içeriği — SHA256 özeti ile içerik eşleşmesi garanti edilir</span></div>
+    <div class="param"><span class="name">dirtree nesnesi</span><span class="desc">Bir dizinin dosya ve alt dizinlerini listeler — her biri SHA256 referansıdır</span></div>
+    <div class="param"><span class="name">dirmeta nesnesi</span><span class="desc">Dizin meta verisi: uid, gid, mode, xattrs</span></div>
+    <div class="param"><span class="name">commit nesnesi</span><span class="desc">Kök dirtree referansı + zaman damgası + üst commit + commit mesajı</span></div>
+  </div>
+
+  <h3>Hardlink paylaşımı ve disk tasarrufu</h3>
+  <p>İki deployment arasında değişmeyen dosyalar hardlink aracılığıyla paylaşılır. Tipik bir kernel güncellemesinde değişen dosyalar yalnızca birkaç MB olabilirken, userspace'in tamamı (yüzlerce MB) yeniden kopyalanmaz. Bu yaklaşım hem disk alanı hem de indirme bant genişliği açısından büyük tasarruf sağlar.</p>
+
+  <pre><code># İki deployment arasındaki farkı gör
+ostree diff COMMIT_ESK COMMIT_YENI
+
+# Disk kullanımını kontrol et
+du -sh /ostree/deploy/*/
+# deploy/myos/deploy/abc123.0/  180M
+# deploy/myos/deploy/def456.0/   12M  (yalnızca değişen dosyalar)
+# Toplam gerçek kullanım: ~180M (hardlink'ler tekrar sayılmaz)</code></pre>
+
+  <h3>Deployment dizin yapısı</h3>
+  <pre><code>/ostree/
+├── boot/
+│   └── ostree/
+│       └── myos-SHA256/
+│           ├── vmlinuz
+│           └── initramfs.img
+├── deploy/
+│   └── myos/
+│       ├── deploy/
+│       │   ├── COMMIT_HASH.0/     # Aktif deployment (rootfs)
+│       │   └── COMMIT_HASH.1/     # Önceki deployment (rollback için)
+│       └── var/                   # Mutable veri (/var symlink'i)
+└── repo/                          # OSTree nesne deposu</code></pre>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> Depo oluşturma ve yayımlama</h2>
+  <p class="section-lead">OSTree deposu sunucu tarafında oluşturulur ve HTTP üzerinden istemcilere sunulur. <code>ostree init</code> ile başlatılır, <code>ostree commit</code> ile içerik eklenir.</p>
+
+  <h3>Sunucu kurulumu</h3>
+  <pre><code># OSTree araçlarını kur (Debian/Ubuntu)
+sudo apt-get install ostree
+
+# Yeni bir depo oluştur (archive modu: HTTP ile sunuma uygun)
+mkdir -p /srv/ostree-repo
+ostree --repo=/srv/ostree-repo init --mode=archive
+
+# Depo yapılandırmasını kontrol et
+cat /srv/ostree-repo/config
+# [core]
+# repo_version=1
+# mode=archive</code></pre>
+
+  <h3>Rootfs'i commit etme</h3>
+  <pre><code># Bir rootfs dizinini OSTree'ye commit et
+# Örnek: Yocto çıktısı olan rootfs/ dizini
+
+ostree --repo=/srv/ostree-repo commit \
+    --branch=myos/aarch64/stable \
+    --subject="v2.1.0 kararlı sürüm" \
+    --body="Kernel 6.6.21, busybox 1.36" \
+    --tree=dir=rootfs/
+
+# Commit özetini doğrula
+ostree --repo=/srv/ostree-repo refs
+# myos/aarch64/stable
+
+# Son commit'i incele
+ostree --repo=/srv/ostree-repo log myos/aarch64/stable</code></pre>
+
+  <h3>Commit filtreleri</h3>
+  <pre><code># Belirli dizinleri commit'ten hariç tut
+ostree --repo=/srv/ostree-repo commit \
+    --branch=myos/aarch64/stable \
+    --skip-if-unchanged \
+    --exclude-regex="\.pyc$" \
+    --exclude-regex="^/var/" \
+    --tree=dir=rootfs/
+
+# Önceki sürümle farkı gör
+ostree --repo=/srv/ostree-repo diff \
+    myos/aarch64/stable^ \
+    myos/aarch64/stable</code></pre>
+
+  <h3>Nginx ile HTTP sunucusu</h3>
+  <pre><code># /etc/nginx/sites-available/ostree-repo
+server {
+    listen 80;
+    server_name ota.yerel.ag;
+    root /srv/ostree-repo;
+
+    location / {
+        autoindex on;
+        add_header Cache-Control "no-cache";
+    }
+}
+
+# summary dosyasını güncelle (istemci keşfi için)
+ostree --repo=/srv/ostree-repo summary --update</code></pre>
+
+  <h3>GPG imzalama</h3>
+  <pre><code># GPG anahtarı oluştur (bir kez)
+gpg --gen-key
+
+# Commit'i imzala
+ostree --repo=/srv/ostree-repo commit \
+    --branch=myos/aarch64/stable \
+    --gpg-sign=ANAHTAR_KIMLIK \
+    --gpg-homedir=/root/.gnupg \
+    --tree=dir=rootfs/
+
+# Depo genel anahtarını dışa aktar
+gpg --export ANAHTAR_KIMLIK &gt; /srv/ostree-repo/ostree-trusted.gpg</code></pre>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> İstemci tarafı güncelleme</h2>
+  <p class="section-lead">Cihaz tarafında <code>ostree pull</code> ile depodan yeni sürüm indirilir, <code>ostree deploy</code> ile etkinleştirilir. Staged deployment sayesinde güncelleme bir sonraki yeniden başlatmada devreye girer.</p>
+
+  <h3>İstemci deposu başlatma</h3>
+  <pre><code># Uzak depo ekle
+ostree remote add --no-gpg-verify \
+    myota http://ota.yerel.ag \
+    --set=branches=myos/aarch64/stable
+
+# Üretim ortamı — GPG doğrulama ile
+ostree remote add \
+    --gpg-import=/etc/ostree/trusted.gpg \
+    myota http://ota.yerel.ag
+
+# Uzak depoları listele
+ostree remote list</code></pre>
+
+  <h3>Güncelleme indirme ve uygulama</h3>
+  <pre><code># Yeni commit'leri kontrol et (indirmeden)
+ostree remote summary myota
+
+# Güncellemeyi indir
+ostree pull myota myos/aarch64/stable
+
+# İndirilen commit'i gör
+ostree log myota:myos/aarch64/stable
+
+# Deployment oluştur
+ostree admin deploy --os=myos myota:myos/aarch64/stable
+
+# Mevcut deployment durumunu gör
+ostree admin status
+# * myos 7a3f9d2e... (aktif)
+#   myos a1b2c3d4... (önceki)</code></pre>
+
+  <h3>Staged deployment</h3>
+  <p>Staged deployment ile güncelleme arka planda indirilir ve hazırlanır; etkinleşme açık onay veya planlanmış yeniden başlatma ile gerçekleşir. Üretim cihazlarında kontrolsüz yeniden başlatmayı önler.</p>
+
+  <pre><code># Güncellemeyi staged modda hazırla (yeniden başlatma YOK)
+ostree admin deploy --stage \
+    --os=myos myota:myos/aarch64/stable
+
+# Bakım penceresinde manuel yeniden başlat
+systemctl reboot
+
+# Ya da finalize servisini tetikle
+systemctl start ostree-finalize-staged.service</code></pre>
+
+  <h3>Rollback</h3>
+  <pre><code># Mevcut deploymentleri gör
+ostree admin status
+
+# Önceki deployment'a geç
+ostree admin undeploy 0
+
+# Bir sonraki açılışta önceki sürüm devreye girer
+systemctl reboot</code></pre>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> A/B boot entegrasyonu</h2>
+  <p class="section-lead">OSTree, A/B (aktif/yedek) bölüm stratejisini bootloader ile koordineli şekilde yönetir. U-Boot veya GRUB ile deployment seçimi ve başarısızlık durumunda otomatik rollback sağlanır.</p>
+
+  <h3>Deployment switching mantığı</h3>
+  <div class="flow">
+    <pre>
+Yeni sürüm deploy edildi
+    |
+    v
+Bootloader config güncellendi:
+  U-Boot: bootcount=0, upgrade_available=1
+    |
+    v
+Cihaz yeniden başlatıldı
+    |
+    +--[Başarılı boot]--&gt; post-boot-healthcheck çalışır
+    |                     upgrade_available=0 yazılır (kalıcı)
+    |
+    `--[Başarısız boot]--&gt; bootcount artışı (U-Boot izler)
+                           bootcount &gt;= bootlimit
+                           Eski deployment seçilir (rollback)
+    </pre>
+  </div>
+
+  <h3>U-Boot entegrasyonu</h3>
+  <pre><code># /boot/uEnv.txt — U-Boot ortam değişkenleri
+bootcount=0
+bootlimit=3
+upgrade_available=0
+ostree_root=/ostree/deploy/myos/deploy/COMMIT_HASH.0
+
+# U-Boot script parçası (boot.scr içinde):
+# if test UPGRADE_AVAILABLE = "1"; then
+#   setexpr bootcount BOOTCOUNT + 1
+#   saveenv
+#   if test BOOTCOUNT &gt; BOOTLIMIT; then
+#     run rollback_cmd
+#   fi
+# fi
+
+# Linux tarafında ortam değişkenlerini güncelle
+fw_setenv upgrade_available 0
+fw_setenv bootcount 0</code></pre>
+
+  <h3>GRUB entegrasyonu</h3>
+  <pre><code># /boot/grub/grub.cfg — OSTree tarafından yönetilir
+
+set default="0"
+set timeout=3
+
+menuentry "myos v2.1.0 (güncel)" {
+    linux /ostree/boot.1/myos/vmlinuz \
+          root=/dev/mmcblk0p2 rw \
+          ostree=/ostree/deploy/myos/deploy/7a3f9d2e.0
+    initrd /ostree/boot.1/myos/initramfs.img
+}
+
+menuentry "myos v2.0.1 (rollback)" {
+    linux /ostree/boot.0/myos/vmlinuz \
+          root=/dev/mmcblk0p2 rw \
+          ostree=/ostree/deploy/myos/deploy/a1b2c3d4.0
+    initrd /ostree/boot.0/myos/initramfs.img
+}</code></pre>
+
+  <h3>Önerilen bölüm düzeni</h3>
+  <div class="file-table">
+    <table>
+      <tr><th>Bölüm</th><th>İçerik</th><th>Boyut</th><th>Notlar</th></tr>
+      <tr><td>/dev/mmcblk0p1</td><td>Boot (FAT32)</td><td>256 MB</td><td>Kernel, initramfs, GRUB/U-Boot</td></tr>
+      <tr><td>/dev/mmcblk0p2</td><td>Rootfs (ext4)</td><td>4+ GB</td><td>OSTree deposu + deploymentler</td></tr>
+      <tr><td>/dev/mmcblk0p3</td><td>/var (ext4)</td><td>1+ GB</td><td>Mutable veriler — güncellemeden etkilenmez</td></tr>
+      <tr><td>/dev/mmcblk0p4</td><td>Veri (ext4/f2fs)</td><td>Kalan</td><td>Uygulama verileri</td></tr>
+    </table>
+  </div>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> Yocto ile OSTree</h2>
+  <p class="section-lead"><code>meta-updater</code> Yocto katmanı, OSTree desteğini BitBake recipe'lerine entegre eder. IMAGE_CLASSES değişkenine eklenerek OSTree uyumlu imaj üretimi otomatikleştirilir.</p>
+
+  <h3>meta-updater katmanını ekleme</h3>
+  <pre><code># bblayers.conf içine ekle
+BBLAYERS += " \
+    TOPDIR/../meta-updater \
+    TOPDIR/../meta-updater-raspberrypi \
+"
+
+# meta-updater klonla
+git clone https://github.com/uptane/meta-updater.git \
+    ../meta-updater -b hardknott</code></pre>
+
+  <h3>local.conf yapılandırması</h3>
+  <pre><code># local.conf
+IMAGE_CLASSES += "ostree"
+
+# OSTree branch adı
+OSTREE_BRANCHNAME = "myos/aarch64/stable"
+
+# Bootloader seçimi: "u-boot" veya "grub"
+OSTREE_BOOTLOADER = "u-boot"
+
+# HTTP sunucusu base URL
+OSTREE_REPO_SYNC_URL = "http://ota.yerel.ag/"
+
+# OSTree repo modu
+OSTREE_REPO_MODE = "archive"</code></pre>
+
+  <h3>Build ve çıktılar</h3>
+  <pre><code># Normal imaj build
+bitbake myos-image-minimal
+
+# Çıktılar (deploy/ dizininde):
+# myos-image-minimal-MACHINE.ostree.tar.gz   -- OSTree depo arşivi
+# myos-image-minimal-MACHINE.rootfs.ext4     -- Disk imajı
+# myos-image-minimal-MACHINE.wic             -- Tam SD kart imajı</code></pre>
+
+  <h3>sstate-cache optimizasyonu</h3>
+  <pre><code># Değişmemiş bileşenler sstate-cache'den yüklenir
+# OSTree commit aşamasında yalnızca değişen dosyalar işlenir
+
+SSTATE_DIR = "/srv/sstate-cache"
+SSTATE_MIRRORS = "file://.* http://sstate.yerel.ag/PATH"
+
+# İstatistikleri izle
+bitbake -e myos-image-minimal | grep SSTATE_RESULT</code></pre>
+
+  <h3>bbappend ile cihaza özel yapılandırma</h3>
+  <pre><code># meta-myos/recipes-sota/ostree/ostree_VERSION.bbappend
+
+do_install_append() {
+    install -d DEST_DIR/etc/ostree/remotes.d/
+    cat &gt; DEST_DIR/etc/ostree/remotes.d/myota.conf &lt;&lt;CONF
+[remote "myota"]
+url=http://ota.yerel.ag/
+branches=myos/aarch64/stable;
+gpg-verify=true
+CONF
+}</code></pre>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> Flatpak ve OSTree ilişkisi</h2>
+  <p class="section-lead">Flatpak, uygulama paketleme ve dağıtımı için OSTree altyapısını kullanır. İşletim sistemi güncellemesi (OSTree) ile uygulama güncellemesi (Flatpak) birbirinden bağımsız ve paralel çalışabilir.</p>
+
+  <h3>İki deponun yan yana çalışması</h3>
+  <div class="flow">
+    <pre>
+OSTree (İşletim Sistemi)         Flatpak (Uygulamalar)
+/ostree/repo/                    /var/lib/flatpak/repo/
+├── refs/heads/                  ├── refs/heads/
+│   └── myos/aarch64/stable      │   ├── app/org.Gnome.App/...
+│                                │   └── runtime/org.Gnome.Platform/...
+└── objects/                     └── objects/
+    (OS dosyaları)                   (uygulama + runtime dosyaları)
+
+Her iki depo da aynı OSTree protokolünü kullanır;
+birbirinden bağımsız commit ve güncelleme döngüleri vardır.
+    </pre>
+  </div>
+
+  <h3>Gömülü sistemlerde Flatpak</h3>
+  <pre><code># Flatpak kurulumu (Yocto — meta-flatpak)
+IMAGE_INSTALL += "flatpak"
+
+# Remote ekle
+flatpak remote-add --if-not-exists flathub \
+    https://dl.flathub.org/repo/flathub.flatpakrepo
+
+# Uygulama yükle
+flatpak install flathub org.freedesktop.Platform//23.08
+flatpak install flathub com.sirket.Uygulama
+
+# Güncelleme kontrolü
+flatpak update --check</code></pre>
+
+  <h3>OS güncellemesi vs Uygulama güncellemesi</h3>
+  <div class="file-table">
+    <table>
+      <tr><th>Özellik</th><th>OSTree (OS)</th><th>Flatpak (Uygulama)</th></tr>
+      <tr><td>Kapsam</td><td>Kernel, libc, sistem araçları</td><td>Masaüstü/gömülü uygulamalar</td></tr>
+      <tr><td>Rollback</td><td>Tam OS rollback (deployment)</td><td>Uygulama versiyonu geri alma</td></tr>
+      <tr><td>Sandbox</td><td>Yok (sistem bileşeni)</td><td>Bubblewrap sandbox</td></tr>
+      <tr><td>Güncelleme sıklığı</td><td>Düşük (ayda 1–2)</td><td>Yüksek (günlük mümkün)</td></tr>
+      <tr><td>Yeniden başlatma</td><td>Zorunlu</td><td>Genellikle gereksiz</td></tr>
+    </table>
+  </div>
+
+  <h3>Runtime ref'lerini sorgulama</h3>
+  <pre><code># Mevcut Flatpak runtime'larını listele
+flatpak list --runtime
+
+# OSTree nesne deposunu sorgula
+ostree --repo=/var/lib/flatpak/repo refs | grep runtime
+
+# Delta güncelleme istatistikleri
+flatpak update --no-deploy --verbose 2&gt;&amp;1 | grep "Delta"</code></pre>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> Delta güncellemeleri</h2>
+  <p class="section-lead">OSTree static delta'ları, iki commit arasındaki farkı tek bir indirilebilir dosyaya paketler. Bsdiff algoritması ile bayt düzeyinde delta hesaplanır ve bant genişliği kullanımı dramatik biçimde azaltılır.</p>
+
+  <h3>Static delta oluşturma</h3>
+  <pre><code># Sunucu tarafında: eski commit'ten yeni commit'e delta üret
+ostree --repo=/srv/ostree-repo static-delta generate \
+    --from=a1b2c3d4e5f6... \
+    --to=7a3f9d2e1b4c... \
+    --min-fallback-size=0
+
+# Delta boyutunu kontrol et
+ostree --repo=/srv/ostree-repo static-delta list
+# a1b2c3d4e5f6->7a3f9d2e1b4c  8.2M
+
+# summary güncelle
+ostree --repo=/srv/ostree-repo summary --update</code></pre>
+
+  <h3>İstemci tarafında delta kullanımı</h3>
+  <pre><code># İstemci — delta otomatik algılanır ve kullanılır
+ostree pull myota myos/aarch64/stable
+
+# Yerel delta listesini kontrol et
+ostree --repo=/ostree/repo static-delta list</code></pre>
+
+  <h3>Delta boyutu karşılaştırması</h3>
+  <div class="file-table">
+    <table>
+      <tr><th>Yöntem</th><th>İndirme boyutu</th><th>Açıklama</th></tr>
+      <tr><td>Tam imaj (eski yöntem)</td><td>180 MB</td><td>Her güncellemede tam rootfs</td></tr>
+      <tr><td>OSTree pull (delta yok)</td><td>~20 MB</td><td>Yalnızca değişen nesneler</td></tr>
+      <tr><td>OSTree static delta</td><td>~8 MB</td><td>bsdiff ile sıkıştırılmış fark</td></tr>
+    </table>
+  </div>
+
+  <h3>Delta üretimini otomatikleştirme</h3>
+  <pre><code>#!/bin/bash
+# Yeni commit sonrası otomatik delta üret
+
+REPO=/srv/ostree-repo
+BRANCH=myos/aarch64/stable
+
+# Son iki commit'i al
+COMMIT_NEW=$(ostree --repo=$REPO rev-parse $BRANCH)
+COMMIT_OLD=$(ostree --repo=$REPO rev-parse $BRANCH^)
+
+echo "Delta: $COMMIT_OLD -&gt; $COMMIT_NEW"
+
+ostree --repo=$REPO static-delta generate \
+    --from=$COMMIT_OLD \
+    --to=$COMMIT_NEW \
+    --min-fallback-size=0
+
+ostree --repo=$REPO summary --update
+echo "Delta hazir, summary guncellendi."</code></pre>
+
+  <h3>Delta bileşeni istatistikleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">Kernel güncelleme</span><span class="desc">Tipik delta: 3–15 MB (vmlinuz ikili farkı bsdiff ile)</span></div>
+    <div class="param"><span class="name">Libc güncellemesi</span><span class="desc">Tipik delta: ~500 KB (tam kütüphane ~2 MB yerine)</span></div>
+    <div class="param"><span class="name">Konfigürasyon değişikliği</span><span class="desc">Tipik delta: 1–10 KB (yalnızca metin farkları)</span></div>
+    <div class="param"><span class="name">Büyük binary güncelleme</span><span class="desc">bsdiff ile genel kural: %60–80 boyut azaltımı</span></div>
+  </div>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Gömülü senaryo: Raspberry Pi OTA demo</h2>
+  <p class="section-lead">Raspberry Pi 4 üzerinde OSTree tabanlı OTA sistemi kurulumu ve update-agent servisi ile tam bir gömülü güncelleme döngüsü örneği.</p>
+
+  <h3>Ortam gereksinimleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">Cihaz</span><span class="desc">Raspberry Pi 4 — 32 GB SD kart, Debian Bullseye veya Yocto imajı</span></div>
+    <div class="param"><span class="name">Sunucu</span><span class="desc">HTTP sunucusu erişilebilir (aynı LAN veya internet)</span></div>
+    <div class="param"><span class="name">Bootloader</span><span class="desc">U-Boot — meta-raspberrypi + meta-updater ile hazırlanmış</span></div>
+    <div class="param"><span class="name">Ağ</span><span class="desc">Ethernet veya WiFi — OTA indirme için bant genişliği</span></div>
+  </div>
+
+  <h3>update-agent betiği</h3>
+  <pre><code>#!/bin/bash
+# /usr/bin/update-agent.sh
+
+REMOTE=myota
+BRANCH=myos/aarch64/stable
+LOG=/var/log/update-agent.log
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a $LOG; }
+
+check_and_update() {
+    log "Güncellemeler kontrol ediliyor..."
+
+    CURRENT=$(ostree admin status | awk '/^\*/{print $3}')
+    log "Mevcut: $CURRENT"
+
+    ostree pull --commit-metadata-only $REMOTE $BRANCH 2&gt;&gt;$LOG
+    REMOTE_COMMIT=$(ostree rev-parse $REMOTE:$BRANCH)
+    log "Uzak: $REMOTE_COMMIT"
+
+    if [ "$CURRENT" = "$REMOTE_COMMIT" ]; then
+        log "Sistem güncel."
+        return 0
+    fi
+
+    log "Yeni sürüm bulundu: $REMOTE_COMMIT"
+
+    # Tam pull (delta varsa otomatik kullanılır)
+    ostree pull $REMOTE $BRANCH &gt;&gt;$LOG 2&gt;&amp;1
+
+    # Staged deploy
+    ostree admin deploy --stage --os=myos $REMOTE:$BRANCH &gt;&gt;$LOG 2&gt;&amp;1
+
+    if [ $? -eq 0 ]; then
+        log "Güncelleme hazır. Bir sonraki yeniden başlatmada aktif olacak."
+    else
+        log "HATA: deploy başarısız!"
+    fi
+}
+
+check_and_update</code></pre>
+
+  <h3>systemd timer ile otomatik kontrol</h3>
+  <pre><code># /etc/systemd/system/update-agent.service
+[Unit]
+Description=OTA Update Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/update-agent.sh</code></pre>
+
+  <pre><code># /etc/systemd/system/update-agent.timer
+[Unit]
+Description=OTA güncellemelerini saatlik kontrol et
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target</code></pre>
+
+  <pre><code># Etkinleştir ve test et
+systemctl enable --now update-agent.timer
+systemctl start update-agent.service
+journalctl -u update-agent.service -f</code></pre>
+
+  <h3>Post-boot health check</h3>
+  <pre><code>#!/bin/bash
+# /usr/bin/post-boot-healthcheck.sh
+
+HEALTH_OK=1
+
+for svc in networking ssh myapp.service; do
+    if ! systemctl is-active --quiet $svc; then
+        echo "HATA: $svc çalışmıyor!" &gt;&amp;2
+        HEALTH_OK=0
+    fi
+done
+
+if [ $HEALTH_OK -eq 1 ]; then
+    fw_setenv upgrade_available 0
+    fw_setenv bootcount 0
+    echo "Sağlık kontrolü başarılı, güncelleme onaylandı."
+else
+    echo "Sağlık kontrolü BAŞARISIZ — rollback bekleniyor."
+    exit 1
+fi</code></pre>
+
+  <h3>Tam OTA döngüsü</h3>
+  <div class="flow">
+    <pre>
+[Sunucu] Yeni rootfs hazırlandı
+    |
+    v
+ostree commit --branch=myos/aarch64/stable
+    |
+    v
+static-delta generate (delta paketi ~8 MB)
+    |
+    v
+ostree summary --update
+    |
+    v
+[Cihaz] update-agent.timer tetiklendi
+    |
+    v
+ostree pull myota (delta ile indirildi)
+    |
+    v
+ostree admin deploy --stage
+    |
+    v
+[Bakım penceresi] systemctl reboot
+    |
+    v
+U-Boot: yeni deployment seçildi
+    |
+    +--[Başarılı]--&gt; post-boot-healthcheck OK
+    |                fw_setenv upgrade_available 0
+    |                Güncelleme ONAYLANDI
+    |
+    `--[Başarısız]-&gt; bootcount &gt;= bootlimit
+                     U-Boot eski deployment seçer
+                     ROLLBACK TAMAMLANDI
+    </pre>
+  </div>
+</section>
+
+</main>

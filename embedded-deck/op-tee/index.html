@@ -1,0 +1,845 @@
+---
+layout: tutorial
+title: "OP-TEE — ARM TrustZone Güvenli Dünya"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>GÜVENLİK</span>
+    <span>2026</span>
+  </div>
+  <h1>OP-TEE<br><em>ARM TrustZone Güvenli Dünya</em></h1>
+  <p class="subtitle">Trusted Applications yazma, TEE Client API kullanma, güvenli depolama ve kriptografi — GlobalPlatform TEE standardı ile uçtan uca rehber.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">TrustZone mimarisi</a></li>
+    <li><a href="#s1">OP-TEE OS yapısı</a></li>
+    <li><a href="#s2">Trusted Application anatomisi</a></li>
+    <li><a href="#s3">TEE Client API — Normal World tarafı</a></li>
+    <li><a href="#s4">Shared memory ve parametre tipleri</a></li>
+    <li><a href="#s5">Secure Storage — güvenli anahtar saklama</a></li>
+    <li><a href="#s6">Kriptografi API</a></li>
+    <li><a href="#s7">PSA Certified ve attestation</a></li>
+    <li><a href="#s8">Derleme, yükleme ve debug</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> TrustZone mimarisi</h2>
+  <p class="section-lead">ARM TrustZone, tek bir SoC üzerinde iki tamamen ayrı çalışma ortamı oluşturur: Secure World ve Normal World. Donanım, bellek ve IO kaynaklarını bu iki dünya arasında yalıtır.</p>
+
+  <h3>İki dünyanın yapısı</h3>
+  <div class="flow">
+    <pre>
+┌───────────────────────┐   ┌───────────────────────┐
+│    NORMAL WORLD        │   │     SECURE WORLD       │
+│                       │   │                        │
+│  Linux Kernel (EL1)   │   │  OP-TEE OS (S-EL1)     │
+│  User apps (EL0)      │   │  Trusted Apps (S-EL0)  │
+│  KVM/Xen (EL2)        │   │                        │
+└──────────┬────────────┘   └────────────┬───────────┘
+           │   SMC                        │   SMC
+           └──────────┬───────────────────┘
+                      ▼
+              Secure Monitor — EL3
+              (TF-A BL31 — daima çalışır)
+              NS bit: SCR_EL3.NS
+                      │
+              ┌───────▼────────┐
+              │   SoC Hardware  │
+              │  TZC-400 DRAM  │
+              │  GIC (FIQ yön.) │
+              │  Secure SRAM    │
+              └────────────────┘</pre>
+  </div>
+
+  <h3>Secure/Non-Secure ayrımı</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Kaynak</th><th>Normal World</th><th>Secure World</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>DRAM bölgesi</td><td>NS DRAM (Linux heap, stack)</td><td>Secure DRAM (OP-TEE heap, TA stack)</td></tr>
+        <tr><td>SRAM</td><td>Erişim yok</td><td>Secure SRAM — hızlı erişim</td></tr>
+        <tr><td>Periferler</td><td>UART, USB, Ethernet vb.</td><td>Güvenli UART, OTP, crypto HW</td></tr>
+        <tr><td>Kesmeler</td><td>IRQ (GIC NS interrupt)</td><td>FIQ (GIC Secure interrupt)</td></tr>
+        <tr><td>Cache</td><td>NS cache satırları</td><td>Secure cache satırları (TrustZone cache)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Monitor modu ve geçiş</h3>
+  <p>Normal World bir TEE servisi istediğinde <code>smc #0</code> komutu çalıştırır. EL3'teki Secure Monitor (TF-A BL31) çağrıyı alır, NS bit'i sıfırlar ve S-EL1'deki OP-TEE'ye geçiş yapar. OP-TEE işi bitirdiğinde tekrar EL3 üzerinden Normal World'e dönülür.</p>
+
+  <pre><code>/* Normal World çağrısı — libteec içindeki SMC wrapper */
+static uint32_t smc(uint32_t func_id, uint32_t a1, uint32_t a2,
+                    uint32_t a3, uint32_t a4, uint32_t a5,
+                    uint32_t a6, struct smc_param *param)
+{
+    /* x0 = func_id (OPTEE_SMC_CALL_WITH_RPC_ARG)
+       x1-x6 = argümanlar
+       Sonuç x0-x3'te dönüyor */
+    asm volatile(
+        "mov x0, %[fid]\n"
+        "mov x1, %[a1]\n"
+        "mov x2, %[a2]\n"
+        "smc #0\n"
+        "str x0, %[ret0]\n"
+        : [ret0] "=m" (param->a0)
+        : [fid] "r" (func_id), [a1] "r" (a1), [a2] "r" (a2)
+        : "x0", "x1", "x2", "memory"
+    );
+    return param->a0;
+}</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> OP-TEE OS yapısı</h2>
+  <p class="section-lead">OP-TEE, GlobalPlatform TEE Core API standardını implement eden açık kaynaklı bir Trusted Operating System'dir; Linaro tarafından geliştirilen proje TF-A ile entegre çalışır.</p>
+
+  <h3>Kaynak ağacı</h3>
+  <pre><code>optee_os/
+├── core/
+│   ├── arch/arm/         # ARM-spesifik: entry, exception vektörleri, MMU
+│   │   ├── sm/           # Secure Monitor interface (EL3 ↔ S-EL1)
+│   │   ├── plat-*/       # Platform portları (stm32mp1, vexpress, rpi3 vb.)
+│   │   └── tee/          # TEE çekirdek servisleri
+│   ├── drivers/          # Crypto HW, UART, RNG, RPMB sürücüleri
+│   ├── kernel/           # Thread scheduler, mutex, IPC
+│   ├── mm/               # Güvenli bellek yönetimi, mobj
+│   └── tee/              # GP TEE Core API impl: crypto, storage, time
+├── lib/
+│   ├── libutee/          # TA tarafı API (Trusted Applications bağlanır)
+│   └── libutils/         # String, math yardımcıları
+├── ta/                   # Yerleşik TA'lar: pkcs11, device_id, gprof
+└── mk/                   # Derleme sistemi Makefile'ları</code></pre>
+
+  <h3>Thread modeli</h3>
+  <p>OP-TEE, Normal World'den gelen her SMC çağrısı için bir S-EL1 thread tahsis eder. Thread sayısı <code>CFG_NUM_THREADS</code> ile sınırlandırılır; genellikle çekirdek sayısına eşittir. Her TA çağrısı ayrı thread bağlamında çalışır.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">CFG_NUM_THREADS</span><span class="desc">Paralel TEE thread sayısı — genellikle SoC çekirdek sayısı (4)</span></div>
+    <div class="param"><span class="name">CFG_TA_STACK_SIZE</span><span class="desc">Her TA thread stack boyutu — varsayılan 8 KB, RAM kısıtlıysa azalt</span></div>
+    <div class="param"><span class="name">CFG_CORE_HEAP_SIZE</span><span class="desc">OP-TEE çekirdek heap — TA yükleme, kriptografi işlemleri için</span></div>
+    <div class="param"><span class="name">CFG_RPMB_FS</span><span class="desc">eMMC RPMB üzerinde güvenli depolama — tamper-evident</span></div>
+    <div class="param"><span class="name">CFG_TEE_CORE_LOG_LEVEL</span><span class="desc">0=kapalı, 1=hata, 2=info, 3=debug, 4=flow — build-time sabit</span></div>
+  </div>
+
+  <h3>OP-TEE supplicant</h3>
+  <p>Normal World'de çalışan <code>tee-supplicant</code> daemon'u, Trusted OS'un dosya sistemi, RPC ve RPMB erişimlerini karşılar. OP-TEE'nin disk dosyalarına erişmesi için gereklidir; sistem açılışında otomatik başlamalıdır.</p>
+
+  <pre><code># systemd servisi
+# /lib/systemd/system/tee-supplicant.service
+[Unit]
+Description=TEE Supplicant Daemon
+After=local-fs.target
+
+[Service]
+ExecStart=/usr/sbin/tee-supplicant
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Trusted Application anatomisi</h2>
+  <p class="section-lead">Trusted Application (TA), Secure World'de S-EL0 seviyesinde çalışan, GlobalPlatform TEE Internal Core API'yi kullanan paylaşımlı kütüphane biçiminde ELF dosyasıdır.</p>
+
+  <h3>TA giriş noktaları</h3>
+  <p>Her TA beş zorunlu giriş noktası (entry point) implement etmek zorundadır. OP-TEE bu fonksiyonları TA yaşam döngüsü boyunca çağırır.</p>
+
+  <pre><code>/* ta/hello_world/hello_world_ta.c */
+#include &lt;tee_internal_api.h&gt;
+#include &lt;tee_internal_api_extensions.h&gt;
+#include "hello_world_ta.h"
+
+/* TA ilk yüklendiğinde — instance oluştur */
+TEE_Result TA_CreateEntryPoint(void)
+{
+    DMSG("TA_CreateEntryPoint cagrildi");
+    /* Global kaynakları tahsis et */
+    return TEE_SUCCESS;
+}
+
+/* TA kaldırılmadan önce */
+void TA_DestroyEntryPoint(void)
+{
+    DMSG("TA_DestroyEntryPoint cagrildi");
+    /* Global kaynakları serbest bırak */
+}
+
+/* Normal World bir session açtığında */
+TEE_Result TA_OpenSessionEntryPoint(uint32_t param_types,
+                                     TEE_Param params[4],
+                                     void **sess_ctx)
+{
+    uint32_t exp_param_types = TEE_PARAM_TYPES(
+        TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE,
+        TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
+    if (param_types != exp_param_types)
+        return TEE_ERROR_BAD_PARAMETERS;
+
+    /* Session'a özel bağlam tahsis et */
+    struct session_ctx *ctx = TEE_Malloc(sizeof(*ctx), 0);
+    if (!ctx) return TEE_ERROR_OUT_OF_MEMORY;
+    *sess_ctx = ctx;
+    return TEE_SUCCESS;
+}
+
+/* Session kapatılırken */
+void TA_CloseSessionEntryPoint(void *sess_ctx)
+{
+    struct session_ctx *ctx = sess_ctx;
+    TEE_Free(ctx);
+}
+
+/* Normal World komut çağırdığında — ana iş burada */
+TEE_Result TA_InvokeCommandEntryPoint(void *sess_ctx,
+                                       uint32_t cmd_id,
+                                       uint32_t param_types,
+                                       TEE_Param params[4])
+{
+    switch (cmd_id) {
+    case TA_HELLO_WORLD_CMD_INC_VALUE:
+        return inc_value(param_types, params);
+    case TA_HELLO_WORLD_CMD_DEC_VALUE:
+        return dec_value(param_types, params);
+    default:
+        EMSG("Bilinmeyen komut: 0x%x", cmd_id);
+        return TEE_ERROR_NOT_SUPPORTED;
+    }
+}</code></pre>
+
+  <h3>TA UUID ve manifest</h3>
+  <pre><code>/* ta/hello_world/Android.mk veya Makefile içindeki UUID */
+/* Her TA eşsiz bir UUID ile tanımlanır */
+
+/* hello_world_ta.h */
+#define TA_HELLO_WORLD_UUID \
+    { 0x8aaaf200, 0x2450, 0x11e4, \
+      { 0xab, 0xe2, 0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b } }
+
+#define TA_HELLO_WORLD_CMD_INC_VALUE   0
+#define TA_HELLO_WORLD_CMD_DEC_VALUE   1</code></pre>
+
+  <pre><code>/* user_ta_header_defines.h — TA özellikleri */
+#define TA_UUID     TA_HELLO_WORLD_UUID
+#define TA_FLAGS    (TA_FLAG_EXEC_DDR | TA_FLAG_SINGLE_INSTANCE)
+#define TA_STACK_SIZE       (4 * 1024)    /* 4 KB */
+#define TA_DATA_SIZE        (32 * 1024)   /* 32 KB heap */
+#define TA_VERSION          "1.0"
+#define TA_DESCRIPTION      "Hello World Ornek TA"</code></pre>
+
+  <h3>TA imzalama</h3>
+  <p>Production ortamında TA'lar, OP-TEE'nin güvendiği bir anahtar çiftiyle imzalanmalıdır. Development modunda test anahtar çifti kullanılır; <code>CFG_TA_KEY_SETUP</code> değişkeniyle kontrol edilir.</p>
+
+  <pre><code># TA imzalama scripti (scripts/sign_encrypt.py)
+python3 scripts/sign_encrypt.py \
+    --uuid 8aaaf200-2450-11e4-abe2-0002a5d5c51b \
+    --key keys/default_ta.pem \
+    --in hello_world.stripped.elf \
+    --out 8aaaf200-2450-11e4-abe2-0002a5d5c51b.ta
+
+# İmzalanan .ta dosyası rootfs'e kopyalanır:
+# /lib/optee_armtz/8aaaf200-2450-11e4-abe2-0002a5d5c51b.ta</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> TEE Client API — Normal World tarafı</h2>
+  <p class="section-lead">libteec, Normal World uygulamalarının OP-TEE ile iletişim kurması için GlobalPlatform TEE Client API standardını implement eder; <code>/dev/tee0</code> üzerinden çalışır.</p>
+
+  <h3>Bağlantı akışı</h3>
+  <div class="flow">
+    <pre>
+Normal World uygulama
+    │
+    │ TEEC_InitializeContext()
+    ▼
+TEE Context  ──── /dev/tee0 ────&gt;  OP-TEE driver (kernel)
+    │                                    │
+    │ TEEC_OpenSession()                 │ SMC
+    ▼                                    ▼
+TEE Session  &lt;──────────────────&gt;  OP-TEE OS (S-EL1)
+    │                                    │
+    │ TEEC_InvokeCommand()               │ TA_InvokeCommandEntryPoint()
+    ▼                                    ▼
+Sonuç &amp; çıktı parametreler &lt;──── TA işlem sonucu</pre>
+  </div>
+
+  <h3>Tam bir istemci örneği</h3>
+  <pre><code>/* host/main.c — Normal World istemci uygulaması */
+#include &lt;tee_client_api.h&gt;
+#include "hello_world_ta.h"
+
+int main(void)
+{
+    TEEC_Result    res;
+    TEEC_Context   ctx;
+    TEEC_Session   sess;
+    TEEC_Operation op;
+    TEEC_UUID      uuid = TA_HELLO_WORLD_UUID;
+    uint32_t       err_origin;
+
+    /* 1. TEE bağlamını başlat — /dev/tee0 aç */
+    res = TEEC_InitializeContext(NULL, &amp;ctx);
+    if (res != TEEC_SUCCESS) {
+        fprintf(stderr, "TEEC_InitializeContext hata: 0x%x\n", res);
+        return 1;
+    }
+
+    /* 2. TA ile oturum aç */
+    res = TEEC_OpenSession(&amp;ctx, &amp;sess, &amp;uuid,
+                           TEEC_LOGIN_PUBLIC, NULL, NULL,
+                           &amp;err_origin);
+    if (res != TEEC_SUCCESS) {
+        fprintf(stderr, "TEEC_OpenSession hata: 0x%x (origin: 0x%x)\n",
+                res, err_origin);
+        TEEC_FinalizeContext(&amp;ctx);
+        return 1;
+    }
+
+    /* 3. Komut hazırla: VALUE_INOUT parametresi ile değer gönder */
+    memset(&amp;op, 0, sizeof(op));
+    op.paramTypes = TEEC_PARAM_TYPES(
+        TEEC_VALUE_INOUT,        /* params[0]: değer gönder/al */
+        TEEC_NONE,
+        TEEC_NONE,
+        TEEC_NONE);
+    op.params[0].value.a = 42;  /* giriş değeri */
+
+    printf("TA'ya 42 gonderiyorum, artirmasini istiyorum...\n");
+    res = TEEC_InvokeCommand(&amp;sess,
+                             TA_HELLO_WORLD_CMD_INC_VALUE,
+                             &amp;op, &amp;err_origin);
+    if (res != TEEC_SUCCESS) {
+        fprintf(stderr, "InvokeCommand hata: 0x%x\n", res);
+    } else {
+        printf("TA sonucu: %d\n", op.params[0].value.a);  /* 43 */
+    }
+
+    /* 4. Temizle */
+    TEEC_CloseSession(&amp;sess);
+    TEEC_FinalizeContext(&amp;ctx);
+    return (res == TEEC_SUCCESS) ? 0 : 1;
+}</code></pre>
+
+  <h3>Hata kodları</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Kod</th><th>Değer</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>TEEC_SUCCESS</td><td>0x00000000</td><td>Başarılı</td></tr>
+        <tr><td>TEE_ERROR_BAD_PARAMETERS</td><td>0xFFFF0006</td><td>Geçersiz parametre tipi ya da değeri</td></tr>
+        <tr><td>TEE_ERROR_ACCESS_DENIED</td><td>0xFFFF0001</td><td>İzin yok — TA imza hatası</td></tr>
+        <tr><td>TEE_ERROR_OUT_OF_MEMORY</td><td>0xFFFF000C</td><td>Secure heap tükendi</td></tr>
+        <tr><td>TEE_ERROR_ITEM_NOT_FOUND</td><td>0xFFFF0008</td><td>Secure storage'da nesne yok</td></tr>
+        <tr><td>TEE_ERROR_COMMUNICATION</td><td>0xFFFF000E</td><td>OP-TEE supplicant bağlantı hatası</td></tr>
+        <tr><td>TEE_ERROR_NOT_SUPPORTED</td><td>0xFFFF000A</td><td>Bilinmeyen komut ID'si</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Shared memory ve parametre tipleri</h2>
+  <p class="section-lead">Normal World ile Secure World arasında büyük veri transferi için shared memory kullanılır; TEE Client API dört parametre tipini destekler.</p>
+
+  <h3>Parametre tipleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">TEEC_VALUE_INPUT</span><span class="desc">32-bit (a, b) çifti — sadece girdi; küçük skalar değerler için ideal</span></div>
+    <div class="param"><span class="name">TEEC_VALUE_OUTPUT</span><span class="desc">32-bit (a, b) çifti — sadece çıktı; TA'nın yazıp CA'nın okuduğu değerler</span></div>
+    <div class="param"><span class="name">TEEC_VALUE_INOUT</span><span class="desc">32-bit çift — hem girdi hem çıktı</span></div>
+    <div class="param"><span class="name">TEEC_MEMREF_TEMP_INPUT</span><span class="desc">Geçici buffer — sadece TA'ya gidiyor; OP-TEE otomatik kopyalar</span></div>
+    <div class="param"><span class="name">TEEC_MEMREF_TEMP_OUTPUT</span><span class="desc">Geçici buffer — sadece TA'dan dönüyor</span></div>
+    <div class="param"><span class="name">TEEC_MEMREF_TEMP_INOUT</span><span class="desc">Geçici buffer — çift yön; kriptografi şifreleme için tipik</span></div>
+    <div class="param"><span class="name">TEEC_MEMREF_WHOLE</span><span class="desc">Kayıtlı shared memory bloğunun tamamı</span></div>
+    <div class="param"><span class="name">TEEC_MEMREF_PARTIAL_*</span><span class="desc">Kayıtlı shared memory'nin alt aralığı</span></div>
+  </div>
+
+  <h3>Geçici buffer kullanımı (şifreleme örneği)</h3>
+  <pre><code>/* AES şifreleme: giriş düz metin → çıktı şifreli metin */
+TEEC_Operation op;
+uint8_t plaintext[64]  = "Gizli mesaj 12345678901234567890123456";
+uint8_t ciphertext[64] = {0};
+
+memset(&amp;op, 0, sizeof(op));
+op.paramTypes = TEEC_PARAM_TYPES(
+    TEEC_MEMREF_TEMP_INPUT,    /* params[0]: düz metin */
+    TEEC_MEMREF_TEMP_OUTPUT,   /* params[1]: şifreli metin */
+    TEEC_VALUE_INPUT,          /* params[2]: anahtar handle */
+    TEEC_NONE);
+
+op.params[0].tmpref.buffer = plaintext;
+op.params[0].tmpref.size   = sizeof(plaintext);
+op.params[1].tmpref.buffer = ciphertext;
+op.params[1].tmpref.size   = sizeof(ciphertext);
+op.params[2].value.a       = key_handle_id;
+
+res = TEEC_InvokeCommand(&amp;sess, TA_CMD_AES_ENCRYPT, &amp;op, &amp;err_origin);
+printf("Sifrelendi: %zu byte\n", op.params[1].tmpref.size);</code></pre>
+
+  <h3>Kayıtlı shared memory (büyük veri)</h3>
+  <pre><code>/* Büyük dosya transferi için shared memory kaydet */
+TEEC_SharedMemory shm;
+
+shm.size  = 1 * 1024 * 1024;  /* 1 MB */
+shm.flags = TEEC_MEM_INPUT | TEEC_MEM_OUTPUT;
+
+res = TEEC_AllocateSharedMemory(&amp;ctx, &amp;shm);
+/* shm.buffer artık hem Normal hem Secure World görür */
+
+/* Buffer'ı doldur */
+memcpy(shm.buffer, large_data, shm.size);
+
+/* MEMREF_WHOLE ile tüm bloğu geç */
+op.params[0].memref.parent = &amp;shm;
+op.params[0].memref.offset = 0;
+op.params[0].memref.size   = shm.size;
+op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_WHOLE,
+                                  TEEC_NONE, TEEC_NONE, TEEC_NONE);
+
+TEEC_InvokeCommand(&amp;sess, TA_CMD_PROCESS_BUFFER, &amp;op, &amp;err_origin);
+
+/* Temizle */
+TEEC_ReleaseSharedMemory(&amp;shm);</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Secure Storage — güvenli anahtar saklama</h2>
+  <p class="section-lead">OP-TEE, kriptografik anahtarları ve hassas verileri kalıcı olarak depolamak için şifreli ve bütünlük korumalı Persistent Object API sunar.</p>
+
+  <h3>Depolama arka uçları</h3>
+  <div class="params">
+    <div class="param"><span class="name">TEE_STORAGE_PRIVATE</span><span class="desc">TA'ya özel depolama — TA UUID + Normal World kullanıcı kimliğiyle izole, /data/tee/ altında şifreli</span></div>
+    <div class="param"><span class="name">TEE_STORAGE_USER</span><span class="desc">Birden fazla TA'nın paylaşabildiği kullanıcı depolaması</span></div>
+    <div class="param"><span class="name">RPMB (CFG_RPMB_FS=y)</span><span class="desc">eMMC RPMB bölümü — donanım sayacı ile replay saldırısına karşı koruma</span></div>
+  </div>
+
+  <h3>Nesne oluşturma ve yazma</h3>
+  <pre><code>/* TA içinde kalıcı nesne oluştur — AES-256 anahtar sakla */
+#include &lt;tee_internal_api.h&gt;
+
+TEE_Result store_aes_key(const uint8_t *key_data, size_t key_len)
+{
+    TEE_ObjectHandle obj = TEE_HANDLE_NULL;
+    TEE_Result res;
+
+    const char obj_id[]  = "device_aes_key_v1";
+    size_t     obj_id_sz = sizeof(obj_id) - 1;
+
+    /* Var olan nesneyi sil (idempotent) */
+    TEE_OpenPersistentObject(TEE_STORAGE_PRIVATE,
+                             obj_id, obj_id_sz,
+                             TEE_DATA_FLAG_ACCESS_WRITE_META,
+                             &amp;obj);
+    if (obj != TEE_HANDLE_NULL) {
+        TEE_CloseAndDeletePersistentObject1(obj);
+        obj = TEE_HANDLE_NULL;
+    }
+
+    /* Yeni nesne oluştur */
+    res = TEE_CreatePersistentObject(
+        TEE_STORAGE_PRIVATE,
+        obj_id, obj_id_sz,
+        TEE_DATA_FLAG_ACCESS_WRITE |
+        TEE_DATA_FLAG_ACCESS_READ  |
+        TEE_DATA_FLAG_OVERWRITE,
+        TEE_HANDLE_NULL,       /* attribute yok — ham veri */
+        key_data, key_len,     /* başlangıç verisi */
+        &amp;obj);
+
+    if (res == TEE_SUCCESS)
+        TEE_CloseObject(obj);
+    return res;
+}</code></pre>
+
+  <h3>Nesne okuma</h3>
+  <pre><code>TEE_Result read_aes_key(uint8_t *key_buf, size_t *key_len)
+{
+    TEE_ObjectHandle obj = TEE_HANDLE_NULL;
+    TEE_ObjectInfo   info;
+    TEE_Result       res;
+
+    const char obj_id[]  = "device_aes_key_v1";
+
+    res = TEE_OpenPersistentObject(
+        TEE_STORAGE_PRIVATE,
+        obj_id, sizeof(obj_id) - 1,
+        TEE_DATA_FLAG_ACCESS_READ,
+        &amp;obj);
+    if (res != TEE_SUCCESS) return res;
+
+    /* Nesne boyutunu sorgula */
+    TEE_GetObjectInfo1(obj, &amp;info);
+    if (*key_len &lt; info.dataSize) {
+        TEE_CloseObject(obj);
+        *key_len = info.dataSize;
+        return TEE_ERROR_SHORT_BUFFER;
+    }
+
+    uint32_t read_count;
+    res = TEE_ReadObjectData(obj, key_buf, info.dataSize, &amp;read_count);
+    *key_len = read_count;
+
+    TEE_CloseObject(obj);
+    return res;
+}</code></pre>
+
+  <h3>Anahtar nesne (TEE_Attribute) ile depolama</h3>
+  <pre><code>/* AES-256 key nesnesi oluştur ve kalıcı olarak sakla */
+TEE_Result create_and_store_aes256(void)
+{
+    TEE_ObjectHandle transient = TEE_HANDLE_NULL;
+    TEE_ObjectHandle persistent = TEE_HANDLE_NULL;
+    TEE_Result res;
+
+    /* Geçici AES-256 anahtar nesnesi oluştur */
+    res = TEE_AllocateTransientObject(TEE_TYPE_AES, 256, &amp;transient);
+    if (res) return res;
+
+    /* Rastgele anahtar üret */
+    res = TEE_GenerateKey(transient, 256, NULL, 0);
+    if (res) goto out;
+
+    /* Kalıcı nesneye dönüştür */
+    res = TEE_CreatePersistentObject(
+        TEE_STORAGE_PRIVATE,
+        "aes256_master_key", 18,
+        TEE_DATA_FLAG_ACCESS_WRITE,
+        transient,          /* attribute kaynağı */
+        NULL, 0,            /* ek veri yok */
+        &amp;persistent);
+
+out:
+    if (transient)  TEE_FreeTransientObject(transient);
+    if (persistent) TEE_CloseObject(persistent);
+    return res;
+}</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Kriptografi API</h2>
+  <p class="section-lead">OP-TEE, GlobalPlatform TEE Cryptographic API üzerinden AES, RSA, ECC, HMAC, SHA gibi algoritmaları hem yazılım hem donanım hızlandırıcıyla sunar.</p>
+
+  <h3>Simetrik şifreleme — AES-CBC</h3>
+  <pre><code>/* TA içinde AES-128-CBC şifreleme */
+TEE_Result aes_cbc_encrypt(TEE_ObjectHandle key_obj,
+                            const uint8_t *iv, size_t iv_len,
+                            const uint8_t *in, size_t in_len,
+                            uint8_t *out, size_t *out_len)
+{
+    TEE_OperationHandle op = TEE_HANDLE_NULL;
+    TEE_Result res;
+
+    /* İşlem nesnesi oluştur */
+    res = TEE_AllocateOperation(&amp;op, TEE_ALG_AES_CBC_NOPAD,
+                                TEE_MODE_ENCRYPT, 128);
+    if (res) return res;
+
+    /* Anahtarı işleme ata */
+    res = TEE_SetOperationKey(op, key_obj);
+    if (res) goto out;
+
+    /* IV ile başlat */
+    TEE_CipherInit(op, iv, iv_len);
+
+    /* Şifrele */
+    res = TEE_CipherDoFinal(op, in, in_len, out, out_len);
+
+out:
+    TEE_FreeOperation(op);
+    return res;
+}</code></pre>
+
+  <h3>Özet hesaplama — SHA-256</h3>
+  <pre><code>TEE_Result sha256_hash(const uint8_t *data, size_t data_len,
+                        uint8_t *digest, size_t *digest_len)
+{
+    TEE_OperationHandle op = TEE_HANDLE_NULL;
+    TEE_Result res;
+
+    res = TEE_AllocateOperation(&amp;op, TEE_ALG_SHA256,
+                                TEE_MODE_DIGEST, 0);
+    if (res) return res;
+
+    /* Veriyi bloklara bölerek besleyebiliriz */
+    TEE_DigestUpdate(op, data, data_len / 2);
+    TEE_DigestUpdate(op, data + data_len / 2, data_len - data_len / 2);
+
+    /* Sonuç üret */
+    res = TEE_DigestDoFinal(op, NULL, 0, digest, digest_len);
+
+    TEE_FreeOperation(op);
+    return res;  /* *digest_len = 32 (SHA-256 = 256 bit) */
+}</code></pre>
+
+  <h3>Asimetrik şifreleme — RSA-OAEP</h3>
+  <pre><code>/* RSA-2048 OAEP ile şifreleme (public key ile) */
+TEE_Result rsa_oaep_encrypt(TEE_ObjectHandle pub_key,
+                             const uint8_t *plain, size_t plain_len,
+                             uint8_t *cipher, size_t *cipher_len)
+{
+    TEE_OperationHandle op = TEE_HANDLE_NULL;
+    TEE_Result res;
+
+    res = TEE_AllocateOperation(&amp;op,
+        TEE_ALG_RSAES_PKCS1_OAEP_MGF1_SHA256,
+        TEE_MODE_ENCRYPT, 2048);
+    if (res) return res;
+
+    res = TEE_SetOperationKey(op, pub_key);
+    if (res) goto out;
+
+    res = TEE_AsymmetricEncrypt(op, NULL, 0,
+                                plain, plain_len,
+                                cipher, cipher_len);
+out:
+    TEE_FreeOperation(op);
+    return res;
+}
+
+/* ECC-P256 imzalama */
+TEE_Result ecdsa_sign(TEE_ObjectHandle priv_key,
+                       const uint8_t *hash, size_t hash_len,
+                       uint8_t *sig, size_t *sig_len)
+{
+    TEE_OperationHandle op = TEE_HANDLE_NULL;
+    TEE_Result res;
+
+    res = TEE_AllocateOperation(&amp;op,
+        TEE_ALG_ECDSA_P256, TEE_MODE_SIGN, 256);
+    if (res) return res;
+
+    res = TEE_SetOperationKey(op, priv_key);
+    if (res) goto out;
+
+    res = TEE_AsymmetricSignDigest(op, NULL, 0,
+                                   hash, hash_len,
+                                   sig, sig_len);
+out:
+    TEE_FreeOperation(op);
+    return res;
+}</code></pre>
+
+  <h3>HMAC — mesaj doğrulama</h3>
+  <pre><code>TEE_Result hmac_sha256(TEE_ObjectHandle hmac_key,
+                        const uint8_t *msg, size_t msg_len,
+                        uint8_t *mac, size_t *mac_len)
+{
+    TEE_OperationHandle op = TEE_HANDLE_NULL;
+    TEE_Result res;
+
+    res = TEE_AllocateOperation(&amp;op, TEE_ALG_HMAC_SHA256,
+                                TEE_MODE_MAC, 256);
+    if (res) return res;
+    res = TEE_SetOperationKey(op, hmac_key);
+    if (res) goto out;
+
+    TEE_MACInit(op, NULL, 0);  /* IV yok */
+    TEE_MACUpdate(op, msg, msg_len);
+    res = TEE_MACComputeFinal(op, NULL, 0, mac, mac_len);
+
+out:
+    TEE_FreeOperation(op);
+    return res;
+}</code></pre>
+
+  <h3>Desteklenen algoritmalar</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Kategori</th><th>Algoritma</th><th>TEE_ALG sabit</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Simetrik</td><td>AES-ECB/CBC/CTR/GCM/CCM</td><td>TEE_ALG_AES_*</td></tr>
+        <tr><td>Asimetrik</td><td>RSA-1024/2048/4096</td><td>TEE_ALG_RSAES_* / TEE_ALG_RSASSA_*</td></tr>
+        <tr><td>ECC</td><td>ECDSA P-192/224/256/384/521</td><td>TEE_ALG_ECDSA_P*</td></tr>
+        <tr><td>ECDH</td><td>ECDH P-192..521</td><td>TEE_ALG_ECDH_P*</td></tr>
+        <tr><td>Özet</td><td>SHA-1/224/256/384/512</td><td>TEE_ALG_SHA*</td></tr>
+        <tr><td>MAC</td><td>HMAC-SHA*, AES-CMAC</td><td>TEE_ALG_HMAC_* / TEE_ALG_AES_CMAC</td></tr>
+        <tr><td>KDF</td><td>HKDF, PBKDF2, Concat KDF</td><td>TEE_ALG_HKDF_* (GP ext.)</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> PSA Certified ve attestation</h2>
+  <p class="section-lead">OP-TEE, PSA Certified çerçevesindeki Initial Attestation Token (IAT) standardını destekler; cihazın güvenilir kimliğini uzak tarafa kriptografik olarak kanıtlar.</p>
+
+  <h3>PSA Attestation mimarisi</h3>
+  <div class="flow">
+    <pre>
+Cihaz (OP-TEE + TF-A)              Uzak Doğrulayıcı
+─────────────────────               ─────────────────
+1. Client: psa_initial_attest_get_token()
+   │
+   ▼
+OP-TEE Attestation TA
+  - Cihaz boot ölçümleri (BL1,BL2,BL31 hash)
+  - Platform instance ID (hardware unique key)
+  - SW bileşen listesi
+  - Nonce (challenge)
+  → COSE_Sign1 [ EAT / IAT claim seti ]
+    ↳ ECC-P256 ile imzalı (DAK — Device Attestation Key)
+   │
+   ▼ token (CBOR)
+                                 2. Verifier:
+                                   - CBOR ayrıştır
+                                   - COSE imzasını doğrula (DAK cert chain)
+                                   - Claim'leri politikayla karşılaştır
+                                   - Güven kararı ver</pre>
+  </div>
+
+  <h3>PSA API kullanımı</h3>
+  <pre><code>/* psa/crypto.h ve psa/initial_attestation.h */
+#include &lt;psa/crypto.h&gt;
+#include &lt;psa/initial_attestation.h&gt;
+
+int get_attestation_token(const uint8_t *nonce, size_t nonce_len,
+                           uint8_t *token_buf, size_t token_buf_size,
+                           size_t *token_len)
+{
+    psa_status_t status;
+
+    /* PSA kriptografi alt sistemini başlat */
+    status = psa_crypto_init();
+    if (status != PSA_SUCCESS) return -1;
+
+    /* Initial Attestation Token talep et */
+    status = psa_initial_attest_get_token(
+        nonce, nonce_len,          /* challenge — tekrar saldırısı önler */
+        token_buf, token_buf_size,
+        token_len);
+
+    return (status == PSA_SUCCESS) ? 0 : -1;
+}</code></pre>
+
+  <h3>IAT claim içeriği</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Claim (CBOR tag)</th><th>İçerik</th><th>Zorunlu</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>EAT_NONCE (10)</td><td>Verifier'ın gönderdiği nonce</td><td>Evet</td></tr>
+        <tr><td>EAT_INSTANCE_ID (256)</td><td>UEID — cihaza özgü 33 byte ID</td><td>Evet</td></tr>
+        <tr><td>EAT_BOOT_SEED (268)</td><td>Boot sırasında üretilen 32 byte rastgele değer</td><td>Evet</td></tr>
+        <tr><td>EAT_SW_COMPONENTS (2393)</td><td>BL1/BL2/BL31/OP-TEE/Linux hash listesi</td><td>Evet</td></tr>
+        <tr><td>EAT_IMPLEMENTATION_ID (265)</td><td>Platform UUID — donanım kimliği</td><td>Evet</td></tr>
+        <tr><td>EAT_SECURITY_LIFECYCLE (267)</td><td>PSA güvenlik yaşam döngüsü aşaması</td><td>Evet</td></tr>
+        <tr><td>EAT_CLIENT_ID (71)</td><td>Çağıran NSPE/SPE bileşeni kimliği</td><td>Hayır</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Derleme, yükleme ve debug</h2>
+  <p class="section-lead">OP-TEE ekosistemini derleme, hedef sisteme kurma, TA yükleme ve xtest ile doğrulama adımları.</p>
+
+  <h3>Repo manifest ile tam build</h3>
+  <pre><code># OP-TEE manifest ile tüm bileşenleri çek
+mkdir optee-project &amp;&amp; cd optee-project
+repo init -u https://github.com/OP-TEE/manifest.git \
+          -m qemu_v8.xml -b 3.21.0
+repo sync -j4
+
+# QEMU ARM v8 için derleme
+cd build
+make toolchains -j2
+make PLATFORM=vexpress-qemu_armv8a -j$(nproc)
+
+# Çıktılar:
+# out-br/images/rootfs.cpio.gz       — Normal World rootfs
+# out/bin/tee.bin                    — OP-TEE OS binary (BL32)
+# out-br/images/u-boot.bin           — BL33</code></pre>
+
+  <h3>TA derleme (tek TA için)</h3>
+  <pre><code># OP-TEE examples reposunu çek
+git clone https://github.com/linaro-swg/optee_examples.git
+cd optee_examples
+
+# Cross-compile toolchain ortamı
+export CROSS_COMPILE=aarch64-linux-gnu-
+export CROSS_COMPILE_HOST=aarch64-linux-gnu-
+export TA_DEV_KIT_DIR=/path/to/optee_os/export-ta_arm64
+export TEEC_EXPORT=/path/to/optee_client/export-usr__aarch64
+
+make -C hello_world
+
+# Çıktılar:
+# hello_world/ta/
+#   8aaaf200-2450-11e4-abe2-0002a5d5c51b.ta  (imzalı TA)
+# hello_world/host/
+#   optee_example_hello_world                (CA binary)</code></pre>
+
+  <h3>Hedef sisteme kurma</h3>
+  <pre><code># TA'yı rootfs'e kopyala
+scp 8aaaf200-2450-11e4-abe2-0002a5d5c51b.ta \
+    root@target:/lib/optee_armtz/
+
+# CA'yı kopyala
+scp optee_example_hello_world root@target:/usr/bin/
+
+# Hedef sistem üzerinde çalıştır
+ssh root@target
+systemctl status tee-supplicant     # supplicant çalışıyor mu?
+optee_example_hello_world           # TA'yı çağır</code></pre>
+
+  <h3>xtest — kapsamlı test süiti</h3>
+  <pre><code># Tüm GP API testlerini çalıştır
+xtest
+
+# Belirli test grubunu çalıştır
+xtest -t regression                 # Regresyon testleri
+xtest 4001                          # Tek test senaryosu (crypto)
+xtest -t pkcs11                     # PKCS#11 testleri
+xtest --level 15                    # Uzun süreli dayanıklılık
+
+# Tipik başarılı çıktı:
+# +-----------------------------------------------------
+# 26944 subtests of which 0 failed
+# 104 test cases of which 0 failed
+# 0 test cases were skipped
+# TEE test application done!</code></pre>
+
+  <h3>TA debug — OP-TEE syslog</h3>
+  <pre><code># OP-TEE log mesajları kernel syslog'a gider
+dmesg | grep optee
+journalctl -u tee-supplicant -f
+
+# TA içinde debug mesajları için (TA kaynak kodu):
+DMSG("Deger: %d, ptr: %p", val, ptr);   /* debug build'de görünür */
+IMSG("Bilgi mesaji");
+EMSG("Hata: res=0x%x", res);
+
+# Kernel OP-TEE driver debug
+echo 8 &gt; /proc/sys/kernel/printk      # Tüm seviyeleri etkinleştir
+cat /sys/kernel/debug/optee/call_count
+ls /sys/kernel/debug/optee/</code></pre>
+</section>
+
+</main>

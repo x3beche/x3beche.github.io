@@ -1,0 +1,1100 @@
+---
+layout: tutorial
+title: "Regulator Framework — Linux PMIC & Güç Rayı Yönetimi"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>REGULATOR / PMIC</span>
+    <span>2026</span>
+  </div>
+  <h1>Regulator Framework<br><em>Linux PMIC &amp; Güç Rayı Yönetimi</em></h1>
+  <p class="subtitle">PMIC sürücüsü yazımı, consumer API, DT binding ve debugfs ile güç ray doğrulaması — eksiksiz regulator rehberi.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Regulator framework neden var — PMIC, LDO, DCDC</a></li>
+    <li><a href="#s1">Consumer API — regulator_get, enable, set_voltage</a></li>
+    <li><a href="#s2">regulator_desc ve regulator_ops — driver tarafı</a></li>
+    <li><a href="#s3">regulator_register ve devm_regulator_register</a></li>
+    <li><a href="#s4">Device Tree regulator binding</a></li>
+    <li><a href="#s5">Regulator constraints ve regulator_init_data</a></li>
+    <li><a href="#s6">Sabit regülatörler — fixed-regulator, gpio-regulator</a></li>
+    <li><a href="#s7">regulator notifier ve event sistemi</a></li>
+    <li><a href="#s8">Hata ayıklama — debugfs regulator/, regulator_summary</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Regulator framework neden var — PMIC, LDO, DCDC</h2>
+  <p class="section-lead">Linux Regulator Framework, SoC ve çevre birimlerinin güç raylarını merkezi, tutarlı ve güvenli biçimde yönetmek için tasarlanmış kernel alt sistemidir.</p>
+
+  <p>Modern embedded sistemlerde bir PMIC (Power Management IC) onlarca güç rayı üretir: işlemci çekirdeği için değişken gerilim (DVFS), bellek için sabit 1.8 V, I/O için 3.3 V, RF için 1.1 V vs. Framework olmadan her peripheral sürücüsü doğrudan PMIC register'larını manipüle etmek zorunda kalır — bu kod tekrarına, güvenlik açıklarına ve eş zamanlılık sorunlarına yol açar.</p>
+
+  <div class="flow">
+    <pre>
+  +---------------------------------------------+
+  |           Consumer Drivers                  |
+  | (GPU, WiFi, Kamera, USB, DRAM controller)   |
+  +----+--------+--------+--------+-------------+
+       |        |        |        |
+   regulator_enable / set_voltage / get_voltage
+       |        |        |        |
+  +----v--------v--------v--------v-------------+
+  |         Regulator Framework Core            |
+  |    (constraints check, ref counting,        |
+  |     voltage rounding, notifiers)            |
+  +----+--------+--------+--------+-------------+
+       |        |        |        |
+  +----v--+ +---v---+ +--v----+ +-v------+
+  | LDO1  | | LDO2  | | DCDC1 | | DCDC2  |
+  | 1.8V  | | 3.3V  | | 0.8-  | | 1.2V   |
+  |       | |       | | 1.3V  | |        |
+  +-------+ +-------+ +-------+ +--------+
+       PMIC  (e.g. Rockchip RK808, TI TPS65217)
+    </pre>
+  </div>
+
+  <h3>Regülatör türleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Tür</th><th>Verimlilik</th><th>Gürültü</th><th>Tipik kullanım</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>LDO (Low Drop-Out)</td><td>Düşük (%30–80)</td><td>Çok düşük</td><td>RF, PLL, ADC, hassas analog</td></tr>
+        <tr><td>Buck (step-down DCDC)</td><td>Yüksek (%85–95)</td><td>Orta (switching)</td><td>CPU core, GPU, DRAM</td></tr>
+        <tr><td>Boost (step-up DCDC)</td><td>Yüksek</td><td>Orta</td><td>LED sürücü, USB 5V</td></tr>
+        <tr><td>Buck-boost</td><td>Yüksek</td><td>Orta</td><td>Batarya deşarjı sırasında sabit ray</td></tr>
+        <tr><td>Fixed regulator</td><td>— (yazılım modeli)</td><td>—</td><td>Sabit gerilim kaynakları</td></tr>
+        <tr><td>GPIO regulator</td><td>— (yazılım modeli)</td><td>—</td><td>GPIO ile kontrol edilen enable</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Framework'ün sağladıkları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Constraints denetimi</span><span class="desc">min/max gerilim, max akım sınırları kernel tarafından zorlanır — donanım koruması</span></div>
+    <div class="param"><span class="name">Referans sayımı</span><span class="desc">Birden fazla consumer aynı rayı kullanırsa son consumer devre dışı bırakır</span></div>
+    <div class="param"><span class="name">DVFS entegrasyonu</span><span class="desc">cpufreq, devfreq ile koordineli gerilim-frekans ölçeklendirmesi</span></div>
+    <div class="param"><span class="name">Uyku/uyanma</span><span class="desc">suspend/resume sırasında regülatörleri otomatik yönetme</span></div>
+    <div class="param"><span class="name">Sysfs/debugfs</span><span class="desc">Çalışan sistemde gerilim okuma, consumer listesi görüntüleme</span></div>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Regulator framework başlık dosyaları: <code class="inline">&lt;linux/regulator/consumer.h&gt;</code> (consumer API) ve <code class="inline">&lt;linux/regulator/driver.h&gt;</code> (provider API). Consumer sürücüler yalnızca consumer.h'ı include etmeli.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Regulator framework: PMIC güç raylarını merkezi, güvenli yöneten kernel alt sistemi</li>
+      <li>LDO (düşük gürültü) vs Buck/Boost DCDC (yüksek verimlilik) farkı</li>
+      <li>Constraints denetimi, referans sayımı, DVFS entegrasyonu</li>
+      <li>consumer.h (tüketici) / driver.h (sağlayıcı) — include ayrımı önemli</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Consumer API — regulator_get, enable, set_voltage</h2>
+  <p class="section-lead">Consumer sürücülerin güç raylarını nasıl alacağı, etkinleştireceği ve gerilimi nasıl ayarlayacağı.</p>
+
+  <h3>Handle alma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>consumer_driver.c — regulator_get</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;linux/regulator/consumer.h&gt;
+
+<span class="cmt">/* Temel alma — remove()'da regulator_put() zorunlu */</span>
+<span class="keyword">struct</span> regulator *vdd = regulator_get(&amp;pdev-&gt;dev, <span class="str">"vdd"</span>);
+<span class="keyword">if</span> (IS_ERR(vdd))
+    <span class="keyword">return</span> PTR_ERR(vdd);
+
+<span class="cmt">/* devm versiyonu — otomatik cleanup, probe'da tercih edin */</span>
+<span class="keyword">struct</span> regulator *vcore = devm_regulator_get(&amp;pdev-&gt;dev, <span class="str">"vcore"</span>);
+<span class="keyword">if</span> (IS_ERR(vcore))
+    <span class="keyword">return</span> dev_err_probe(&amp;pdev-&gt;dev, PTR_ERR(vcore),
+                         <span class="str">"vcore alinamadi\n"</span>);
+
+<span class="cmt">/* İsteğe bağlı regülatör — yoksa NULL döner, hata değil */</span>
+<span class="keyword">struct</span> regulator *vopt = devm_regulator_get_optional(&amp;pdev-&gt;dev, <span class="str">"vopt"</span>);
+<span class="keyword">if</span> (IS_ERR(vopt)) {
+    <span class="keyword">if</span> (PTR_ERR(vopt) == -ENODEV)
+        vopt = NULL;  <span class="cmt">/* regülatör yok — tamam */</span>
+    <span class="keyword">else</span>
+        <span class="keyword">return</span> PTR_ERR(vopt);
+}</code></pre>
+  </div>
+
+  <h3>Enable / Disable</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>consumer_driver.c — enable/disable</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Enable — may sleep (I2C/SPI PMIC protokolü sürebilir) */</span>
+<span class="keyword">int</span> ret = regulator_enable(vcore);
+<span class="keyword">if</span> (ret) {
+    dev_err(&amp;pdev-&gt;dev, <span class="str">"vcore enable edilemedi: %d\n"</span>, ret);
+    <span class="keyword">return</span> ret;
+}
+
+<span class="cmt">/* Enable durumu sorgusu */</span>
+<span class="keyword">int</span> enabled = regulator_is_enabled(vcore);
+<span class="cmt">/* 1: enabled, 0: disabled, negatif: hata */</span>
+
+<span class="cmt">/* Disable */</span>
+regulator_disable(vcore);
+
+<span class="cmt">/* Force disable — referans sayacını sıfıra zorla (dikkatli kullanın!) */</span>
+regulator_force_disable(vcore);</code></pre>
+  </div>
+
+  <h3>Gerilim ayarlama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>consumer_driver.c — voltage API</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Mevcut gerilimi oku (mikroVolt cinsinden) */</span>
+<span class="keyword">int</span> voltage = regulator_get_voltage(vcore);
+<span class="keyword">if</span> (voltage &lt; <span class="num">0</span>)
+    dev_warn(&amp;pdev-&gt;dev, <span class="str">"gerilim okunamadi: %d\n"</span>, voltage);
+<span class="keyword">else</span>
+    dev_info(&amp;pdev-&gt;dev, <span class="str">"vcore: %d uV\n"</span>, voltage);
+
+<span class="cmt">/* Gerilim aralığı ayarla (uV cinsinden min, max) */</span>
+ret = regulator_set_voltage(vcore, <span class="num">900000</span>, <span class="num">1100000</span>);
+<span class="cmt">/* Framework: constraints aralığında mı? Yoksa -EINVAL */</span>
+
+<span class="cmt">/* Tam olarak bir gerilim (min == max) */</span>
+ret = regulator_set_voltage(vcore, <span class="num">1000000</span>, <span class="num">1000000</span>);  <span class="cmt">/* 1.0 V */</span>
+
+<span class="cmt">/* Akım sınırı ayarla (mikroAmper) */</span>
+ret = regulator_set_current_limit(vdd, <span class="num">500000</span>, <span class="num">1000000</span>);
+
+<span class="cmt">/* Gerilim aralığını sorgula */</span>
+<span class="keyword">int</span> min_uv = regulator_get_linear_step(vcore);
+<span class="keyword">int</span> max_sel = regulator_count_voltages(vcore);</code></pre>
+  </div>
+
+  <h3>Tam consumer örneği — GPU sürücüsü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>gpu_driver.c — probe() regulator yönetimi</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">struct</span> my_gpu_priv {
+    <span class="keyword">struct</span> regulator *vdd_core;
+    <span class="keyword">struct</span> regulator *vdd_io;
+    <span class="keyword">unsigned int</span>      cur_freq_khz;
+};
+
+<span class="keyword">static const struct</span> {
+    <span class="keyword">unsigned int</span> freq_khz;
+    <span class="keyword">int</span>          min_uv;
+    <span class="keyword">int</span>          max_uv;
+} gpu_opp_table[] = {
+    { <span class="num">200000</span>, <span class="num">800000</span>, <span class="num">900000</span>  },  <span class="cmt">/* 200 MHz — 0.8–0.9 V */</span>
+    { <span class="num">400000</span>, <span class="num">900000</span>, <span class="num">1000000</span> },  <span class="cmt">/* 400 MHz — 0.9–1.0 V */</span>
+    { <span class="num">600000</span>, <span class="num">950000</span>, <span class="num">1100000</span> },  <span class="cmt">/* 600 MHz — 0.95–1.1 V */</span>
+};
+
+<span class="keyword">static int</span> gpu_set_freq(<span class="keyword">struct</span> my_gpu_priv *priv,
+                         <span class="keyword">unsigned int</span> target_khz)
+{
+    <span class="keyword">int</span> i, ret;
+
+    <span class="keyword">for</span> (i = <span class="num">0</span>; i &lt; ARRAY_SIZE(gpu_opp_table); i++) {
+        <span class="keyword">if</span> (gpu_opp_table[i].freq_khz == target_khz)
+            <span class="keyword">break</span>;
+    }
+    <span class="keyword">if</span> (i == ARRAY_SIZE(gpu_opp_table))
+        <span class="keyword">return</span> -EINVAL;
+
+    <span class="cmt">/* Frekans artışı: önce gerilimi yükselt */</span>
+    <span class="keyword">if</span> (target_khz &gt; priv-&gt;cur_freq_khz) {
+        ret = regulator_set_voltage(priv-&gt;vdd_core,
+                                    gpu_opp_table[i].min_uv,
+                                    gpu_opp_table[i].max_uv);
+        <span class="keyword">if</span> (ret)
+            <span class="keyword">return</span> ret;
+        <span class="cmt">/* sonra clock değiştir... */</span>
+    } <span class="keyword">else</span> {
+        <span class="cmt">/* Frekans düşüşü: önce clock düşür, sonra gerilimi */</span>
+        <span class="cmt">/* ... clock değiştir ... */</span>
+        ret = regulator_set_voltage(priv-&gt;vdd_core,
+                                    gpu_opp_table[i].min_uv,
+                                    gpu_opp_table[i].max_uv);
+        <span class="keyword">if</span> (ret)
+            <span class="keyword">return</span> ret;
+    }
+    priv-&gt;cur_freq_khz = target_khz;
+    <span class="keyword">return</span> <span class="num">0</span>;
+}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">ÖNEMLİ</div>
+    <p>DVFS (Dynamic Voltage and Frequency Scaling) sırasında doğru sıra kritiktir: frekans <strong>artışında</strong> önce gerilimi yükselt, sonra frekansı artır. Frekans <strong>düşüşünde</strong> önce frekansı düşür, sonra gerilimi azalt. Sıra hatası, SoC'un stabil çalışmamasına neden olur.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>devm_regulator_get() → IS_ERR() → -EPROBE_DEFER akışı</li>
+      <li>regulator_get_optional(): olmayan regülatörler için -ENODEV → NULL dönüşümü</li>
+      <li>set_voltage(min_uv, max_uv): framework constraints ile çakışırsa -EINVAL</li>
+      <li>DVFS sırası: frekans artışı → önce voltage up; frekans düşüşü → önce freq down</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> regulator_desc ve regulator_ops — driver tarafı API</h2>
+  <p class="section-lead">PMIC sürücüsünün kernel'e sunduğu regulator_desc yapısı ve ops callback kümesi.</p>
+
+  <h3>regulator_desc yapısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>include/linux/regulator/driver.h — regulator_desc (önemli alanlar)</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">struct</span> regulator_desc {
+    <span class="keyword">const char</span>              *name;          <span class="cmt">/* "ldo1", "buck2" vb. */</span>
+    <span class="keyword">const char</span>              *supply_name;   <span class="cmt">/* parent supply ismi */</span>
+    <span class="keyword">const char</span>              *of_match;      <span class="cmt">/* DT compatible eşleşmesi */</span>
+
+    <span class="keyword">unsigned int</span>             id;
+    <span class="keyword">unsigned int</span>             type;          <span class="cmt">/* REGULATOR_VOLTAGE / REGULATOR_CURRENT */</span>
+
+    <span class="keyword">const struct</span> regulator_ops *ops;
+
+    <span class="cmt">/* Gerilim tablosu (lineer veya liste) */</span>
+    <span class="keyword">const struct</span> regulator_linear_range *linear_ranges;
+    <span class="keyword">int</span>                      n_linear_ranges;
+
+    <span class="keyword">const unsigned int</span>      *volt_table;    <span class="cmt">/* Non-lineer voltajlar */</span>
+    <span class="keyword">unsigned int</span>             n_voltages;    <span class="cmt">/* Seçici sayısı */</span>
+
+    <span class="cmt">/* Register adresleri (regmap kullanırken) */</span>
+    <span class="keyword">unsigned int</span>             vsel_reg;      <span class="cmt">/* Gerilim seçici register */</span>
+    <span class="keyword">unsigned int</span>             vsel_mask;
+    <span class="keyword">unsigned int</span>             enable_reg;
+    <span class="keyword">unsigned int</span>             enable_mask;
+    <span class="keyword">bool</span>                     enable_is_inverted;
+
+    <span class="keyword">unsigned int</span>             ramp_delay;    <span class="cmt">/* uV/us cinsinden */</span>
+    <span class="keyword">unsigned int</span>             off_on_delay;  <span class="cmt">/* us — enable sonrası stabilizasyon */</span>
+
+    <span class="keyword">struct</span> module           *owner;
+};</code></pre>
+  </div>
+
+  <h3>regulator_ops callback'leri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>my_pmic_ldo.c — regulator_ops</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* LDO enable/disable — I2C register yazımı */</span>
+<span class="keyword">static int</span> my_ldo_enable(<span class="keyword">struct</span> regulator_dev *rdev)
+{
+    <span class="keyword">struct</span> my_pmic *pmic = rdev_get_drvdata(rdev);
+    <span class="keyword">unsigned int</span>   reg  = rdev-&gt;desc-&gt;enable_reg;
+    <span class="keyword">unsigned int</span>   mask = rdev-&gt;desc-&gt;enable_mask;
+
+    <span class="keyword">return</span> regmap_update_bits(pmic-&gt;regmap, reg, mask, mask);
+}
+
+<span class="keyword">static int</span> my_ldo_disable(<span class="keyword">struct</span> regulator_dev *rdev)
+{
+    <span class="keyword">struct</span> my_pmic *pmic = rdev_get_drvdata(rdev);
+    <span class="keyword">return</span> regmap_update_bits(pmic-&gt;regmap,
+                               rdev-&gt;desc-&gt;enable_reg,
+                               rdev-&gt;desc-&gt;enable_mask,
+                               <span class="num">0</span>);
+}
+
+<span class="keyword">static int</span> my_ldo_is_enabled(<span class="keyword">struct</span> regulator_dev *rdev)
+{
+    <span class="keyword">struct</span> my_pmic *pmic = rdev_get_drvdata(rdev);
+    <span class="keyword">unsigned int</span> val;
+    <span class="keyword">int</span> ret;
+
+    ret = regmap_read(pmic-&gt;regmap, rdev-&gt;desc-&gt;enable_reg, &amp;val);
+    <span class="keyword">if</span> (ret)
+        <span class="keyword">return</span> ret;
+    <span class="keyword">return</span> !!(val &amp; rdev-&gt;desc-&gt;enable_mask);
+}
+
+<span class="cmt">/* Gerilim seçici get/set — regmap_field vb. */</span>
+<span class="keyword">static int</span> my_ldo_get_voltage_sel(<span class="keyword">struct</span> regulator_dev *rdev)
+{
+    <span class="keyword">struct</span> my_pmic *pmic = rdev_get_drvdata(rdev);
+    <span class="keyword">unsigned int</span> val;
+    <span class="keyword">int</span> ret;
+
+    ret = regmap_read(pmic-&gt;regmap, rdev-&gt;desc-&gt;vsel_reg, &amp;val);
+    <span class="keyword">if</span> (ret)
+        <span class="keyword">return</span> ret;
+    <span class="keyword">return</span> (val &amp; rdev-&gt;desc-&gt;vsel_mask) &gt;&gt; __ffs(rdev-&gt;desc-&gt;vsel_mask);
+}
+
+<span class="keyword">static int</span> my_ldo_set_voltage_sel(<span class="keyword">struct</span> regulator_dev *rdev,
+                                   <span class="keyword">unsigned</span> selector)
+{
+    <span class="keyword">struct</span> my_pmic *pmic = rdev_get_drvdata(rdev);
+    <span class="keyword">unsigned int</span>   val  = selector &lt;&lt; __ffs(rdev-&gt;desc-&gt;vsel_mask);
+
+    <span class="keyword">return</span> regmap_update_bits(pmic-&gt;regmap,
+                               rdev-&gt;desc-&gt;vsel_reg,
+                               rdev-&gt;desc-&gt;vsel_mask,
+                               val);
+}
+
+<span class="keyword">static const struct</span> regulator_ops my_ldo_ops = {
+    .enable            = my_ldo_enable,
+    .disable           = my_ldo_disable,
+    .is_enabled        = my_ldo_is_enabled,
+    .get_voltage_sel   = my_ldo_get_voltage_sel,
+    .set_voltage_sel   = my_ldo_set_voltage_sel,
+    .list_voltage      = regulator_list_voltage_linear_range,
+    .map_voltage       = regulator_map_voltage_linear_range,
+};</code></pre>
+  </div>
+
+  <h3>regulator_ops helper seçimi</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Callback</th><th>Kernel helper (regmap için)</th><th>Kullanım durumu</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>list_voltage</td><td>regulator_list_voltage_linear_range</td><td>Lineer gerilim aralığı</td></tr>
+        <tr><td>list_voltage</td><td>regulator_list_voltage_table</td><td>Lineer olmayan volt_table</td></tr>
+        <tr><td>map_voltage</td><td>regulator_map_voltage_linear_range</td><td>uV → selector dönüşümü</td></tr>
+        <tr><td>set_voltage_sel</td><td>regulator_set_voltage_sel_regmap</td><td>Doğrudan regmap yazımı</td></tr>
+        <tr><td>get_voltage_sel</td><td>regulator_get_voltage_sel_regmap</td><td>Doğrudan regmap okuma</td></tr>
+        <tr><td>enable/disable</td><td>regulator_enable_regmap / regulator_disable_regmap</td><td>Tek bit enable</td></tr>
+        <tr><td>is_enabled</td><td>regulator_is_enabled_regmap</td><td>Bit okuma</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">İPUCU</div>
+    <p>Eğer sürücünüz regmap kullanıyorsa ve standart bir lineer gerilim aralığına sahipse, <code class="inline">regulator_*_regmap</code> ve <code class="inline">regulator_*_linear_range</code> helper'larını kullanarak ops struct'ını minimuma indirebilirsiniz. Birçok üretim PMIC sürücüsü bu şekilde ops tablosunu 2–3 callback'e düşürür.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>regulator_desc: isim, tip, ops, linear_ranges, vsel/enable register tanımları</li>
+      <li>regulator_ops: enable/disable/is_enabled + get/set_voltage_sel + list/map_voltage</li>
+      <li>regmap helper'ları: regulator_enable_regmap, regulator_get_voltage_sel_regmap</li>
+      <li>rdev_get_drvdata(rdev): driver private data'ya ulaşım</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> regulator_register ve devm_regulator_register</h2>
+  <p class="section-lead">PMIC sürücüsünün regülatörleri framework'e nasıl kaydedeceği, regulator_config yapısı ve çoklu regülatör kaydı.</p>
+
+  <h3>Temel kayıt akışı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>my_pmic.c — regulator_register</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;linux/regulator/driver.h&gt;
+<span class="keyword">#include</span> &lt;linux/regulator/of_regulator.h&gt;
+
+<span class="keyword">struct</span> my_pmic {
+    <span class="keyword">struct</span> device      *dev;
+    <span class="keyword">struct</span> regmap      *regmap;
+    <span class="keyword">struct</span> regulator_dev *rdvs[MY_NUM_REGULATORS];
+};
+
+<span class="keyword">static const struct</span> regulator_linear_range ldo1_ranges[] = {
+    REGULATOR_LINEAR_RANGE(<span class="num">800000</span>,  <span class="num">0</span>,  <span class="num">63</span>, <span class="num">12500</span>),
+    <span class="cmt">/* min_uV=800000, min_sel=0, max_sel=63, step=12500 uV */</span>
+    <span class="cmt">/* 800 mV'tan başlayarak 63 adımda 12.5 mV artışlı */</span>
+};
+
+<span class="keyword">static const struct</span> regulator_desc my_ldo1_desc = {
+    .name            = <span class="str">"LDO1"</span>,
+    .of_match        = of_match_ptr(<span class="str">"ldo1"</span>),
+    .regulators_node = of_match_ptr(<span class="str">"regulators"</span>),
+    .id              = <span class="num">0</span>,
+    .type            = REGULATOR_VOLTAGE,
+    .ops             = &amp;my_ldo_ops,
+    .linear_ranges   = ldo1_ranges,
+    .n_linear_ranges = ARRAY_SIZE(ldo1_ranges),
+    .n_voltages      = <span class="num">64</span>,
+    .vsel_reg        = MY_LDO1_VSEL,
+    .vsel_mask       = <span class="num">0x3F</span>,
+    .enable_reg      = MY_LDO1_EN,
+    .enable_mask     = BIT(<span class="num">0</span>),
+    .ramp_delay      = <span class="num">12500</span>,   <span class="cmt">/* 12.5 mV/us */</span>
+    .off_on_delay    = <span class="num">200</span>,     <span class="cmt">/* 200 us stabilizasyon */</span>
+    .owner           = THIS_MODULE,
+};
+
+<span class="keyword">static int</span> my_pmic_probe(<span class="keyword">struct</span> i2c_client *client)
+{
+    <span class="keyword">struct</span> my_pmic        *pmic;
+    <span class="keyword">struct</span> regulator_config config = {};
+    <span class="keyword">struct</span> regulator_dev  *rdev;
+
+    pmic = devm_kzalloc(&amp;client-&gt;dev, <span class="keyword">sizeof</span>(*pmic), GFP_KERNEL);
+    <span class="keyword">if</span> (!pmic)
+        <span class="keyword">return</span> -ENOMEM;
+
+    pmic-&gt;dev    = &amp;client-&gt;dev;
+    pmic-&gt;regmap = devm_regmap_init_i2c(client, &amp;my_pmic_regmap_cfg);
+    <span class="keyword">if</span> (IS_ERR(pmic-&gt;regmap))
+        <span class="keyword">return</span> PTR_ERR(pmic-&gt;regmap);
+
+    <span class="cmt">/* regulator_config: kayıt sırasında sağlanan runtime bilgiler */</span>
+    config.dev         = &amp;client-&gt;dev;
+    config.driver_data = pmic;         <span class="cmt">/* rdev_get_drvdata() ile alınır */</span>
+    config.regmap      = pmic-&gt;regmap;
+    config.of_node     = client-&gt;dev.of_node;
+
+    <span class="cmt">/* devm_ versiyonu — otomatik unregister */</span>
+    rdev = devm_regulator_register(&amp;client-&gt;dev, &amp;my_ldo1_desc, &amp;config);
+    <span class="keyword">if</span> (IS_ERR(rdev))
+        <span class="keyword">return</span> dev_err_probe(&amp;client-&gt;dev, PTR_ERR(rdev),
+                             <span class="str">"LDO1 kaydi basarisiz\n"</span>);
+
+    pmic-&gt;rdvs[<span class="num">0</span>] = rdev;
+    i2c_set_clientdata(client, pmic);
+    <span class="keyword">return</span> <span class="num">0</span>;
+}</code></pre>
+  </div>
+
+  <h3>Çoklu regülatör kaydı döngüsü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>my_pmic.c — döngüsel kayıt</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">static const struct</span> regulator_desc my_pmic_descs[] = {
+    [<span class="num">0</span>] = { .name = <span class="str">"LDO1"</span>, .of_match = of_match_ptr(<span class="str">"ldo1"</span>), <span class="cmt">/* ... */</span> },
+    [<span class="num">1</span>] = { .name = <span class="str">"LDO2"</span>, .of_match = of_match_ptr(<span class="str">"ldo2"</span>), <span class="cmt">/* ... */</span> },
+    [<span class="num">2</span>] = { .name = <span class="str">"BUCK1"</span>,.of_match = of_match_ptr(<span class="str">"buck1"</span>),<span class="cmt">/* ... */</span> },
+};
+
+<span class="keyword">static int</span> my_pmic_probe(<span class="keyword">struct</span> i2c_client *client)
+{
+    <span class="keyword">struct</span> my_pmic *pmic = /* ... init ... */
+    <span class="keyword">struct</span> regulator_config config = {};
+    <span class="keyword">int</span> i;
+
+    config.dev    = &amp;client-&gt;dev;
+    config.regmap = pmic-&gt;regmap;
+
+    <span class="keyword">for</span> (i = <span class="num">0</span>; i &lt; ARRAY_SIZE(my_pmic_descs); i++) {
+        config.driver_data = pmic;
+        config.of_node     = of_get_child_by_name(client-&gt;dev.of_node,
+                                                   my_pmic_descs[i].of_match);
+        pmic-&gt;rdvs[i] = devm_regulator_register(&amp;client-&gt;dev,
+                                                  &amp;my_pmic_descs[i],
+                                                  &amp;config);
+        <span class="keyword">if</span> (IS_ERR(pmic-&gt;rdvs[i]))
+            <span class="keyword">return</span> dev_err_probe(&amp;client-&gt;dev,
+                                  PTR_ERR(pmic-&gt;rdvs[i]),
+                                  <span class="str">"%s kaydi basarisiz\n"</span>,
+                                  my_pmic_descs[i].name);
+    }
+    <span class="keyword">return</span> <span class="num">0</span>;
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>REGULATOR_LINEAR_RANGE(min_uV, min_sel, max_sel, step_uV) makrosu</li>
+      <li>regulator_config: dev, driver_data, regmap, of_node — kayıt runtime bilgisi</li>
+      <li>devm_regulator_register(): otomatik unregister, probe'da tercih edilmeli</li>
+      <li>Çoklu desc dizisi + döngüsel kayıt — standart PMIC sürücü paterni</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Device Tree regulator binding</h2>
+  <p class="section-lead">DT binding standartları: regulator-min/max-microvolt, regulator-always-on, regulator-boot-on ve supplier-consumer bağlantıları.</p>
+
+  <h3>PMIC node ve regulator alt node'ları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>my-board.dts — PMIC DT binding</span><span class="dot">●</span></div>
+    <pre><code>&amp;i2c0 {
+    pmic: pmic@20 {
+        compatible = "myvendor,my-pmic";
+        reg = &lt;0x20&gt;;
+        interrupt-parent = &lt;&amp;gpio2&gt;;
+        interrupts = &lt;5 IRQ_TYPE_LEVEL_LOW&gt;;
+
+        regulators {
+            ldo1_reg: ldo1 {
+                regulator-name          = "VDD_CAM_1V8";
+                regulator-min-microvolt = &lt;1700000&gt;;  /* 1.7 V */
+                regulator-max-microvolt = &lt;1900000&gt;;  /* 1.9 V */
+                regulator-always-on;   /* suspend sırasında da açık */
+            };
+
+            ldo2_reg: ldo2 {
+                regulator-name          = "VDD_CODEC_3V3";
+                regulator-min-microvolt = &lt;3300000&gt;;
+                regulator-max-microvolt = &lt;3300000&gt;;  /* sabit */
+                regulator-boot-on;     /* bootloader açmışsa kapat */
+            };
+
+            buck1_reg: buck1 {
+                regulator-name          = "VDD_CPU";
+                regulator-min-microvolt = &lt;800000&gt;;   /* 0.8 V */
+                regulator-max-microvolt = &lt;1100000&gt;;  /* 1.1 V */
+                regulator-always-on;
+                regulator-ramp-delay    = &lt;12500&gt;;    /* uV/us */
+            };
+
+            buck2_reg: buck2 {
+                regulator-name          = "VDD_DRAM_1V1";
+                regulator-min-microvolt = &lt;1050000&gt;;
+                regulator-max-microvolt = &lt;1150000&gt;;
+                regulator-always-on;
+                /* DT'de soft-start zamanı */
+                regulator-soft-start;
+            };
+        };
+    };
+};</code></pre>
+  </div>
+
+  <h3>Consumer'ların regülatöre bağlanması</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>my-board.dts — consumer bağlantısı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Kamera sürücüsü — ldo1 ve ldo2'yi kullanıyor */</span>
+&amp;camera0 {
+    status = "okay";
+
+    /*
+     * supply bağlaması: "vdd" ismi consumer sürücüdeki
+     * devm_regulator_get(&dev, "vdd") ile eşleşir
+     */
+    vdd-supply      = &lt;&amp;ldo1_reg&gt;;   /* 1.8 V analog */
+    vddio-supply    = &lt;&amp;ldo2_reg&gt;;   /* 3.3 V I/O */
+};
+
+<span class="cmt">/* CPU cluster — buck1 vdd-supply */</span>
+&amp;cpu0 {
+    cpu-supply = &lt;&amp;buck1_reg&gt;;
+};
+
+<span class="cmt">/* GPU */</span>
+&amp;gpu {
+    mali-supply = &lt;&amp;buck1_reg&gt;;
+};
+
+<span class="cmt">/* Regülatörler arası bağımlılık: ldo2 buck2'ye bağlı */</span>
+&amp;ldo2_reg {
+    vin-supply = &lt;&amp;buck2_reg&gt;;
+};</code></pre>
+  </div>
+
+  <h3>Standart DT property tablosu</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Property</th><th>Tür</th><th>Anlamı</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>regulator-name</td><td>string</td><td>İnsan-okunabilir isim (loglarda görünür)</td></tr>
+        <tr><td>regulator-min-microvolt</td><td>u32</td><td>İzin verilen minimum gerilim (uV)</td></tr>
+        <tr><td>regulator-max-microvolt</td><td>u32</td><td>İzin verilen maksimum gerilim (uV)</td></tr>
+        <tr><td>regulator-always-on</td><td>boolean</td><td>Hiçbir zaman disable edilmez</td></tr>
+        <tr><td>regulator-boot-on</td><td>boolean</td><td>Açılışta enable edilmiş; shutdown uygulanır</td></tr>
+        <tr><td>regulator-ramp-delay</td><td>u32</td><td>uV/us — gerilim değişim hızı</td></tr>
+        <tr><td>regulator-min-microamp</td><td>u32</td><td>Minimum akım kısıtı</td></tr>
+        <tr><td>regulator-max-microamp</td><td>u32</td><td>Maksimum akım kısıtı</td></tr>
+        <tr><td>regulator-allow-bypass</td><td>boolean</td><td>LDO bypass moduna izin ver</td></tr>
+        <tr><td>regulator-soft-start</td><td>boolean</td><td>Soft-start özelliğini etkinleştir</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">DİKKAT</div>
+    <p><code class="inline">regulator-always-on</code> ile <code class="inline">regulator-boot-on</code> farkı: always-on hiçbir koşulda disable edilmez. boot-on ise "açılışta enable gelmiş" anlamına gelir — consumer disable ederse framework disable eder. Güç tasarrufu için yanlış flag seçimi enerji tasarrufunu engeller.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>regulators {}: PMIC node içindeki alt node'lar — her biri bir regülatörü temsil eder</li>
+      <li>*-supply = &lt;&amp;ldo1_reg&gt;: consumer'ı regülatöre bağlar; isim "vdd-supply" → "vdd"</li>
+      <li>regulator-always-on: hiçbir zaman disable; regulator-boot-on: açılışta enable</li>
+      <li>vin-supply: regülatörler arası kaynak bağımlılığı (kaskad)</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Regulator constraints ve regulator_init_data</h2>
+  <p class="section-lead">Kernel içi kısıt yapısı: regulator_constraints, güvenlik sınırları ve platform init_data.</p>
+
+  <p>DT'den veya platform data'dan alınan kısıtlar <code class="inline">struct regulator_constraints</code>'a dönüştürülür. Framework, her <code class="inline">set_voltage</code> ve <code class="inline">enable</code> çağrısını bu kısıtlara karşı doğrular — böylece yanlış gerilim yazımı kernel düzeyinde engellenir.</p>
+
+  <h3>regulator_constraints yapısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>include/linux/regulator/machine.h — regulator_constraints</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">struct</span> regulator_constraints {
+    <span class="keyword">const char</span>    *name;
+
+    <span class="cmt">/* Gerilim kısıtları (uV) */</span>
+    <span class="keyword">int</span>    min_uV;
+    <span class="keyword">int</span>    max_uV;
+    <span class="keyword">int</span>    uV_offset;   <span class="cmt">/* Kalibrasyon ofseti */</span>
+
+    <span class="cmt">/* Akım kısıtları (uA) */</span>
+    <span class="keyword">int</span>    min_uA;
+    <span class="keyword">int</span>    max_uA;
+
+    <span class="cmt">/* Davranış bayrakları */</span>
+    <span class="keyword">unsigned int</span>  always_on:1;
+    <span class="keyword">unsigned int</span>  boot_on:1;
+    <span class="keyword">unsigned int</span>  apply_uV:1;   <span class="cmt">/* Kayıt sırasında uV uygula */</span>
+    <span class="keyword">unsigned int</span>  ramp_disable:1;
+    <span class="keyword">unsigned int</span>  soft_start:1;
+    <span class="keyword">unsigned int</span>  over_current_protection:1;
+
+    <span class="cmt">/* İzin verilen modlar */</span>
+    <span class="keyword">unsigned int</span>  valid_modes_mask;
+    <span class="keyword">unsigned int</span>  valid_ops_mask;   <span class="cmt">/* REGULATOR_CHANGE_VOLTAGE | _STATUS | _MODE */</span>
+
+    <span class="keyword">int</span>    ramp_delay;       <span class="cmt">/* uV/us */</span>
+    <span class="keyword">int</span>    settling_time;   <span class="cmt">/* us */</span>
+    <span class="keyword">int</span>    enable_time;     <span class="cmt">/* us — enable sonrası bekleme */</span>
+};</code></pre>
+  </div>
+
+  <h3>Platform board init_data (DT olmayan sistemler için)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>board_init.c — regulator_init_data</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">static struct</span> regulator_consumer_supply ldo1_consumers[] = {
+    REGULATOR_SUPPLY(<span class="str">"vdd"</span>, <span class="str">"0-003c"</span>),   <span class="cmt">/* kamera I2C adresi 0x3c */</span>
+    REGULATOR_SUPPLY(<span class="str">"avdd"</span>, <span class="str">"spi0.0"</span>),  <span class="cmt">/* SPI slave 0 */</span>
+};
+
+<span class="keyword">static struct</span> regulator_init_data my_ldo1_init_data = {
+    .constraints = {
+        .name       = <span class="str">"VDD_CAM_1V8"</span>,
+        .min_uV     = <span class="num">1700000</span>,
+        .max_uV     = <span class="num">1900000</span>,
+        .valid_ops_mask = REGULATOR_CHANGE_VOLTAGE |
+                          REGULATOR_CHANGE_STATUS,
+        .always_on  = <span class="num">0</span>,
+        .boot_on    = <span class="num">0</span>,
+    },
+    .num_consumer_supplies = ARRAY_SIZE(ldo1_consumers),
+    .consumer_supplies     = ldo1_consumers,
+};
+
+<span class="cmt">/* PMIC platform data */</span>
+<span class="keyword">static struct</span> my_pmic_platform_data my_pmic_pdata = {
+    .regulators[<span class="num">0</span>] = &amp;my_ldo1_init_data,
+    .regulators[<span class="num">1</span>] = &amp;my_ldo2_init_data,
+    .regulators[<span class="num">2</span>] = &amp;my_buck1_init_data,
+};</code></pre>
+  </div>
+
+  <h3>valid_ops_mask değerleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Flag</th><th>Anlamı</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>REGULATOR_CHANGE_VOLTAGE</td><td>Consumer set_voltage() çağırabilir</td></tr>
+        <tr><td>REGULATOR_CHANGE_CURRENT</td><td>Consumer set_current_limit() çağırabilir</td></tr>
+        <tr><td>REGULATOR_CHANGE_MODE</td><td>Consumer çalışma modunu değiştirebilir</td></tr>
+        <tr><td>REGULATOR_CHANGE_STATUS</td><td>Consumer enable/disable yapabilir</td></tr>
+        <tr><td>REGULATOR_CHANGE_DRMS</td><td>Dynamic Regulator Mode Switching izinli</td></tr>
+        <tr><td>REGULATOR_CHANGE_BYPASS</td><td>LDO bypass moduna geçiş izinli</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">GÜVENLİK</div>
+    <p><code class="inline">valid_ops_mask</code> yanlış yapılandırılırsa consumer <code class="inline">set_voltage()</code> çağırdığında <code class="inline">-EPERM</code> hatası alır. Üretim sistemlerinde kısıt maskesini minimum tutun: yalnızca gerekli ops'ları açın. Bu, yazılım hatalarının donanıma zarar vermesini önler.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>regulator_constraints: framework'ün her set_voltage/enable'ı doğruladığı kısıt yapısı</li>
+      <li>valid_ops_mask: hangi consumer işlemlerine izin verildiğini belirler</li>
+      <li>apply_uV: kayıt sırasında doğrudan gerilim uygula (tek uV değeri için)</li>
+      <li>Platform init_data: DT olmayan sistemlerde consumer-supply eşleştirmesi</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Sabit regülatörler — fixed-regulator, gpio-regulator</h2>
+  <p class="section-lead">Ayrı PMIC olmadan donanım regülatörlerini modelleyen generic kernel sürücüleri.</p>
+
+  <h3>fixed-regulator</h3>
+  <p>Sabit gerilimli ve her zaman açık olan güç kaynaklarını (anakart voltage rail'leri, linear regulatörler) modellemek için <code class="inline">fixed-regulator</code> generic binding kullanılır. Kernel sürücüsü <code class="inline">drivers/regulator/fixed.c</code>'dedir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>board.dts — fixed-regulator örnekleri</span><span class="dot">●</span></div>
+    <pre><code>/ {
+    <span class="cmt">/* Her zaman açık 3.3 V rail */</span>
+    vcc_3v3: regulator-vcc3v3 {
+        compatible      = "regulator-fixed";
+        regulator-name  = "VCC_3V3";
+        regulator-min-microvolt = &lt;3300000&gt;;
+        regulator-max-microvolt = &lt;3300000&gt;;
+        regulator-always-on;
+    };
+
+    <span class="cmt">/* GPIO ile kontrol edilen enable */</span>
+    vdd_wifi: regulator-vdd-wifi {
+        compatible      = "regulator-fixed";
+        regulator-name  = "VDD_WIFI_1V8";
+        regulator-min-microvolt = &lt;1800000&gt;;
+        regulator-max-microvolt = &lt;1800000&gt;;
+        gpio            = &lt;&amp;gpio3 12 GPIO_ACTIVE_HIGH&gt;;
+        enable-active-high;          /* GPIO high = enable */
+        startup-delay-us = &lt;5000&gt;;  /* 5 ms stabilizasyon */
+        vin-supply = &lt;&amp;vcc_3v3&gt;;    /* kaynak */
+    };
+
+    <span class="cmt">/* GPIO active-low örneği */</span>
+    vdd_cam: regulator-vdd-cam {
+        compatible      = "regulator-fixed";
+        regulator-name  = "VDD_CAM_2V8";
+        regulator-min-microvolt = &lt;2800000&gt;;
+        regulator-max-microvolt = &lt;2800000&gt;;
+        gpio            = &lt;&amp;gpio1 8 GPIO_ACTIVE_LOW&gt;;
+        <span class="cmt">/* enable-active-high yok = active-low enable */</span>
+    };
+};</code></pre>
+  </div>
+
+  <h3>gpio-regulator</h3>
+  <p><code class="inline">gpio-regulator</code> iki ya da daha fazla gerilim düzeyi arasında GPIO ile seçim yapan regülatörleri modellemek için kullanılır. Kernel sürücüsü <code class="inline">drivers/regulator/gpio-regulator.c</code>'dedir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>board.dts — gpio-regulator</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* GPIO ile 1.8V / 3.3V seçimi yapan I/O regülatörü */</span>
+vccq_sd: regulator-vccq-sd {
+    compatible = "regulator-gpio";
+    regulator-name = "VCCQ_SD";
+    regulator-min-microvolt = &lt;1800000&gt;;
+    regulator-max-microvolt = &lt;3300000&gt;;
+    gpios = &lt;&amp;gpio0 7 GPIO_ACTIVE_HIGH&gt;;
+    gpios-states = &lt;0&gt;;           /* başlangıç durumu */
+    states = &lt;1800000 0            /* GPIO=0: 1.8 V */
+               3300000 1&gt;;         /* GPIO=1: 3.3 V */
+    enable-active-high;
+    startup-delay-us = &lt;200&gt;;
+};</code></pre>
+  </div>
+
+  <h3>Yazılımda fixed/gpio regülatör kullanımı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>consumer_driver.c — fixed regülatör</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Fixed/GPIO regülatörler de aynı consumer API ile kullanılır */</span>
+<span class="keyword">struct</span> regulator *vdd_wifi = devm_regulator_get(&amp;pdev-&gt;dev, <span class="str">"vdd"</span>);
+<span class="keyword">if</span> (IS_ERR(vdd_wifi))
+    <span class="keyword">return</span> dev_err_probe(&amp;pdev-&gt;dev, PTR_ERR(vdd_wifi),
+                         <span class="str">"WiFi regulator alinamadi\n"</span>);
+
+ret = regulator_enable(vdd_wifi);
+<span class="keyword">if</span> (ret)
+    <span class="keyword">return</span> ret;
+
+<span class="cmt">/* startup-delay-us DT'de tanımlandıysa framework otomatik bekler */</span>
+<span class="cmt">/* Manuel bekleme gerekmez — framework halleder */</span>
+
+<span class="cmt">/* vccq_sd: voltage mux için set_voltage ile GPIO toggle */</span>
+<span class="keyword">struct</span> regulator *vccq = devm_regulator_get(&amp;mmc-&gt;dev, <span class="str">"vccq"</span>);
+ret = regulator_set_voltage(vccq, <span class="num">1800000</span>, <span class="num">1800000</span>);  <span class="cmt">/* 1.8V seç */</span>
+<span class="cmt">/* Arka planda gpio-regulator sürücüsü GPIO'yu toggle eder */</span></code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">regulator-fixed</span><span class="desc">Sabit gerilim; opsiyonel GPIO enable; startup-delay-us otomatik uygulanır</span></div>
+    <div class="param"><span class="name">regulator-gpio</span><span class="desc">GPIO ile gerilim seviyesi seçimi; states tablosu uV ↔ GPIO bit mask eşleşmesi</span></div>
+    <div class="param"><span class="name">enable-active-high</span><span class="desc">GPIO HIGH = enable; yoksa GPIO LOW = enable (active-low)</span></div>
+    <div class="param"><span class="name">vin-supply</span><span class="desc">Kaynak regülatör — kaskad güç açma/kapama sırası için önemli</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>regulator-fixed: sabit gerilim, opsiyonel GPIO enable — ayrı sürücü gerekmez</li>
+      <li>regulator-gpio: GPIO ile birden fazla gerilim seçimi, states tablosu</li>
+      <li>startup-delay-us: framework enable sonrası otomatik bekler</li>
+      <li>Consumer API aynı — sürücü fixed/gpio/PMIC farkını bilmez</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> regulator notifier ve event sistemi</h2>
+  <p class="section-lead">Consumer sürücüler regülatör olaylarını (over-current, under-voltage, failure) dinlemek için notifier kaydedebilir.</p>
+
+  <p>Regulator framework, donanım korumaları veya yazılım kısıt ihlalleri oluştuğunda event yayar. Consumer sürücüler bu olayları dinleyerek reaktif güç yönetimi uygulayabilir — örneğin aşırı akımda işlem yükünü azaltma.</p>
+
+  <h3>regulator_register_notifier kullanımı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>consumer_notifier.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;linux/regulator/consumer.h&gt;
+
+<span class="keyword">struct</span> my_dev_priv {
+    <span class="keyword">struct</span> regulator      *vdd;
+    <span class="keyword">struct</span> notifier_block  nb;
+};
+
+<span class="keyword">static int</span> my_regulator_event(<span class="keyword">struct</span> notifier_block *nb,
+                               <span class="keyword">unsigned long</span>         event,
+                               <span class="keyword">void</span>                 *data)
+{
+    <span class="keyword">struct</span> my_dev_priv *priv =
+        container_of(nb, <span class="keyword">struct</span> my_dev_priv, nb);
+
+    <span class="keyword">switch</span> (event) {
+    <span class="keyword">case</span> REGULATOR_EVENT_UNDER_VOLTAGE:
+        <span class="cmt">/* Düşük gerilim — performansı azalt */</span>
+        dev_warn(NULL, <span class="str">"VDD dusuk gerilim! Performans azaltiliyor.\n"</span>);
+        my_dev_throttle(priv);
+        <span class="keyword">break</span>;
+
+    <span class="keyword">case</span> REGULATOR_EVENT_OVER_CURRENT:
+        <span class="cmt">/* Aşırı akım — donanımı koru */</span>
+        dev_err(NULL, <span class="str">"VDD asiri akim! Cihaz kapatiliyor.\n"</span>);
+        my_dev_emergency_shutdown(priv);
+        <span class="keyword">break</span>;
+
+    <span class="keyword">case</span> REGULATOR_EVENT_VOLTAGE_CHANGE:
+        <span class="cmt">/* Gerilim değişti — yeniden yapılandır */</span>
+        {
+            <span class="keyword">int</span> new_uv = regulator_get_voltage(priv-&gt;vdd);
+            dev_info(NULL, <span class="str">"Yeni VDD: %d uV\n"</span>, new_uv);
+            my_dev_reconfigure(priv, new_uv);
+        }
+        <span class="keyword">break</span>;
+
+    <span class="keyword">case</span> REGULATOR_EVENT_DISABLE:
+        dev_warn(NULL, <span class="str">"VDD devre disi birakildi!\n"</span>);
+        <span class="keyword">break</span>;
+
+    <span class="keyword">case</span> REGULATOR_EVENT_FAILURE:
+        dev_crit(NULL, <span class="str">"VDD arizasi! Acil kapatma.\n"</span>);
+        kernel_power_off();
+        <span class="keyword">break</span>;
+    }
+    <span class="keyword">return</span> NOTIFY_OK;
+}
+
+<span class="keyword">static int</span> my_dev_probe(<span class="keyword">struct</span> platform_device *pdev)
+{
+    <span class="keyword">struct</span> my_dev_priv *priv;
+    <span class="keyword">int</span> ret;
+
+    priv = devm_kzalloc(&amp;pdev-&gt;dev, <span class="keyword">sizeof</span>(*priv), GFP_KERNEL);
+    <span class="keyword">if</span> (!priv)
+        <span class="keyword">return</span> -ENOMEM;
+
+    priv-&gt;vdd = devm_regulator_get(&amp;pdev-&gt;dev, <span class="str">"vdd"</span>);
+    <span class="keyword">if</span> (IS_ERR(priv-&gt;vdd))
+        <span class="keyword">return</span> PTR_ERR(priv-&gt;vdd);
+
+    priv-&gt;nb.notifier_call = my_regulator_event;
+
+    ret = devm_regulator_register_notifier(priv-&gt;vdd, &amp;priv-&gt;nb);
+    <span class="keyword">if</span> (ret) {
+        dev_err(&amp;pdev-&gt;dev, <span class="str">"notifier kaydi basarisiz: %d\n"</span>, ret);
+        <span class="keyword">return</span> ret;
+    }
+
+    <span class="keyword">return</span> <span class="num">0</span>;
+}
+
+<span class="cmt">/* Manuel unregister — devm kullanılmadıysa */</span>
+<span class="keyword">static int</span> my_dev_remove(<span class="keyword">struct</span> platform_device *pdev)
+{
+    <span class="keyword">struct</span> my_dev_priv *priv = platform_get_drvdata(pdev);
+    regulator_unregister_notifier(priv-&gt;vdd, &amp;priv-&gt;nb);
+    <span class="keyword">return</span> <span class="num">0</span>;
+}</code></pre>
+  </div>
+
+  <h3>Regulator event listesi</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Event</th><th>Kaynak</th><th>Tipik aksiyon</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>REGULATOR_EVENT_UNDER_VOLTAGE</td><td>Donanım OVP/UVP</td><td>Performans kısıtla</td></tr>
+        <tr><td>REGULATOR_EVENT_OVER_CURRENT</td><td>Donanım OCP</td><td>Yük azalt veya kapat</td></tr>
+        <tr><td>REGULATOR_EVENT_OVER_TEMP</td><td>Termal koruma</td><td>Thermal throttle</td></tr>
+        <tr><td>REGULATOR_EVENT_VOLTAGE_CHANGE</td><td>set_voltage sonrası</td><td>Bağımlı donanımı yeniden ayarla</td></tr>
+        <tr><td>REGULATOR_EVENT_DISABLE</td><td>regulator_disable()</td><td>Log, emergency stop</td></tr>
+        <tr><td>REGULATOR_EVENT_ENABLE</td><td>regulator_enable()</td><td>Başlangıç gecikme kontrolü</td></tr>
+        <tr><td>REGULATOR_EVENT_FAILURE</td><td>Donanım arızası</td><td>Kernel panic / güvenli kapatma</td></tr>
+        <tr><td>REGULATOR_EVENT_PRE_DISABLE</td><td>disable öncesi</td><td>Graceful shutdown</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>devm_regulator_register_notifier(): otomatik cleanup ile notifier kaydı</li>
+      <li>REGULATOR_EVENT_*: donanım OCP/UVP olayları + yazılım enable/disable olayları</li>
+      <li>container_of ile notifier_block'tan driver priv data'ya erişim</li>
+      <li>REGULATOR_EVENT_FAILURE: kernel_power_off() için güvenli kapatma noktası</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Hata ayıklama — debugfs regulator/, regulator_summary</h2>
+  <p class="section-lead">/sys/kernel/debug/regulator/ altındaki debugfs arayüzü ve regulator_summary ile sistemin güç durumunu analiz etme.</p>
+
+  <h3>debugfs regulator dosyaları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — debugfs regulator keşfi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># debugfs mount</span>
+mount -t debugfs none /sys/kernel/debug
+
+<span class="cmt"># Tüm regülatörleri listele</span>
+ls /sys/kernel/debug/regulator/
+<span class="cmt"># Çıktı: LDO1  LDO2  BUCK1  BUCK2  VCC_3V3 ...</span>
+
+<span class="cmt"># Belirli regülatörün gerilimini oku</span>
+cat /sys/kernel/debug/regulator/LDO1/voltage
+<span class="cmt"># Çıktı: 1800000</span>
+
+<span class="cmt"># Enable durumu</span>
+cat /sys/kernel/debug/regulator/LDO1/state
+<span class="cmt"># Çıktı: enabled</span>
+
+<span class="cmt"># Kullanım sayısı</span>
+cat /sys/kernel/debug/regulator/LDO1/use_count
+<span class="cmt"># Çıktı: 2  (2 consumer enable etti)</span>
+
+<span class="cmt"># Consumer listesi</span>
+cat /sys/kernel/debug/regulator/LDO1/consumers
+<span class="cmt"># Çıktı:</span>
+<span class="cmt"># Device-Supply: camera0 vdd</span>
+<span class="cmt"># Device-Supply: spi0.0  avdd</span></code></pre>
+  </div>
+
+  <h3>regulator_summary — tam sistem görünümü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — regulator_summary</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm regülatör hiyerarşisi</span>
+cat /sys/kernel/debug/regulator/regulator_summary
+
+<span class="cmt"># Örnek çıktı:</span>
+<span class="cmt"># regulator                      use open bypass  voltage current     min     max</span>
+<span class="cmt"># -------------------------------------------------------------------------------</span>
+<span class="cmt"># VCC_3V3                          0    1      0  3300000       0 3300000 3300000</span>
+<span class="cmt">#   LDO1                           2    2      0  1800000       0 1700000 1900000</span>
+<span class="cmt">#     camera0-vdd                  1    0      0</span>
+<span class="cmt">#     spi0.0-avdd                  1    0      0</span>
+<span class="cmt">#   LDO2                           0    1      0  3300000       0 3300000 3300000</span>
+<span class="cmt">#   BUCK1                          1    3      0  1000000       0  800000 1100000</span>
+<span class="cmt">#     cpu0-cpu-supply              1    0      0</span></code></pre>
+  </div>
+
+  <h3>sysfs regulator arayüzü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — sysfs regulator</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># /sys/class/regulator/ altındaki her regülatör</span>
+ls /sys/class/regulator/
+<span class="cmt"># regulator.0  regulator.1  regulator.2 ...</span>
+
+<span class="cmt"># İsim</span>
+cat /sys/class/regulator/regulator.0/name
+<span class="cmt"># LDO1</span>
+
+<span class="cmt"># Desteklenen gerilim adımları</span>
+cat /sys/class/regulator/regulator.0/num_voltages
+<span class="cmt"># 64</span>
+
+<span class="cmt"># Minimum gerilim</span>
+cat /sys/class/regulator/regulator.0/min_microvolts
+<span class="cmt"># 1700000</span></code></pre>
+  </div>
+
+  <h3>Yaygın sorunlar ve çözümleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Belirti</th><th>Olası neden</th><th>Kontrol</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>-EPROBE_DEFER</td><td>PMIC sürücüsü henüz yüklenmemiş</td><td>dmesg | grep "PMIC"; modprobe sırası</td></tr>
+        <tr><td>set_voltage: -EINVAL</td><td>İstenen gerilim constraints dışında</td><td>regulator_summary min/max aralığını kontrol et</td></tr>
+        <tr><td>set_voltage: -EPERM</td><td>valid_ops_mask'ta CHANGE_VOLTAGE yok</td><td>DT / init_data constraints incelemesi</td></tr>
+        <tr><td>enable: -EACCES</td><td>CHANGE_STATUS izni yok</td><td>valid_ops_mask kontrolü</td></tr>
+        <tr><td>use_count sıfırlanmıyor</td><td>regulator_enable/disable dengesizliği</td><td>Her enable için disable çağrıldığından emin ol</td></tr>
+        <tr><td>Regülatör kapanmıyor</td><td>always-on veya başka consumer tutmuş</td><td>consumers dosyasına bak</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Kernel config gereksinimleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig</span><span class="dot">●</span></div>
+    <pre><code>CONFIG_REGULATOR=y
+CONFIG_REGULATOR_DEBUG=y          <span class="cmt"># debugfs arayüzü</span>
+CONFIG_REGULATOR_FIXED_VOLTAGE=y  <span class="cmt"># fixed-regulator sürücüsü</span>
+CONFIG_REGULATOR_GPIO=y           <span class="cmt"># gpio-regulator sürücüsü</span>
+CONFIG_DEBUG_FS=y                 <span class="cmt"># debugfs genel</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>/sys/kernel/debug/regulator/&lt;name&gt;/: voltage, state, use_count, consumers</li>
+      <li>regulator_summary: tüm hiyerarşiyi use/open/bypass/voltage/current/min/max ile listeler</li>
+      <li>use_count dengesizliği: en yaygın hata — her enable için eşleşen disable zorunlu</li>
+      <li>-EPROBE_DEFER: PMIC modülü yüklenmemiş; -EPERM: valid_ops_mask eksikliği</li>
+    </ul>
+  </div>
+</section>
+
+</main>

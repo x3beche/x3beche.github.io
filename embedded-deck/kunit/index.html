@@ -1,0 +1,950 @@
+---
+layout: tutorial
+title: "KUnit — Linux Kernel Unit Test Çatısı"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>KUnit</span>
+    <span>2026</span>
+  </div>
+  <h1>KUnit<br><em>Linux Kernel Unit Test Çatısı</em></h1>
+  <p class="subtitle">Kernel içinde birim testi — test suite, assertion, fixture ve kunit.py ile UML kernel üzerinde CI entegrasyonu.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Kernel testine neden ihtiyaç var</a></li>
+    <li><a href="#s1">KUnit mimarisi</a></li>
+    <li><a href="#s2">İlk KUnit testi</a></li>
+    <li><a href="#s3">Assertion türleri</a></li>
+    <li><a href="#s4">Test fixtures ve init/exit</a></li>
+    <li><a href="#s5">Mocking ve bağımlılık enjeksiyonu</a></li>
+    <li><a href="#s6">Kernel modülü olarak çalıştırma</a></li>
+    <li><a href="#s7">kunit.py ile çalıştırma</a></li>
+    <li><a href="#s8">CI entegrasyonu</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> Kernel testine neden ihtiyaç var</h2>
+  <p class="section-lead">Linux kernel geliştirme süreçlerinde hataların büyük çoğunluğu regresyon kaynaklıdır — önceki testlerden geçen bir kod parçası yeni bir değişiklikle bozulur ve sürücü kalitesi düşer.</p>
+
+  <h3>Kernel geliştirmenin test edilmesindeki güçlükler</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Donanım bağımlılığı</span><span class="desc">Çoğu sürücü gerçek donanım olmadan test edilemez — her değişiklik için fiziksel board gerekebilir</span></div>
+    <div class="param"><span class="name">Kullanıcı alanı izolasyonu</span><span class="desc">glibc, syscall, userspace framework'leri çalışmaz; standart C test kütüphaneleri (Google Test, Unity) kernel space'te kullanılamaz</span></div>
+    <div class="param"><span class="name">Panik riski</span><span class="desc">Bir sürücü hatası sistemi çökertebilir — test ortamı geri dönülemez olabilir</span></div>
+    <div class="param"><span class="name">Yavaş feedback döngüsü</span><span class="desc">Geleneksel kernel testi: kernel derle → flash → boot → manuel test → hata raporla — dakikalar/saatler sürer</span></div>
+  </div>
+
+  <h3>Test türleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Test türü</th><th>Araç</th><th>Çalıştığı yer</th><th>Uygun olduğu alan</th></tr></thead>
+      <tbody>
+        <tr><td>Unit test</td><td>KUnit</td><td>UML kernel veya gerçek kernel</td><td>Sürücü alt fonksiyonları, veri yapıları, algoritmalar</td></tr>
+        <tr><td>Functional test</td><td>kselftest</td><td>Gerçek kernel, user space test</td><td>Syscall davranışı, ABI uyumluluğu</td></tr>
+        <tr><td>Integration test</td><td>LTP</td><td>Gerçek kernel, rootfs</td><td>Sistem geneli davranış, stress</td></tr>
+        <tr><td>Fuzzing</td><td>syzkaller</td><td>QEMU/KVM</td><td>Güvenlik açığı keşfi, edge case</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>KUnit'in avantajları</h3>
+
+  <div class="flow">
+    <pre>Değişiklik yaz → kunit.py run → UML kernel boot → testler çalışır → TAP raporu → 30 saniye içinde sonuç</pre>
+  </div>
+
+  <p>KUnit, Google'ın kernel ekibinin 2019'da Linux'a katkıladığı bir birim test çatısıdır. <strong>User Mode Linux (UML)</strong> üzerinde gerçek donanım olmadan saniyeler içinde çalışır; CI pipeline'larına kolayca entegre edilebilir.</p>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Kernel regresyonlar, donanım bağımlılığı ve panik riski testi zorlaştırır</li>
+      <li>KUnit: UML üzerinde saniyeler içinde çalışan kernel içi birim test çatısı</li>
+      <li>kselftest: kullanıcı alanından syscall testi; LTP: sistem stres testi</li>
+      <li>KUnit 2019'dan itibaren mainline Linux'ta; drivers/*/tests/ dizinlerinde örnekler mevcut</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> KUnit mimarisi</h2>
+  <p class="section-lead">KUnit, test suite ve test case hiyerarşisi üzerine kuruludur. Her test case bir struct kunit bağlamında çalışır; sonuçlar TAP (Test Anything Protocol) formatında raporlanır.</p>
+
+  <h3>Terim sözlüğü</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">test case</span><span class="desc">Tek bir fonksiyon — kunit_test_suite() içinde tanımlanır. Bir konuyu tek odak noktasıyla sınar.</span></div>
+    <div class="param"><span class="name">test suite</span><span class="desc">İlgili test case'lerin kümesi — init/exit hook'ları paylaşır. kunit_test_suite() makrosu ile kayıt edilir.</span></div>
+    <div class="param"><span class="name">assertion</span><span class="desc">KUNIT_EXPECT_* veya KUNIT_ASSERT_* — başarısız olduğunda raporlar. ASSERT türü testi durdurur, EXPECT devam ettirir.</span></div>
+    <div class="param"><span class="name">TAP output</span><span class="desc">Test Anything Protocol — her test "ok" veya "not ok" satırı üretir; CI araçları bu formatı otomatik ayrıştırır.</span></div>
+    <div class="param"><span class="name">struct kunit</span><span class="desc">Test çalışma zamanı bağlamı — bellek yönetimi, log, beklenti durumunu taşır. Her test case argüman olarak alır.</span></div>
+  </div>
+
+  <h3>KUnit kaynak ağacı</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Yol</th><th>İçerik</th></tr></thead>
+      <tbody>
+        <tr><td><code>lib/kunit/</code></td><td>KUnit çekirdek: test.c, assert.c, resource.c, string-stream.c</td></tr>
+        <tr><td><code>include/kunit/test.h</code></td><td>Ana başlık — tüm makro ve struct tanımları</td></tr>
+        <tr><td><code>include/kunit/mock.h</code></td><td>Mock altyapısı (deneysel)</td></tr>
+        <tr><td><code>tools/testing/kunit/</code></td><td>kunit.py — UML runner, wrapper script</td></tr>
+        <tr><td><code>drivers/*/tests/</code></td><td>Sürücü birim testleri — iio, regmap, clk, drm alt sistemleri</td></tr>
+        <tr><td><code>lib/kunit/kunit-example-test.c</code></td><td>Referans örnek — yeni başlayanlar için şablon</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>TAP çıktısı formatı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>tap</span><span class="dot">●</span></div>
+    <pre><code>TAP version 14
+    # Subtest: example_test_suite
+    1..3
+    ok 1 - example_simple_test
+    not ok 2 - example_failing_test
+        # example_failing_test: FAILED at lib/kunit/kunit-example-test.c:42
+        # Expected 1 + 1 == 3, but:
+        #        1 + 1 == 2
+        #        3 == 3 is false
+    ok 3 - example_init_test
+# example_test_suite: 2 passed, 1 failed
+not ok 1 - example_test_suite</code></pre>
+  </div>
+
+  <h3>Kernel konfigürasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># KUnit'i etkinleştir</span>
+<span class="cmt"># CONFIG_KUNIT=y           — KUnit çatısı (zorunlu)</span>
+<span class="cmt"># CONFIG_KUNIT_TEST=y      — KUnit kendi öz testleri</span>
+<span class="cmt"># CONFIG_KUNIT_EXAMPLE_TEST=y — örnek test modülü</span>
+
+<span class="cmt"># Kernel config'te etkinleştir:</span>
+<span class="cmd">./scripts/config</span> <span class="flag">--enable</span> CONFIG_KUNIT
+<span class="cmd">./scripts/config</span> <span class="flag">--enable</span> CONFIG_KUNIT_TEST
+<span class="cmd">./scripts/config</span> <span class="flag">--enable</span> CONFIG_KUNIT_EXAMPLE_TEST
+
+<span class="cmt"># kunit.py otomatik bu ayarları yapar (ayrıca el ile gerekmez)</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>test case → test suite → kunit_test_suite() kayıt hiyerarşisi</li>
+      <li>struct kunit: her test'e geçilen bağlam nesnesi</li>
+      <li>TAP çıktısı: CI araçlarının ayrıştırdığı standart format</li>
+      <li>lib/kunit/ çekirdek; tools/testing/kunit/kunit.py UML runner</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> İlk KUnit testi</h2>
+  <p class="section-lead">Sıfırdan bir KUnit test modülü yazmak — test case fonksiyonu, suite tanımı ve Kconfig/Makefile entegrasyonu.</p>
+
+  <h3>Test dosyası yapısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — drivers/misc/mydrv/mydrv-test.c</span><span class="dot">●</span></div>
+    <pre><code>// SPDX-License-Identifier: GPL-2.0
+/*
+ * mydrv KUnit birim testleri
+ * Bu dosya yalnızca CONFIG_MYDRV_KUNIT_TEST=y ile derlenir.
+ */
+#include &lt;kunit/test.h&gt;
+#include "mydrv.h"   /* test edilen modülün başlığı */
+
+/* ------------------------------------------------------------------ */
+/*  Test case 1: temel ekleme fonksiyonu                               */
+/* ------------------------------------------------------------------ */
+static void mydrv_add_test(struct kunit *test)
+{
+    /* Beklenti: 2 + 3 = 5 */
+    KUNIT_EXPECT_EQ(test, mydrv_add(2, 3), 5);
+    KUNIT_EXPECT_EQ(test, mydrv_add(0, 0), 0);
+    KUNIT_EXPECT_EQ(test, mydrv_add(-1, 1), 0);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Test case 2: sınır değerleri                                       */
+/* ------------------------------------------------------------------ */
+static void mydrv_boundary_test(struct kunit *test)
+{
+    /* INT_MAX + 1 taşma kontrolü (örnek) */
+    KUNIT_EXPECT_TRUE(test, mydrv_is_valid_range(0));
+    KUNIT_EXPECT_TRUE(test, mydrv_is_valid_range(255));
+    KUNIT_EXPECT_FALSE(test, mydrv_is_valid_range(256));
+    KUNIT_EXPECT_FALSE(test, mydrv_is_valid_range(-1));
+}
+
+/* ------------------------------------------------------------------ */
+/*  Test suite tanımı                                                  */
+/* ------------------------------------------------------------------ */
+static struct kunit_case mydrv_test_cases[] = {
+    KUNIT_CASE(mydrv_add_test),
+    KUNIT_CASE(mydrv_boundary_test),
+    {}   /* sentinel — dizi sonu */
+};
+
+static struct kunit_suite mydrv_test_suite = {
+    .name  = "mydrv",
+    .test_cases = mydrv_test_cases,
+};
+
+/* Suite'i KUnit'e kaydet */
+kunit_test_suite(mydrv_test_suite);</code></pre>
+  </div>
+
+  <h3>Kconfig girdisi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>kconfig — drivers/misc/mydrv/Kconfig</span><span class="dot">●</span></div>
+    <pre><code>config MYDRV
+    tristate "My example driver"
+    help
+      Basit örnek sürücü.
+
+config MYDRV_KUNIT_TEST
+    tristate "KUnit tests for mydrv" if !KUNIT_ALL_TESTS
+    depends on MYDRV &amp;&amp; KUNIT
+    default KUNIT_ALL_TESTS
+    help
+      mydrv KUnit birim testleri.
+      CONFIG_KUNIT=y/m gerektirir.</code></pre>
+  </div>
+
+  <h3>Makefile girdisi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>makefile — drivers/misc/mydrv/Makefile</span><span class="dot">●</span></div>
+    <pre><code>obj-$(CONFIG_MYDRV)            += mydrv.o
+obj-$(CONFIG_MYDRV_KUNIT_TEST) += mydrv-test.o</code></pre>
+  </div>
+
+  <h3>kunit.py ile hızlı çalıştırma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Test modülünü isme göre çalıştır (UML kernel)</span>
+<span class="cmd">./tools/testing/kunit/kunit.py</span> run <span class="flag">--filter_glob</span> 'mydrv*'
+
+<span class="cmt"># Tüm testleri çalıştır</span>
+<span class="cmd">./tools/testing/kunit/kunit.py</span> run
+
+<span class="cmt"># Beklenen çıktı:</span>
+<span class="cmt"># [PASSED] mydrv_add_test</span>
+<span class="cmt"># [PASSED] mydrv_boundary_test</span>
+<span class="cmt"># ============================================================</span>
+<span class="cmt"># Testing complete. 2 tests run. 0 failures. 0 crashed.</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Test dosyasının adı geleneksel olarak <code>&lt;modül&gt;-test.c</code> veya <code>&lt;modül&gt;_test.c</code> şeklindedir. Bazı alt sistemler <code>tests/</code> alt dizini kullanır (ör. <code>drivers/iio/tests/</code>). Hangi düzeni kullanırsanız kullanın, test kodu ana modül kodundan <strong>ayrı bir derleme birimi</strong> (obj-) olmalıdır.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Test case: static void foo(struct kunit *test) — KUNIT_EXPECT_* ile sına</li>
+      <li>kunit_test_cases[] dizisi + kunit_test_suite() + kunit_test_suite() kayıt</li>
+      <li>Kconfig: depends on MYDRV &amp;&amp; KUNIT, default KUNIT_ALL_TESTS</li>
+      <li>Makefile: obj-$(CONFIG_MYDRV_KUNIT_TEST) += mydrv-test.o</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> Assertion türleri</h2>
+  <p class="section-lead">KUnit iki kategoride assertion sunar: KUNIT_EXPECT_* (başarısızlıkta test devam eder) ve KUNIT_ASSERT_* (başarısızlıkta test anında durur). Her ikisi de zengin karşılaştırma makro setiyle gelir.</p>
+
+  <h3>EXPECT vs ASSERT farkı</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Makro ailesi</th><th>Başarısızlık davranışı</th><th>Ne zaman kullanılır</th></tr></thead>
+      <tbody>
+        <tr><td><code>KUNIT_EXPECT_*</code></td><td>Hatayı raporlar, test <strong>devam eder</strong></td><td>Birden fazla bağımsız koşul — hepsini raporlamak istersiniz</td></tr>
+        <tr><td><code>KUNIT_ASSERT_*</code></td><td>Hatayı raporlar, test <strong>anında durur</strong></td><td>Önceki bir koşulun doğru olması sonraki adım için zorunluysa</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Temel karşılaştırma makroları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code>/* Eşitlik */
+KUNIT_EXPECT_EQ(test, left, right);      /* left == right */
+KUNIT_EXPECT_NE(test, left, right);      /* left != right */
+
+/* Büyük/küçük */
+KUNIT_EXPECT_LT(test, left, right);      /* left &lt; right */
+KUNIT_EXPECT_LE(test, left, right);      /* left &lt;= right */
+KUNIT_EXPECT_GT(test, left, right);      /* left &gt; right */
+KUNIT_EXPECT_GE(test, left, right);      /* left &gt;= right */
+
+/* Boolean */
+KUNIT_EXPECT_TRUE(test, condition);
+KUNIT_EXPECT_FALSE(test, condition);
+
+/* Pointer */
+KUNIT_EXPECT_NULL(test, ptr);
+KUNIT_EXPECT_NOT_NULL(test, ptr);
+KUNIT_EXPECT_PTR_EQ(test, ptr1, ptr2);
+KUNIT_EXPECT_PTR_NE(test, ptr1, ptr2);
+
+/* Bellek karşılaştırma */
+KUNIT_EXPECT_MEMEQ(test, buf1, buf2, size);    /* memcmp == 0 */
+KUNIT_EXPECT_MEMNEQ(test, buf1, buf2, size);   /* memcmp != 0 */
+
+/* String karşılaştırma */
+KUNIT_EXPECT_STREQ(test, str1, str2);    /* strcmp == 0 */
+KUNIT_EXPECT_STRNEQ(test, str1, str2);   /* strcmp != 0 */</code></pre>
+  </div>
+
+  <h3>Hata mesajı özelleştirme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code>/* _MSG varyantları: başarısızlıkta özel mesaj yazdırır */
+KUNIT_EXPECT_EQ_MSG(test, actual, expected,
+                    "Reg 0x%x beklenen 0x%x, okunan 0x%x",
+                    reg_addr, expected, actual);
+
+/* kunit_fail_msg: koşulsuz test başarısızlığı ve özel mesaj */
+if (ptr == NULL) {
+    kunit_fail(test, "kmalloc NULL döndürdü — bellek yetersiz olabilir");
+    return;  /* bu noktadan sonra devam etmek anlamsız */
+}
+
+/* kunit_info / kunit_warn / kunit_err: log seviyeleri */
+kunit_info(test, "Test verisi: %d eleman\n", count);
+kunit_warn(test, "Timeout yaklasik, sonuclar guvenilmeyebilir\n");</code></pre>
+  </div>
+
+  <h3>ASSERT kullanım örneği</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code>static void mydrv_parse_test(struct kunit *test)
+{
+    struct mydrv_config *cfg;
+    const char *raw = "speed=100,mode=duplex";
+
+    /* cfg NULL ise devam etmek anlamsız — ASSERT kullan */
+    cfg = mydrv_parse_config(raw);
+    KUNIT_ASSERT_NOT_NULL(test, cfg);
+
+    /* cfg geçerli — alanları tek tek kontrol et */
+    KUNIT_EXPECT_EQ(test, cfg-&gt;speed, 100);
+    KUNIT_EXPECT_EQ(test, cfg-&gt;mode,  MYDRV_DUPLEX);
+
+    mydrv_free_config(cfg);
+}</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p><code>KUNIT_ASSERT_*</code> başarısızlığında <code>kunit_do_failed_assertion()</code> çağrılır ve test case fonksiyonu kernel'deki <code>kunit_try_catch</code> mekanizması aracılığıyla <strong>longjmp benzeri</strong> bir şekilde sonlandırılır. Bu nedenle <code>KUNIT_ASSERT_*</code> sonrasına temizleme (cleanup) kodları koymayın — fixture exit hook kullanın.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>KUNIT_EXPECT_*: devam eden test — birden fazla bağımsız koşulu raporlar</li>
+      <li>KUNIT_ASSERT_*: durduran test — sonraki adım için ön koşul gerektiğinde</li>
+      <li>_MSG varyantları özel hata mesajı; kunit_fail() koşulsuz başarısızlık</li>
+      <li>ASSERT sonrası temizleme yapma — fixture exit hook'unu kullan</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> Test fixtures ve init/exit</h2>
+  <p class="section-lead">Test fixture'ları, birden fazla test case'in paylaştığı kurulum (setup) ve temizlik (teardown) kodunu merkezi hâle getirir. KUnit'te bunu struct kunit_suite'in init/exit alanları ve kunit_alloc_resource() ile sağlarsınız.</p>
+
+  <h3>Suite seviyesi init/exit</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code>/* Suite genelindeki veri — tüm test case'ler paylaşır */
+struct mydrv_fixture {
+    struct mydrv_dev  *dev;
+    void              *shared_buf;
+};
+
+/* Her test case çalışmadan ÖNCE çağrılır */
+static int mydrv_test_init(struct kunit *test)
+{
+    struct mydrv_fixture *fixture;
+
+    /* kunit_kzalloc: test bitince otomatik serbest bırakılır */
+    fixture = kunit_kzalloc(test, sizeof(*fixture), GFP_KERNEL);
+    KUNIT_ASSERT_NOT_NULL(test, fixture);
+
+    /* Sahte (fake) bir cihaz oluştur */
+    fixture-&gt;dev = mydrv_fake_device_create();
+    KUNIT_ASSERT_NOT_NULL(test, fixture-&gt;dev);
+
+    fixture-&gt;shared_buf = kunit_kzalloc(test, 4096, GFP_KERNEL);
+    KUNIT_ASSERT_NOT_NULL(test, fixture-&gt;shared_buf);
+
+    /* Bağlamı test'e bağla */
+    test-&gt;priv = fixture;
+    return 0;
+}
+
+/* Her test case bittikten SONRA çağrılır */
+static void mydrv_test_exit(struct kunit *test)
+{
+    struct mydrv_fixture *fixture = test-&gt;priv;
+    if (fixture &amp;&amp; fixture-&gt;dev)
+        mydrv_fake_device_destroy(fixture-&gt;dev);
+    /* kunit_kzalloc ile alınan bellek otomatik serbest bırakılır */
+}
+
+/* Test case: fixture'dan cihaza eriş */
+static void mydrv_reg_read_test(struct kunit *test)
+{
+    struct mydrv_fixture *f = test-&gt;priv;
+    u32 val;
+
+    KUNIT_ASSERT_EQ(test, mydrv_reg_read(f-&gt;dev, 0x00, &amp;val), 0);
+    KUNIT_EXPECT_EQ(test, val, 0xDEADBEEF);   /* reset değeri */
+}
+
+static struct kunit_case mydrv_reg_cases[] = {
+    KUNIT_CASE(mydrv_reg_read_test),
+    {}
+};
+
+static struct kunit_suite mydrv_reg_suite = {
+    .name       = "mydrv_reg",
+    .init       = mydrv_test_init,
+    .exit       = mydrv_test_exit,
+    .test_cases = mydrv_reg_cases,
+};
+
+kunit_test_suite(mydrv_reg_suite);</code></pre>
+  </div>
+
+  <h3>kunit_alloc_resource() ile otomatik temizleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;kunit/resource.h&gt;
+
+/* Kaynak tanımı */
+static void mydrv_buf_free(struct kunit_resource *res)
+{
+    kfree(res-&gt;data);
+}
+
+/* Test case içinde otomatik temizlenen kaynak */
+static void mydrv_dma_test(struct kunit *test)
+{
+    void *dma_buf;
+
+    /* Test bittiğinde mydrv_buf_free() otomatik çağrılır */
+    dma_buf = kunit_alloc_resource(test,
+                                   NULL,           /* alloc — NULL: data manuel set */
+                                   mydrv_buf_free, /* free  */
+                                   GFP_KERNEL,
+                                   NULL);
+    /* Alternatif: kunit_kzalloc kullan (daha yaygın) */
+    dma_buf = kunit_kzalloc(test, PAGE_SIZE, GFP_KERNEL);
+    KUNIT_ASSERT_NOT_NULL(test, dma_buf);
+
+    /* DMA transfer testi */
+    mydrv_dma_fill(dma_buf, 0xAB, PAGE_SIZE);
+    KUNIT_EXPECT_EQ(test, ((u8 *)dma_buf)[0], 0xAB);
+    KUNIT_EXPECT_EQ(test, ((u8 *)dma_buf)[PAGE_SIZE - 1], 0xAB);
+}</code></pre>
+  </div>
+
+  <h3>Suite vs case seviyesi init karşılaştırması</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Mekanizma</th><th>Kapsam</th><th>Çağrılma zamanı</th><th>Tipik kullanım</th></tr></thead>
+      <tbody>
+        <tr><td>suite.init / suite.exit</td><td>Her test case</td><td>Her case öncesi/sonrası</td><td>Cihaz mock, paylaşılan tampon</td></tr>
+        <tr><td>suite.suite_init / suite_exit</td><td>Tüm suite</td><td>Suite başı/sonu (tek sefer)</td><td>Pahalı kaynaklar, global register</td></tr>
+        <tr><td>kunit_kzalloc</td><td>Test case içi</td><td>Otomatik, case bitince</td><td>Tek testte gerekli küçük tampon</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>suite.init / suite.exit: her test case için çalışır — cihaz ve tampon kurulumu</li>
+      <li>test-&gt;priv: fixture verisini test case'e taşımak için pointer</li>
+      <li>kunit_kzalloc: test bitince otomatik serbest bırakılır — manuel free gerekmez</li>
+      <li>suite_init/suite_exit: tüm suite için tek seferlik pahalı kaynak yönetimi</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> Mocking ve bağımlılık enjeksiyonu</h2>
+  <p class="section-lead">Kernel sürücüleri donanıma doğrudan bağımlıdır. Birim testinde donanımı simüle etmek için bağımlılık enjeksiyonu (dependency injection) ve struct üzerinden fonksiyon işaretçisi (ops struct) mocking yöntemi kullanılır.</p>
+
+  <h3>Ops struct ile bağımlılık enjeksiyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — mydrv.h</span><span class="dot">●</span></div>
+    <pre><code>/* Sürücü operasyon tablosu — gerçek veya sahte (fake) */
+struct mydrv_ops {
+    int  (*reg_read) (void *priv, u32 offset, u32 *val);
+    int  (*reg_write)(void *priv, u32 offset, u32  val);
+    void (*reset)    (void *priv);
+};
+
+struct mydrv_dev {
+    const struct mydrv_ops *ops;
+    void                   *priv;      /* hw private data */
+    /* sürücü durumu ... */
+};
+
+/* Gerçek donanım uygulaması */
+extern const struct mydrv_ops mydrv_hw_ops;</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — mydrv-test.c</span><span class="dot">●</span></div>
+    <pre><code>/* Test verisi: kayıt deposu */
+struct fake_hw {
+    u32 regs[256];
+    int reset_count;
+};
+
+/* Sahte (fake) register okuma */
+static int fake_reg_read(void *priv, u32 offset, u32 *val)
+{
+    struct fake_hw *hw = priv;
+    if (offset &gt;= ARRAY_SIZE(hw-&gt;regs)) return -EINVAL;
+    *val = hw-&gt;regs[offset];
+    return 0;
+}
+
+/* Sahte register yazma */
+static int fake_reg_write(void *priv, u32 offset, u32 val)
+{
+    struct fake_hw *hw = priv;
+    if (offset &gt;= ARRAY_SIZE(hw-&gt;regs)) return -EINVAL;
+    hw-&gt;regs[offset] = val;
+    return 0;
+}
+
+static void fake_reset(void *priv)
+{
+    struct fake_hw *hw = priv;
+    memset(hw-&gt;regs, 0, sizeof(hw-&gt;regs));
+    hw-&gt;reset_count++;
+}
+
+/* Sahte ops tablosu */
+static const struct mydrv_ops fake_ops = {
+    .reg_read  = fake_reg_read,
+    .reg_write = fake_reg_write,
+    .reset     = fake_reset,
+};
+
+/* Test: reset sonrası tüm register'lar sıfır olmalı */
+static void mydrv_reset_clears_regs(struct kunit *test)
+{
+    struct fake_hw  *hw  = kunit_kzalloc(test, sizeof(*hw),  GFP_KERNEL);
+    struct mydrv_dev *dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
+    KUNIT_ASSERT_NOT_NULL(test, hw);
+    KUNIT_ASSERT_NOT_NULL(test, dev);
+
+    /* Sahte donanımı enjekte et */
+    dev-&gt;ops  = &amp;fake_ops;
+    dev-&gt;priv = hw;
+
+    /* Bir register'a değer yaz */
+    mydrv_write_reg(dev, 0x10, 0xCAFEBABE);
+
+    /* Reset uygula */
+    mydrv_reset(dev);
+
+    /* Register sıfırlanmış olmalı */
+    u32 val;
+    KUNIT_ASSERT_EQ(test, mydrv_read_reg(dev, 0x10, &amp;val), 0);
+    KUNIT_EXPECT_EQ(test, val, 0U);
+    KUNIT_EXPECT_EQ(test, hw-&gt;reset_count, 1);
+}</code></pre>
+  </div>
+
+  <h3>Otomatik mock üretimi (deneysel)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code>/*
+ * include/kunit/mock.h — DEFINE_STRUCT_CLASS_MOCK_VOID_RETURN ile
+ * otomatik mock fonksiyonu oluşturma (Linux 6.4+ deneysel özellik)
+ * Henüz mainline değil; kullanımı için kunit-mock-example.c'ye bakın.
+ *
+ * Kararlı yol: ops struct + fake fonksiyon (yukarıdaki yöntem)
+ */
+
+/* En sağlam yaklaşım: struct ops üzerinden dependency injection */</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">TAVSIYE</div>
+    <p>Sürücünüzü başından itibaren <strong>ops struct</strong> (ör. <code>mydrv_ops</code>) üzerine kurarsanız hem gerçek hem fake implementasyonu kolayca değiştirebilirsiniz. Bu, <em>testability</em> için temel tasarım prensibidir. Donanımı doğrudan <code>ioread32()</code> gibi çağrılarla kullanan sürücüler test edilemez; ops üzerinden soyutlayın.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Ops struct + fonksiyon işaretçisi: kernel'de standart dependency injection yöntemi</li>
+      <li>Sahte (fake) implementasyon: bellek tabanlı kayıt deposu, donanım simülasyonu</li>
+      <li>kunit_kzalloc ile fake_hw ve mydrv_dev otomatik temizleme</li>
+      <li>include/kunit/mock.h: deneysel — kararlı kod için ops struct kullanın</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> Kernel modülü olarak çalıştırma</h2>
+  <p class="section-lead">KUnit testleri kernel içine gömülü (built-in) derlenebileceği gibi, yüklenebilir modül (loadable module) olarak da derlenip çalışma zamanında insmod ile yüklenebilir.</p>
+
+  <h3>Modül olarak derleme ve yükleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kconfig'i modül (=m) olarak ayarla</span>
+<span class="cmd">./scripts/config</span> <span class="flag">--module</span> CONFIG_MYDRV_KUNIT_TEST
+
+<span class="cmt"># Sadece test modülünü derle (hızlı yöntem)</span>
+<span class="cmd">make</span> <span class="flag">-j$(nproc)</span> M=drivers/misc/mydrv modules
+
+<span class="cmt"># Hedef sistemde yükle</span>
+<span class="cmd">insmod</span> mydrv.ko           <span class="cmt"># önce ana modül</span>
+<span class="cmd">insmod</span> mydrv-test.ko      <span class="cmt"># test modülü yüklenince testler otomatik çalışır</span>
+
+<span class="cmt"># Sonuçları kernel log'dan oku</span>
+<span class="cmd">dmesg</span> <span class="flag">|</span> <span class="cmd">grep</span> <span class="flag">-A</span> 20 'TAP version'
+<span class="cmt"># veya daha temiz:</span>
+<span class="cmd">dmesg</span> <span class="flag">|</span> <span class="cmd">grep</span> <span class="flag">-E</span> '(ok|not ok|TAP|#)'</code></pre>
+  </div>
+
+  <h3>debugfs üzerinden sonuçlara erişim</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># debugfs bağlı değilse:</span>
+<span class="cmd">mount</span> <span class="flag">-t</span> debugfs none /sys/kernel/debug
+
+<span class="cmt"># Tüm KUnit sonuçları</span>
+<span class="cmd">cat</span> /sys/kernel/debug/kunit/results
+
+<span class="cmt"># Belirli suite sonuçları</span>
+<span class="cmd">cat</span> /sys/kernel/debug/kunit/mydrv/results
+
+<span class="cmt"># Mevcut suite listesi</span>
+<span class="cmd">ls</span> /sys/kernel/debug/kunit/</code></pre>
+  </div>
+
+  <h3>kunit_run_all_tests() ile programatik çalıştırma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;kunit/test.h&gt;
+
+/* Belirli bir suite'i programatik olarak çalıştır */
+static int __init mydrv_test_module_init(void)
+{
+    /*
+     * kunit_test_suite() makrosu init() sırasında çağrılır.
+     * Module yüklenince testler otomatik başlar.
+     * Ek programatik başlatma gerekmez; ancak kunit_run_suite()
+     * ile belirli sürümde manuel kontrol mümkündür.
+     */
+    return 0;
+}
+
+static void __exit mydrv_test_module_exit(void)
+{
+    /* Temizlik: kunit_alloc_resource kaynakları zaten serbest bırakıldı */
+}
+
+module_init(mydrv_test_module_init);
+module_exit(mydrv_test_module_exit);
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("mydrv KUnit testleri");</code></pre>
+  </div>
+
+  <h3>Modül derleme sonrası test akışı</h3>
+
+  <div class="flow">
+    <pre>make M=... modules → scp *.ko target:/ → insmod mydrv.ko → insmod mydrv-test.ko → dmesg TAP → pass/fail</pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>KUnit testleri çalışma zamanında <strong>gerçek kernel bağlamında</strong> çalışır — bir KUNIT_ASSERT_* panik yerine testi durdursa da, test kodu <code>NULL</code> pointer erişimi veya yanlış lock kullanımı gibi bir hata yaparsa sistem çökebilir. Testleri önce UML (kunit.py) üzerinde doğrulayın, ardından gerçek donanımda çalıştırın.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>CONFIG_MYDRV_KUNIT_TEST=m → insmod ile yükleme → otomatik test çalışması</li>
+      <li>dmesg | grep TAP: kernel log'dan sonuçları oku</li>
+      <li>/sys/kernel/debug/kunit/: debugfs üzerinden sonuç dosyaları</li>
+      <li>Gerçek kernel testleri öncesi UML üzerinde doğrula — panik riski</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> kunit.py ile çalıştırma</h2>
+  <p class="section-lead">kunit.py, User Mode Linux (UML) kernel'i otomatik derleyip başlatan, testleri çalıştıran ve TAP sonuçlarını ayrıştıran wrapper script'tir. Gerçek donanım olmadan saniyeler içinde test mümkün kılar.</p>
+
+  <h3>kunit.py kurulumu ve gereksinimleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Gereksinimler: Python 3.7+, GCC (x86_64), qemu-system-x86_64 (isteğe bağlı)</span>
+<span class="cmd">python3</span> <span class="flag">--version</span>   <span class="cmt"># &gt;= 3.7</span>
+
+<span class="cmt"># kunit.py yolu: Linux kaynak ağacı kökünden</span>
+<span class="cmd">cd</span> /path/to/linux
+<span class="cmd">ls</span> tools/testing/kunit/kunit.py
+
+<span class="cmt"># İlk çalıştırma: UML kernel'i derler (~3-5 dakika, ikinci seferden hızlı)</span>
+<span class="cmd">./tools/testing/kunit/kunit.py</span> run
+
+<span class="cmt"># Yardım</span>
+<span class="cmd">./tools/testing/kunit/kunit.py</span> <span class="flag">--help</span></code></pre>
+  </div>
+
+  <h3>Yaygın kunit.py komutları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1. Tüm testleri çalıştır</span>
+<span class="cmd">./tools/testing/kunit/kunit.py</span> run
+
+<span class="cmt"># 2. Belirli test suite(ları) — glob filtresi</span>
+<span class="cmd">./tools/testing/kunit/kunit.py</span> run <span class="flag">--filter_glob</span> 'mydrv*'
+<span class="cmd">./tools/testing/kunit/kunit.py</span> run <span class="flag">--filter_glob</span> 'mydrv.mydrv_add_test'
+
+<span class="cmt"># 3. Özel .kunitconfig dosyası (hangi testlerin derleneceği)</span>
+<span class="cmd">./tools/testing/kunit/kunit.py</span> run <span class="flag">--kunitconfig</span> drivers/misc/mydrv/.kunitconfig
+
+<span class="cmt"># 4. Sadece derle, çalıştırma</span>
+<span class="cmd">./tools/testing/kunit/kunit.py</span> build
+
+<span class="cmt"># 5. Sonuçları ayrıştır (önceden kaydedilmiş TAP çıktısından)</span>
+<span class="cmd">./tools/testing/kunit/kunit.py</span> parse kunit_output.log
+
+<span class="cmt"># 6. QEMU ile çalıştır (x86_64)</span>
+<span class="cmd">./tools/testing/kunit/kunit.py</span> run <span class="flag">--arch</span> x86_64</code></pre>
+  </div>
+
+  <h3>.kunitconfig dosyası</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>kconfig — drivers/misc/mydrv/.kunitconfig</span><span class="dot">●</span></div>
+    <pre><code># UML kernel için minimal config — sadece ilgili testleri içerir
+CONFIG_KUNIT=y
+CONFIG_KUNIT_DEBUGFS=y
+
+# Test edilen modül ve test bağımlılıkları
+CONFIG_MYDRV=y
+CONFIG_MYDRV_KUNIT_TEST=y
+
+# İsteğe bağlı: KUnit öz testleri
+CONFIG_KUNIT_TEST=y</code></pre>
+  </div>
+
+  <h3>Çıktı yorumlama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Başarılı çalıştırma çıktısı:</span>
+<span class="cmt"># [PASSED] mydrv.mydrv_add_test</span>
+<span class="cmt"># [PASSED] mydrv.mydrv_boundary_test</span>
+<span class="cmt"># [PASSED] mydrv.mydrv_reset_clears_regs</span>
+<span class="cmt"># ============================================================</span>
+<span class="cmt"># Testing complete. 3 tests run. 0 failures. 0 crashed.</span>
+
+<span class="cmt"># Başarısız test:</span>
+<span class="cmt"># [FAILED] mydrv.mydrv_add_test</span>
+<span class="cmt"># ====== FAILED CASES ======</span>
+<span class="cmt"># mydrv.mydrv_add_test:</span>
+<span class="cmt">#   EXPECTATION FAILED at drivers/misc/mydrv/mydrv-test.c:18</span>
+<span class="cmt">#   Expected mydrv_add(2, 3) == 5, but:</span>
+<span class="cmt">#     mydrv_add(2, 3) == 4</span>
+<span class="cmt">#     5 == 5</span>
+
+<span class="cmt"># Hata kodu: 0=başarı, 1=test başarısız, 2=build hatası</span>
+<span class="cmd">echo</span> <span class="flag">$?</span></code></pre>
+  </div>
+
+  <h3>UML çalışma zamanı ve sınırlar</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Hız</span><span class="desc">UML kernel boot + test çalışması tipik olarak 10–30 saniye. İkinci çalıştırma derleme olmadığından çok daha hızlı.</span></div>
+    <div class="param"><span class="name">Mimari</span><span class="desc">Varsayılan UML (x86_64). ARM/RISC-V testleri için --arch arm64 + QEMU gerekir.</span></div>
+    <div class="param"><span class="name">Donanım erişimi</span><span class="desc">UML'de gerçek donanıma erişim yoktur — fake/mock kullanmak zorunludur. Bu KUnit tasarım prensibidir.</span></div>
+    <div class="param"><span class="name">Timeout</span><span class="desc">Varsayılan 300 saniye. --timeout ile değiştirilebilir. Sonsuz döngü yapan test zaman aşımına düşer.</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>kunit.py run: UML kernel derle + boot + test + TAP ayrıştır — tek komutla</li>
+      <li>--filter_glob: isim tabanlı test seçimi — hızlı geliştirme döngüsü</li>
+      <li>.kunitconfig: UML derlemesine hangi modüllerin gireceğini belirler</li>
+      <li>Dönüş kodu 0/1/2: CI pipeline'da pass/fail kararı için</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> CI entegrasyonu</h2>
+  <p class="section-lead">KUnit testlerini her kod değişikliğinde otomatik çalıştırmak — LKFT altyapısı, GitHub Actions ile kunit.py ve defconfig + KUnit kombinasyonu.</p>
+
+  <h3>GitHub Actions ile CI</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>yaml — .github/workflows/kunit.yml</span><span class="dot">●</span></div>
+    <pre><code>name: KUnit Tests
+
+on:
+  push:
+    branches: [ main, 'dev/**' ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  kunit:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Kaynak kodunu al
+        uses: actions/checkout@v4
+
+      - name: Araçları kur
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y \
+            gcc gcc-aarch64-linux-gnu flex bison \
+            libelf-dev libssl-dev python3 python3-pip
+
+      - name: KUnit testlerini çalıştır (UML)
+        run: |
+          ./tools/testing/kunit/kunit.py run \
+            --kunitconfig drivers/misc/mydrv/.kunitconfig \
+            --jobs $(nproc) \
+            --timeout 180
+
+      - name: TAP sonuçlarını artifact olarak kaydet
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kunit-results
+          path: .kunit/test_output.log</code></pre>
+  </div>
+
+  <h3>LKFT (Linux Kernel Functional Testing)</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">LKFT nedir</span><span class="desc">Linaro tarafından yürütülen, gerçek ARM ve x86 donanım üzerinde kernel testlerini CI ile otomatikleştiren açık altyapı</span></div>
+    <div class="param"><span class="name">Desteklenen testler</span><span class="desc">kselftest, LTP, KUnit, perf — tüm mainline ve LTS branch'leri için otomatik çalışır</span></div>
+    <div class="param"><span class="name">Sonuçlara erişim</span><span class="desc">https://lkft.linaro.org — regresyon raporları, board bazlı sonuçlar, tarihsel karşılaştırma</span></div>
+    <div class="param"><span class="name">Gönüllü katılım</span><span class="desc">Kendi board'unuzu LKFT ağına ekleyebilirsiniz — LAVA (Lab Automation and Validation Architecture) kullanılır</span></div>
+  </div>
+
+  <h3>defconfig ile KUnit etkinleştirme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Mevcut defconfig'e KUnit ekle</span>
+<span class="cmd">cd</span> /path/to/linux
+
+<span class="cmt"># 1. defconfig'i yükle ve KUnit ekle</span>
+<span class="cmd">make</span> ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+<span class="cmd">./scripts/config</span> <span class="flag">--enable</span> CONFIG_KUNIT
+<span class="cmd">./scripts/config</span> <span class="flag">--enable</span> CONFIG_KUNIT_ALL_TESTS
+<span class="cmd">./scripts/config</span> <span class="flag">--enable</span> CONFIG_MYDRV_KUNIT_TEST
+
+<span class="cmt"># 2. Kernel derle</span>
+<span class="cmd">make</span> ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- <span class="flag">-j$(nproc)</span> Image modules
+
+<span class="cmt"># 3. Hedef sistemde (QEMU veya gerçek board) çalıştır</span>
+<span class="cmt"># KUnit testleri boot sırasında otomatik çalışır (built-in ise)</span>
+<span class="cmt"># veya insmod ile yükle</span>
+
+<span class="cmt"># 4. Boot log'dan TAP çıktısını çek ve ayrıştır</span>
+<span class="cmd">./tools/testing/kunit/kunit.py</span> parse &lt; boot.log</code></pre>
+  </div>
+
+  <h3>kunit_tool CI çıktı seçenekleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># JUnit XML formatında çıktı (Jenkins, GitLab CI için)</span>
+<span class="cmd">./tools/testing/kunit/kunit.py</span> run <span class="flag">--json</span> &gt; results.json
+
+<span class="cmt"># Ayrıştırılmış TAP'ı JUnit'e dönüştür (üçüncü taraf araç)</span>
+<span class="cmt"># pip install junit-xml</span>
+
+<span class="cmt"># Çıktı renklendirme (terminal için)</span>
+<span class="cmd">./tools/testing/kunit/kunit.py</span> run <span class="flag">--raw_output</span>   <span class="cmt"># ham TAP</span>
+<span class="cmd">./tools/testing/kunit/kunit.py</span> run                    <span class="cmt"># renkli özet (varsayılan)</span></code></pre>
+  </div>
+
+  <h3>Tam CI test akışı</h3>
+
+  <div class="flow">
+    <pre>git push → CI tetiklenir → apt install araçlar → kunit.py run --kunitconfig ...
+    → UML kernel boot → testler çalışır → TAP parse → 0 (pass) veya 1 (fail)
+    → artifact kaydet → PR'a yorum/badge</pre>
+  </div>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>CI platformu</th><th>Entegrasyon yöntemi</th><th>Süre (tipik)</th></tr></thead>
+      <tbody>
+        <tr><td>GitHub Actions</td><td>ubuntu-22.04 runner + kunit.py</td><td>3–8 dakika</td></tr>
+        <tr><td>GitLab CI</td><td>Docker gcc:12 + kunit.py</td><td>3–8 dakika</td></tr>
+        <tr><td>Jenkins</td><td>Makefile hedef + TAP parser plugin</td><td>5–10 dakika</td></tr>
+        <tr><td>LKFT/LAVA</td><td>Gerçek donanım, QEMU — kselftest + KUnit</td><td>15–30 dakika</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>GitHub Actions: ubuntu-22.04 + kunit.py run — tam çalışan örnek</li>
+      <li>LKFT: Linaro'nun gerçek donanım üzerinde otomatik kernel test altyapısı</li>
+      <li>kunit.py --json: makine okunabilir çıktı — CI araçlarına entegrasyon</li>
+      <li>Dönüş kodu 0=geçti, 1=başarısız, 2=derleme hatası — CI kararı için</li>
+    </ul>
+  </div>
+</section>
+
+</main>

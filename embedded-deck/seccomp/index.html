@@ -1,0 +1,978 @@
+---
+layout: tutorial
+title: "seccomp & Capabilities — Linux Süreç Sandbox"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>GÜVENLİK</span>
+    <span>2026</span>
+  </div>
+  <h1>seccomp &amp; Capabilities<br><em>Linux Süreç Sandbox</em></h1>
+  <p class="subtitle">Sistem çağrısı filtreleme, capability kümeleri ve ayrıcalık düşürme teknikleriyle üretime hazır Linux süreç güvenlik katmanı.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Linux güvenlik katmanları</a></li>
+    <li><a href="#s1">Linux capabilities</a></li>
+    <li><a href="#s2">Capability dropping</a></li>
+    <li><a href="#s3">seccomp strict mode</a></li>
+    <li><a href="#s4">seccomp-bpf filtre yazımı</a></li>
+    <li><a href="#s5">libseccomp ile kolay filtre</a></li>
+    <li><a href="#s6">Systemd sandbox</a></li>
+    <li><a href="#s7">Container entegrasyonu</a></li>
+    <li><a href="#s8">Hata ayıklama</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> Linux güvenlik katmanları</h2>
+  <p class="section-lead">Linux, süreçleri kısıtlamak için birbirini tamamlayan dört farklı mekanizma sunar. Bu mekanizmalar derinlemesine savunma (defense in depth) ilkesini uygular.</p>
+
+  <h3>Dört katman</h3>
+
+  <div class="flow">
+    <pre>
+Kullanıcı alanı süreci
+        │
+        ▼
+┌─────────────────────────────────────────────┐
+│  1. DAC  — uid/gid dosya izinleri (chmod)   │
+│     "Bu süreç hangi dosyalara erişebilir?"  │
+├─────────────────────────────────────────────┤
+│  2. MAC  — SELinux / AppArmor               │
+│     "Bu süreç hangi label'lara erişebilir?" │
+├─────────────────────────────────────────────┤
+│  3. Capabilities — ayrıntılı ayrıcalıklar  │
+│     "Bu süreç hangi ayrıcalıklı işlemleri  │
+│      yapabilir?"                            │
+├─────────────────────────────────────────────┤
+│  4. seccomp — sistem çağrısı filtresi       │
+│     "Bu süreç hangi syscall'ları çağırabilir?"│
+└─────────────────────────────────────────────┘
+        │
+        ▼
+   Kernel (syscall arayüzü)</pre>
+  </div>
+
+  <h3>Neden birden fazla katman</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">DAC tek başına yetersiz</span><span class="desc">root (uid=0) tüm DAC kısıtlamalarını aşar; capabilities bunu parçalara böler</span></div>
+    <div class="param"><span class="name">MAC bypass riski</span><span class="desc">Kernel güvenlik açığı SELinux/AppArmor'u atlayabilir; seccomp kernel arayüzünü kısıtlar</span></div>
+    <div class="param"><span class="name">Capability ile exploit riski</span><span class="desc">Capability olan süreç bile tehlikeli syscall'ları çağırabilir; seccomp bunu engeller</span></div>
+    <div class="param"><span class="name">Derinlemesine savunma</span><span class="desc">Birden fazla katman, tek bir açığın yeterli olmamasını sağlar</span></div>
+  </div>
+
+  <h3>Tehdit modeli: privilege escalation</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Saldırı vektörü</th><th>DAC</th><th>Capabilities</th><th>seccomp</th></tr></thead>
+      <tbody>
+        <tr><td>Dosya okuma yetkisi yok</td><td>Engeller</td><td>Kısmen</td><td>Etkisiz</td></tr>
+        <tr><td>setuid binary istismarı</td><td>Etkisiz</td><td>Engeller (drop)</td><td>Kısmen</td></tr>
+        <tr><td>Kernel exploit via syscall</td><td>Etkisiz</td><td>Etkisiz</td><td>Engeller</td></tr>
+        <tr><td>ptrace ile süreç enjeksiyonu</td><td>Kısmen</td><td>CAP_SYS_PTRACE drop ile</td><td>ptrace syscall filtrele</td></tr>
+        <tr><td>Network raw socket</td><td>Etkisiz</td><td>CAP_NET_RAW drop ile</td><td>socket() filtrele</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>DAC → MAC → Capabilities → seccomp: dört bağımsız katman</li>
+      <li>Her katman farklı bir saldırı vektörünü engeller</li>
+      <li>Embedded sistemlerde en etkili yaklaşım: capabilities drop + seccomp-bpf</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> Linux capabilities</h2>
+  <p class="section-lead">Linux capabilities, geleneksel root/non-root ayrımını onlarca ayrıntılı ayrıcalığa böler. Her süreç veya dosya belirli capability'lere sahip olabilir.</p>
+
+  <h3>Capability kümeleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Küme</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td>Permitted (CapPrm)</td><td>Sürecin sahip olabileceği maksimum capability kümesi; effective'e eklenebilir</td></tr>
+        <tr><td>Effective (CapEff)</td><td>Şu an aktif olan capability'ler; kernel bu kümeye göre erişim kontrolü yapar</td></tr>
+        <tr><td>Inheritable (CapInh)</td><td>exec() sonrasında child sürece aktarılacak capability'ler</td></tr>
+        <tr><td>Bounding (CapBnd)</td><td>Sürecin asla kazanamayacağı capability'leri kısıtlayan üst sınır</td></tr>
+        <tr><td>Ambient (CapAmb)</td><td>Non-root exec() için inheritable'ı destekleyen ek küme (kernel 4.3+)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Önemli capability'ler</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">CAP_NET_BIND_SERVICE</span><span class="desc">1024 altı port'a bağlanma; web sunucusu için root yerine bu yeterli</span></div>
+    <div class="param"><span class="name">CAP_NET_ADMIN</span><span class="desc">Ağ arayüzü, routing, iptables yönetimi — güçlü ve dikkatli kullanılmalı</span></div>
+    <div class="param"><span class="name">CAP_SYS_TIME</span><span class="desc">Sistem saatini değiştirme (settimeofday, adjtimex)</span></div>
+    <div class="param"><span class="name">CAP_SYS_PTRACE</span><span class="desc">Başka süreçleri izleme; strace, gdb gibi araçlar için gerekli</span></div>
+    <div class="param"><span class="name">CAP_DAC_OVERRIDE</span><span class="desc">Dosya izinlerini atlama — root'a en yakın; dikkatle ver</span></div>
+    <div class="param"><span class="name">CAP_SETUID / CAP_SETGID</span><span class="desc">uid/gid değiştirme; setuid binary'ler bu capability'ye ihtiyaç duyar</span></div>
+    <div class="param"><span class="name">CAP_SYS_ADMIN</span><span class="desc">Yüzlerce farklı ayrıcalıklı işlem; neredeyse root'a eşdeğer, kullanmaktan kaçın</span></div>
+  </div>
+
+  <h3>Capability'leri okuma ve yönetme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># libcap-dev ve libcap2-bin kurulumu</span>
+apt-get install libcap2-bin
+
+<span class="cmt"># Mevcut sürecin capability'lerini göster</span>
+getpcaps $$
+
+<span class="cmt"># Belirli bir PID'nin capability'lerini göster</span>
+getpcaps 1234
+
+<span class="cmt"># /proc/PID/status ile okuma (ham hexadecimal)</span>
+grep Cap /proc/$$/status
+<span class="cmt"># CapInh: 0000000000000000</span>
+<span class="cmt"># CapPrm: 0000003fffffffff</span>
+<span class="cmt"># CapEff: 0000003fffffffff</span>
+<span class="cmt"># CapBnd: 0000003fffffffff</span>
+<span class="cmt"># CapAmb: 0000000000000000</span>
+
+<span class="cmt"># Hex değeri okunabilir capability listesine çevir</span>
+capsh --decode=0000003fffffffff
+
+<span class="cmt"># Dosya capability'lerini gör (setcap ile ayarlananlar)</span>
+getcap /usr/bin/ping
+<span class="cmt"># /usr/bin/ping = cap_net_raw+ep</span>
+
+<span class="cmt"># Dosyaya capability ata (root/sudo gerekir)</span>
+setcap cap_net_bind_service+ep /usr/local/bin/myserver
+
+<span class="cmt"># Dosya capability'lerini kaldır</span>
+setcap -r /usr/local/bin/myserver</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>5 capability kümesi: permitted, effective, inheritable, bounding, ambient</li>
+      <li>getpcaps/getcap ile okuma, setcap ile dosyaya atama</li>
+      <li>CAP_SYS_ADMIN neredeyse root'a eşdeğer — daima daha spesifik capability kullan</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> Capability dropping</h2>
+  <p class="section-lead">Bir daemon başlangıçta root yetkisiyle başlar (port bağlamak için), ardından gereksiz tüm capability'leri düşürerek minimum ayrıcalıkla çalışmaya devam eder.</p>
+
+  <h3>prctl() ile capability yönetimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;sys/prctl.h&gt;
+#include &lt;sys/capability.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;grp.h&gt;
+
+/* Root olarak başla, port'a bağlan, sonra ayrıcalıkları düşür */
+int drop_privileges(uid_t target_uid, gid_t target_gid) {
+    cap_t caps;
+
+    /* 1. Yalnızca ihtiyaç duyulan capability'leri tut */
+    caps = cap_from_text("cap_net_bind_service=ep");
+    if (cap_set_proc(caps) != 0) {
+        perror("cap_set_proc");
+        cap_free(caps);
+        return -1;
+    }
+    cap_free(caps);
+
+    /* 2. Supplementary group'ları ayarla */
+    if (setgroups(0, NULL) != 0) {
+        perror("setgroups");
+        return -1;
+    }
+
+    /* 3. gid değiştir */
+    if (setresgid(target_gid, target_gid, target_gid) != 0) {
+        perror("setresgid");
+        return -1;
+    }
+
+    /* 4. uid değiştir */
+    if (setresuid(target_uid, target_uid, target_uid) != 0) {
+        perror("setresuid");
+        return -1;
+    }
+
+    /* 5. No new privileges: exec() ile yeni capability kazanılamaz */
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+        perror("prctl(PR_SET_NO_NEW_PRIVS)");
+        return -1;
+    }
+
+    return 0;
+}</code></pre>
+  </div>
+
+  <h3>PR_SET_SECUREBITS</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">SECBIT_NOROOT</span><span class="desc">uid=0 olan sürecin otomatik olarak tüm capability'leri almasını engeller</span></div>
+    <div class="param"><span class="name">SECBIT_NO_SETUID_FIXUP</span><span class="desc">setuid() çağrıları sırasında capability kümelerinin otomatik güncellenmesini engeller</span></div>
+    <div class="param"><span class="name">SECBIT_KEEP_CAPS</span><span class="desc">setuid() sonrasında effective capability'lerin korunmasını sağlar (geçici)</span></div>
+    <div class="param"><span class="name">SECBIT_NO_NEW_PRIVS</span><span class="desc">securebit olarak PR_SET_NO_NEW_PRIVS — kalıcı ve devredilebilir</span></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>C</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;sys/prctl.h&gt;
+#include &lt;linux/securebits.h&gt;
+
+/* Root bile olsa yeni capability kazanılamaz */
+prctl(PR_SET_SECUREBITS,
+      SECBIT_NOROOT | SECBIT_NOROOT_LOCKED |
+      SECBIT_NO_SETUID_FIXUP | SECBIT_NO_SETUID_FIXUP_LOCKED |
+      SECBIT_KEEP_CAPS_LOCKED);
+
+/* Bounding set'ten tüm tehlikeli capability'leri kaldır */
+for (int cap = 0; cap &lt;= CAP_LAST_CAP; cap++) {
+    if (cap == CAP_NET_BIND_SERVICE) continue; /* İhtiyacımız var */
+    prctl(PR_CAPBSET_DROP, cap, 0, 0, 0);
+}</code></pre>
+  </div>
+
+  <h3>Ambient capability — non-root exec</h3>
+  <p>Ambient capability kümesi (kernel 4.3+), non-root bir sürecin <code>exec()</code> çağrısı sırasında child sürece capability aktarmasını sağlar. Sistemd socket activation ile birlikte kullanışlıdır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;sys/prctl.h&gt;
+#include &lt;sys/capability.h&gt;
+
+/* Ambient capability ekle (permitted ve inheritable'da da olmalı) */
+/* Önce inheritable'a ekle */
+cap_t caps = cap_get_proc();
+cap_value_t cap_list[] = { CAP_NET_BIND_SERVICE };
+cap_set_flag(caps, CAP_INHERITABLE, 1, cap_list, CAP_SET);
+cap_set_proc(caps);
+cap_free(caps);
+
+/* Sonra ambient'e ekle */
+prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_NET_BIND_SERVICE, 0, 0);
+
+/* Şimdi exec() ile başlatılan child uid=www-data olsa bile */
+/* CAP_NET_BIND_SERVICE'e sahip olur */</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>cap_set_proc() + setresuid/gid: root'tan non-root geçişinde capability dropping</li>
+      <li>PR_SET_NO_NEW_PRIVS: exec() ile ayrıcalık kazanımını kalıcı olarak engeller</li>
+      <li>SECBIT_NOROOT: uid=0 olsa bile otomatik capability ataması olmaz</li>
+      <li>Ambient capability: non-root child'a belirli capability'leri aktarma (kernel 4.3+)</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> seccomp strict mode</h2>
+  <p class="section-lead">seccomp strict modu, bir süreci yalnızca dört sistem çağrısına (<code>read</code>, <code>write</code>, <code>exit</code>, <code>sigreturn</code>) kısıtlar. Sandbox güvenlik gerektiren, önceden veri işleyen uygulamalar için idealdir.</p>
+
+  <h3>Strict mode nasıl çalışır</h3>
+
+  <div class="flow">
+    <pre>
+prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT)
+        │
+        ▼
+  İzin verilen syscall'lar:
+    read(), write(), exit(), sigreturn()
+        │
+  Diğer tüm syscall'lar:
+        ▼
+    SIGKILL (anında sonlanma)</pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>C</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;sys/prctl.h&gt;
+#include &lt;linux/seccomp.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;string.h&gt;
+
+int main(void) {
+    int fd;
+    char buf[4096];
+    ssize_t n;
+
+    /* Dosyayı strict mode ÖNCE aç */
+    fd = open("/etc/hostname", O_RDONLY);
+    if (fd &lt; 0) {
+        write(STDERR_FILENO, "open failed\n", 12);
+        return 1;
+    }
+
+    /* Strict mode'u etkinleştir */
+    /* Bundan sonra read, write, exit, sigreturn dışında her şey SIGKILL */
+    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT) != 0) {
+        /* prctl başarısız; kernel desteği yok */
+        return 1;
+    }
+
+    /* Şu an sadece read/write/exit/sigreturn yapabiliriz */
+    n = read(fd, buf, sizeof(buf) - 1);
+    if (n &gt; 0) {
+        buf[n] = '\0';
+        write(STDOUT_FILENO, buf, n);
+    }
+
+    /* _exit() exit syscall'ını çağırır — izinli */
+    _exit(0);
+}</code></pre>
+  </div>
+
+  <h3>Derleme ve kernel gereksinimleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Derleme</span>
+gcc -O2 -o sandboxed_reader sandboxed_reader.c
+
+<span class="cmt"># Kernel konfigürasyonu (zaten çoğu dağıtımda aktif)</span>
+<span class="cmt"># CONFIG_SECCOMP=y</span>
+<span class="cmt"># CONFIG_SECCOMP_FILTER=y</span>
+
+<span class="cmt"># Kernel desteğini kontrol et</span>
+grep CONFIG_SECCOMP /boot/config-$(uname -r)
+<span class="cmt"># CONFIG_SECCOMP=y</span>
+<span class="cmt"># CONFIG_SECCOMP_FILTER=y</span>
+
+<span class="cmt"># Çalışma zamanı desteğini kontrol et</span>
+cat /proc/sys/kernel/seccomp/actions_avail
+<span class="cmt"># kill_process kill_thread trap errno trace log allow</span></code></pre>
+  </div>
+
+  <h3>Strict mode sınırlamaları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Çok kısıtlayıcı</span><span class="desc">Gerçek uygulamalar onlarca farklı syscall kullanır; strict mode pratik değil</span></div>
+    <div class="param"><span class="name">Hazırlık gerektirir</span><span class="desc">Tüm dosya/soket işlemleri strict mode aktive edilmeden önce tamamlanmalı</span></div>
+    <div class="param"><span class="name">malloc() çalışmaz</span><span class="desc">brk/mmap syscall'larına ihtiyaç duyar; strict modda bu çağrılar öldürücü</span></div>
+    <div class="param"><span class="name">Kullanım alanı</span><span class="desc">Kriptografik hesaplama, sıkıştırma/açma motorları gibi isolated hesaplama görevleri</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Strict mode: yalnızca read, write, exit, sigreturn — diğerleri SIGKILL</li>
+      <li>Tüm I/O işlemleri aktif etmeden önce tamamlanmalı</li>
+      <li>Gerçek uygulamalar için seccomp-bpf daha esnek ve pratiktir</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> seccomp-bpf filtre yazımı</h2>
+  <p class="section-lead">seccomp-bpf, BPF (Berkeley Packet Filter) programlarını syscall filtresi olarak kullanır. Her syscall için izin ver, reddet veya özel eylem kararı verilebilir.</p>
+
+  <h3>BPF filtre yapısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/seccomp.h&gt;
+#include &lt;linux/filter.h&gt;
+#include &lt;linux/audit.h&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;sys/prctl.h&gt;
+#include &lt;stddef.h&gt;
+
+/* BPF makroları seccomp için */
+#define VALIDATE_ARCH \
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, \
+             offsetof(struct seccomp_data, arch)), \
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0), \
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS)
+
+#define LOAD_SYSCALL_NR \
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, \
+             offsetof(struct seccomp_data, nr))
+
+#define ALLOW_SYSCALL(name) \
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_##name, 0, 1), \
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)
+
+#define BLOCK_SYSCALL(name) \
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_##name, 0, 1), \
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM)
+
+static int install_filter(void) {
+    struct sock_filter filter[] = {
+        /* 1. Mimari doğrula */
+        VALIDATE_ARCH,
+        /* 2. Syscall numarasını yükle */
+        LOAD_SYSCALL_NR,
+        /* 3. İzin verilen syscall'lar */
+        ALLOW_SYSCALL(read),
+        ALLOW_SYSCALL(write),
+        ALLOW_SYSCALL(open),
+        ALLOW_SYSCALL(openat),
+        ALLOW_SYSCALL(close),
+        ALLOW_SYSCALL(fstat),
+        ALLOW_SYSCALL(mmap),
+        ALLOW_SYSCALL(mprotect),
+        ALLOW_SYSCALL(munmap),
+        ALLOW_SYSCALL(brk),
+        ALLOW_SYSCALL(exit_group),
+        ALLOW_SYSCALL(futex),
+        /* 4. Tüm diğerlerini reddet — EPERM ile (crash yerine hata döner) */
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+    };
+
+    struct sock_fprog prog = {
+        .len = sizeof(filter) / sizeof(filter[0]),
+        .filter = filter,
+    };
+
+    /* No new privs zorunlu (CAP_SYS_ADMIN olmadan) */
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
+        return -1;
+
+    /* Filtreyi yükle */
+    if (prctl(PR_SET_SECCOMP, SECCOMP_SET_MODE_FILTER, &amp;prog) != 0)
+        return -1;
+
+    return 0;
+}</code></pre>
+  </div>
+
+  <h3>SECCOMP_RET eylem türleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Eylem</th><th>Değer</th><th>Davranış</th></tr></thead>
+      <tbody>
+        <tr><td>SECCOMP_RET_ALLOW</td><td>0x7fff0000</td><td>Syscall'a izin ver</td></tr>
+        <tr><td>SECCOMP_RET_ERRNO</td><td>0x00050000 | errno</td><td>Syscall'ı reddet, errno döndür</td></tr>
+        <tr><td>SECCOMP_RET_KILL_THREAD</td><td>0x00000000</td><td>Çağıran thread'i SIGSYS ile öldür</td></tr>
+        <tr><td>SECCOMP_RET_KILL_PROCESS</td><td>0x80000000</td><td>Tüm süreci öldür (kernel 4.14+)</td></tr>
+        <tr><td>SECCOMP_RET_TRAP</td><td>0x00030000</td><td>SIGSYS gönder (signal handler tetiklenir)</td></tr>
+        <tr><td>SECCOMP_RET_TRACE</td><td>0x7ff00000</td><td>ptrace ile izleyen sürece bildir</td></tr>
+        <tr><td>SECCOMP_RET_LOG</td><td>0x7ffc0000</td><td>Audit log'a yaz, syscall'a izin ver</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Syscall argümanı filtreleme</h3>
+  <p>BPF filtresi, syscall numarasının yanı sıra argümanları da inceleyebilir. Bu özellikle <code>socket()</code> çağrısında soket türünü kısıtlamak için kullanılır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C</span><span class="dot">●</span></div>
+    <pre><code>/* Yalnızca AF_INET TCP socket'lerine izin ver, raw socket'leri engelle */
+/* socket(domain, type, protocol) — arg0=domain, arg1=type */
+
+#define LOAD_ARG0_LOW32 \
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, \
+             offsetof(struct seccomp_data, args[0]))
+
+/* socket syscall için argüman denetimi */
+BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_socket, 0, 10),
+/* arg0 = AF_INET (2) mi? */
+LOAD_ARG0_LOW32,
+BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_INET, 0, 4),
+/* arg1 = SOCK_STREAM (1) veya SOCK_DGRAM (2) mi? */
+BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+         offsetof(struct seccomp_data, args[1])),
+BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SOCK_STREAM, 1, 0),
+BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SOCK_DGRAM, 0, 1),
+BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+/* AF_INET ama SOCK_RAW veya diğerleri — reddet */
+BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>BPF filtresi: struct sock_filter dizisi, prctl(PR_SET_SECCOMP, SECCOMP_SET_MODE_FILTER)</li>
+      <li>Önce PR_SET_NO_NEW_PRIVS gerekli (CAP_SYS_ADMIN olmadan yükleme için)</li>
+      <li>SECCOMP_RET_ERRNO: güvenli reddetme, KILL_PROCESS: sert sonlandırma</li>
+      <li>args[0]–args[5]: syscall argümanlarını filtrelemek mümkün</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> libseccomp ile kolay filtre</h2>
+  <p class="section-lead">libseccomp, ham BPF kodu yazmadan yüksek seviyeli API ile seccomp filtresi oluşturur. Taşınabilir kod yazmayı kolaylaştırır ve mimari farkını soyutlar.</p>
+
+  <h3>Temel libseccomp API</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;seccomp.h&gt;
+#include &lt;errno.h&gt;
+
+/*
+ * Derleme: gcc -O2 -o app app.c -lseccomp
+ * Embedded için statik: gcc -O2 -static -o app app.c -l:libseccomp.a
+ */
+
+int setup_seccomp(void) {
+    scmp_filter_ctx ctx;
+    int rc;
+
+    /* Varsayılan eylem: izin verilmeyen tüm syscall'ları EPERM ile reddet */
+    ctx = seccomp_init(SCMP_ACT_ERRNO(EPERM));
+    if (ctx == NULL)
+        return -1;
+
+    /* İzin verilen syscall'ları tek tek ekle */
+    rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(read), 0);
+    rc |= seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(write), 0);
+    rc |= seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(open), 0);
+    rc |= seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(openat), 0);
+    rc |= seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(close), 0);
+    rc |= seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(fstat), 0);
+    rc |= seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(mmap), 0);
+    rc |= seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(mprotect), 0);
+    rc |= seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(munmap), 0);
+    rc |= seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(brk), 0);
+    rc |= seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(exit_group), 0);
+    rc |= seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(futex), 0);
+    rc |= seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(rt_sigreturn), 0);
+
+    if (rc != 0) {
+        seccomp_release(ctx);
+        return -1;
+    }
+
+    /* Filtreyi kernel'e yükle */
+    rc = seccomp_load(ctx);
+    seccomp_release(ctx);
+    return rc;
+}</code></pre>
+  </div>
+
+  <h3>Argüman tabanlı kural ekleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C</span><span class="dot">●</span></div>
+    <pre><code>/* Yalnızca AF_INET + SOCK_STREAM socket'lerine izin ver */
+seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(socket), 2,
+    SCMP_A0(SCMP_CMP_EQ, AF_INET),
+    SCMP_A1(SCMP_CMP_EQ, SOCK_STREAM));
+
+/* open() sadece O_RDONLY ile */
+seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(open), 1,
+    SCMP_A1(SCMP_CMP_MASKED_EQ, O_ACCMODE, O_RDONLY));
+
+/* ioctl sadece FIONREAD komutuna izin ver */
+seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(ioctl), 1,
+    SCMP_A1(SCMP_CMP_EQ, FIONREAD));
+
+/* Karşılaştırma operatörleri:
+   SCMP_CMP_EQ    — eşit
+   SCMP_CMP_NE    — eşit değil
+   SCMP_CMP_LT    — küçük
+   SCMP_CMP_LE    — küçük eşit
+   SCMP_CMP_GT    — büyük
+   SCMP_CMP_GE    — büyük eşit
+   SCMP_CMP_MASKED_EQ — mask &amp; arg == datum */</code></pre>
+  </div>
+
+  <h3>Filtreyi dosyaya yazma (analiz / dağıtım)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># C API ile BPF byte code'u dosyaya aktar (analiz için)</span>
+<span class="cmt"># seccomp_export_bpf(ctx, fd);</span>
+
+<span class="cmt"># seccomp-tools ile filtre içeriğini oku</span>
+apt-get install ruby-seccomp-tools   <span class="cmt"># veya gem install seccomp-tools</span>
+seccomp-tools dump ./my_sandboxed_app
+<span class="cmt"># Örnek çıktı:</span>
+<span class="cmt">#  line  CODE  JT   JF      K</span>
+<span class="cmt"># =================================</span>
+<span class="cmt">#  0000: 0x20 0x00 0x00 0x00000004  ld  [4]  ; arch</span>
+<span class="cmt">#  0001: 0x15 0x00 0x04 0xc000003e  jeq ARCH_X86_64 ; true: continue, false: +4</span>
+<span class="cmt">#  ...</span>
+
+<span class="cmt"># strace ile hangi syscall'ların kullanıldığını bul (filtre yazmadan önce)</span>
+strace -c ./my_app 2&gt;&amp;1 | tail -20</code></pre>
+  </div>
+
+  <h3>Embedded için önerilen libseccomp kullanımı</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Statik linkleme</span><span class="desc">Küçük embedded rootfs'te -l:libseccomp.a ile statik derle; ek .so gerekmez</span></div>
+    <div class="param"><span class="name">strace -c ile analiz</span><span class="desc">Filtre yazmadan önce uygulamanın kullandığı tüm syscall'ları say: strace -c ./app</span></div>
+    <div class="param"><span class="name">SCMP_ACT_LOG</span><span class="desc">Geliştirme sırasında SCMP_ACT_ERRNO yerine SCMP_ACT_LOG kullan — log al, engelleme</span></div>
+    <div class="param"><span class="name">Çok thread dikkat</span><span class="desc">Filtre her thread'e ayrı uygulanır; thread oluşturulmadan önce yükleme önerilir</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>seccomp_init(SCMP_ACT_ERRNO) + seccomp_rule_add + seccomp_load — üç adım</li>
+      <li>Argüman tabanlı kural: SCMP_A0(SCMP_CMP_EQ, değer) ile spesifik filtreleme</li>
+      <li>strace -c ile önce syscall envanteri, sonra izin listesi oluştur</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> Systemd sandbox</h2>
+  <p class="section-lead">Systemd, servis birimlerine seccomp, capability ve namespacing kısıtlamaları eklemeyi kod değişikliği gerektirmeden sağlar. Modern embedded dağıtımlar için güçlü bir güvenlik katmanıdır.</p>
+
+  <h3>Temel güvenlik direktifleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>systemd unit</span><span class="dot">●</span></div>
+    <pre><code>[Service]
+ExecStart=/usr/bin/myserver
+
+# ──────────────────────────────────────────
+# Capability kısıtlamaları
+# ──────────────────────────────────────────
+# Yalnızca bu capability'lere izin ver (geri kalanlar bounding set'ten kaldırılır)
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+
+# Ambient capability ekle (non-root servis için port &lt; 1024 bağlama)
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+# ──────────────────────────────────────────
+# Ayrıcalık yükseltmeyi engelle
+# ──────────────────────────────────────────
+NoNewPrivileges=yes
+
+# ──────────────────────────────────────────
+# Kimlik
+# ──────────────────────────────────────────
+User=myserver
+Group=myserver
+DynamicUser=yes     # Çalışma zamanında geçici uid/gid ata
+
+# ──────────────────────────────────────────
+# Dosya sistemi kısıtlamaları
+# ──────────────────────────────────────────
+ProtectSystem=strict          # /usr, /boot, /etc salt okunur
+ProtectHome=yes               # /home, /root erişilemez
+PrivateTmp=yes                # Özel /tmp
+ReadWritePaths=/var/lib/myserver /run/myserver
+ReadOnlyPaths=/etc/myserver
+
+# ──────────────────────────────────────────
+# Syscall filtreleme
+# ──────────────────────────────────────────
+SystemCallFilter=@system-service       # Servis için gerekli syscall kümesi
+SystemCallFilter=~@privileged @resources  # Tehlikeli grupları çıkar
+SystemCallErrorNumber=EPERM            # Yasaklı syscall SIGKILL yerine EPERM döndürür
+
+# ──────────────────────────────────────────
+# Namespace izolasyonu
+# ──────────────────────────────────────────
+PrivateNetwork=no              # Ağa ihtiyaç var
+PrivateDevices=yes             # /dev erişimini kısıtla
+ProtectKernelTunables=yes      # /proc/sys yazmaya kapat
+ProtectKernelModules=yes       # modprobe/rmmod engelle
+ProtectKernelLogs=yes          # /dev/kmsg, /proc/kmsg kapat
+ProtectClock=yes               # Sistem saati değiştirme engelle
+RestrictNamespaces=yes         # Yeni namespace oluşturmayı engelle
+LockPersonality=yes            # personality() syscall'ını kısıtla
+MemoryDenyWriteExecute=yes     # W+X bellek eşlemesi engelle (JIT olmayan servisler için)</code></pre>
+  </div>
+
+  <h3>SystemCallFilter grupları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Grup</th><th>İçerik</th></tr></thead>
+      <tbody>
+        <tr><td>@basic-io</td><td>read, write, close, lseek, dup, pipe, …</td></tr>
+        <tr><td>@network-io</td><td>socket, connect, bind, accept, send, recv, …</td></tr>
+        <tr><td>@system-service</td><td>Daemon için gerekli temel syscall kümesi (geniş)</td></tr>
+        <tr><td>@privileged</td><td>mount, chown, mknod, ptrace, … — genellikle engellenmeli</td></tr>
+        <tr><td>@resources</td><td>setrlimit, nice, ioprio_set, … — performans ayarları</td></tr>
+        <tr><td>@raw-io</td><td>iopl, ioperm, pciconfig_read — donanım erişimi</td></tr>
+        <tr><td>@reboot</td><td>reboot, kexec_load — sistemi yeniden başlatma</td></tr>
+        <tr><td>@clock</td><td>settimeofday, clock_settime, adjtimex</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Güvenlik skorunu kontrol etme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Servis güvenlik skorunu analiz et (systemd 240+)</span>
+systemd-analyze security myserver.service
+
+<span class="cmt"># Örnek çıktı:</span>
+<span class="cmt"># NAME                        DESCRIPTION                              EXPOSURE</span>
+<span class="cmt"># ✓ NoNewPrivileges=          Service processes cannot gain new privs   0.0</span>
+<span class="cmt"># ✓ SystemCallFilter=         System call filtering                     0.0</span>
+<span class="cmt"># ✗ MemoryDenyWriteExecute=  Memory regions can be written and exec    0.1</span>
+<span class="cmt"># ...</span>
+<span class="cmt"># → Overall exposure level: 2.1 OK &#x1f7e2;</span>
+
+<span class="cmt"># Birim dosyasını doğrula</span>
+systemd-analyze verify /etc/systemd/system/myserver.service</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>SystemCallFilter=@system-service ~@privileged: kod değişikliği olmadan seccomp</li>
+      <li>CapabilityBoundingSet + NoNewPrivileges: capability dropping unit dosyasından</li>
+      <li>ProtectSystem=strict + PrivateTmp: dosya sistemi izolasyonu</li>
+      <li>systemd-analyze security: güvenlik puan tablosu</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> Container entegrasyonu</h2>
+  <p class="section-lead">Docker ve Kubernetes, container süreçleri için seccomp profili ve capability kısıtlamaları destekler. OCI runtime spec üzerinden standart bir arayüz sunar.</p>
+
+  <h3>Docker seccomp profili</h3>
+  <p>Docker varsayılan olarak yaklaşık 44 tehlikeli syscall'ı engelleyen bir seccomp profili uygular. Özel profil JSON formatında tanımlanır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>json</span><span class="dot">●</span></div>
+    <pre><code>{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "architectures": [
+    "SCMP_ARCH_X86_64",
+    "SCMP_ARCH_AARCH64"
+  ],
+  "syscalls": [
+    {
+      "names": [
+        "read", "write", "open", "openat", "close",
+        "fstat", "stat", "lstat", "mmap", "mprotect",
+        "munmap", "brk", "rt_sigaction", "rt_sigprocmask",
+        "rt_sigreturn", "ioctl", "access", "pipe", "select",
+        "sched_yield", "mremap", "msync", "mincore", "madvise",
+        "socket", "connect", "accept", "sendto", "recvfrom",
+        "bind", "listen", "getsockname", "getpeername",
+        "setsockopt", "getsockopt", "clone", "fork", "execve",
+        "exit", "wait4", "kill", "uname", "fcntl", "flock",
+        "fsync", "getdents", "getcwd", "chdir", "rename",
+        "mkdir", "rmdir", "unlink", "readlink", "chmod",
+        "gettimeofday", "getrlimit", "getuid", "getgid",
+        "setuid", "setgid", "geteuid", "getegid", "getppid",
+        "getpgrp", "setsid", "setgroups", "getgroups",
+        "exit_group", "futex", "set_tid_address",
+        "clock_gettime", "clock_getres", "clock_nanosleep",
+        "epoll_wait", "epoll_ctl", "epoll_create1",
+        "timerfd_create", "timerfd_settime", "timerfd_gettime",
+        "signalfd4", "eventfd2", "pipe2", "inotify_init1",
+        "inotify_add_watch", "sendmsg", "recvmsg",
+        "getrandom", "copy_file_range"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    }
+  ]
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Özel seccomp profili ile container çalıştır</span>
+docker run --security-opt seccomp=/etc/docker/seccomp-myapp.json myimage
+
+<span class="cmt"># Capability dropping ile çalıştır</span>
+docker run \
+  --cap-drop ALL \
+  --cap-add NET_BIND_SERVICE \
+  --security-opt no-new-privileges \
+  myimage
+
+<span class="cmt"># Seccomp tamamen devre dışı (geliştirme/test)</span>
+docker run --security-opt seccomp=unconfined myimage</code></pre>
+  </div>
+
+  <h3>Kubernetes seccomp profili</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>yaml</span><span class="dot">●</span></div>
+    <pre><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp-pod
+spec:
+  securityContext:
+    # Pod seviyesinde seccomp (Kubernetes 1.19+ GA)
+    seccompProfile:
+      type: Localhost
+      localhostProfile: profiles/myapp-seccomp.json
+    runAsNonRoot: true
+    runAsUser: 1000
+
+  containers:
+  - name: myapp
+    image: myapp:1.0
+    securityContext:
+      # Container seviyesinde capability
+      capabilities:
+        drop:
+        - ALL
+        add:
+        - NET_BIND_SERVICE
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      seccompProfile:
+        type: RuntimeDefault   # Container runtime varsayılan profili</code></pre>
+  </div>
+
+  <h3>OCI seccomp profili konumları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Runtime</th><th>Varsayılan profil konumu</th></tr></thead>
+      <tbody>
+        <tr><td>Docker (containerd)</td><td>/etc/docker/seccomp.json</td></tr>
+        <tr><td>containerd</td><td>/etc/containerd/config.toml → seccomp_profile</td></tr>
+        <tr><td>CRI-O</td><td>/etc/crio/seccomp.json</td></tr>
+        <tr><td>Kubernetes node</td><td>/var/lib/kubelet/seccomp/profiles/</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Docker: --security-opt seccomp=profil.json + --cap-drop ALL --cap-add ...</li>
+      <li>Kubernetes: pod.spec.securityContext.seccompProfile + capabilities.drop/add</li>
+      <li>Profil konumu: /var/lib/kubelet/seccomp/profiles/ (node yerel)</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Hata ayıklama</h2>
+  <p class="section-lead">seccomp ve capability sorunları genellikle EACCES veya EPERM hataları olarak ortaya çıkar. doğru araçlarla hangi syscall veya capability'nin engellendiğini tespit etmek mümkündür.</p>
+
+  <h3>/proc/PID/status capability alanları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Mevcut kabuğun capability durumu</span>
+grep Cap /proc/$$/status
+<span class="cmt"># CapInh: 0000000000000000</span>
+<span class="cmt"># CapPrm: 0000000000000000</span>
+<span class="cmt"># CapEff: 0000000000000000</span>
+<span class="cmt"># CapBnd: 000001ffffffffff</span>
+<span class="cmt"># CapAmb: 0000000000000000</span>
+
+<span class="cmt"># Hex değeri okunabilir isme çevir</span>
+capsh --decode=000001ffffffffff
+
+<span class="cmt"># seccomp durumunu göster</span>
+grep Seccomp /proc/$$/status
+<span class="cmt"># Seccomp: 2    (0=yok, 1=strict, 2=filter)</span>
+grep SeccompFilters /proc/$$/status
+<span class="cmt"># SeccompFilters: 1   (yüklü filtre sayısı)</span></code></pre>
+  </div>
+
+  <h3>strace ile syscall yakalama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Engellenen syscall'ları bul (EPERM/EACCES dönen çağrılar)</span>
+strace -e trace=all 2&gt;&amp;1 ./myapp | grep -E "EPERM|EACCES|= -1"
+
+<span class="cmt"># Yalnızca başarısız syscall'ları göster</span>
+strace -Z ./myapp 2&gt;&amp;1 | head -50   <span class="cmt"># -Z: başarısız syscall'ları vurgula</span>
+
+<span class="cmt"># Hangi syscall'ların kullanıldığını say (filtre yazmadan önce)</span>
+strace -c ./myapp 2&gt;&amp;1 | sort -k4 -rn | head -20
+
+<span class="cmt"># Thread ve child süreçleri de takip et</span>
+strace -f -e trace=all ./myapp 2&gt;strace.log
+grep "SIGSYS\|SECCOMP\|EPERM" strace.log</code></pre>
+  </div>
+
+  <h3>auditd ile SIGSYS yakalama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># seccomp ihlallerini audit log'a yaz</span>
+<span class="cmt"># (SECCOMP_RET_KILL ile öldürülen süreçler audit log'a düşer)</span>
+ausearch -m SECCOMP -ts recent
+
+<span class="cmt"># Örnek audit log çıktısı:</span>
+<span class="cmt"># type=SECCOMP msg=audit(1234567890.123:456):</span>
+<span class="cmt">#   auid=1000 uid=1000 gid=1000</span>
+<span class="cmt">#   ses=3 subj=unconfined_u:... pid=12345 comm="myapp"</span>
+<span class="cmt">#   exe="/usr/bin/myapp" sig=31 arch=c000003e syscall=56</span>
+<span class="cmt">#   compat=0 ip=0x7f... code=0x80000000</span>
+
+<span class="cmt"># syscall=56 nedir?</span>
+ausyscall x86_64 56   <span class="cmt"># clone</span>
+
+<span class="cmt"># SECCOMP_RET_LOG ile loglayan filtre (engelleme yok)</span>
+<span class="cmt"># Geliştirme sırasında kullanışlı: SCMP_ACT_LOG</span>
+journalctl -k | grep "seccomp"</code></pre>
+  </div>
+
+  <h3>Capability sorunları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Bir ikiliyi hangi capability ile çalıştırılması gerektiğini test et</span>
+<span class="cmt"># capsh ile geçici capability değişimi</span>
+capsh --caps="cap_net_raw=eip" -- -c "./myapp"
+
+<span class="cmt"># setpriv ile belirli capability seti ile çalıştır (util-linux)</span>
+setpriv --bounding-set -cap_sys_admin --inh-caps -all ./myapp
+
+<span class="cmt"># Capability gerektiren erişim hatası: EPERM + errno=1</span>
+<span class="cmt"># strace ile yakalama:</span>
+strace -e trace=socket,bind,open ./myapp 2&gt;&amp;1 | grep EPERM
+
+<span class="cmt"># Dosya capability'lerini listele (tüm /usr/bin)</span>
+find /usr/bin -exec getcap {} + 2&gt;/dev/null</code></pre>
+  </div>
+
+  <h3>Yaygın sorunlar tablosu</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Belirti</th><th>Neden</th><th>Çözüm</th></tr></thead>
+      <tbody>
+        <tr><td>Program anında ölüyor (signal 31)</td><td>seccomp KILL_PROCESS: yasak syscall</td><td>strace -c ile syscall'ı bul, filtreye ekle</td></tr>
+        <tr><td>socket() EPERM döndürüyor</td><td>seccomp ERRNO veya CAP_NET_RAW eksik</td><td>filtre veya capability kontrolü</td></tr>
+        <tr><td>bind() port 80 için EACCES</td><td>CAP_NET_BIND_SERVICE yok</td><td>setcap veya AmbientCapabilities ekle</td></tr>
+        <tr><td>ptrace attach başarısız</td><td>CAP_SYS_PTRACE yok veya Yama Yatches</td><td>capability ekle veya /proc/sys/kernel/yama/ptrace_scope=0</td></tr>
+        <tr><td>mount() EPERM</td><td>CAP_SYS_ADMIN yok + seccomp</td><td>user namespace + unshare -m veya capability</td></tr>
+        <tr><td>exec() sonrası capability kaybı</td><td>inheritable/ambient ayarlanmamış</td><td>PR_CAP_AMBIENT_RAISE veya dosya capability</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>/proc/PID/status: CapPrm/CapEff/CapBnd/CapAmb hex değerleri + capsh --decode</li>
+      <li>strace -c: syscall envanteri; strace -Z: başarısız çağrıları vurgula</li>
+      <li>ausearch -m SECCOMP: audit log'da yakalanan seccomp ihlalleri</li>
+      <li>SECCOMP_RET_LOG / SCMP_ACT_LOG: geliştirme sırasında engelsiz loglama</li>
+    </ul>
+  </div>
+</section>
+
+</main>

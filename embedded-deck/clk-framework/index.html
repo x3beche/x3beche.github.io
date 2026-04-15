@@ -1,0 +1,1198 @@
+---
+layout: tutorial
+title: "CCF — Linux Common Clock Framework"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>CLK / CCF</span>
+    <span>2026</span>
+  </div>
+  <h1>CCF — Linux Common Clock Framework<br><em>Saat Ağacı, Sürücü Yazımı &amp; DT Bağlaması</em></h1>
+  <p class="subtitle">clock tree modeli, consumer/provider API'si, PLL sürücüsü tasarımı ve debugfs ile hata ayıklama — eksiksiz CCF rehberi.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">CCF nedir — clock tree ve provider/consumer modeli</a></li>
+    <li><a href="#s1">Consumer API — clk_get, clk_prepare, clk_enable, clk_set_rate</a></li>
+    <li><a href="#s2">struct clk_ops — driver tarafı callback'leri</a></li>
+    <li><a href="#s3">clk_register ve clk_hw_register — provider kayıt</a></li>
+    <li><a href="#s4">Hazır clock türleri — fixed-rate, divider, mux, gate</a></li>
+    <li><a href="#s5">Device Tree clock binding — clock-names, clocks özelliği</a></li>
+    <li><a href="#s6">PLL sürücüsü yazımı — ARM SoC örneği</a></li>
+    <li><a href="#s7">clk_notifier — frekans değişikliği bildirimleri</a></li>
+    <li><a href="#s8">Hata ayıklama — debugfs clk/, clk_summary, clk_dump</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> CCF nedir — clock tree ve provider/consumer modeli</h2>
+  <p class="section-lead">Linux Common Clock Framework (CCF), çekirdek içindeki tüm clock kaynaklarını hiyerarşik bir ağaç yapısında modelleyen ve tek bir tutarlı API ile yöneten alt sistemdir.</p>
+
+  <p>Embedded SoC'larda onlarca — bazen yüzlerce — clock kaynağı bulunur: kristal osilatörler, PLL'ler, divider'lar, mux'lar ve gate'ler. CCF öncesinde her mimarinin kendi clock yönetim kodu vardı; bu durum kod tekrarına ve taşıma güçlüğüne yol açıyordu. CCF (<code class="inline">drivers/clk/</code>) bu problemi çözmek için Linux 3.4'te birleşik bir framework sunar.</p>
+
+  <div class="flow">
+    <pre>
+  [XO 24 MHz] ──► [PLL A 1200 MHz] ──► [DIV /4] ──► [CPU CLK 300 MHz]
+                                   └──► [DIV /2] ──► [BUS CLK 600 MHz]
+  [XO 24 MHz] ──► [PLL B 800 MHz]  ──► [MUX]    ──► [UART CLK]
+                                         ▲
+  [RTC 32 kHz] ─────────────────────────┘
+
+  Her düğüm: struct clk_hw  (provider perspektifi)
+  Tüketiciler: struct clk * (consumer handle)
+    </pre>
+  </div>
+
+  <h3>Temel kavramlar</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Clock provider</span><span class="desc">Bir clock kaynağı sağlayan sürücü; clk_hw_register*() ile CCF'e kaydolur</span></div>
+    <div class="param"><span class="name">Clock consumer</span><span class="desc">Bir clock kaynağını kullanan sürücü; clk_get()/devm_clk_get() ile handle alır</span></div>
+    <div class="param"><span class="name">struct clk_hw</span><span class="desc">Provider tarafındaki temel yapı; sürücü bu struct'ı gömülü tutar</span></div>
+    <div class="param"><span class="name">struct clk</span><span class="desc">Consumer'a döndürülen opak handle; clk_ API ile kullanılır</span></div>
+    <div class="param"><span class="name">struct clk_core</span><span class="desc">CCF'in iç temsili; kullanım sayısını, parent'ı ve flags'leri tutar</span></div>
+    <div class="param"><span class="name">clk_ops</span><span class="desc">Provider'ın uyguladığı callback kümesi: enable, disable, set_rate vb.</span></div>
+  </div>
+
+  <h3>Clock hiyerarşisi ve referans sayımı</h3>
+  <p>CCF'de her clock'un bir ya da birden fazla parent'ı olabilir (mux clock). <code class="inline">clk_prepare_enable()</code> çağrıldığında CCF kök'e kadar tüm parent'ları otomatik etkinleştirir. <code class="inline">clk_disable_unprepare()</code> ise referans sayacını düşürür; sıfıra inen clock ve etkilenen parent'lar devre dışı bırakılır. Bu mekanizma güç tasarrufu için kritiktir.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Clock türü</th><th>Kernel helper</th><th>Tanımı</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>fixed-rate</td><td>clk_hw_register_fixed_rate()</td><td>Sabit frekanslı kristal/osilatör</td></tr>
+        <tr><td>fixed-factor</td><td>clk_hw_register_fixed_factor()</td><td>Parent'ın sabit çarpan/böleni</td></tr>
+        <tr><td>divider</td><td>clk_hw_register_divider()</td><td>Programlanabilir bölen (register'dan)</td></tr>
+        <tr><td>mux</td><td>clk_hw_register_mux()</td><td>Birden fazla parent arasında seçim</td></tr>
+        <tr><td>gate</td><td>clk_hw_register_gate()</td><td>Enable/disable için tek bit kontrolü</td></tr>
+        <tr><td>composite</td><td>clk_hw_register_composite()</td><td>mux + divider + gate birleşimi</td></tr>
+        <tr><td>pll</td><td>Özel clk_ops (elle yazılır)</td><td>Tam programlanabilir PLL</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">ÖNEMLİ</div>
+    <p>CCF başlık dosyaları: <code class="inline">&lt;linux/clk.h&gt;</code> (consumer API), <code class="inline">&lt;linux/clk-provider.h&gt;</code> (provider API). Consumer sürücüler yalnızca <code class="inline">clk.h</code>'ı include etmeli; provider implementasyonu gereksiz yere consumer koduna sızmamalıdır.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>CCF: tüm clock kaynaklarını tek hiyerarşik ağaçta modelleyen birleşik framework</li>
+      <li>Provider (clk_hw) ve consumer (clk *) ayrımı — iki farklı include dosyası</li>
+      <li>clk_prepare_enable → parent'ları otomatik etkinleştirme zinciri</li>
+      <li>Yedi temel clock türü: fixed-rate, fixed-factor, divider, mux, gate, composite, PLL</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Consumer API — clk_get, clk_prepare, clk_enable, clk_set_rate</h2>
+  <p class="section-lead">Consumer sürücüler clock ağacından nasıl handle alır, enable/disable zinciri nasıl çalışır ve frekans ayarı nasıl yapılır?</p>
+
+  <h3>Handle alma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>consumer_driver.c — handle alma</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">// Yöntem 1: devm_clk_get — probe() içinde kullanın, otomatik cleanup</span>
+<span class="keyword">struct</span> clk *uart_clk = devm_clk_get(&amp;pdev-&gt;dev, <span class="str">"uart"</span>);
+<span class="keyword">if</span> (IS_ERR(uart_clk))
+    <span class="keyword">return</span> PTR_ERR(uart_clk);
+
+<span class="cmt">// Yöntem 2: clk_get — manuel release gerektirir</span>
+<span class="keyword">struct</span> clk *bus_clk = clk_get(&amp;pdev-&gt;dev, <span class="str">"bus"</span>);
+<span class="keyword">if</span> (IS_ERR(bus_clk)) {
+    dev_err(&amp;pdev-&gt;dev, <span class="str">"bus clock alinamadi: %ld\n"</span>, PTR_ERR(bus_clk));
+    <span class="keyword">return</span> PTR_ERR(bus_clk);
+}
+
+<span class="cmt">// Yöntem 3: of_clk_get_by_name — DT node'undan isimle al</span>
+<span class="keyword">struct</span> clk *ref = of_clk_get_by_name(np, <span class="str">"ref"</span>);
+
+<span class="cmt">// NULL-safe helper — clock isteğe bağlıysa</span>
+<span class="keyword">struct</span> clk *opt = devm_clk_get_optional(&amp;pdev-&gt;dev, <span class="str">"optional-clk"</span>);
+<span class="cmt">// PTR_ERR değil NULL döner — clock yoksa hata değildir</span></code></pre>
+  </div>
+
+  <h3>prepare / enable iki aşaması</h3>
+  <p>CCF, iki aşamalı bir enable mekanizması kullanır. <strong>prepare</strong> aşaması uyku bağlamında (sleepable) çalışır ve PLL lock bekleme gibi uzun işlemleri kapsar. <strong>enable</strong> aşaması atomik bağlamda çalışır ve donanımda clock'u açar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>consumer_driver.c — prepare/enable</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">// Aşama 1: prepare (may sleep — uyku bağlamında çağrılabilir)</span>
+<span class="keyword">int</span> ret = clk_prepare(uart_clk);
+<span class="keyword">if</span> (ret)
+    <span class="keyword">return</span> ret;
+
+<span class="cmt">// Aşama 2: enable (atomic — interrupt handler'da da çağrılabilir)</span>
+ret = clk_enable(uart_clk);
+<span class="keyword">if</span> (ret) {
+    clk_unprepare(uart_clk);
+    <span class="keyword">return</span> ret;
+}
+
+<span class="cmt">// Birleşik form — en yaygın kullanım (may sleep)</span>
+ret = clk_prepare_enable(uart_clk);
+<span class="keyword">if</span> (ret)
+    <span class="keyword">return</span> ret;
+
+<span class="cmt">/* ... sürücü çalışıyor ... */</span>
+
+<span class="cmt">// Kapatma — her zaman enable'ın tersi sırayla</span>
+clk_disable_unprepare(uart_clk);
+
+<span class="cmt">// Sadece disable (atomic), unprepare ayrıca</span>
+clk_disable(uart_clk);
+clk_unprepare(uart_clk);</code></pre>
+  </div>
+
+  <h3>Frekans sorgulama ve ayarlama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>consumer_driver.c — rate API</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">// Mevcut frekansı oku (Hz cinsinden)</span>
+<span class="keyword">unsigned long</span> rate = clk_get_rate(uart_clk);
+dev_info(&amp;pdev-&gt;dev, <span class="str">"UART clock: %lu Hz\n"</span>, rate);
+
+<span class="cmt">// Donanımın desteklediği en yakın frekansı sor</span>
+<span class="keyword">long</span> actual = clk_round_rate(uart_clk, <span class="num">115200UL</span> * <span class="num">16</span>);
+dev_info(&amp;pdev-&gt;dev, <span class="str">"En yakin rate: %ld Hz\n"</span>, actual);
+
+<span class="cmt">// Frekansı ayarla (may sleep — PLL relock sürebilir)</span>
+<span class="keyword">int</span> ret = clk_set_rate(uart_clk, <span class="num">1843200UL</span>);  <span class="cmt">// 1.8432 MHz</span>
+<span class="keyword">if</span> (ret)
+    dev_warn(&amp;pdev-&gt;dev, <span class="str">"rate ayarlanamadi: %d\n"</span>, ret);
+
+<span class="cmt">// Parent ayarla (mux clock için)</span>
+<span class="keyword">struct</span> clk *new_parent = devm_clk_get(&amp;pdev-&gt;dev, <span class="str">"pll_b"</span>);
+ret = clk_set_parent(uart_clk, new_parent);</code></pre>
+  </div>
+
+  <h3>Tam consumer örneği — probe içinde</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>my_uart.c — probe() clock yönetimi</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">struct</span> my_uart_priv {
+    <span class="keyword">void</span> __iomem  *base;
+    <span class="keyword">struct</span> clk    *clk;
+    <span class="keyword">unsigned long</span>  clk_rate;
+};
+
+<span class="keyword">static int</span> my_uart_probe(<span class="keyword">struct</span> platform_device *pdev)
+{
+    <span class="keyword">struct</span> my_uart_priv *priv;
+    <span class="keyword">int</span> ret;
+
+    priv = devm_kzalloc(&amp;pdev-&gt;dev, <span class="keyword">sizeof</span>(*priv), GFP_KERNEL);
+    <span class="keyword">if</span> (!priv)
+        <span class="keyword">return</span> -ENOMEM;
+
+    priv-&gt;base = devm_platform_ioremap_resource(pdev, <span class="num">0</span>);
+    <span class="keyword">if</span> (IS_ERR(priv-&gt;base))
+        <span class="keyword">return</span> PTR_ERR(priv-&gt;base);
+
+    priv-&gt;clk = devm_clk_get(&amp;pdev-&gt;dev, <span class="str">"uart"</span>);
+    <span class="keyword">if</span> (IS_ERR(priv-&gt;clk))
+        <span class="keyword">return</span> dev_err_probe(&amp;pdev-&gt;dev, PTR_ERR(priv-&gt;clk),
+                             <span class="str">"uart clock alinamadi\n"</span>);
+
+    ret = clk_prepare_enable(priv-&gt;clk);
+    <span class="keyword">if</span> (ret)
+        <span class="keyword">return</span> dev_err_probe(&amp;pdev-&gt;dev, ret,
+                             <span class="str">"clock enable edilemedi\n"</span>);
+
+    <span class="cmt">// devm ile otomatik cleanup için notifier kaydedelim</span>
+    ret = devm_add_action_or_reset(&amp;pdev-&gt;dev,
+        (<span class="keyword">void</span>(*)(void*))clk_disable_unprepare, priv-&gt;clk);
+    <span class="keyword">if</span> (ret)
+        <span class="keyword">return</span> ret;
+
+    priv-&gt;clk_rate = clk_get_rate(priv-&gt;clk);
+    platform_set_drvdata(pdev, priv);
+    <span class="keyword">return</span> <span class="num">0</span>;
+}</code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">clk_get() / devm_clk_get()</span><span class="desc">Device node'undan isimle clock handle alır; -EPROBE_DEFER deferral'ı destekler</span></div>
+    <div class="param"><span class="name">clk_prepare()</span><span class="desc">Uyku bağlamı; PLL lock, VCO ayarlama gibi uzun işlemler burada yapılır</span></div>
+    <div class="param"><span class="name">clk_enable()</span><span class="desc">Atomik bağlam; donanımda gate bitini açar</span></div>
+    <div class="param"><span class="name">clk_set_rate()</span><span class="desc">Frekans ayarı; CLK_SET_RATE_GATE flag varsa önce disable gerektirir</span></div>
+    <div class="param"><span class="name">clk_round_rate()</span><span class="desc">Desteklenen en yakın frekansı sorgular, ayarlama yapmaz</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>devm_clk_get() → IS_ERR() kontrolü → -EPROBE_DEFER akışı</li>
+      <li>prepare (may sleep) + enable (atomic) iki aşaması; clk_prepare_enable() kısayolu</li>
+      <li>clk_get_rate / clk_round_rate / clk_set_rate — frekans yönetimi</li>
+      <li>devm_add_action_or_reset ile otomatik clk_disable_unprepare cleanup</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> struct clk_ops — driver tarafı callback'leri</h2>
+  <p class="section-lead">Clock provider sürücüsünün CCF'e sunduğu callback fonksiyonları kümesi olan clk_ops, clock'un tüm davranışını tanımlar.</p>
+
+  <p><code class="inline">struct clk_ops</code> (<code class="inline">include/linux/clk-provider.h</code>), bir clock'un nasıl enable/disable edileceğini, frekansının nasıl hesaplanacağını ve ayarlanacağını tanımlayan function pointer dizisidir. Sürücü bu struct'ı doldurur; CCF consumer isteklerini bu callback'lere yönlendirir.</p>
+
+  <h3>clk_ops yapısı — önemli alanlar</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>include/linux/clk-provider.h — clk_ops (sadeleştirilmiş)</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">struct</span> clk_ops {
+    <span class="cmt">/* Hazırlık — may sleep */</span>
+    <span class="keyword">int</span>   (*prepare)(<span class="keyword">struct</span> clk_hw *hw);
+    <span class="keyword">void</span>  (*unprepare)(<span class="keyword">struct</span> clk_hw *hw);
+    <span class="keyword">int</span>   (*is_prepared)(<span class="keyword">struct</span> clk_hw *hw);
+
+    <span class="cmt">/* Enable/disable — atomic */</span>
+    <span class="keyword">int</span>   (*enable)(<span class="keyword">struct</span> clk_hw *hw);
+    <span class="keyword">void</span>  (*disable)(<span class="keyword">struct</span> clk_hw *hw);
+    <span class="keyword">int</span>   (*is_enabled)(<span class="keyword">struct</span> clk_hw *hw);
+
+    <span class="cmt">/* Frekans hesaplama */</span>
+    <span class="keyword">unsigned long</span>  (*recalc_rate)(<span class="keyword">struct</span> clk_hw *hw,
+                                   <span class="keyword">unsigned long</span> parent_rate);
+    <span class="keyword">long</span>           (*round_rate)(<span class="keyword">struct</span> clk_hw *hw,
+                                  <span class="keyword">unsigned long</span> rate,
+                                  <span class="keyword">unsigned long</span> *parent_rate);
+    <span class="keyword">int</span>            (*determine_rate)(<span class="keyword">struct</span> clk_hw *hw,
+                                      <span class="keyword">struct</span> clk_rate_request *req);
+    <span class="keyword">int</span>            (*set_rate)(<span class="keyword">struct</span> clk_hw *hw,
+                               <span class="keyword">unsigned long</span> rate,
+                               <span class="keyword">unsigned long</span> parent_rate);
+
+    <span class="cmt">/* Parent yönetimi */</span>
+    <span class="keyword">u8</span>   (*get_parent)(<span class="keyword">struct</span> clk_hw *hw);
+    <span class="keyword">int</span>  (*set_parent)(<span class="keyword">struct</span> clk_hw *hw, <span class="keyword">u8</span> index);
+
+    <span class="cmt">/* Faz ve başlangıç değeri */</span>
+    <span class="keyword">int</span>   (*get_phase)(<span class="keyword">struct</span> clk_hw *hw);
+    <span class="keyword">int</span>   (*set_phase)(<span class="keyword">struct</span> clk_hw *hw, <span class="keyword">int</span> degrees);
+    <span class="keyword">void</span>  (*init)(<span class="keyword">struct</span> clk_hw *hw);
+    <span class="keyword">void</span>  (*debug_init)(<span class="keyword">struct</span> clk_hw *hw, <span class="keyword">struct</span> dentry *dentry);
+};</code></pre>
+  </div>
+
+  <h3>recalc_rate — mevcut frekansın hesaplanması</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>my_div_clk.c — recalc_rate</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">static unsigned long</span> my_div_recalc_rate(<span class="keyword">struct</span> clk_hw *hw,
+                                         <span class="keyword">unsigned long</span> parent_rate)
+{
+    <span class="keyword">struct</span> my_div_clk *div = to_my_div_clk(hw);
+    <span class="keyword">u32</span> reg_val = readl(div-&gt;base + DIV_REG);
+    <span class="keyword">u32</span> divisor = FIELD_GET(DIV_RATIO_MASK, reg_val) + <span class="num">1</span>;
+
+    <span class="cmt">/* parent_rate / divisor — CCF bölme işlemini doğru yapar */</span>
+    <span class="keyword">return</span> DIV_ROUND_UP_ULL((<span class="keyword">u64</span>)parent_rate, divisor);
+}</code></pre>
+  </div>
+
+  <h3>round_rate — istenen frekansa en yakın değer</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>my_div_clk.c — round_rate</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">static long</span> my_div_round_rate(<span class="keyword">struct</span> clk_hw *hw,
+                               <span class="keyword">unsigned long</span> rate,
+                               <span class="keyword">unsigned long</span> *parent_rate)
+{
+    <span class="keyword">struct</span> my_div_clk *div = to_my_div_clk(hw);
+    <span class="keyword">unsigned long</span> best_rate = <span class="num">0</span>;
+    <span class="keyword">u32</span> d;
+
+    <span class="cmt">/* Mümkün tüm bölücüleri tara, en yakını bul */</span>
+    <span class="keyword">for</span> (d = <span class="num">1</span>; d &lt;= div-&gt;max_div; d++) {
+        <span class="keyword">unsigned long</span> r = DIV_ROUND_UP_ULL((<span class="keyword">u64</span>)*parent_rate, d);
+        <span class="keyword">if</span> (r &lt;= rate &amp;&amp; r &gt; best_rate)
+            best_rate = r;
+    }
+    <span class="keyword">return</span> best_rate ? best_rate : DIV_ROUND_UP_ULL((<span class="keyword">u64</span>)*parent_rate,
+                                                      div-&gt;max_div);
+}</code></pre>
+  </div>
+
+  <h3>set_rate — donanımda frekansı uygula</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>my_div_clk.c — set_rate</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">static int</span> my_div_set_rate(<span class="keyword">struct</span> clk_hw *hw,
+                            <span class="keyword">unsigned long</span> rate,
+                            <span class="keyword">unsigned long</span> parent_rate)
+{
+    <span class="keyword">struct</span> my_div_clk *div = to_my_div_clk(hw);
+    <span class="keyword">u32</span> divisor, reg_val;
+
+    <span class="keyword">if</span> (!rate)
+        <span class="keyword">return</span> -EINVAL;
+
+    divisor = DIV_ROUND_UP(parent_rate, rate);
+    <span class="keyword">if</span> (divisor &gt; div-&gt;max_div)
+        divisor = div-&gt;max_div;
+
+    reg_val = readl(div-&gt;base + DIV_REG);
+    reg_val = (reg_val &amp; ~DIV_RATIO_MASK) |
+              FIELD_PREP(DIV_RATIO_MASK, divisor - <span class="num">1</span>);
+    writel(reg_val, div-&gt;base + DIV_REG);
+    <span class="keyword">return</span> <span class="num">0</span>;
+}</code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">recalc_rate</span><span class="desc">Donanımdan mevcut frekansı oku ve döndür; boot sırasında da çağrılır</span></div>
+    <div class="param"><span class="name">round_rate</span><span class="desc">İstenen frekansa en yakın desteklenen değeri döndür; parent_rate değiştirilebilir</span></div>
+    <div class="param"><span class="name">determine_rate</span><span class="desc">round_rate'in gelişmiş versiyonu; birden fazla parent'ı değerlendirmek için</span></div>
+    <div class="param"><span class="name">set_rate</span><span class="desc">Donanıma rate'i uygula; round_rate sonucuyla çağrılır</span></div>
+    <div class="param"><span class="name">enable / disable</span><span class="desc">Gate bitini aç/kapat; spinlock içinde çalışmalı (atomic)</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>clk_ops: sürücünün CCF'e sunduğu function pointer tablosu</li>
+      <li>recalc_rate: donanım register'larından mevcut bölücüyü okuyarak frekans hesaplar</li>
+      <li>round_rate: istenen frekansa en yakın donanım değerini arar</li>
+      <li>set_rate: donanıma divisor yazar; round_rate sonucuyla çağrılır</li>
+      <li>to_container_of pattern ile clk_hw'den özel struct'a ulaşım</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> clk_register ve clk_hw_register — clock provider kayıt</h2>
+  <p class="section-lead">Clock provider sürücüsünün CCF'e clk_hw_register*() ile nasıl kaydolacağı, init_data yapısı ve provider tablo mekanizması.</p>
+
+  <h3>Temel kayıt API'si</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>provider_driver.c — clk_hw_register</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;linux/clk-provider.h&gt;
+
+<span class="cmt">/* Özel clock struct'ımız */</span>
+<span class="keyword">struct</span> my_clk {
+    <span class="keyword">struct</span> clk_hw    hw;         <span class="cmt">/* İLK alan — to_my_clk() için */</span>
+    <span class="keyword">void</span>  __iomem   *reg_base;
+    <span class="keyword">spinlock_t</span>       lock;
+};
+
+<span class="cmt">/* container_of helper */</span>
+<span class="keyword">#define</span> to_my_clk(hw) container_of(hw, struct my_clk, hw)
+
+<span class="keyword">static const struct</span> clk_ops my_clk_ops = {
+    .recalc_rate  = my_clk_recalc_rate,
+    .round_rate   = my_clk_round_rate,
+    .set_rate     = my_clk_set_rate,
+    .enable       = my_clk_enable,
+    .disable      = my_clk_disable,
+    .is_enabled   = my_clk_is_enabled,
+};
+
+<span class="keyword">static int</span> my_clk_provider_probe(<span class="keyword">struct</span> platform_device *pdev)
+{
+    <span class="keyword">struct</span> device *dev = &amp;pdev-&gt;dev;
+    <span class="keyword">struct</span> my_clk  *mclk;
+    <span class="keyword">struct</span> clk_init_data init = {};
+    <span class="keyword">const char</span> *parent_names[] = { <span class="str">"xo_24mhz"</span> };
+    <span class="keyword">int</span> ret;
+
+    mclk = devm_kzalloc(dev, <span class="keyword">sizeof</span>(*mclk), GFP_KERNEL);
+    <span class="keyword">if</span> (!mclk)
+        <span class="keyword">return</span> -ENOMEM;
+
+    mclk-&gt;reg_base = devm_platform_ioremap_resource(pdev, <span class="num">0</span>);
+    <span class="keyword">if</span> (IS_ERR(mclk-&gt;reg_base))
+        <span class="keyword">return</span> PTR_ERR(mclk-&gt;reg_base);
+
+    spin_lock_init(&amp;mclk-&gt;lock);
+
+    <span class="cmt">/* clk_init_data: clock'un meta verisi */</span>
+    init.name         = <span class="str">"my_uart_clk"</span>;
+    init.ops          = &amp;my_clk_ops;
+    init.parent_names = parent_names;
+    init.num_parents  = ARRAY_SIZE(parent_names);
+    init.flags        = CLK_SET_RATE_PARENT;
+
+    mclk-&gt;hw.init = &amp;init;
+
+    <span class="cmt">/* Kaydol — devm_ versiyonu otomatik unregister yapar */</span>
+    ret = devm_clk_hw_register(dev, &amp;mclk-&gt;hw);
+    <span class="keyword">if</span> (ret)
+        <span class="keyword">return</span> dev_err_probe(dev, ret, <span class="str">"clk kaydi basarisiz\n"</span>);
+
+    <span class="cmt">/* DT consumer'lara provider tablosunu sun */</span>
+    <span class="keyword">return</span> devm_of_clk_add_hw_provider(dev,
+                                        of_clk_hw_simple_get,
+                                        &amp;mclk-&gt;hw);
+}</code></pre>
+  </div>
+
+  <h3>Çoklu clock sağlayan provider</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>multi_clk_provider.c — clk_hw_onecell_data</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Birden fazla clock sunan SoC CMU (Clock Management Unit) */</span>
+<span class="keyword">#define</span> MY_CLK_UART0    <span class="num">0</span>
+<span class="keyword">#define</span> MY_CLK_SPI0     <span class="num">1</span>
+<span class="keyword">#define</span> MY_CLK_I2C0     <span class="num">2</span>
+<span class="keyword">#define</span> MY_CLK_COUNT    <span class="num">3</span>
+
+<span class="keyword">static int</span> my_cmu_probe(<span class="keyword">struct</span> platform_device *pdev)
+{
+    <span class="keyword">struct</span> clk_hw_onecell_data *data;
+    <span class="keyword">int</span> ret;
+
+    data = devm_kzalloc(&amp;pdev-&gt;dev,
+                struct_size(data, hws, MY_CLK_COUNT),
+                GFP_KERNEL);
+    <span class="keyword">if</span> (!data)
+        <span class="keyword">return</span> -ENOMEM;
+
+    data-&gt;num = MY_CLK_COUNT;
+
+    <span class="cmt">/* Her clock'u kaydet */</span>
+    data-&gt;hws[MY_CLK_UART0] = my_register_uart_clk(&amp;pdev-&gt;dev);
+    data-&gt;hws[MY_CLK_SPI0]  = my_register_spi_clk(&amp;pdev-&gt;dev);
+    data-&gt;hws[MY_CLK_I2C0]  = my_register_i2c_clk(&amp;pdev-&gt;dev);
+
+    <span class="cmt">/* Herhangi biri başarısız mı? */</span>
+    <span class="keyword">for</span> (<span class="keyword">int</span> i = <span class="num">0</span>; i &lt; MY_CLK_COUNT; i++) {
+        <span class="keyword">if</span> (IS_ERR(data-&gt;hws[i]))
+            <span class="keyword">return</span> PTR_ERR(data-&gt;hws[i]);
+    }
+
+    <span class="cmt">/* Provider tablosunu DT'ye bağla */</span>
+    <span class="keyword">return</span> devm_of_clk_add_hw_provider(&amp;pdev-&gt;dev,
+                                        of_clk_hw_onecell_get,
+                                        data);
+}</code></pre>
+  </div>
+
+  <h3>clk_init_data flags tablosu</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Flag</th><th>Tanımı</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>CLK_SET_RATE_PARENT</td><td>set_rate isteği parent'a da iletilir</td></tr>
+        <tr><td>CLK_IGNORE_UNUSED</td><td>Consumer yoksa bile clock disable edilmez</td></tr>
+        <tr><td>CLK_IS_CRITICAL</td><td>Sistem kritik — hiçbir zaman disable edilmez</td></tr>
+        <tr><td>CLK_GET_RATE_NOCACHE</td><td>Her sorguda donanımdan okunur, önbellek kullanılmaz</td></tr>
+        <tr><td>CLK_SET_RATE_GATE</td><td>set_rate öncesi clock disable edilmeli</td></tr>
+        <tr><td>CLK_SET_PARENT_GATE</td><td>set_parent öncesi clock disable edilmeli</td></tr>
+        <tr><td>CLK_DUTY_CYCLE_PARENT</td><td>duty cycle bilgisini parent'tan al</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>clk_hw: sürücünün gömülü tuttuğu temel struct; container_of ile erişim</li>
+      <li>clk_init_data: isim, ops, parent_names ve flags — boot sırasında kullanılır</li>
+      <li>devm_clk_hw_register() + devm_of_clk_add_hw_provider() — tam devm akışı</li>
+      <li>Çoklu clock için clk_hw_onecell_data + of_clk_hw_onecell_get</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Hazır clock türleri — fixed-rate, divider, mux, gate</h2>
+  <p class="section-lead">CCF'in sunduğu hazır clock helper'ları çoğu donanım için yeterlidir; özel ops yazmaktan kaçınmak için bunları kullanın.</p>
+
+  <h3>fixed-rate clock</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>fixed_rate_example.c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* 24 MHz kristal — sabit, değiştirilemez */</span>
+<span class="keyword">struct</span> clk_hw *xo_hw;
+xo_hw = clk_hw_register_fixed_rate(dev, <span class="str">"xo_24mhz"</span>,
+                                    NULL,     <span class="cmt">/* parent yok */</span>
+                                    <span class="num">0</span>,        <span class="cmt">/* flags */</span>
+                                    <span class="num">24000000UL</span>); <span class="cmt">/* 24 MHz */</span>
+<span class="keyword">if</span> (IS_ERR(xo_hw))
+    <span class="keyword">return</span> PTR_ERR(xo_hw);</code></pre>
+  </div>
+
+  <h3>fixed-factor clock</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>fixed_factor_example.c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* xo_24mhz * 50 / 1 = 1200 MHz PLL çıkışı simülasyonu */</span>
+<span class="keyword">struct</span> clk_hw *pll_hw;
+pll_hw = clk_hw_register_fixed_factor(dev, <span class="str">"pll_fixed"</span>,
+                                       <span class="str">"xo_24mhz"</span>,
+                                       <span class="num">0</span>,    <span class="cmt">/* flags */</span>
+                                       <span class="num">50</span>,   <span class="cmt">/* mult */</span>
+                                       <span class="num">1</span>);   <span class="cmt">/* div */</span></code></pre>
+  </div>
+
+  <h3>divider clock</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>divider_example.c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/*
+ * Register-kontrollü bölücü:
+ *   reg + offset adresindeki bitler[7:4] bölücüyü taşır
+ *   CLK_DIVIDER_ONE_BASED: register değeri doğrudan bölücüdür (0 geçersiz)
+ */</span>
+<span class="keyword">struct</span> clk_hw *div_hw;
+div_hw = clk_hw_register_divider(dev, <span class="str">"uart_div"</span>,
+                                  <span class="str">"pll_fixed"</span>,      <span class="cmt">/* parent */</span>
+                                  CLK_SET_RATE_PARENT,
+                                  reg_base + <span class="num">0x10</span>,  <span class="cmt">/* register adresi */</span>
+                                  <span class="num">4</span>,                 <span class="cmt">/* bit offset */</span>
+                                  <span class="num">4</span>,                 <span class="cmt">/* bit width */</span>
+                                  CLK_DIVIDER_ONE_BASED,
+                                  &amp;my_lock);          <span class="cmt">/* spinlock */</span>
+
+<span class="cmt">/* Tablo-tabanlı divider (log2 değerleri için) */</span>
+<span class="keyword">static const</span> <span class="keyword">struct</span> clk_div_table uart_div_table[] = {
+    { .val = <span class="num">0</span>, .div = <span class="num">1</span> },
+    { .val = <span class="num">1</span>, .div = <span class="num">2</span> },
+    { .val = <span class="num">2</span>, .div = <span class="num">4</span> },
+    { .val = <span class="num">3</span>, .div = <span class="num">8</span> },
+    { <span class="cmt">/* sentinel */</span> }
+};
+div_hw = clk_hw_register_divider_table(dev, <span class="str">"uart_div2"</span>,
+                                        <span class="str">"pll_fixed"</span>, <span class="num">0</span>,
+                                        reg_base + <span class="num">0x14</span>, <span class="num">0</span>, <span class="num">2</span>,
+                                        <span class="num">0</span>, uart_div_table, &amp;my_lock);</code></pre>
+  </div>
+
+  <h3>mux clock</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>mux_example.c</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">static const char</span> * <span class="keyword">const</span> uart_mux_parents[] = {
+    <span class="str">"xo_24mhz"</span>,
+    <span class="str">"pll_fixed"</span>,
+    <span class="str">"uart_div"</span>,
+};
+
+<span class="keyword">struct</span> clk_hw *mux_hw;
+mux_hw = clk_hw_register_mux(dev, <span class="str">"uart_mux"</span>,
+                               uart_mux_parents,
+                               ARRAY_SIZE(uart_mux_parents),
+                               CLK_SET_RATE_PARENT,
+                               reg_base + <span class="num">0x20</span>,  <span class="cmt">/* register */</span>
+                               <span class="num">8</span>,                 <span class="cmt">/* bit offset */</span>
+                               <span class="num">2</span>,                 <span class="cmt">/* bit width — 4 seçenek */</span>
+                               <span class="num">0</span>,                 <span class="cmt">/* flags */</span>
+                               &amp;my_lock);</code></pre>
+  </div>
+
+  <h3>gate clock</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>gate_example.c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Tek bit enable/disable gate */</span>
+<span class="keyword">struct</span> clk_hw *gate_hw;
+gate_hw = clk_hw_register_gate(dev, <span class="str">"uart0_gate"</span>,
+                                <span class="str">"uart_mux"</span>,        <span class="cmt">/* parent */</span>
+                                CLK_SET_RATE_PARENT,
+                                reg_base + <span class="num">0x30</span>,   <span class="cmt">/* gate register */</span>
+                                <span class="num">3</span>,                  <span class="cmt">/* bit 3 */</span>
+                                <span class="num">0</span>,                  <span class="cmt">/* flags (0: active high) */</span>
+                                &amp;my_lock);
+
+<span class="cmt">/* CLK_GATE_SET_TO_DISABLE flag: 1 yazınca disable olur (ters mantık) */</span>
+gate_hw = clk_hw_register_gate(dev, <span class="str">"uart0_gate_inv"</span>,
+                                <span class="str">"uart_mux"</span>, <span class="num">0</span>,
+                                reg_base + <span class="num">0x34</span>, <span class="num">0</span>,
+                                CLK_GATE_SET_TO_DISABLE,
+                                &amp;my_lock);</code></pre>
+  </div>
+
+  <h3>composite clock — mux + divider + gate birleşimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>composite_example.c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Composite: tek register üzerinde mux + divider + gate */</span>
+<span class="keyword">struct</span> clk_hw *comp_hw;
+comp_hw = clk_hw_register_composite(dev, <span class="str">"uart_comp"</span>,
+    uart_mux_parents, ARRAY_SIZE(uart_mux_parents),
+    mux_hw,   &amp;clk_mux_ops,       <span class="cmt">/* mux */</span>
+    NULL,     NULL,                <span class="cmt">/* rate (NULL = parent pasla) */</span>
+    gate_hw,  &amp;clk_gate_ops,      <span class="cmt">/* gate */</span>
+    CLK_SET_RATE_PARENT, &amp;my_lock);</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>clk_hw_register_fixed_rate: sabit kaynak — parent yok, ops yok</li>
+      <li>clk_hw_register_divider: register tabanlı veya lookup tablo bölücüsü</li>
+      <li>clk_hw_register_mux: birden fazla parent arasında register bit seçimi</li>
+      <li>clk_hw_register_gate: tek bit enable/disable; CLK_GATE_SET_TO_DISABLE ters mantık</li>
+      <li>clk_hw_register_composite: tek çağrıyla mux+divider+gate zincirleme</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Device Tree clock binding — clock-names, clocks özelliği</h2>
+  <p class="section-lead">DT binding standardı: clock provider'ın #clock-cells değeri ve consumer'ın clocks/clock-names çifti.</p>
+
+  <h3>Provider tarafı DT</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>my-soc.dtsi — clock provider node</span><span class="dot">●</span></div>
+    <pre><code>/ {
+    cmu: clock-controller@10400000 {
+        compatible = "myvendor,mysoc-cmu";
+        reg = &lt;0x10400000 0x1000&gt;;
+        clocks = &lt;&amp;xo_clk&gt;;
+        clock-names = "ref";
+        #clock-cells = &lt;1&gt;;   /* 1: indeks ile erişim */
+    };
+
+    /* Tekli clock: #clock-cells = 0 */
+    uart0_clk: clock@10500000 {
+        compatible = "myvendor,mysoc-clk";
+        reg = &lt;0x10500000 0x10&gt;;
+        clocks = &lt;&amp;cmu 2&gt;;   /* CMU'nun indeks 2 clock'u */
+        clock-names = "parent";
+        #clock-cells = &lt;0&gt;;
+    };
+
+    /* Sabit kristal — fixed-clock generic binding */
+    xo_clk: oscillator {
+        compatible = "fixed-clock";
+        #clock-cells = &lt;0&gt;;
+        clock-frequency = &lt;24000000&gt;;
+        clock-output-names = "xo_24mhz";
+    };
+};</code></pre>
+  </div>
+
+  <h3>Consumer tarafı DT</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>my-board.dts — consumer node</span><span class="dot">●</span></div>
+    <pre><code>&amp;uart0 {
+    status = "okay";
+
+    /*
+     * clocks: phandle listesi — &lt;&amp;provider index&gt;
+     * clock-names: sürücünün devm_clk_get() ile kullandığı isimler
+     *   sıra birebir eşleşmeli
+     */
+    clocks = &lt;&amp;cmu 0   /* uart_clk */
+              &amp;cmu 15&gt;; /* apb_clk  */
+    clock-names = "uart", "apb";
+};
+
+&amp;spi0 {
+    status = "okay";
+    clocks = &lt;&amp;cmu 5&gt;;
+    clock-names = "spi";
+};
+
+&amp;i2c0 {
+    status = "okay";
+    /* Tekil clock: indeks yok */
+    clocks = &lt;&amp;uart0_clk&gt;;
+    clock-names = "i2c";
+};</code></pre>
+  </div>
+
+  <h3>Kernel sürücüsünde DT binding okuma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>uart_driver.c — clock DT okuma</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">static int</span> my_uart_probe(<span class="keyword">struct</span> platform_device *pdev)
+{
+    <span class="keyword">struct</span> clk *uart_clk, *apb_clk;
+    <span class="keyword">int</span> ret;
+
+    <span class="cmt">/* clock-names = "uart" eşleşmesi */</span>
+    uart_clk = devm_clk_get(&amp;pdev-&gt;dev, <span class="str">"uart"</span>);
+    <span class="keyword">if</span> (IS_ERR(uart_clk))
+        <span class="keyword">return</span> dev_err_probe(&amp;pdev-&gt;dev, PTR_ERR(uart_clk),
+                             <span class="str">"uart clock alinamadi\n"</span>);
+
+    <span class="cmt">/* clock-names = "apb" eşleşmesi */</span>
+    apb_clk = devm_clk_get(&amp;pdev-&gt;dev, <span class="str">"apb"</span>);
+    <span class="keyword">if</span> (IS_ERR(apb_clk))
+        <span class="keyword">return</span> dev_err_probe(&amp;pdev-&gt;dev, PTR_ERR(apb_clk),
+                             <span class="str">"apb clock alinamadi\n"</span>);
+
+    <span class="cmt">/* Bulk enable — birden fazla clock için daha temiz */</span>
+    <span class="keyword">static const</span> <span class="keyword">struct</span> clk_bulk_data clks[] = {
+        { .id = <span class="str">"uart"</span> },
+        { .id = <span class="str">"apb"</span>  },
+    };
+    ret = devm_clk_bulk_get(&amp;pdev-&gt;dev, ARRAY_SIZE(clks),
+                             (<span class="keyword">struct</span> clk_bulk_data *)clks);
+    <span class="keyword">if</span> (ret)
+        <span class="keyword">return</span> ret;
+
+    ret = clk_bulk_prepare_enable(ARRAY_SIZE(clks), clks);
+    <span class="keyword">if</span> (ret)
+        <span class="keyword">return</span> ret;
+
+    <span class="keyword">return</span> <span class="num">0</span>;
+}</code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">#clock-cells = &lt;0&gt;</span><span class="desc">Tekli clock sağlayan node; consumer sadece phandle yazar: clocks = &lt;&amp;xo_clk&gt;</span></div>
+    <div class="param"><span class="name">#clock-cells = &lt;1&gt;</span><span class="desc">Çoklu clock; consumer phandle + indeks yazar: clocks = &lt;&amp;cmu 5&gt;</span></div>
+    <div class="param"><span class="name">clock-names</span><span class="desc">clocks listesindeki her girişin sürücü tarafından kullanılan ismi</span></div>
+    <div class="param"><span class="name">clock-output-names</span><span class="desc">Provider'ın sunduğu clock isimlerinin listesi (eski binding)</span></div>
+    <div class="param"><span class="name">assigned-clocks / assigned-clock-rates</span><span class="desc">DT'de frekansı önceden ayarlama — probe'dan önce uygulanır</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>#clock-cells = 0: tekil, 1: indeksli çoklu clock provider</li>
+      <li>clocks + clock-names çifti; sıra eşleşmeli, devm_clk_get("isim") ile alınır</li>
+      <li>fixed-clock: generic DT binding, sürücü gerekmez</li>
+      <li>devm_clk_bulk_get + clk_bulk_prepare_enable — çok clock için temiz API</li>
+      <li>assigned-clocks/rates: DT'de önceden frekans atama</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> PLL sürücüsü yazımı — ARM SoC örneği</h2>
+  <p class="section-lead">Gerçek bir ARM SoC PLL'inin CCF sürücüsü: VCO hesaplama, lock bekleme ve power-down/up dizisi.</p>
+
+  <p>PLL'ler CCF'in hazır helper'larıyla modellenemez; tam özel <code class="inline">clk_ops</code> gerektirir. Tipik bir integer-N PLL formülü: <code class="inline">F_out = F_ref * N / (R * OD)</code> — burada N feedback bölücüsü, R referans bölücüsü, OD çıkış bölücüsüdür.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>mysoc_pll.c — tam PLL sürücüsü</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">// SPDX-License-Identifier: GPL-2.0
+// MySOC PLL Clock Driver</span>
+<span class="keyword">#include</span> &lt;linux/clk-provider.h&gt;
+<span class="keyword">#include</span> &lt;linux/delay.h&gt;
+<span class="keyword">#include</span> &lt;linux/io.h&gt;
+<span class="keyword">#include</span> &lt;linux/module.h&gt;
+
+<span class="cmt">/* PLL register offset'leri */</span>
+<span class="keyword">#define</span> PLL_CON0       <span class="num">0x00</span>
+<span class="keyword">#define</span> PLL_CON1       <span class="num">0x04</span>
+<span class="keyword">#define</span> PLL_CON2       <span class="num">0x08</span>
+
+<span class="cmt">/* CON0 bit alanları */</span>
+<span class="keyword">#define</span> PLL_N_MASK     GENMASK(<span class="num">15</span>, <span class="num">8</span>)    <span class="cmt">/* feedback N */</span>
+<span class="keyword">#define</span> PLL_R_MASK     GENMASK(<span class="num">23</span>, <span class="num">16</span>)   <span class="cmt">/* reference R */</span>
+<span class="keyword">#define</span> PLL_OD_MASK    GENMASK(<span class="num">3</span>,  <span class="num">0</span>)    <span class="cmt">/* output divider */</span>
+<span class="keyword">#define</span> PLL_ENABLE     BIT(<span class="num">31</span>)
+<span class="keyword">#define</span> PLL_POWERDOWN  BIT(<span class="num">30</span>)
+
+<span class="cmt">/* CON1 */</span>
+<span class="keyword">#define</span> PLL_LOCK       BIT(<span class="num">0</span>)           <span class="cmt">/* lock status read-only */</span>
+
+<span class="keyword">#define</span> PLL_LOCK_TIMEOUT_US  <span class="num">1000</span>
+
+<span class="keyword">struct</span> mysoc_pll {
+    <span class="keyword">struct</span>  clk_hw   hw;
+    <span class="keyword">void</span>   __iomem  *base;
+    <span class="keyword">struct</span>  spinlock_t lock;
+};
+
+<span class="keyword">#define</span> to_mysoc_pll(hw) container_of(hw, struct mysoc_pll, hw)
+
+<span class="cmt">/* Frekans hesaplama yardımcısı: F_out = F_ref * N / (R * OD) */</span>
+<span class="keyword">static unsigned long</span> mysoc_pll_calc_rate(<span class="keyword">unsigned long</span> parent_rate,
+                                          <span class="keyword">u32</span> n, <span class="keyword">u32</span> r, <span class="keyword">u32</span> od)
+{
+    <span class="keyword">u64</span> rate = (<span class="keyword">u64</span>)parent_rate * n;
+    <span class="keyword">do_div</span>(rate, r * od);
+    <span class="keyword">return</span> (<span class="keyword">unsigned long</span>)rate;
+}
+
+<span class="keyword">static unsigned long</span> mysoc_pll_recalc_rate(<span class="keyword">struct</span> clk_hw *hw,
+                                             <span class="keyword">unsigned long</span> parent_rate)
+{
+    <span class="keyword">struct</span> mysoc_pll *pll = to_mysoc_pll(hw);
+    <span class="keyword">u32</span> con0 = readl(pll-&gt;base + PLL_CON0);
+    <span class="keyword">u32</span> n  = FIELD_GET(PLL_N_MASK,  con0);
+    <span class="keyword">u32</span> r  = FIELD_GET(PLL_R_MASK,  con0);
+    <span class="keyword">u32</span> od = FIELD_GET(PLL_OD_MASK, con0);
+
+    <span class="keyword">if</span> (!n || !r || !od)
+        <span class="keyword">return</span> <span class="num">0</span>;
+
+    <span class="keyword">return</span> mysoc_pll_calc_rate(parent_rate, n, r, od);
+}
+
+<span class="keyword">static long</span> mysoc_pll_round_rate(<span class="keyword">struct</span> clk_hw *hw,
+                                   <span class="keyword">unsigned long</span> rate,
+                                   <span class="keyword">unsigned long</span> *prate)
+{
+    <span class="cmt">/* Basitleştirilmiş: N'i ayarla, R=1, OD=1 sabitle */</span>
+    <span class="keyword">u64</span> n = DIV_ROUND_CLOSEST_ULL((<span class="keyword">u64</span>)rate, *prate);
+
+    n = clamp_val(n, <span class="num">1</span>, <span class="num">255</span>);
+    <span class="keyword">return</span> (<span class="keyword">long</span>)(*prate * n);
+}
+
+<span class="keyword">static int</span> mysoc_pll_set_rate(<span class="keyword">struct</span> clk_hw *hw,
+                               <span class="keyword">unsigned long</span> rate,
+                               <span class="keyword">unsigned long</span> parent_rate)
+{
+    <span class="keyword">struct</span> mysoc_pll *pll = to_mysoc_pll(hw);
+    <span class="keyword">unsigned long</span>    flags;
+    <span class="keyword">u32</span>  con0, n;
+    <span class="keyword">int</span>  timeout = PLL_LOCK_TIMEOUT_US;
+
+    n = DIV_ROUND_CLOSEST(rate, parent_rate);
+    n = clamp_val(n, <span class="num">1</span>, <span class="num">255</span>);
+
+    spin_lock_irqsave(&amp;pll-&gt;lock, flags);
+
+    <span class="cmt">/* 1. Power-down */</span>
+    con0 = readl(pll-&gt;base + PLL_CON0);
+    con0 |= PLL_POWERDOWN;
+    writel(con0, pll-&gt;base + PLL_CON0);
+    udelay(<span class="num">5</span>);
+
+    <span class="cmt">/* 2. N değerini yaz */</span>
+    con0 = (con0 &amp; ~PLL_N_MASK) | FIELD_PREP(PLL_N_MASK, n);
+    <span class="cmt">/* R=1, OD=1 sabitle */</span>
+    con0 = (con0 &amp; ~PLL_R_MASK)  | FIELD_PREP(PLL_R_MASK,  <span class="num">1</span>);
+    con0 = (con0 &amp; ~PLL_OD_MASK) | FIELD_PREP(PLL_OD_MASK, <span class="num">1</span>);
+    writel(con0, pll-&gt;base + PLL_CON0);
+
+    <span class="cmt">/* 3. Power-up */</span>
+    con0 &amp;= ~PLL_POWERDOWN;
+    writel(con0, pll-&gt;base + PLL_CON0);
+
+    spin_unlock_irqrestore(&amp;pll-&gt;lock, flags);
+
+    <span class="cmt">/* 4. Lock bekleme — spin_lock dışında (may sleep) */</span>
+    <span class="keyword">while</span> (!(readl(pll-&gt;base + PLL_CON1) &amp; PLL_LOCK)) {
+        <span class="keyword">if</span> (--timeout &lt;= <span class="num">0</span>)
+            <span class="keyword">return</span> -ETIMEDOUT;
+        udelay(<span class="num">1</span>);
+    }
+    <span class="keyword">return</span> <span class="num">0</span>;
+}
+
+<span class="keyword">static int</span> mysoc_pll_prepare(<span class="keyword">struct</span> clk_hw *hw)
+{
+    <span class="keyword">struct</span> mysoc_pll *pll = to_mysoc_pll(hw);
+    <span class="keyword">u32</span> con0;
+    <span class="keyword">int</span> timeout = PLL_LOCK_TIMEOUT_US;
+
+    con0 = readl(pll-&gt;base + PLL_CON0);
+    con0 |= PLL_ENABLE;
+    con0 &amp;= ~PLL_POWERDOWN;
+    writel(con0, pll-&gt;base + PLL_CON0);
+
+    <span class="keyword">while</span> (!(readl(pll-&gt;base + PLL_CON1) &amp; PLL_LOCK)) {
+        <span class="keyword">if</span> (--timeout &lt;= <span class="num">0</span>)
+            <span class="keyword">return</span> -ETIMEDOUT;
+        udelay(<span class="num">1</span>);
+    }
+    <span class="keyword">return</span> <span class="num">0</span>;
+}
+
+<span class="keyword">static void</span> mysoc_pll_unprepare(<span class="keyword">struct</span> clk_hw *hw)
+{
+    <span class="keyword">struct</span> mysoc_pll *pll = to_mysoc_pll(hw);
+    <span class="keyword">u32</span> con0 = readl(pll-&gt;base + PLL_CON0);
+    con0 &amp;= ~PLL_ENABLE;
+    con0 |= PLL_POWERDOWN;
+    writel(con0, pll-&gt;base + PLL_CON0);
+}
+
+<span class="keyword">static int</span> mysoc_pll_is_prepared(<span class="keyword">struct</span> clk_hw *hw)
+{
+    <span class="keyword">struct</span> mysoc_pll *pll = to_mysoc_pll(hw);
+    <span class="keyword">return</span> !!(readl(pll-&gt;base + PLL_CON0) &amp; PLL_ENABLE);
+}
+
+<span class="keyword">static const struct</span> clk_ops mysoc_pll_ops = {
+    .prepare      = mysoc_pll_prepare,
+    .unprepare    = mysoc_pll_unprepare,
+    .is_prepared  = mysoc_pll_is_prepared,
+    .recalc_rate  = mysoc_pll_recalc_rate,
+    .round_rate   = mysoc_pll_round_rate,
+    .set_rate     = mysoc_pll_set_rate,
+};</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>PLL formülü: F_out = F_ref × N / (R × OD) — do_div ile 64-bit bölme</li>
+      <li>prepare/unprepare: PLL enable + lock bekleme (may sleep bağlamı)</li>
+      <li>set_rate: power-down → N yaz → power-up → lock bekleme dizisi</li>
+      <li>spin_lock_irqsave ile register R-M-W koruması</li>
+      <li>clamp_val ile N'i geçerli aralığa sınırlama</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> clk_notifier — frekans değişikliği bildirimleri</h2>
+  <p class="section-lead">Consumer sürücüler, clock frekansı değişmeden önce ve sonra bildirim almak için clk_notifier_register() kullanır.</p>
+
+  <p>Bazı sürücülerin clock frekansı değiştiğinde baud rate, DMA burst size veya timeout değerlerini güncellemesi gerekir. CCF'in notifier mekanizması bu ihtiyacı karşılar: consumer, <code class="inline">clk_notifier_register()</code> ile bir callback kaydeder; CCF frekans değişikliği öncesinde (<code class="inline">PRE_RATE_CHANGE</code>) ve sonrasında (<code class="inline">POST_RATE_CHANGE</code>) bu callback'i çağırır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>uart_notifier.c — clk_notifier kullanımı</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;linux/clk.h&gt;
+<span class="keyword">#include</span> &lt;linux/notifier.h&gt;
+
+<span class="keyword">struct</span> my_uart_priv {
+    <span class="keyword">void</span>            __iomem *base;
+    <span class="keyword">struct</span> clk             *clk;
+    <span class="keyword">struct</span> notifier_block   clk_nb;
+    <span class="keyword">unsigned int</span>            baud;
+};
+
+<span class="keyword">static int</span> my_uart_clk_notify(<span class="keyword">struct</span> notifier_block *nb,
+                               <span class="keyword">unsigned long</span>         action,
+                               <span class="keyword">void</span>                 *data)
+{
+    <span class="keyword">struct</span> clk_notifier_data *cnd = data;
+    <span class="keyword">struct</span> my_uart_priv *priv =
+        container_of(nb, <span class="keyword">struct</span> my_uart_priv, clk_nb);
+
+    <span class="keyword">switch</span> (action) {
+    <span class="keyword">case</span> PRE_RATE_CHANGE:
+        <span class="cmt">/*
+         * Frekans değişmeden önce TX/RX'i durdur.
+         * Yeni frekans: cnd-&gt;new_rate
+         * Eski frekans: cnd-&gt;old_rate
+         */</span>
+        dev_dbg(NULL, <span class="str">"CLK: %lu -&gt; %lu Hz, UART durdurluyor\n"</span>,
+                cnd-&gt;old_rate, cnd-&gt;new_rate);
+        my_uart_stop_tx(priv);
+        <span class="keyword">break</span>;
+
+    <span class="keyword">case</span> POST_RATE_CHANGE:
+        <span class="cmt">/* Yeni frekansa göre baud divisor'ü güncelle */</span>
+        {
+            <span class="keyword">u32</span> div = DIV_ROUND_CLOSEST(cnd-&gt;new_rate,
+                                         priv-&gt;baud * <span class="num">16</span>);
+            writel(div, priv-&gt;base + UART_BRD_REG);
+            my_uart_start_tx(priv);
+        }
+        <span class="keyword">break</span>;
+
+    <span class="keyword">case</span> ABORT_RATE_CHANGE:
+        <span class="cmt">/* set_rate başarısız — eski frekansı geri yükle */</span>
+        {
+            <span class="keyword">u32</span> div = DIV_ROUND_CLOSEST(cnd-&gt;old_rate,
+                                         priv-&gt;baud * <span class="num">16</span>);
+            writel(div, priv-&gt;base + UART_BRD_REG);
+            my_uart_start_tx(priv);
+        }
+        <span class="keyword">break</span>;
+    }
+    <span class="keyword">return</span> NOTIFY_OK;
+}
+
+<span class="keyword">static int</span> my_uart_probe(<span class="keyword">struct</span> platform_device *pdev)
+{
+    <span class="keyword">struct</span> my_uart_priv *priv = /* ... alloc ... */
+    priv-&gt;clk_nb.notifier_call = my_uart_clk_notify;
+
+    <span class="keyword">int</span> ret = clk_notifier_register(priv-&gt;clk, &amp;priv-&gt;clk_nb);
+    <span class="keyword">if</span> (ret)
+        <span class="keyword">return</span> ret;
+
+    <span class="cmt">/* devm cleanup için — remove'da çağrılır */</span>
+    <span class="keyword">return</span> devm_add_action_or_reset(&amp;pdev-&gt;dev,
+        my_uart_unregister_notifier, priv);
+}
+
+<span class="keyword">static void</span> my_uart_unregister_notifier(<span class="keyword">void</span> *data)
+{
+    <span class="keyword">struct</span> my_uart_priv *priv = data;
+    clk_notifier_unregister(priv-&gt;clk, &amp;priv-&gt;clk_nb);
+}</code></pre>
+  </div>
+
+  <h3>Notifier aksiyonları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Aksiyon</th><th>Tetiklenme zamanı</th><th>Dönüş değeri</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>PRE_RATE_CHANGE</td><td>set_rate çağrısından önce; bloke edebilir</td><td>NOTIFY_BAD → değişimi iptal et</td></tr>
+        <tr><td>POST_RATE_CHANGE</td><td>set_rate başarıyla tamamlandıktan sonra</td><td>NOTIFY_OK</td></tr>
+        <tr><td>ABORT_RATE_CHANGE</td><td>set_rate başarısız olduğunda rollback için</td><td>NOTIFY_OK</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">DİKKAT</div>
+    <p><code class="inline">PRE_RATE_CHANGE</code> callback'inden <code class="inline">NOTIFY_BAD</code> döndürmek frekans değişimini iptal eder. Bu mekanizma, örneğin yeni frekansın desteklenen minimum altında olduğu durumlarda kullanılabilir. Gereksiz NOTIFY_BAD dönüşü sistem performansını ciddi ölçüde kısıtlayabilir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>clk_notifier_register(clk, nb) — clock başına ayrı notifier zinciri</li>
+      <li>PRE: değişim öncesi durdurma; POST: yeni rate ile yeniden yapılandırma</li>
+      <li>ABORT: set_rate başarısız olduğunda eski değerleri geri yükleme</li>
+      <li>PRE'den NOTIFY_BAD → değişimi veto etme mekanizması</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Hata ayıklama — debugfs clk/, clk_summary, clk_dump</h2>
+  <p class="section-lead">/sys/kernel/debug/clk/ altındaki debugfs arayüzü, çalışan sistemde tüm clock ağacını gözlemlemenin birincil yoludur.</p>
+
+  <h3>debugfs clock dosyaları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — debugfs clk/ keşfi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># debugfs mount (genellikle otomatik mount edilir)</span>
+mount -t debugfs none /sys/kernel/debug
+
+<span class="cmt"># Tüm clock'ları listele</span>
+ls /sys/kernel/debug/clk/
+
+<span class="cmt"># Belirli bir clock'un frekansını oku</span>
+cat /sys/kernel/debug/clk/uart0_gate/clk_rate
+<span class="cmt"># Çıktı: 1843200</span>
+
+<span class="cmt"># Enable durumu</span>
+cat /sys/kernel/debug/clk/uart0_gate/clk_enable_count
+<span class="cmt"># Çıktı: 1 (enable edilmiş)</span>
+
+cat /sys/kernel/debug/clk/uart0_gate/clk_prepare_count
+<span class="cmt"># Çıktı: 1</span>
+
+<span class="cmt"># Parent clock</span>
+cat /sys/kernel/debug/clk/uart0_gate/clk_parent
+<span class="cmt"># Çıktı: uart_mux</span>
+
+<span class="cmt"># Flags</span>
+cat /sys/kernel/debug/clk/uart0_gate/clk_flags
+<span class="cmt"># Çıktı: 8 (CLK_SET_RATE_PARENT = BIT(3))</span></code></pre>
+  </div>
+
+  <h3>clk_summary — tüm ağacı tek seferde gör</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — clk_summary çıktısı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tam clock ağacı özeti (hiyerarşik)</span>
+cat /sys/kernel/debug/clk/clk_summary
+
+<span class="cmt"># Örnek çıktı:</span>
+<span class="cmt">#                      enable  prepare  protect                  rate   accuracy   phase</span>
+<span class="cmt"># clock                 count    count    count        rate       (Hz)  (degrees)</span>
+<span class="cmt"># --------------------------------------------------------------------------------</span>
+<span class="cmt"># xo_24mhz                  1        1        0    24000000          0         0</span>
+<span class="cmt">#    pll_a               1        1        0  1200000000          0         0</span>
+<span class="cmt">#       cpu_div          1        1        0   300000000          0         0</span>
+<span class="cmt">#          cpu_gate      1        1        0   300000000          0         0</span>
+<span class="cmt">#       bus_div          1        1        0   600000000          0         0</span>
+<span class="cmt">#    pll_b               0        0        0   800000000          0         0</span>
+<span class="cmt">#       uart_mux         1        1        0   800000000          0         0</span>
+<span class="cmt">#          uart_div      1        1        0    50000000          0         0</span>
+<span class="cmt">#             uart0_gate 1        1        0    50000000          0         0</span></code></pre>
+  </div>
+
+  <h3>clk_dump — JSON formatında çıktı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — clk_dump JSON çıktısı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># JSON formatında clock ağacı</span>
+cat /sys/kernel/debug/clk/clk_dump | python3 -m json.tool | head -40
+
+<span class="cmt"># Örnek çıktı (kısaltılmış):</span>
+<span class="cmt"># {</span>
+<span class="cmt">#   "xo_24mhz": {</span>
+<span class="cmt">#     "enable_count": 1,</span>
+<span class="cmt">#     "prepare_count": 1,</span>
+<span class="cmt">#     "rate": 24000000,</span>
+<span class="cmt">#     "children": {</span>
+<span class="cmt">#       "pll_a": { ... }</span>
+<span class="cmt">#     }</span>
+<span class="cmt">#   }</span>
+<span class="cmt"># }</span></code></pre>
+  </div>
+
+  <h3>Yaygın sorunlar ve çözümleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Belirti</th><th>Olası neden</th><th>Kontrol</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>-EPROBE_DEFER döngüsü</td><td>Provider sürücüsü yüklenmemiş</td><td>dmesg | grep "clock provider"; modprobe sırası</td></tr>
+        <tr><td>clk_get: -ENOENT</td><td>clock-names eşleşmiyor</td><td>DTS clock-names vs devm_clk_get() argümanı</td></tr>
+        <tr><td>rate 0 dönüyor</td><td>recalc_rate 0 döndürüyor</td><td>parent_rate sıfır mı? register init edilmemiş mi?</td></tr>
+        <tr><td>PLL lock timeout</td><td>parent clock yetersiz veya VCO aralığı dışı</td><td>PLL_CON1 lock bit; N/R/OD hesabı kontrol</td></tr>
+        <tr><td>Clock disable edilemiyor</td><td>CLK_IS_CRITICAL flag</td><td>clk_flags dosyası; clk_init_data flags'e bak</td></tr>
+        <tr><td>Rate değişmiyor</td><td>CLK_SET_RATE_GATE — önce disable gerek</td><td>clk_disable_unprepare → clk_set_rate → enable</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Kernel config gereksinimleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig — CCF hata ayıklama</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># CCF temel</span>
+CONFIG_COMMON_CLK=y
+
+<span class="cmt"># debugfs clock arayüzü</span>
+CONFIG_DEBUG_FS=y
+
+<span class="cmt"># Clock rate hata ayıklama mesajları (verbose)</span>
+<span class="cmt"># CONFIG_COMMON_CLK_DEBUG — ayrı seçenek (bazı kernel versiyonlarında)</span>
+
+<span class="cmt"># Hazır clock helper'ları</span>
+CONFIG_COMMON_CLK_FIXED_RATE=y
+CONFIG_COMMON_CLK_FIXED_FACTOR=y
+CONFIG_COMMON_CLK_DIVIDER=y
+CONFIG_COMMON_CLK_MUX=y
+CONFIG_COMMON_CLK_GATE=y</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>/sys/kernel/debug/clk/&lt;clock&gt;/: rate, enable_count, prepare_count, parent, flags</li>
+      <li>clk_summary: tüm ağacı hiyerarşik tablo olarak göster</li>
+      <li>clk_dump: JSON formatı, araçlarla işlemeye uygun</li>
+      <li>-EPROBE_DEFER: provider modülü yüklenmemiş veya DT phandle hatalı</li>
+      <li>CLK_IS_CRITICAL / CLK_SET_RATE_GATE: beklenmedik davranışların en yaygın kaynağı</li>
+    </ul>
+  </div>
+</section>
+
+</main>

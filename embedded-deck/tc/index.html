@@ -1,0 +1,788 @@
+---
+layout: tutorial
+title: "tc — Linux Traffic Control"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>LİNUX AĞ</span>
+    <span>TRAFFIC CONTROL</span>
+    <span>2026</span>
+  </div>
+  <h1>tc<br><em>Linux Traffic Control</em></h1>
+  <p class="subtitle">iproute2 tc aracı ile trafik şekillendirme, bant genişliği sınırlama, paket önceliklendirme ve ağ emülasyonu: qdisc, class, filter ve action kavramları uçtan uca.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Traffic Control mimarisi — qdisc, class, filter</a></li>
+    <li><a href="#s1">Temel qdisc türleri: pfifo, fq_codel, sfq</a></li>
+    <li><a href="#s2">HTB — Hierarchical Token Bucket ile bant genişliği yönetimi</a></li>
+    <li><a href="#s3">HFSC ve CBQ — ileri şekillendirme</a></li>
+    <li><a href="#s4">netem — ağ emülasyonu (gecikme, kayıp, jitter)</a></li>
+    <li><a href="#s5">tbf — Token Bucket Filter ile hız sınırlama</a></li>
+    <li><a href="#s6">Filtreler: u32, flower, BPF</a></li>
+    <li><a href="#s7">Uygulamalar: QoS, önceliklendirme, çok kiracılı</a></li>
+    <li><a href="#s8">Hata ayıklama ve istatistikler</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Traffic Control mimarisi — qdisc, class, filter</h2>
+  <p class="section-lead">Linux Traffic Control (TC), ağ arayüzlerinden çıkan (egress) ve giren (ingress) paketlerin nasıl sıralanacağını, şekillendirileceğini ve işleneceğini belirleyen bir çerçevedir. Üç temel kavram üzerine kuruludur: <strong>qdisc</strong>, <strong>class</strong> ve <strong>filter</strong>.</p>
+
+  <h3>Üç temel kavram</h3>
+  <div class="params">
+    <div class="param"><span class="name">qdisc (queuing discipline)</span><span class="desc">Paketlerin kuyruğa alınma ve gönderilinme politikasını belirler. Her arayüzün bir root qdisc'i vardır. Classful veya classless olabilir.</span></div>
+    <div class="param"><span class="name">class</span><span class="desc">Yalnızca classful qdisc'lerde (HTB, CBQ, HFSC) bulunur. Trafik türlerine göre hiyerarşik alt gruplar oluşturur.</span></div>
+    <div class="param"><span class="name">filter</span><span class="desc">Paketi hangi class'a veya action'a yönlendireceğini belirleyen kural. u32, flower, BPF ile tanımlanır.</span></div>
+  </div>
+
+  <h3>Paket yolculuğu: egress</h3>
+  <div class="flow">
+    <pre>
+Uygulama (send/write)
+       │
+ Linux IP yığını (routing, conntrack, netfilter POSTROUTING)
+       │
+ qdiscs (egress — NIC'ten çıkış)
+       ├── root qdisc (örn. HTB 1:)
+       │     ├── filter: hangi paketi nereye gönder?
+       │     ├── class 1:10  (yüksek öncelik — 100 Mbit/s)
+       │     │     └── alt qdisc (fq_codel veya pfifo)
+       │     └── class 1:20  (düşük öncelik — 10 Mbit/s)
+       │           └── alt qdisc (sfq)
+       │
+ NIC sürücüsü (donanıma teslim)
+    </pre>
+  </div>
+
+  <h3>Egress vs Ingress</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th></th><th>Egress (çıkış)</th><th>Ingress (giriş)</th></tr></thead>
+      <tbody>
+        <tr><td>Yön</td><td>NIC'ten çıkan paketler</td><td>NIC'e gelen paketler</td></tr>
+        <tr><td>Qdisc desteği</td><td>Tam (tüm qdisc türleri)</td><td>Kısıtlı (sadece ingress qdisc + action)</td></tr>
+        <tr><td>Şekillendirme</td><td>Evet (HTB, TBF, netem vb.)</td><td>Policing (hız sınırlama), yönlendirme</td></tr>
+        <tr><td>tc komutu</td><td><code>tc qdisc add dev eth0 root ...</code></td><td><code>tc qdisc add dev eth0 ingress</code></td></tr>
+        <tr><td>IFB trick</td><td>—</td><td>IFB (Intermediate Functional Block) ile ingress → egress dönüşümü</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>tc komut yapısı</h3>
+  <pre><code># Genel sözdizimi
+tc [ OPTIONS ] OBJECT { COMMAND | help }
+
+OBJECT: qdisc | class | filter | action | monitor
+
+# Mevcut qdisc'leri listele
+tc qdisc show dev eth0
+
+# Mevcut sınıfları listele
+tc class show dev eth0
+
+# Mevcut filtreleri listele
+tc filter show dev eth0
+
+# İstatistiklerle birlikte
+tc -s qdisc show dev eth0
+</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> Temel qdisc türleri: pfifo, fq_codel, sfq</h2>
+  <p class="section-lead">Linux'ta çeşitli hazır qdisc türleri bulunur. Classless qdisc'ler hiyerarşi oluşturmaz; doğrudan arayüze eklenir ve paket sıralamasını kendi algoritmasıyla yönetir.</p>
+
+  <h3>pfifo / bfifo — basit FIFO kuyruk</h3>
+  <pre><code># pfifo: paket sayısına göre sınır (txqueuelen varsayılan)
+tc qdisc replace dev eth0 root pfifo limit 1000
+
+# bfifo: byte sayısına göre sınır
+tc qdisc replace dev eth0 root bfifo limit 131072   # 128 KB
+
+# pfifo_fast: kernel varsayılanı — 3 bantlı öncelik kuyruğu
+# Çoğu arayüzde otomatik olarak atanır
+tc qdisc show dev eth0
+# qdisc pfifo_fast 0: root refcnt 2 bands 3 priomap  1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1
+</code></pre>
+
+  <h3>fq_codel — Fair Queue CoDel (modern varsayılan)</h3>
+  <p><strong>fq_codel</strong>, küçük akışları büyük akışlardan korur ve buffer bloat problemini çözer. Linux 3.5+ sistemlerde varsayılan qdisc olarak önerilir.</p>
+  <pre><code># fq_codel ekle
+tc qdisc replace dev eth0 root fq_codel
+
+# Parametrelerle
+tc qdisc replace dev eth0 root fq_codel \
+    limit 10240 \       # toplam kuyruk paketi limiti
+    flows 1024 \        # eşzamanlı akış sayısı
+    target 5ms \        # hedef gecikme (AQM)
+    interval 100ms \    # CoDel interval
+    quantum 1514        # akış başına max byte/tur
+
+# İstatistikler
+tc -s qdisc show dev eth0
+# qdisc fq_codel ... drop_overlimit 0 new_flows_len 0 old_flows_len 3
+# Sent 123456 bytes 890 pkt
+</code></pre>
+
+  <h3>sfq — Stochastic Fairness Queuing</h3>
+  <p><strong>sfq</strong>, her akışa (src IP + dst IP + protocol + ports hash'i) sırayla erişim hakkı verir. Buffer bloat'u önlemek için HTB leaf qdisc olarak yaygın kullanılır.</p>
+  <pre><code># sfq — basit kullanım
+tc qdisc replace dev eth0 root sfq perturb 10
+
+# perturb: hash perturbation aralığı (saniye) — collision saldırı koruma
+# HTB leaf olarak kullanım (bkz. Bölüm 02)
+tc qdisc add dev eth0 parent 1:10 handle 10: sfq perturb 10
+</code></pre>
+
+  <h3>cake — Comprehensive Queue Management</h3>
+  <p><strong>cake</strong>, fq_codel'in geliştirilmiş halefidir. DSL/kablo bağlantıları için optimal; overhead accounting ve diffserv desteği içerir.</p>
+  <pre><code># cake — DSL uplink şekillendirme
+tc qdisc replace dev eth0 root cake \
+    bandwidth 10mbit \      # uplink hızı
+    diffserv4 \             # DSCP önceliklendirme (4 kuyruk)
+    nat \                   # NAT geçişinde srcnat/dstnat düzeltme
+    wash \                  # DSCP alanını temizle (güvenlik)
+    overhead 40             # PPPoE+Ethernet overhead
+
+# cake istatistikleri (ayrıntılı)
+tc -s qdisc show dev eth0
+</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> HTB — Hierarchical Token Bucket ile bant genişliği yönetimi</h2>
+  <p class="section-lead">HTB (Hierarchical Token Bucket), en yaygın kullanılan classful qdisc'tir. Farklı trafik türlerine garantili bant genişliği (rate) ve maksimum bant genişliği (ceil) tanımlamaya olanak tanır. Kullanılmayan bant genişliği alt sınıflar arasında paylaşılabilir (borrowing).</p>
+
+  <h3>HTB temel kavramları</h3>
+  <div class="params">
+    <div class="param"><span class="name">rate</span><span class="desc">Sınıfın garantili minimum bant genişliği. Bu değere kadar her zaman token alır.</span></div>
+    <div class="param"><span class="name">ceil</span><span class="desc">Sınıfın kullanabileceği maksimum bant genişliği. Üst sınıfın boş tokenlarını ödünç alarak bu değere kadar çıkabilir.</span></div>
+    <div class="param"><span class="name">burst / cburst</span><span class="desc">Anlık token birikmesi — kısa süreli hız aşımına izin verir (burst toleransı).</span></div>
+    <div class="param"><span class="name">quantum</span><span class="desc">Ödünç almada adil sıralama için kullanılan birim (genellikle MTU boyutu).</span></div>
+    <div class="param"><span class="name">prio</span><span class="desc">Sınıflar arasında öncelik — düşük değer = yüksek öncelik.</span></div>
+  </div>
+
+  <h3>3 sınıflı HTB yapısı — adım adım</h3>
+  <pre><code>#!/bin/bash
+# Senaryo: 100 Mbit/s çıkışı üç kullanıcı/servis türüne böl
+# - Yönetim trafiği: min 20M, max 100M (öncelikli)
+# - Web trafiği:     min 50M, max 100M
+# - Bulk/yedek:      min 10M, max 100M
+
+DEV=eth0
+RATE=100mbit
+
+# 1. Önceki qdisc'i temizle
+tc qdisc del dev $DEV root 2>/dev/null
+
+# 2. Root HTB qdisc oluştur (default: sınıflandırılmayan paketler → class 1:30)
+tc qdisc add dev $DEV root handle 1: htb default 30
+
+# 3. Root class — toplam bant genişliği
+tc class add dev $DEV parent 1: classid 1:1 htb rate $RATE ceil $RATE
+
+# 4. Alt sınıflar
+tc class add dev $DEV parent 1:1 classid 1:10 htb \
+    rate 20mbit ceil 100mbit burst 15k prio 1
+
+tc class add dev $DEV parent 1:1 classid 1:20 htb \
+    rate 50mbit ceil 100mbit burst 15k prio 2
+
+tc class add dev $DEV parent 1:1 classid 1:30 htb \
+    rate 10mbit ceil 100mbit burst 15k prio 3
+
+# 5. Her sınıfa leaf qdisc ekle (adil sıralama için sfq)
+tc qdisc add dev $DEV parent 1:10 handle 10: sfq perturb 10
+tc qdisc add dev $DEV parent 1:20 handle 20: sfq perturb 10
+tc qdisc add dev $DEV parent 1:30 handle 30: sfq perturb 10
+
+# 6. Filtreler — trafiği sınıflara yönlendir
+# Yönetim: SSH (port 22) → 1:10
+tc filter add dev $DEV protocol ip parent 1:0 prio 1 u32 \
+    match ip dport 22 0xffff flowid 1:10
+
+# Web: HTTP/HTTPS → 1:20
+tc filter add dev $DEV protocol ip parent 1:0 prio 2 u32 \
+    match ip dport 80 0xffff flowid 1:20
+tc filter add dev $DEV protocol ip parent 1:0 prio 2 u32 \
+    match ip dport 443 0xffff flowid 1:20
+
+# Geri kalan trafik otomatik olarak default class 1:30'a gider
+
+echo "HTB qdisc yapılandırıldı."
+tc class show dev $DEV
+</code></pre>
+
+  <h3>HTB istatistiklerini okuma</h3>
+  <pre><code>tc -s class show dev eth0
+
+# Çıktı örneği:
+# class htb 1:10 parent 1:1 prio 1 rate 20Mbit ceil 100Mbit burst 15Kb cburst 15Kb
+#  Sent 45678901 bytes 30245 pkt (dropped 0, overlimits 0 requeues 0)
+#  rate 19.8Mbit 1650pps backlog 0b 0p requeues 0
+#  lended: 5120 borrowed: 12345 giants: 0
+#  tokens: 1234 ctokens: 5678
+</code></pre>
+
+  <h3>Borrowing mekanizması</h3>
+  <p>HTB'nin en güçlü özelliği bant genişliği ödünç almadır. Bir sınıf kendi garantili hızını aşmak isterse, üst sınıfta boş token varsa <strong>ceil</strong> değerine kadar ödünç alabilir. Bu, fiziksel bağlantının hiç atıl kalmamasını sağlar.</p>
+  <div class="flow">
+    <pre>
+1:1 (100Mbit toplam)
+├── 1:10 (20M garantili)  ─── Web trafiği yoğun değil
+│    kullanılan: 5M → 15M boş token üst sınıfa döner
+├── 1:20 (50M garantili)  ─── Çok yoğun, ödünç istiyor
+│    kullanılan: 50M + ödünç 35M = 85M (ceil=100M)
+└── 1:30 (10M garantili)  ─── Düşük yük
+     kullanılan: 10M
+    </pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> HFSC ve CBQ — ileri şekillendirme</h2>
+  <p class="section-lead">HTB'nin yanı sıra Linux'ta HFSC (Hierarchical Fair Service Curve) ve CBQ (Class Based Queuing) classful qdisc'leri mevcuttur. HFSC özellikle gerçek zamanlı ve gecikmeye duyarlı trafik için güçlüdür.</p>
+
+  <h3>CBQ — Class Based Queuing</h3>
+  <p>CBQ, HTB'den daha eskidir ve bazı senaryolarda less accurate rate limiting gösterir. Basit hız sınırlama için hâlâ kullanılmaktadır.</p>
+  <pre><code># CBQ — 1 Mbit/s hız sınırı örneği
+tc qdisc add dev eth0 root handle 1: cbq \
+    avpkt 1000 bandwidth 100mbit
+
+tc class add dev eth0 parent 1: classid 1:1 cbq \
+    rate 1mbit allot 1514 prio 5 bounded isolated
+
+tc filter add dev eth0 parent 1: protocol ip prio 16 u32 \
+    match ip dst 10.0.0.5/32 flowid 1:1
+
+tc qdisc add dev eth0 parent 1:1 sfq perturb 10
+</code></pre>
+
+  <h3>HFSC — Hierarchical Fair Service Curve</h3>
+  <p>HFSC, her sınıfa iki boyutlu hizmet eğrisi tanımlar: <strong>SC (Service Curve)</strong> — bant genişliği + gecikme garantisi, <strong>UL (Upper Limit)</strong> — maksimum hız. Gerçek zamanlı ses/video ile bulk dosya aktarımını aynı arayüzde doğru şekilde yönetmek için idealdir.</p>
+  <pre><code># HFSC — VoIP öncelikli yapılandırma
+DEV=eth0
+
+tc qdisc del dev $DEV root 2>/dev/null
+tc qdisc add dev $DEV root handle 1: hfsc default 30
+
+# Root class
+tc class add dev $DEV parent 1: classid 1:1 hfsc sc rate 100mbit ul rate 100mbit
+
+# VoIP — düşük gecikme garantisi (rt: real-time service curve)
+# sc m1: başlangıç hızı, d: gecikme, m2: uzun vadeli hız
+tc class add dev $DEV parent 1:1 classid 1:10 hfsc \
+    rt m1 50mbit d 5ms m2 1mbit \
+    ls m1 50mbit d 5ms m2 1mbit \
+    ul rate 10mbit
+
+# Interaktif — ssh, web
+tc class add dev $DEV parent 1:1 classid 1:20 hfsc \
+    ls rate 30mbit ul rate 80mbit
+
+# Bulk — indirme, yedek
+tc class add dev $DEV parent 1:1 classid 1:30 hfsc \
+    ls rate 10mbit ul rate 100mbit
+
+# Filtreler
+tc filter add dev $DEV parent 1: protocol ip prio 1 u32 \
+    match ip dport 5060 0xffff flowid 1:10   # SIP
+tc filter add dev $DEV parent 1: protocol ip prio 1 u32 \
+    match ip protocol 17 0xff \
+    match ip dport 10000 0xfc00 flowid 1:10  # RTP (10000-16383)
+
+# SSH
+tc filter add dev $DEV parent 1: protocol ip prio 2 u32 \
+    match ip dport 22 0xffff flowid 1:20
+</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> netem — ağ emülasyonu</h2>
+  <p class="section-lead">netem (Network Emulator), gerçek ağ koşullarını simüle etmek için kullanılan classless qdisc'tir. Gecikme, paket kaybı, jitter, çoğaltma ve bozma ekleyebilir. Gömülü sistemlerin ağ dayanıklılığını test etmek için vazgeçilmezdir.</p>
+
+  <h3>Temel netem kullanımı</h3>
+  <pre><code># 100ms sabit gecikme ekle
+tc qdisc add dev eth0 root netem delay 100ms
+
+# Gecikmeyi kaldır
+tc qdisc del dev eth0 root netem
+
+# Gecikme + jitter (normal dağılım)
+tc qdisc add dev eth0 root netem \
+    delay 100ms 20ms distribution normal
+# 100ms ± 20ms gecikme, normal dağılımlı
+
+# Korelasyonlu jitter (gerçekçi ağ davranışı)
+tc qdisc add dev eth0 root netem \
+    delay 100ms 20ms 25%
+# 25% korelasyon: ardışık paketlerin gecikmeleri birbirine bağlı
+</code></pre>
+
+  <h3>Paket kaybı</h3>
+  <pre><code># %1 rastgele paket kaybı
+tc qdisc change dev eth0 root netem loss 1%
+
+# Gilbert-Elliott paket kaybı modeli (burst loss)
+tc qdisc change dev eth0 root netem \
+    loss gemodel 1% 10% 80% 0%
+# p: good→bad, r: bad→good, 1-h: bad durumda kayıp olasılığı, 1-k: good durumda
+
+# Paket kaybı + korelasyon
+tc qdisc change dev eth0 root netem loss 5% 25%
+# 5% kayıp, %25 korelasyon
+</code></pre>
+
+  <h3>Paket çoğaltma, sıra bozma, bozma</h3>
+  <pre><code># Paket çoğaltma (%2 ihtimalle)
+tc qdisc change dev eth0 root netem duplicate 2%
+
+# Sıra bozma: %10 paket 10ms geciktirilir (bant genişliği korumalı)
+tc qdisc change dev eth0 root netem \
+    delay 10ms reorder 10% 50%
+
+# Paket içeriği bozma (bit flip)
+tc qdisc change dev eth0 root netem corrupt 0.1%
+
+# Hepsi birlikte — uç senaryo testi
+tc qdisc replace dev eth0 root netem \
+    delay 200ms 50ms distribution normal \
+    loss 2% \
+    duplicate 0.5% \
+    corrupt 0.1% \
+    reorder 5% 50%
+</code></pre>
+
+  <h3>Bantlı (rate-limited) netem</h3>
+  <pre><code># netem + bant genişliği sınırlama
+tc qdisc replace dev eth0 root netem \
+    delay 50ms \
+    rate 1mbit
+
+# TBF (Token Bucket Filter) ile birleştirme — daha doğru hız sınırlama
+tc qdisc del dev eth0 root 2>/dev/null
+
+tc qdisc add dev eth0 root handle 1: tbf \
+    rate 1mbit burst 32kbit latency 400ms
+
+tc qdisc add dev eth0 parent 1:1 handle 10: netem \
+    delay 50ms 10ms
+</code></pre>
+
+  <h3>İki yönlü WAN emülasyonu (veth çifti)</h3>
+  <pre><code># Test ortamı: iki namespace, veth pair
+ip netns add ns1
+ip netns add ns2
+
+ip link add veth1 type veth peer name veth2
+ip link set veth1 netns ns1
+ip link set veth2 netns ns2
+
+ip netns exec ns1 ip addr add 10.1.1.1/24 dev veth1
+ip netns exec ns2 ip addr add 10.1.1.2/24 dev veth2
+ip netns exec ns1 ip link set veth1 up
+ip netns exec ns2 ip link set veth2 up
+
+# ns1 → ns2 yönüne 50ms gecikme, %1 kayıp
+ip netns exec ns1 tc qdisc add dev veth1 root netem \
+    delay 50ms loss 1%
+
+# ns2 → ns1 yönüne (karşı yön) farklı parametre
+ip netns exec ns2 tc qdisc add dev veth2 root netem \
+    delay 80ms loss 2%
+
+# Test
+ip netns exec ns1 ping 10.1.1.2 -c 20
+ip netns exec ns1 iperf3 -c 10.1.1.2 &
+ip netns exec ns2 iperf3 -s
+
+# Temizlik
+ip netns del ns1
+ip netns del ns2
+</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> tbf — Token Bucket Filter ile hız sınırlama</h2>
+  <p class="section-lead">TBF (Token Bucket Filter), belirli bir arayüzden veya trafik akışından çıkacak veriyi sabit bir hızla sınırlandırmanın en basit ve verimli yoludur. ISP bandwidth policing veya IoT cihazlarına kota atamak için idealdir.</p>
+
+  <h3>TBF parametreleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">rate</span><span class="desc">Ortalama çıkış hızı (1mbit, 512kbit, 100mbps vb.)</span></div>
+    <div class="param"><span class="name">burst</span><span class="desc">Token kova boyutu — anlık trafiğin ne kadar aşıma izin verileceği. Minimum: rate/8000 (yaklaşık)</span></div>
+    <div class="param"><span class="name">latency</span><span class="desc">Bir paketin kuyrukta bekleyebileceği maksimum süre. Kuyruk boyutunu dolaylı olarak belirler (burst + latency × rate).</span></div>
+    <div class="param"><span class="name">peakrate</span><span class="desc">İkinci token kovası — burst dönemlerinde de ani zirveyi sınırlar.</span></div>
+    <div class="param"><span class="name">mtu / minburst</span><span class="desc">peakrate ile birlikte kullanılan minimum burst boyutu.</span></div>
+  </div>
+
+  <h3>Temel TBF kullanımı</h3>
+  <pre><code># eth0 çıkışını 1 Mbit/s ile sınırla
+tc qdisc add dev eth0 root tbf \
+    rate 1mbit \
+    burst 32kbit \
+    latency 400ms
+
+# Değiştirme (çalışırken)
+tc qdisc change dev eth0 root tbf \
+    rate 2mbit \
+    burst 64kbit \
+    latency 400ms
+
+# Kaldırma
+tc qdisc del dev eth0 root
+
+# İstatistikler
+tc -s qdisc show dev eth0
+# qdisc tbf 8001: root refcnt 2 rate 1Mbit burst 32Kb lat 400.0ms
+#  Sent 1234567 bytes 890 pkt (dropped 12, overlimits 45 requeues 0)
+</code></pre>
+
+  <h3>Çift kova (peakrate) ile ani zirveleri kırpma</h3>
+  <pre><code># Ortalama 1 Mbit/s, anlık zirve 2 Mbit/s ile sınırlı
+tc qdisc replace dev eth0 root tbf \
+    rate 1mbit \
+    burst 32kbit \
+    peakrate 2mbit \
+    minburst 1540 \
+    latency 400ms
+</code></pre>
+
+  <h3>HTB leaf olarak TBF — per-host sınırlama</h3>
+  <pre><code>#!/bin/bash
+# Senaryo: her IP'ye 2 Mbit/s sınır, aynı HTB sınıfı altında
+DEV=eth0
+
+tc qdisc del dev $DEV root 2>/dev/null
+tc qdisc add dev $DEV root handle 1: htb default 99
+
+# Yönetim sınıfı — toplam bant genişliği
+tc class add dev $DEV parent 1: classid 1:1 htb rate 100mbit
+
+# Her host için dinamik sınıf ekleme (bu statik örnek)
+for i in 1 2 3 4 5; do
+    tc class add dev $DEV parent 1:1 classid 1:$((100+i)) htb \
+        rate 2mbit ceil 10mbit burst 4k
+
+    tc qdisc add dev $DEV parent 1:$((100+i)) handle $((100+i)): \
+        tbf rate 2mbit burst 32kbit latency 200ms
+
+    tc filter add dev $DEV parent 1:0 protocol ip prio 1 u32 \
+        match ip src 10.0.0.$i/32 \
+        flowid 1:$((100+i))
+done
+</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Filtreler: u32, flower, BPF</h2>
+  <p class="section-lead">Filtreler (classifier), gelen paketi inceler ve hangi sınıfa ya da action'a gönderileceğine karar verir. Linux'ta üç ana filter tipi vardır: geleneksel <code>u32</code>, modern <code>flower</code> ve programlanabilir <code>BPF</code>.</p>
+
+  <h3>u32 — Universal 32-bit Classifier</h3>
+  <pre><code># Hedef IP'ye göre eşleştir
+tc filter add dev eth0 parent 1:0 protocol ip prio 10 u32 \
+    match ip dst 192.168.1.0/24 \
+    flowid 1:20
+
+# Kaynak IP + port kombinasyonu
+tc filter add dev eth0 parent 1:0 protocol ip prio 5 u32 \
+    match ip src 10.0.0.5/32 \
+    match ip dport 443 0xffff \
+    flowid 1:10
+
+# DSCP değerine göre (TOS alanı)
+# DSCP EF (Expedited Forwarding) = 0x2e → TOS byte içinde bits[7:2]
+tc filter add dev eth0 parent 1:0 protocol ip prio 1 u32 \
+    match ip tos 0xb8 0xfc \
+    flowid 1:10
+
+# u32 filtre listesi
+tc filter show dev eth0
+</code></pre>
+
+  <h3>flower — akış tabanlı eşleştirme</h3>
+  <p>flower filtresi, çok sayıda alan üzerinde kolayca eşleştirme yapılmasını sağlar. HW offload desteği olan NIC sürücüleriyle donanım hızlandırmalı çalışır.</p>
+  <pre><code># VLAN ID'ye göre eşleştir
+tc filter add dev eth0 parent 1:0 protocol 802.1q prio 1 \
+    flower vlan_id 100 \
+    action mirred egress redirect dev veth0
+
+# TCP + DSCP kombinasyonu
+tc filter add dev eth0 parent 1:0 protocol ip prio 2 \
+    flower \
+        ip_proto tcp \
+        dst_port 22 \
+        ip_tos 0x10 \
+    action skbedit priority 7
+
+# Ethertype + MAC kaynak filtresi
+tc filter add dev eth0 parent 1:0 protocol ip prio 3 \
+    flower \
+        src_mac aa:bb:cc:dd:ee:ff \
+        dst_mac ff:ff:ff:ff:ff:ff \
+    action drop
+</code></pre>
+
+  <h3>BPF/eBPF filtresi</h3>
+  <pre><code># TC eBPF programı derleme (clang)
+clang -O2 -target bpf -c tc_filter.c -o tc_filter.o
+
+# TC qdisc + BPF filtresi ekle
+tc qdisc add dev eth0 clsact
+tc filter add dev eth0 ingress bpf obj tc_filter.o sec ingress da
+tc filter add dev eth0 egress  bpf obj tc_filter.o sec egress  da
+
+# da = direct-action: BPF programı TC_ACT_OK/DROP/REDIRECT döndürür
+
+# Minimal TC eBPF C programı iskeleti
+cat &lt;&lt;'EOF' &gt; tc_filter.c
+#include &lt;linux/bpf.h&gt;
+#include &lt;linux/pkt_cls.h&gt;
+#include &lt;bpf/bpf_helpers.h&gt;
+
+SEC("ingress")
+int tc_ingress(struct __sk_buff *skb)
+{
+    /* Paketi incele, gerekirse manipüle et */
+    return TC_ACT_OK;   /* geçir */
+    // return TC_ACT_SHOT; /* düşür */
+}
+char LICENSE[] SEC("license") = "GPL";
+EOF
+</code></pre>
+
+  <h3>Actions — filtreden sonra ne olur</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Action</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td><code>flowid</code></td><td>Paketi belirtilen sınıfa yönlendir</td></tr>
+        <tr><td><code>drop</code></td><td>Paketi at</td></tr>
+        <tr><td><code>pass</code></td><td>Kural zincirinden çıkıp paketi geçir</td></tr>
+        <tr><td><code>mirred redirect</code></td><td>Paketi başka bir arayüze yönlendir (ingress → egress)</td></tr>
+        <tr><td><code>mirred mirror</code></td><td>Paketi kopyala ve başka arayüze gönder (wiretap)</td></tr>
+        <tr><td><code>skbedit priority</code></td><td>SKB önceliğini değiştir (SO_PRIORITY)</td></tr>
+        <tr><td><code>csum</code></td><td>Checksum güncelle (NAT sonrası)</td></tr>
+        <tr><td><code>nat</code></td><td>Adres çevirisi (kernel NAT, iptables'sız)</td></tr>
+        <tr><td><code>pedit</code></td><td>Paket başlık alanlarını düzenle</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Uygulamalar: QoS, önceliklendirme, çok kiracılı</h2>
+  <p class="section-lead">Gerçek dünya senaryolarında tc nasıl kullanılır? VoIP QoS, container ağı bant genişliği sınırlama ve çok kiracılı (multi-tenant) gömülü gateway yapılandırmaları.</p>
+
+  <h3>DSCP tabanlı QoS — DSCP → HTB sınıfı</h3>
+  <pre><code>#!/bin/bash
+# DSCP değerlerini HTB sınıflarına eşleştir
+DEV=eth0
+
+tc qdisc del dev $DEV root 2>/dev/null
+tc qdisc add dev $DEV root handle 1: htb default 40
+
+tc class add dev $DEV parent 1: classid 1:1 htb rate 100mbit
+
+# EF (DSCP 46 = 0x2e): VoIP, video konferans
+tc class add dev $DEV parent 1:1 classid 1:10 htb rate 30mbit ceil 100mbit prio 1
+# AF41 (DSCP 34): interaktif video
+tc class add dev $DEV parent 1:1 classid 1:20 htb rate 30mbit ceil 100mbit prio 2
+# CS0 (DSCP 0): normal trafik
+tc class add dev $DEV parent 1:1 classid 1:30 htb rate 30mbit ceil 100mbit prio 3
+# CS1 (DSCP 8): düşük öncelik / bulk
+tc class add dev $DEV parent 1:1 classid 1:40 htb rate 10mbit ceil 50mbit  prio 4
+
+# DSCP eşleştirme (TOS byte bits[7:2] = DSCP × 4)
+# EF  = 46 → TOS = 184 (0xb8), mask = 0xfc
+tc filter add dev $DEV parent 1:0 protocol ip prio 1 u32 \
+    match ip tos 0xb8 0xfc flowid 1:10
+# AF41 = 34 → TOS = 136 (0x88)
+tc filter add dev $DEV parent 1:0 protocol ip prio 2 u32 \
+    match ip tos 0x88 0xfc flowid 1:20
+# CS1  = 8  → TOS = 32 (0x20)
+tc filter add dev $DEV parent 1:0 protocol ip prio 4 u32 \
+    match ip tos 0x20 0xfc flowid 1:40
+
+# Leaf qdisc
+for cls in 10 20 30 40; do
+    tc qdisc add dev $DEV parent 1:$cls handle ${cls}: fq_codel
+done
+</code></pre>
+
+  <h3>Container / cgroup trafik kontrolü</h3>
+  <pre><code># cgroup v2 ile container ağ sınırlaması
+# Her container'a ayrı cgroup atanmış varsayılır
+
+# net_cls classid'yi cgroup'a ata
+echo 0x00010010 > /sys/fs/cgroup/my_container/net_cls.classid
+# classid: major:minor = 1:16 (hex 0x10)
+
+# Ağ arayüzünde bu classid için şekillendirme
+tc qdisc add dev eth0 root handle 1: htb default 99
+tc class add dev eth0 parent 1: classid 1:1 htb rate 1gbit
+
+# Container sınıfı: 10 Mbit/s
+tc class add dev eth0 parent 1:1 classid 1:16 htb rate 10mbit ceil 50mbit
+
+# cgroup classid filtresi
+tc filter add dev eth0 parent 1:0 protocol ip prio 1 \
+    handle 0x00010010 cgroup flowid 1:16
+
+tc qdisc add dev eth0 parent 1:16 fq_codel
+</code></pre>
+
+  <h3>IFB ile ingress şekillendirme</h3>
+  <p>tc doğrudan ingress'te shaping (gecikme ekleyemez); yalnızca policing (drop) yapabilir. Gerçek ingress shaping için IFB (Intermediate Functional Block) sanal arayüz kullanılır: gelen trafik IFB'ye yönlendirilir, oradan egress gibi şekillendirilir.</p>
+  <pre><code>#!/bin/bash
+# İndirme hızını 5 Mbit/s ile sınırla
+modprobe ifb numifbs=1
+
+ip link set ifb0 up
+
+# eth0 ingress → ifb0 egress yönlendir
+tc qdisc add dev eth0 handle ffff: ingress
+tc filter add dev eth0 parent ffff: protocol ip u32 \
+    match u32 0 0 \
+    action mirred egress redirect dev ifb0
+
+# ifb0 üzerinde shaping
+tc qdisc add dev ifb0 root handle 1: htb default 10
+tc class add dev ifb0 parent 1: classid 1:1 htb rate 100mbit
+tc class add dev ifb0 parent 1:1 classid 1:10 htb rate 5mbit ceil 5mbit
+tc qdisc add dev ifb0 parent 1:10 fq_codel
+</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Hata ayıklama ve istatistikler</h2>
+  <p class="section-lead">tc yapılandırmalarının etkinliğini ve olası sorunlarını izlemek için istatistikler, izleme araçları ve sık karşılaşılan hataların teşhis yöntemleri.</p>
+
+  <h3>tc istatistiklerini okuma</h3>
+  <pre><code># Qdisc istatistikleri
+tc -s qdisc show dev eth0
+
+# Alanların anlamı:
+# Sent X bytes Y pkt     ← toplam gönderilen
+# dropped Z              ← kuyruk dolduğu için atılan
+# overlimits N           ← TBF/HTB hız aşımı sayısı
+# requeues R             ← yeniden kuyruğa alınan
+
+# Sınıf istatistikleri (HTB)
+tc -s class show dev eth0
+
+# Filtre istatistikleri
+tc -s filter show dev eth0
+
+# Tüm ayrıntılar
+tc -s -d qdisc show dev eth0
+</code></pre>
+
+  <h3>Anlık izleme — watch ile</h3>
+  <pre><code># Her 1 saniyede istatistikleri güncelle
+watch -n 1 'tc -s qdisc show dev eth0'
+
+# Belirli sınıfın bant genişliğini izle
+watch -n 1 'tc -s class show dev eth0 classid 1:20'
+</code></pre>
+
+  <h3>nstat ve ss ile ağ yığını istatistikleri</h3>
+  <pre><code># Çekirdek ağ istatistikleri
+nstat -az | grep -E "TcpExt|IpExt|Udp"
+
+# Socket kuyruk dolulukları
+ss -tnp   # TCP soket durumu
+ss -unp   # UDP soket durumu
+
+# Paket atma noktaları
+cat /proc/net/dev | awk '{print $1, $4, $12}'   # RX/TX drop
+</code></pre>
+
+  <h3>Yaygın hatalar ve çözümleri</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Hata / Belirti</th><th>Neden</th><th>Çözüm</th></tr></thead>
+      <tbody>
+        <tr><td><code>RTNETLINK answers: File exists</code></td><td>Aynı handle ile qdisc zaten var</td><td><code>tc qdisc change</code> veya önce <code>del</code></td></tr>
+        <tr><td><code>RTNETLINK answers: Invalid argument</code></td><td>Yanlış parametre: burst çok küçük, rate formatı hatalı</td><td>burst ≥ rate/8000 kontrolü; <code>1mbit</code> yazımına dikkat</td></tr>
+        <tr><td>Hız sınırı çalışmıyor</td><td>Filtre eşleşmiyor veya yanlış flowid</td><td><code>tc filter show</code> ile eşleşme sayacını kontrol et</td></tr>
+        <tr><td>netem gecikme etkisiz</td><td>NIC TX offload gerçek zamanlamayı bozuyor</td><td><code>ethtool -K eth0 tx off gso off</code> ile offload kapat</td></tr>
+        <tr><td>HTB'de trafik yavaş ama dropped yok</td><td>sfq/fq_codel leaf qdisc eklenmemiş</td><td>Her class'a leaf qdisc ekle</td></tr>
+        <tr><td>Yapılandırma reboot'ta siliniyor</td><td>tc kuralları RAM'de — kalıcı değil</td><td><code>/etc/network/interfaces</code> up hookuna veya systemd servisine ekle</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>tc yapılandırmasını kalıcı yapma</h3>
+  <pre><code># Yöntem 1: systemd service
+cat &gt; /etc/systemd/system/tc-qos.service &lt;&lt;'EOF'
+[Unit]
+Description=TC QoS rules
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/setup-tc.sh
+ExecStop=/sbin/tc qdisc del dev eth0 root
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl enable tc-qos.service
+
+# Yöntem 2: NetworkManager dispatcher
+cat &gt; /etc/NetworkManager/dispatcher.d/99-tc-qos &lt;&lt;'EOF'
+#!/bin/bash
+[ "$1" = "eth0" ] &amp;&amp; [ "$2" = "up" ] &amp;&amp; /usr/local/bin/setup-tc.sh
+EOF
+chmod +x /etc/NetworkManager/dispatcher.d/99-tc-qos
+</code></pre>
+
+  <h3>tc + ss + iperf3 — tam test döngüsü</h3>
+  <pre><code>#!/bin/bash
+# Test: HTB 10 Mbit/s sınırının doğrulanması
+
+# 1. HTB kur
+tc qdisc del dev eth0 root 2>/dev/null
+tc qdisc add dev eth0 root handle 1: htb default 10
+tc class add dev eth0 parent 1: classid 1:1 htb rate 100mbit
+tc class add dev eth0 parent 1:1 classid 1:10 htb rate 10mbit ceil 10mbit
+tc qdisc add dev eth0 parent 1:10 fq_codel
+
+# 2. iperf3 sunucu (arka plan)
+iperf3 -s &
+sleep 1
+
+# 3. Bant genişliği testi
+echo "=== iperf3 test (beklenen ~10 Mbit/s) ==="
+iperf3 -c 127.0.0.1 -t 10 -i 2
+
+# 4. tc istatistikleri
+echo "=== TC istatistikleri ==="
+tc -s class show dev eth0 classid 1:10
+
+# 5. Temizlik
+kill %1
+tc qdisc del dev eth0 root
+</code></pre>
+</section>
+
+</main>

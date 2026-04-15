@@ -1,0 +1,733 @@
+---
+layout: tutorial
+title: "BeagleBone Black PRU — Gerçek Zamanlı I/O Birimi"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>GERÇEK ZAMANLI I/O</span>
+    <span>2026</span>
+  </div>
+  <h1>BeagleBone Black PRU<br><em>Gerçek Zamanlı I/O Birimi</em></h1>
+  <p class="subtitle">BeagleBone Black'in PRU-ICSS alt sistemini kullanarak nanosaniye hassasiyetinde I/O, özel protokol sürücüsü ve remoteproc ile Linux entegrasyonu.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">PRU nedir?</a></li>
+    <li><a href="#s1">Donanım kaynakları</a></li>
+    <li><a href="#s2">Geliştirme ortamı kurulumu</a></li>
+    <li><a href="#s3">PRU firmware yazımı</a></li>
+    <li><a href="#s4">remoteproc ile yükleme</a></li>
+    <li><a href="#s5">RPMsg ile haberleşme</a></li>
+    <li><a href="#s6">GPIO ve pin multiplexing</a></li>
+    <li><a href="#s7">Gerçek senaryo: WS2812 LED sürücüsü</a></li>
+    <li><a href="#s8">Hata ayıklama</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> PRU nedir?</h2>
+  <p class="section-lead">PRU (Programmable Realtime Unit), Texas Instruments AM335x SoC içinde bulunan bağımsız 32-bit RISC işlemcileridir. Linux tarafından etkilenmeden deterministik, nanosaniye seviyesinde I/O işlemleri yürütürler.</p>
+
+  <h3>PRU-ICSS Mimarisi</h3>
+  <p>BeagleBone Black'taki AM335x çipi, tek bir <strong>PRU-ICSS (Industrial Communication SubSystem)</strong> bloğu barındırır. Bu blok iki adet PRU çekirdeği (PRU0 ve PRU1), paylaşımlı bellek, interrupt controller (INTC) ve çeşitli çevre birimlerinden oluşur. Her PRU 32 adet 32-bit genel amaçlı yazmaç içerir ve tek saat döngüsünde bir komut yürütür.</p>
+
+  <div class="flow">
+    <pre>
+AM335x SoC
+├── ARM Cortex-A8 (Linux çalışır)
+│   └── remoteproc / rpmsg sürücüleri
+└── PRU-ICSS
+    ├── PRU0 (200 MHz, 8 KB inst RAM, 8 KB data RAM)
+    ├── PRU1 (200 MHz, 8 KB inst RAM, 8 KB data RAM)
+    ├── Shared RAM (12 KB)
+    ├── INTC (64 sistem olayı, 10 host IRQ)
+    ├── IEP (Industrial Ethernet Peripheral — zamanlayıcı)
+    └── MII_RT (Ethernet MII arayüzü)
+    </pre>
+  </div>
+
+  <h3>200 MHz Sabit Gecikme</h3>
+  <p>PRU, 200 MHz'de çalışır; yani her komut tam olarak <strong>5 ns</strong> sürer. Bellek erişimi, I/O toggle ve döngü sayımları tamamen deterministiktir. Linux tarafındaki kesme gecikmesi, zamanlayıcı jiteri veya önbellek ısınması PRU yürütmesini etkilemez. Bu özellik, PRU'yu şu senaryolar için ideal kılar:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Protokol bit-banging</span><span class="desc">WS2812, DMX-512, 1-Wire gibi kesin zamanlama gerektiren protokoller</span></div>
+    <div class="param"><span class="name">Endüstriyel I/O</span><span class="desc">EtherCAT, PROFIBUS, Modbus RTU gibi endüstriyel haberleşme protokolleri</span></div>
+    <div class="param"><span class="name">Encoder okuma</span><span class="desc">Yüksek frekanslı quadrature encoder sinyallerini kayıpsız sayma</span></div>
+    <div class="param"><span class="name">PWM üretimi</span><span class="desc">Linux zamanlayıcısından bağımsız yüksek çözünürlüklü PWM sinyalleri</span></div>
+    <div class="param"><span class="name">Gerçek zamanlı veri toplama</span><span class="desc">Sabit örnekleme aralıklarıyla sensör verisi toplamak</span></div>
+  </div>
+
+  <h3>ARM ile karşılaştırma</h3>
+  <div class="file-table">
+    <table>
+      <tr><th>Özellik</th><th>ARM Cortex-A8 (Linux)</th><th>PRU</th></tr>
+      <tr><td>Frekans</td><td>1 GHz</td><td>200 MHz</td></tr>
+      <tr><td>Zamanlama deterministikliği</td><td>Yok (OS jitter)</td><td>Tam (tek döngü kesin)</td></tr>
+      <tr><td>Minimum GPIO toggle</td><td>~1 µs (tipik)</td><td>5 ns</td></tr>
+      <tr><td>Bellek koruması</td><td>MMU + sanal adres</td><td>Fiziksel adres, MMU yok</td></tr>
+      <tr><td>İşletim sistemi</td><td>Linux</td><td>Bare-metal firmware</td></tr>
+    </table>
+  </div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> Donanım kaynakları</h2>
+  <p class="section-lead">PRU-ICSS bloğunun barındırdığı donanım kaynakları, firmware tasarımını doğrudan etkiler. Her birimin kapasitesini ve sınırlamalarını iyi anlamak gerekir.</p>
+
+  <h3>PRU0 ve PRU1 Çekirdekleri</h3>
+  <p>Her PRU çekirdeği kendi bellek alanına sahiptir ve birbirinden bağımsız çalışabilir. Ancak paylaşımlı RAM ve INTC aracılığıyla birbirleriyle ve ARM ile haberleşirler.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Komut RAM (IRAM)</span><span class="desc">Her PRU için 8 KB — maksimum ~2000 komut kapasitesi</span></div>
+    <div class="param"><span class="name">Veri RAM (DRAM)</span><span class="desc">Her PRU için 8 KB — yerel değişkenler ve tamponlar için</span></div>
+    <div class="param"><span class="name">Paylaşımlı RAM</span><span class="desc">12 KB — her iki PRU ve ARM'ın erişebildiği ortak alan</span></div>
+    <div class="param"><span class="name">GPO pinleri</span><span class="desc">Her PRU için 32 adet dijital çıkış, tek döngüde tamamı değiştirilebilir</span></div>
+    <div class="param"><span class="name">GPI pinleri</span><span class="desc">Her PRU için 32 adet dijital giriş, tek döngüde tamamı okunabilir</span></div>
+  </div>
+
+  <h3>IEP Zamanlayıcısı</h3>
+  <p>IEP (Industrial Ethernet Peripheral), 32-bit donanım zamanlayıcısı olarak kullanılabilir. PRU firmware'i IEP ile periyodik görevler zamanlayabilir veya olaylar arasındaki süreyi nanosaniye çözünürlüğüyle ölçebilir.</p>
+
+  <pre><code>/* IEP zamanlayıcısını başlatmak */
+CT_IEP.TMR_GLB_CFG_bit.CNT_EN = 1;       /* sayacı etkinleştir */
+CT_IEP.TMR_GLB_CFG_bit.DEFAULT_INC = 1;  /* her döngüde 1 artır */
+
+/* Mevcut zamanı oku */
+uint32_t t_start = CT_IEP.TMR_CNT;
+/* ... işlem ... */
+uint32_t elapsed_ns = (CT_IEP.TMR_CNT - t_start) * 5; /* 5 ns/döngü */</code></pre>
+
+  <h3>eCAP (Enhanced Capture)</h3>
+  <p>PRU-ICSS içindeki eCAP modülü, gelen sinyal kenarlarını (yükselen/düşen) donanım düzeyinde zaman damgalamak için kullanılır. Yazılım döngüsü gerekmeksizin PWM frekans/duty ölçümü yapılabilir.</p>
+
+  <h3>UART</h3>
+  <p>PRU-ICSS, 115200 baud'a kadar çalışabilen bir donanım UART birimini barındırır. PRU firmware'i bu UART'ı Linux seri konsolu veya özel protokol arayüzü olarak kullanabilir.</p>
+
+  <h3>Fiziksel Pin Eşlemeleri</h3>
+  <div class="file-table">
+    <table>
+      <tr><th>PRU Birimi</th><th>BeagleBone Header</th><th>AM335x Sinyal Adı</th><th>Notlar</th></tr>
+      <tr><td>PRU0 GPO[0]</td><td>P9.31</td><td>pr1_pru0_pru_r30[0]</td><td>Çıkış</td></tr>
+      <tr><td>PRU0 GPI[0]</td><td>P9.31</td><td>pr1_pru0_pru_r31[0]</td><td>Giriş (aynı pin, farklı mod)</td></tr>
+      <tr><td>PRU1 GPO[0]</td><td>P8.45</td><td>pr1_pru1_pru_r30[0]</td><td>Çıkış</td></tr>
+      <tr><td>PRU1 GPO[1]</td><td>P8.46</td><td>pr1_pru1_pru_r30[1]</td><td>Çıkış</td></tr>
+      <tr><td>PRU0 UART TX</td><td>P9.17</td><td>pr1_uart0_txd</td><td>UART0 TX</td></tr>
+    </table>
+  </div>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> Geliştirme ortamı kurulumu</h2>
+  <p class="section-lead">PRU firmware'i derlemek için TI'ın resmi PRU Code Generation Tools (PRU-CGT) ve destekleyici yazılım paketi (pru-software-support-package) gereklidir.</p>
+
+  <h3>Gerekli bileşenler</h3>
+  <div class="params">
+    <div class="param"><span class="name">ti-pru-cgt</span><span class="desc">TI PRU C/C++ derleyicisi (clpru) — PRU mimarisi için optimize edilmiş</span></div>
+    <div class="param"><span class="name">pru-software-support</span><span class="desc">Başlık dosyaları, örnek kodlar ve resource table şablonları</span></div>
+    <div class="param"><span class="name">gnuarmemb / arm-linux-gnueabihf</span><span class="desc">Konak sistemde Linux çapraz derleyicisi (Linux tarafı modülleri için)</span></div>
+    <div class="param"><span class="name">BeagleBone SDK / TI SDK</span><span class="desc">Opsiyonel — eksiksiz BSP ve önceden derlenmiş kernel içerir</span></div>
+  </div>
+
+  <h3>Ubuntu/Debian üzerinde kurulum</h3>
+  <pre><code># TI resmi PPA üzerinden PRU araçları
+sudo add-apt-repository ppa:beagleboard/ppa
+sudo apt-get update
+sudo apt-get install ti-pru-cgt-installer
+
+# pru-software-support paketi (başlık dosyaları)
+git clone https://git.ti.com/pru-software-support-package/pru-software-support-package.git
+export PRU_SSP=$(pwd)/pru-software-support-package
+
+# Derleyici yolunu ayarla
+export PRU_CGT=/usr/share/ti/cgt-pru
+export PATH=$PRU_CGT/bin:$PATH
+
+# Kurulumu doğrula
+clpru --version</code></pre>
+
+  <h3>BeagleBone üzerinde yerinde kurulum</h3>
+  <p>Debian Buster veya Bullseye çalıştıran BeagleBone'da PRU araçları paket deposundan yüklenebilir:</p>
+  <pre><code># BeagleBone Debian deposu üzerinden
+sudo apt-get update
+sudo apt-get install pru-software-support am335x-pru-package
+
+# Kernel PRU sürücülerini kontrol et
+lsmod | grep pru
+# pru_rproc ve rpmsg_pru yüklü olmalı
+
+# PRU remoteproc sysfs düğümleri
+ls /sys/bus/platform/drivers/pru-rproc/</code></pre>
+
+  <h3>Dizin yapısı</h3>
+  <pre><code>pru-projesi/
+├── Makefile
+├── resource_table.h       # remoteproc kaynak tablosu
+├── main.c                 # PRU C kaynak kodu
+├── AM335x_PRU.cmd         # Linker command dosyası
+└── gen/
+    ├── main.out           # ELF çıktısı
+    └── main.map           # Bellek haritası</code></pre>
+
+  <h3>Temel Makefile</h3>
+  <pre><code>PRU_CGT    ?= /usr/share/ti/cgt-pru
+PRU_SSP    ?= /usr/lib/ti/pru-software-support-package
+
+CC         = clpru
+CFLAGS     = --include_path=$(PRU_SSP)/include \
+             --include_path=$(PRU_SSP)/include/am335x \
+             -v3 -O2 --display_error_number \
+             --endian=little --hardware_mac=yes
+LFLAGS     = --reread_libs --warn_sections \
+             --stack_size=0x100 --heap_size=0x100
+
+TARGET     = gen/main.out
+SOURCES    = main.c
+
+all: $(TARGET)
+
+$(TARGET): $(SOURCES)
+	mkdir -p gen
+	$(CC) $(CFLAGS) -z -i$(PRU_CGT)/lib -i$(PRU_CGT)/include \
+	      $(LFLAGS) -o $@ $(SOURCES) AM335x_PRU.cmd
+
+clean:
+	rm -rf gen/</code></pre>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> PRU firmware yazımı</h2>
+  <p class="section-lead">PRU firmware, C dili ile yazılır; ancak standart libc mevcut değildir ve çevre birimine doğrudan yazmaç erişimi gereklidir. Resource table yapısı, remoteproc ile iletişim kurmak için zorunludur.</p>
+
+  <h3>Resource Table</h3>
+  <p>Her PRU firmware, <code>resource_table</code> bölümünde bir kaynak tablosu tanımlamalıdır. Bu tablo remoteproc çerçevesine hangi RPMsg kanallarının, vring'lerin ve memory mapping'lerinin gerektiğini bildirir.</p>
+
+  <pre><code>#ifndef _RSC_TABLE_PRU_H_
+#define _RSC_TABLE_PRU_H_
+
+#include &lt;stddef.h&gt;
+#include &lt;rsc_types.h&gt;
+
+#define NUM_VDEVS       1
+#define NUM_RPMSG_CHNLS 1
+
+struct my_resource_table {
+    struct resource_table base;
+    uint32_t offset[1];
+    struct fw_rsc_vdev rpmsg_vdev;
+    struct fw_rsc_vdev_vring rpmsg_vring0;
+    struct fw_rsc_vdev_vring rpmsg_vring1;
+};
+
+#pragma DATA_SECTION(pru_remoteproc_ResourceTable, ".resource_table")
+#pragma RETAIN(pru_remoteproc_ResourceTable)
+struct my_resource_table pru_remoteproc_ResourceTable = {
+    { 1, NUM_VDEVS, 0, 0, },
+    { offsetof(struct my_resource_table, rpmsg_vdev), },
+    {   TYPE_VDEV, VIRTIO_ID_RPMSG, 0,
+        RPMSG_PRU_C0_FEATURES, 0, 0, 0, NUM_RPMSG_CHNLS, { 0, 0 },
+    },
+    { PRU_D_STACK_SIZE, 16, 4, 1, 0 },
+    { PRU_D_STACK_SIZE + 0x2000, 16, 4, 2, 0 },
+};</code></pre>
+
+  <h3>Temel PRU C programı</h3>
+  <pre><code>#include &lt;stdint.h&gt;
+#include &lt;pru_cfg.h&gt;
+#include &lt;pru_intc.h&gt;
+#include "resource_table.h"
+
+volatile register uint32_t __R30;  /* GPO çıkış yazmaç */
+volatile register uint32_t __R31;  /* GPI giriş yazmaç  */
+
+#define SHARED_MEM_ADDR  0x00010000
+volatile uint32_t *shared_mem = (volatile uint32_t *)SHARED_MEM_ADDR;
+
+static inline void delay_ns(uint32_t ns) {
+    uint32_t cycles = ns / 5;
+    while (cycles--) {
+        __delay_cycles(1);
+    }
+}
+
+void main(void) {
+    /* OCP master bağlantısını etkinleştir */
+    CT_CFG.SYSCFG_bit.STANDBY_INIT = 0;
+
+    while (1) {
+        uint32_t cmd = shared_mem[0];
+        if (cmd == 1) {
+            __R30 |=  (1u &lt;&lt; 0);   /* GPO0 yüksek */
+            delay_ns(500);
+            __R30 &amp;= ~(1u &lt;&lt; 0);  /* GPO0 düşük */
+            shared_mem[0] = 0;      /* komutu temizle */
+        }
+        __delay_cycles(10);
+    }
+}</code></pre>
+
+  <h3>INTC yapılandırması</h3>
+  <p>PRU, ARM'dan sinyal almak için INTC üzerinden kesme alabilir. Sistem olayları (system events) PRU kanallarına eşlenerek "mailbox" benzeri bir mekanizma oluşturulur.</p>
+
+  <pre><code>/* INTC başlatma — PRU0 system event 16 bekle */
+CT_INTC.SICR_bit.STS_CLR_IDX = 16;   /* event 16'yı temizle */
+CT_INTC.EISR_bit.EN_SET_IDX  = 16;   /* event 16'yı etkinleştir */
+
+/* Kesme bekle (host interrupt 0 = R31 bit 30) */
+while ((__R31 &amp; (1u &lt;&lt; 30)) == 0) {
+    /* bekleniyor */
+}
+CT_INTC.SICR_bit.STS_CLR_IDX = 16;  /* event'i temizle */</code></pre>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> remoteproc ile yükleme</h2>
+  <p class="section-lead">Linux, PRU firmware'ini <code>remoteproc</code> çerçevesi üzerinden yükler ve yönetir. Firmware ELF dosyası <code>/lib/firmware/</code> dizinine kopyalanır; ardından sysfs üzerinden PRU başlatılıp durdurulabilir.</p>
+
+  <h3>remoteproc sürücü mimarisi</h3>
+  <div class="flow">
+    <pre>
+Linux Kullanıcı Alanı
+    |
+    | sysfs: /sys/class/remoteproc/remoteproc1/state
+    v
+pru_rproc.ko (kernel sürücüsü)
+    |-- Firmware yükle: /lib/firmware/am335x-pru0-fw
+    |-- ELF ayrıştır: resource_table oku
+    |-- Bellek eşle: IRAM / DRAM / Shared RAM
+    |-- INTC yapılandır
+    v
+PRU0 Çekirdeği (firmware çalışıyor)
+    </pre>
+  </div>
+
+  <h3>Firmware dağıtımı</h3>
+  <pre><code># Derlenmiş firmware'i yerleştir
+sudo cp gen/main.out /lib/firmware/am335x-pru0-fw
+
+# Sembolik bağlantıyı kontrol et
+ls -la /lib/firmware/ | grep pru</code></pre>
+
+  <h3>sysfs üzerinden PRU kontrolü</h3>
+  <pre><code># remoteproc düğümlerini listele
+ls /sys/class/remoteproc/
+# remoteproc0  remoteproc1  (PRU0 ve PRU1)
+
+# PRU0 için firmware adını ayarla
+echo "am335x-pru0-fw" | sudo tee /sys/class/remoteproc/remoteproc1/firmware
+
+# PRU0'ı başlat
+echo "start" | sudo tee /sys/class/remoteproc/remoteproc1/state
+
+# Durumu kontrol et
+cat /sys/class/remoteproc/remoteproc1/state
+# "running" çıktısı beklenir
+
+# PRU0'ı durdur
+echo "stop" | sudo tee /sys/class/remoteproc/remoteproc1/state</code></pre>
+
+  <h3>Kernel mesajlarını izleme</h3>
+  <pre><code># PRU yükleme/başlatma günlüklerini takip et
+dmesg -w | grep -i pru
+
+# Beklenen çıktı:
+# remoteproc remoteproc1: powering up 4a334000.pru
+# remoteproc remoteproc1: Booting fw image am335x-pru0-fw, size 49152
+# remoteproc remoteproc1: remote processor 4a334000.pru is now up
+# rpmsg_pru virtio0.rpmsg-pru.-1.30: new rpmsg_pru channel: 30</code></pre>
+
+  <h3>remoteproc durum makinesi</h3>
+  <div class="params">
+    <div class="param"><span class="name">offline</span><span class="desc">PRU durdurulmuş, bellek yüklenmemiş — başlangıç durumu</span></div>
+    <div class="param"><span class="name">running</span><span class="desc">Firmware yüklendi ve PRU çekirdeği çalışıyor</span></div>
+    <div class="param"><span class="name">suspended</span><span class="desc">PRU askıya alınmış, bellek korunuyor</span></div>
+    <div class="param"><span class="name">crashed</span><span class="desc">PRU hata nedeniyle durdu; dmesg'de hata mesajı beklenir</span></div>
+    <div class="param"><span class="name">deleted</span><span class="desc">Donanım nesnesi kaldırıldı (modül çıkarmada)</span></div>
+  </div>
+
+  <h3>Device Tree düğümü</h3>
+  <pre><code>/* arch/arm/boot/dts/am33xx-l4.dtsi içindeki PRU düğümü */
+pru0: pru@4a334000 {
+    compatible = "ti,am3356-pru";
+    reg = &lt;0x4a334000 0x2000&gt;,   /* IRAM */
+          &lt;0x4a322000 0x400&gt;,    /* control */
+          &lt;0x4a322400 0x100&gt;;    /* debug */
+    firmware-name = "am335x-pru0-fw";
+};</code></pre>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> RPMsg ile haberleşme</h2>
+  <p class="section-lead">RPMsg (Remote Processor Messaging), PRU ve ARM çekirdeği arasında çift yönlü, mesaj tabanlı iletişim sağlar. Linux tarafında <code>/dev/rpmsg_pruN</code> karakter aygıtı üzerinden erişilir.</p>
+
+  <h3>RPMsg mimarisi</h3>
+  <div class="flow">
+    <pre>
+Linux Kullanıcı Alanı
+    |  open("/dev/rpmsg_pru30")
+    |  write(fd, msg, len)  /  read(fd, buf, sizeof(buf))
+    v
+rpmsg_pru.ko (kernel sürücüsü)
+    |
+    | virtqueue (vring üzerinden)
+    v
+PRU Firmware
+    |  pru_rpmsg_receive()
+    |  pru_rpmsg_send()
+    v
+(işlem + yanıt)
+    </pre>
+  </div>
+
+  <h3>PRU firmware — RPMsg başlatma</h3>
+  <pre><code>#include &lt;pru_rpmsg.h&gt;
+#include &lt;pru_virtqueue.h&gt;
+
+struct pru_rpmsg_transport transport;
+uint16_t src, dst, len;
+char payload[RPMSG_BUF_SIZE];
+
+void main(void) {
+    volatile uint8_t *status;
+
+    CT_CFG.SYSCFG_bit.STANDBY_INIT = 0;
+
+    /* VDEV'in hazır olmasını bekle */
+    status = &amp;resourceTable.rpmsg_vdev.status;
+    while (!(*status &amp; VIRTIO_CONFIG_S_DRIVER_OK));
+
+    /* Transport başlat */
+    pru_rpmsg_init(&amp;transport,
+                   &amp;resourceTable.rpmsg_vring0,
+                   &amp;resourceTable.rpmsg_vring1,
+                   TO_ARM_HOST, FROM_ARM_HOST);
+
+    /* RPMsg kanalını duyur */
+    while (pru_rpmsg_channel(RPMSG_NS_CREATE, &amp;transport,
+                             CHAN_NAME, CHAN_DESC, CHAN_PORT) != PRU_RPMSG_SUCCESS);
+
+    /* Ping-pong döngüsü */
+    while (1) {
+        if (__R31 &amp; HOST_INT) {
+            CT_INTC.SICR_bit.STS_CLR_IDX = FROM_ARM_HOST;
+            while (pru_rpmsg_receive(&amp;transport, &amp;src, &amp;dst,
+                                     payload, &amp;len) == PRU_RPMSG_SUCCESS) {
+                /* Echo: aynı mesajı geri gönder */
+                pru_rpmsg_send(&amp;transport, dst, src, payload, len);
+            }
+        }
+    }
+}</code></pre>
+
+  <h3>Linux kullanıcı alanı</h3>
+  <pre><code>#include &lt;stdio.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;string.h&gt;
+
+int main(void) {
+    int fd;
+    char tx_buf[] = "merhaba PRU";
+    char rx_buf[512];
+    ssize_t n;
+
+    fd = open("/dev/rpmsg_pru30", O_RDWR);
+    if (fd &lt; 0) { perror("open"); return 1; }
+
+    write(fd, tx_buf, strlen(tx_buf));
+
+    n = read(fd, rx_buf, sizeof(rx_buf));
+    if (n &gt; 0) {
+        rx_buf[n] = '\0';
+        printf("PRU yaniti: %s\n", rx_buf);
+    }
+    close(fd);
+    return 0;
+}</code></pre>
+
+  <h3>RPMsg kanal referansları</h3>
+  <div class="params">
+    <div class="param"><span class="name">/dev/rpmsg_pru30</span><span class="desc">PRU0 RPMsg kanalı — varsayılan port 30</span></div>
+    <div class="param"><span class="name">/dev/rpmsg_pru31</span><span class="desc">PRU1 RPMsg kanalı — varsayılan port 31</span></div>
+    <div class="param"><span class="name">RPMSG_BUF_SIZE</span><span class="desc">512 bayt — tek mesaj maksimum boyutu</span></div>
+    <div class="param"><span class="name">virtqueue</span><span class="desc">vring0: ARM-&gt;PRU, vring1: PRU-&gt;ARM yönleri</span></div>
+  </div>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> GPIO ve pin multiplexing</h2>
+  <p class="section-lead">BeagleBone Black'taki her pin birden fazla işlev için kullanılabilir. PRU girişi/çıkışı olarak kullanmak için Device Tree overlay ile pin mux ayarlanmalıdır.</p>
+
+  <h3>Pin Mux Kavramı</h3>
+  <p>AM335x'in her I/O pini, <strong>pinmux register</strong> üzerinden 8 farklı "mod" seçeneğinden birine ayarlanabilir. PRU için <code>pruout</code> veya <code>pruin</code> modu seçilmelidir. Mod numaraları pin başına farklıdır; AM335x Technical Reference Manual'dan doğrulanmalıdır.</p>
+
+  <div class="file-table">
+    <table>
+      <tr><th>Mod Biti</th><th>Anlamı</th></tr>
+      <tr><td>MUX_MODE (2:0)</td><td>0–7 arası fonksiyon seçimi (pruout genellikle 5 veya 6)</td></tr>
+      <tr><td>PULL_UP (4)</td><td>Dahili pull-up direnci etkinleştir</td></tr>
+      <tr><td>PULL_DOWN (3)</td><td>Dahili pull-down direnci etkinleştir (varsayılan)</td></tr>
+      <tr><td>RXACTIVE (5)</td><td>Giriş tamponu etkinleştir — GPI için zorunlu</td></tr>
+      <tr><td>SLEWCTRL (6)</td><td>0 = hızlı, 1 = yavaş kenar</td></tr>
+    </table>
+  </div>
+
+  <h3>Device Tree overlay</h3>
+  <pre><code>/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "ti,beaglebone-black";
+    part-number = "BBB-PRU0-GPIO";
+    version = "00A0";
+
+    fragment@0 {
+        target = &lt;&amp;am33xx_pinmux&gt;;
+        __overlay__ {
+            pru0_gpio_pins: pru0_gpio_pins {
+                pinctrl-single,pins = &lt;
+                    /* P9.31 = offset 0x190, mode 5 = GPO (pruout) */
+                    0x190 0x05
+                    /* P9.29 = offset 0x194, mode 5 = GPO */
+                    0x194 0x05
+                    /* P9.28 = offset 0x19C, mode 6 + RXACTIVE = GPI */
+                    0x19C 0x26
+                &gt;;
+            };
+        };
+    };
+};</code></pre>
+
+  <h3>Overlay derleme ve yükleme</h3>
+  <pre><code># DTS'i DTB overlay formatına derle
+dtc -O dtb -o am335x-boneblack-pru0-gpio-00A0.dtbo \
+    -b 0 -@ am335x-boneblack-pru0-gpio.dts
+
+sudo cp am335x-boneblack-pru0-gpio-00A0.dtbo /lib/firmware/
+
+# Yeni kernel (4.19+) ile config-pin kullanımı
+config-pin P9.31 pruout
+config-pin P9.29 pruout
+config-pin P9.28 pruin
+
+# Mevcut modu doğrula
+config-pin -q P9.31</code></pre>
+
+  <h3>Firmware içinde GPO/GPI kullanımı</h3>
+  <pre><code>volatile register uint32_t __R30;  /* GPO */
+volatile register uint32_t __R31;  /* GPI */
+
+/* P9.31 pini yüksek yap (PRU0 GPO bit 0) */
+__R30 |= (1u &lt;&lt; 0);
+
+/* P9.29 pini yüksek yap (PRU0 GPO bit 1) */
+__R30 |= (1u &lt;&lt; 1);
+
+/* Tüm GPO'yu atomik olarak ayarla */
+__R30 = 0x00000003;
+
+/* P9.28 pini oku (PRU0 GPI bit 3) */
+uint8_t pin_val = (__R31 &gt;&gt; 3) &amp; 1;</code></pre>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> Gerçek senaryo: WS2812 LED sürücüsü</h2>
+  <p class="section-lead">WS2812 (NeoPixel) RGB LED'ler, 800 kHz taşıyıcı ve kesin darbe genişliği gerektiren tek-kablo protokol kullanır. PRU'nun deterministik zamanlaması bu protokol için biçilmiş kaftandır.</p>
+
+  <h3>WS2812 Protokolü</h3>
+  <p>Her LED 24-bit GRB veri (8-bit G, 8-bit R, 8-bit B) alır. Her bit, yüksek ve düşük darbe süresiyle kodlanır:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Bit-1 : T1H = 800 ns</span><span class="desc">Yüksek: 800 ns (160 döngü), Düşük: 450 ns (90 döngü)</span></div>
+    <div class="param"><span class="name">Bit-0 : T0H = 400 ns</span><span class="desc">Yüksek: 400 ns (80 döngü), Düşük: 850 ns (170 döngü)</span></div>
+    <div class="param"><span class="name">Reset sinyali</span><span class="desc">Düşük: 50 µs minimum (10000 döngü) — veri gönderimi sonunda zorunlu</span></div>
+  </div>
+
+  <div class="flow">
+    <pre>
+PRU Zamanlaması (200 MHz = 5 ns/döngü):
+
+  Bit-1: [HIGH: 160 döngü][LOW: 90 döngü]  toplam = 1250 ns
+  Bit-0: [HIGH:  80 döngü][LOW: 170 döngü] toplam = 1250 ns
+  Reset: [LOW: 10000 döngü] = 50 µs
+    </pre>
+  </div>
+
+  <h3>WS2812 PRU firmware</h3>
+  <pre><code>#include &lt;stdint.h&gt;
+#include &lt;pru_cfg.h&gt;
+#include "resource_table.h"
+
+volatile register uint32_t __R30;
+
+#define DATA_PIN_BIT  0u
+#define SHARED_MEM    0x00010000u
+#define MAX_LEDS      60u
+
+typedef struct { uint8_t g, r, b; } rgb_t;
+
+volatile rgb_t *led_buf = (volatile rgb_t *)SHARED_MEM;
+volatile uint32_t *cmd  = (volatile uint32_t *)(SHARED_MEM + MAX_LEDS * 3 + 4);
+
+static void send_bit(uint8_t bit) {
+    if (bit) {
+        __R30 |=  (1u &lt;&lt; DATA_PIN_BIT);
+        __delay_cycles(158);
+        __R30 &amp;= ~(1u &lt;&lt; DATA_PIN_BIT);
+        __delay_cycles(88);
+    } else {
+        __R30 |=  (1u &lt;&lt; DATA_PIN_BIT);
+        __delay_cycles(78);
+        __R30 &amp;= ~(1u &lt;&lt; DATA_PIN_BIT);
+        __delay_cycles(168);
+    }
+}
+
+static void send_byte(uint8_t byte) {
+    int i;
+    for (i = 7; i &gt;= 0; i--) {
+        send_bit((byte &gt;&gt; i) &amp; 1);
+    }
+}
+
+static void send_reset(void) {
+    __R30 &amp;= ~(1u &lt;&lt; DATA_PIN_BIT);
+    __delay_cycles(10000);
+}
+
+void main(void) {
+    uint32_t i, n_leds;
+    CT_CFG.SYSCFG_bit.STANDBY_INIT = 0;
+
+    while (1) {
+        if (*cmd &gt; 0) {
+            n_leds = (*cmd &gt; MAX_LEDS) ? MAX_LEDS : *cmd;
+            for (i = 0; i &lt; n_leds; i++) {
+                send_byte(led_buf[i].g);
+                send_byte(led_buf[i].r);
+                send_byte(led_buf[i].b);
+            }
+            send_reset();
+            *cmd = 0;  /* tamamlandı */
+        }
+    }
+}</code></pre>
+
+  <h3>Linux kullanıcı alanı kontrolü</h3>
+  <pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;unistd.h&gt;
+
+#define PRUSS_SHAREDMEM_BASE  0x4A310000
+#define PRUSS_MAP_SIZE        0x40000
+#define MAX_LEDS              60
+
+typedef struct { uint8_t g, r, b; } rgb_t;
+
+int main(void) {
+    int mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
+    void *base = mmap(NULL, PRUSS_MAP_SIZE,
+                      PROT_READ | PROT_WRITE,
+                      MAP_SHARED, mem_fd,
+                      PRUSS_SHAREDMEM_BASE);
+
+    rgb_t *leds = (rgb_t *)base;
+    volatile uint32_t *cmd = (volatile uint32_t *)(base + MAX_LEDS * 3 + 4);
+
+    /* Gökkuşağı efekti */
+    int i;
+    for (i = 0; i &lt; MAX_LEDS; i++) {
+        leds[i].r = (i * 4) &amp; 0xFF;
+        leds[i].g = ((i + 20) * 4) &amp; 0xFF;
+        leds[i].b = ((i + 40) * 4) &amp; 0xFF;
+    }
+    *cmd = MAX_LEDS;
+
+    while (*cmd != 0);  /* tamamlanmayı bekle */
+
+    munmap(base, PRUSS_MAP_SIZE);
+    close(mem_fd);
+    return 0;
+}</code></pre>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Hata ayıklama</h2>
+  <p class="section-lead">PRU firmware hata ayıklaması, klasik GDB akışından farklıdır. Paylaşımlı bellek dökümü, IEP zamanlayıcısı tabanlı profilleme ve remoteproc crash kurtarma temel tekniklerdir.</p>
+
+  <h3>Shared Memory Log ile hata tespiti</h3>
+  <pre><code>/* PRU firmware — debug mesajı shared mem'e yaz */
+#define DBG_MEM  0x00010F00u
+volatile uint32_t *dbg = (volatile uint32_t *)DBG_MEM;
+
+void pru_assert(uint32_t cond, uint32_t code) {
+    if (!cond) {
+        dbg[0] = 0xDEADBEEFu;
+        dbg[1] = code;
+        dbg[2] = CT_IEP.TMR_CNT;  /* nanosaniye zaman damgası */
+        while (1);                  /* PRU'yu durdur */
+    }
+}</code></pre>
+
+  <pre><code>/* Linux — shared mem okuma */
+int fd = open("/dev/mem", O_RDONLY);
+uint32_t *base = mmap(NULL, 0x40000, PROT_READ,
+                      MAP_SHARED, fd, 0x4A310000);
+volatile uint32_t *dbg = base + (0x0F00 / 4);
+
+if (dbg[0] == 0xDEADBEEF) {
+    printf("PRU HATA: kod=0x%08X, t=%u döngü\n", dbg[1], dbg[2]);
+}</code></pre>
+
+  <h3>remoteproc crash kurtarma</h3>
+  <pre><code># PRU durumunu kontrol et
+cat /sys/class/remoteproc/remoteproc1/state
+
+# "crashed" ise yeniden başlat:
+echo "stop"  | sudo tee /sys/class/remoteproc/remoteproc1/state
+dmesg | tail -30 | grep -i "pru\|remoteproc"
+sudo cp gen/main_fixed.out /lib/firmware/am335x-pru0-fw
+echo "start" | sudo tee /sys/class/remoteproc/remoteproc1/state</code></pre>
+
+  <h3>Logic analyzer ile doğrulama</h3>
+  <p>WS2812 gibi kesin zamanlama protokollerinde yazılım analizörü yeterli değildir. <strong>Sigrok / PulseView</strong> ile ucuz bir logic analyzer (örn. DSLogic) kullanarak PRU çıkış pinini örneklemek, gerçek darbe genişliklerini doğrulamak için en güvenilir yöntemdir.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Örnekleme hızı</span><span class="desc">WS2812 için minimum 10 MHz örnekleme gerekir (100 ns çözünürlük)</span></div>
+    <div class="param"><span class="name">Tetikleme</span><span class="desc">İlk yükselen kenarda tetikle, 60 LED x 24 bit = 1440 bit yakalanır</span></div>
+    <div class="param"><span class="name">Decoder</span><span class="desc">PulseView'da "WS2812" protokol decoder'ı hazır olarak mevcuttur</span></div>
+  </div>
+
+  <h3>IEP ile performans profilleme</h3>
+  <pre><code>CT_IEP.TMR_GLB_CFG_bit.CNT_EN = 1;
+
+uint32_t t0 = CT_IEP.TMR_CNT;
+/* ... ölçülecek kod ... */
+uint32_t t1 = CT_IEP.TMR_CNT;
+
+/* Sonucu shared mem'e yaz */
+shared_mem[10] = (t1 - t0) * 5;  /* nanosaniye cinsinden */</code></pre>
+
+  <h3>Sık karşılaşılan sorunlar</h3>
+  <div class="file-table">
+    <table>
+      <tr><th>Sorun</th><th>Olası Neden</th><th>Çözüm</th></tr>
+      <tr><td>PRU "crashed" durumuna geçiyor</td><td>IRAM taşması, yanlış bellek erişimi</td><td>Linker map dosyasını kontrol et, adres sınırlarını doğrula</td></tr>
+      <tr><td>/dev/rpmsg_pru30 oluşmuyor</td><td>Resource table yanlış, VDEV hazır değil</td><td>resource_table.h'yi doğrula, dmesg'i incele</td></tr>
+      <tr><td>GPIO çıkışı yok</td><td>Pin mux ayarı eksik veya yanlış</td><td>config-pin ile pin modunu doğrula</td></tr>
+      <tr><td>WS2812 renk hatalı</td><td>Gecikme döngüsü sayısı yanlış</td><td>Logic analyzer ile darbe süresini ölç, kalibre et</td></tr>
+      <tr><td>Firmware yüklenmiyor</td><td>/lib/firmware/ dosyası eksik veya bozuk</td><td>file gen/main.out ile ELF formatını kontrol et</td></tr>
+    </table>
+  </div>
+</section>
+
+</main>

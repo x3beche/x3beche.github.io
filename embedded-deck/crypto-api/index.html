@@ -1,0 +1,628 @@
+---
+layout: tutorial
+title: "Linux Kernel Crypto API — Şifreleme Altyapısı"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span><span>GÖMÜLÜ LİNUX</span><span>ŞİFRELEME</span><span>2026</span>
+  </div>
+  <h1>Linux Kernel Crypto API<br><em>Şifreleme Altyapısı</em></h1>
+  <p class="subtitle">Linux kernel kriptografi çerçevesinin şifre/hash/aead/akcipher arayüzleri, donanım hızlandırıcı entegrasyonu ve gömülü güvenli depolama uygulamaları.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Crypto API Neden?</a></li>
+    <li><a href="#s1">API Katmanları</a></li>
+    <li><a href="#s2">Hash Kullanımı</a></li>
+    <li><a href="#s3">Simetrik Şifreleme</a></li>
+    <li><a href="#s4">AEAD — Kimlik Doğrulamalı Şifreleme</a></li>
+    <li><a href="#s5">Donanım Hızlandırıcı Entegrasyonu</a></li>
+    <li><a href="#s6">dm-crypt ile Şifreli Depolama</a></li>
+    <li><a href="#s7">Kernel Keyring ile Anahtar Yönetimi</a></li>
+    <li><a href="#s8">Hata Ayıklama ve Benchmark</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> Crypto API Neden?</h2>
+  <p class="section-lead">Linux kernel'de kriptografik işlemler her yerde gerekir: ağ güvenliği (IPsec, TLS), disk şifrelemesi (dm-crypt), dosya sistemi şifrelemesi (fscrypt), kimlik doğrulama (IMA/EVM). Crypto API bu gereksinimleri tek bir tutarlı çerçeve altında toplar.</p>
+
+  <p>Crypto API öncesinde her sürücü kendi şifreleme kodunu yazmak zorundaydı. Bu hem kod tekrarına hem de güvenlik açıklarına neden oluyordu. Kernel 2.5.45 sürümünde tanıtılan Crypto API, algoritma bağımsızlığı ve sürücü tekrarsızlığı sağlayarak bu sorunu köklü biçimde çözdü.</p>
+
+  <h3>Temel Motivasyonlar</h3>
+  <div class="params">
+    <div class="param"><span class="name">Sürücü tekrarsızlığı</span><span class="desc">AES-CBC gibi algoritmanın tek bir kernel implementasyonu bulunur; tüm alt sistemler bu implementasyonu kullanır.</span></div>
+    <div class="param"><span class="name">Algoritma bağımsızlığı</span><span class="desc">Üst katman kodu algoritma adıyla çalışır; somut implementasyon (yazılım / donanım) runtime'da seçilir.</span></div>
+    <div class="param"><span class="name">Donanım offload</span><span class="desc">ARM TrustZone, Intel QAT, NXP CAAM gibi donanım motorları şeffaf biçimde devreye girer; uygulama kodu değişmez.</span></div>
+    <div class="param"><span class="name">Test altyapısı</span><span class="desc">tcrypt modülü algoritmaları otomatik test eder; yeni implementasyonlar kayıt sırasında doğrulanır.</span></div>
+    <div class="param"><span class="name">FIPS uyumluluğu</span><span class="desc">CONFIG_CRYPTO_FIPS ile FIPS 140-2/3 onaylı mod etkinleştirilebilir; onaylı olmayan algoritmalar engellenir.</span></div>
+  </div>
+
+  <h3>Mimari Genel Bakış</h3>
+  <div class="flow"><pre>
+Kullanıcı / Alt Sistem
+    |
+    v
+Crypto API Arayüzü   (crypto_alloc_*, crypto_*_setkey, ...)
+    |
+    v
+Algoritma Kütüphanesi (cipher, hash, aead, akcipher, kpp)
+    |
+    +---> Yazılım Implementasyonu   (lib/crypto/, arch/arm64/crypto/)
+    |
+    +---> Donanım Sürücüsü          (drivers/crypto/*)
+              |
+              v
+         DMA / Donanım Motoru      (CAAM, QAT, CE, ...)
+  </pre></div>
+
+  <p>Gömülü Linux sistemlerinde Crypto API özellikle önem taşır. Kaynakları kısıtlı bir ARM Cortex-A cihazda yazılımsal AES-256, sıkça bir performans sorunu oluşturur. Ancak SoC üreticilerinin çoğu (NXP, Xilinx, Marvell) donanım kriptografi motorlarıyla birlikte sürücüler sunar. Crypto API'yi doğru kullanan bir uygulama, bu motorları sıfır değişiklikle otomatik olarak kullanır.</p>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> API Katmanları</h2>
+  <p class="section-lead">Crypto API beş ana şifreleme ailesini ve her aile için senkron/asenkron olmak üzere iki kullanım modelini destekler. Doğru aile ve modu seçmek, hem doğruluk hem performans açısından kritiktir.</p>
+
+  <h3>Şifreleme Aileleri</h3>
+  <div class="file-table"><table>
+    <tr><th>Aile</th><th>Tip Sabiti</th><th>Kullanım Alanı</th></tr>
+    <tr><td>cipher (singleblock)</td><td>CRYPTO_ALG_TYPE_CIPHER</td><td>Tek blok işlemi; ECB/CBC wrapper'lar için temel</td></tr>
+    <tr><td>skcipher</td><td>CRYPTO_ALG_TYPE_SKCIPHER</td><td>Simetrik blok/akış şifreleme (AES-CBC, ChaCha20)</td></tr>
+    <tr><td>shash / ahash</td><td>CRYPTO_ALG_TYPE_SHASH/AHASH</td><td>Özet fonksiyonları (SHA-256, BLAKE2, HMAC)</td></tr>
+    <tr><td>aead</td><td>CRYPTO_ALG_TYPE_AEAD</td><td>Kimlik doğrulamalı şifreleme (AES-GCM, ChaCha20-Poly1305)</td></tr>
+    <tr><td>akcipher</td><td>CRYPTO_ALG_TYPE_AKCIPHER</td><td>Asimetrik şifreleme/imza (RSA, ECDSA)</td></tr>
+    <tr><td>kpp</td><td>CRYPTO_ALG_TYPE_KPP</td><td>Anahtar değişimi (ECDH, Diffie-Hellman)</td></tr>
+  </table></div>
+
+  <h3>Senkron ve Asenkron API</h3>
+  <p>Crypto API her aile için iki arayüz sunar:</p>
+  <div class="params">
+    <div class="param"><span class="name">Senkron (shash, skcipher)</span><span class="desc">İşlem tamamlanana kadar bloke eder. Yazılımsal implementasyonlar ve küçük veri boyutlarında tercih edilir. Sürücü bağlamında kullanım basittir.</span></div>
+    <div class="param"><span class="name">Asenkron (ahash, ablkcipher)</span><span class="desc">İşlem kuyruğa alınır, completion callback tetiklenir. DMA tabanlı donanım motorları için gereklidir. Yüksek verimlilik sağlar.</span></div>
+  </div>
+
+  <h3>Request Yaşam Döngüsü</h3>
+  <div class="flow"><pre>
+1. crypto_alloc_*()        -- transform nesnesi oluştur
+        |
+2. crypto_*_setkey()       -- anahtar yükle
+        |
+3. skcipher_request_alloc() -- istek nesnesi ayır
+        |
+4. skcipher_request_set_callback() -- async için callback
+        |
+5. skcipher_request_set_crypt()    -- kaynak/hedef scatter-list, IV
+        |
+6. crypto_skcipher_encrypt/decrypt() -- işlemi başlat
+        |
+7. skcipher_request_free()  -- istek nesnesini serbest bırak
+        |
+8. crypto_free_skcipher()   -- transform nesnesini serbest bırak
+  </pre></div>
+
+  <h3>Temel Başlık Dosyaları</h3>
+  <pre><code>#include &lt;crypto/hash.h&gt;        /* shash / ahash */
+#include &lt;crypto/skcipher.h&gt;    /* skcipher */
+#include &lt;crypto/aead.h&gt;        /* aead */
+#include &lt;crypto/akcipher.h&gt;    /* akcipher */
+#include &lt;linux/crypto.h&gt;       /* temel tipler */
+#include &lt;linux/scatterlist.h&gt;  /* sg_init_one, sg_set_buf */</code></pre>
+
+  <p>Tüm Crypto API nesneleri GFP_KERNEL ile tahsis edilir ve referans sayımlıdır. Yanlış serbest bırakma bellek sızıntısına yol açar; <code>crypto_free_*</code> çağrıları her zaman eşleştirilmelidir.</p>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> Hash Kullanımı</h2>
+  <p class="section-lead">Senkron hash arayüzü (shash), kernel modüllerinde en yaygın kullanılan Crypto API bileşenidir. IMA dosya ölçümünden HMAC kimlik doğrulamasına kadar pek çok alt sistem shash kullanır.</p>
+
+  <h3>SHA-256 ile Özet Hesaplama</h3>
+  <p>Aşağıdaki örnek, tek bir çağrıyla SHA-256 özeti hesaplar:</p>
+  <pre><code>#include &lt;linux/module.h&gt;
+#include &lt;crypto/hash.h&gt;
+#include &lt;linux/err.h&gt;
+
+int crypto_sha256_digest(const u8 *data, unsigned int len,
+                         u8 *out /* 32 bayt */)
+{
+    struct crypto_shash *tfm;
+    struct shash_desc   *desc;
+    int ret;
+
+    /* 1. Transform nesnesi */
+    tfm = crypto_alloc_shash("sha256", 0, 0);
+    if (IS_ERR(tfm))
+        return PTR_ERR(tfm);
+
+    /* 2. Descriptor -- inline tahsis (stack güvenli) */
+    desc = kzalloc(sizeof(*desc) + crypto_shash_descsize(tfm),
+                   GFP_KERNEL);
+    if (!desc) {
+        ret = -ENOMEM;
+        goto out_free_tfm;
+    }
+    desc-&gt;tfm = tfm;
+
+    /* 3. Tek adımda özet */
+    ret = crypto_shash_digest(desc, data, len, out);
+
+    kfree(desc);
+out_free_tfm:
+    crypto_free_shash(tfm);
+    return ret;
+}</code></pre>
+
+  <h3>Çok Parçalı (Multi-Part) Hash</h3>
+  <p>Büyük veya parçalı veriler için init/update/final döngüsü kullanılır:</p>
+  <pre><code>ret = crypto_shash_init(desc);
+if (ret) goto err;
+
+ret = crypto_shash_update(desc, part1, len1);
+if (ret) goto err;
+
+ret = crypto_shash_update(desc, part2, len2);
+if (ret) goto err;
+
+ret = crypto_shash_final(desc, out);  /* digest yaz */</code></pre>
+
+  <h3>HMAC Kullanımı</h3>
+  <p>HMAC için algoritma adı <code>"hmac(sha256)"</code> şeklinde belirtilir; anahtar setkey ile yüklenir:</p>
+  <pre><code>tfm = crypto_alloc_shash("hmac(sha256)", 0, 0);
+if (IS_ERR(tfm)) return PTR_ERR(tfm);
+
+ret = crypto_shash_setkey(tfm, key, key_len);
+if (ret) goto err;
+
+/* Ardından normal digest akışı devam eder */</code></pre>
+
+  <h3>Kullanışlı Yardımcı Fonksiyonlar</h3>
+  <div class="params">
+    <div class="param"><span class="name">crypto_shash_digestsize()</span><span class="desc">Özet çıktı boyutunu bayt olarak döner (SHA-256 için 32).</span></div>
+    <div class="param"><span class="name">crypto_shash_descsize()</span><span class="desc">Algoritmanın dahili durum boyutunu döner; descriptor tahsisinde kullanılır.</span></div>
+    <div class="param"><span class="name">crypto_shash_blocksize()</span><span class="desc">Algoritma blok boyutunu döner (SHA-256 için 64).</span></div>
+    <div class="param"><span class="name">crypto_shash_digest()</span><span class="desc">init+update+final işlemini tek çağrıda gerçekleştirir; küçük veriler için uygundur.</span></div>
+  </div>
+
+  <h3>Kernel Yerleşik Kısayollar</h3>
+  <p>Linux 5.10+ sürümlerinde <code>lib/crypto/</code> altında bağımsız kullanılabilir fonksiyonlar vardır. Tam Crypto API iskeleti gerektirmeyen modüller için tercih edilebilir:</p>
+  <pre><code>#include &lt;crypto/sha2.h&gt;
+
+/* Bağımsız SHA-256 — Crypto API gerektirmez */
+sha256(data, len, digest);  /* 32 bayt digest */</code></pre>
+  <p>Ancak bu yol donanım offload'dan yararlanamaz. Donanım hızlandırıcısı olan platformlarda tam Crypto API kullanımı önerilir.</p>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> Simetrik Şifreleme</h2>
+  <p class="section-lead">skcipher (symmetric key cipher) arayüzü, AES gibi blok şifrelerin CBC, CTR, XTS gibi modlarla kullanımını standartlaştırır. Scatter-list tabanlı API sayesinde donanım DMA ile sorunsuz çalışır.</p>
+
+  <h3>AES-CBC Şifreleme Örneği</h3>
+  <pre><code>#include &lt;crypto/skcipher.h&gt;
+#include &lt;linux/scatterlist.h&gt;
+
+struct crypto_skcipher *tfm;
+struct skcipher_request *req;
+struct scatterlist src_sg, dst_sg;
+u8 key[32];   /* AES-256 anahtarı */
+u8 iv[16];    /* CBC başlangıç vektörü */
+u8 plaintext[64];
+u8 ciphertext[64];
+int ret;
+
+/* 1. Transform oluştur */
+tfm = crypto_alloc_skcipher("cbc(aes)", 0, 0);
+if (IS_ERR(tfm)) return PTR_ERR(tfm);
+
+/* 2. Anahtar yükle */
+ret = crypto_skcipher_setkey(tfm, key, sizeof(key));
+if (ret) goto free_tfm;
+
+/* 3. İstek nesnesi */
+req = skcipher_request_alloc(tfm, GFP_KERNEL);
+if (!req) { ret = -ENOMEM; goto free_tfm; }
+
+/* 4. Scatter-list kur */
+sg_init_one(&amp;src_sg, plaintext, sizeof(plaintext));
+sg_init_one(&amp;dst_sg, ciphertext, sizeof(ciphertext));
+
+/* 5. IV ve veri bağla */
+skcipher_request_set_crypt(req, &amp;src_sg, &amp;dst_sg,
+                           sizeof(plaintext), iv);
+
+/* 6. Şifrele */
+ret = crypto_skcipher_encrypt(req);
+
+skcipher_request_free(req);
+free_tfm:
+    crypto_free_skcipher(tfm);
+return ret;</code></pre>
+
+  <h3>IV Yönetimi</h3>
+  <p>CBC modunda IV, her şifreleme işleminde rastgele olmalı ve şifreli veriyle birlikte iletilmelidir. Kernel içi güvenli rastgele veri üretimi için:</p>
+  <pre><code>#include &lt;linux/random.h&gt;
+
+u8 iv[AES_BLOCK_SIZE];
+get_random_bytes(iv, sizeof(iv));
+/* iv'yi şifreli verinin başına ekle, alıcıda çıkar */</code></pre>
+
+  <h3>AES-CTR ve ChaCha20</h3>
+  <p>CTR modu dolgu gerektirmez; gömülü sistemlerde akış şifresine ihtiyaç duyulduğunda tercih edilir:</p>
+  <pre><code>/* AES-CTR */
+tfm = crypto_alloc_skcipher("ctr(aes)", 0, 0);
+
+/* ChaCha20 -- donanım implementasyonu çoğu ARM SoC'de mevcut */
+tfm = crypto_alloc_skcipher("chacha20", 0, 0);</code></pre>
+
+  <h3>Algoritma Seçim Kılavuzu</h3>
+  <div class="file-table"><table>
+    <tr><th>Algoritma</th><th>Anahtar Boyutu</th><th>Avantaj</th><th>Dikkat</th></tr>
+    <tr><td>cbc(aes)</td><td>128/192/256 bit</td><td>Yaygın donanım desteği</td><td>IV tahmin edilemez olmalı</td></tr>
+    <tr><td>ctr(aes)</td><td>128/192/256 bit</td><td>Paralel işlenebilir, dolgu yok</td><td>Nonce tekrar edilmemeli</td></tr>
+    <tr><td>xts(aes)</td><td>256/512 bit</td><td>Disk şifreleme için optimize</td><td>Kimlik doğrulama sunmaz</td></tr>
+    <tr><td>chacha20</td><td>256 bit</td><td>Yazılımsal hız, basit impl.</td><td>Kimlik doğrulama sunmaz</td></tr>
+  </table></div>
+
+  <p>Dikkat: CBC ve CTR modları yalnızca gizlilik sağlar, bütünlük doğrulaması yapmaz. Bütünlük gerektiren senaryolarda AEAD kullanılmalıdır.</p>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> AEAD — Kimlik Doğrulamalı Şifreleme</h2>
+  <p class="section-lead">AEAD (Authenticated Encryption with Associated Data), gizlilik ve bütünlük doğrulamasını tek geçişte sunar. Gömülü güvenli haberleşme protokollerinde (TLS, DTLS, IPsec) standart tercihtir.</p>
+
+  <h3>AEAD Kavramları</h3>
+  <div class="params">
+    <div class="param"><span class="name">Plaintext</span><span class="desc">Şifrelenecek asıl veri.</span></div>
+    <div class="param"><span class="name">AAD (Associated Data)</span><span class="desc">Şifrelenmez ancak kimlik doğrulamaya dahil edilir; paket başlıkları, sıra numaraları için kullanılır.</span></div>
+    <div class="param"><span class="name">Authentication Tag</span><span class="desc">Hem şifreli verinin hem AAD'nin bütünlüğünü doğrulayan kriptografik etiket (AES-GCM'de 16 bayt).</span></div>
+    <div class="param"><span class="name">Nonce / IV</span><span class="desc">AES-GCM'de 12 bayt. Aynı anahtar ile asla tekrar kullanılmamalı; aksi takdirde anahtar açığa çıkabilir.</span></div>
+  </div>
+
+  <h3>AES-GCM ile Şifreleme</h3>
+  <pre><code>#include &lt;crypto/aead.h&gt;
+
+struct crypto_aead *tfm;
+struct aead_request *req;
+struct scatterlist sg[3];  /* aad, plaintext, tag */
+u8 key[32];   /* AES-256-GCM */
+u8 nonce[12]; /* GCM için 12 bayt */
+u8 aad[16];
+u8 plaintext[64];
+u8 ciphertext[64 + 16]; /* veri + 16 bayt tag */
+int ret;
+
+tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
+if (IS_ERR(tfm)) return PTR_ERR(tfm);
+
+/* Tag boyutunu ayarla (16 = maksimum güvenlik) */
+ret = crypto_aead_setauthsize(tfm, 16);
+if (ret) goto free_tfm;
+
+ret = crypto_aead_setkey(tfm, key, sizeof(key));
+if (ret) goto free_tfm;
+
+req = aead_request_alloc(tfm, GFP_KERNEL);
+if (!req) { ret = -ENOMEM; goto free_tfm; }
+
+/* Scatter-list: [aad | plaintext/ciphertext+tag] */
+sg_init_table(sg, 3);
+sg_set_buf(&amp;sg[0], aad, sizeof(aad));
+sg_set_buf(&amp;sg[1], plaintext, sizeof(plaintext));
+/* Şifreli çıktı: ciphertext alanı */
+sg_set_buf(&amp;sg[2], ciphertext, sizeof(ciphertext));
+
+aead_request_set_callback(req, 0, NULL, NULL);
+aead_request_set_crypt(req, sg + 1, sg + 2,
+                       sizeof(plaintext), nonce);
+aead_request_set_ad(req, sizeof(aad));
+
+ret = crypto_aead_encrypt(req);
+
+aead_request_free(req);
+free_tfm:
+    crypto_free_aead(tfm);
+return ret;</code></pre>
+
+  <h3>Şifre Çözme ve Tag Doğrulama</h3>
+  <p>Şifre çözme sırasında AEAD otomatik olarak authentication tag'i doğrular. Tag geçersizse <code>-EBADMSG</code> döner; bu değer kesinlikle kontrol edilmelidir:</p>
+  <pre><code>ret = crypto_aead_decrypt(req);
+if (ret == -EBADMSG) {
+    pr_err("AEAD: kimlik doğrulama başarısız — veri değiştirilmiş!\n");
+    return ret;
+}</code></pre>
+
+  <h3>Gömülü Güvenli Haberleşme Akışı</h3>
+  <div class="flow"><pre>
+Gönderen                           Alıcı
+--------                           ------
+get_random_bytes(nonce, 12)
+
+aead_encrypt(key, nonce,           aead_decrypt(key, nonce,
+             aad, plaintext)                    aad, ciphertext)
+    |                                  |
+    v                                  v
+[nonce | aad | ciphertext | tag] ---> Doğrulama OK / -EBADMSG
+  </pre></div>
+
+  <p>ChaCha20-Poly1305 de popüler bir AEAD tercihidir. Yazılımsal performansı AES-GCM'den üstündür; AES donanım desteği olmayan küçük MCU benzeri sistemlerde avantaj sağlar:</p>
+  <pre><code>tfm = crypto_alloc_aead("rfc7539(chacha20,poly1305)", 0, 0);</code></pre>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> Donanım Hızlandırıcı Entegrasyonu</h2>
+  <p class="section-lead">Gömülü SoC'lerin büyük çoğunluğunda kriptografi donanım motorları bulunur. Crypto API'nin <code>crypto_engine</code> altyapısı bu motorları standart bir şekilde entegre etmeyi sağlar.</p>
+
+  <h3>crypto_engine Altyapısı</h3>
+  <p><code>crypto_engine</code> (<code>crypto/engine.c</code>), asenkron kriptografi işlemlerini sıraya koyar, DMA transferlerini yönetir ve sürücü yazarına basit bir callback modeli sunar. Sürücü yalnızca donanıma özgü prepare/unprepare ve do_one_request fonksiyonlarını uygulamak zorundadır.</p>
+
+  <pre><code>#include &lt;crypto/engine.h&gt;
+
+struct my_crypto_dev {
+    struct crypto_engine *engine;
+    void __iomem        *base;
+    struct clk          *clk;
+    struct reset_control *rst;
+};
+
+/* Engine oluştur */
+dev-&gt;engine = crypto_engine_alloc_init(dev, true);
+if (!dev-&gt;engine) return -ENOMEM;
+
+/* Engine başlat */
+ret = crypto_engine_start(dev-&gt;engine);
+if (ret) {
+    crypto_engine_exit(dev-&gt;engine);
+    return ret;
+}</code></pre>
+
+  <h3>Algoritma Kaydı</h3>
+  <p>Donanım sürücüsü algoritmayı <code>crypto_engine_op</code> yapısı ile kaydeder:</p>
+  <pre><code>static struct skcipher_engine_alg my_aes_alg = {
+    .base = {
+        .base = {
+            .cra_name        = "cbc(aes)",
+            .cra_driver_name = "cbc-aes-my-hw",
+            .cra_priority    = 400,   /* yazılımdan yüksek öncelik */
+            .cra_blocksize   = AES_BLOCK_SIZE,
+            .cra_ctxsize     = sizeof(struct my_aes_ctx),
+            .cra_module      = THIS_MODULE,
+        },
+        .min_keysize = AES_MIN_KEY_SIZE,
+        .max_keysize = AES_MAX_KEY_SIZE,
+        .ivsize      = AES_BLOCK_SIZE,
+        .setkey      = my_aes_setkey,
+        .encrypt     = my_aes_encrypt_req,
+        .decrypt     = my_aes_decrypt_req,
+    },
+    .op.do_one_request = my_aes_do_one_request,
+};
+
+crypto_engine_register_skcipher(&amp;my_aes_alg);</code></pre>
+
+  <h3>Fallback Zinciri</h3>
+  <p>Donanım her anahtar boyutunu veya modu desteklemeyebilir. Fallback zinciri bu durumu şeffaf biçimde yazılım implementasyonuna devreder:</p>
+  <pre><code>struct my_aes_ctx {
+    struct crypto_skcipher *fallback;
+    /* ... hw-specific fields ... */
+};
+
+/* init'te fallback ayır */
+ctx-&gt;fallback = crypto_alloc_skcipher("cbc(aes)", 0,
+                    CRYPTO_ALG_NEED_FALLBACK);
+
+/* encrypt'te: donanım desteklemiyorsa fallback kullan */
+if (!hw_supports_keylen(ctx, keylen)) {
+    skcipher_request_set_tfm(&amp;rctx-&gt;fallback_req,
+                             ctx-&gt;fallback);
+    return crypto_skcipher_encrypt(&amp;rctx-&gt;fallback_req);
+}</code></pre>
+
+  <h3>NXP CAAM Sürücüsü (Örnek Platform)</h3>
+  <div class="params">
+    <div class="param"><span class="name">drivers/crypto/caam/</span><span class="desc">NXP i.MX SoC ailesi için referans crypto_engine implementasyonu. Hem skcipher hem AEAD hem hash destekler.</span></div>
+    <div class="param"><span class="name">CONFIG_CRYPTO_DEV_FSL_CAAM</span><span class="desc">CAAM sürücüsünü etkinleştirir; otomatik olarak yazılım fallback'i de ekler.</span></div>
+    <div class="param"><span class="name">cra_priority = 3000</span><span class="desc">CAAM'ın yüksek önceliği, yazılım AES'ten (öncelik 100) önce seçilmesini garanti eder.</span></div>
+  </div>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> dm-crypt ile Şifreli Depolama</h2>
+  <p class="section-lead">dm-crypt, Linux Device Mapper altyapısı üzerinde blok aygıt düzeyinde şifreleme sağlar. Gömülü sistemlerde hassas verilerin depolandığı bölümler (yapılandırma, kullanıcı verisi) için tercih edilen çözümdür.</p>
+
+  <h3>Kernel Yapılandırması</h3>
+  <pre><code>CONFIG_BLK_DEV_DM=y          # Device Mapper
+CONFIG_DM_CRYPT=y             # dm-crypt hedefi
+CONFIG_CRYPTO_AES=y           # AES temel
+CONFIG_CRYPTO_XTS=y           # XTS modu (disk şifreleme standardı)
+CONFIG_CRYPTO_SHA256=y        # LUKS2 header doğrulama
+CONFIG_CRYPTO_USER_API_SKCIPHER=y  # kullanıcı alanı API
+CONFIG_KEYS=y                 # kernel keyring
+CONFIG_TRUSTED_KEYS=y         # TPM destekli anahtarlar (opsiyonel)</code></pre>
+
+  <h3>LUKS2 ile Şifreli Bölüm Oluşturma</h3>
+  <p>Bu adımlar hedef sistemde veya çapraz derleme ortamında çalıştırılır:</p>
+  <pre><code># Şifreli bölüm oluştur (AES-256-XTS varsayılan)
+cryptsetup luksFormat --type luks2 /dev/mmcblk0p3
+
+# Bölümü aç
+cryptsetup luksOpen /dev/mmcblk0p3 secure_data
+
+# ext4 dosya sistemi oluştur
+mkfs.ext4 /dev/mapper/secure_data
+
+# Bağla
+mount /dev/mapper/secure_data /mnt/secure
+
+# Kapat
+umount /mnt/secure
+cryptsetup luksClose secure_data</code></pre>
+
+  <h3>Otomatik Açma — systemd-cryptsetup</h3>
+  <p>Gömülü sistemlerde otomatik açma için <code>/etc/crypttab</code> kullanılır:</p>
+  <pre><code># /etc/crypttab
+# Ad              Aygıt              Anahtar           Seçenekler
+secure_data       /dev/mmcblk0p3     /etc/dm-key.bin   luks,timeout=0</code></pre>
+
+  <h3>dm-crypt ile dm-verity Birleşimi</h3>
+  <div class="flow"><pre>
+Depolama Aygıtı (/dev/mmcblk0p3)
+        |
+        v
+dm-crypt katmanı  &lt;-- AES-256-XTS şifreleme/çözme
+        |
+        v
+dm-verity katmanı &lt;-- SHA-256 blok doğrulama (salt bozulma tespiti)
+        |
+        v
+Dosya Sistemi (ext4/squashfs)
+  </pre></div>
+
+  <h3>Gömülü Kullanım İpuçları</h3>
+  <div class="params">
+    <div class="param"><span class="name">Anahtar boyutu</span><span class="desc">AES-256-XTS 512 bit anahtar kullanır (iki 256 bit yarım-anahtar). luksFormat --key-size 512 ile ayarlayın.</span></div>
+    <div class="param"><span class="name">Bellekte anahtar</span><span class="desc">Anahtar materyali user_key veya logon key türüyle kernel keyring'e yüklenirse bellek dökümlerinde görünmez.</span></div>
+    <div class="param"><span class="name">Performans</span><span class="desc">AES donanım motoru olmayan sistemlerde AES-128-CBC daha hızlıdır; güvenlik gereksinimlerine göre değerlendirin.</span></div>
+    <div class="param"><span class="name">--perf-no_read_workqueue</span><span class="desc">Linux 5.9+ ile dm-crypt workqueue bypass seçeneği; gerçek zamanlı sistemlerde gecikmeyi azaltır.</span></div>
+  </div>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> Kernel Keyring ile Anahtar Yönetimi</h2>
+  <p class="section-lead">Linux kernel keyring servisi, şifreleme anahtarlarını kullanıcı alanından izole ederek korur. Trusted keys TPM ile, encrypted keys ise master key ile korunur.</p>
+
+  <h3>Keyring Anahtar Türleri</h3>
+  <div class="file-table"><table>
+    <tr><th>Tür</th><th>Güven Kaynağı</th><th>Kullanım</th></tr>
+    <tr><td>user</td><td>Kullanıcı alanı</td><td>Genel amaç; bellekte plaintext</td></tr>
+    <tr><td>logon</td><td>Kullanıcı alanı</td><td>Kullanıcı alanına asla okunmaz</td></tr>
+    <tr><td>trusted</td><td>TPM PCR</td><td>Sealed blob; yalnızca belirli platform durumunda açılır</td></tr>
+    <tr><td>encrypted</td><td>Master key (trusted/user)</td><td>Çekirdek içi şifrelenmiş; DM/fscrypt ile entegre</td></tr>
+  </table></div>
+
+  <h3>Kullanıcı Anahtarı Yükleme</h3>
+  <pre><code># keyctl ile kernel session keyring'e anahtar ekle
+keyctl add user my_dm_key "$(cat /etc/dm-key.bin | xxd -p)" @s
+
+# Anahtar ID'sini al
+KEY_ID=$(keyctl search @s user my_dm_key)
+
+# dm-crypt'e keyring anahtarı bağla
+cryptsetup luksOpen /dev/mmcblk0p3 secure_data \
+    --key-description my_dm_key</code></pre>
+
+  <h3>Encrypted Key ile dm-crypt</h3>
+  <pre><code># Master key oluştur (trusted veya user türünde)
+keyctl add user master_key "$(dd if=/dev/urandom bs=32 count=1 2&gt;/dev/null | xxd -p)" @s
+
+# Encrypted key oluştur (master ile korunur)
+keyctl add encrypted dm_key "new user:master_key 32" @s
+
+# dm-crypt'e bağla
+dmsetup create secure_data \
+    --table "0 $(blockdev --getsz /dev/mmcblk0p3) crypt \
+    aes-xts-plain64 :32:logon:dm_key 0 /dev/mmcblk0p3 0"</code></pre>
+
+  <h3>Kernel Modülünden Anahtar Okuma</h3>
+  <pre><code>#include &lt;linux/key.h&gt;
+#include &lt;linux/keyctl.h&gt;
+#include &lt;keys/user-type.h&gt;
+
+struct key *key;
+struct user_key_payload *payload;
+
+/* Anahtarı bul */
+key = request_key(&amp;key_type_user, "my_dm_key", NULL);
+if (IS_ERR(key)) return PTR_ERR(key);
+
+/* Yük veriye eriş */
+payload = key-&gt;payload.data[0];
+memcpy(out_key, payload-&gt;data, payload-&gt;datalen);
+
+/* Referansı serbest bırak */
+key_put(key);</code></pre>
+
+  <h3>TPM ile Güvenli Önyükleme Entegrasyonu</h3>
+  <div class="flow"><pre>
+Platform Önyüklemesi
+        |
+        v
+TPM PCR Ölçümleri (bootloader, kernel, initrd)
+        |
+        v
+trusted key unsealed (PCR değerleri eşleşirse)
+        |
+        v
+encrypted dm key çözülür
+        |
+        v
+dm-crypt bölümü açılır (kullanıcı müdahalesi olmadan)
+  </pre></div>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Hata Ayıklama ve Benchmark</h2>
+  <p class="section-lead">/proc/crypto, tcrypt modülü ve kernel debug altyapıları, kriptografi performansını ölçmeyi ve sorunları tespit etmeyi kolaylaştırır.</p>
+
+  <h3>/proc/crypto — Kayıtlı Algoritmalar</h3>
+  <pre><code># Tüm kayıtlı algoritmaları listele
+cat /proc/crypto
+
+# Belirli bir algoritmayı filtrele
+grep -A 10 "name.*gcm" /proc/crypto</code></pre>
+  <p><code>/proc/crypto</code> her algoritma için tür, blok boyutu, özet boyutu, öncelik ve sürücü adını gösterir. Donanım hızlandırıcısının devrede olup olmadığını <code>driver</code> ve <code>priority</code> alanlarından anlayabilirsiniz.</p>
+
+  <h3>tcrypt Modülü ile Benchmark</h3>
+  <pre><code># AES-CBC benchmark (test=10: skcipher testleri)
+modprobe tcrypt mode=10 sec=5
+
+# AES-GCM AEAD benchmark
+modprobe tcrypt mode=211 sec=5
+
+# SHA-256 hash benchmark
+modprobe tcrypt mode=304 sec=5
+
+# Tüm mevcut testler
+modprobe tcrypt mode=0</code></pre>
+
+  <h3>Örnek tcrypt Çıktısı</h3>
+  <pre><code>testing speed of async cbc(aes) (cbc-aes-caam) encryption
+test  0 (  16 byte blocks,  16 bytes per update,   1 updates): 1523456 opers/sec, 24375296 bytes/sec
+test  1 ( 128 byte blocks,  16 bytes per update,   8 updates): 897234 opers/sec, 114845952 bytes/sec
+test  8 (4096 byte blocks,4096 bytes per update,   1 updates): 312441 opers/sec, 1279848448 bytes/sec</code></pre>
+
+  <h3>Bellek Sızıntısı Tespiti</h3>
+  <p>Crypto API nesneleri çifter tahsis/serbest bırakma gerektirir. Kasan veya kmemleak ile sızıntılar yakalanabilir:</p>
+  <pre><code># Konfigürasyon
+CONFIG_KASAN=y
+CONFIG_KMEMLEAK=y
+
+# Kmemleak tetikleme
+echo scan &gt; /sys/kernel/debug/kmemleak
+cat /sys/kernel/debug/kmemleak</code></pre>
+
+  <h3>Yaygın Hatalar ve Çözümleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">-ENOENT / -EINVAL (alloc)</span><span class="desc">Algoritma kayıtlı değil. /proc/crypto kontrol edin; gerekli CONFIG_CRYPTO_* seçeneğini etkinleştirin.</span></div>
+    <div class="param"><span class="name">-EBADMSG (AEAD decrypt)</span><span class="desc">Authentication tag doğrulaması başarısız. Veri bozulmuş ya da yanlış anahtar/nonce kullanıldı.</span></div>
+    <div class="param"><span class="name">-EINVAL (setkey)</span><span class="desc">Geçersiz anahtar boyutu. min_keysize / max_keysize aralığını kontrol edin.</span></div>
+    <div class="param"><span class="name">Kernel Oops (sg)</span><span class="desc">Scatter-list tamponu DMA uyumsuz bellek bölgesinde. kmalloc (GFP_DMA) veya dma_alloc_coherent kullanın.</span></div>
+    <div class="param"><span class="name">Performans düşüklüğü</span><span class="desc">Donanım motoru devreye girmemiş olabilir. cra_driver_name ve priority değerini /proc/crypto'dan doğrulayın.</span></div>
+  </div>
+
+  <h3>Üretim Ortamı Notları</h3>
+  <pre><code># CONFIG_CRYPTO_MANAGER_DISABLE_TESTS -- boot süresini azaltır
+# (test vektörleri yükleme sırasında atlanır)
+# Üretim görüntülerinde etkinleştirilebilir, geliştirme aşamasında KAPALI tutun
+
+CONFIG_CRYPTO_MANAGER_DISABLE_TESTS=y
+
+# FIPS modu -- onaylı olmayan algoritmalar engellenir
+CONFIG_CRYPTO_FIPS=y
+# Önyükleme parametresi: fips=1</code></pre>
+</section>
+
+</main>

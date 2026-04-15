@@ -1,0 +1,705 @@
+---
+layout: tutorial
+title: "ftrace — Derinlemesine Kernel İzleme"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span><span>GÖMÜLÜ LİNUX</span><span>PERFORMANS</span><span>2026</span>
+  </div>
+  <h1>ftrace<br><em>Derinlemesine Kernel İzleme</em></h1>
+  <p class="subtitle">ftrace function tracer, function_graph, event tracing, kprobe/uprobe dinamik iz noktaları ve trace-cmd ile gömülü sistemlerde kernel davranış analizi.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">ftrace Neden?</a></li>
+    <li><a href="#s1">Tracefs Altyapısı</a></li>
+    <li><a href="#s2">function ve function_graph Tracer</a></li>
+    <li><a href="#s3">Event Tracing</a></li>
+    <li><a href="#s4">kprobe Dinamik İzleme</a></li>
+    <li><a href="#s5">uprobe Kullanıcı Alanı İzleme</a></li>
+    <li><a href="#s6">trace-cmd Kullanımı</a></li>
+    <li><a href="#s7">Gömülü Senaryo — IRQ ve Zamanlayıcı Analizi</a></li>
+    <li><a href="#s8">Hata Ayıklama ve Üretim Notları</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> ftrace Neden?</h2>
+  <p class="section-lead">Kernel davranışını anlamak için en fazla başvurulan yöntem printk eklemektir; ancak bu yaklaşım yüksek overhead oluşturur, derleme gerektirir ve üretim sistemlerinde uygulanamaz. ftrace bu sınırlamaların tamamını ortadan kaldırır.</p>
+
+  <h3>printk Maliyeti</h3>
+  <p>printk çağrısı seri port veya konsol sürücüsünü tetikler; bu işlem mikrosaniyelerden milisaniyelere kadar gecikme ekleyebilir. Gerçek zamanlı sistemlerde IRQ handler içinde printk kullanmak zamanlama ölçümlerini tamamen bozar. Üstelik her eklenen printk için yeniden derleme, kurulum ve yeniden başlatma gerekir.</p>
+
+  <h3>Ring Buffer Mekanizması</h3>
+  <p>ftrace, kernel içinde kilitsiz (lock-free) ring buffer'lar kullanır. Her CPU'nun kendi ring buffer'ı vardır; bu sayede CPU arası çakışma önlenir. Tracepoint kayıt işlemi genellikle 50-100 ns aralığındadır — printk'ten 1000 kat daha hızlı.</p>
+
+  <div class="flow"><pre>
+Kernel Fonksiyon / Olay
+        |
+        v
+ftrace ring buffer (CPU başına)
+        |
+        +----> /sys/kernel/tracing/trace      (anlık okuma)
+        |
+        +----> /sys/kernel/tracing/trace_pipe (akış okuma)
+        |
+        +----> trace-cmd / perf okuma (binary format)
+  </pre></div>
+
+  <h3>Sıfır-Overhead Tracepoint'ler</h3>
+  <p>Statik tracepoint'ler (TRACE_EVENT makrosu ile tanımlanmış) devre dışıyken yalnızca bir NOP talimatı olarak çalışır. Etkinleştirildiğinde kernel, NOP'u JMP ile değiştirir (text_poke ile). Bu mekanizma sayesinde devre dışı tracepoint'lerin sistemde pratik olarak sıfır maliyeti vardır.</p>
+
+  <h3>Kernel Yapılandırması</h3>
+  <pre><code>CONFIG_FTRACE=y
+CONFIG_FUNCTION_TRACER=y          # function tracer
+CONFIG_FUNCTION_GRAPH_TRACER=y    # function_graph tracer
+CONFIG_DYNAMIC_FTRACE=y           # dinamik etkinleştirme (NOP mekanizması)
+CONFIG_KPROBES=y                  # kprobe desteği
+CONFIG_KPROBE_EVENTS=y            # kprobe olay izleme
+CONFIG_UPROBES=y                  # uprobe desteği
+CONFIG_UPROBE_EVENTS=y            # uprobe olay izleme
+CONFIG_TRACING=y
+CONFIG_TRACEPOINTS=y
+CONFIG_TRACE_EVENTS_ENABLED=y</code></pre>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> Tracefs Altyapısı</h2>
+  <p class="section-lead">Tracefs, ftrace ile etkileşimin temel arayüzüdür. /sys/kernel/tracing (veya eski /sys/kernel/debug/tracing) altındaki sanal dosya sistemi aracılığıyla tüm ftrace özellikleri yapılandırılır ve veriler okunur.</p>
+
+  <h3>Temel Dizin Yapısı</h3>
+  <div class="file-table"><table>
+    <tr><th>Dosya / Dizin</th><th>Açıklama</th></tr>
+    <tr><td>current_tracer</td><td>Etkin tracer adı (nop, function, function_graph)</td></tr>
+    <tr><td>available_tracers</td><td>Desteklenen tracer'ların listesi</td></tr>
+    <tr><td>tracing_on</td><td>1: izleme açık, 0: kapalı</td></tr>
+    <tr><td>trace</td><td>Ring buffer içeriğinin anlık görüntüsü</td></tr>
+    <tr><td>trace_pipe</td><td>Ring buffer akışı (tüketici-üretici, bloklayan okuma)</td></tr>
+    <tr><td>buffer_size_kb</td><td>Her CPU için ring buffer boyutu (KB)</td></tr>
+    <tr><td>set_ftrace_filter</td><td>İzlenecek fonksiyon filtresi (function tracer)</td></tr>
+    <tr><td>set_ftrace_notrace</td><td>İzlenmeyecek fonksiyonlar</td></tr>
+    <tr><td>set_graph_function</td><td>function_graph başlangıç fonksiyonu</td></tr>
+    <tr><td>events/</td><td>Olay alt sistemi (enable/disable/filter)</td></tr>
+    <tr><td>kprobe_events</td><td>Dinamik kprobe tanımları</td></tr>
+    <tr><td>uprobe_events</td><td>Dinamik uprobe tanımları</td></tr>
+  </table></div>
+
+  <h3>Tracefs Bağlama</h3>
+  <pre><code># Modern çekirdeklerde otomatik bağlı gelir:
+mount -t tracefs tracefs /sys/kernel/tracing
+
+# Yol kısayolu (geriye dönük uyumluluk):
+ls /sys/kernel/debug/tracing   # debugfs altında ayna
+
+# Çalışma dizinini ayarla (kolaylık için)
+TRACING=/sys/kernel/tracing</code></pre>
+
+  <h3>Temel Kullanım Kalıbı</h3>
+  <pre><code>TRACING=/sys/kernel/tracing
+
+# 1. Buffer temizle
+echo &gt; $TRACING/trace
+
+# 2. Tracer seç
+echo function &gt; $TRACING/current_tracer
+
+# 3. Buffer boyutunu artır (gömülü sistemlerde dikkatli ol)
+echo 4096 &gt; $TRACING/buffer_size_kb
+
+# 4. İzlemeyi başlat
+echo 1 &gt; $TRACING/tracing_on
+
+# 5. Test yükü çalıştır
+my_test_program
+
+# 6. İzlemeyi durdur
+echo 0 &gt; $TRACING/tracing_on
+
+# 7. Sonuçları oku
+cat $TRACING/trace | head -100</code></pre>
+
+  <h3>Önemli Performans Notu</h3>
+  <p>Gömülü sistemlerde ring buffer boyutunu dikkatli ayarlayın. Her CPU için 4 MB buffer, 512 MB RAM'li bir sistemde önemli bir pay olabilir. <code>buffer_size_kb</code> değerini ihtiyaca göre küçültün; <code>saved_cmdlines_size</code> de PID-komut eşlemesi için bellek kullanır.</p>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> function ve function_graph Tracer</h2>
+  <p class="section-lead">function tracer her çağrılan kernel fonksiyonunu kaydeder. function_graph ise çağrı ağacını zaman damgalarıyla birlikte gösterir; hangi fonksiyonun ne kadar süre çalıştığını görselleştirir.</p>
+
+  <h3>function Tracer</h3>
+  <pre><code>TRACING=/sys/kernel/tracing
+
+# function tracer'ı etkinleştir
+echo function &gt; $TRACING/current_tracer
+
+# Yalnızca belirli fonksiyonları izle (örn: ext4 yazma yolu)
+echo 'ext4_*' &gt; $TRACING/set_ftrace_filter
+
+# Gürültülü fonksiyonları dışla
+echo 'rcu_*' &gt; $TRACING/set_ftrace_notrace
+
+echo 1 &gt; $TRACING/tracing_on
+# ... işlem ...
+echo 0 &gt; $TRACING/tracing_on
+cat $TRACING/trace</code></pre>
+
+  <h3>function Tracer Çıktısı</h3>
+  <pre><code># tracer: function
+#
+#           TASK-PID   CPU#  ||||  TIMESTAMP  FUNCTION
+#              | |       |   ||||     |         |
+       kworker-45    [001] d... 1234.567890: ext4_file_write_iter &lt;-new_sync_write
+       kworker-45    [001] d... 1234.567891: ext4_buffered_write_iter &lt;-ext4_file_write_iter
+       kworker-45    [001] d... 1234.567892: generic_perform_write &lt;-ext4_buffered_write_iter</code></pre>
+
+  <p>TIMESTAMP sütunu, sistemin başlamasından bu yana geçen saniyeyi gösterir. Latency formatı etkinleştirilirse IRQ durumu, preemption sayacı ve NEED_RESCHED bayrağı da görünür.</p>
+
+  <h3>function_graph Tracer</h3>
+  <pre><code># function_graph tracer'ı etkinleştir
+echo function_graph &gt; $TRACING/current_tracer
+
+# Yalnızca belirli bir fonksiyondan başla
+echo tcp_sendmsg &gt; $TRACING/set_graph_function
+
+# Maksimum çağrı derinliği (varsayılan: 0 = sınırsız)
+echo 5 &gt; $TRACING/max_graph_depth
+
+echo 1 &gt; $TRACING/tracing_on
+# ...
+echo 0 &gt; $TRACING/tracing_on</code></pre>
+
+  <h3>function_graph Çıktısı</h3>
+  <pre><code># tracer: function_graph
+#
+# CPU  DURATION                  FUNCTION CALLS
+# |     |   |                     |   |   |   |
+ 0)   0.842 us    |              _raw_spin_lock_irqsave();
+ 0)   0.310 us    |              _raw_spin_unlock_irqrestore();
+ 0)   + 14.560 us |           tcp_sendmsg_locked() {
+ 0)   1.042 us    |             tcp_rate_check_app_limited();
+ 0)   2.384 us    |             tcp_send_mss();
+ 0)               |             tcp_write_xmit() {
+ 0)   0.917 us    |               tcp_nagle_test();
+ 0)   + 8.124 us  |             }
+ 0)   + 14.560 us |           }</code></pre>
+
+  <h3>Latency Format Sembolleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">d (IRQ devre dışı)</span><span class="desc">Fonksiyon çalışırken kesme devre dışı bırakılmış.</span></div>
+    <div class="param"><span class="name">n (NEED_RESCHED)</span><span class="desc">Zamanlayıcı bu CPU'da bağlam anahtarlaması talep ediyor.</span></div>
+    <div class="param"><span class="name">p (preempt_count &gt; 0)</span><span class="desc">Preemption devre dışı, bağlam anahtarlaması engellenmiş.</span></div>
+    <div class="param"><span class="name">+ (10-100 µs)</span><span class="desc">Fonksiyon süresi 10-100 mikrosaniye arası.</span></div>
+    <div class="param"><span class="name">! (&gt; 100 µs)</span><span class="desc">Fonksiyon süresi 100 mikrosaniyeyi geçiyor; dikkat gerektiren durum.</span></div>
+  </div>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> Event Tracing</h2>
+  <p class="section-lead">Event tracing, kernel içindeki önceden tanımlanmış TRACE_EVENT noktalarını izler. Zamanlayıcı, ağ, disk I/O, bellek yönetimi gibi alt sistemler için kapsamlı izleme olanakları sunar.</p>
+
+  <h3>Mevcut Olayları Keşfetme</h3>
+  <pre><code>TRACING=/sys/kernel/tracing
+
+# Tüm olay kategorilerini listele
+ls $TRACING/events/
+
+# Belirli bir kategorinin olaylarını listele
+ls $TRACING/events/sched/
+
+# Tüm mevcut olayları düz liste
+cat $TRACING/available_events | grep sched | head -20</code></pre>
+
+  <h3>Olay Etkinleştirme</h3>
+  <pre><code># Tüm zamanlayıcı olaylarını etkinleştir
+echo 1 &gt; $TRACING/events/sched/enable
+
+# Yalnızca belirli olayı etkinleştir
+echo 1 &gt; $TRACING/events/sched/sched_switch/enable
+echo 1 &gt; $TRACING/events/sched/sched_wakeup/enable
+
+# IRQ olaylarını etkinleştir
+echo 1 &gt; $TRACING/events/irq/enable
+
+# Block I/O olayları
+echo 1 &gt; $TRACING/events/block/block_rq_issue/enable
+echo 1 &gt; $TRACING/events/block/block_rq_complete/enable</code></pre>
+
+  <h3>Olay Formatı</h3>
+  <pre><code># Olay formatını incele (alanlar ve türler)
+cat $TRACING/events/sched/sched_switch/format</code></pre>
+  <pre><code>name: sched_switch
+ID: 315
+format:
+    field:unsigned short common_type;       offset:0;  size:2; signed:0;
+    field:unsigned char common_flags;       offset:2;  size:1; signed:0;
+    field:int common_pid;                   offset:4;  size:4; signed:1;
+
+    field:char prev_comm[16];               offset:8;  size:16; signed:1;
+    field:pid_t prev_pid;                   offset:24; size:4;  signed:1;
+    field:int prev_prio;                    offset:28; size:4;  signed:1;
+    field:long prev_state;                  offset:32; size:8;  signed:1;
+    field:char next_comm[16];               offset:40; size:16; signed:1;
+    field:pid_t next_pid;                   offset:56; size:4;  signed:1;
+    field:int next_prio;                    offset:60; size:4;  signed:1;</code></pre>
+
+  <h3>Olay Filtreleme</h3>
+  <p>Filter sözdizimi, C koşul ifadelerine benzer biçimde alanlar üzerinde karşılaştırma yapar:</p>
+  <pre><code># Yalnızca pid=1234 olan sched_switch olayları
+echo 'prev_pid == 1234 || next_pid == 1234' \
+    &gt; $TRACING/events/sched/sched_switch/filter
+
+# IRQ latency filtresi (100 µs üzeri)
+echo 'irq_duration &gt; 100000' \
+    &gt; $TRACING/events/irq/irq_handler_entry/filter
+
+# String filtresi
+echo 'comm == "my_process"' \
+    &gt; $TRACING/events/sched/sched_wakeup/filter</code></pre>
+
+  <h3>Önemli Event Kategorileri</h3>
+  <div class="file-table"><table>
+    <tr><th>Kategori</th><th>Tipik Kullanım</th></tr>
+    <tr><td>sched/sched_switch</td><td>Bağlam anahtarlama, CPU kullanımı analizi</td></tr>
+    <tr><td>sched/sched_wakeup</td><td>Uyandırma gecikmesi ölçümü</td></tr>
+    <tr><td>irq/irq_handler_entry|exit</td><td>IRQ handler süresi</td></tr>
+    <tr><td>block/block_rq_*</td><td>Disk I/O gecikme analizi</td></tr>
+    <tr><td>net/net_dev_xmit</td><td>Ağ paketi gönderme yolu</td></tr>
+    <tr><td>kmem/kmalloc</td><td>Kernel bellek tahsis profillemesi</td></tr>
+    <tr><td>syscalls/sys_enter_*</td><td>Sistem çağrısı izleme</td></tr>
+  </table></div>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> kprobe Dinamik İzleme</h2>
+  <p class="section-lead">kprobe, herhangi bir kernel sembolüne veya belirli bir adrese çalışma anında dinamik iz noktası eklemeyi sağlar. Kaynak kodu değişikliği veya yeniden derleme gerektirmez.</p>
+
+  <h3>kprobe_events Sözdizimi</h3>
+  <pre><code># Temel sözdizim:
+# p[:[grup/]ad] SEMBOL[+ofset] [arg1 ...]
+# r[:[grup/]ad] SEMBOL[+ofset] [arg1 ...]  (dönüş noktası)
+
+TRACING=/sys/kernel/tracing
+
+# tcp_sendmsg girişinde izleme: uzunluk argümanı (x86_64: rdx)
+echo 'p:myprobes/tcp_send tcp_sendmsg size=%dx' \
+    &gt; $TRACING/kprobe_events
+
+# tcp_sendmsg dönüşünde: dönüş değeri
+echo 'r:myprobes/tcp_send_ret tcp_sendmsg ret=$retval' \
+    &gt;&gt; $TRACING/kprobe_events</code></pre>
+
+  <h3>Argüman Okuma Sözdizimi</h3>
+  <div class="file-table"><table>
+    <tr><th>Sözdizim</th><th>Anlam</th></tr>
+    <tr><td>%REG</td><td>Kayıt defteri değeri (mimariye özgü: ax, dx, si, di...)</td></tr>
+    <tr><td>$retval</td><td>Fonksiyon dönüş değeri (r: için)</td></tr>
+    <tr><td>$stack0, $stack1</td><td>Stack argümanları</td></tr>
+    <tr><td>+OFSET(REG)</td><td>Bellek dereferans: REG + OFSET adresindeki değer</td></tr>
+    <tr><td>+0(%di):string</td><td>İlk argümandan string okuma</td></tr>
+    <tr><td>$comm</td><td>Mevcut görevin komut adı</td></tr>
+  </table></div>
+
+  <h3>kprobe Olayını Etkinleştirme ve Okuma</h3>
+  <pre><code># Probe olayını etkinleştir
+echo 1 &gt; $TRACING/events/myprobes/tcp_send/enable
+echo 1 &gt; $TRACING/events/myprobes/tcp_send_ret/enable
+
+# İzlemeyi başlat ve akışı oku
+echo 1 &gt; $TRACING/tracing_on
+cat $TRACING/trace_pipe &amp;
+
+# ... test işlemi ...
+
+echo 0 &gt; $TRACING/tracing_on
+
+# Tüm probe'ları temizle
+echo &gt; $TRACING/kprobe_events</code></pre>
+
+  <h3>Kernel Fonksiyon Parametrelerine Erişim</h3>
+  <p>Hangi register'ın hangi parametreye karşılık geldiği sisteme ve calling convention'a göre değişir. ARM64 için:</p>
+  <pre><code># ARM64 calling convention:
+# x0 = arg1, x1 = arg2, x2 = arg3, x3 = arg4
+
+# do_sys_open(dfd, filename, flags, mode)
+echo 'p:myprobes/open do_sys_openat2 filename=+0(%x1):string flags=%x2' \
+    &gt; $TRACING/kprobe_events</code></pre>
+
+  <h3>kretprobe ile Gecikme Ölçümü</h3>
+  <pre><code># Fonksiyon giriş/çıkış çiftini tanımla
+echo 'p:t/start schedule' &gt; $TRACING/kprobe_events
+echo 'r:t/end   schedule ret=$retval' &gt;&gt; $TRACING/kprobe_events
+
+# Trigger ile otomatik histogram
+echo 'hist:key=common_pid:val=hitcount' \
+    &gt; $TRACING/events/t/start/trigger
+
+# Sonuçları oku
+cat $TRACING/events/t/start/hist</code></pre>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> uprobe Kullanıcı Alanı İzleme</h2>
+  <p class="section-lead">uprobe, kullanıcı alanı binary'leri ve kütüphaneleri içindeki fonksiyonları kernel seviyesinde izler. ELF sembol tablosu veya USDT (User Statically Defined Tracing) noktaları kullanılabilir.</p>
+
+  <h3>ELF Offset Hesaplama</h3>
+  <p>uprobe için fonksiyonun ELF binary içindeki offset'ini bulmak gerekir:</p>
+  <pre><code># objdump ile sembol offset'ini bul
+objdump -d /usr/bin/my_app | grep -A 3 "&lt;my_function&gt;"
+
+# readelf ile sembol tablosu
+readelf -s /usr/bin/my_app | grep my_function
+
+# nm ile sembol adresi
+nm -D /usr/bin/my_app | grep my_function
+
+# Örnek çıktı: 0000000000001a40 T my_function
+# Offset: 0x1a40</code></pre>
+
+  <h3>uprobe Tanımlama</h3>
+  <pre><code>TRACING=/sys/kernel/tracing
+
+# p:grup/ad YOLU:OFFSET [argümanlar]
+# /usr/bin/my_app içinde my_function (offset 0x1a40)
+echo 'p:myuprobes/my_func /usr/bin/my_app:0x1a40' \
+    &gt; $TRACING/uprobe_events
+
+# Geri dönüş noktası
+echo 'r:myuprobes/my_func_ret /usr/bin/my_app:0x1a40 ret=$retval' \
+    &gt;&gt; $TRACING/uprobe_events
+
+# Etkinleştir
+echo 1 &gt; $TRACING/events/myuprobes/my_func/enable
+
+# Belirli bir PID'e sınırla
+echo PID_VALUE &gt; $TRACING/set_event_pid</code></pre>
+
+  <h3>Paylaşılan Kütüphane izleme</h3>
+  <pre><code># libc malloc fonksiyonunu izle
+# malloc offset'ini bul:
+readelf -s /lib/aarch64-linux-gnu/libc.so.6 | grep " malloc$"
+# Örnek: 000000000007a2d0 T malloc
+
+echo 'p:alibs/malloc /lib/aarch64-linux-gnu/libc.so.6:0x7a2d0 size=%x0' \
+    &gt; $TRACING/uprobe_events
+
+echo 1 &gt; $TRACING/events/alibs/malloc/enable</code></pre>
+
+  <h3>USDT (User Statically Defined Tracing)</h3>
+  <p>USDT, kaynak koduna eklenmiş statik iz noktalarıdır. GCC/Clang <code>sys/sdt.h</code> başlığı ile tanımlanır:</p>
+  <pre><code>/* Uygulama kaynak kodu */
+#include &lt;sys/sdt.h&gt;
+
+void process_request(int req_id, size_t size)
+{
+    DTRACE_PROBE2(myapp, request__start, req_id, size);
+    /* ... işlem ... */
+    DTRACE_PROBE1(myapp, request__end, req_id);
+}</code></pre>
+
+  <pre><code># USDT noktalarını listele
+readelf -n /usr/bin/my_app | grep -A 5 NT_STAPSDT
+
+# bpftrace ile USDT izleme
+bpftrace -e 'usdt:/usr/bin/my_app:myapp:request__start {
+    printf("req_id=%d size=%d\n", arg0, arg1);
+}'</code></pre>
+
+  <h3>uprobe ile Performans Profilleme</h3>
+  <div class="params">
+    <div class="param"><span class="name">Giriş/çıkış çifti</span><span class="desc">p: ve r: probe çifti ile fonksiyon süresi ölçülebilir; histogram trigger ile otomatik dağılım hesaplanır.</span></div>
+    <div class="param"><span class="name">PID filtresi</span><span class="desc">set_event_pid ile tek bir sürece odaklanılabilir; çoklu süreç gürültüsü önlenir.</span></div>
+    <div class="param"><span class="name">Sembolik argüman</span><span class="desc">%x0, %x1 (ARM64) veya %di, %si (x86_64) ile fonksiyon argümanları okunabilir; struct alanlarına +OFSET(REG) ile erişilir.</span></div>
+  </div>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> trace-cmd Kullanımı</h2>
+  <p class="section-lead">trace-cmd, ftrace'in tracefs arayüzü üzerine kurulmuş komut satırı aracıdır. İkili format kaydı, sıkıştırma ve KernelShark görselleştirme desteğiyle üretim analizini kolaylaştırır.</p>
+
+  <h3>trace-cmd record</h3>
+  <pre><code># Tüm zamanlayıcı olaylarını kaydet
+trace-cmd record -e sched ./my_workload
+
+# Birden fazla olay kategorisi
+trace-cmd record \
+    -e sched \
+    -e irq \
+    -e block \
+    ./my_workload
+
+# Function_graph tracer ile belirli fonksiyon
+trace-cmd record \
+    -p function_graph \
+    -g tcp_sendmsg \
+    -O nohup \
+    sleep 5
+
+# Belirli PID
+trace-cmd record -e sched -P 1234 sleep 10
+
+# Ring buffer boyutu (MB cinsinden)
+trace-cmd record -b 8 -e sched sleep 5</code></pre>
+
+  <h3>trace-cmd report</h3>
+  <pre><code># trace.dat dosyasını metin olarak raporla
+trace-cmd report
+
+# Belirli bir CPU'nun izini göster
+trace-cmd report --cpu 0
+
+# Zaman aralığı filtresi
+trace-cmd report --start-time 1234.5 --stop-time 1234.6
+
+# Özet istatistikler
+trace-cmd report --stat
+
+# Latency formatı
+trace-cmd report -l</code></pre>
+
+  <h3>trace-cmd hist ile Histogram</h3>
+  <pre><code># sched_switch gecikme histogramı
+trace-cmd hist -e sched_switch
+
+# IRQ handler süre dağılımı
+trace-cmd hist -e irq_handler_exit
+
+# Örnek çıktı:
+# usecs         count    distribution
+# 0 -&gt; 1        1523   |********************|
+# 2 -&gt; 3         892   |***********         |
+# 4 -&gt; 7         234   |***                 |
+# 8 -&gt; 15         45   |                    |
+# 16 -&gt; 31          8   |                    |</code></pre>
+
+  <h3>Uzak Sistemden Kayıt (Gömülü Hedef)</h3>
+  <pre><code"># Hedef sistemde agent başlat (trace-cmd'in bir parçası)
+trace-cmd listen -p 1234
+
+# Geliştirme makinesinden bağlan ve kaydet
+trace-cmd record \
+    -N 192.168.1.100:1234 \
+    -e sched \
+    sleep 10
+
+# Kayıt dosyasını al ve raporla
+trace-cmd report</code></pre>
+
+  <h3>KernelShark Görselleştirme</h3>
+  <p>KernelShark, trace-cmd verisini grafiksel olarak gösterir. Zaman çizelgesinde CPU aktivitesini, görev geçişlerini ve olayları renkli şeritlerle sunar:</p>
+  <pre><code># trace.dat kayıt dosyasını KernelShark ile aç
+kernelshark trace.dat
+
+# Alternatif: trace-cmd stream ile canlı görüntüleme
+trace-cmd stream -e sched | kernelshark -i -</code></pre>
+
+  <h3>trace-cmd ile Tetikleyici Kullanımı</h3>
+  <pre><code># Belirli bir fonksiyon çağrıldığında izlemeyi başlat
+trace-cmd record \
+    -e sched \
+    --func-trace \
+    -T start_cond_func \
+    sleep 5</code></pre>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> Gömülü Senaryo — IRQ ve Zamanlayıcı Analizi</h2>
+  <p class="section-lead">Gerçek zamanlı gömülü sistemlerde IRQ gecikme analizi ve zamanlayıcı uyandırma gecikmesi kritik önemdedir. ftrace bu metrikleri ölçmek için biçilmiş kaftandır.</p>
+
+  <h3>IRQ Gecikme Analizi</h3>
+  <pre><code>TRACING=/sys/kernel/tracing
+
+# irqsoff tracer: IRQ devre dışı bırakılan en uzun aralığı yakala
+echo irqsoff &gt; $TRACING/current_tracer
+echo 1 &gt; $TRACING/tracing_on
+
+# Test yükü çalıştır
+./irq_latency_test
+
+echo 0 &gt; $TRACING/tracing_on
+cat $TRACING/trace</code></pre>
+
+  <h3>irqsoff Çıktı Yorumlama</h3>
+  <pre><code># irqsoff latency trace v1.1.5 on 5.15.0-rt
+# -----------------
+# latency: 127 us, #4/4, CPU#1 | (M:rt VP:0, KP:0, SP:0 HP:0 #P:4)
+#    -----------------
+#    | task: irq/35-eth0-312 (uid:0 nice:0 policy:1 rt_prio:50)
+#    -----------------
+#
+#                  _------=&gt; CPU#
+#                 / _-----=&gt; irqs-off
+#                | / _----=&gt; need-resched
+#                || / _---=&gt; hardirq/softirq
+#                ||| / _--=&gt; preempt-depth
+#                |||| /
+#  TIME           TASK/PID     DURATION        FUNCTION CALLS
+# |                 | |           |             |   |   |   |
+ 0.000000 |   0)  irq/35-312   |             | spin_lock_irqsave();
+ 0.000041 |   0)  irq/35-312   |   41 us   ! | _raw_spin_lock();
+ 0.000127 |   0)  irq/35-312   |  127 us   ! | spin_unlock_irqrestore();</code></pre>
+
+  <h3>Wakeup Latency Ölçümü</h3>
+  <pre><code># wakeup tracer: yüksek öncelikli görevin uyanma gecikmesi
+echo wakeup &gt; $TRACING/current_tracer
+
+# Yalnızca RT görevleri için
+echo wakeup_rt &gt; $TRACING/current_tracer
+
+echo 1 &gt; $TRACING/tracing_on
+# Test: RT thread uyandır
+./rt_wakeup_test
+echo 0 &gt; $TRACING/tracing_on
+cat $TRACING/trace</code></pre>
+
+  <h3>PREEMPT_RT ile Karşılaştırma</h3>
+  <div class="flow"><pre>
+Standart Kernel                    PREEMPT_RT Kernel
+----------------                   -----------------
+IRQ Handler (hardirq)              IRQ thread (kthread)
+  |                                  |
+  v                                  v
+softirq / tasklet                  RT kthread (prio=50)
+  |                                  |
+  v                                  v
+Zamanlayıcı (CFS/RT)               Zamanlayıcı (CFS/RT)
+
+Gecikme: ~50-500 µs                Gecikme: ~20-100 µs (iyileştirilmiş)
+
+ftrace irqsoff tracer ile ölç:
+  Standart: max latency 300 µs     PREEMPT_RT: max latency 80 µs
+  </pre></div>
+
+  <h3>Pratik Analiz Senaryo: SPI IRQ Gecikmesi</h3>
+  <pre><code># SPI transfer tamamlanma IRQ'sından veri işlemeye kadar gecikme
+# Adım 1: IRQ girişini kprobe ile izle
+echo 'p:spi_irq spi_transfer_one_irq' \
+    &gt; $TRACING/kprobe_events
+
+# Adım 2: Callback fonksiyonunu izle
+echo 'p:spi_cb spi_complete_transfer' \
+    &gt;&gt; $TRACING/kprobe_events
+
+# Adım 3: Her ikisini etkinleştir ve kaydet
+echo 1 &gt; $TRACING/events/spi_irq/enable
+echo 1 &gt; $TRACING/events/spi_cb/enable
+echo 1 &gt; $TRACING/tracing_on
+
+# Adım 4: Zaman farkını hesapla
+trace-cmd record -e spi_irq -e spi_cb ./spi_test
+trace-cmd report | awk '/spi_irq/ { t=$4 } /spi_cb/ { print $4 - t " us" }'</code></pre>
+
+  <h3>Scheduler Wakeup Histogram</h3>
+  <pre><code># Histogram trigger ile otomatik gecikme dağılımı
+echo 'hist:key=next_comm:val=lat:sort=lat' \
+    &gt; $TRACING/events/sched/sched_wakeup/trigger
+
+# 10 saniye çalıştır
+sleep 10
+
+# Sonuçları oku
+cat $TRACING/events/sched/sched_wakeup/hist</code></pre>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Hata Ayıklama ve Üretim Notları</h2>
+  <p class="section-lead">ftrace gücünü doğru kullandığınızda sisteme minimal etki ederken maksimum gözlemlenebilirlik sunar. Ancak yanlış yapılandırma hem veri kaybına hem de performans sorunlarına yol açabilir.</p>
+
+  <h3>Olay Kaybı (Lost Events)</h3>
+  <p>Ring buffer dolduğunda yeni olaylar atılır. Bu durum <code>trace_pipe</code> okunurken görülebilir:</p>
+  <pre><code># Kayıp olayları kontrol et
+cat /sys/kernel/tracing/per_cpu/cpu0/stats
+
+# Örnek çıktı:
+# entries: 4096
+# overrun: 1523        &lt;-- ring buffer taşması
+# commit overrun: 0
+# bytes: 266240
+# oldest event ts: 12345.678
+
+# Çözüm: buffer boyutunu artır
+echo 16384 &gt; /sys/kernel/tracing/buffer_size_kb</code></pre>
+
+  <h3>Ring Buffer Taşması ile Başa Çıkma</h3>
+  <div class="params">
+    <div class="param"><span class="name">buffer_size_kb artırma</span><span class="desc">En basit çözüm. Gömülü sistemlerde bellek kısıtına dikkat edin; toplam bellek = buffer_size_kb * CPU sayısı.</span></div>
+    <div class="param"><span class="name">Filtre daralı</span><span class="desc">set_ftrace_filter veya event filter ile yalnızca ilgilenilen fonksiyon/olay izlenirse olay oranı düşer.</span></div>
+    <div class="param"><span class="name">snapshot</span><span class="desc">$TRACING/snapshot ile ring buffer yedeği alınabilir; taşma durumunda önceki veri korunur.</span></div>
+    <div class="param"><span class="name">trace_pipe okuma hızı</span><span class="desc">trace_pipe yavaş tüketilirse olaylar birikir. trace-cmd veya hızlı bir okuyucu kullanın.</span></div>
+  </div>
+
+  <h3>Tracer Overhead Ölçümü</h3>
+  <pre><code># function tracer overhead testi (cyclictest ile)
+# Önce baseline ölç
+cyclictest -p 80 -t 1 -n -l 10000 --quiet &gt; baseline.txt
+
+# function tracer açıkken ölç
+echo function &gt; /sys/kernel/tracing/current_tracer
+echo 1 &gt; /sys/kernel/tracing/tracing_on
+cyclictest -p 80 -t 1 -n -l 10000 --quiet &gt; with_ftrace.txt
+echo 0 &gt; /sys/kernel/tracing/tracing_on
+echo nop &gt; /sys/kernel/tracing/current_tracer
+
+# Karşılaştır
+diff baseline.txt with_ftrace.txt</code></pre>
+
+  <h3>Üretim Ortamında ftrace</h3>
+  <pre><code"># Üretimde function tracer KULLANMAYIN -- overhead yüksek
+# Bunun yerine: event tracing ve kprobe (çok daha düşük etki)
+
+# Güvenli üretim kullanımı:
+# 1. Yalnızca gerekli olayları etkinleştir
+echo 1 &gt; /sys/kernel/tracing/events/sched/sched_wakeup/enable
+
+# 2. İzlemeyi tamamlayınca kapat
+echo 0 &gt; /sys/kernel/tracing/tracing_on
+
+# 3. Trace verisini hızla kopyala
+cp /sys/kernel/tracing/trace /tmp/trace_$(date +%s).txt
+
+# 4. Buffer ve filter'ları temizle
+echo nop &gt; /sys/kernel/tracing/current_tracer
+echo &gt; /sys/kernel/tracing/trace
+echo &gt; /sys/kernel/tracing/kprobe_events</code></pre>
+
+  <h3>Yaygın Sorunlar ve Çözümleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">trace dosyası boş</span><span class="desc">tracing_on=1 mi? current_tracer doğru mu? set_ftrace_filter çok kısıtlayıcı olabilir; boş bırakın veya genişletin.</span></div>
+    <div class="param"><span class="name">-bash: echo: write error</span><span class="desc">Geçersiz filtre sözdizimi veya desteklenmeyen tracer. available_tracers dosyasını kontrol edin.</span></div>
+    <div class="param"><span class="name">kprobe: ENXIO</span><span class="desc">Sembol bulunamadı; /proc/kallsyms ile sembolün var olduğunu doğrulayın.</span></div>
+    <div class="param"><span class="name">Yanlış zaman damgası</span><span class="desc">trace_clock dosyasını inceleyin. local/global/mono seçeneklerinden uygun olanı seçin; çok CPU'lu sistemlerde global önerilir.</span></div>
+    <div class="param"><span class="name">Gömülü: tracefs bağlı değil</span><span class="desc">mount -t tracefs tracefs /sys/kernel/tracing komutunu init script'e ekleyin.</span></div>
+  </div>
+
+  <h3>Hızlı Başvuru Kartı</h3>
+  <pre><code">T=/sys/kernel/tracing
+
+# Sıfırla
+echo nop &gt; $T/current_tracer; echo &gt; $T/trace
+
+# function tracer -- belirli fonksiyon
+echo function &gt; $T/current_tracer
+echo my_func   &gt; $T/set_ftrace_filter
+echo 1 &gt; $T/tracing_on; YOUR_CMD; echo 0 &gt; $T/tracing_on
+cat $T/trace
+
+# function_graph -- çağrı ağacı
+echo function_graph &gt; $T/current_tracer
+echo my_func        &gt; $T/set_graph_function
+echo 1 &gt; $T/tracing_on; YOUR_CMD; echo 0 &gt; $T/tracing_on
+
+# Event izleme
+echo 1 &gt; $T/events/sched/sched_switch/enable
+echo 1 &gt; $T/tracing_on; YOUR_CMD; echo 0 &gt; $T/tracing_on
+
+# kprobe
+echo 'p:t/f my_func arg=%x0' &gt; $T/kprobe_events
+echo 1 &gt; $T/events/t/f/enable</code></pre>
+</section>
+
+</main>

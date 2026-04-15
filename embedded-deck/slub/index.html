@@ -1,0 +1,814 @@
+---
+layout: tutorial
+title: "SLUB Allocator — Linux Kernel Bellek Yöneticisi"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>KERNEL BELLEK</span>
+    <span>2026</span>
+  </div>
+  <h1>SLUB Allocator<br><em>Linux Kernel Bellek Yöneticisi</em></h1>
+  <p class="subtitle">Linux kernel'ın varsayılan slab tahsis yöneticisi SLUB'ın iç mimarisi, gömülü sistemlerde bellek optimizasyonu ve hata ayıklama teknikleri.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">SLUB neden var — slab allocator evrimi</a></li>
+    <li><a href="#s1">SLUB mimarisi — temel veri yapıları</a></li>
+    <li><a href="#s2">kmem_cache API — oluşturma ve tahsis</a></li>
+    <li><a href="#s3">kmalloc ve kmem_cache ilişkisi</a></li>
+    <li><a href="#s4">Gömülü sistemlerde SLUB tuningleri</a></li>
+    <li><a href="#s5">SLUB hata ayıklama teknikleri</a></li>
+    <li><a href="#s6">Bellek baskısı ve shrinker API</a></li>
+    <li><a href="#s7">KASAN ile SLUB entegrasyonu</a></li>
+    <li><a href="#s8">Performans ölçümü ve optimizasyon</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> SLUB neden var — slab allocator evrimi</h2>
+  <p class="section-lead">Linux kernel'ın bellek yönetimi katmanları arasında slab katmanı, küçük ve orta boyutlu nesnelerin verimli tahsisini sağlar. SLUB bu katmanın günümüzdeki varsayılan uygulamasıdır.</p>
+
+  <h3>Slab Allocator Neden Gerekli?</h3>
+  <p>Buddy allocator sayfa (4 KB) granülaritesinde çalışır. Bir <code>task_struct</code> yaklaşık 9 KB, bir <code>inode</code> ise yaklaşık 600 bayttır. Her küçük nesne için tam sayfa tahsis etmek hem bellek israfına hem de TLB baskısına yol açar. Slab katmanı bu boşluğu kapatır: sayfaları önbelleğe alır ve aynı türden nesneleri bu sayfalar içinde paketler.</p>
+
+  <div class="flow">
+    <pre>
+Uygulama / Surucu
+       |
+  kmalloc / kmem_cache_alloc
+       |
+   SLUB Katmani  &lt;-- nesneleri onbellekte tutar
+       |
+  Buddy Allocator  &lt;-- sayfa bazli tahsis
+       |
+  Fiziksel Bellek</pre>
+  </div>
+
+  <h3>Tarihsel Süreç: SLAB, SLUB ve SLOB</h3>
+  <p>İlk slab uygulaması <strong>SLAB</strong>, Solaris kernel'ından Jeff Bonwick tarafından Linux'a adapte edildi (1994). Verimli nesne önbelleklemesi sağlasa da zamanla karmaşık veri yapıları, yüksek metadata alanı ve NUMA ile ölçekleme sorunları ortaya çıktı.</p>
+  <p><strong>SLUB</strong> (2007, Christoph Lameter), SLAB'ın yerini almak üzere tasarlandı. Temel hedefleri şunlardı: daha az metadata, daha basit kod yolu, NUMA farkındalığı ve per-CPU freelist. Linux 2.6.22'de tanıtıldı ve 2011'den itibaren varsayılan allocator oldu.</p>
+  <p><strong>SLOB</strong> ise küçük gömülü sistemler (CONFIG_EMBEDDED) için tasarlanmış minimal bir uygulamadır. Metadata overhead'i en düşük seviyededir ancak performansı düşüktür ve büyük sistemlerde kullanılmaz.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Özellik</th><th>SLAB</th><th>SLUB</th><th>SLOB</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Varsayılan mı?</td><td>Hayır (eski varsayılan)</td><td>Evet (Linux 3.x+)</td><td>Hayır (CONFIG_EMBEDDED)</td></tr>
+        <tr><td>Metadata alanı</td><td>Yüksek</td><td>Düşük (sayfa içi)</td><td>Çok düşük</td></tr>
+        <tr><td>NUMA desteği</td><td>Sınırlı</td><td>Tam</td><td>Yok</td></tr>
+        <tr><td>Per-CPU freelist</td><td>Var (karmaşık)</td><td>Var (sade)</td><td>Yok</td></tr>
+        <tr><td>Hata ayıklama</td><td>Orta</td><td>Güçlü</td><td>Minimal</td></tr>
+        <tr><td>Hedef platform</td><td>Genel</td><td>Genel + Sunucu</td><td>Küçük gömülü</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Kernel Konfigürasyonu</h3>
+  <p>Kullanılacak allocator kernel derleme zamanında seçilir. Çalışma zamanında hangi allocator aktif olduğu aşağıdaki komutlarla doğrulanabilir:</p>
+  <pre><code># .config dosyasında SLUB seçimi (varsayılan)
+CONFIG_SLUB=y
+# CONFIG_SLAB is not set
+# CONFIG_SLOB is not set
+
+# Calısma zamanında hangi allocator aktif:
+cat /proc/slabinfo | head -5
+
+# dmesg çıktısında allocator adı:
+dmesg | grep -i "slub\|slab allocator"</code></pre>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> SLUB mimarisi — temel veri yapıları</h2>
+  <p class="section-lead">SLUB'ın verimliliği, akıllıca tasarlanmış veri yapılarından kaynaklanır. Metadata'yı sayfa içinde saklayarak ayrı metadata dizileri yerine sıfır ek bellek kullanır.</p>
+
+  <h3>kmem_cache Yapısı</h3>
+  <p>Her slab önbelleği bir <code>kmem_cache</code> örneğiyle temsil edilir. Bu yapı, nesne boyutu, hizalama, NUMA eşleme, per-CPU veriler ve istatistikler gibi tüm önbellek meta-bilgilerini barındırır.</p>
+
+  <pre><code>/* Basitleştirilmiş kmem_cache yapısı (include/linux/slub_def.h) */
+struct kmem_cache {
+    struct kmem_cache_cpu __percpu *cpu_slab; /* Per-CPU aktif slab */
+    unsigned long flags;         /* Önbellek bayrakları (SLAB_POISON vb.) */
+    unsigned long min_partial;   /* Partial listede minimum slab sayısı */
+    int size;                    /* Nesne boyutu (padding dahil) */
+    int object_size;             /* Gerçek nesne boyutu */
+    int offset;                  /* Freelist pointer ofseti */
+    int cpu_partial;             /* Per-CPU partial list boyutu */
+    struct kmem_cache_order_objects oo; /* Sayfa düzeni bilgisi */
+    gfp_t allocflags;            /* Buddy'den sayfa alırken kullanılan bayraklar */
+    int refcount;                /* Referans sayısı */
+    void (*ctor)(void *);        /* Nesne kurucu fonksiyonu */
+    const char *name;            /* Önbellek adı (/sys/kernel/slab'da görünür) */
+    struct list_head list;       /* Tüm kmem_cache listesine bağlantı */
+    struct kmem_cache_node *node[MAX_NUMNODES]; /* NUMA node listeleri */
+};</code></pre>
+
+  <h3>Per-CPU Slab Yapısı</h3>
+  <p><code>kmem_cache_cpu</code>, her CPU için ayrı tutulan yerel slab durumunu içerir. Kilit gerektirmeden hızlı tahsis ve serbest bırakma bu yapı sayesinde mümkündür.</p>
+
+  <pre><code>struct kmem_cache_cpu {
+    void **freelist;    /* Sonraki boş nesneye işaret eden pointer */
+    unsigned long tid;  /* İşlem kimliği — ABA sorununu önler */
+    struct page *page;  /* Aktif slab sayfası */
+    struct page *partial; /* Kısmen dolu sayfalar listesi */
+};</code></pre>
+
+  <h3>Slab Sayfası ve Freelist Mekanizması</h3>
+  <p>SLUB, nesne meta-bilgilerini ayrı bir veri yapısında tutmaz; bunun yerine sayfa descriptor'ının <code>struct page</code> alanlarını yeniden kullanır. Boş nesneler, her nesnenin ilk birkaç baytında gömülü bir freelist zinciriyle birbirine bağlıdır.</p>
+
+  <div class="flow">
+    <pre>
+struct page (slab sayfası):
+  .freelist -----&gt; [Nesne 0] -&gt; [Nesne 3] -&gt; [Nesne 7] -&gt; NULL
+                    (bos)         (bos)         (bos)
+  .objects = 8  [Nesne 1] [Nesne 2] [Nesne 4] [Nesne 5] [Nesne 6]
+  .inuse   = 5   (dolu)    (dolu)    (dolu)    (dolu)    (dolu)</pre>
+  </div>
+
+  <h3>Üç Seviyeli Liste Yapısı</h3>
+  <p>SLUB her NUMA node için üç farklı slab kategorisi tutar:</p>
+
+  <div class="params">
+    <div class="param">
+      <span class="name">Aktif Slab (cpu_slab-&gt;page)</span>
+      <span class="desc">Per-CPU olarak tutulan, kilit gerektirmeden tahsis yapılan mevcut slab sayfası. Her CPU'nun kendi aktif sayfası vardır.</span>
+    </div>
+    <div class="param">
+      <span class="name">Partial List (node-&gt;partial)</span>
+      <span class="desc">Hem dolu hem boş nesneler içeren sayfalar. CPU'sunun aktif sayfası tükendiğinde buradan yeni sayfa alınır. NUMA node başına ayrı listedir.</span>
+    </div>
+    <div class="param">
+      <span class="name">Full List</span>
+      <span class="desc">Tüm nesneleri dolu sayfalar. CONFIG_SLUB_DEBUG açık olduğunda takip edilir; normal modda ayrıca izlenmez.</span>
+    </div>
+  </div>
+
+  <h3>Tahsis Akışı</h3>
+  <div class="flow">
+    <pre>
+kmem_cache_alloc(cache, flags)
+    |
+    v
+CPU freelist bos degil?  ---Evet--&gt; freelist'ten nesne al (hizli yol, kilit yok)
+    |
+   Hayir
+    |
+    v
+cpu_slab-&gt;page bos degil?  ---Evet--&gt; page freelist'ten al, cpu freelist'i doldur
+    |
+   Hayir
+    |
+    v
+node-&gt;partial listesi bos degil?  ---Evet--&gt; partial sayfayi cpu_slab'a aktar
+    |
+   Hayir
+    |
+    v
+Buddy'den yeni sayfa tahsis et (alloc_pages), yeni slab olustur</pre>
+  </div>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> kmem_cache API — oluşturma ve tahsis</h2>
+  <p class="section-lead">Sürücü veya kernel alt sistemi kendi nesne önbelleğini oluşturmak istediğinde <code>kmem_cache_create</code> ile başlar. Bu API, nesne boyutu ve hizalama gereksinimlerine göre optimize edilmiş bir önbellek yapısı kurar.</p>
+
+  <h3>kmem_cache_create Prototipi</h3>
+  <pre><code>#include &lt;linux/slab.h&gt;
+
+struct kmem_cache *kmem_cache_create(
+    const char *name,      /* /sys/kernel/slab'da görünecek isim */
+    unsigned int size,     /* Nesne boyutu (bayt) */
+    unsigned int align,    /* Minimum hizalama (0 = doğal hizalama) */
+    slab_flags_t flags,    /* Davranış bayrakları */
+    void (*ctor)(void *)   /* Nesne kurucu (NULL = yok) */
+);
+/* Dönüş: başarıda kmem_cache *, hata durumunda NULL */</code></pre>
+
+  <h3>Önemli Bayraklar</h3>
+  <div class="params">
+    <div class="param">
+      <span class="name">SLAB_HWCACHE_ALIGN</span>
+      <span class="desc">Nesneyi CPU donanım önbelleği satırı sınırına (genellikle 64 bayt) hizalar. False sharing'i önler; performans kritik önbelleklerde kullanılır.</span>
+    </div>
+    <div class="param">
+      <span class="name">SLAB_POISON</span>
+      <span class="desc">Tahsis edilen nesneleri 0x5a, serbest bırakılanları 0x6b deseniyle doldurur. Use-after-free ve başlatılmamış bellek okuma hatalarını tespit etmeye yarar.</span>
+    </div>
+    <div class="param">
+      <span class="name">SLAB_RED_ZONE</span>
+      <span class="desc">Nesnenin başına ve sonuna "red zone" eklenir. Sınır dışı yazma (out-of-bounds write) erken tespit edilir.</span>
+    </div>
+    <div class="param">
+      <span class="name">SLAB_ACCOUNT</span>
+      <span class="desc">Bu önbellekten yapılan tahsisler cgroup bellek sayacına dahil edilir. memcg entegrasyonu için gereklidir.</span>
+    </div>
+    <div class="param">
+      <span class="name">SLAB_PANIC</span>
+      <span class="desc">Önbellek oluşturulamazsa kernel panic verir. Kritik sistem önbelleklerinde (task_struct, inode vb.) kullanılır; NULL kontrolü gereksiz kılınır.</span>
+    </div>
+    <div class="param">
+      <span class="name">SLAB_TYPESAFE_BY_RCU</span>
+      <span class="desc">RCU grace period dolana kadar slab sayfaları serbest bırakılmaz. Kilit olmadan güvenli nesne erişimi için kullanılır.</span>
+    </div>
+  </div>
+
+  <h3>Tam Kullanım Örneği — Kernel Modülünde Özel Önbellek</h3>
+  <pre><code>#include &lt;linux/module.h&gt;
+#include &lt;linux/slab.h&gt;
+#include &lt;linux/init.h&gt;
+
+/* Önbelleğe alınacak nesne tipi */
+struct my_sensor_data {
+    u32  sensor_id;
+    s32  temperature;   /* 1/1000 derece cinsinden */
+    u64  timestamp_ns;
+    u8   flags;
+    /* SLAB_HWCACHE_ALIGN 64 byte'a tamamlar */
+};
+
+static struct kmem_cache *sensor_cache;
+
+static int __init sensor_cache_init(void)
+{
+    sensor_cache = kmem_cache_create(
+        "sensor_data",                   /* isim */
+        sizeof(struct my_sensor_data),   /* boyut */
+        0,                               /* hizalama: doğal */
+        SLAB_HWCACHE_ALIGN | SLAB_PANIC, /* bayraklar */
+        NULL                             /* kurucu yok */
+    );
+    /* SLAB_PANIC: başarısızsa panic, NULL dönmez */
+    pr_info("sensor_cache olusturuldu, boyut=%zu\n",
+            kmem_cache_size(sensor_cache));
+    return 0;
+}
+
+static struct my_sensor_data *alloc_sensor(void)
+{
+    struct my_sensor_data *sd;
+    sd = kmem_cache_alloc(sensor_cache, GFP_KERNEL);
+    if (!sd)
+        return NULL;
+    memset(sd, 0, sizeof(*sd));
+    return sd;
+}
+
+static void free_sensor(struct my_sensor_data *sd)
+{
+    kmem_cache_free(sensor_cache, sd);
+}
+
+static void __exit sensor_cache_exit(void)
+{
+    kmem_cache_destroy(sensor_cache);
+}
+
+module_init(sensor_cache_init);
+module_exit(sensor_cache_exit);</code></pre>
+
+  <h3>Hizalama Hesabı</h3>
+  <p>SLUB, <code>size</code> parametresini birden fazla gereksinime göre yukarı yuvarlar. Bu hesap derleme zamanında gerçekleşir ve çalışma zamanı overhead'i yoktur:</p>
+  <pre><code>/* Gerçek nesne boyutu hesabı (basitleştirilmiş) */
+size = ALIGN(size, sizeof(void *));        /* freelist pointer için */
+if (flags &amp; SLAB_HWCACHE_ALIGN)
+    size = ALIGN(size, cache_line_size()); /* donanım önbellek satırı */
+if (flags &amp; SLAB_RED_ZONE)
+    size += sizeof(unsigned long long);    /* red zone eklenir */
+
+/* Bir sayfaya kaç nesne sığar? */
+objects_per_slab = (PAGE_SIZE &lt;&lt; order) / size;</code></pre>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> kmalloc ve kmem_cache ilişkisi</h2>
+  <p class="section-lead"><code>kmalloc</code>, SLUB üzerinde inşa edilmiş genel amaçlı kernel bellek tahsis fonksiyonudur. İstenen boyutu en yakın boyut sınıfına yuvarlar ve ilgili <code>kmem_cache</code>'den nesne alır.</p>
+
+  <h3>kmalloc_caches Dizisi</h3>
+  <p>Kernel başlangıcında (<code>kmem_cache_init</code>), 8 bayttan başlayıp genellikle 8 MB'a kadar uzanan ikinin kuvvetleri ve ara boyutlar için sabit bir dizi kmem_cache oluşturulur. Bu diziye <code>kmalloc_caches</code> adı verilir.</p>
+
+  <pre><code>/* Kernel içi tanım (include/linux/slab.h — basitleştirilmiş) */
+extern struct kmem_cache *
+    kmalloc_caches[NR_KMALLOC_TYPES][KMALLOC_SHIFT_HIGH + 1];
+
+/* Boyut sınıfları (KMALLOC_NORMAL tipi):
+ *  Index 0:    8 bayt    (kmalloc-8)
+ *  Index 1:   16 bayt    (kmalloc-16)
+ *  Index 2:   32 bayt    (kmalloc-32)
+ *  Index 3:   64 bayt    (kmalloc-64)
+ *  Index 4:  128 bayt    (kmalloc-128)
+ *  Index 5:  256 bayt    (kmalloc-256)
+ *  Index 6:  512 bayt    (kmalloc-512)
+ *  Index 7: 1024 bayt    (kmalloc-1k)
+ *  Index 8: 2048 bayt    (kmalloc-2k)
+ *  Index 9: 4096 bayt    (kmalloc-4k)
+ */</code></pre>
+
+  <h3>__kmalloc Akışı</h3>
+  <div class="flow">
+    <pre>
+kmalloc(size, flags)
+    |
+    v
+size &lt;= KMALLOC_MAX_CACHE_SIZE?
+    |
+   Evet                      Hayir
+    |                          |
+    v                          v
+kmalloc_index(size)       __kmalloc_large_node()
+boyut sinifini hesapla     (buddy allocator dogrudan)
+    |
+    v
+kmalloc_caches[type][index]
+    |
+    v
+kmem_cache_alloc_trace()
+    |
+    v
+SLUB per-CPU freelist'ten nesne dondur</pre>
+  </div>
+
+  <h3>GFP Bayrakları</h3>
+  <div class="params">
+    <div class="param">
+      <span class="name">GFP_KERNEL</span>
+      <span class="desc">Standart kernel tahsisi. Bellek baskısı altında bekleme (uyku) yapabilir. Interrupt context'te kullanılamaz.</span>
+    </div>
+    <div class="param">
+      <span class="name">GFP_ATOMIC</span>
+      <span class="desc">Interrupt handler, spinlock ve benzeri atomik bağlamlarda kullanılır. Uyku yapmaz; başarısız olursa NULL döner.</span>
+    </div>
+    <div class="param">
+      <span class="name">GFP_NOWAIT</span>
+      <span class="desc">GFP_ATOMIC benzeri ama acil bellek rezervini (emergency pool) kullanmaz. Kademeli geriye dönüş senaryoları için.</span>
+    </div>
+    <div class="param">
+      <span class="name">GFP_DMA</span>
+      <span class="desc">DMA uyumlu (genellikle 16 MB altı) bellek bölgesinden tahsis. Eski ISA DMA için; modern sistemlerde genellikle gerekmez.</span>
+    </div>
+    <div class="param">
+      <span class="name">__GFP_ZERO</span>
+      <span class="desc">Tahsis edilen belleği sıfırlar. kzalloc() bu bayrağı örtük olarak ekler.</span>
+    </div>
+  </div>
+
+  <h3>Boyut Sınıfı Seçimi Örneği</h3>
+  <pre><code>/* 100 bayt istendiğinde */
+idx = kmalloc_index(100);   /* idx = 7 =&gt; 128 baytlık önbellek seçilir */
+cache = kmalloc_caches[KMALLOC_NORMAL][7];  /* kmalloc-128 */
+
+/* Atık: 128 - 100 = 28 bayt iç fragmantasyon */
+
+/* kzalloc: sıfırlanmış bellek */
+void *ptr = kzalloc(sizeof(struct my_obj), GFP_KERNEL);
+
+/* kfree: hangi boyut sınıfı olduğunu sayfa metadata'sından otomatik anlar */
+kfree(ptr);</code></pre>
+
+  <h3>Performans İpucu: kmalloc ve kmem_cache_alloc Karşılaştırması</h3>
+  <p>Tekrar eden aynı boyuttaki tahsisler için doğrudan <code>kmem_cache_create</code> ve <code>kmem_cache_alloc</code> tercih edilmelidir. <code>kmalloc</code> boyut yuvarlaması nedeniyle daha fazla iç fragmentasyon oluşturabilir; ayrıca boyut bilgisini bulana kadar hafif bir indeks hesabı yapar. Kendi önbelleğiniz bu ek maliyeti ortadan kaldırır ve önbellek adını <code>/sys/kernel/slab/</code> altında izlemenizi sağlar.</p>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> Gömülü sistemlerde SLUB tuningleri</h2>
+  <p class="section-lead">RAM kısıtlı gömülü platformlarda SLUB'ın varsayılan davranışı optimal olmayabilir. Kernel komut satırı parametreleri ve derleme zamanı seçenekleriyle bellek kullanımını ince ayarlamak mümkündür.</p>
+
+  <h3>Kernel Komut Satırı Parametreleri</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Parametre</th><th>Varsayılan</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>slub_min_order=N</td><td>0</td><td>Slab sayfası için minimum buddy order. 0 = tek sayfa (4 KB). Büyük değerler daha az sayfa başlığı overhead'i ama daha fazla bellek israfı.</td></tr>
+        <tr><td>slub_max_order=N</td><td>1 (ARM) / 3 (x86)</td><td>Slab sayfası için maksimum buddy order. Gömülü sistemlerde 0 veya 1 ile sınırlamak çok büyük parçalar kullanılmasını engeller.</td></tr>
+        <tr><td>slub_min_objects=N</td><td>0 (otomatik)</td><td>Bir slabda en az kaç nesne olmalı. SLUB, bu değeri sağlamak için gerekirse order'ı artırır.</td></tr>
+        <tr><td>slab_max_order=N</td><td>Değişken</td><td>kmalloc büyük tahsisleri için buddy order üst sınırı.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <pre><code># Gömülü sistem bootargs örneği (256 MB RAM, ARMv7)
+# U-Boot ortam değişkeni
+setenv bootargs "console=ttyS0,115200 root=/dev/mmcblk0p2 rw \
+    slub_max_order=0 slub_min_objects=4"
+
+# /proc/cmdline ile doğrulama:
+cat /proc/cmdline</code></pre>
+
+  <h3>CONFIG_SLUB_CPU_PARTIAL</h3>
+  <p>Bu seçenek per-CPU partial list'i etkinleştirir. Partial slab'ların CPU'ya yerel tutulması NUMA sistemlerde büyük kazanç sağlar; ancak küçük gömülü sistemlerde (tek çekirdek veya 2 çekirdek) bu yapı gereksiz bellek harcar. Devre dışı bırakmak RAM tasarrufu sağlar:</p>
+  <pre><code># Küçük gömülü sistemler için (tek çekirdek, 256 MB RAM ve altı)
+# CONFIG_SLUB_CPU_PARTIAL is not set
+
+# Çok çekirdekli, 512 MB RAM üstü sistemlerde açık tutun:
+CONFIG_SLUB_CPU_PARTIAL=y</code></pre>
+
+  <h3>Per-CPU Partial Limit Ayarı</h3>
+  <p>CONFIG_SLUB_CPU_PARTIAL etkinse, her önbelleğin per-CPU partial listesinde tutulacak maksimum nesne sayısı çalışma zamanında sysfs üzerinden izlenebilir ve belirli ölçüde denetlenebilir:</p>
+  <pre><code># Çalışma zamanı gözlem:
+cat /sys/kernel/slab/kmalloc-256/cpu_partial
+cat /sys/kernel/slab/kmalloc-256/cpu_slabs
+
+# Tüm önbelleklerde cpu_partial değerlerini listele:
+for d in /sys/kernel/slab/*/; do
+    name=$(basename $d)
+    val=$(cat $d/cpu_partial 2&gt;/dev/null)
+    echo "$name: $val"
+done</code></pre>
+
+  <h3>NUMA Bağlantısız Sistemlerde min_partial</h3>
+  <p>Tek NUMA nodlu gömülü sistemlerde <code>min_partial</code> değerini düşürmek, partial listede fazladan slab sayfaları tutulmasını önler. Bu sayede bellek geri dönüşümü daha agresif olur:</p>
+  <pre><code># Çalışma zamanında sysfs üzerinden:
+cat /sys/kernel/slab/my_cache/min_partial
+
+# Düşürme (geliştirme/test ortamı):
+echo 3 &gt; /sys/kernel/slab/my_cache/min_partial</code></pre>
+
+  <h3>SLOB ile Karşılaştırma: Ne Zaman SLOB Tercih Edilmeli?</h3>
+  <p>RAM'in 32 MB'ın altında olduğu ve çok fazla farklı nesne türü olmayan sistemlerde SLOB tercih edilebilir. SLUB'ın per-CPU yapıları ve partial listeleri bu ölçekte belleğin anlamlı bir bölümünü tüketir. Ancak SLOB hata ayıklama desteğinden yoksundur; bu, geliştirme sürecini zorlaştırır. Geliştirme aşamasında SLUB kullanılıp ürün imajında SLOB'a geçmek yaygın bir yaklaşımdır.</p>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> SLUB hata ayıklama teknikleri</h2>
+  <p class="section-lead">Slab katmanındaki hatalar — use-after-free, double-free, heap buffer overflow — kernel'ın en tehlikeli ve tespit edilmesi en güç sorunları arasındadır. SLUB'ın yerleşik hata ayıklama altyapısı bu sorunları derleme ve çalışma zamanında yakalamayı kolaylaştırır.</p>
+
+  <h3>CONFIG_SLUB_DEBUG</h3>
+  <p>Temel hata ayıklama altyapısını etkinleştirir. Red zone, poison, track, owner gibi ek özellikler bu seçenek açık olduğunda kullanılabilir hale gelir. Üretim gömülü imajlarında kapalı tutmak, hem bellek hem CPU açısından avantajlıdır.</p>
+  <pre><code># Derleme zamanı:
+CONFIG_SLUB_DEBUG=y
+CONFIG_SLUB_DEBUG_ON=y  # Tüm önbelleklerde varsayılan olarak debug açık
+
+# Yalnızca belirli bir önbellek için açmak (daha az overhead):
+# Kernel komut satırında:
+slub_debug=FZP,my_cache_name
+# F = sanity check, Z = red zone, P = poison</code></pre>
+
+  <h3>slabinfo Kullanımı</h3>
+  <pre><code># /proc/slabinfo çıktısını görüntüle:
+cat /proc/slabinfo | head -3
+
+# En büyük bellek tüketen önbellekler:
+awk 'NR &gt; 2 { printf "%s %d KB\n", $1, ($3 * $2) / 1024 }' \
+    /proc/slabinfo | sort -k2 -rn | head -10
+
+# Belirli bir önbelleğin tahsis istatistikleri:
+cat /sys/kernel/slab/kmalloc-256/alloc_calls
+cat /sys/kernel/slab/kmalloc-256/free_calls</code></pre>
+
+  <h3>/sys/kernel/slab/ Arayüzü</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Dosya</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>object_size</td><td>Gerçek nesne boyutu (bayt)</td></tr>
+        <tr><td>slab_size</td><td>Slab sayfası boyutu (padding dahil)</td></tr>
+        <tr><td>objs_per_slab</td><td>Bir slabdaki nesne sayısı</td></tr>
+        <tr><td>order</td><td>Slab için kullanılan buddy order</td></tr>
+        <tr><td>slabs</td><td>Toplam aktif slab sayfası sayısı</td></tr>
+        <tr><td>objects</td><td>Toplam nesne kapasitesi</td></tr>
+        <tr><td>objects_partial</td><td>Partial slablardaki nesne sayısı</td></tr>
+        <tr><td>alloc_fastpath</td><td>Per-CPU freelist'ten yapılan tahsis sayısı</td></tr>
+        <tr><td>alloc_slowpath</td><td>Yavaş yoldan (kilitli) yapılan tahsis sayısı</td></tr>
+        <tr><td>free_fastpath</td><td>Hızlı yoldan serbest bırakma sayısı</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Use-After-Free Tespiti</h3>
+  <p>CONFIG_SLUB_DEBUG + SLAB_POISON kombinasyonu serbest bırakılan nesneyi <code>0x6b</code> deseniyle doldurur. Nesne serbest bırakıldıktan sonra bu alana yazma veya okuma yapılırsa, sonraki sanity check'te bozulma tespit edilir:</p>
+  <pre><code>/* Hatalı kod örneği: use-after-free */
+struct my_obj *obj = kmem_cache_alloc(my_cache, GFP_KERNEL);
+kmem_cache_free(my_cache, obj);
+obj-&gt;field = 42;  /* YANLIS: serbest bırakıldı! */
+
+/* SLUB_DEBUG + SLAB_POISON açıksa, sonraki sanity check'te:
+ * BUG kmalloc-128 (Not tainted): Poison overwritten
+ * INFO: 0xffff... has been poisoned: 0x6b vs 0x2a */</code></pre>
+
+  <h3>Validate Komutu ile Elle Doğrulama</h3>
+  <pre><code># Belirli bir önbelleği elle doğrula (CONFIG_SLUB_DEBUG gerektirir):
+echo 1 &gt; /sys/kernel/slab/my_cache/validate
+
+# Kernel log'unda bozulma bulunursa:
+# BUG: KASAN: slab-out-of-bounds in ...
+# Write of size N at addr ... by task .../PID
+
+# Tüm önbellekleri sistematik olarak tara:
+for cache in /sys/kernel/slab/*/; do
+    echo 1 &gt; "$cache/validate" 2&gt;/dev/null
+done
+dmesg | grep "BUG\|KASAN" | tail -20</code></pre>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> Bellek baskısı ve shrinker API</h2>
+  <p class="section-lead">Gömülü sistemlerde RAM kıtlığı altında çalışırken, slab katmanının elindeki fazla belleği geri vermesi kritik önem taşır. Shrinker API bu mekanizmanın temel taşıdır.</p>
+
+  <h3>Shrinker API Genel Bakış</h3>
+  <p>Linux kernel'ında bellek baskısı oluştuğunda (düşük su işareti <code>WMARK_LOW</code> altına düşüldüğünde) kswapd, tescil edilmiş tüm shrinker'ları çağırır. Her slab önbelleği kendi shrinker'ını sunabilir ya da alt sistem kendi özel mantığını uygular.</p>
+
+  <pre><code>#include &lt;linux/shrinker.h&gt;
+
+/* Shrinker yapısı */
+struct shrinker {
+    unsigned long (*count_objects)(struct shrinker *,
+                                   struct shrink_control *sc);
+    unsigned long (*scan_objects)(struct shrinker *,
+                                  struct shrink_control *sc);
+    long batch;     /* Tek seferinde serbest bırakılacak nesne sayısı */
+    int seeks;      /* Nesneyi yeniden oluşturma maliyeti */
+    unsigned flags;
+    struct list_head list;
+};</code></pre>
+
+  <h3>Özel Shrinker Kaydı</h3>
+  <pre><code>static unsigned long my_count_objects(struct shrinker *shrinker,
+                                      struct shrink_control *sc)
+{
+    return atomic_read(&amp;my_cache_free_count);
+}
+
+static unsigned long my_scan_objects(struct shrinker *shrinker,
+                                     struct shrink_control *sc)
+{
+    unsigned long freed = 0;
+    while (freed &lt; sc-&gt;nr_to_scan &amp;&amp; !list_empty(&amp;my_idle_list)) {
+        struct my_obj *obj = list_first_entry(&amp;my_idle_list,
+                                              struct my_obj, list);
+        list_del(&amp;obj-&gt;list);
+        kmem_cache_free(my_cache, obj);
+        freed++;
+        atomic_dec(&amp;my_cache_free_count);
+    }
+    return freed;
+}
+
+static struct shrinker my_shrinker = {
+    .count_objects = my_count_objects,
+    .scan_objects  = my_scan_objects,
+    .seeks         = DEFAULT_SEEKS,
+};
+
+/* Modül init'inde kaydet: */
+register_shrinker(&amp;my_shrinker, "my-driver-shrinker");
+
+/* Modül exit'inde sil: */
+unregister_shrinker(&amp;my_shrinker);</code></pre>
+
+  <h3>kmem_cache_shrink</h3>
+  <p><code>kmem_cache_shrink</code>, belirli bir önbellekteki tüm boş slab sayfalarını hemen buddy allocator'a geri verir. Partial slab'lara dokunmaz. Bellek baskısı olmasa bile çağrılabilir:</p>
+  <pre><code>/* Acil bellek geri alma — tüm bos slabları serbest bırak */
+int ret = kmem_cache_shrink(my_cache);
+/* ret: 0 = tamamen bos, pozitif = hala partial/full slab var */
+
+# Kullanıcı alanından tüm slab önbelleklerini küçültme:
+echo 2 &gt; /proc/sys/vm/drop_caches   /* sadece slab */
+echo 3 &gt; /proc/sys/vm/drop_caches   /* sayfa önbelleği + slab */</code></pre>
+
+  <h3>Gömülü Düşük Bellek Senaryosu</h3>
+  <div class="flow">
+    <pre>
+RAM kritik seviyenin altina dusuyor (WMARK_LOW)
+        |
+        v
+kswapd uyaniyor
+        |
+        v
+do_shrink_slab() -- kayitli tum shrinker'lari cagir
+        |
+        +--&gt; driver shrinker: bos nesne havuzunu bosalt
+        +--&gt; inode/dentry shrinker: kullanilmayan VFS nesneleri
+        +--&gt; netfs shrinker: ag tampon onbellekleri
+        |
+        v
+kmem_cache_shrink() -- bos slab sayfalarini buddy'e iade et
+        |
+        v
+Buddy allocator bos sayfalari geri aliyor -- RAM basinc azaliyor</pre>
+  </div>
+
+  <h3>memcg ile Slab Muhasebesi</h3>
+  <p>cgroup v2 kullanılan sistemlerde slab tahsisleri bellek cgroup'larına atfedilebilir. <code>SLAB_ACCOUNT</code> bayrağı ve <code>CONFIG_MEMCG_KMEM</code> bu özelliği etkinleştirir. Gömülü konteyner tabanlı mimarilerde kaynak izolasyonu sağlar:</p>
+  <pre><code>CONFIG_MEMCG=y
+CONFIG_MEMCG_KMEM=y
+
+/* Önbellek oluştururken: */
+cache = kmem_cache_create("net_skb", sizeof(struct sk_buff), 0,
+                          SLAB_HWCACHE_ALIGN | SLAB_ACCOUNT, NULL);
+
+# cgroup bellek kullanımını izle:
+cat /sys/fs/cgroup/my_container/memory.kmem.usage_in_bytes</code></pre>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> KASAN ile SLUB entegrasyonu</h2>
+  <p class="section-lead">Kernel Address Sanitizer (KASAN), SLUB ile derin entegrasyon kurarak heap bellek hatalarını donanım desteği olmadan yazılım düzeyinde tespit eder. Gömülü geliştirme ortamlarında vazgeçilmez bir araçtır.</p>
+
+  <h3>KASAN Çalışma Prensibi</h3>
+  <p>KASAN, her 8 baytlık "uygulama belleği" için 1 bayt "gölge bellek" kullanır. Gölge bellek, ilgili adresin erişilebilir olup olmadığını kodlar. Derleyici, her bellek erişiminden önce otomatik olarak gölge bellek kontrolü ekler.</p>
+
+  <div class="flow">
+    <pre>
+Gölge bellek bayt anlamları:
+  0x00 = 8 baytın tamamı erişilebilir
+  0x01-0x07 = yalnızca ilk N bayt erişilebilir
+  0xFC = slab redzone (sınır dışı erişim)
+  0xFB = slab freelist poison (use-after-free)
+  0xF1 = stack sol redzone
+  0xF3 = stack sag redzone</pre>
+  </div>
+
+  <h3>Konfigürasyon Seçenekleri</h3>
+  <div class="params">
+    <div class="param">
+      <span class="name">CONFIG_KASAN=y</span>
+      <span class="desc">KASAN'ı etkinleştirir. CONFIG_SLUB_DEBUG ile birlikte kullanılması önerilir.</span>
+    </div>
+    <div class="param">
+      <span class="name">CONFIG_KASAN_GENERIC</span>
+      <span class="desc">Yazılım tabanlı, compiler-instrumented mod. Her bellek erişiminde ekstra kontrol kodu çalışır. Yavaş ama taşınabilir.</span>
+    </div>
+    <div class="param">
+      <span class="name">CONFIG_KASAN_OUTLINE</span>
+      <span class="desc">Kontrol kodu ayrı bir fonksiyon çağrısı olarak derlenir. Daha küçük text boyutu, ancak daha yavaş. Gömülü sistemlerde flash alanından tasarruf sağlar.</span>
+    </div>
+    <div class="param">
+      <span class="name">CONFIG_KASAN_INLINE</span>
+      <span class="desc">Kontrol kodu doğrudan inline eklenir. Daha hızlı ancak kernel text boyutu önemli ölçüde artar.</span>
+    </div>
+    <div class="param">
+      <span class="name">CONFIG_KASAN_SW_TAGS</span>
+      <span class="desc">Pointer tag tabanlı KASAN (ARMv8.5 MTE'nin yazılım öykünmesi). Daha düşük bellek overhead'i; gömülü ARM64 için iyi seçenek.</span>
+    </div>
+  </div>
+
+  <h3>Gömülü Sistemde KASAN Konfigürasyonu</h3>
+  <pre><code># Gömülü ARM64 için önerilen KASAN konfigürasyonu:
+CONFIG_KASAN=y
+CONFIG_KASAN_GENERIC=y
+CONFIG_KASAN_OUTLINE=y      # Flash boyutu için INLINE yerine
+# CONFIG_KASAN_INLINE is not set
+CONFIG_SLUB_DEBUG=y
+CONFIG_STACKTRACE=y          # Hata raporunda stack trace için
+
+# Overhead tahmini:
+# - Bellek: yaklasik 1/8 ekstra RAM (shadow memory)
+# - Hız: genellikle yuzde 20-40 yavaslamaayıklama
+# - Flash: OUTLINE modda minimum artis</code></pre>
+
+  <h3>KASAN Hata Raporu Örneği</h3>
+  <pre><code>==================================================================
+BUG: KASAN: slab-out-of-bounds in sensor_write+0x4c/0x80 [sensor_drv]
+Write of size 4 at addr ffff000012345678 by task kworker/0:1/42
+
+CPU: 0 PID: 42 Comm: kworker/0:1 Not tainted 6.6.0 #1
+Hardware name: My Embedded Board (DT)
+Call trace:
+ dump_backtrace+0x0/0x1c0
+ show_stack+0x18/0x24
+ dump_stack_lvl+0x68/0x84
+ kasan_report+0xac/0x1c0
+ sensor_write+0x4c/0x80 [sensor_drv]
+ ...
+
+Allocated by task 42:
+ kmem_cache_alloc+0x88/0x200
+ sensor_alloc+0x30/0x60 [sensor_drv]
+
+The buggy address ffff000012345678 is located 8 bytes to the right
+of 32-byte region [ffff000012345658, ffff000012345678)
+==================================================================</code></pre>
+
+  <h3>Shadow Byte Haritası ile SLUB Entegrasyonu</h3>
+  <p>SLUB nesne tahsis ettiğinde, ilgili gölge bellek baytları <code>0x00</code> (erişilebilir) olarak işaretlenir. Nesne serbest bırakıldığında ise <code>0xFB</code> (slab freelist zehiri) olarak güncellenir. Red zone bölgeleri <code>0xFC</code> ile işaretlidir. Derleyici tarafından eklenen her yük ve saklama talimatı öncesi bu değer kontrol edilir; uyumsuzluk KASAN raporunu tetikler.</p>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Performans ölçümü ve optimizasyon</h2>
+  <p class="section-lead">SLUB'ın performansını analiz etmek; allocator darboğazlarını, fragmentasyon sorunlarını ve önbellek etkinliğini anlamayı gerektirir. Bu bölüm, ölçüm araçlarını ve gömülü sistemlere özel optimizasyon önerilerini kapsar.</p>
+
+  <h3>perf kmem ile Tahsis Profili</h3>
+  <pre><code># Kernel slab tahsislerini kayıt altına al (5 saniye):
+perf record -e kmem:kmalloc,kmem:kmem_cache_alloc \
+     -a --sleep 5
+
+# Raporu göster — hangi fonksiyon en çok tahsis yapıyor:
+perf report --stdio | head -30
+
+# Boyut dağılımı analizi:
+perf kmem --slab stat --sort=bytes | head -20
+
+# Örnek çıktı:
+# Callsite        Total_alloc/Per | Total_req/Per | Hit | Frag
+# sensor_alloc    16384/128       | 12800/100     | 128 | 21.88%</code></pre>
+
+  <h3>slabstats Betiği</h3>
+  <pre><code>#!/bin/sh
+# /proc/slabinfo'dan anlamlı istatistik çıkaran basit betik
+
+echo "=== En Büyük Slab Önbellekleri ==="
+awk 'NR &gt; 2 {
+    name = $1; active = $2; total = $3; obj_size = $4
+    mem_kb = (total * obj_size) / 1024
+    printf "%-30s %8d KB (%d nesne, %d bayt)\n",
+           name, mem_kb, total, obj_size
+}' /proc/slabinfo | sort -k2 -rn | head -15
+
+echo ""
+echo "=== Fragmantasyon Analizi ==="
+awk 'NR &gt; 2 &amp;&amp; $3 &gt; 0 {
+    frag = 100 - ($2 * 100 / $3)
+    if (frag &gt; 20)
+        printf "YUKSEK FRAG: %-25s %5.1f%%\n", $1, frag
+}' /proc/slabinfo</code></pre>
+
+  <h3>Fragmantasyon Analizi</h3>
+  <p>Slab fragmantasyonu, toplam nesnelerin yalnızca bir kısmının kullanımda olması durumudur. Yüksek fragmantasyon, belleğin atıl kalması anlamına gelir:</p>
+  <pre><code># Aktif nesne oranı (kullanım yoğunluğu):
+# active_objs / num_objs &gt; 0.8 idealdir
+awk 'NR &gt; 2 {
+    printf "%-30s kullanim=%.0f%%\n", $1, ($2/$3)*100
+}' /proc/slabinfo | sort -t= -k2 -n | head -10
+
+# Ayrıntılı fragmantasyon raporu:
+for cache in /sys/kernel/slab/kmalloc-*; do
+    name=$(basename $cache)
+    slabs=$(cat $cache/slabs 2&gt;/dev/null)
+    objs=$(cat $cache/objects 2&gt;/dev/null)
+    partial=$(cat $cache/objects_partial 2&gt;/dev/null)
+    echo "$name: slabs=$slabs objects=$objs partial=$partial"
+done</code></pre>
+
+  <h3>Gömülü Optimizasyon Önerileri</h3>
+  <div class="params">
+    <div class="param">
+      <span class="name">1. Özel kmem_cache kullanın</span>
+      <span class="desc">Sık tahsis edilen aynı boyuttaki nesneler için kmalloc yerine kmem_cache_create tercih edin. Boyut yuvarlamasını ortadan kaldırır, fragmantasyonu azaltır.</span>
+    </div>
+    <div class="param">
+      <span class="name">2. SLAB_HWCACHE_ALIGN uygulayın</span>
+      <span class="desc">Cache-line false sharing'i önler. Çok çekirdekli gömülü SoC'larda (Cortex-A55 quad-core gibi) somut performans kazancı sağlar.</span>
+    </div>
+    <div class="param">
+      <span class="name">3. Nesne havuzu tasarımı yapın</span>
+      <span class="desc">Gerçek zamanlı görevlerde tahsis gecikmesini ortadan kaldırmak için başlangıçta nesne havuzu doldurun, çalışma zamanında yalnızca havuzdan alın ve iade edin.</span>
+    </div>
+    <div class="param">
+      <span class="name">4. slub_max_order=0 deneyin</span>
+      <span class="desc">Slab sayfalarını tek sayfa (4 KB) ile sınırlamak buddy allocator fragmantasyonunu azaltır. Küçük nesnelerde overhead artabilir; profil alarak karar verin.</span>
+    </div>
+    <div class="param">
+      <span class="name">5. CONFIG_SLUB_CPU_PARTIAL değerini değerlendirin</span>
+      <span class="desc">Tek çekirdekli veya düşük RAM'li sistemlerde devre dışı bırakmak bellek tasarrufu sağlar. Çok çekirdekli sistemlerde ise throughput'u artırır.</span>
+    </div>
+  </div>
+
+  <h3>Benchmark: kmalloc ve kmem_cache_alloc Karşılaştırması</h3>
+  <pre><code>/* Basit kıyaslama kernel modülü (yalnızca geliştirme ortamı için) */
+#include &lt;linux/time.h&gt;
+
+#define ITER 100000
+
+static void bench_kmalloc(void)
+{
+    int i;
+    ktime_t t0 = ktime_get();
+    for (i = 0; i &lt; ITER; i++) {
+        void *p = kmalloc(128, GFP_KERNEL);
+        kfree(p);
+    }
+    ktime_t t1 = ktime_get();
+    pr_info("kmalloc-128: %lld ns / tahsis\n",
+            ktime_to_ns(ktime_sub(t1, t0)) / ITER);
+}
+
+static void bench_cache_alloc(struct kmem_cache *cache)
+{
+    int i;
+    ktime_t t0 = ktime_get();
+    for (i = 0; i &lt; ITER; i++) {
+        void *p = kmem_cache_alloc(cache, GFP_KERNEL);
+        kmem_cache_free(cache, p);
+    }
+    ktime_t t1 = ktime_get();
+    pr_info("kmem_cache_alloc: %lld ns / tahsis\n",
+            ktime_to_ns(ktime_sub(t1, t0)) / ITER);
+}
+/* Tipik sonuç: kmem_cache_alloc genellikle yuzde 5-15 daha hızlıdır */</code></pre>
+
+  <h3>Sonuç: SLUB'ı Doğru Kullanmak</h3>
+  <p>SLUB, Linux kernel'ının bellek tahsis katmanının sağlam ve verimli temelidir. Gömülü sistemlerde maksimum fayda için: sık tahsis edilen nesnelere özel önbellek açın, DEBUG modunu yalnızca geliştirme imajlarında kullanın, <code>slub_max_order</code> ve <code>cpu_partial</code> parametrelerini platform RAM'ine göre ayarlayın ve düzenli olarak <code>/proc/slabinfo</code> ile fragmentasyon durumunu izleyin.</p>
+</section>
+
+</main>

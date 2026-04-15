@@ -1,0 +1,874 @@
+---
+layout: tutorial
+title: "CoAP / LwM2M — IoT Cihaz Yönetim Protokolleri"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span><span>GÖMÜLÜ LİNUX</span><span>IOT PROTOKOLÜ</span><span>2026</span>
+  </div>
+  <h1>CoAP / LwM2M<br><em>IoT Cihaz Yönetim Protokolleri</em></h1>
+  <p class="subtitle">Kısıtlı cihazlar için CoAP protokolü ve OMA LwM2M cihaz yönetim standardının gömülü Linux uygulaması, Wakaama ve Eclipse Leshan entegrasyonu.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">CoAP Neden? HTTP'nin Sınırları</a></li>
+    <li><a href="#s1">CoAP Protokol Temelleri</a></li>
+    <li><a href="#s2">libcoap ile CoAP Sunucu</a></li>
+    <li><a href="#s3">LwM2M Nesne Modeli</a></li>
+    <li><a href="#s4">Wakaama İstemci Entegrasyonu</a></li>
+    <li><a href="#s5">OTA Firmware Güncelleme</a></li>
+    <li><a href="#s6">DTLS ile Güvenlik</a></li>
+    <li><a href="#s7">Gömülü Senaryo: Sıcaklık Sensörü</a></li>
+    <li><a href="#s8">Hata Ayıklama Teknikleri</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> CoAP Neden? HTTP'nin Sınırları</h2>
+  <p class="section-lead">Klasik HTTP/REST mimarisi kısıtlı gömülü cihazlar için ciddi yük oluşturur. CoAP (Constrained Application Protocol), bu boşluğu doldurmak için RFC 7252 ile tanımlanmıştır.</p>
+
+  <p>Endüstriyel IoT'de milyonlarca sensör, birkaç KB RAM ile çalışan mikrodenetleyici veya MPU tabanlı kartlar üzerinde koşar. Bu cihazlarda TCP bağlantısı kurmak, TLS el sıkışması gerçekleştirmek ve HTTP başlıklarını işlemek hem bellek hem enerji açısından maliyetlidir. Standart bir HTTP GET isteği başlıklar dahil kolayca 500-1000 bayt yer kaplarken CoAP aynı isteği 4 baytlık sabit başlık ile gönderebilir.</p>
+
+  <div class="flow"><pre>
+OSI Katmanı    HTTP Stack         CoAP Stack
+─────────────────────────────────────────────
+Uygulama (7)   HTTP/1.1           CoAP (RFC 7252)
+Sunum (6)      TLS/SSL            DTLS (RFC 6347)
+Taşıma (4)     TCP                UDP
+Ağ (3)         IPv4/IPv6          IPv4/IPv6 / 6LoWPAN
+Veri Bağı (2)  Ethernet / Wi-Fi   IEEE 802.15.4 / BLE
+  </pre></div>
+
+  <p>CoAP'ın temel avantajları şunlardır:</p>
+  <div class="params">
+    <div class="param"><span class="name">UDP tabanlı</span><span class="desc">Bağlantı kurulum yükü yok; tek paket ile istek ve yanıt mümkün</span></div>
+    <div class="param"><span class="name">4 bayt başlık</span><span class="desc">HTTP'ye kıyasla dramatik bant genişliği tasarrufu sağlar</span></div>
+    <div class="param"><span class="name">Eşzamansız mesajlaşma</span><span class="desc">CON/NON mesaj tipleri ile güvenilirlik seviyeleri ayarlanabilir</span></div>
+    <div class="param"><span class="name">Gözlem desteği</span><span class="desc">RFC 7641 ile kaynaklarda long-poll yerine sunucu itme bildirimleri</span></div>
+    <div class="param"><span class="name">HTTP eşleme</span><span class="desc">CoAP ile HTTP arasında proxy ile mevcut web altyapısına doğal entegrasyon</span></div>
+    <div class="param"><span class="name">6LoWPAN uyumlu</span><span class="desc">IEEE 802.15.4 ağlarında küçük paket boyutu ile sorunsuz çalışır</span></div>
+  </div>
+
+  <p>Enerji tüketimi açısından bakıldığında, bir CoAP isteği için gereken radyo açık kalma süresi HTTP'ye göre 10 kat daha kısa olabilir. Pil ile çalışan bir sensör düğümü, HTTP ile günler içinde bitirdiği pili CoAP ile aylarca koruyabilir. Bu nedenle akıllı enerji sayaçlarından tarımsal sensörlere, endüstriyel monitörlerden sağlık giyilebilirlerine kadar tüm kısıtlı IoT cihazları için CoAP fiili standart haline gelmiştir.</p>
+
+  <div class="file-table"><table>
+    <tr><th>Özellik</th><th>HTTP/1.1</th><th>CoAP</th></tr>
+    <tr><td>Taşıma katmanı</td><td>TCP</td><td>UDP</td></tr>
+    <tr><td>Başlık boyutu</td><td>200-500 bayt</td><td>4 bayt sabit</td></tr>
+    <tr><td>Güvenlik</td><td>TLS</td><td>DTLS</td></tr>
+    <tr><td>Multicast</td><td>Desteklenmez</td><td>NON mesajlarıyla desteklenir</td></tr>
+    <tr><td>Gözlemleme (push)</td><td>SSE/WebSocket gerekir</td><td>Yerleşik Observe seçeneği</td></tr>
+    <tr><td>İkili kodlama</td><td>Metin</td><td>İkili; CBOR ile birleşir</td></tr>
+  </table></div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> CoAP Protokol Temelleri</h2>
+  <p class="section-lead">CoAP, HTTP metotlarını UDP üzerine taşır ve mesaj güvenilirliği için dört farklı mesaj tipi tanımlar. Protokolü anlamak sağlam bir uygulama geliştirmenin temelidir.</p>
+
+  <h3>Mesaj Tipleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">CON (Confirmable)</span><span class="desc">Onay gerektiren güvenilir mesaj; ACK alınana dek yeniden gönderilir (exponential backoff)</span></div>
+    <div class="param"><span class="name">NON (Non-confirmable)</span><span class="desc">Onay gerektirmeyen best-effort mesaj; periyodik sensör verisi için uygundur</span></div>
+    <div class="param"><span class="name">ACK (Acknowledgement)</span><span class="desc">CON mesajının alındığını doğrular; piggybacked yanıt taşıyabilir</span></div>
+    <div class="param"><span class="name">RST (Reset)</span><span class="desc">Anlaşılamayan bir mesaja verilen hata yanıtı; bilinmeyen Message ID için kullanılır</span></div>
+  </div>
+
+  <h3>CoAP Metotları ve Yanıt Kodları</h3>
+  <p>CoAP, HTTP'nin GET/POST/PUT/DELETE metotlarını benimser ancak yanıt kodları farklı bir şema kullanır (sınıf.ayrıntı biçiminde):</p>
+
+  <div class="file-table"><table>
+    <tr><th>Metot / Kod</th><th>Açıklama</th></tr>
+    <tr><td>GET</td><td>Kaynağı okur; gözlem için Observe seçeneği eklenir</td></tr>
+    <tr><td>POST</td><td>Kaynak oluşturur veya mevcut kaynağa işlem uygular</td></tr>
+    <tr><td>PUT</td><td>Kaynağı tamamen günceller</td></tr>
+    <tr><td>DELETE</td><td>Kaynağı siler</td></tr>
+    <tr><td>2.05 Content</td><td>GET isteğine başarılı yanıt (HTTP 200 eşdeğeri)</td></tr>
+    <tr><td>2.01 Created</td><td>POST ile kaynak oluşturuldu (HTTP 201)</td></tr>
+    <tr><td>4.04 Not Found</td><td>Kaynak bulunamadı (HTTP 404)</td></tr>
+    <tr><td>5.00 Internal Server Error</td><td>Sunucu taraflı hata (HTTP 500)</td></tr>
+  </table></div>
+
+  <h3>CoAP Seçenekleri (Options)</h3>
+  <p>CoAP başlığına eklenen seçenekler, HTTP başlıklarının sıkıştırılmış eşdeğeridir. Her seçenek delta-kodlama ile sıkıştırılır:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Uri-Host / Uri-Path</span><span class="desc">Hedef kaynak yolu; coap://host/sensor/temp gibi URI oluşturur</span></div>
+    <div class="param"><span class="name">Content-Format</span><span class="desc">0 = text/plain, 50 = application/json, 60 = application/cbor</span></div>
+    <div class="param"><span class="name">Observe (RFC 7641)</span><span class="desc">0 = kayda ol, 1 = kaydı iptal et; sunucu değişiklikte bildirim gönderir</span></div>
+    <div class="param"><span class="name">Block1 / Block2</span><span class="desc">Büyük payload'ları parçalara böler (RFC 7959); OTA transferi için kritik</span></div>
+    <div class="param"><span class="name">ETag</span><span class="desc">İçerik versiyonu; önbellekleme ve gereksiz yanıtları önler</span></div>
+    <div class="param"><span class="name">Max-Age</span><span class="desc">Yanıtın önbellekte geçerli kalacağı süre (saniye cinsinden)</span></div>
+  </div>
+
+  <h3>CoAP Paket Yapısı</h3>
+  <div class="flow"><pre>
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|Ver| T |  TKL  |      Code     |          Message ID           |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|   Token (0-8 bayt)                                            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|   Secenekler (degisken) + 0xFF isareti + Payload              |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+Ver=01 (CoAP v1)  T=mesaj tipi  TKL=token uzunlugu (0-8 bayt)
+Code=istek/yanit kodu  MsgID=16 bit benzersiz kimlik
+  </pre></div>
+
+  <h3>CON/ACK Mesaj Akışı</h3>
+  <div class="flow"><pre>
+Istemci                          Sunucu
+   |                                |
+   |-- CON GET /sensor/temp ------&gt;|  (MsgID=0x4A2B)
+   |                                |
+   |&lt;-- ACK 2.05 Content ----------|  (MsgID=0x4A2B, yanit)
+   |    Payload: "23.5"             |
+   |                                |
+   |-- NON GET /sensor/hum -------&gt;|  (best-effort, ACK beklenmez)
+   |&lt;-- NON 2.05 Content ----------|
+  </pre></div>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> libcoap ile CoAP Sunucu</h2>
+  <p class="section-lead">libcoap, C dilinde tam özellikli bir CoAP yığını sunar. Gömülü Linux üzerinde CoAP kaynak sunucusu kurmak için en yaygın ve olgun seçenektir.</p>
+
+  <h3>Kurulum</h3>
+  <pre><code># Ubuntu / Debian tabanlı sistemler
+sudo apt install libcoap3-dev coap-utils
+
+# Yocto icin meta-openembedded/meta-networking katmani gerekir
+# local.conf icine ekleyin:
+IMAGE_INSTALL:append = " libcoap coap-utils"
+
+# Kaynak koddan derleme
+git clone https://github.com/obgm/libcoap.git
+cd libcoap
+./autogen.sh
+./configure --enable-examples --enable-dtls --with-tinydtls
+make -j4
+sudo make install</code></pre>
+
+  <h3>Temel CoAP Sunucu — C Kodu</h3>
+  <pre><code>#include &lt;coap3/coap.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+
+/* Sicaklik kaynagi icin GET handler */
+static void
+hnd_get_temperature(coap_resource_t *resource,
+                    coap_session_t  *session,
+                    const coap_pdu_t *request,
+                    const coap_string_t *query,
+                    coap_pdu_t *response)
+{
+    char buf[32];
+    float temp = 23.5f;  /* Gercek uygulamada sensordan okunur */
+
+    snprintf(buf, sizeof(buf), "%.1f", temp);
+
+    coap_pdu_set_code(response, COAP_RESPONSE_CODE_CONTENT);
+    coap_add_option(response,
+                    COAP_OPTION_CONTENT_FORMAT,
+                    coap_encode_var_safe(NULL, 0,
+                        COAP_MEDIATYPE_TEXT_PLAIN),
+                    NULL);
+    coap_add_data(response, strlen(buf), (uint8_t *)buf);
+}
+
+/* PUT handler: esik degerini guncelle */
+static void
+hnd_put_threshold(coap_resource_t *resource,
+                  coap_session_t  *session,
+                  const coap_pdu_t *request,
+                  const coap_string_t *query,
+                  coap_pdu_t *response)
+{
+    size_t size;
+    const uint8_t *data;
+
+    if (coap_get_data(request, &amp;size, &amp;data)) {
+        float threshold = atof((const char *)data);
+        printf("Yeni esik degeri: %.1f\n", threshold);
+        coap_pdu_set_code(response, COAP_RESPONSE_CODE_CHANGED);
+    } else {
+        coap_pdu_set_code(response, COAP_RESPONSE_CODE_BAD_REQUEST);
+    }
+}
+
+int main(void)
+{
+    coap_context_t  *ctx   = NULL;
+    coap_address_t   addr;
+    coap_endpoint_t *ep    = NULL;
+    coap_resource_t *r_temp, *r_thresh;
+
+    coap_startup();
+
+    /* Dinleme adresi: tum arayuzler, 5683 portu */
+    coap_address_init(&amp;addr);
+    addr.addr.sin.sin_family      = AF_INET;
+    addr.addr.sin.sin_port        = htons(5683);
+    addr.addr.sin.sin_addr.s_addr = INADDR_ANY;
+
+    ctx = coap_new_context(NULL);
+    if (!ctx) {
+        fprintf(stderr, "Context olusturulamadi\n");
+        return 1;
+    }
+
+    ep = coap_new_endpoint(ctx, &amp;addr, COAP_PROTO_UDP);
+    if (!ep) {
+        fprintf(stderr, "Endpoint olusturulamadi\n");
+        return 1;
+    }
+
+    /* /sensor/temperature kaynagi */
+    r_temp = coap_resource_init(
+                 coap_make_str_const("sensor/temperature"), 0);
+    coap_register_handler(r_temp, COAP_REQUEST_GET,
+                          hnd_get_temperature);
+    coap_resource_set_observable(r_temp, 1); /* Observe destegi */
+    coap_add_resource(ctx, r_temp);
+
+    /* /sensor/threshold kaynagi */
+    r_thresh = coap_resource_init(
+                   coap_make_str_const("sensor/threshold"), 0);
+    coap_register_handler(r_thresh, COAP_REQUEST_PUT,
+                          hnd_put_threshold);
+    coap_add_resource(ctx, r_thresh);
+
+    printf("CoAP sunucu 5683 portunda dinleniyor...\n");
+
+    /* Ana dongu */
+    while (1) {
+        coap_io_process(ctx, COAP_IO_WAIT);
+    }
+
+    coap_free_context(ctx);
+    coap_cleanup();
+    return 0;
+}</code></pre>
+
+  <h3>Derleme ve Test</h3>
+  <pre><code>gcc -o coap_server coap_server.c \
+    $(pkg-config --cflags --libs libcoap-3) \
+    -Wall -Wextra
+
+# Sunucuyu baslatın
+./coap_server &amp;
+
+# GET istegi test
+coap-client -m get coap://localhost/sensor/temperature
+
+# PUT ile esik guncelle
+coap-client -m put -e "26.0" coap://localhost/sensor/threshold
+
+# Observe: 30 saniye boyunca bildirimleri dinle
+coap-client -m get -s 30 coap://localhost/sensor/temperature</code></pre>
+
+  <h3>Gözlemleme Bildirimi Tetikleme</h3>
+  <pre><code>/* Sensorden yeni deger okundigunda cagrilir */
+void notify_observers(coap_context_t *ctx,
+                      coap_resource_t *r_temp,
+                      float new_temp)
+{
+    /* Onceki degerden farkli ise bildir */
+    static float last_temp = -999.0f;
+    if (new_temp != last_temp) {
+        last_temp = new_temp;
+        /* Kayitli tum gozlemcilere bildirim kuyrukla */
+        coap_resource_notify_observers(r_temp, NULL);
+        /* coap_io_process() bildirimleri gonderir */
+    }
+}</code></pre>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> LwM2M Nesne Modeli</h2>
+  <p class="section-lead">OMA LwM2M (Lightweight M2M), CoAP üzerine inşa edilmiş bir cihaz yönetim protokolüdür. Hiyerarşik nesne modeli ile cihaz bilgisinden OTA güncellemesine kadar tüm yönetim işlemleri standartlaştırılmıştır.</p>
+
+  <h3>Object / Instance / Resource Hiyerarşisi</h3>
+  <div class="flow"><pre>
+LwM2M Sunucu
+    |
+    +-- Cihaz (Bootstrap veya DM Sunucusu)
+         |
+         +-- Object (Nesne) -- orn. Object 3: Device
+              |
+              +-- Object Instance (Ornek) -- orn. /3/0
+                   |
+                   +-- Resource (Kaynak) -- orn. /3/0/0 = Manufacturer
+                                          +-- /3/0/9  = Battery Level
+                                          +-- /3/0/13 = Current Time
+  </pre></div>
+
+  <p>Her nesne ve kaynak OMA tarafından benzersiz bir tam sayı ID ile tanımlanır. Bu şema herhangi bir sunucunun herhangi bir uyumlu cihazı yönetmesini sağlar. LwM2M adresleme şeması <code>/ObjectID/InstanceID/ResourceID</code> biçimindedir:</p>
+
+  <div class="file-table"><table>
+    <tr><th>Object ID</th><th>Nesne Adı</th><th>Açıklama</th></tr>
+    <tr><td>0</td><td>LwM2M Security</td><td>Sunucu bağlantı güvenlik bilgileri (PSK, RPK, X.509)</td></tr>
+    <tr><td>1</td><td>LwM2M Server</td><td>Sunucu URI, ömür (lifetime), binding modu</td></tr>
+    <tr><td>2</td><td>Access Control</td><td>Kaynak erişim hakları yönetimi</td></tr>
+    <tr><td>3</td><td>Device</td><td>Üretici, model, seri no, pil seviyesi, cihaz saati</td></tr>
+    <tr><td>4</td><td>Connectivity Monitoring</td><td>Ağ arayüzü, IP adresi, sinyal gücü</td></tr>
+    <tr><td>5</td><td>Firmware Update</td><td>OTA paketi indirme ve uygulama durum makinesi</td></tr>
+    <tr><td>6</td><td>Location</td><td>GPS enlemi, boylamı, yüksekliği, zaman damgası</td></tr>
+    <tr><td>3303</td><td>Temperature</td><td>IPSO sensör nesnesi; mevcut değer, min, max, birim</td></tr>
+    <tr><td>3311</td><td>Light Control</td><td>IPSO ışık kontrolü; On/Off durumu ve parlaklık</td></tr>
+  </table></div>
+
+  <h3>LwM2M İşlemleri</h3>
+  <div class="file-table"><table>
+    <tr><th>LwM2M İşlemi</th><th>CoAP Metodu</th><th>Örnek</th></tr>
+    <tr><td>Read</td><td>GET</td><td>GET /3/0/9 pil seviyesini döner</td></tr>
+    <tr><td>Write</td><td>PUT</td><td>PUT /3/0/13 zaman ayarlar</td></tr>
+    <tr><td>Execute</td><td>POST</td><td>POST /3/0/4 cihazı yeniden başlatır</td></tr>
+    <tr><td>Observe</td><td>GET + Observe:0</td><td>GET /3303/0/5700 sıcaklığı izler</td></tr>
+    <tr><td>Discover</td><td>GET + Accept:40</td><td>GET /3 nesne linklerini listeler</td></tr>
+  </table></div>
+
+  <h3>Bootstrap Süreci</h3>
+  <p>LwM2M cihazları fabrika çıkışında yalnızca Bootstrap Sunucusu bilgisiyle gelir. İlk açılışta bootstrap sunucusuna kayıt olur ve DM sunucu bilgilerini alır:</p>
+
+  <div class="flow"><pre>
+Cihaz                Bootstrap Sunucu         DM Sunucu
+  |                        |                      |
+  |-- Bootstrap Request --&gt;|                      |
+  |&lt;-- Write (Object 0) ---|  (DM sunucu URI/PSK) |
+  |&lt;-- Bootstrap Finish ---|                      |
+  |                        |                      |
+  |-- Register (DM) ----------------------&gt;|      |
+  |&lt;-- 2.01 Created ----------------------|      |
+  |                        |                      |
+  |-- Update (lifetime) ------------------&gt;|      |
+  |&lt;-- 2.04 Changed -----------------------|      |
+  </pre></div>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> Wakaama İstemci Entegrasyonu</h2>
+  <p class="section-lead">Eclipse Wakaama, gömülü Linux ve bare-metal RTOS için C dilinde yazılmış hafif bir LwM2M yığınıdır. Birkaç yüz KB bellekle çalışabilir ve cross-platform desteği sunar.</p>
+
+  <h3>Kurulum ve Derleme</h3>
+  <pre><code>git clone https://github.com/eclipse/wakaama.git
+cd wakaama
+
+# Linux istemci ornegi derle
+mkdir build &amp;&amp; cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j4
+
+# Olusan binary: build/examples/lightclient/lightclient</code></pre>
+
+  <h3>Wakaama İstemci Yapısı — Object 3 (Device)</h3>
+  <pre><code>#include "liblwm2m.h"
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include &lt;stdlib.h&gt;
+
+/* lwm2m_context_t tum istemci durumunu tutar */
+lwm2m_context_t *lwm2mH = NULL;
+
+/* Object 3 (Device) icin kaynak okuma */
+static uint8_t
+device_read(lwm2m_context_t *contextP,
+            uint16_t instanceId,
+            int *numDataP,
+            lwm2m_data_t **dataArrayP,
+            lwm2m_object_t *objectP)
+{
+    int i;
+
+    /* Istenen kaynak listesi bossa tumunu doldur */
+    if (*numDataP == 0) {
+        /* RES 0=Manufacturer, 1=Model, 2=Serial, 9=Battery */
+        uint16_t resList[] = { 0, 1, 2, 9 };
+        *numDataP    = 4;
+        *dataArrayP  = lwm2m_data_new(4);
+        if (!*dataArrayP) return COAP_500_INTERNAL_SERVER_ERROR;
+        for (i = 0; i &lt; 4; i++)
+            (*dataArrayP)[i].id = resList[i];
+    }
+
+    for (i = 0; i &lt; *numDataP; i++) {
+        switch ((*dataArrayP)[i].id) {
+        case 0:
+            lwm2m_data_encode_string("EmbeddedCo",
+                                     &amp;(*dataArrayP)[i]);
+            break;
+        case 1:
+            lwm2m_data_encode_string("SensorNode-v1",
+                                     &amp;(*dataArrayP)[i]);
+            break;
+        case 2:
+            lwm2m_data_encode_string("SN-20260001",
+                                     &amp;(*dataArrayP)[i]);
+            break;
+        case 9:  /* Pil seviyesi (%) */
+            lwm2m_data_encode_int(87, &amp;(*dataArrayP)[i]);
+            break;
+        default:
+            return COAP_404_NOT_FOUND;
+        }
+    }
+    return COAP_205_CONTENT;
+}</code></pre>
+
+  <h3>Object 3303 (Temperature) Okuma</h3>
+  <pre><code>/* Object 3303 (Temperature) icin kaynak okuma */
+static uint8_t
+temperature_read(lwm2m_context_t *contextP,
+                 uint16_t instanceId,
+                 int *numDataP,
+                 lwm2m_data_t **dataArrayP,
+                 lwm2m_object_t *objectP)
+{
+    int i;
+    if (*numDataP == 0) {
+        /* 5700=Value, 5601=Min, 5602=Max, 5701=Unit */
+        uint16_t resList[] = { 5700, 5601, 5602, 5701 };
+        *numDataP   = 4;
+        *dataArrayP = lwm2m_data_new(4);
+        if (!*dataArrayP) return COAP_500_INTERNAL_SERVER_ERROR;
+        for (i = 0; i &lt; 4; i++)
+            (*dataArrayP)[i].id = resList[i];
+    }
+
+    for (i = 0; i &lt; *numDataP; i++) {
+        switch ((*dataArrayP)[i].id) {
+        case 5700:  /* Mevcut sicaklik degeri */
+            lwm2m_data_encode_float(23.7, &amp;(*dataArrayP)[i]);
+            break;
+        case 5601:  /* Min olculen deger */
+            lwm2m_data_encode_float(18.2, &amp;(*dataArrayP)[i]);
+            break;
+        case 5602:  /* Max olculen deger */
+            lwm2m_data_encode_float(31.4, &amp;(*dataArrayP)[i]);
+            break;
+        case 5701:  /* Birim dizesi */
+            lwm2m_data_encode_string("Cel", &amp;(*dataArrayP)[i]);
+            break;
+        default:
+            return COAP_404_NOT_FOUND;
+        }
+    }
+    return COAP_205_CONTENT;
+}
+
+/* Ana dongu */
+int main(void)
+{
+    lwm2m_object_t *objArray[3];
+
+    objArray[0] = get_security_object(123,
+                      "coap://leshan.eclipse.org:5683",
+                      NULL, NULL, 0, false);
+    objArray[1] = get_server_object(123, "U", 300, false);
+    objArray[2] = make_object(3, device_read, NULL, NULL);
+
+    lwm2mH = lwm2m_init(NULL);
+    lwm2m_configure(lwm2mH, "embedded-sensor-01",
+                    NULL, NULL, 3, objArray);
+
+    printf("LwM2M istemci baslatildi\n");
+
+    while (1) {
+        struct timeval tv = { 5, 0 };
+        lwm2m_step(lwm2mH, &amp;tv.tv_sec);
+        /* select() ile ag olaylarini isle */
+    }
+
+    lwm2m_close(lwm2mH);
+    return 0;
+}</code></pre>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> OTA Firmware Güncelleme</h2>
+  <p class="section-lead">LwM2M Object 5 (Firmware Update), standart bir OTA mekanizması sağlar. Push ve Pull olmak üzere iki yöntem desteklenir; durum makinesi sunucu tarafından gerçek zamanlı izlenir.</p>
+
+  <h3>Object 5 Kaynakları</h3>
+  <div class="file-table"><table>
+    <tr><th>Kaynak ID</th><th>Adı</th><th>Açıklama</th></tr>
+    <tr><td>0</td><td>Package</td><td>Push yöntemi: sunucu binary'yi doğrudan Block1 ile yazar</td></tr>
+    <tr><td>1</td><td>Package URI</td><td>Pull yöntemi: cihaz bu URI'dan binary'yi indirir</td></tr>
+    <tr><td>2</td><td>Update (Execute)</td><td>İndirilen paketi uygula komutu; Execute işlemi</td></tr>
+    <tr><td>3</td><td>State</td><td>0=Idle, 1=Downloading, 2=Downloaded, 3=Updating</td></tr>
+    <tr><td>5</td><td>Update Result</td><td>0=Initial, 1=Success, 2=No Flash, 3=OOM, 4=CRC Error</td></tr>
+    <tr><td>6</td><td>PkgName</td><td>Firmware paketinin adı (opsiyonel)</td></tr>
+    <tr><td>7</td><td>PkgVersion</td><td>Firmware paketinin sürüm dizesi</td></tr>
+  </table></div>
+
+  <h3>OTA Durum Makinesi (Pull Yöntemi)</h3>
+  <div class="flow"><pre>
+        Sunucu                     Cihaz
+           |                         |
+           |-- Write /5/0/1 (URI) --&gt;|  (Pull yontemi)
+           |                         |-- State: 1 (Downloading)
+           |                         |   [HTTP/CoAP Block2 ile indir]
+           |                         |-- State: 2 (Downloaded)
+           |                         |   [CRC dogrula]
+           |-- Execute /5/0/2 ------&gt;|
+           |                         |-- State: 3 (Updating)
+           |                         |   [swupdate / mtd_write]
+           |                         |   [reboot]
+           |                         |
+           |      [Cihaz yeniden baslar]
+           |                         |
+           |&lt;-- Register (yeni ver) --|  Update Result: 1 (Success)
+  </pre></div>
+
+  <h3>Pull Yöntemi — C Uygulama Taslağı</h3>
+  <pre><code>/* Object 5 durum makinesi sabitleri */
+#define FIRMWARE_STATE_IDLE        0
+#define FIRMWARE_STATE_DOWNLOADING 1
+#define FIRMWARE_STATE_DOWNLOADED  2
+#define FIRMWARE_STATE_UPDATING    3
+
+static int fw_state  = FIRMWARE_STATE_IDLE;
+static int fw_result = 0;
+
+/* Object 5 / Resource 1 yazildiginda cagrilir */
+static uint8_t
+firmware_write(lwm2m_context_t *ctx,
+               uint16_t instanceId,
+               int numData,
+               lwm2m_data_t *dataArray,
+               lwm2m_object_t *objectP)
+{
+    int i;
+    for (i = 0; i &lt; numData; i++) {
+        if (dataArray[i].id == 1) { /* Package URI */
+            const char *uri =
+                (const char *)dataArray[i].value.asBuffer.buffer;
+            printf("Firmware URI alindi: %s\n", uri);
+            fw_state = FIRMWARE_STATE_DOWNLOADING;
+            /* Arka planda indirme baslatilir */
+            start_firmware_download(uri);
+        }
+    }
+    return COAP_204_CHANGED;
+}
+
+/* Indirme tamamlandiginda cagrilir */
+void on_firmware_downloaded(const char *path, uint32_t crc32)
+{
+    if (verify_crc32(path, crc32)) {
+        fw_state = FIRMWARE_STATE_DOWNLOADED;
+        printf("Firmware dogrulandi, guncelleme bekleniyor\n");
+    } else {
+        fw_result = 4; /* CRC hatasi */
+        fw_state  = FIRMWARE_STATE_IDLE;
+    }
+}
+
+/* Execute /5/0/2 alindigi zaman cagrilir */
+static uint8_t
+firmware_execute(lwm2m_context_t *ctx,
+                 uint16_t instanceId,
+                 lwm2m_data_t *dataArray,
+                 lwm2m_object_t *objectP)
+{
+    if (fw_state != FIRMWARE_STATE_DOWNLOADED)
+        return COAP_405_METHOD_NOT_ALLOWED;
+
+    fw_state = FIRMWARE_STATE_UPDATING;
+
+    /* SWUpdate ile guncelle, reboot ile tamamla */
+    system("swupdate -i /tmp/firmware.swu -e stable,copy2 &amp;&amp; reboot");
+    return COAP_204_CHANGED;
+}</code></pre>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> DTLS ile Güvenlik</h2>
+  <p class="section-lead">CoAP ve LwM2M, güvenlik katmanı olarak DTLS (Datagram TLS) kullanır. tinydtls veya mbedTLS ile entegre edilerek kimlik doğrulama ve şifreleme sağlanır.</p>
+
+  <h3>DTLS Kimlik Doğrulama Modları</h3>
+  <div class="params">
+    <div class="param"><span class="name">PSK (Pre-Shared Key)</span><span class="desc">Önceden paylaşılan anahtar; kısıtlı cihazlar için en basit yöntem, en az bellek kullanır (~4 KB RAM)</span></div>
+    <div class="param"><span class="name">RPK (Raw Public Key)</span><span class="desc">Sertifika zinciri olmadan ham açık anahtar; PKI altyapısına gerek kalmaz (~8 KB RAM)</span></div>
+    <div class="param"><span class="name">X.509</span><span class="desc">Tam sertifika zinciri; kurumsal PKI entegrasyonu için kullanılır (~16 KB RAM)</span></div>
+  </div>
+
+  <h3>LwM2M Object 0 ile PSK Yapılandırması</h3>
+  <pre><code>/* Object 0 (Security) PSK ornegi */
+lwm2m_object_t *get_security_object_psk(
+        uint16_t serverId,
+        const char *serverUri,
+        const char *pskId,     /* kimlik dizesi */
+        const uint8_t *psk,    /* ikili anahtar */
+        uint16_t pskLen)
+{
+    lwm2m_object_t *secObj = lwm2m_malloc(sizeof(lwm2m_object_t));
+    memset(secObj, 0, sizeof(lwm2m_object_t));
+    secObj-&gt;objID = LWM2M_SECURITY_OBJECT_ID;  /* 0 */
+
+    security_instance_t *inst =
+        lwm2m_malloc(sizeof(security_instance_t));
+    memset(inst, 0, sizeof(security_instance_t));
+
+    inst-&gt;instanceId   = 0;
+    inst-&gt;uri          = lwm2m_strdup(serverUri);
+    inst-&gt;securityMode = LWM2M_SECURITY_MODE_PRE_SHARED_KEY;
+
+    /* PSK kimlik ve anahtar */
+    inst-&gt;publicIdentity   = lwm2m_strdup(pskId);
+    inst-&gt;publicIdLen      = strlen(pskId);
+    inst-&gt;secretKey        = lwm2m_malloc(pskLen);
+    memcpy(inst-&gt;secretKey, psk, pskLen);
+    inst-&gt;secretKeyLen     = pskLen;
+    inst-&gt;shortID          = serverId;
+    inst-&gt;isBootstrap      = false;
+
+    secObj-&gt;instanceList = LWM2M_LIST_ADD(NULL, inst);
+    secObj-&gt;readFunc     = security_read;
+    secObj-&gt;writeFunc    = security_write;
+
+    return secObj;
+}
+
+/*
+ Kullanim ornegi:
+   uint8_t psk[] = { 0x73, 0x65, 0x63, 0x72, 0x65, 0x74 };
+   obj = get_security_object_psk(
+             123,
+             "coaps://leshan.eclipse.org:5684",
+             "device-identity-01",
+             psk, sizeof(psk));
+*/</code></pre>
+
+  <h3>tinydtls ile libcoap Entegrasyonu</h3>
+  <pre><code># libcoap'i tinydtls ile derle
+./configure --enable-dtls --with-tinydtls
+make
+
+# Guvenli CoAP sunucu baslatma (PSK modu)
+coap-server -k "gizlianahtar" -h "kimlik01" -p 5684
+
+# Guvenli istemci istegi
+coap-client -m get coaps://localhost/sensor/temperature \
+            -k "gizlianahtar" -h "kimlik01"</code></pre>
+
+  <h3>DTLS El Sıkışma Akışı</h3>
+  <div class="flow"><pre>
+Istemci                    Sunucu
+   |                          |
+   |-- ClientHello ----------&gt;|
+   |&lt;-- HelloVerifyRequest ----|  (Anti-DoS cookie)
+   |-- ClientHello (cookie) --&gt;|
+   |&lt;-- ServerHello -----------|
+   |&lt;-- ServerKeyExchange -----|  (PSK: hint gonderilir)
+   |&lt;-- ServerHelloDone -------|
+   |-- ClientKeyExchange ----&gt;|  (PSK: identity gonderilir)
+   |-- ChangeCipherSpec -----&gt;|
+   |-- Finished -------------&gt;|
+   |&lt;-- ChangeCipherSpec ------|
+   |&lt;-- Finished --------------|
+   |=== Sifreli CoAP veri =====|
+  </pre></div>
+
+  <h3>Cipher Suite Seçimi (Gömülü İçin)</h3>
+  <div class="file-table"><table>
+    <tr><th>Cipher Suite</th><th>Özellik</th><th>Gömülü Uygunluk</th></tr>
+    <tr><td>TLS_PSK_WITH_AES_128_CCM_8</td><td>PSK + AES-CCM-8</td><td>En hafif; kısıtlı cihazlar için önerilir</td></tr>
+    <tr><td>TLS_PSK_WITH_AES_128_CBC_SHA256</td><td>PSK + CBC-SHA256</td><td>Geniş destek; biraz daha fazla yük</td></tr>
+    <tr><td>TLS_ECDHE_ECDSA_WITH_AES_128_CCM_8</td><td>ECDHE + X.509</td><td>Kurumsal; mbedTLS ile 50+ KB ROM</td></tr>
+  </table></div>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> Gömülü Senaryo: Raspberry Pi Sıcaklık Sensörü</h2>
+  <p class="section-lead">Raspberry Pi üzerinde DS18B20 sıcaklık sensörü, Wakaama LwM2M istemcisi ve Eclipse Leshan sunucusu ile uçtan uca bir IoT cihaz yönetim senaryosu kurulur.</p>
+
+  <h3>Sistem Mimarisi</h3>
+  <div class="flow"><pre>
+[DS18B20 Sensor]
+      |
+      | 1-Wire (GPIO4)
+      v
+[Raspberry Pi 4 -- Linux 6.6]
+  - Wakaama istemci (LwM2M 1.1)
+  - libcoap + tinydtls
+  - IPSO Object 3303 (Temperature)
+      |
+      | CoAPS (UDP 5684) / LTE veya Wi-Fi
+      v
+[Eclipse Leshan Sunucu -- Java]
+  - REST API + Web UI
+  - Nesne izleme / OTA tetikleme
+      |
+      v
+[OTA Deposu -- SWUpdate imzali]
+  - SHA256 + RSA-2048 imzali swu paketi
+  </pre></div>
+
+  <h3>DS18B20 Okuma — Linux sysfs</h3>
+  <pre><code>#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include &lt;stdlib.h&gt;
+
+/* DS18B20 sensoru /sys/bus/w1/devices/ altinda gorunur */
+float read_ds18b20(const char *sensor_id)
+{
+    char path[128];
+    char buf[256];
+    FILE *fp;
+    float temp = -999.0f;
+
+    snprintf(path, sizeof(path),
+             "/sys/bus/w1/devices/%s/w1_slave", sensor_id);
+
+    fp = fopen(path, "r");
+    if (!fp) { perror("Sensor acilamadi"); return temp; }
+
+    /* Birinci satir: CRC kontrolu (YES/NO) */
+    if (fgets(buf, sizeof(buf), fp) == NULL) goto done;
+    if (strstr(buf, "YES") == NULL) goto done;
+
+    /* Ikinci satir: "t=XXXXX" formatinda milisantigrat */
+    if (fgets(buf, sizeof(buf), fp) == NULL) goto done;
+    {
+        char *t_pos = strstr(buf, "t=");
+        if (t_pos) {
+            long raw = atol(t_pos + 2);
+            temp = raw / 1000.0f;
+        }
+    }
+done:
+    fclose(fp);
+    return temp;
+}
+
+/*
+ LwM2M Object 3303 ile entegrasyon:
+   float sicaklik = read_ds18b20("28-01234567abcd");
+   lwm2m_data_encode_float(sicaklik, data);
+*/</code></pre>
+
+  <h3>Yocto ile Sistem İmajı</h3>
+  <pre><code># local.conf
+MACHINE = "raspberrypi4-64"
+IMAGE_INSTALL:append = " wakaama-client libcoap tinydtls \
+                          kernel-module-w1-gpio \
+                          kernel-module-w1-therm"
+
+# 1-Wire GPIO4 etkinlestirmek icin Device Tree overlay
+KERNEL_DEVICETREE:append = " overlays/w1-gpio.dtbo"
+
+# meta-raspberrypi katmani RPI_EXTRA_CONFIG icin:
+# RPI_EXTRA_CONFIG += "dtoverlay=w1-gpio"</code></pre>
+
+  <h3>Leshan Sunucusu — OTA Tetikleme (REST API)</h3>
+  <pre><code># Object 5 / Instance 0 / Resource 1 yaz (Package URI)
+curl -X PUT \
+  http://leshan-server:8080/api/clients/embedded-sensor-01/5/0/1 \
+  -H "Content-Type: application/json" \
+  -d '{"id":1,"kind":"singleResource","value":"coap://ota.local/firmware-v1.2.swu"}'
+
+# Durum sorgula (State: 0-3)
+curl http://leshan-server:8080/api/clients/embedded-sensor-01/5/0/3
+
+# Guncellemeyi baslat (Execute /5/0/2)
+curl -X POST \
+  http://leshan-server:8080/api/clients/embedded-sensor-01/5/0/2
+
+# Guncelleme sonucunu sorgula (1 = basarili)
+curl http://leshan-server:8080/api/clients/embedded-sensor-01/5/0/5</code></pre>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Hata Ayıklama Teknikleri</h2>
+  <p class="section-lead">CoAP ve LwM2M katmanlarında sorunları teşhis etmek için komut satırı araçları, Wireshark eklentisi ve Leshan web arayüzü birlikte kullanılır.</p>
+
+  <h3>coap-client CLI ile Hızlı Test</h3>
+  <pre><code># GET istegi
+coap-client -m get coap://192.168.1.100:5683/sensor/temperature
+
+# Observe modu: 10 saniye boyunca bildirimleri al
+coap-client -m get -s 10 coap://192.168.1.100:5683/sensor/temperature
+
+# PUT ile deger gonder
+coap-client -m put -e "25.0" coap://192.168.1.100:5683/sensor/threshold
+
+# POST ile kaynak olustur
+coap-client -m post \
+  -t application/json \
+  -e '{"name":"sensor1","location":"room1"}' \
+  coap://192.168.1.100:5683/devices
+
+# Verbose mod (paket ayrinti, seviye 0-9)
+coap-client -v 7 -m get coap://192.168.1.100:5683/sensor/temperature
+
+# DTLS ile guvenli istek
+coap-client -m get -k "psk_key" -h "client_identity" \
+  coaps://192.168.1.100:5684/sensor/temperature
+
+# Kaynaklari kesif (well-known/core)
+coap-client -m get coap://192.168.1.100:5683/.well-known/core</code></pre>
+
+  <h3>Wireshark CoAP Dissector</h3>
+  <pre><code># Wireshark 3.6+ CoAP dissector varsayilan aktiftir
+# 5683 portunu filtrele:
+udp.port == 5683
+
+# Yalnizca GET istekleri (Code = 0.01):
+coap.code == 1
+
+# Yalnizca 2.05 Content yanitlari:
+coap.code == 69
+
+# Belirli token ile eslestir:
+coap.token == ab:cd:ef:01
+
+# DTLS sifre cozme (PSK modunda):
+# Edit &gt; Preferences &gt; Protocols &gt; DTLS &gt; PSK Keys
+# Format: IP,Port,Protocol,Key_hex
+
+# tcpdump ile trafik yakala
+tcpdump -i eth0 -w coap.pcap udp port 5683 or udp port 5684</code></pre>
+
+  <h3>Leshan UI ile Nesne İzleme</h3>
+  <p>Eclipse Leshan web arayüzü (varsayılan port 8080) üzerinden kayıtlı cihazlar, nesneleri ve kaynakları gerçek zamanlı izlenebilir:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Clients sekmesi</span><span class="desc">Tüm kayıtlı LwM2M istemcilerini, son kayıt zamanını ve yaşam süresini gösterir</span></div>
+    <div class="param"><span class="name">Nesne ağacı</span><span class="desc">Cihazın desteklediği tüm Object/Instance/Resource hiyerarşisini görsel olarak sunar</span></div>
+    <div class="param"><span class="name">Observe butonu</span><span class="desc">Herhangi bir kaynağa observe aboneliği oluşturur; değer değişimlerini anlık gösterir</span></div>
+    <div class="param"><span class="name">Write/Execute</span><span class="desc">Doğrudan kaynak güncelleme ve komut yürütme işlemlerini UI üzerinden gerçekleştirir</span></div>
+    <div class="param"><span class="name">Event log</span><span class="desc">Tüm CoAP mesaj alışverişlerini, durum geçişlerini ve hata kodlarını kaydeder</span></div>
+  </div>
+
+  <h3>Wakaama Debug Logları</h3>
+  <pre><code># Wakaama debug modu ile derle
+cmake .. -DCMAKE_BUILD_TYPE=Debug -DLWM2M_WITH_LOGS=ON
+
+# Ornek log ciktisi:
+# [INFO] lwm2m_step() called
+# [INFO] State: STATE_REGISTERING
+# [INFO] Sending REGISTER to coap://leshan:5683
+# [DEBUG] Message ID: 0x4A2B, Token: 0xDEADBEEF
+# [INFO] Registration successful, location: /rd/abc123
+# [INFO] Lifetime: 300s, next update in 270s</code></pre>
+
+  <h3>Yaygın Sorunlar ve Çözümleri</h3>
+  <div class="file-table"><table>
+    <tr><th>Sorun</th><th>Olası Neden</th><th>Çözüm</th></tr>
+    <tr><td>Kayıt başarısız, 4.01 Unauthorized</td><td>PSK anahtar uyumsuzluğu</td><td>Object 0 kaynaklarını doğrula; hex dump karşılaştır</td></tr>
+    <tr><td>CON mesajı sürekli yeniden gönderiliyor</td><td>Güvenlik duvarı UDP 5683'ü engelliyor</td><td>iptables -I INPUT -p udp --dport 5683 -j ACCEPT</td></tr>
+    <tr><td>Block2 transferi yarıda kesiliyor</td><td>MTU uyumsuzluğu, 6LoWPAN fragmentasyonu</td><td>COAP_MAX_BLOCK_SZX = 4 (256 bayt) olarak küçült</td></tr>
+    <tr><td>Observe bildirimleri gelmiyor</td><td>NAT UDP oturumunu düşürüyor</td><td>CoAP PING ile oturumu canlı tut; NON moduna geç</td></tr>
+    <tr><td>Firmware State donmuş</td><td>Update Result set edilmemiş</td><td>Güncelleme handler'ında result ve state değerlerini ayarla</td></tr>
+  </table></div>
+</section>
+
+</main>

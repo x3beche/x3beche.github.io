@@ -1,0 +1,1051 @@
+---
+layout: tutorial
+title: "OpenAMP — Heterojen Çok Çekirdek İletişimi"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>ÇOK ÇEKİRDEK</span>
+    <span>2026</span>
+  </div>
+  <h1>OpenAMP<br><em>Heterojen Çok Çekirdek İletişimi</em></h1>
+  <p class="subtitle">remoteproc, RPMsg ve virtio katmanlarıyla Cortex-A Linux + Cortex-M RTOS aynı SoC üzerinde — STM32MP1, i.MX8M ve AM62x uygulamaları.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Heterojen SoC mimarisi</a></li>
+    <li><a href="#s1">OpenAMP bileşenleri</a></li>
+    <li><a href="#s2">remoteproc</a></li>
+    <li><a href="#s3">RPMsg</a></li>
+    <li><a href="#s4">Cortex-M tarafı</a></li>
+    <li><a href="#s5">Shared memory ve resource table</a></li>
+    <li><a href="#s6">STM32MP1 üzerinde OpenAMP</a></li>
+    <li><a href="#s7">i.MX8M ve AM62x üzerinde OpenAMP</a></li>
+    <li><a href="#s8">Hata ayıklama</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> Heterojen SoC mimarisi</h2>
+  <p class="section-lead">Modern SoC'lar aynı silikon üzerinde farklı mimarilere sahip işlemcileri bir araya getirir: güçlü Cortex-A uygulama işlemcisi yanında gerçek zamanlı görevler için Cortex-M mikrodenetleyici.</p>
+
+  <h3>Neden heterojen tasarım</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Güç verimliliği</span><span class="desc">Cortex-M tipik olarak mW mertebesinde çalışırken Cortex-A W mertebesinde güç tüketir. Sensör okuma gibi sürekli görevler için M çekirdeği A çekirdeğini uyandırmaktan çok daha verimlidir.</span></div>
+    <div class="param"><span class="name">Gerçek zamanlı deterministlik</span><span class="desc">Linux çekirdeği öncelik tersine çevrilmesi, IRQ gecikmesi ve bellek yönetimi nedeniyle kesin zaman garantisi vermez. Cortex-M + RTOS mikrosaniye mertebesinde gecikme sunar.</span></div>
+    <div class="param"><span class="name">Güvenlik izolasyonu</span><span class="desc">M çekirdeği güvenli firmware çalıştırırken A çekirdeği kullanıcı uygulamalarını koşturabilir. TrustZone ile kriptografik işlemler izole edilebilir.</span></div>
+    <div class="param"><span class="name">Görev ayrımı</span><span class="desc">Motor kontrol, ADC örnekleme, PWM gibi donanım yakın görevler M'de; ağ yığını, kullanıcı arayüzü, OTA güncellemesi A'da çalışır.</span></div>
+  </div>
+
+  <h3>Yaygın heterojen SoC'lar</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>SoC</th><th>A çekirdeği</th><th>M çekirdeği</th><th>Bellek</th><th>Tipik kullanım</th></tr></thead>
+      <tbody>
+        <tr><td>STM32MP157</td><td>Cortex-A7 (2 çekirdek, 650 MHz)</td><td>Cortex-M4 (209 MHz)</td><td>DDR3 + SRAM</td><td>Endüstriyel kontrol, tıbbi</td></tr>
+        <tr><td>STM32MP135</td><td>Cortex-A7 (1 çekirdek, 1 GHz)</td><td>—</td><td>DDR3L</td><td>HMI, IoT gateway</td></tr>
+        <tr><td>i.MX8M Plus</td><td>Cortex-A53 (4 çekirdek)</td><td>Cortex-M7 (800 MHz)</td><td>LPDDR4</td><td>ML + gerçek zamanlı kontrol</td></tr>
+        <tr><td>i.MX8M Mini</td><td>Cortex-A53 (4 çekirdek)</td><td>Cortex-M4 (400 MHz)</td><td>LPDDR4</td><td>Ses, enerji yönetimi</td></tr>
+        <tr><td>AM62x (AM6254)</td><td>Cortex-A53 (4 çekirdek)</td><td>Cortex-M4F (x2)</td><td>LPDDR4</td><td>Endüstriyel HMI, otomotiv</td></tr>
+        <tr><td>AM64x</td><td>Cortex-A53 (2 çekirdek)</td><td>Cortex-M4F + R5F</td><td>DDR4</td><td>EtherCAT, CAN, motor kontrol</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>İki çekirdek arasındaki iletişim seçenekleri</h3>
+
+  <div class="flow">
+    <pre>
+Cortex-A (Linux)                    Cortex-M (RTOS / bare-metal)
+     │                                      │
+     │  ┌─────────────────────────┐         │
+     ├──│  Shared Memory (DDR)    │─────────┤
+     │  └─────────────────────────┘         │
+     │  ┌─────────────────────────┐         │
+     ├──│  Mailbox / IPC HW       │─────────┤  ← IRQ tetikler
+     │  └─────────────────────────┘         │
+     │  ┌─────────────────────────┐         │
+     ├──│  OpenAMP (RPMsg/virtio) │─────────┤  ← Bu rehberin konusu
+     │  └─────────────────────────┘         │
+     │  ┌─────────────────────────┐         │
+     └──│  RPMSG char / tty       │─────────┘  ← Kullanıcı alanı arayüzü</pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Heterojen SoC: aynı çipte A (Linux) + M (RTOS) — güç, deterministlik, izolasyon</li>
+      <li>Popüler SoC'lar: STM32MP1, i.MX8M, AM62x — her birinde Cortex-M yan işlemci</li>
+      <li>OpenAMP: shared memory + mailbox üzerine inşa edilen standart iletişim katmanı</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> OpenAMP bileşenleri</h2>
+  <p class="section-lead">OpenAMP (Open Asymmetric Multi-Processing), üç temel katmandan oluşur: remoteproc (yaşam döngüsü), virtio/vring (aktarım), RPMsg (mesajlaşma).</p>
+
+  <h3>Katman mimarisi</h3>
+
+  <div class="flow">
+    <pre>
+Kullanıcı alanı
+┌────────────────────────────────────────────┐
+│  /dev/rpmsg0  /dev/ttyRPMSG0              │
+│  rpmsg_char driver   rpmsg_tty driver     │
+└────────────────────────────────────────────┘
+        │
+Kernel alanı
+┌────────────────────────────────────────────┐
+│  RPMsg çerçevesi  (mesaj yönlendirme)      │
+│  ┌──────────────────────────────────────┐  │
+│  │  virtio + vring  (ring buffer DMA)   │  │
+│  └──────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────┐  │
+│  │  remoteproc  (firmware lifecycle)    │  │
+│  └──────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────┐  │
+│  │  mailbox driver  (IPC interrupt)     │  │
+│  └──────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────┐  │
+│  │  libmetal  (shared memory, I/O)      │  │
+│  └──────────────────────────────────────┘  │
+└────────────────────────────────────────────┘
+        │ Shared DDR + HW Mailbox
+Cortex-M tarafı (bare-metal / FreeRTOS)
+┌────────────────────────────────────────────┐
+│  OpenAMP lib: remoteproc_virtio + rpmsg    │
+│  libmetal: bellek/IRQ soyutlama            │
+│  RTOS: FreeRTOS / Zephyr / ThreadX         │
+└────────────────────────────────────────────┘</pre>
+  </div>
+
+  <h3>Bileşen görevleri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">libmetal</span><span class="desc">Düşük seviyeli donanım soyutlama: bellek eşleme, önbellek yönetimi, I/O port erişimi, kesme yönetimi. Hem A hem M tarafında kullanılır.</span></div>
+    <div class="param"><span class="name">remoteproc</span><span class="desc">Linux tarafında M çekirdeğinin yaşam döngüsünü yönetir: firmware yükleme, başlatma, durdurma, crash recovery. /sys/class/remoteproc/ arayüzü sunar.</span></div>
+    <div class="param"><span class="name">virtio</span><span class="desc">Sanallaştırma dünyasından alınan standart cihaz arayüzü. M tarafı bir virtio cihaz, A tarafı virtio sürücü görevi görür. vring halka tamponları veri taşır.</span></div>
+    <div class="param"><span class="name">RPMsg</span><span class="desc">virtio üzerinde çalışan hafif mesajlaşma protokolü. Her channel için kaynak/hedef adres (endpoint) tanımlanır; 512 byte'a kadar mesaj gönderilir.</span></div>
+  </div>
+
+  <h3>OpenAMP proje bileşenleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Bileşen</th><th>Konum</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td>openamp</td><td>github.com/OpenAMP/open-amp</td><td>Çekirdek kütüphane: remoteproc, rpmsg, virtio</td></tr>
+        <tr><td>libmetal</td><td>github.com/OpenAMP/libmetal</td><td>Donanım soyutlama katmanı</td></tr>
+        <tr><td>openamp-system-reference</td><td>github.com/OpenAMP/openamp-system-reference</td><td>Demo uygulamalar ve BSP örnekleri</td></tr>
+        <tr><td>Kernel remoteproc</td><td>drivers/remoteproc/</td><td>Linux kernel remoteproc sürücüleri</td></tr>
+        <tr><td>Kernel rpmsg</td><td>drivers/rpmsg/</td><td>Linux kernel RPMsg çerçevesi</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>OpenAMP = libmetal + remoteproc + virtio/vring + RPMsg</li>
+      <li>libmetal: donanım soyutlama (her iki tarafta)</li>
+      <li>remoteproc: M çekirdeği yaşam döngüsü (Linux kernel sürücüsü)</li>
+      <li>RPMsg: virtio tabanlı 512B mesajlaşma — endpoint adresleme</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> remoteproc</h2>
+  <p class="section-lead">remoteproc alt sistemi, Linux'un kardeş işlemciyi (remote processor) yönetmesini sağlar: ELF firmware yükleme, başlatma, durdurma ve güvenli yeniden başlatma.</p>
+
+  <h3>remoteproc sysfs arayüzü</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>sysfs düğümü</th><th>Okuma</th><th>Yazma</th></tr></thead>
+      <tbody>
+        <tr><td>/sys/class/remoteproc/remoteproc0/state</td><td>offline / running / suspended / crashed</td><td>start / stop</td></tr>
+        <tr><td>/sys/class/remoteproc/remoteproc0/firmware</td><td>Firmware adı</td><td>Firmware adını değiştir</td></tr>
+        <tr><td>/sys/class/remoteproc/remoteproc0/coredump</td><td>crash sonrası dump etkinleştir</td><td>disabled / enabled / inline</td></tr>
+        <tr><td>/sys/class/remoteproc/remoteproc0/recovery</td><td>Otomatik yeniden başlatma durumu</td><td>enabled / disabled</td></tr>
+        <tr><td>/sys/class/remoteproc/remoteproc0/name</td><td>Remoteproc adı</td><td>—</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Firmware yükleme ve başlatma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Firmware dosyasının yerini kontrol et (/lib/firmware/ altında olmalı)</span>
+ls /lib/firmware/stm32mp157c-rproc.elf
+
+<span class="cmt"># Hangi firmware yüklenecek?</span>
+cat /sys/class/remoteproc/remoteproc0/firmware
+<span class="cmt"># stm32mp157c-rproc.elf</span>
+
+<span class="cmt"># Firmware adını değiştir (çalışmıyorken)</span>
+echo "myfirmware.elf" &gt; /sys/class/remoteproc/remoteproc0/firmware
+
+<span class="cmt"># Cortex-M çekirdeğini başlat</span>
+echo "start" &gt; /sys/class/remoteproc/remoteproc0/state
+
+<span class="cmt"># Durum kontrolü</span>
+cat /sys/class/remoteproc/remoteproc0/state
+<span class="cmt"># running</span>
+
+<span class="cmt"># Cortex-M çekirdeğini durdur</span>
+echo "stop" &gt; /sys/class/remoteproc/remoteproc0/state
+
+<span class="cmt"># Kernel log'unda remoteproc mesajlarını izle</span>
+dmesg | grep remoteproc</code></pre>
+  </div>
+
+  <h3>remoteproc sürücü zinciri</h3>
+
+  <div class="flow">
+    <pre>
+Platform device tree: &amp;m4_rproc { ... }
+        │
+        ▼
+SoC özgü remoteproc sürücüsü
+  (stm32_rproc.c / imx_rproc.c / ti_k3_r5_remoteproc.c)
+        │  firmware yükleme isteği
+        ▼
+request_firmware("stm32mp157c-rproc.elf")
+        │  /lib/firmware/ üzerinden
+        ▼
+ELF ayrıştırma + resource table okuma
+        │
+        ├─ Bellek bölgelerini eşle (carveout)
+        ├─ vdev'leri başlat (virtio)
+        ├─ Mailbox kanallarını aç
+        │
+        ▼
+M çekirdeği PC/SP değerlerini yaz → reset kaldır
+        │
+        ▼
+M çekirdeği çalışıyor → virtio handshake</pre>
+  </div>
+
+  <h3>Kernel konfigürasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig</span><span class="dot">●</span></div>
+    <pre><code>CONFIG_REMOTEPROC=y
+CONFIG_STM32_RPROC=y          <span class="cmt"># STM32MP için</span>
+<span class="cmt"># CONFIG_IMX_REMOTEPROC=y     # i.MX için</span>
+<span class="cmt"># CONFIG_TI_K3_R5_REMOTEPROC=y  # AM62x/AM64x için</span>
+CONFIG_RPMSG=y
+CONFIG_RPMSG_VIRTIO=y
+CONFIG_RPMSG_CHAR=y           <span class="cmt"># /dev/rpmsgX karakter aygıtları</span>
+CONFIG_RPMSG_TTY=y            <span class="cmt"># /dev/ttyRPMSGX sanal seri port</span>
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_MMIO=y          <span class="cmt"># Bellek eşlemeli virtio</span>
+CONFIG_MAILBOX=y
+<span class="cmt"># STM32 için:</span>
+CONFIG_STM32_IPCC=y           <span class="cmt"># STM32 IPCC mailbox</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>/sys/class/remoteproc/remoteproc0/: state, firmware, coredump, recovery</li>
+      <li>echo start/stop ile M çekirdeği kontrolü</li>
+      <li>ELF firmware: /lib/firmware/ altında, resource table içermeli</li>
+      <li>SoC özgü sürücü: stm32_rproc, imx_rproc, ti_k3_r5_remoteproc</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> RPMsg</h2>
+  <p class="section-lead">RPMsg (Remote Processor Messaging), virtio vring halka tamponları üzerine inşa edilmiş hafif bir mesajlaşma çerçevesidir. Her endpoint bir adres-port çiftine sahiptir; mesajlar 512 bayta kadardır.</p>
+
+  <h3>RPMsg mesaj yapısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C</span><span class="dot">●</span></div>
+    <pre><code>/* Kernel kaynak: include/linux/rpmsg.h */
+
+struct rpmsg_hdr {
+    __u32 src;    /* Kaynak endpoint adresi */
+    __u32 dst;    /* Hedef endpoint adresi */
+    __u32 reserved;
+    __u16 len;    /* Yük uzunluğu (maks 512 byte) */
+    __u16 flags;
+    __u8  data[]; /* Mesaj verisi */
+} __packed;</code></pre>
+  </div>
+
+  <h3>Linux tarafında RPMsg sürücüsü yazma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/module.h&gt;
+#include &lt;linux/rpmsg.h&gt;
+
+/* Mesaj geldiğinde çağrılır */
+static int mydrv_cb(struct rpmsg_device *rpdev,
+                    void *data, int len,
+                    void *priv, u32 src)
+{
+    dev_info(&amp;rpdev-&gt;dev, "M4'ten mesaj (src=%u, len=%d): %.*s\n",
+             src, len, len, (char *)data);
+
+    /* M4'e yanıt gönder */
+    rpmsg_send(rpdev-&gt;ept, "ACK", 3);
+    return 0;
+}
+
+static int mydrv_probe(struct rpmsg_device *rpdev)
+{
+    dev_info(&amp;rpdev-&gt;dev, "RPMsg kanalı açıldı (src=%u dst=%u)\n",
+             rpdev-&gt;src, rpdev-&gt;dst);
+
+    /* Karşı tarafa tanışma mesajı gönder */
+    rpmsg_send(rpdev-&gt;ept, "HELLO", 5);
+    return 0;
+}
+
+static void mydrv_remove(struct rpmsg_device *rpdev)
+{
+    dev_info(&amp;rpdev-&gt;dev, "RPMsg kanalı kapandı\n");
+}
+
+/* Bu isim, M4 tarafındaki endpoint adıyla eşleşmeli */
+static struct rpmsg_device_id mydrv_id_table[] = {
+    { .name = "my-rpmsg-channel" },
+    { },
+};
+MODULE_DEVICE_TABLE(rpmsg, mydrv_id_table);
+
+static struct rpmsg_driver mydrv = {
+    .drv.name = "my_rpmsg_driver",
+    .id_table = mydrv_id_table,
+    .probe    = mydrv_probe,
+    .remove   = mydrv_remove,
+    .callback = mydrv_cb,
+};
+module_rpmsg_driver(mydrv);</code></pre>
+  </div>
+
+  <h3>Kullanıcı alanından RPMsg erişimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># rpmsg_char modülü yüklü olmalı</span>
+modprobe rpmsg_char
+
+<span class="cmt"># RPMsg karakter aygıtları oluştur</span>
+ls /dev/rpmsg*
+<span class="cmt"># /dev/rpmsg0   /dev/rpmsg_ctrl0</span>
+
+<span class="cmt"># rpmsg_ctrl üzerinden yeni endpoint aç</span>
+<span class="cmt"># (rpmsg_create_ept ioctl)</span>
+
+<span class="cmt"># Doğrudan okuma/yazma:</span>
+echo "Merhaba M4" &gt; /dev/rpmsg0
+cat /dev/rpmsg0   <span class="cmt"># M4'ten gelen veriyi oku</span>
+
+<span class="cmt"># ttyRPMSG sanal seri port ile (rpmsg_tty modülü)</span>
+modprobe rpmsg_tty
+ls /dev/ttyRPMSG*
+<span class="cmt"># /dev/ttyRPMSG0</span>
+minicom -D /dev/ttyRPMSG0 -b 115200</code></pre>
+  </div>
+
+  <h3>RPMsg endpoint adresleme</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Adres 0x35 (53)</span><span class="desc">name service endpoint — kanal keşfi için ayrılmış</span></div>
+    <div class="param"><span class="name">Dinamik adres</span><span class="desc">Linux tarafı, rpmsg_create_ept() ile dinamik olarak adres alır</span></div>
+    <div class="param"><span class="name">M4 sabit adres</span><span class="desc">M4 tarafı genellikle sabit adres kullanır; Linux name service üzerinden eşleşir</span></div>
+    <div class="param"><span class="name">RPMSG_ADDR_ANY</span><span class="desc">Kaynak adres olarak kullanılırsa kernel uygun boş adresi atar</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>RPMsg: src/dst endpoint adresi + maks 512B mesaj</li>
+      <li>Kernel sürücüsü: rpmsg_driver + callback — name ile otomatik eşleşme</li>
+      <li>Kullanıcı alanı: /dev/rpmsg0 (char) veya /dev/ttyRPMSG0 (tty)</li>
+      <li>Name service (0x35): kanal adı üzerinden otomatik keşif ve eşleşme</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> Cortex-M tarafı</h2>
+  <p class="section-lead">M çekirdeği, OpenAMP kütüphanesini doğrudan kullanarak RPMsg endpoint oluşturur, mesaj alır ve gönderir. FreeRTOS ile entegrasyon en yaygın yaklaşımdır.</p>
+
+  <h3>OpenAMP bare-metal kurulumu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C</span><span class="dot">●</span></div>
+    <pre><code>/* M4 tarafı: OpenAMP + FreeRTOS ile RPMsg endpoint */
+#include "openamp/open_amp.h"
+#include "metal/alloc.h"
+#include "metal/sys.h"
+
+/* Virtio cihaz ve vring yapıları (resource table'dan gelir) */
+static struct virtio_device vdev;
+static struct rpmsg_virtio_device rvdev;
+static struct metal_io_region shm_io;
+
+/* RPMsg endpoint */
+static struct rpmsg_endpoint my_ept;
+
+/* Mesaj alındığında çağrılır (ISR veya task context'ten) */
+static int rpmsg_recv_callback(struct rpmsg_endpoint *ept,
+                               void *data, size_t len,
+                               uint32_t src, void *priv)
+{
+    /* Gelen veriyi işle */
+    uint8_t *msg = (uint8_t *)data;
+
+    /* Yanıt gönder */
+    rpmsg_send(ept, "ACK", 3);
+    return 0;
+}
+
+/* OpenAMP başlatma */
+void openamp_init(void) {
+    struct metal_init_params metal_params = METAL_INIT_DEFAULTS;
+
+    /* libmetal başlat */
+    metal_init(&amp;metal_params);
+
+    /* Shared memory I/O bölgesini kaydet */
+    metal_io_init(&amp;shm_io,
+                  (void *)SHARED_MEM_BASE,   /* Fiziksel adres */
+                  &amp;(uint64_t){SHARED_MEM_BASE},
+                  SHARED_MEM_SIZE,
+                  (unsigned int)-1,          /* page_shift: sayfa yok */
+                  0,                         /* flags */
+                  NULL);                     /* ops */
+
+    /* Resource table'dan virtio cihaz oluştur */
+    rproc_virtio_init_vdev(&amp;vdev,
+                           &amp;rsc_table-&gt;vdev,
+                           VDEV_NOTIFY_ID,
+                           notify_callback, NULL);
+
+    /* RPMsg virtio cihaz başlat */
+    rpmsg_init_vdev(&amp;rvdev, &amp;vdev,
+                    rpmsg_ns_callback,   /* name service callback */
+                    &amp;shm_io,
+                    &amp;rpmsg_vring_rx,
+                    &amp;rpmsg_vring_tx,
+                    RPMSG_ROLE_REMOTE);  /* M4 = remote, A7 = host */
+}
+
+/* Endpoint oluştur ve kaydet */
+void create_endpoint(void) {
+    struct rpmsg_device *rdev = rpmsg_virtio_get_rpmsg_device(&amp;rvdev);
+
+    rpmsg_create_ept(&amp;my_ept,
+                     rdev,
+                     "my-rpmsg-channel",   /* Kanal adı (Linux sürücüsüyle eşleşmeli) */
+                     RPMSG_ADDR_ANY,       /* Yerel adres: dinamik ata */
+                     RPMSG_ADDR_ANY,       /* Uzak adres: name service'den öğren */
+                     rpmsg_recv_callback,
+                     NULL);
+}</code></pre>
+  </div>
+
+  <h3>Mailbox (IPC) kesme işleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C</span><span class="dot">●</span></div>
+    <pre><code>/* STM32MP1 IPCC kesme işleyici (M4 tarafı) */
+void IPCC_C1_RX_IRQHandler(void)
+{
+    /* A7'den M4'e gelen bildirim */
+    /* virtio vring'de yeni mesaj var */
+    rproc_virtio_notified(&amp;vdev, VRING0_ID);
+
+    /* Kesme bayrağını temizle */
+    HAL_IPCC_RxCallback(&amp;hipcc, IPCC_CHANNEL_1, IPCC_CHANNEL_DIR_TX);
+}
+
+/* M4'ten A7'ye bildirim gönder */
+static void notify_callback(struct virtio_device *vdev,
+                            uint32_t notifyid)
+{
+    /* A7 tarafına IRQ gönder (IPCC üzerinden) */
+    HAL_IPCC_NotifyCPU2(&amp;hipcc, IPCC_CHANNEL_1, IPCC_CHANNEL_DIR_RX);
+}</code></pre>
+  </div>
+
+  <h3>FreeRTOS task ile RPMsg döngüsü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C</span><span class="dot">●</span></div>
+    <pre><code>/* FreeRTOS task: RPMsg mesaj işleme döngüsü */
+void rpmsg_task(void *pvParameters)
+{
+    openamp_init();
+    create_endpoint();
+
+    /* Bağlantı kurulana kadar bekle */
+    while (!rpmsg_endpoint_is_bound(&amp;my_ept)) {
+        taskYIELD();
+    }
+
+    /* Ana döngü: mesaj gönder ve bekle */
+    for (;;) {
+        /* Sensör verisi örneği gönder */
+        sensor_data_t sensor = read_sensor();
+        rpmsg_send(&amp;my_ept, &amp;sensor, sizeof(sensor));
+
+        /* 100ms bekle */
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+/* FreeRTOS task oluşturma (main veya scheduler başlatılmadan önce) */
+xTaskCreate(rpmsg_task, "RPMsg", 512, NULL, tskIDLE_PRIORITY + 1, NULL);</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>M4 tarafı: metal_init + rpmsg_init_vdev + rpmsg_create_ept</li>
+      <li>Rol: M4 = RPMSG_ROLE_REMOTE, A7/Linux = host</li>
+      <li>Mailbox IRQ: A7'den bildirim geldiğinde rproc_virtio_notified() çağır</li>
+      <li>FreeRTOS: ayrı task ile RPMsg döngüsü, endpoint_is_bound() ile bağlantı kontrolü</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> Shared memory ve resource table</h2>
+  <p class="section-lead">Resource table, M4 ELF firmware içinde gömülü bir veri yapısıdır. Linux remoteproc bu tabloyu okuyarak paylaşımlı bellek bölgelerini, vdev'leri ve trace buffer'ı yapılandırır.</p>
+
+  <h3>Resource table yapısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>C</span><span class="dot">●</span></div>
+    <pre><code>/* M4 ELF firmware içindeki resource_table bölümü */
+/* Linker script'te: .resource_table bölümü tanımlanmalı */
+
+#include "openamp/remoteproc.h"
+
+/* Resource table yapısı — SoC'a göre değişir */
+struct __resource_table {
+    struct resource_table base;
+
+    /* Kaynak sayısı kadar offset */
+    uint32_t offset[2];
+
+    /* 1. Kaynak: Paylaşımlı bellek carveout */
+    struct fw_rsc_carveout shm_carveout;
+
+    /* 2. Kaynak: virtio cihaz (RPMsg için) */
+    struct fw_rsc_vdev     vdev;
+    struct fw_rsc_vdev_vring vring0;  /* TX vring (M4 -&gt; A7) */
+    struct fw_rsc_vdev_vring vring1;  /* RX vring (A7 -&gt; M4) */
+    uint8_t vdev_features[RSC_VDEV_FEATURE_SIZE];
+
+    /* 3. Kaynak: Trace buffer */
+    struct fw_rsc_trace trace;
+} __packed;
+
+/* ELF içinde .resource_table bölümüne yerleştir */
+__attribute__((section(".resource_table")))
+struct __resource_table rsc_table = {
+    .base = {
+        .ver = 1,           /* Resource table versiyon */
+        .num = 2,           /* Kaynak sayısı */
+    },
+    .offset = { offsetof(struct __resource_table, shm_carveout),
+                offsetof(struct __resource_table, vdev) },
+
+    .shm_carveout = {
+        .type    = RSC_CARVEOUT,
+        .da      = 0x10040000,   /* M4 görüş adresi */
+        .pa      = 0x10040000,   /* Fiziksel adres */
+        .len     = 0x10000,      /* 64 KB */
+        .flags   = 0,
+        .name    = "OPENAMP_SHM",
+    },
+
+    .vdev = {
+        .type        = RSC_VDEV,
+        .id          = VIRTIO_ID_RPMSG,  /* 7 */
+        .notifyid    = 0,
+        .dfeatures   = 1,       /* VIRTIO_RPMSG_F_NS */
+        .gfeatures   = 0,
+        .config_len  = 0,
+        .status      = 0,
+        .num_of_vrings = 2,
+    },
+
+    .vring0 = {
+        .da     = FW_RSC_ADDR_ANY,  /* Linux tarafından atanır */
+        .align  = 4096,
+        .num    = 16,               /* Descriptor sayısı */
+        .notifyid = 0,
+    },
+    .vring1 = {
+        .da     = FW_RSC_ADDR_ANY,
+        .align  = 4096,
+        .num    = 16,
+        .notifyid = 1,
+    },
+
+    .trace = {
+        .type = RSC_TRACE,
+        .da   = 0x10050000,   /* Trace buffer adresi */
+        .len  = 0x1000,       /* 4 KB */
+        .name = "M4_TRACE",
+    },
+};</code></pre>
+  </div>
+
+  <h3>Bellek haritası planlaması</h3>
+
+  <div class="flow">
+    <pre>
+DDR Bellek Haritası (STM32MP157 örneği)
+┌──────────────────┬──────────────┬─────────────────────────┐
+│  Adres           │  Boyut       │  Kullanım               │
+├──────────────────┼──────────────┼─────────────────────────┤
+│  0xC0000000      │  512 MB      │  Linux DDR (DT reserved) │
+│  0xDD000000      │  1 MB        │  M4 DDR firmware        │
+│  0xDD100000      │  64 KB       │  Carveout: vring + IPC  │
+│  0xDD110000      │  4 KB        │  Trace buffer           │
+│  0x10000000      │  64 KB       │  M4 SRAM (yerel)        │
+└──────────────────┴──────────────┴─────────────────────────┘</pre>
+  </div>
+
+  <h3>Device tree'de carveout bölge tanımlama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts</span><span class="dot">●</span></div>
+    <pre><code>/* arch/arm/boot/dts/stm32mp157c-myboard.dts */
+
+/ {
+    reserved-memory {
+        #address-cells = &lt;1&gt;;
+        #size-cells = &lt;1&gt;;
+        ranges;
+
+        /* M4 firmware için ayrılmış DDR bölgesi */
+        mcuram: mcuram@dd000000 {
+            compatible = "shared-dma-pool";
+            reg = &lt;0xdd000000 0x100000&gt;;   /* 1 MB */
+            no-map;
+        };
+
+        /* OpenAMP paylaşımlı bellek */
+        openamp_shmem: openamp-shmem@dd100000 {
+            compatible = "shared-dma-pool";
+            reg = &lt;0xdd100000 0x10000&gt;;    /* 64 KB */
+            no-map;
+        };
+    };
+
+    /* remoteproc düğümü */
+    &amp;m4_rproc {
+        memory-region = &lt;&amp;mcuram&gt;, &lt;&amp;openamp_shmem&gt;;
+        mboxes = &lt;&amp;ipcc 0&gt;, &lt;&amp;ipcc 1&gt;;
+        mbox-names = "vq0", "vq1";
+        status = "okay";
+    };
+};</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Resource table: ELF içindeki .resource_table bölümü — carveout + vdev + trace</li>
+      <li>vring: iki yönlü halka tampon — TX (M4→A7) ve RX (A7→M4)</li>
+      <li>Device tree: reserved-memory ile carveout bölge no-map olarak ayrılır</li>
+      <li>FW_RSC_ADDR_ANY: vring adresini Linux dinamik olarak atar</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> STM32MP1 üzerinde OpenAMP</h2>
+  <p class="section-lead">STM32MP157, Cortex-A7 ve Cortex-M4'ü aynı çipte barındırır. ST, Linux tarafı için OpenSTLinux dağıtımını ve M4 tarafı için STM32CubeMP1 HAL + FreeRTOS referans paketini sağlar.</p>
+
+  <h3>Gerekli yazılım bileşenleri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">OpenSTLinux (A7 tarafı)</span><span class="desc">ST'nin Yocto tabanlı Linux dağıtımı; stm32_rproc.ko, rpmsg.ko ve IPCC sürücülerini içerir</span></div>
+    <div class="param"><span class="name">STM32CubeMP1 (M4 tarafı)</span><span class="desc">HAL kütüphanesi + OpenAMP + FreeRTOS referans projesi; CubeIDE ile derlenir</span></div>
+    <div class="param"><span class="name">OpenAMP kütüphanesi</span><span class="desc">github.com/STMicroelectronics/openamp — ST yamaları içeren özel dal</span></div>
+    <div class="param"><span class="name">IPCC (Inter-Processor Communication Controller)</span><span class="desc">STM32MP1 dahili donanım mailbox; iki çekirdek arası kesme kanalları sağlar</span></div>
+  </div>
+
+  <h3>Yocto ile OpenAMP etkinleştirme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># meta-st-stm32mp layer'ı içeren Yocto projesi</span>
+<span class="cmt"># local.conf veya image recipe:</span>
+
+IMAGE_INSTALL:append = " \
+    kernel-modules \
+    rpmsg-utils \
+    copro-utils \
+"
+
+<span class="cmt"># Firmware dosyasını rootfs'e koy</span>
+<span class="cmt"># meta-mylayer/recipes-firmware/m4-firmware/m4-firmware.bb</span></code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Hedef üzerinde M4 firmware başlatma</span>
+
+<span class="cmt"># 1. Firmware dosyasını /lib/firmware/ altına koy</span>
+cp stm32mp157c-rproc.elf /lib/firmware/
+
+<span class="cmt"># 2. remoteproc sysfs üzerinden başlat</span>
+echo "stm32mp157c-rproc.elf" &gt; /sys/class/remoteproc/remoteproc0/firmware
+echo start &gt; /sys/class/remoteproc/remoteproc0/state
+
+<span class="cmt"># 3. Durum kontrolü</span>
+cat /sys/class/remoteproc/remoteproc0/state    <span class="cmt"># running</span>
+
+<span class="cmt"># 4. RPMsg kanalının açılıp açılmadığını kontrol et</span>
+dmesg | grep rpmsg
+<span class="cmt"># rpmsg_virtio0: creating channel my-rpmsg-channel addr 0x400</span>
+
+<span class="cmt"># 5. Kullanıcı alanından test</span>
+ls /dev/rpmsg*
+echo "test" &gt; /dev/rpmsg0
+cat /dev/rpmsg0</code></pre>
+  </div>
+
+  <h3>M4 trace buffer okuma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># M4 firmware'in yazdığı trace buffer'ı oku</span>
+cat /sys/kernel/debug/remoteproc/remoteproc0/trace0
+
+<span class="cmt"># Örnek M4 çıktısı:</span>
+<span class="cmt"># [M4] OpenAMP baslatiliyor...</span>
+<span class="cmt"># [M4] RPMsg endpoint olusturuldu: addr=1024</span>
+<span class="cmt"># [M4] A7 baglantisi kuruldu</span>
+<span class="cmt"># [M4] Sensor: temp=25.3C, humidity=65%</span></code></pre>
+  </div>
+
+  <h3>Copro (coprocessor) servis birimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>systemd unit</span><span class="dot">●</span></div>
+    <pre><code>[Unit]
+Description=STM32MP1 M4 Coprocessor
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/copro-utils start stm32mp157c-rproc.elf
+ExecStop=/usr/bin/copro-utils stop
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>STM32MP157: A7 Linux + M4 FreeRTOS, IPCC donanım mailbox üzerinden haberleşir</li>
+      <li>Firmware: /lib/firmware/ altında ELF; copro-utils veya sysfs ile başlatılır</li>
+      <li>Trace buffer: /sys/kernel/debug/remoteproc/remoteproc0/trace0 — M4 log çıktısı</li>
+      <li>Yocto: meta-st-stm32mp layer + rpmsg-utils + copro-utils</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> i.MX8M ve AM62x üzerinde OpenAMP</h2>
+  <p class="section-lead">i.MX8M ve AM62x, STM32MP1'den farklı SoC mimarisine sahiptir; remoteproc sürücüleri ve device tree yapısı değişir ancak OpenAMP kullanım modeli aynı kalır.</p>
+
+  <h3>i.MX8M Plus — Cortex-M7</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts — i.MX8M Plus</span><span class="dot">●</span></div>
+    <pre><code>/* arch/arm64/boot/dts/freescale/imx8mp-myboard.dts */
+
+/ {
+    reserved-memory {
+        #address-cells = &lt;2&gt;;
+        #size-cells = &lt;2&gt;;
+        ranges;
+
+        /* M7 için ayrılmış bellek */
+        m7_reserved: m7-reserved@55000000 {
+            no-map;
+            reg = &lt;0 0x55000000 0 0x1000000&gt;;  /* 16 MB */
+        };
+
+        /* vdev ring buffers */
+        vdev0vring0: vdev0vring0@55000000 {
+            no-map;
+            reg = &lt;0 0x55000000 0 0x8000&gt;;
+        };
+        vdev0vring1: vdev0vring1@55008000 {
+            no-map;
+            reg = &lt;0 0x55008000 0 0x8000&gt;;
+        };
+        vdev0buffer: vdev0buffer@55400000 {
+            compatible = "shared-dma-pool";
+            no-map;
+            reg = &lt;0 0x55400000 0 0x100000&gt;;
+        };
+    };
+
+    &amp;rpmsg {
+        memory-region = &lt;&amp;vdev0buffer&gt;;
+        status = "okay";
+    };
+};
+
+/* Kernel: CONFIG_IMX_REMOTEPROC=y */</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — i.MX8M</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># i.MX8M M7 firmware başlatma</span>
+<span class="cmt"># NXP MCUXpresso SDK veya Zephyr ile derlenen ELF kullanılır</span>
+
+<span class="cmt"># Firmware konumu</span>
+ls /lib/firmware/imx8mp-cm7-*
+
+<span class="cmt"># remoteproc0 = M7 çekirdeği</span>
+echo "imx8mp-cm7-rpmsg.elf" &gt; /sys/class/remoteproc/remoteproc0/firmware
+echo start &gt; /sys/class/remoteproc/remoteproc0/state
+
+<span class="cmt"># i.MX8M MU (Messaging Unit) — mailbox mekanizması</span>
+<span class="cmt"># IPCC yerine MU kullanılır: drivers/mailbox/imx-mailbox.c</span>
+<span class="cmt"># Kernel: CONFIG_IMX_MBOX=y</span></code></pre>
+  </div>
+
+  <h3>AM62x (TI) — Cortex-M4F</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Bileşen</th><th>AM62x'te karşılığı</th></tr></thead>
+      <tbody>
+        <tr><td>remoteproc sürücüsü</td><td>ti_k3_r5_remoteproc.c (R5F) / ti_k3_m4_remoteproc.c (M4F)</td></tr>
+        <tr><td>Mailbox</td><td>OMAP mailbox: mailbox-j721e.c</td></tr>
+        <tr><td>sysfs</td><td>/sys/class/remoteproc/remoteproc0/ (aynı arayüz)</td></tr>
+        <tr><td>Firmware konumu</td><td>/lib/firmware/ti-ipc/am62xx/ipc_echo_testb_mcu1_0_release_strip.xer5f</td></tr>
+        <tr><td>IPC çerçevesi</td><td>TI IPC (eski) veya OpenAMP (yeni, önerilen)</td></tr>
+        <tr><td>SDK</td><td>MCU+ SDK, Processor SDK Linux</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts — AM62x</span><span class="dot">●</span></div>
+    <pre><code>/* arch/arm64/boot/dts/ti/k3-am625-sk.dts */
+
+&amp;mcu_m4fss {
+    mboxes = &lt;&amp;mailbox0_cluster0 &amp;mbox_m4_0&gt;,
+             &lt;&amp;mailbox0_cluster0 &amp;mbox_r5_0&gt;;
+    mbox-names = "txacq", "rxacq";
+    memory-region = &lt;&amp;mcu_m4fss0_dma_memory_region&gt;,
+                    &lt;&amp;mcu_m4fss0_memory_region&gt;;
+    status = "okay";
+};</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — AM62x</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># AM62x M4F başlatma (TI Processor SDK Linux)</span>
+
+<span class="cmt"># remoteproc sayısını kontrol et</span>
+ls /sys/class/remoteproc/
+<span class="cmt"># remoteproc0  remoteproc1  (M4F-0 ve M4F-1)</span>
+
+<span class="cmt"># Firmware adı ve durumu</span>
+cat /sys/class/remoteproc/remoteproc0/firmware
+<span class="cmt"># ti-ipc/am62xx/ipc_echo_testb_mcu1_0_release_strip.xer5f</span>
+
+echo start &gt; /sys/class/remoteproc/remoteproc0/state
+
+<span class="cmt"># TI IPC test aracı</span>
+<span class="cmt"># apt install ti-rpmsg-char (veya Yocto'da rpmsg-utils)</span>
+rpmsg_char_simple -d /dev/rpmsg0 -n 10 -m "Merhaba AM62x"</code></pre>
+  </div>
+
+  <h3>SoC karşılaştırması</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>STM32MP157</th><th>i.MX8M Plus</th><th>AM62x</th></tr></thead>
+      <tbody>
+        <tr><td>M çekirdeği</td><td>Cortex-M4 @ 209 MHz</td><td>Cortex-M7 @ 800 MHz</td><td>Cortex-M4F @ 400 MHz</td></tr>
+        <tr><td>Mailbox HW</td><td>IPCC</td><td>MU (Messaging Unit)</td><td>OMAP Mailbox</td></tr>
+        <tr><td>remoteproc sürücüsü</td><td>stm32_rproc.c</td><td>imx_rproc.c</td><td>ti_k3_m4_remoteproc.c</td></tr>
+        <tr><td>Yocto layer</td><td>meta-st-stm32mp</td><td>meta-imx</td><td>meta-ti</td></tr>
+        <tr><td>M tarafı SDK</td><td>STM32CubeMP1</td><td>MCUXpresso SDK</td><td>MCU+ SDK</td></tr>
+        <tr><td>Trace okuma</td><td>/debug/remoteproc/trace0</td><td>/debug/remoteproc/trace0</td><td>/debug/remoteproc/trace0</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>i.MX8M: IMX_REMOTEPROC sürücüsü, MU mailbox, MCUXpresso firmware</li>
+      <li>AM62x: ti_k3_m4_remoteproc, OMAP mailbox, MCU+ SDK</li>
+      <li>Tüm SoC'larda sysfs arayüzü aynı: state/firmware/coredump</li>
+      <li>Device tree: reserved-memory + vring bölgeleri SoC'a özgü adreslenmeli</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Hata ayıklama</h2>
+  <p class="section-lead">OpenAMP sorunları firmware yükleme hatalarından RPMsg mesaj kayıplarına kadar geniş bir yelpazede görülür. debugfs, dmesg ve donanım izleme araçları temel tanı araçlardır.</p>
+
+  <h3>remoteproc debugfs arayüzü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># debugfs bağla (genellikle zaten bağlı)</span>
+mount -t debugfs debugfs /sys/kernel/debug
+
+<span class="cmt"># remoteproc debugfs dizini</span>
+ls /sys/kernel/debug/remoteproc/remoteproc0/
+<span class="cmt"># carveout_memories  name  recovery  regs  trace0  version</span>
+
+<span class="cmt"># M4/M7 trace buffer çıktısı</span>
+cat /sys/kernel/debug/remoteproc/remoteproc0/trace0
+<span class="cmt"># Çıktı yoksa: M4 firmware trace buffer başlatmamış olabilir</span>
+<span class="cmt"># Resource table'da fw_rsc_trace girişi kontrol et</span>
+
+<span class="cmt"># Carveout bellek bölgelerini listele</span>
+cat /sys/kernel/debug/remoteproc/remoteproc0/carveout_memories
+<span class="cmt"># Name: OPENAMP_SHM PA: 0xdd100000 DA: 0xdd100000 Len: 0x10000</span>
+
+<span class="cmt"># Firmware versiyonunu göster</span>
+cat /sys/kernel/debug/remoteproc/remoteproc0/version</code></pre>
+  </div>
+
+  <h3>virtio-mmio ve vring durumu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># virtio cihaz listesi</span>
+ls /sys/bus/virtio/devices/
+<span class="cmt"># virtio0</span>
+
+<span class="cmt"># virtio cihaz bilgisi</span>
+cat /sys/bus/virtio/devices/virtio0/device
+<span class="cmt"># 0x0007  (VIRTIO_ID_RPMSG)</span>
+
+cat /sys/bus/virtio/devices/virtio0/vendor
+<span class="cmt"># 0x0000</span>
+
+<span class="cmt"># RPMsg kanal listesi</span>
+ls /sys/bus/rpmsg/devices/
+<span class="cmt"># virtio0.my-rpmsg-channel.-1.1024</span>
+<span class="cmt"># Biçim: vdevNAME.channel.src.dst</span>
+
+<span class="cmt"># Virtio mmio aygıt bilgisi (debugfs)</span>
+ls /sys/kernel/debug/virtio-mmio/
+cat /sys/kernel/debug/virtio-mmio/virtio0</code></pre>
+  </div>
+
+  <h3>Yaygın hata senaryoları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Hata</th><th>Belirti</th><th>Çözüm</th></tr></thead>
+      <tbody>
+        <tr><td>Firmware bulunamadı</td><td>dmesg: "failed to load firmware"</td><td>/lib/firmware/ altında doğru isimde ELF var mı kontrol et</td></tr>
+        <tr><td>Resource table geçersiz</td><td>dmesg: "bad resource table"</td><td>resource_table sürümü ve offset'leri kontrol et</td></tr>
+        <tr><td>State offline kalıyor</td><td>echo start sonrası hâlâ offline</td><td>mailbox sürücüsü yüklü mü (dmesg | grep ipcc/mu/mbox)</td></tr>
+        <tr><td>RPMsg kanalı açılmıyor</td><td>dmesg'de rpmsg mesajı yok</td><td>M4 firmware endpoint oluşturuyor mu (trace0 oku)</td></tr>
+        <tr><td>Mesaj kaybı</td><td>Uygulama veri kaybediyor</td><td>vring descriptor sayısını artır (num=32), flow control ekle</td></tr>
+        <tr><td>M4 crash sonrası recovery</td><td>state: crashed</td><td>coredump okuma + recovery: enabled ile otomatik yeniden başlat</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>M4 crash dump okuma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Coredump etkinleştir</span>
+echo "enabled" &gt; /sys/class/remoteproc/remoteproc0/coredump
+
+<span class="cmt"># M4 crash olursa state "crashed" olur</span>
+cat /sys/class/remoteproc/remoteproc0/state
+<span class="cmt"># crashed</span>
+
+<span class="cmt"># Coredump dosyasını kaydet (inline mode — debugfs üzerinden)</span>
+echo "inline" &gt; /sys/class/remoteproc/remoteproc0/coredump
+cat /sys/kernel/debug/remoteproc/remoteproc0/core_dump &gt; m4_crash.elf
+
+<span class="cmt"># GDB ile analiz</span>
+arm-none-eabi-gdb firmware.elf -c m4_crash.elf
+<span class="cmt"># (gdb) bt   — backtrace</span>
+<span class="cmt"># (gdb) info registers</span>
+
+<span class="cmt"># Otomatik recovery etkinleştir</span>
+echo enabled &gt; /sys/class/remoteproc/remoteproc0/recovery
+<span class="cmt"># Crash sonrası firmware otomatik yeniden yüklenir ve başlatılır</span></code></pre>
+  </div>
+
+  <h3>Kernel log filtreleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># OpenAMP ile ilgili tüm kernel mesajları</span>
+dmesg | grep -E "remoteproc|rpmsg|virtio|ipcc|mailbox" | tail -50
+
+<span class="cmt"># Dinamik debug etkinleştirme (çalışma zamanında)</span>
+echo "file drivers/remoteproc/stm32_rproc.c +p" &gt; \
+    /sys/kernel/debug/dynamic_debug/control
+
+echo "file drivers/rpmsg/*.c +p" &gt; \
+    /sys/kernel/debug/dynamic_debug/control
+
+<span class="cmt"># Etkinleştirilmiş dynamic debug kurallarını listele</span>
+grep "=p" /sys/kernel/debug/dynamic_debug/control | grep -E "remoteproc|rpmsg"
+
+<span class="cmt"># ftrace ile remoteproc fonksiyon izleme</span>
+echo function &gt; /sys/kernel/debug/tracing/current_tracer
+echo "stm32_rproc*" &gt; /sys/kernel/debug/tracing/set_ftrace_filter
+echo 1 &gt; /sys/kernel/debug/tracing/tracing_on
+echo start &gt; /sys/class/remoteproc/remoteproc0/state
+cat /sys/kernel/debug/tracing/trace | head -50
+echo 0 &gt; /sys/kernel/debug/tracing/tracing_on</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>/sys/kernel/debug/remoteproc/remoteproc0/trace0: M4 firmware log çıktısı</li>
+      <li>carveout_memories: bellek bölgelerinin düzgün eşlenip eşlenmediğini kontrol et</li>
+      <li>coredump=inline: M4 crash ELF dump, GDB ile analiz edilebilir</li>
+      <li>dynamic_debug: çalışma zamanında remoteproc/rpmsg sürücü loglarını etkinleştir</li>
+    </ul>
+  </div>
+</section>
+
+</main>

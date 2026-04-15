@@ -1,0 +1,785 @@
+---
+layout: tutorial
+title: "eBPF LSM — Programlanabilir Güvenlik Politikaları"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span><span>GÖMÜLÜ LİNUX</span><span>GÜVENLİK</span><span>2026</span>
+  </div>
+  <h1>eBPF LSM<br><em>Programlanabilir Güvenlik Politikaları</em></h1>
+  <p class="subtitle">Linux 5.7+ BPF LSM hook'ları ile kernel güvenlik politikalarını esnek biçimde programlama, SELinux/AppArmor'a alternatif ve tamamlayıcı yaklaşım.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">BPF LSM Neden?</a></li>
+    <li><a href="#s1">LSM Hook Altyapısı</a></li>
+    <li><a href="#s2">İlk BPF LSM Programı</a></li>
+    <li><a href="#s3">Dosya Erişim Kontrolü</a></li>
+    <li><a href="#s4">Ağ Politikası</a></li>
+    <li><a href="#s5">Süreç Denetimi</a></li>
+    <li><a href="#s6">MAP ile Dinamik Politika</a></li>
+    <li><a href="#s7">Gömülü Güvenlik Senaryosu</a></li>
+    <li><a href="#s8">Hata Ayıklama ve Doğrulama</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> BPF LSM Neden?</h2>
+  <p class="section-lead">SELinux ve AppArmor güçlü güvenlik modülleridir; ancak politika dili karmaşıklığı, dinamik güncelleme zorluğu ve gözlemlenebilirlik eksikliği gömülü sistemlerde ciddi engeller oluşturur. BPF LSM bu sorunları köklü biçimde çözer.</p>
+
+  <h3>Geleneksel LSM Sorunları</h3>
+  <div class="params">
+    <div class="param"><span class="name">SELinux politika karmaşıklığı</span><span class="desc">Milyonlarca kural, tür geçiş tanımları, boolean'lar — öğrenme eğrisi diktir. Özel donanım sürücüleri için politika yazmak haftalar alabilir.</span></div>
+    <div class="param"><span class="name">Statik politika</span><span class="desc">Politika değişikliği genellikle yeniden derleme veya en azından servis yeniden başlatması gerektirir. Canlı sistemde anlık güncelleme güçtür.</span></div>
+    <div class="param"><span class="name">Gözlemlenebilirlik eksikliği</span><span class="desc">SELinux AVC logları reddedilen işlemleri gösterir, ancak neden reddedildiğini, hangi sürecin hangi bağlamda çalıştığını derinlemesine analiz etmek güçtür.</span></div>
+    <div class="param"><span class="name">Gömülü sistem uyumsuzluğu</span><span class="desc">Kaynakları kısıtlı sistemlerde tam bir SELinux politika kümesi bellek ve depolama israfına neden olur.</span></div>
+  </div>
+
+  <h3>BPF LSM Avantajları</h3>
+  <div class="params">
+    <div class="param"><span class="name">Programlanabilir politika</span><span class="desc">C benzeri eBPF kodu ile tam programatik esneklik — koşullara, MAP verilerine, sistem durumuna göre dinamik karar verme.</span></div>
+    <div class="param"><span class="name">Sıfır yeniden başlatma güncellemesi</span><span class="desc">Yeni BPF programı yüklenerek politika anlık değiştirilebilir. Önceki program atomik olarak değiştirilir.</span></div>
+    <div class="param"><span class="name">Yerleşik gözlemlenebilirlik</span><span class="desc">BPF MAP'leri ve ring buffer'ları sayesinde her güvenlik kararı, geçen süre, süreç bilgisi kolayca raporlanabilir.</span></div>
+    <div class="param"><span class="name">SELinux ile birlikte çalışma</span><span class="desc">BPF LSM mevcut LSM'lerle yan yana çalışır; ek politika katmanı olarak kullanılabilir.</span></div>
+  </div>
+
+  <h3>Gereksinim Özeti</h3>
+  <div class="flow"><pre>
+Kernel 5.7+
+  CONFIG_BPF_LSM=y
+  CONFIG_LSM="lockdown,yama,bpf"  (veya mevcut listeye ,bpf ekle)
+  CONFIG_DEBUG_INFO_BTF=y          (CO-RE için)
+
+Kullanıcı Alanı Araçları
+  libbpf >= 0.6
+  clang >= 12 (BPF hedefi için)
+  bpftool
+  linux-headers veya vmlinux.h (bpftool btf dump ile)
+  </pre></div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> LSM Hook Altyapısı</h2>
+  <p class="section-lead">Linux LSM altyapısı, kernel içindeki kritik güvenlik noktalarına hook'lar yerleştirir. BPF LSM bu hook'lara eBPF programları bağlamasına izin vererek mevcut LSM çerçevesini programlanabilir hale getirir.</p>
+
+  <h3>security_* Hook'ları</h3>
+  <p>Kernel kaynak kodunda <code>security_*()</code> ile başlayan fonksiyonlar LSM hook çağrı noktalarıdır. Bu noktaların her birinde kayıtlı LSM'ler (SELinux, BPF LSM vb.) sırayla çağrılır; herhangi biri ret != 0 döndürürse işlem reddedilir.</p>
+
+  <div class="file-table"><table>
+    <tr><th>Hook</th><th>Tetiklenme Noktası</th><th>Dönüş Değeri</th></tr>
+    <tr><td>lsm/file_open</td><td>Dosya açılırken</td><td>0: izin, negatif: reddet</td></tr>
+    <tr><td>lsm/inode_permission</td><td>İzin kontrolünde</td><td>0: izin, -EACCES: reddet</td></tr>
+    <tr><td>lsm/socket_connect</td><td>Bağlantı kurulurken</td><td>0: izin, -EPERM: reddet</td></tr>
+    <tr><td>lsm/bprm_check_security</td><td>execve() öncesi</td><td>0: izin, -EACCES: reddet</td></tr>
+    <tr><td>lsm/task_kill</td><td>Sinyal gönderilirken</td><td>0: izin, -EPERM: reddet</td></tr>
+    <tr><td>lsm/sb_mount</td><td>Dosya sistemi bağlanırken</td><td>0: izin, -EPERM: reddet</td></tr>
+  </table></div>
+
+  <h3>BPF_PROG_TYPE_LSM</h3>
+  <p>BPF LSM programları <code>BPF_PROG_TYPE_LSM</code> tipinde tanımlanır ve <code>SEC("lsm/hook_adı")</code> bölüm etiketiyle hangi hook'a bağlandıkları belirtilir:</p>
+  <pre><code>SEC("lsm/file_open")
+int BPF_PROG(my_file_open, struct file *file)
+{
+    /* Güvenlik kararı burada verilir */
+    return 0;  /* izin ver */
+}</code></pre>
+
+  <h3>Sleepable ve Non-Sleepable Programlar</h3>
+  <div class="params">
+    <div class="param"><span class="name">Non-sleepable (varsayılan)</span><span class="desc">Çoğu LSM hook'u bu tiptedir. GFP_ATOMIC bellek tahsisi, spinlock uyumlu. Bekleme yapan çağrılar yasaktır.</span></div>
+    <div class="param"><span class="name">Sleepable (SEC("lsm.s/..."))</span><span class="desc">Linux 5.11+ ile bazı hook'larda sleepable programlar çalışabilir. bpf_copy_from_user gibi fonksiyonlar kullanılabilir.</span></div>
+  </div>
+
+  <h3>Kernel BTF ve CO-RE</h3>
+  <p>BPF LSM programları CO-RE (Compile Once, Run Everywhere) prensibini kullanır. <code>vmlinux.h</code> dosyası kernel BTF bilgisinden üretilir ve tüm kernel veri yapılarını içerir:</p>
+  <pre><code># vmlinux.h üret
+bpftool btf dump file /sys/kernel/btf/vmlinux format c &gt; vmlinux.h</code></pre>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> İlk BPF LSM Programı</h2>
+  <p class="section-lead">libbpf skeleton yaklaşımı, BPF LSM programlarını en az boilerplate kodla derleme ve yükleme imkanı sunar. Aşağıdaki örnek dosya açma işlemlerini izler.</p>
+
+  <h3>Kernel Tarafı: file_monitor.bpf.c</h3>
+  <pre><code>// file_monitor.bpf.c
+#include "vmlinux.h"
+#include &lt;bpf/bpf_helpers.h&gt;
+#include &lt;bpf/bpf_tracing.h&gt;
+#include &lt;bpf/bpf_core_read.h&gt;
+
+char LICENSE[] SEC("license") = "GPL";
+
+/* Olay yapısı -- ring buffer'a yazılacak */
+struct event {
+    u32  pid;
+    u32  uid;
+    char comm[16];
+    char filename[128];
+    int  ret;
+};
+
+/* Ring buffer map */
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024);
+} events SEC(".maps");
+
+SEC("lsm/file_open")
+int BPF_PROG(monitor_file_open, struct file *file)
+{
+    struct event *e;
+    struct dentry *dentry;
+    const unsigned char *name;
+
+    /* Ring buffer'a alan ayır */
+    e = bpf_ringbuf_reserve(&amp;events, sizeof(*e), 0);
+    if (!e)
+        return 0;
+
+    e-&gt;pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+    e-&gt;uid = bpf_get_current_uid_gid() &amp; 0xFFFFFFFF;
+    bpf_get_current_comm(e-&gt;comm, sizeof(e-&gt;comm));
+
+    /* Dosya adını oku (CO-RE ile güvenli) */
+    dentry = BPF_CORE_READ(file, f_path.dentry);
+    name   = BPF_CORE_READ(dentry, d_name.name);
+    bpf_probe_read_kernel_str(e-&gt;filename,
+                              sizeof(e-&gt;filename), name);
+
+    e-&gt;ret = 0;  /* bu hook izin veriyor */
+    bpf_ringbuf_submit(e, 0);
+
+    return 0;  /* erişime izin ver */
+}</code></pre>
+
+  <h3>Kullanıcı Alanı: file_monitor.c</h3>
+  <pre><code>#include &lt;stdio.h&gt;
+#include &lt;bpf/libbpf.h&gt;
+#include "file_monitor.skel.h"
+
+static int handle_event(void *ctx, void *data, size_t sz)
+{
+    struct event *e = data;
+    printf("PID=%-6u UID=%-4u COMM=%-16s FILE=%s\n",
+           e-&gt;pid, e-&gt;uid, e-&gt;comm, e-&gt;filename);
+    return 0;
+}
+
+int main(void)
+{
+    struct file_monitor_bpf *skel;
+    struct ring_buffer      *rb;
+    int err;
+
+    /* Skeleton yükle ve BPF programı kernel'e at */
+    skel = file_monitor_bpf__open_and_load();
+    if (!skel) { fprintf(stderr, "Yükleme hatası\n"); return 1; }
+
+    err = file_monitor_bpf__attach(skel);
+    if (err) { fprintf(stderr, "Attach hatası\n"); goto cleanup; }
+
+    /* Ring buffer dinleyici */
+    rb = ring_buffer__new(bpf_map__fd(skel-&gt;maps.events),
+                          handle_event, NULL, NULL);
+    if (!rb) { err = -1; goto cleanup; }
+
+    printf("Dosya erişimleri izleniyor...\n");
+    while (ring_buffer__poll(rb, 100) &gt;= 0)
+        ;  /* sonsuz döngü */
+
+    ring_buffer__free(rb);
+cleanup:
+    file_monitor_bpf__destroy(skel);
+    return err;
+}</code></pre>
+
+  <h3>Derleme</h3>
+  <pre><code># BPF nesne dosyası derle
+clang -O2 -target bpf -D__TARGET_ARCH_arm64 \
+    -I/usr/include/bpf \
+    -c file_monitor.bpf.c -o file_monitor.bpf.o
+
+# Skeleton üret
+bpftool gen skeleton file_monitor.bpf.o \
+    name file_monitor_bpf &gt; file_monitor.skel.h
+
+# Kullanıcı alanı derle
+gcc -O2 file_monitor.c -o file_monitor -lbpf</code></pre>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> Dosya Erişim Kontrolü</h2>
+  <p class="section-lead">lsm/inode_permission hook'u, inode bazında okuma/yazma/yürütme izinlerini denetler. Bu hook ile hassas dizinlere erişimi belirli süreçlerle kısıtlamak mümkündür.</p>
+
+  <h3>İzin Reddetme Örneği</h3>
+  <pre><code>// deny_write.bpf.c
+#include "vmlinux.h"
+#include &lt;bpf/bpf_helpers.h&gt;
+#include &lt;bpf/bpf_tracing.h&gt;
+#include &lt;bpf/bpf_core_read.h&gt;
+#include &lt;errno.h&gt;
+
+char LICENSE[] SEC("license") = "GPL";
+
+/* Korunan dizin inode numarası (user space'den doldurulur) */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, u64);
+} protected_inode SEC(".maps");
+
+SEC("lsm/inode_permission")
+int BPF_PROG(deny_write_to_protected, struct inode *inode,
+             int mask)
+{
+    u32  key = 0;
+    u64 *target_ino;
+    u64  ino;
+
+    /* Yalnızca yazma girişimlerini denetle */
+    if (!(mask &amp; MAY_WRITE))
+        return 0;
+
+    target_ino = bpf_map_lookup_elem(&amp;protected_inode, &amp;key);
+    if (!target_ino)
+        return 0;
+
+    ino = BPF_CORE_READ(inode, i_ino);
+    if (ino == *target_ino) {
+        bpf_printk("BPF LSM: inode %llu yazma reddedildi\n", ino);
+        return -EACCES;
+    }
+
+    return 0;
+}</code></pre>
+
+  <h3>Path Filtreleme</h3>
+  <p>Daha esnek bir yaklaşım için <code>lsm/file_open</code> ile dosya adını string karşılaştırma:</p>
+  <pre><code>SEC("lsm/file_open")
+int BPF_PROG(block_etc_shadow, struct file *file)
+{
+    char fname[32];
+    struct dentry *dentry;
+    const unsigned char *name;
+
+    dentry = BPF_CORE_READ(file, f_path.dentry);
+    name   = BPF_CORE_READ(dentry, d_name.name);
+    bpf_probe_read_kernel_str(fname, sizeof(fname), name);
+
+    /* /etc/shadow erişimini root olmayan herkes için reddet */
+    if (__builtin_memcmp(fname, "shadow", 6) == 0) {
+        u32 uid = bpf_get_current_uid_gid() &amp; 0xFFFFFFFF;
+        if (uid != 0)
+            return -EACCES;
+    }
+
+    return 0;
+}</code></pre>
+
+  <h3>İzin Kararı Akışı</h3>
+  <div class="flow"><pre>
+open("shadow", O_RDONLY)
+        |
+        v
+VFS katmanı
+        |
+        v
+security_file_open() çağrısı
+        |
+        +---> SELinux hook  (önce)
+        |
+        +---> BPF LSM hook  (sonra)
+                  |
+                  +-- uid != 0 ? --> return -EACCES --> EPERM kullanıcıya
+                  |
+                  +-- uid == 0 ? --> return 0 ---------> VFS devam eder
+  </pre></div>
+
+  <h3>Whitelist Yaklaşımı</h3>
+  <p>Yalnızca belirli süreçlere belirli dosyalara erişim izni vermek için MAP tabanlı whitelist:</p>
+  <div class="params">
+    <div class="param"><span class="name">Kara liste (blacklist)</span><span class="desc">Varsayılan izin ver, listedeki koşullarda reddet. Basit uygulamalar için uygundur.</span></div>
+    <div class="param"><span class="name">Beyaz liste (whitelist)</span><span class="desc">Varsayılan reddet, listedeki koşullarda izin ver. Güvenlik ilkesi açısından daha güçlüdür; ancak tüm meşru erişimlerin listelenmesi gerekir.</span></div>
+  </div>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> Ağ Politikası</h2>
+  <p class="section-lead">lsm/socket_connect hook'u, bir sürecin TCP/UDP bağlantısı kurmasından önce çağrılır. IP adresi ve port bazında filtreleme ile süreç başına ağ politikası uygulanabilir.</p>
+
+  <h3>Bağlantı Engelleme Örneği</h3>
+  <pre><code>// net_policy.bpf.c
+#include "vmlinux.h"
+#include &lt;bpf/bpf_helpers.h&gt;
+#include &lt;bpf/bpf_tracing.h&gt;
+#include &lt;bpf/bpf_endian.h&gt;
+#include &lt;errno.h&gt;
+
+char LICENSE[] SEC("license") = "GPL";
+
+/* Yasaklı portlar haritası: port -&gt; 1 */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, u16);
+    __type(value, u8);
+} blocked_ports SEC(".maps");
+
+SEC("lsm/socket_connect")
+int BPF_PROG(block_ports, struct socket *sock,
+             struct sockaddr *address, int addrlen)
+{
+    struct sockaddr_in *addr4;
+    u16 port;
+    u8 *blocked;
+    char comm[16];
+
+    /* Yalnızca IPv4 TCP/UDP kontrol et */
+    if (address-&gt;sa_family != AF_INET)
+        return 0;
+
+    addr4 = (struct sockaddr_in *)address;
+    port  = bpf_ntohs(addr4-&gt;sin_port);
+
+    blocked = bpf_map_lookup_elem(&amp;blocked_ports, &amp;port);
+    if (blocked &amp;&amp; *blocked) {
+        bpf_get_current_comm(comm, sizeof(comm));
+        bpf_printk("BPF LSM: %s port %u'e bağlantı reddedildi\n",
+                   comm, port);
+        return -EPERM;
+    }
+
+    return 0;
+}</code></pre>
+
+  <h3>Kullanıcı Alanından Port Listesi Güncelleme</h3>
+  <pre><code>// net_policy_user.c (basitleştirilmiş)
+#include &lt;bpf/libbpf.h&gt;
+#include "net_policy.skel.h"
+
+int main(void)
+{
+    struct net_policy_bpf *skel;
+    u16 port;
+    u8  val = 1;
+
+    skel = net_policy_bpf__open_and_load();
+    net_policy_bpf__attach(skel);
+
+    /* Telnet portunu engelle */
+    port = 23;
+    bpf_map__update_elem(skel-&gt;maps.blocked_ports,
+                         &amp;port, sizeof(port),
+                         &amp;val,  sizeof(val),
+                         BPF_ANY);
+
+    /* FTP portunu engelle */
+    port = 21;
+    bpf_map__update_elem(skel-&gt;maps.blocked_ports,
+                         &amp;port, sizeof(port),
+                         &amp;val, sizeof(val),
+                         BPF_ANY);
+
+    pause();  /* sinyal gelene kadar bekle */
+    net_policy_bpf__destroy(skel);
+    return 0;
+}</code></pre>
+
+  <h3>cgroup ile Birleştirme</h3>
+  <p>Süreç bazlı değil konteyner/uygulama grubu bazlı politika için cgroup ID kullanılır:</p>
+  <pre><code>SEC("lsm/socket_connect")
+int BPF_PROG(cgroup_net_policy, struct socket *sock,
+             struct sockaddr *address, int addrlen)
+{
+    u64 cgroup_id = bpf_get_current_cgroup_id();
+
+    /* Yalnızca kısıtlı cgroup'a uygula (cgroup ID harici ayarlanır) */
+    if (cgroup_id == RESTRICTED_CGROUP_ID) {
+        /* ... politika uygula ... */
+    }
+    return 0;
+}</code></pre>
+
+  <h3>Desteklenen Ağ Hook'ları</h3>
+  <div class="file-table"><table>
+    <tr><th>Hook</th><th>Tetiklenme</th><th>Parametre</th></tr>
+    <tr><td>lsm/socket_create</td><td>Socket oluşturmada</td><td>family, type, protocol</td></tr>
+    <tr><td>lsm/socket_connect</td><td>Bağlantı kurulurken</td><td>socket, sockaddr</td></tr>
+    <tr><td>lsm/socket_bind</td><td>Porta bind sırasında</td><td>socket, sockaddr</td></tr>
+    <tr><td>lsm/socket_sendmsg</td><td>Mesaj göndermede</td><td>socket, msghdr</td></tr>
+    <tr><td>lsm/socket_recvmsg</td><td>Mesaj almada</td><td>socket, msghdr</td></tr>
+  </table></div>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> Süreç Denetimi</h2>
+  <p class="section-lead">lsm/bprm_check_security hook'u, execve() sistem çağrısının güvenlik denetiminde tetiklenir. Bu hook sayesinde hangi binary'nin çalıştırılabileceği, hash doğrulaması ve imza kontrolü gibi politikalar uygulanabilir.</p>
+
+  <h3>execve İzleme</h3>
+  <pre><code>// exec_monitor.bpf.c
+#include "vmlinux.h"
+#include &lt;bpf/bpf_helpers.h&gt;
+#include &lt;bpf/bpf_tracing.h&gt;
+#include &lt;bpf/bpf_core_read.h&gt;
+
+char LICENSE[] SEC("license") = "GPL";
+
+struct exec_event {
+    u32  pid;
+    u32  ppid;
+    u32  uid;
+    char comm[16];
+    char filename[128];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 512 * 1024);
+} exec_events SEC(".maps");
+
+SEC("lsm/bprm_check_security")
+int BPF_PROG(monitor_exec, struct linux_binprm *bprm)
+{
+    struct exec_event *e;
+    struct task_struct *task;
+    const char *fname;
+
+    e = bpf_ringbuf_reserve(&amp;exec_events, sizeof(*e), 0);
+    if (!e) return 0;
+
+    task  = bpf_get_current_task_btf();
+    e-&gt;pid  = BPF_CORE_READ(task, pid);
+    e-&gt;ppid = BPF_CORE_READ(task, real_parent, pid);
+    e-&gt;uid  = bpf_get_current_uid_gid() &amp; 0xFFFFFFFF;
+    bpf_get_current_comm(e-&gt;comm, sizeof(e-&gt;comm));
+
+    fname = BPF_CORE_READ(bprm, filename);
+    bpf_probe_read_kernel_str(e-&gt;filename,
+                              sizeof(e-&gt;filename), fname);
+
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}</code></pre>
+
+  <h3>Binary Whitelist ile Çalıştırma Engeli</h3>
+  <pre><code>/* İzin verilen binary adları MAP'i */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 64);
+    __type(key, char[128]);
+    __type(value, u8);
+} allowed_binaries SEC(".maps");
+
+SEC("lsm/bprm_check_security")
+int BPF_PROG(whitelist_exec, struct linux_binprm *bprm)
+{
+    char filename[128];
+    const char *fname;
+    u8 *allowed;
+
+    /* Yalnızca uid=1000 süreçlere uygula */
+    u32 uid = bpf_get_current_uid_gid() &amp; 0xFFFFFFFF;
+    if (uid != 1000)
+        return 0;
+
+    fname = BPF_CORE_READ(bprm, filename);
+    bpf_probe_read_kernel_str(filename, sizeof(filename), fname);
+
+    allowed = bpf_map_lookup_elem(&amp;allowed_binaries, filename);
+    if (!allowed) {
+        bpf_printk("BPF LSM: %s calistirilmasi reddedildi\n",
+                   filename);
+        return -EACCES;
+    }
+
+    return 0;
+}</code></pre>
+
+  <h3>Parent-Child İlişkisi Denetimi</h3>
+  <p>Güvenilir olmayan bir sürecin alt süreç (fork+exec) başlatmasını engelleme senaryosu gömülü sistemlerde yaygındır. Örneğin, bir ağ servisi yalnızca önceden tanımlanmış yardımcı programları çalıştırabilir:</p>
+  <div class="params">
+    <div class="param"><span class="name">bpf_get_current_task_btf()</span><span class="desc">Mevcut görevin task_struct işaretçisini BTF türüyle döner; parent, UID, GID alanlarına CO-RE ile erişilebilir.</span></div>
+    <div class="param"><span class="name">BPF_CORE_READ(task, real_parent, pid)</span><span class="desc">Üst sürecin PID'ini güvenli biçimde okur.</span></div>
+    <div class="param"><span class="name">BPF_CORE_READ(bprm, filename)</span><span class="desc">Çalıştırılmak istenen binary'nin tam yolunu döner.</span></div>
+  </div>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> MAP ile Dinamik Politika</h2>
+  <p class="section-lead">BPF MAP'leri, kullanıcı alanından kernel içindeki BPF programlarına veri aktarmanın temel mekanizmasıdır. Bu sayede güvenlik politikaları çalışma anında güncellenebilir.</p>
+
+  <h3>Kara Liste MAP'i</h3>
+  <pre><code>// blacklist.bpf.c -- PID bazlı kara liste
+#include "vmlinux.h"
+#include &lt;bpf/bpf_helpers.h&gt;
+#include &lt;bpf/bpf_tracing.h&gt;
+#include &lt;errno.h&gt;
+
+char LICENSE[] SEC("license") = "GPL";
+
+/* PID kara listesi: pid -&gt; reason_code */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key,   u32);
+    __type(value, u32);
+} pid_blacklist SEC(".maps");
+
+SEC("lsm/file_open")
+int BPF_PROG(blacklist_pid_file, struct file *file)
+{
+    u32 pid = bpf_get_current_pid_tgid() &gt;&gt; 32;
+    u32 *reason;
+
+    reason = bpf_map_lookup_elem(&amp;pid_blacklist, &amp;pid);
+    if (reason) {
+        bpf_printk("BPF LSM: PID %u kara listede (reason=%u)\n",
+                   pid, *reason);
+        return -EACCES;
+    }
+    return 0;
+}</code></pre>
+
+  <h3>Kullanıcı Alanından Politika Güncelleme</h3>
+  <pre><code>// policy_manager.c
+#include &lt;bpf/libbpf.h&gt;
+#include &lt;bpf/bpf.h&gt;
+#include "blacklist.skel.h"
+
+static int add_to_blacklist(struct blacklist_bpf *skel, u32 pid, u32 reason)
+{
+    return bpf_map__update_elem(skel-&gt;maps.pid_blacklist,
+                                &amp;pid,    sizeof(pid),
+                                &amp;reason, sizeof(reason),
+                                BPF_ANY);
+}
+
+static int remove_from_blacklist(struct blacklist_bpf *skel, u32 pid)
+{
+    return bpf_map__delete_elem(skel-&gt;maps.pid_blacklist,
+                                &amp;pid, sizeof(pid), 0);
+}
+
+int main(int argc, char **argv)
+{
+    struct blacklist_bpf *skel;
+    u32 pid, reason;
+
+    skel = blacklist_bpf__open_and_load();
+    blacklist_bpf__attach(skel);
+
+    /* PID 1234'ü kara listeye al */
+    add_to_blacklist(skel, 1234, 42);
+
+    /* Kullanıcı komutlarını dinle (basit REPL) */
+    while (scanf("add %u %u", &amp;pid, &amp;reason) == 2)
+        add_to_blacklist(skel, pid, reason);
+
+    blacklist_bpf__destroy(skel);
+    return 0;
+}</code></pre>
+
+  <h3>MAP Türleri ve Kullanım Senaryoları</h3>
+  <div class="file-table"><table>
+    <tr><th>MAP Türü</th><th>Kullanım Senaryosu</th><th>Avantaj</th></tr>
+    <tr><td>BPF_MAP_TYPE_HASH</td><td>PID/UID kara-beyaz liste</td><td>O(1) arama, dinamik boyut</td></tr>
+    <tr><td>BPF_MAP_TYPE_ARRAY</td><td>Tek yapılandırma değeri</td><td>Çok hızlı erişim, sabit boyut</td></tr>
+    <tr><td>BPF_MAP_TYPE_RINGBUF</td><td>Olay raporlama</td><td>Düşük overhead, sıralı iletim</td></tr>
+    <tr><td>BPF_MAP_TYPE_LPM_TRIE</td><td>IP adresi prefix eşleme</td><td>CIDR blok filtreleme</td></tr>
+    <tr><td>BPF_MAP_TYPE_PERCPU_HASH</td><td>Performans sayaçları</td><td>CPU başına kilit yok</td></tr>
+  </table></div>
+
+  <h3>Atomik Politika Geçişi</h3>
+  <p>MAP güncellemeleri atomiktir; okuma ile güncelleme arasında tutarsız durum oluşmaz. Büyük politika geçişlerinde <code>BPF_F_LOCK</code> bayrağı ile spin kilit koruması eklenebilir.</p>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> Gömülü Güvenlik Senaryosu</h2>
+  <p class="section-lead">Gerçek bir IoT cihazı örneği: MQTT telemetri servisi yalnızca bulut sunucusuna (belirli IP:port) bağlanabilmeli, diğer tüm ağ bağlantıları engellenmelidir. Yetkisiz binary çalıştırma da kısıtlanmıştır.</p>
+
+  <h3>Senaryo Gereksinimleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">Ağ kısıtlaması</span><span class="desc">mqtt-client süreci yalnızca 192.168.1.100:8883 adresine bağlanabilir. Diğer tüm dış bağlantılar reddedilir.</span></div>
+    <div class="param"><span class="name">Süreç kısıtlaması</span><span class="desc">Belirli kullanıcı (uid=1001) altında yalnızca /usr/bin/mqtt-client çalıştırılabilir.</span></div>
+    <div class="param"><span class="name">Dosya koruması</span><span class="desc">/etc/mqtt/certs/ dizinine yalnızca mqtt-client erişebilir, diğer süreçler okuyamaz.</span></div>
+    <div class="param"><span class="name">Dinamik güncelleme</span><span class="desc">Sunucu IP değiştiğinde politika yeniden başlatma olmadan güncellenebilmelidir.</span></div>
+  </div>
+
+  <h3>iot_policy.bpf.c</h3>
+  <pre><code>#include "vmlinux.h"
+#include &lt;bpf/bpf_helpers.h&gt;
+#include &lt;bpf/bpf_tracing.h&gt;
+#include &lt;bpf/bpf_core_read.h&gt;
+#include &lt;bpf/bpf_endian.h&gt;
+#include &lt;errno.h&gt;
+
+char LICENSE[] SEC("license") = "GPL";
+
+/* Yapılandırma: izin verilen sunucu IP ve port */
+struct iot_config {
+    __be32 allowed_ip;
+    __be16 allowed_port;
+    u32    mqtt_uid;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct iot_config);
+} iot_cfg SEC(".maps");
+
+/* Ağ politikası */
+SEC("lsm/socket_connect")
+int BPF_PROG(iot_net_policy, struct socket *sock,
+             struct sockaddr *address, int addrlen)
+{
+    struct sockaddr_in *addr4;
+    struct iot_config  *cfg;
+    u32 key = 0, uid;
+
+    if (address-&gt;sa_family != AF_INET)
+        return 0;
+
+    cfg = bpf_map_lookup_elem(&amp;iot_cfg, &amp;key);
+    if (!cfg) return 0;
+
+    uid = bpf_get_current_uid_gid() &amp; 0xFFFFFFFF;
+    if (uid != cfg-&gt;mqtt_uid)
+        return 0;  /* diğer kullanıcılara dokunma */
+
+    addr4 = (struct sockaddr_in *)address;
+
+    /* İzin verilen IP+port kontrolü */
+    if (addr4-&gt;sin_addr.s_addr == cfg-&gt;allowed_ip &amp;&amp;
+        addr4-&gt;sin_port         == cfg-&gt;allowed_port)
+        return 0;
+
+    bpf_printk("IoT LSM: uid=%u yetkisiz baglanti engellendi\n",
+               uid);
+    return -EPERM;
+}
+
+/* Dosya erişim politikası */
+SEC("lsm/file_open")
+int BPF_PROG(iot_file_policy, struct file *file)
+{
+    char fname[32];
+    struct dentry *dentry;
+    const unsigned char *name;
+    u32 uid;
+
+    dentry = BPF_CORE_READ(file, f_path.dentry);
+    name   = BPF_CORE_READ(dentry, d_name.name);
+    bpf_probe_read_kernel_str(fname, sizeof(fname), name);
+
+    /* "certs" dizinine erişimi kısıtla */
+    if (__builtin_memcmp(fname, "certs", 5) == 0) {
+        struct iot_config *cfg;
+        u32 key = 0;
+        cfg = bpf_map_lookup_elem(&amp;iot_cfg, &amp;key);
+        uid = bpf_get_current_uid_gid() &amp; 0xFFFFFFFF;
+        if (cfg &amp;&amp; uid != cfg-&gt;mqtt_uid)
+            return -EACCES;
+    }
+    return 0;
+}</code></pre>
+
+  <h3>Politika Güncelleme (Sunucu IP Değişimi)</h3>
+  <pre><code>/* Yeni sunucu adresini yükle -- yeniden başlatma gerekmez */
+struct iot_config new_cfg = {
+    .allowed_ip   = htonl(0xC0A80165),  /* 192.168.1.101 */
+    .allowed_port = htons(8883),
+    .mqtt_uid     = 1001,
+};
+u32 key = 0;
+bpf_map__update_elem(skel-&gt;maps.iot_cfg,
+                     &amp;key, sizeof(key),
+                     &amp;new_cfg, sizeof(new_cfg),
+                     BPF_ANY);</code></pre>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Hata Ayıklama ve Doğrulama</h2>
+  <p class="section-lead">BPF LSM programlarını doğrulamak ve hata ayıklamak için bpftool, bpftrace ve kernel verifier mesajları temel araçlardır. CAP_BPF yetki gereksinimleri de dikkate alınmalıdır.</p>
+
+  <h3>bpftool ile Program Listeleme</h3>
+  <pre><code># Yüklü BPF programlarını listele
+bpftool prog list
+
+# LSM programlarını filtrele
+bpftool prog list | grep lsm
+
+# Belirli programın detayları
+bpftool prog show id 42
+
+# Programın BPF bytecode'unu göster
+bpftool prog dump xlated id 42
+
+# JIT sonrası makine kodu
+bpftool prog dump jited id 42</code></pre>
+
+  <h3>bpftrace ile Anlık İzleme</h3>
+  <pre><code># Tüm LSM hook çağrılarını say
+bpftrace -e 'kprobe:security_file_open { @[comm] = count(); }'
+
+# BPF LSM reddedilen işlemleri izle
+bpftrace -e 'kretprobe:bpf_lsm_file_open /retval != 0/ {
+    printf("DENY: %s ret=%d\n", comm, retval);
+}'
+
+# execve çağrılarını izle
+bpftrace -e 'tracepoint:syscalls:sys_enter_execve {
+    printf("exec: %s %s\n", comm, str(args-&gt;filename));
+}'</code></pre>
+
+  <h3>Verifier Hataları ve Çözümleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">invalid mem access 'scalar'</span><span class="desc">NULL pointer dereference olasılığı. bpf_map_lookup_elem sonucu NULL kontrolü yapın.</span></div>
+    <div class="param"><span class="name">back-edge from insn X to Y</span><span class="desc">Döngüde sonsuz çalışma riski. Döngü sayısı sınırlı olmalı; bounded loop (Linux 5.3+) kullanın.</span></div>
+    <div class="param"><span class="name">program too large</span><span class="desc">BPF talimat limiti (varsayılan 1M). Büyük programları ayrı fonksiyonlara bölün, bpf_tail_call kullanın.</span></div>
+    <div class="param"><span class="name">cannot call sleepable</span><span class="desc">Non-sleepable hook içinde uyku gerektirecek yardımcı çağrısı. SEC("lsm.s/...") ile sleepable programa dönüştürün.</span></div>
+    <div class="param"><span class="name">R0 !read_ok</span><span class="desc">Fonksiyon dönüş değeri okunmadan kullanılmış. Her dönüş değeri kontrol edilmeli.</span></div>
+  </div>
+
+  <h3>CAP_BPF Gereksinimleri</h3>
+  <pre><code># BPF LSM programı yüklemek için gereken yetkiler:
+# CAP_BPF      -- BPF programı yükleme
+# CAP_MAC_ADMIN -- LSM hook'a program bağlama
+
+# Test amaçlı (üretimde kaçının):
+setcap cap_bpf,cap_mac_admin+eip ./my_lsm_tool
+
+# systemd servis olarak (güvenli yol):
+# [Service]
+# AmbientCapabilities=CAP_BPF CAP_MAC_ADMIN
+# CapabilityBoundingSet=CAP_BPF CAP_MAC_ADMIN</code></pre>
+
+  <h3>BPF Log Seviyesi</h3>
+  <pre><code># bpf_printk çıktılarını göster
+cat /sys/kernel/debug/tracing/trace_pipe
+
+# Verifier ayrıntılı log (yükleme hatası durumunda)
+# libbpf ile:
+libbpf_set_print(LIBBPF_DEBUG, ...);</code></pre>
+
+  <h3>Performans Ölçümü</h3>
+  <p>BPF LSM hook'larının gecikme etkisini ölçmek için perf ya da bpftrace kullanılabilir. Kritik yolda çalışan hook'lar (file_open, socket_connect) mikrosaniye mertebesinde etkiye sahip olabilir; MAP erişimlerini en aza indirin ve gereksiz <code>bpf_printk</code> çağrılarını üretimde devre dışı bırakın.</p>
+  <pre><code># file_open hook gecikmesini ölç
+bpftrace -e '
+    kprobe:bpf_lsm_file_open  { @start[tid] = nsecs; }
+    kretprobe:bpf_lsm_file_open /@start[tid]/ {
+        @latency = hist(nsecs - @start[tid]);
+        delete(@start[tid]);
+    }
+'</code></pre>
+</section>
+
+</main>

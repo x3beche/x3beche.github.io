@@ -1,0 +1,881 @@
+---
+layout: tutorial
+title: "KGDB — Çekirdek Seviyesi GDB ile Hata Ayıklama"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span><span>GÖMÜLÜ LİNUX</span><span>HATA AYIKLAMA</span><span>2026</span>
+  </div>
+  <h1>KGDB<br><em>Çekirdek Seviyesi GDB ile Hata Ayıklama</em></h1>
+  <p class="subtitle">KGDB ve KGDBOC ile çalışan Linux kernel'da kesme noktası koyma, bellek inceleme, modül hata ayıklama ve gömülü UART tabanlı uzak hata ayıklama.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">KGDB'ye Neden İhtiyaç Var?</a></li>
+    <li><a href="#s1">Kernel Yapılandırması</a></li>
+    <li><a href="#s2">KGDBOC Kurulumu</a></li>
+    <li><a href="#s3">İlk Bağlantı</a></li>
+    <li><a href="#s4">Kesme Noktaları ve İzleme Noktaları</a></li>
+    <li><a href="#s5">Modül Hata Ayıklama</a></li>
+    <li><a href="#s6">Kernel Panic Analizi</a></li>
+    <li><a href="#s7">QEMU ile KGDB Geliştirme Ortamı</a></li>
+    <li><a href="#s8">KDB: Klavye Hata Ayıklayıcı</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> KGDB'ye Neden İhtiyaç Var?</h2>
+  <p class="section-lead">
+    Kullanıcı alanı uygulamaları için GDB sıradan bir araçtır. Kernel geliştirmede ise durum farklıdır:
+    bir kernel modülü yanlış davrandığında ya da bir sürücü belleği bozduğunda geleneksel
+    <code>printk</code> yaklaşımı çoğu zaman yetersiz kalır.
+  </p>
+  <p>
+    Linux çekirdeği kullanıcı alanından tamamen izole bir sanal bellek ortamında çalışır. Bir kullanıcı
+    süreci çöktüğünde işletim sistemi onu öldürüp devam eder; ancak çekirdeğin kendisi çöktüğünde ya
+    sistem yanıt vermez ya da <em>kernel panic</em> ile donar. Bu noktada geriye yalnızca önceden
+    yazdırılmış log satırları kalır — sorun ise çoğunlukla log yazmadan çok önce gerçekleşmiştir.
+  </p>
+
+  <h3>printk'nin Sınırları</h3>
+  <p>
+    <code>printk</code> ile hata ayıklama aşağıdaki durumlarda etkisizdir:
+  </p>
+  <div class="params">
+    <div class="param"><span class="name">Zamanlama bağımlı hatalar</span><span class="desc">printk eklemek çalışma zamanı zamanlamasını değiştirir ve yarış koşullarını (race condition) gizler.</span></div>
+    <div class="param"><span class="name">Önyükleme erken aşaması</span><span class="desc">Konsol sürücüsü hazır olmadan önceki paniklerde log tamponu boşaltılamaz.</span></div>
+    <div class="param"><span class="name">Dinamik modül durumu</span><span class="desc">Hangi değişkenin ne zaman bozulduğunu bulmak için binlerce satır log yazılması gerekebilir.</span></div>
+    <div class="param"><span class="name">Canlı bellek inceleme</span><span class="desc">Çalışan bir çekirdeğin veri yapılarına (task_struct, inode, sk_buff) anlık olarak bakmak mümkün olmaz.</span></div>
+  </div>
+
+  <h3>KGDB Nedir?</h3>
+  <p>
+    KGDB (Kernel GNU Debugger), Linux çekirdeğinin içine entegre edilmiş bir hata ayıklama alt sistemidir.
+    Etkinleştirildiğinde çekirdek bir <em>gdb stub</em> içerir. Bu stub, seri port (KGDBOC) veya
+    ethernet (KGDBOE) üzerinden uzaktaki bir GDB oturumuna bağlanarak standart GDB Remote Serial
+    Protocol (RSP) ile iletişim kurar.
+  </p>
+  <div class="flow"><pre>
+  [Host Makine]                    [Hedef (Gömülü) Kart]
+  +--------------+     UART/USB    +----------------------+
+  |  gdb         | &lt;==========&gt;  |  Linux Kernel        |
+  |  vmlinux     |  ttyUSB0       |  + KGDB Stub         |
+  |  (debug sym) |                |  + KGDBOC (ttyS0)    |
+  +--------------+                +----------------------+
+  </pre></div>
+
+  <h3>Kullanım Senaryoları</h3>
+  <p>KGDB aşağıdaki durumlarda diğer araçlardan üstündür:</p>
+  <ul>
+    <li>Bir kernel modülünde <strong>NULL pointer dereference</strong> hatasının tam satırını bulmak</li>
+    <li>Sürücü geliştirirken <strong>canlı çekirdek değişkenlerini</strong> gerçek zamanlı izlemek</li>
+    <li><strong>Use-after-free</strong> hatasını izleme noktası (watchpoint) ile yakalamak</li>
+    <li>Karmaşık alt sistemlerde (ağ yığını, VFS) <strong>kontrol akışını</strong> adım adım izlemek</li>
+    <li>QEMU ortamında çekirdek geliştirme döngüsünü hızlandırmak</li>
+  </ul>
+
+  <h3>KGDB ve JTAG Karşılaştırması</h3>
+  <div class="file-table"><table>
+    <tr><th>Özellik</th><th>KGDB</th><th>JTAG</th></tr>
+    <tr><td>Ek donanım</td><td>Yok — seri port yeterli</td><td>JTAG probe (20–500 USD)</td></tr>
+    <tr><td>Kurulum süresi</td><td>Kernel config + birkaç komut</td><td>OpenOCD/J-Link kurulumu + pinout</td></tr>
+    <tr><td>Erişim seviyesi</td><td>Kernel sembolleri üzerinden</td><td>Register ve bellek tam erişim</td></tr>
+    <tr><td>Bootloader debug</td><td>Hayır (kernel sonrası)</td><td>Evet, reset vektöründen itibaren</td></tr>
+    <tr><td>SMP desteği</td><td>Evet — tüm CPU'lar durdurulur</td><td>Evet</td></tr>
+    <tr><td>Üretim kullanımı</td><td>Mümkün (dikkatli kullanım)</td><td>Genellikle geliştirme boardlarına özgü</td></tr>
+  </table></div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> Kernel Yapılandırması</h2>
+  <p class="section-lead">
+    KGDB, derleme zamanında etkinleştirilmesi gereken bir kernel alt sistemidir. Doğru
+    seçenekler belirlenmeden derlenen bir çekirdekte KGDB çalışmaz.
+  </p>
+
+  <h3>Gerekli CONFIG Seçenekleri</h3>
+  <div class="file-table"><table>
+    <tr><th>CONFIG Seçeneği</th><th>Menü Yolu</th><th>Açıklama</th></tr>
+    <tr><td><code>CONFIG_KGDB</code></td><td>Kernel hacking &rarr; KGDB</td><td>KGDB temel desteği — zorunlu</td></tr>
+    <tr><td><code>CONFIG_KGDB_SERIAL_CONSOLE</code></td><td>Kernel hacking &rarr; KGDB &rarr; use kgdb over the serial console</td><td>UART üzerinden KGDBOC desteği</td></tr>
+    <tr><td><code>CONFIG_KGDB_KDB</code></td><td>Kernel hacking &rarr; KGDB &rarr; include kdb frontend</td><td>Klavye hata ayıklayıcı arabirimi</td></tr>
+    <tr><td><code>CONFIG_FRAME_POINTER</code></td><td>Kernel hacking &rarr; Compile with frame pointers</td><td>GDB'nin yığın çerçevelerini doğru görmesi için zorunlu</td></tr>
+    <tr><td><code>CONFIG_DEBUG_INFO</code></td><td>Kernel hacking &rarr; Compile the kernel with debug info</td><td>DWARF hata ayıklama sembolleri kernel'a gömülür</td></tr>
+    <tr><td><code>CONFIG_DEBUG_INFO_DWARF4</code></td><td>Kernel hacking &rarr; Debug information &rarr; DWARF4</td><td>GDB uyumluluğu için önerilir</td></tr>
+    <tr><td><code>CONFIG_MAGIC_SYSRQ</code></td><td>Kernel hacking &rarr; Magic SysRq key</td><td>SysRq-g ile KGDB tetiklemek için gerekli</td></tr>
+    <tr><td><code>CONFIG_RANDOMIZE_BASE</code></td><td>Security &rarr; Randomize the kernel image address (KASLR)</td><td>Geliştirmede <strong>kapatın</strong> — sembol adresleri tutarsız olur</td></tr>
+  </table></div>
+
+  <h3>Minimum Kernel Fragment (Yocto)</h3>
+  <p>
+    Yocto projelerinde bir <code>.cfg</code> fragment dosyası oluşturun ve
+    <code>SRC_URI</code> ile kernel recipe'ye ekleyin:
+  </p>
+  <pre><code># kgdb-debug.cfg
+CONFIG_KGDB=y
+CONFIG_KGDB_SERIAL_CONSOLE=y
+CONFIG_KGDB_KDB=y
+CONFIG_KDB_DEFAULT_ENABLE=0x1
+CONFIG_FRAME_POINTER=y
+CONFIG_DEBUG_INFO=y
+CONFIG_DEBUG_INFO_DWARF4=y
+CONFIG_MAGIC_SYSRQ=y
+CONFIG_RANDOMIZE_BASE=n
+CONFIG_DEBUG_KERNEL=y</code></pre>
+
+  <h3>scripts/config ile Programatik Yapılandırma</h3>
+  <pre><code>cd /path/to/linux-source
+
+./scripts/config --enable  KGDB
+./scripts/config --enable  KGDB_SERIAL_CONSOLE
+./scripts/config --enable  KGDB_KDB
+./scripts/config --enable  DEBUG_INFO
+./scripts/config --enable  DEBUG_INFO_DWARF4
+./scripts/config --enable  FRAME_POINTER
+./scripts/config --enable  MAGIC_SYSRQ
+./scripts/config --disable RANDOMIZE_BASE
+
+# Eski değerler silinmesi için olddefconfig çalıştırın
+make olddefconfig</code></pre>
+
+  <h3>Derleme Sonrası Doğrulama</h3>
+  <pre><code># Hedef sistemde çalışan kernelde doğrula
+zcat /proc/config.gz | grep -E "KGDB|DEBUG_INFO|FRAME_POINTER"
+# CONFIG_KGDB=y
+# CONFIG_KGDB_SERIAL_CONSOLE=y
+# CONFIG_KGDB_KDB=y
+# CONFIG_DEBUG_INFO=y
+# CONFIG_FRAME_POINTER=y
+
+# vmlinux debug sembolleri içeriyor mu? (host'ta)
+file vmlinux
+# vmlinux: ELF 64-bit LSB executable ... with debug_info, not stripped
+
+# Sembol tablosu dolu mu?
+nm vmlinux | grep " T do_sys_open" | head -3</code></pre>
+
+  <h3>KASLR'ın KGDB Üzerindeki Etkisi</h3>
+  <p>
+    KASLR her önyüklemede çekirdeği farklı bir bellek adresine yerleştirir. Bu güvenlik özelliği,
+    GDB'nin <code>vmlinux</code> dosyasındaki sabit sembol adreslerini geçersiz kılar. Geliştirme
+    ve test ortamlarında ya <code>nokaslr</code> boot parametresi ekleyin ya da
+    <code>CONFIG_RANDOMIZE_BASE=n</code> ile kapatın. Üretim hedeflerinde KGDB kullanmaktan
+    kaçının ya da adres kaydırmasını hesaplayarak GDB'ye bildirin.
+  </p>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> KGDBOC Kurulumu</h2>
+  <p class="section-lead">
+    KGDBOC (KGDB Over Console), KGDB'nin seri konsol üzerinden haberleşmesini sağlayan taşıma
+    katmanıdır. Gömülü sistemlerde UART en yaygın ve en güvenilir bağlantı yöntemidir.
+  </p>
+
+  <h3>Önyükleyici ile Kurulum</h3>
+  <p>
+    En basit ve önerilen yöntem, KGDBOC'u önyükleyici parametresiyle etkinleştirmektir.
+    U-Boot örneği:
+  </p>
+  <pre><code># U-Boot ortam değişkeni
+setenv bootargs "console=ttyS0,115200 kgdboc=ttyS0,115200"
+saveenv
+
+# kgdbwait parametresi ile kernel GDB bağlantısı gelene kadar önyüklemeyi askıya alır.
+# Yalnızca geliştirme imajlarında kullanın:
+setenv bootargs "console=ttyS0,115200 kgdboc=ttyS0,115200 kgdbwait"</code></pre>
+
+  <p>GRUB veya QEMU komut satırı için:</p>
+  <pre><code>GRUB_CMDLINE_LINUX="console=ttyS0,115200 kgdboc=ttyS0,115200 nokaslr"
+
+# Birden fazla konsolla — kgdboc hangi TTY'yi kullandığını açıkça belirtin
+GRUB_CMDLINE_LINUX="console=tty0 console=ttyS0,115200 kgdboc=ttyS0,115200 nokaslr"</code></pre>
+
+  <h3>Sysfs ile Dinamik Kurulum</h3>
+  <p>
+    Sistem zaten çalışıyorken KGDBOC'u etkinleştirmek mümkündür; yeniden başlatma gerekmez:
+  </p>
+  <pre><code># Hedef sistemde root olarak çalıştırın
+echo ttyS0 > /sys/module/kgdboc/parameters/kgdboc
+
+# Baud hızı da belirtmek için
+echo ttyS0,115200 > /sys/module/kgdboc/parameters/kgdboc
+
+# Doğrulama
+cat /sys/module/kgdboc/parameters/kgdboc
+# ttyS0
+
+# KGDBOC'u devre dışı bırakmak
+echo "" > /sys/module/kgdboc/parameters/kgdboc</code></pre>
+
+  <h3>Donanım Bağlantı Topolojisi</h3>
+  <div class="flow"><pre>
+  [Host PC]                          [Gömülü Kart]
+  +------------------+               +------------------+
+  |  USB-UART Dongle |               |  UART Debug Port |
+  |  /dev/ttyUSB0    |&lt;--TX/RX/GND--&gt;|  /dev/ttyS0      |
+  +------------------+               |  (kgdboc hedef)  |
+  |                                  +------------------+
+  |   gdb -q vmlinux
+  |   (gdb) target remote /dev/ttyUSB0
+  +------------------+
+  </pre></div>
+
+  <h3>Yapılandırma Parametreleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">Baud hızı eşleşmesi</span><span class="desc">Host GDB bağlantısı ile hedef kgdboc parametresi aynı baud hızını kullanmalıdır. 115200 standart ve önerilen değerdir.</span></div>
+    <div class="param"><span class="name">Konsol paylaşımı</span><span class="desc">KGDBOC, konsol TTY'sini KGDB modu aktifken geçici olarak devralır. Normal log akışı bu sürede duraklar.</span></div>
+    <div class="param"><span class="name">Akış kontrolü</span><span class="desc">Hardware flow control (RTS/CTS) devre dışı bırakın. Çoğu USB-UART dongle'da sorun çıkarır.</span></div>
+    <div class="param"><span class="name">kgdbwait uyarısı</span><span class="desc">kgdbwait parametresiyle çekirdek, GDB bağlanana kadar önyüklemede tamamen bloke olur. Watchdog'u tetikleyebilir.</span></div>
+  </div>
+
+  <h3>Yapılandırma Doğrulama</h3>
+  <pre><code># Hedef sistemde KGDBOC başlatma mesajlarını kontrol et
+dmesg | grep -i kgdb
+# [    0.543210] KGDB: Registered I/O driver kgdboc
+# [    0.543215] KGDB: Waiting for connection from remote gdb...  (kgdbwait varsa)
+
+# Sysfs parametre durumu
+ls /sys/module/kgdboc/parameters/
+# kgdboc
+
+cat /sys/module/kgdboc/parameters/kgdboc
+# ttyS0</code></pre>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> İlk Bağlantı</h2>
+  <p class="section-lead">
+    KGDBOC yapılandırması tamamlandıktan sonra, çalışan çekirdeği durdurarak GDB oturumu başlatmak
+    gerekir. Bu işlem için Magic SysRq mekanizması kullanılır.
+  </p>
+
+  <h3>Hedef Sistemde KGDB'yi Tetikleme</h3>
+  <p>
+    Çalışan bir Linux sistemini KGDB moduna almak için aşağıdaki yöntemlerden biri kullanılır.
+    Sistem dondurulur ve GDB bağlantısı beklenir:
+  </p>
+  <pre><code># Yöntem 1: /proc/sysrq-trigger (en yaygın)
+echo g > /proc/sysrq-trigger
+
+# SysRq etkin değilse önce etkinleştirin
+echo 1 > /proc/sys/kernel/sysrq
+echo g > /proc/sysrq-trigger
+
+# Yöntem 2: Seri konsoldan break sinyali
+# Minicom ile: Ctrl+A, F (break gönder)
+# Picocom ile: Ctrl+A, Ctrl+\
+
+# Yöntem 3: x86 fiziksel klavyeden
+# Alt + SysRq + G tuş kombinasyonu</code></pre>
+
+  <p>
+    SysRq-g tetiklendikten sonra hedef konsolda aşağıdaki mesaj görünür:
+  </p>
+  <pre><code>[ 1234.567890] SysRq : DEBUG
+[ 1234.567891] KGDB: Entering KGDB</code></pre>
+
+  <h3>Host'ta GDB Başlatma</h3>
+  <p>
+    Host makinede, çekirdeğin <code>vmlinux</code> dosyasıyla GDB başlatın. Bu dosya hedef üzerinde
+    çalışan kernel ile <strong>aynı derleme</strong> olmalıdır:
+  </p>
+  <pre><code># ARM64 hedef için cross-GDB
+aarch64-linux-gnu-gdb vmlinux
+
+# x86_64 hedef için standart GDB
+gdb vmlinux
+
+# Yocto'da vmlinux genellikle şu konumdadır:
+# tmp/work/MACHINE-poky-linux-gnueabi/linux-yocto/VERSION/
+#   linux-MACHINE-standard-build/vmlinux</code></pre>
+
+  <h3>Uzak Bağlantı Kurma</h3>
+  <pre><code># GDB içinde seri bağlantıyı kur
+(gdb) set remotebaud 115200
+(gdb) target remote /dev/ttyUSB0
+
+# Bağlantı başarılıysa mevcut durumu gösterir:
+# Remote debugging using /dev/ttyUSB0
+# 0xffffffc0100123b4 in default_idle () at arch/arm64/kernel/process.c:123
+# 123         cpu_do_idle();
+# (gdb)
+
+# TCP üzerinden bağlantı (QEMU veya kgdboe için)
+(gdb) target remote localhost:4321</code></pre>
+
+  <h3>GDB Uzak Bağlantı Parametreleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">set remotebaud BAUD</span><span class="desc">Seri port baud hızını ayarlar. kgdboc parametresiyle eşleşmelidir (115200).</span></div>
+    <div class="param"><span class="name">set remote hardware-breakpoint-limit N</span><span class="desc">ARM gibi mimarilerde donanım kesme noktası sayısını sınırlar (genellikle 4–8).</span></div>
+    <div class="param"><span class="name">set remote hardware-watchpoint-limit N</span><span class="desc">Donanım izleme noktası sayısını sınırlar.</span></div>
+    <div class="param"><span class="name">set serial baud BAUD</span><span class="desc">Alternatif baud ayar komutu; GDB sürümüne göre farklılık gösterebilir.</span></div>
+  </div>
+
+  <h3>İlk Bağlantıda Kullanışlı GDB Komutları</h3>
+  <pre><code>(gdb) info threads           # Tüm CPU'lardaki thread'leri listele
+(gdb) thread N               # N numaralı thread'e geç (CPU'lar arası)
+(gdb) bt                     # Mevcut stack trace (backtrace)
+(gdb) frame N                # N numaralı frame'e git
+(gdb) info registers         # Tüm register değerleri
+(gdb) x/16xw ADRES           # ADRES'ten 16 kelime hex dump
+(gdb) p init_task            # init_task yapısını yazdır
+(gdb) p *current             # Mevcut task_struct içeriği
+(gdb) thread apply all bt    # Tüm CPU'ların stack trace'i</code></pre>
+
+  <h3>Bağlantı Sorunlarını Giderme</h3>
+  <pre><code># Sorun: "Remote connection closed" veya timeout
+# Kontrol 1: Aynı TTY'yi başka bir program kullanıyor mu?
+fuser /dev/ttyUSB0
+
+# Kontrol 2: Baud hızları eşleşiyor mu?
+# Hedef: cat /sys/module/kgdboc/parameters/kgdboc
+# GDB: show remotebaud
+
+# Kontrol 3: vmlinux doğru build'den mi?
+# Hedef: uname -r
+# Host: strings vmlinux | grep "Linux version"
+
+# Kontrol 4: Debug sembolleri var mı?
+nm vmlinux | wc -l    # sıfırdan büyük olmalı</code></pre>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> Kesme Noktaları ve İzleme Noktaları</h2>
+  <p class="section-lead">
+    KGDB, GDB'nin tüm kesme noktası ve izleme noktası mekanizmalarını kernel bağlamında destekler.
+    Yazılım ve donanım kesme noktaları, bellek değişikliği izleme noktaları ve koşullu durmalar
+    bunların başında gelir.
+  </p>
+
+  <h3>Yazılım Kesme Noktaları</h3>
+  <p>
+    Yazılım kesme noktaları hedef kodu geçici olarak <code>INT3</code> (x86) veya <code>BRK</code>
+    (ARM64) talimatıyla değiştirir:
+  </p>
+  <pre><code># Fonksiyon adıyla kesme noktası
+(gdb) break sys_open
+(gdb) break do_page_fault
+
+# Kaynak dosya ve satır numarasıyla
+(gdb) break kernel/sched/core.c:3142
+
+# Koşullu kesme noktası — yalnızca büyük tahsisatlarda dur
+(gdb) break kmalloc if size > 65536
+
+# Mevcut kesme noktalarını listele
+(gdb) info breakpoints
+
+# Kesme noktasını sil
+(gdb) delete 1          # numara ile
+(gdb) clear sys_open    # fonksiyon adıyla</code></pre>
+
+  <h3>Donanım Kesme Noktaları</h3>
+  <p>
+    Donanım kesme noktaları, CPU'nun debug register'larını kullanır (x86'da DR0–DR3, ARM64'te BVR/BCR).
+    Salt okunur bellek bölgelerinde veya MMU olmayan alanlarda kullanılır:
+  </p>
+  <pre><code># Donanım kesme noktası (hbreak)
+(gdb) hbreak arch/arm64/mm/fault.c:250
+
+# Belirli bir adrese donanım kesme noktası
+(gdb) hbreak *0xffff800010001234
+
+# ARM64'te genellikle 4-8 donanım kesme noktası mevcuttur
+(gdb) info breakpoints</code></pre>
+
+  <h3>İzleme Noktaları (Watchpoints)</h3>
+  <p>
+    İzleme noktaları bir bellek konumu okunduğunda veya yazıldığında çekirdeği durdurur.
+    Use-after-free ve bellek bozulması (memory corruption) hatalarını yakalamada son
+    derece etkilidir:
+  </p>
+  <pre><code># Değişken yazıldığında dur (write watchpoint)
+(gdb) watch global_variable
+
+# Belirli bir bellek adresini izle
+(gdb) watch *((int *)0xffff800012345678)
+
+# Okuma izleme noktası
+(gdb) rwatch some_kernel_var
+
+# Okuma veya yazma
+(gdb) awatch some_kernel_var
+
+# task_struct içindeki bir alanı izle
+(gdb) watch -l current->mm
+
+# İzleme noktalarını listele
+(gdb) info watchpoints</code></pre>
+
+  <h3>Çalıştırma Kontrol Komutları</h3>
+  <div class="params">
+    <div class="param"><span class="name">continue (c)</span><span class="desc">Çekirdeği çalıştırmaya devam ettirir; bir sonraki kesme noktasına kadar sürer.</span></div>
+    <div class="param"><span class="name">step (s)</span><span class="desc">Bir kaynak satırı ilerler; fonksiyon çağrılarının içine girer.</span></div>
+    <div class="param"><span class="name">next (n)</span><span class="desc">Bir kaynak satırı ilerler; fonksiyon çağrılarının üzerinden atlar.</span></div>
+    <div class="param"><span class="name">stepi (si)</span><span class="desc">Bir makine komutu ilerler; assembly seviyesi analiz için kullanılır.</span></div>
+    <div class="param"><span class="name">finish</span><span class="desc">Mevcut fonksiyonun sonuna kadar çalışır ve döner.</span></div>
+    <div class="param"><span class="name">until SATIR</span><span class="desc">Belirtilen satıra kadar çalışır; döngüleri atlamak için kullanışlıdır.</span></div>
+  </div>
+
+  <h3>Pratik Senaryo: Bellek Bozulmasını Yakalama</h3>
+  <pre><code># Senaryo: Bir sürücü başka bir modülün değişkenini bozuyor
+
+# Adım 1: Bozulan değişkenin adresini bul
+(gdb) p &amp;target_module_global_var
+# $1 = (int *) 0xffff800008abc123
+
+# Adım 2: İzleme noktası koy
+(gdb) watch *0xffff800008abc123
+
+# Adım 3: Devam et — bozulma anında duracak
+(gdb) continue
+
+# Kernel durduğunda:
+# Hardware watchpoint 1: *0xffff800008abc123
+# Old value = 42
+# New value = 0
+# evil_driver_write () at drivers/evil/evil.c:88
+
+# Adım 4: Stack izini al
+(gdb) bt
+# #0  evil_driver_write () at drivers/evil/evil.c:88
+# #1  evil_irq_handler () at drivers/evil/evil.c:120
+# #2  handle_irq_event () at kernel/irq/handle.c:167</code></pre>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> Modül Hata Ayıklama</h2>
+  <p class="section-lead">
+    Yüklenebilir kernel modülleri (LKM) çalışma zamanında dinamik olarak yüklenir. Modül kodunun
+    sembol adresleri önyükleme sırasında bilinmez; GDB'ye ayrıca bildirilmesi gerekir.
+  </p>
+
+  <h3>add-symbol-file Komutu</h3>
+  <p>
+    GDB'nin <code>add-symbol-file</code> komutu, modülün debug sembollerini içeren <code>.ko</code>
+    dosyasını belirtilen bellek adresine konumlandırır:
+  </p>
+  <pre><code>(gdb) add-symbol-file /path/to/mydriver.ko TEXT_ADDRESS \
+      -s .data DATA_ADDRESS \
+      -s .bss  BSS_ADDRESS</code></pre>
+
+  <h3>Modül Bellek Adreslerini Okuma</h3>
+  <p>
+    Adresler hedef sistemdeki <code>/sys/module/</code> sysfs arayüzünden okunur:
+  </p>
+  <pre><code># Hedef sistemde (modül yüklüyken)
+cat /sys/module/mydriver/sections/.text
+# 0xffff800008abc000
+
+cat /sys/module/mydriver/sections/.data
+# 0xffff800008ac4000
+
+cat /sys/module/mydriver/sections/.bss
+# 0xffff800008ac6000
+
+# Tüm section'ları tek seferde listele
+for s in /sys/module/mydriver/sections/.*; do
+    printf "%s : %s\n" "$s" "$(cat $s 2>/dev/null)"
+done</code></pre>
+
+  <h3>GDB'de Modülü Konumlandırma</h3>
+  <pre><code># Host'ta GDB oturumunda sembol dosyasını ekle
+(gdb) add-symbol-file mydriver.ko 0xffff800008abc000 \
+      -s .data 0xffff800008ac4000 \
+      -s .bss  0xffff800008ac6000
+
+# Onay istenir:
+# add symbol table from file "mydriver.ko" at
+#         .text_addr = 0xffff800008abc000
+# (y or n) y
+# Reading symbols from mydriver.ko...done.
+
+# Artık modül içinde kesme noktası koyabilirsiniz
+(gdb) break mydriver.c:probe_function
+(gdb) break mydriver_read</code></pre>
+
+  <h3>Otomatik Sembol Yükleme (Python Yardımcı Script)</h3>
+  <pre><code>#!/usr/bin/env python3
+# load_module_syms.py
+# Kullanim: ssh root@hedef python3 - &lt; load_module_syms.py mydriver
+import sys, os
+
+modname = sys.argv[1]
+base = "/sys/module/" + modname + "/sections/"
+
+def read_addr(section):
+    path = base + section
+    if os.path.exists(path):
+        return open(path).read().strip()
+    return None
+
+text = read_addr(".text")
+data = read_addr(".data")
+bss  = read_addr(".bss")
+
+if not text:
+    print("# Modül bulunamadi:", modname)
+    sys.exit(1)
+
+cmd = "add-symbol-file {}.ko {}".format(modname, text)
+if data: cmd += " -s .data {}".format(data)
+if bss:  cmd += " -s .bss  {}".format(bss)
+print(cmd)</code></pre>
+
+  <h3>Modül Yükleme Anında Kesme</h3>
+  <pre><code># Modülün yüklenme anında dur — do_init_module kesme noktası
+(gdb) break do_init_module
+(gdb) continue
+
+# Modül yüklendiğinde kernel durur:
+# Breakpoint 1, do_init_module (mod=0xffff800009abc000)
+#     at kernel/module.c:3482
+
+# Modül adını kontrol et
+(gdb) p mod->name
+# $1 = "mydriver"
+
+# Text adresini al ve sembol ekle
+(gdb) p mod->core_layout.base
+# $2 = (void *) 0xffff800008abc000</code></pre>
+
+  <h3>Modül Debug için Yocto Yapılandırması</h3>
+  <div class="params">
+    <div class="param"><span class="name">INHIBIT_PACKAGE_STRIP = "1"</span><span class="desc">.ko dosyasının debug sembollerinin paketleme sırasında soyulmasını engeller.</span></div>
+    <div class="param"><span class="name">INHIBIT_PACKAGE_DEBUG_SPLIT = "1"</span><span class="desc">Debug sembollerinin ayrı bir paket olarak bölünmesini engeller; semboller ana .ko içinde kalır.</span></div>
+    <div class="param"><span class="name">CONFIG_DEBUG_INFO=y (fragment)</span><span class="desc">.ko dosyasının DWARF debug bilgisi içermesi için kernel config fragment'ine eklenmeli.</span></div>
+  </div>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> Kernel Panic Analizi</h2>
+  <p class="section-lead">
+    Kernel panic ve oops mesajları, Linux'un kendi kendine ürettiği kritik hata bildirimleridir.
+    KGDB ile bu anları dondurarak tam bir canlı veya post-mortem analiz yapmak mümkündür.
+  </p>
+
+  <h3>Kernel Oops Mesajı Anatomisi</h3>
+  <p>
+    Bir oops mesajı birkaç bölümden oluşur. Aşağıda NULL pointer dereference örneği:
+  </p>
+  <pre><code>Unable to handle kernel NULL pointer dereference at virtual address 0000000000000010
+Mem abort info:
+  ESR = 0x96000004
+  Exception class = DABT (current EL), IL = 32 bits
+Data abort info:
+  ISV = 0, ISS = 0x00000004
+  CM = 0, WnR = 0
+[0000000000000010] pgd=0000000000000000
+Internal error: Oops: 96000004 [#1] PREEMPT SMP
+Modules linked in: mydriver(O) e1000e i2c_core
+CPU: 2 PID: 1234 Comm: myprocess Tainted: G           O
+pc : mydriver_read+0x48/0x120 [mydriver]
+lr : vfs_read+0xbc/0x1a0
+Call trace:
+ mydriver_read+0x48/0x120 [mydriver]
+ vfs_read+0xbc/0x1a0
+ ksys_read+0x68/0xf0
+ __arm64_sys_read+0x18/0x28
+ el0_svc+0x8/0x200</code></pre>
+
+  <h3>KGDB ile Panic Anında Canlı Analiz</h3>
+  <pre><code># Panic sonrası KGDB otomatik devreye girer
+# (CONFIG_KGDB_ON_PANIC etkinse — bazı dağıtımlarda)
+# GDB'den bağlan:
+(gdb) target remote /dev/ttyUSB0
+
+# Panic anındaki stack izini al
+(gdb) bt
+# #0  die () at arch/arm64/kernel/traps.c:234
+# #1  do_mem_abort ()
+# #2  mydriver_read () at drivers/mydriver/mydriver.c:88
+
+# Frame 2'ye git — hatanın gerçekleştiği yer
+(gdb) frame 2
+
+# O frame'deki lokal değişkenleri gör
+(gdb) info locals
+# ptr = 0x0          &lt;-- NULL pointer!
+# size = 4096
+
+# Tam kaynak bağlamını gör
+(gdb) list
+# 85: int mydriver_read(struct file *file, char __user *buf, size_t count)
+# 86: {
+# 87:     struct mydev *dev = file->private_data;
+# 88:     return copy_to_user(buf, dev-&gt;buffer, dev-&gt;size);  &lt;-- dev NULL!</code></pre>
+
+  <h3>Use-After-Free Tespiti</h3>
+  <pre><code># Yöntem 1: KASAN ile otomatik tespit (önerilir)
+# CONFIG_KASAN=y + CONFIG_KASAN_INLINE=y ile derleyin
+# KASAN, UAF'ı stack trace ile birlikte otomatik raporlar
+
+# Yöntem 2: İzleme noktası ile manuel tespit
+# Nesnenin adresi biliniyorsa:
+(gdb) watch -l *((struct mydev *)0xffff800009abc000)
+
+# Yöntem 3: SLUB debug ile adres tespit
+# Hedef: echo "mydev" > /sys/kernel/slab/mydev/trace
+
+# Yöntem 4: Tipik use-after-free belirtisi
+(gdb) x/32xb 0xdeadbeefdeadbeef
+# KASAN poison değerleri: 0xCC (freed), 0xAA (uninitialized)</code></pre>
+
+  <h3>Oops Adresini Kaynak Satırına Çevirme</h3>
+  <pre><code># GDB olmadan da oops adreslerini çözümleyebilirsiniz
+# "pc : mydriver_read+0x48/0x120 [mydriver]" ifadesinden:
+
+# Yöntem 1: addr2line ile (offset yeterli)
+aarch64-linux-gnu-addr2line -e mydriver.ko 0x48
+# /home/user/driver-src/mydriver.c:88
+
+# Yöntem 2: faddr2line ile (fonksiyon+offset)
+./scripts/faddr2line mydriver.ko mydriver_read+0x48
+# mydriver_read at drivers/mydriver/mydriver.c:88
+
+# Yöntem 3: decode_stacktrace.sh ile tam stack
+./scripts/decode_stacktrace.sh vmlinux . &lt; oops_log.txt</code></pre>
+
+  <h3>Post-Mortem: kdump + crash</h3>
+  <pre><code># kdump kernel panic anında belleği diske yazar
+# crash aracı bu dökümü analiz eder
+
+# 1) Hedef sistemde kdump kurun
+apt-get install kdump-tools
+echo 'crashkernel=256M' &gt;&gt; /etc/default/grub
+update-grub &amp;&amp; reboot
+
+# 2) Panic sonrası /var/crash/TARIH/vmcore oluşur
+
+# 3) crash ile analiz (host veya hedef)
+crash /usr/lib/debug/boot/vmlinux-$(uname -r) \
+      /var/crash/20260415/vmcore
+
+# crash kabuğunda
+crash&gt; bt        # backtrace
+crash&gt; log       # dmesg ring buffer
+crash&gt; ps        # process listesi
+crash&gt; mod       # yüklü modüller</code></pre>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> QEMU ile KGDB Geliştirme Ortamı</h2>
+  <p class="section-lead">
+    Gerçek donanım her zaman erişilebilir olmayabilir. QEMU, kernel geliştirme ve hata ayıklama için
+    güçlü bir sanallaştırma ortamı sunar. KGDB, QEMU'nun sanal seri portu üzerinden sorunsuz çalışır.
+  </p>
+
+  <h3>QEMU TCP Seri Köprüsü ile KGDBOC</h3>
+  <pre><code># ARM64 sanal makine — KGDB için TCP seri köprü
+qemu-system-aarch64 \
+    -M virt \
+    -cpu cortex-a57 \
+    -m 1G \
+    -kernel Image \
+    -append "console=ttyAMA0,115200 kgdboc=ttyAMA0,115200 nokaslr" \
+    -nographic \
+    -serial tcp::4321,server,nowait \
+    -drive file=rootfs.ext4,format=raw,if=virtio
+
+# x86_64 sanal makine
+qemu-system-x86_64 \
+    -kernel bzImage \
+    -append "console=ttyS0,115200 kgdboc=ttyS0,115200 nokaslr" \
+    -nographic \
+    -serial tcp::4321,server,nowait \
+    -initrd initrd.img</code></pre>
+
+  <h3>QEMU Yerleşik GDB Server (-s -S)</h3>
+  <p>
+    QEMU'nun kendi GDB server'ı (<code>-s -S</code> parametreleri), kernel çalışmadan önce makine
+    seviyesinde durur. KGDB'den farklıdır ancak kernel önyükleme sürecini debug etmek için kullanışlıdır:
+  </p>
+  <pre><code># QEMU kendi GDB server'ı ile (makine seviyesi, KGDB değil)
+qemu-system-aarch64 \
+    -M virt -cpu cortex-a57 -m 1G \
+    -kernel Image \
+    -s -S \      # -s: port 1234'te GDB server, -S: başlangıçta dur
+    -nographic
+
+# Host'ta GDB:
+aarch64-linux-gnu-gdb vmlinux
+(gdb) target remote localhost:1234
+(gdb) continue     # Kernel önyüklemeye başlar</code></pre>
+
+  <h3>KGDB ile TCP Bağlantısı</h3>
+  <pre><code># 1. QEMU başlatıldıktan ve kernel açıldıktan sonra
+#    QEMU guest'te KGDB'yi tetikle:
+# QEMU monitor moduna geç: Ctrl+A, C
+# monitor&gt; sendkey alt-sysrq-g
+
+# Veya guest terminal üzerinden:
+# echo g &gt; /proc/sysrq-trigger
+
+# 2. Host'ta GDB bağlan
+aarch64-linux-gnu-gdb vmlinux
+(gdb) target remote localhost:4321
+
+# TCP bağlantısında baud hızı ayarı gerekmez</code></pre>
+
+  <h3>QEMU + KGDB Geliştirme Döngüsü</h3>
+  <div class="flow"><pre>
+  1. Kernel veya modülü derle
+         |
+         v
+  2. QEMU başlat (rootfs'e modül kopyala)
+         |
+         v
+  3. Guest'te modülü yükle: insmod mydriver.ko
+         |
+         v
+  4. /sys/module/mydriver/sections/.text adresini oku
+         |
+         v
+  5. GDB: target remote localhost:4321
+     GDB: add-symbol-file mydriver.ko TEXT_ADRES
+         |
+         v
+  6. Kesme noktası koy; SysRq-g ile tetikle
+         |
+         v
+  7. Hata bul, düzelt -&gt; 1'e don
+  </pre></div>
+
+  <h3>QEMU Snapshot ile Tekrarlanabilir Test</h3>
+  <pre><code># Belirli bir sistem durumunu snapshot olarak kaydet
+# QEMU monitor modunda (Ctrl+A, C):
+# monitor&gt; savevm before-test
+
+# Hata ayıkladıktan sonra başlangıç durumuna dön:
+# monitor&gt; loadvm before-test
+
+# Bu özellik race condition araştırmasında son derece değerlidir:
+# - Aynı sistem durumunu tekrar tekrar yeniden oluşturabilirsiniz
+# - Modül yükleme öncesi temiz durum kolayca geri yüklenir</code></pre>
+
+  <h3>QEMU ile Kernel Modülü Geliştirme İpuçları</h3>
+  <div class="params">
+    <div class="param"><span class="name">9P/VirtFS paylaşımlı dizin</span><span class="desc">QEMU 9P protokolü ile host dizinini guest'e monte edin; derlenen .ko dosyasını kopyalamadan kullanın.</span></div>
+    <div class="param"><span class="name">-kernel ile hızlı döngü</span><span class="desc">Yeni kernel imajı denemek için QEMU'yu -kernel ile yeniden başlatın; disk imajını yeniden oluşturmanız gerekmez.</span></div>
+    <div class="param"><span class="name">nokaslr zorunlu</span><span class="desc">QEMU boot parametrelerine nokaslr eklemeden GDB sembol adresleri tutarsız olacaktır.</span></div>
+  </div>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> KDB: Klavye Hata Ayıklayıcı</h2>
+  <p class="section-lead">
+    KDB (Kernel Debugger), KGDB altyapısı üzerine inşa edilmiş ve GDB'ye ihtiyaç duymayan yerel bir
+    hata ayıklama ön yüzüdür. Doğrudan hedef sistemin konsolundan etkileşimli olarak kullanılır.
+    Uzak GDB bağlantısı mümkün olmadığında ya da üretim sisteminde acil inceleme gerektiğinde
+    vazgeçilmezdir.
+  </p>
+
+  <h3>KDB'yi Etkinleştirme</h3>
+  <pre><code># Kernel yapılandırmasında (derleme zamanı):
+# CONFIG_KGDB_KDB=y
+# CONFIG_KDB_DEFAULT_ENABLE=0x1
+
+# Çalışma zamanında etkinleştirme:
+echo 1 > /sys/module/kdb/parameters/kdb_enable
+
+# KDB moduna giriş:
+echo g > /proc/sysrq-trigger</code></pre>
+
+  <p>
+    KDB etkinleştirildiğinde ve SysRq-g tetiklendiğinde konsol şu görünümü alır:
+  </p>
+  <pre><code>Entering kdb (current=0xffff800009abc000, pid 1234) due to Keyboard Entry
+[0]kdb&gt;</code></pre>
+
+  <p>
+    Köşeli parantez içindeki sayı mevcut CPU numarasıdır.
+  </p>
+
+  <h3>Temel KDB Komutları</h3>
+  <div class="file-table"><table>
+    <tr><th>Komut</th><th>Açıklama</th><th>Örnek</th></tr>
+    <tr><td><code>help</code></td><td>Tüm komutları listeler</td><td><code>help</code></td></tr>
+    <tr><td><code>go</code></td><td>Çalışmaya devam et</td><td><code>go</code></td></tr>
+    <tr><td><code>bt</code></td><td>Mevcut stack trace</td><td><code>bt</code></td></tr>
+    <tr><td><code>btp PID</code></td><td>Belirtilen PID'in stack trace'i</td><td><code>btp 1234</code></td></tr>
+    <tr><td><code>bta</code></td><td>Tüm süreçlerin stack trace'i</td><td><code>bta</code></td></tr>
+    <tr><td><code>ps</code></td><td>Çalışan süreç listesi</td><td><code>ps</code></td></tr>
+    <tr><td><code>md ADRES</code></td><td>Bellekten veri oku (hex dump)</td><td><code>md 0xffff800008abc000</code></td></tr>
+    <tr><td><code>mdr ADRES BOY</code></td><td>Belirtilen uzunlukta bellek oku</td><td><code>mdr 0xffff800008abc000 32</code></td></tr>
+    <tr><td><code>mm ADRES DEGER</code></td><td>Belleğe değer yaz</td><td><code>mm 0xffff000012345678 0x1</code></td></tr>
+    <tr><td><code>id ADRES</code></td><td>Adresi disassemble et</td><td><code>id mydriver_probe</code></td></tr>
+    <tr><td><code>lsmod</code></td><td>Yüklü modülleri listele</td><td><code>lsmod</code></td></tr>
+    <tr><td><code>rd</code></td><td>Register değerlerini göster</td><td><code>rd</code></td></tr>
+    <tr><td><code>bp ADRES</code></td><td>Kesme noktası koy</td><td><code>bp do_sys_open</code></td></tr>
+    <tr><td><code>bc NUM</code></td><td>Kesme noktasını sil</td><td><code>bc 1</code></td></tr>
+    <tr><td><code>sr SYSRQ</code></td><td>SysRq komutu çalıştır</td><td><code>sr t</code> (thread dump)</td></tr>
+    <tr><td><code>kgdb</code></td><td>KGDB protokolüne geç</td><td><code>kgdb</code></td></tr>
+  </table></div>
+
+  <h3>KDB ile Acil Sistem Analizi</h3>
+  <pre><code># Tüm CPU'lardaki stack trace'leri al
+[0]kdb&gt; bta
+
+# Belirli bir task'ın stack'ını gör
+[0]kdb&gt; btp 1
+
+# Tüm process'leri listele
+[0]kdb&gt; ps A
+
+# CPU register durumunu gör
+[0]kdb&gt; rd
+
+# Modül listesi — crash olan modülü tespit et
+[0]kdb&gt; lsmod
+
+# Çalışmaya devam et
+[0]kdb&gt; go</code></pre>
+
+  <h3>KDB Bellek Komutları Kullanım Örnekleri</h3>
+  <pre><code># Kernel sembol adresini doğrudan kullan
+[0]kdb&gt; md init_task
+
+# 8 kelime oku
+[0]kdb&gt; md 0xffff800008abc000 8
+
+# 16 bayt oku
+[0]kdb&gt; mdr 0xffff800008abc000 16
+
+# Modül listesinden adres bul
+[0]kdb&gt; lsmod
+# Module                  Address        Size
+# mydriver               0xffff800008abc000  16384
+
+# Modül adresinden kodu disassemble et
+[0]kdb&gt; id 0xffff800008abc000</code></pre>
+
+  <h3>KGDB ile KDB Arasında Geçiş</h3>
+  <pre><code># KDB modundayken KGDB'ye geç (uzak GDB bağlantısı için)
+[0]kdb&gt; kgdb
+
+# Artık host'ta GDB ile bağlanabilirsiniz:
+# aarch64-linux-gnu-gdb vmlinux
+# (gdb) target remote /dev/ttyUSB0
+
+# KGDB modundayken KDB'ye geç (GDB oturumundan):
+(gdb) maintenance packet 3</code></pre>
+
+  <h3>Üretim Sisteminde Güvenli Kullanım</h3>
+  <p>
+    Üretim sistemlerinde KGDB/KDB kullanımı dikkatli değerlendirme gerektirir:
+  </p>
+  <div class="params">
+    <div class="param"><span class="name">Fiziksel erişim kontrolü</span><span class="desc">KDB, UART portuna fiziksel erişimi olan herkese kernel seviyesi kontrol verir. Debug portunu yetkisiz erişime karşı koruyun.</span></div>
+    <div class="param"><span class="name">SysRq kısıtlama</span><span class="desc">/proc/sys/kernel/sysrq değerini 0 yaparak üretimde SysRq'yu tamamen devre dışı bırakın; ihtiyaç duyulduğunda 1 yapın.</span></div>
+    <div class="param"><span class="name">Ayrı debug build</span><span class="desc">KGDB/KDB içeren kernel sürümlerini yalnızca geliştirme ve test ortamlarında kullanın; üretim imajlarına dahil etmeyin.</span></div>
+    <div class="param"><span class="name">CONFIG_KGDB_KDB=n üretimde</span><span class="desc">Üretim çekirdeklerinde KDB desteğini derleme zamanında devre dışı bırakmak en güvenli yaklaşımdır.</span></div>
+  </div>
+</section>
+
+</main>

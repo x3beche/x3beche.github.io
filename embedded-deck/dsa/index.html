@@ -1,0 +1,960 @@
+---
+layout: tutorial
+title: "DSA — Linux Distributed Switch Architecture"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>AĞ SÜRÜCÜSÜ</span>
+    <span>2026</span>
+  </div>
+  <h1>DSA<br><em>Linux Distributed Switch Architecture</em></h1>
+  <p class="subtitle">SoC entegre Ethernet switch'leri Linux çekirdeğine entegre etmek için DSA çerçevesini — Marvell 88E6xxx, MediaTek MT7530 ve Realtek RTL8370 örnekleriyle — adım adım öğrenin.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">DSA neden var — SoC switch ve CPU port</a></li>
+    <li><a href="#s1">DSA mimarisi — master/slave netdev</a></li>
+    <li><a href="#s2">dsa_switch_ops — temel callback'ler</a></li>
+    <li><a href="#s3">Device Tree DSA binding</a></li>
+    <li><a href="#s4">VLAN aware mod</a></li>
+    <li><a href="#s5">STP ve bridge entegrasyonu</a></li>
+    <li><a href="#s6">Port mirroring ve trafik izleme</a></li>
+    <li><a href="#s7">mv88e6xxx ve MT7530 gerçek dünya yapılandırması</a></li>
+    <li><a href="#s8">Hata ayıklama</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> DSA neden var — SoC switch ve CPU port</h2>
+  <p class="section-lead">Yönlendirici ve geçit (gateway) SoC'lerinin büyük çoğunluğu entegre bir Ethernet switch çekirdeği içerir. Linux'un bu switch'i nasıl yönettiğini anlamak, DSA'nın neden var olduğunu açıklar.</p>
+
+  <h3>Klasik yaklaşımın sorunu</h3>
+  <p>OpenWrt veya benzeri yönlendirici dağıtımlarının ilk kuşaklarında entegre switch'ler bir <em>tek parça MAC</em> olarak gösterilir, portlar arası yönetim ise vendor-specific kullanıcı alanı araçlarıyla (switch binary, swconfig) yapılırdı. Bu yaklaşım şu sorunları doğuruyordu:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Kernel görünürlüğü yok</span><span class="desc">Bireysel switch portları bağımsız ağ arayüzü olarak görünmüyordu; tc, iptables uygulanamıyordu</span></div>
+    <div class="param"><span class="name">Standart dışı yönetim</span><span class="desc">Her vendor farklı kullanıcı alanı araçları; taşınabilirlik sıfır</span></div>
+    <div class="param"><span class="name">Bridge/VLAN entegrasyonu</span><span class="desc">Linux yazılım bridge ile donanım switch koordinasyonu imkânsız</span></div>
+    <div class="param"><span class="name">netfilter/tc hook yok</span><span class="desc">Trafiği kernel ağ yığınından geçiremediğiniz için paket filtreleme yapılamaz</span></div>
+  </div>
+
+  <h3>DSA çözümü</h3>
+  <p>DSA (Distributed Switch Architecture, <code>net/dsa/</code>), her switch portunu bağımsız bir Linux ağ arayüzü (slave netdev) olarak sunar. Trafik hâlâ donanımda anahtarlanır; ancak CPU port üzerinden geçen paketler kernel yığınına girer, böylece tc/netfilter/bridge API'leri çalışır.</p>
+
+  <div class="flow">
+    <pre>         Linux Kernel
+    ┌──────────────────────────────┐
+    │  eth0 (master/CPU netdev)    │
+    │   lan1   lan2   lan3   wan   │  ← slave netdev'ler
+    └────────────┬─────────────────┘
+                 │ DSA tag (Ethertype / trailer)
+    ┌────────────▼─────────────────┐
+    │   Switch donanımı            │
+    │  P0(CPU) P1  P2  P3  P4(WAN)│
+    └──────────────────────────────┘</pre>
+  </div>
+
+  <h3>DSA etiket protokolleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Etiket türü</th><th>Konum</th><th>Kullanan chipset</th></tr></thead>
+      <tbody>
+        <tr><td>DSA (Ethertype 0xDADA)</td><td>Frame başı</td><td>Marvell 88E6xxx (eski)</td></tr>
+        <tr><td>EDSA (Ethertype 0xDADB)</td><td>Frame başı</td><td>Marvell 88E6xxx (yeni)</td></tr>
+        <tr><td>MTK</td><td>Frame başı (4 B)</td><td>MediaTek MT7530/MT7621</td></tr>
+        <tr><td>RTL4 / RTL8_4</td><td>Frame sonu (trailer)</td><td>Realtek RTL8370/RTL838x</td></tr>
+        <tr><td>OCELOT</td><td>IFH başlık</td><td>Microchip Ocelot/Sparx</td></tr>
+        <tr><td>SJA1105</td><td>Meta frame</td><td>NXP SJA1105</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>DSA her switch portunu bağımsız netdev olarak sunar — standart Linux araçları çalışır</li>
+      <li>CPU port üzerinden geçen trafik DSA etiketiyle hangi porta ait olduğunu belirtir</li>
+      <li>Donanım anahtarlama hâlâ chip içinde yapılır — yazılım yolu sadece CPU'ya gelen trafik için</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> DSA mimarisi — master ve slave netdev</h2>
+  <p class="section-lead">DSA'nın katmanlı mimarisini anlamak, sürücü yazarken hangi katmanın ne yaptığını bilmek açısından kritiktir.</p>
+
+  <h3>Katman yapısı</h3>
+
+  <div class="flow">
+    <pre>Kullanıcı alanı: ip link / bridge / tc
+         │
+   Linux Ağ Çekirdeği (netdev API)
+         │
+   ┌─────┴──────────────────────────────┐
+   │ DSA çerçevesi (net/dsa/dsa2.c)     │
+   │  ┌─────────────────────────────┐   │
+   │  │ slave netdev (lan1…lanN, wan)│   │
+   │  │ dsa_slave_xmit()            │   │
+   │  │ → DSA etiket ekle           │   │
+   │  └──────────────┬──────────────┘   │
+   │                 │                  │
+   │  master netdev (eth0, CPU port)    │
+   │  dsa_master_xmit() → MAC sürücüsü │
+   └─────────────────┬──────────────────┘
+                     │
+             Switch chip sürücüsü
+             (mv88e6xxx / mt7530 …)
+                     │
+              MDIO / SPI / I2C</pre>
+  </div>
+
+  <h3>dsa_switch yapısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* include/net/dsa.h'den sadeleştirilmiş */</span>
+<span class="kw">struct</span> dsa_switch {
+    <span class="kw">struct</span> device        *dev;
+    <span class="kw">struct</span> dsa_switch_tree *dst;         <span class="cmt">/* çok-chip topoloji ağacı */</span>
+    <span class="kw">unsigned int</span>          index;         <span class="cmt">/* bu switch'in numarası (cascaded) */</span>
+    <span class="kw">const struct</span> dsa_switch_ops *ops;    <span class="cmt">/* sürücü callback'leri */</span>
+    <span class="kw">void</span>                 *priv;          <span class="cmt">/* sürücüye özel veri */</span>
+    <span class="kw">int</span>                   num_ports;
+    <span class="kw">struct</span> dsa_port       ports[DSA_MAX_PORTS];
+    <span class="kw">unsigned long</span>         phys_mii_mask; <span class="cmt">/* dahili MDIO maskelemesi */</span>
+    <span class="kw">struct</span> mii_bus       *slave_mii_bus; <span class="cmt">/* slave MDIO bus (dahili PHY) */</span>
+    /* VLAN filtreleme modu */
+    <span class="kw">bool</span>                  vlan_filtering_is_global;
+    <span class="kw">bool</span>                  needs_standalone_vlan_filtering;
+};</code></pre>
+  </div>
+
+  <h3>RX path — paket gelişi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Master netdev RX handler (dsa_switch_rcv) */</span>
+<span class="kw">static</span> rx_handler_result_t dsa_switch_rcv(<span class="kw">struct</span> sk_buff **pskb)
+{
+    <span class="kw">struct</span> sk_buff *skb = *pskb;
+    <span class="kw">struct</span> dsa_port *cpu_dp = skb-&gt;dev-&gt;rx_handler_data;
+    <span class="kw">const struct</span> dsa_device_ops *tag_ops = cpu_dp-&gt;dst-&gt;tag_ops;
+    <span class="kw">struct</span> dsa_slave_priv *p;
+
+    <span class="cmt">/* DSA etiketini çöz — hangi port gönderdi? */</span>
+    skb = tag_ops-&gt;rcv(skb, skb-&gt;dev);
+    <span class="kw">if</span> (!skb)
+        <span class="kw">return</span> RX_HANDLER_CONSUMED;
+
+    <span class="cmt">/* sk_buff'ın dev'ini doğru slave netdev'e yönlendir */</span>
+    skb-&gt;dev-&gt;stats.rx_packets++;
+    netif_receive_skb(skb);
+    <span class="kw">return</span> RX_HANDLER_CONSUMED;
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Master netdev = CPU portuna bağlı MAC arayüzü (eth0)</li>
+      <li>Slave netdev'ler = her switch portuna karşılık gelen sanal arayüzler (lan1, wan…)</li>
+      <li>RX: DSA etiketi çözülerek skb doğru slave arayüze yönlendirilir</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> dsa_switch_ops — temel callback'ler</h2>
+  <p class="section-lead"><code>dsa_switch_ops</code>, switch chip sürücüsünün DSA çerçevesine sunduğu işlev tablosudur. Tüm alanları uygulamak zorunlu değildir; kritik olanlar aşağıda ele alınmıştır.</p>
+
+  <h3>Zorunlu callback'ler</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code><span class="kw">static const struct</span> dsa_switch_ops myswitch_ops = {
+    .get_tag_protocol  = myswitch_get_tag_protocol,
+    .setup             = myswitch_setup,
+    .port_enable       = myswitch_port_enable,
+    .port_disable      = myswitch_port_disable,
+    .phylink_get_caps  = myswitch_phylink_get_caps,
+};
+
+<span class="cmt">/* Hangi DSA etiket protokolünü kullanıyoruz */</span>
+<span class="kw">static enum</span> dsa_tag_protocol
+myswitch_get_tag_protocol(<span class="kw">struct</span> dsa_switch *ds, <span class="kw">int</span> port,
+                           <span class="kw">enum</span> dsa_tag_protocol mp)
+{
+    <span class="kw">return</span> DSA_TAG_PROTO_MTK;   <span class="cmt">/* veya _EDSA, _RTL8_4 … */</span>
+}
+
+<span class="cmt">/* Switch ilk kurulum */</span>
+<span class="kw">static int</span> myswitch_setup(<span class="kw">struct</span> dsa_switch *ds)
+{
+    <span class="kw">int</span> port, ret;
+
+    <span class="cmt">/* Global reset */</span>
+    ret = myswitch_global_reset(ds);
+    <span class="kw">if</span> (ret)
+        <span class="kw">return</span> ret;
+
+    <span class="cmt">/* Her port için bağımsız VLAN, STP durumu başlangıç ayarı */</span>
+    <span class="kw">for</span> (port = 0; port &lt; ds-&gt;num_ports; port++) {
+        <span class="kw">if</span> (dsa_is_unused_port(ds, port))
+            <span class="kw">continue</span>;
+        myswitch_port_init(ds, port);
+    }
+    <span class="kw">return</span> 0;
+}</code></pre>
+  </div>
+
+  <h3>Bridge entegrasyon callback'leri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Port bir Linux bridge'e eklendiğinde */</span>
+<span class="kw">static int</span> myswitch_port_bridge_join(<span class="kw">struct</span> dsa_switch *ds, <span class="kw">int</span> port,
+                                      <span class="kw">struct</span> dsa_bridge bridge,
+                                      <span class="kw">bool</span> *tx_fwd_offload,
+                                      <span class="kw">struct</span> netlink_ext_ack *extack)
+{
+    <span class="cmt">/* Donanımda portlar arası anahtarlamayı etkinleştir */</span>
+    myswitch_set_port_bridge_member(ds, port, bridge.num);
+    *tx_fwd_offload = true;   <span class="cmt">/* donanım TX yönlendirmesi yapılabilir */</span>
+    <span class="kw">return</span> 0;
+}
+
+<span class="cmt">/* Port bridge'den çıkarıldığında */</span>
+<span class="kw">static void</span> myswitch_port_bridge_leave(<span class="kw">struct</span> dsa_switch *ds, <span class="kw">int</span> port,
+                                        <span class="kw">struct</span> dsa_bridge bridge)
+{
+    myswitch_clear_port_bridge_member(ds, port);
+}
+
+<span class="cmt">/* VLAN ekleme */</span>
+<span class="kw">static int</span> myswitch_port_vlan_add(<span class="kw">struct</span> dsa_switch *ds, <span class="kw">int</span> port,
+                                   <span class="kw">const struct</span> switchdev_obj_port_vlan *vlan,
+                                   <span class="kw">struct</span> netlink_ext_ack *extack)
+{
+    <span class="kw">bool</span> untagged = vlan-&gt;flags &amp; BRIDGE_VLAN_INFO_UNTAGGED;
+    <span class="kw">bool</span> pvid     = vlan-&gt;flags &amp; BRIDGE_VLAN_INFO_PVID;
+
+    myswitch_hw_vlan_add(ds, port, vlan-&gt;vid, untagged, pvid);
+    <span class="kw">return</span> 0;
+}
+
+<span class="cmt">/* VLAN silme */</span>
+<span class="kw">static int</span> myswitch_port_vlan_del(<span class="kw">struct</span> dsa_switch *ds, <span class="kw">int</span> port,
+                                   <span class="kw">const struct</span> switchdev_obj_port_vlan *vlan)
+{
+    myswitch_hw_vlan_del(ds, port, vlan-&gt;vid);
+    <span class="kw">return</span> 0;
+}</code></pre>
+  </div>
+
+  <h3>FDB (Forwarding Database) callback'leri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Statik FDB girdisi ekle */</span>
+<span class="kw">static int</span> myswitch_port_fdb_add(<span class="kw">struct</span> dsa_switch *ds, <span class="kw">int</span> port,
+                                  <span class="kw">const unsigned char</span> *addr, u16 vid,
+                                  <span class="kw">struct</span> db_info *db)
+{
+    <span class="kw">return</span> myswitch_hw_fdb_insert(ds, port, addr, vid);
+}
+
+<span class="cmt">/* FDB gezinti — bridge fdb show için */</span>
+<span class="kw">static int</span> myswitch_port_fdb_dump(<span class="kw">struct</span> dsa_switch *ds, <span class="kw">int</span> port,
+                                   dsa_fdb_dump_cb_t *cb, <span class="kw">void</span> *data)
+{
+    <span class="kw">struct</span> myswitch_fdb_entry entry;
+    <span class="kw">int</span> bucket, i, ret;
+
+    <span class="kw">for</span> (bucket = 0; bucket &lt; MY_FDB_BUCKETS; bucket++) {
+        ret = myswitch_read_fdb(ds, bucket, &amp;entry);
+        <span class="kw">if</span> (ret)
+            <span class="kw">continue</span>;
+        <span class="kw">if</span> (entry.port == port)
+            cb(entry.addr, entry.vid, entry.is_static, data);
+    }
+    <span class="kw">return</span> 0;
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>get_tag_protocol</code> ve <code>setup</code> zorunludur; diğerleri isteğe bağlı</li>
+      <li><code>port_bridge_join</code> → donanım port gruplamasını etkinleştirir</li>
+      <li><code>port_vlan_add</code>/<code>port_vlan_del</code> VLAN aware mod için gereklidir</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> Device Tree DSA binding</h2>
+  <p class="section-lead">DSA switch'i tanımlamak için cihaz ağacında standart bir bağlama yapısı kullanılır. Bu yapı, CPU portunu, switch portlarını ve bağlı PHY'leri sisteme bildirir.</p>
+
+  <h3>Temel DSA Device Tree yapısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* MAC (CPU port) */</span>
+&amp;gmac0 {
+    status = "okay";
+    phy-mode = "rgmii-id";
+    fixed-link {
+        speed = &lt;1000&gt;;
+        full-duplex;
+    };
+};
+
+<span class="cmt">/* Switch chip — MDIO üzerinden erişim */</span>
+&amp;mdio {
+    switch0: ethernet-switch@0 {
+        compatible = "mediatek,mt7530";
+        reg = &lt;0&gt;;               <span class="cmt">/* MDIO adres */</span>
+        reset-gpios = &lt;&amp;gpio 10 GPIO_ACTIVE_LOW&gt;;
+
+        ports {
+            #address-cells = &lt;1&gt;;
+            #size-cells = &lt;0&gt;;
+
+            <span class="cmt">/* LAN portları */</span>
+            port@0 {
+                reg = &lt;0&gt;;
+                label = "lan1";
+            };
+            port@1 {
+                reg = &lt;1&gt;;
+                label = "lan2";
+            };
+            port@2 {
+                reg = &lt;2&gt;;
+                label = "lan3";
+            };
+            port@3 {
+                reg = &lt;3&gt;;
+                label = "lan4";
+            };
+
+            <span class="cmt">/* WAN portu — ayrı phy */</span>
+            port@4 {
+                reg = &lt;4&gt;;
+                label = "wan";
+            };
+
+            <span class="cmt">/* CPU port — master netdev'e bağlı */</span>
+            port@6 {
+                reg = &lt;6&gt;;
+                ethernet = &lt;&amp;gmac0&gt;;  <span class="cmt">/* CPU netdev */</span>
+                phy-mode = "rgmii-id";
+                fixed-link {
+                    speed = &lt;1000&gt;;
+                    full-duplex;
+                };
+            };
+        };
+    };
+};</code></pre>
+  </div>
+
+  <h3>Dahili PHY'leri olan switch</h3>
+  <p>MT7530 gibi chipset'lerde her porta entegre PHY vardır. Bu durumda cihaz ağacına PHY referansı eklenir:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts</span><span class="dot">●</span></div>
+    <pre><code>port@0 {
+    reg = &lt;0&gt;;
+    label = "lan1";
+    phy-handle = &lt;&amp;switch0phy0&gt;;   <span class="cmt">/* dahili PHY referansı */</span>
+};
+
+<span class="cmt">/* Switch dahili MDIO bus */</span>
+mdio {
+    #address-cells = &lt;1&gt;;
+    #size-cells = &lt;0&gt;;
+
+    switch0phy0: ethernet-phy@0 {
+        reg = &lt;0&gt;;
+    };
+    switch0phy1: ethernet-phy@1 {
+        reg = &lt;1&gt;;
+    };
+    /* ... */
+};</code></pre>
+  </div>
+
+  <h3>Çok-chip (daisy-chain) topoloji</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Switch 0 — CPU'ya bağlı */</span>
+switch0: ethernet-switch@0 {
+    /* ... */
+    ports {
+        port@5 {
+            reg = &lt;5&gt;;
+            label = "dsa";    <span class="cmt">/* cascade port, bir sonraki switch'e */</span>
+            link = &lt;&amp;switch1p0&gt;;
+        };
+        /* CPU port @6 ... */
+    };
+};
+
+<span class="cmt">/* Switch 1 — switch 0'a cascade */</span>
+switch1: ethernet-switch@1 {
+    /* ... */
+    ports {
+        switch1p0: port@0 {
+            reg = &lt;0&gt;;
+            ethernet = &lt;&amp;switch0port5&gt;;
+        };
+        port@1 { reg = &lt;1&gt;; label = "lan5"; };
+        port@2 { reg = &lt;2&gt;; label = "lan6"; };
+    };
+};</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>CPU portu <code>ethernet</code> phandle ile MAC'e bağlanır</li>
+      <li>LAN/WAN portlarına <code>label</code> değeri, netdev ismine dönüşür</li>
+      <li>Dahili PHY'ler switch'in kendi mdio alt düğümünde tanımlanır</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> VLAN aware mod</h2>
+  <p class="section-lead">DSA ile VLAN aware köprüleme, donanım switch içindeki VLAN tablosunu Linux bridge VLAN API'sine bağlar. Tagged/untagged üyelik, PVID ve VID atanması adım adım açıklanmaktadır.</p>
+
+  <h3>VLAN aware bridge oluşturma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># VLAN aware bridge oluştur</span>
+ip link add name br0 type bridge vlan_filtering 1
+ip link set br0 up
+
+<span class="cmt"># Switch portlarını bridge'e ekle</span>
+ip link set lan1 master br0
+ip link set lan2 master br0
+ip link set lan3 master br0
+ip link set wan  master br0
+
+<span class="cmt"># Portları etkinleştir</span>
+ip link set lan1 up
+ip link set lan2 up
+ip link set lan3 up
+ip link set wan  up</code></pre>
+  </div>
+
+  <h3>VLAN üyeliği ayarlama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Mevcut VLAN yapılandırmasını sıfırla (default VID 1'i kaldır)</span>
+bridge vlan del dev lan1 vid 1
+bridge vlan del dev lan2 vid 1
+bridge vlan del dev lan3 vid 1
+
+<span class="cmt"># LAN portlarını VLAN 10'a untagged + PVID olarak ekle</span>
+bridge vlan add dev lan1 vid 10 pvid untagged
+bridge vlan add dev lan2 vid 10 pvid untagged
+bridge vlan add dev lan3 vid 10 pvid untagged
+
+<span class="cmt"># WAN portunu VLAN 20'ye tagged üye yap</span>
+bridge vlan add dev wan vid 20
+
+<span class="cmt"># CPU portunu (br0) her iki VLAN'a ekle</span>
+bridge vlan add dev br0 vid 10 self
+bridge vlan add dev br0 vid 20 self
+
+<span class="cmt"># Yapılandırmayı doğrula</span>
+bridge vlan show</code></pre>
+  </div>
+
+  <h3>Donanım offload doğrulama</h3>
+  <p>DSA VLAN offload gerçekleştiğinde <code>bridge vlan show</code> çıktısında <code>offloaded</code> bayrağı görünür:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Örnek çıktı</span>
+bridge vlan show
+port    vlan ids
+lan1     10 PVID Egress Untagged offloaded
+lan2     10 PVID Egress Untagged offloaded
+lan3     10 PVID Egress Untagged offloaded
+wan      20 offloaded
+br0      10
+         20</code></pre>
+  </div>
+
+  <h3>VLAN ve FDB ilişkisi</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">PVID (Port VLAN ID)</span><span class="desc">Etiketlenmemiş gelen pakete atanan VLAN kimliği; genellikle erişim (access) portu için</span></div>
+    <div class="param"><span class="name">Egress Untagged</span><span class="desc">Bu VLAN paketleri çıkarken etiket soyulur; erişim portlarında zorunlu</span></div>
+    <div class="param"><span class="name">Tagged üyelik</span><span class="desc">Paket VLAN etiketi ile iletilir; trunk portlarında kullanılır</span></div>
+    <div class="param"><span class="name">VID 0</span><span class="desc">VLAN-unaware mode'da kullanılan VID; donanımda özel anlam taşır</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>vlan_filtering 1</code> ile bridge oluşturulmalı — aksi hâlde VLAN göz ardı edilir</li>
+      <li><code>bridge vlan add dev PORT vid VID pvid untagged</code> → erişim portu yapılandırması</li>
+      <li>Donanım offload gerçekleşmişse <code>bridge vlan show</code> çıktısında <code>offloaded</code> görünür</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> STP ve bridge entegrasyonu</h2>
+  <p class="section-lead">DSA slave portları standart Linux bridge ile birlikte kullanıldığında, STP (Spanning Tree Protocol) ve RSTP protokolleri donanıma offload edilebilir.</p>
+
+  <h3>STP durumları ve DSA</h3>
+  <p>Linux bridge STP'yi etkinleştirdiğinde, her port BLOCKING → LISTENING → LEARNING → FORWARDING geçişini yapar. DSA sürücüsü bu durumları switch donanımına yansıtmak için <code>port_stp_state_set</code> callback'ini uygular.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code><span class="kw">static void</span> myswitch_port_stp_state_set(<span class="kw">struct</span> dsa_switch *ds, <span class="kw">int</span> port,
+                                          u8 state)
+{
+    u16 hw_state;
+
+    <span class="kw">switch</span> (state) {
+    <span class="kw">case</span> BR_STATE_DISABLED:
+    <span class="kw">case</span> BR_STATE_BLOCKING:
+        hw_state = MY_PORT_STATE_BLOCKING;
+        <span class="kw">break</span>;
+    <span class="kw">case</span> BR_STATE_LISTENING:
+        hw_state = MY_PORT_STATE_LISTENING;
+        <span class="kw">break</span>;
+    <span class="kw">case</span> BR_STATE_LEARNING:
+        hw_state = MY_PORT_STATE_LEARNING;
+        <span class="kw">break</span>;
+    <span class="kw">case</span> BR_STATE_FORWARDING:
+    <span class="kw">default</span>:
+        hw_state = MY_PORT_STATE_FORWARDING;
+        <span class="kw">break</span>;
+    }
+
+    myswitch_write_port_state(ds, port, hw_state);
+}</code></pre>
+  </div>
+
+  <h3>Kullanıcı alanında STP etkinleştirme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># STP ile bridge oluştur</span>
+ip link add name br0 type bridge vlan_filtering 1 stp_state 1
+ip link set br0 up
+
+<span class="cmt"># STP öncelik ayarı (root bridge için düşük değer)</span>
+ip link set br0 type bridge priority 4096
+
+<span class="cmt"># Port path cost</span>
+ip link set lan1 type bridge_slave cost 4
+
+<span class="cmt"># STP durumunu görüntüle</span>
+ip -d link show br0
+bridge link show
+
+<span class="cmt"># Per-port STP durumu</span>
+bridge link show dev lan1</code></pre>
+  </div>
+
+  <h3>RSTP — 802.1w desteği</h3>
+  <p>Daha hızlı yakınsama için RSTP, mstpd arka plan süreci ile kullanılır. mstpd, bridge'e doğrudan STP durumlarını NETLINK üzerinden yazar:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># mstpd'yi kur ve başlat</span>
+apt-get install mstpd    <span class="cmt"># veya Yocto'da IMAGE_INSTALL += "mstpd"</span>
+mstpd
+
+<span class="cmt"># Bridge'i RSTP moduna al</span>
+mstpctl setforcevers br0 rstp
+
+<span class="cmt"># RSTP durumunu izle</span>
+mstpctl showbridge br0
+mstpctl showport br0 lan1</code></pre>
+  </div>
+
+  <h3>Multicast — MDB offload</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Multicast snooping etkinleştir</span>
+ip link set br0 type bridge mcast_snooping 1
+ip link set br0 type bridge mcast_querier 1
+
+<span class="cmt"># MDB (Multicast Database) izle</span>
+bridge mdb show dev br0
+
+<span class="cmt"># Statik MDB girdisi ekle</span>
+bridge mdb add dev br0 port lan1 grp 239.255.0.1 permanent vid 10</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>port_stp_state_set</code> callback STP durumlarını donanıma yansıtır</li>
+      <li>mstpd ile RSTP yakınsama süresi STP'ye göre çok daha kısadır</li>
+      <li>Multicast snooping MDB callback'leriyle donanıma offload edilebilir</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> Port mirroring ve trafik izleme</h2>
+  <p class="section-lead">DSA çerçevesi, switch donanımının port mirroring özelliğini <code>tc mirred</code> eylemi ve <code>port_mirror_add</code> callback'i aracılığıyla kullanıcı alanına sunar.</p>
+
+  <h3>Donanım port mirroring callback</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Kaynak portu hedef porta yansıt */</span>
+<span class="kw">static int</span> myswitch_port_mirror_add(<span class="kw">struct</span> dsa_switch *ds, <span class="kw">int</span> port,
+                                     <span class="kw">struct</span> dsa_mall_mirror_tc_entry *mirror,
+                                     <span class="kw">bool</span> ingress,
+                                     <span class="kw">struct</span> netlink_ext_ack *extack)
+{
+    <span class="kw">int</span> monitor_port = mirror-&gt;to_local_port;
+
+    <span class="kw">if</span> (ingress)
+        myswitch_set_ingress_mirror(ds, port, monitor_port);
+    <span class="kw">else</span>
+        myswitch_set_egress_mirror(ds, port, monitor_port);
+
+    <span class="kw">return</span> 0;
+}
+
+<span class="kw">static void</span> myswitch_port_mirror_del(<span class="kw">struct</span> dsa_switch *ds, <span class="kw">int</span> port,
+                                      <span class="kw">struct</span> dsa_mall_mirror_tc_entry *mirror)
+{
+    myswitch_clear_mirror(ds, port);
+}</code></pre>
+  </div>
+
+  <h3>tc ile port mirroring kullanımı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># lan1 ingress trafiğini lan3'e yansıt (analiz için)</span>
+tc qdisc add dev lan1 handle ffff: ingress
+
+tc filter add dev lan1 parent ffff: \
+    protocol all u32 match u32 0 0 \
+    action mirred egress mirror dev lan3
+
+<span class="cmt"># Egress mirroring</span>
+tc qdisc add dev lan1 handle 1: root prio
+tc filter add dev lan1 parent 1: \
+    protocol all u32 match u32 0 0 \
+    action mirred egress mirror dev lan3
+
+<span class="cmt"># Mirroring kaldır</span>
+tc qdisc del dev lan1 handle ffff: ingress
+
+<span class="cmt"># Aktif tc filter'ları listele</span>
+tc filter show dev lan1 ingress</code></pre>
+  </div>
+
+  <h3>tcpdump ile analiz</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Yansıma portunda trafik yakala</span>
+tcpdump -i lan3 -n -e -v
+
+<span class="cmt"># Sadece belirli protokol</span>
+tcpdump -i lan3 arp or icmp
+
+<span class="cmt"># Dosyaya kaydet, Wireshark ile analiz</span>
+tcpdump -i lan3 -w /tmp/capture.pcap</code></pre>
+  </div>
+
+  <h3>devlink health reporter</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Switch devlink aygıtını bul</span>
+devlink dev show
+
+<span class="cmt"># Port istatistikleri</span>
+devlink port show
+
+<span class="cmt"># Health reporter listesi</span>
+devlink health show</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>port_mirror_add</code>/<code>port_mirror_del</code> callback'leri donanım yansıtma yönetir</li>
+      <li>Kullanıcı alanında <code>tc mirred egress mirror</code> ile yapılandırılır</li>
+      <li>Yansıtma portuna bağlı tcpdump ile gerçek zamanlı analiz yapılabilir</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> mv88e6xxx ve MT7530 gerçek dünya yapılandırması</h2>
+  <p class="section-lead">Marvell 88E6xxx serisi ve MediaTek MT7530, açık kaynak DSA sürücüleriyle en geniş destek bulan switch ailesidir. Bu bölümde gerçek ürün yapılandırma örnekleri verilmektedir.</p>
+
+  <h3>Marvell 88E6xxx — OpenWrt tipik konfigürasyon</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Marvell 88E6176 — 7 portlu Gigabit switch */</span>
+&amp;mdio {
+    switch0: ethernet-switch@0 {
+        compatible = "marvell,mv88e6085";
+        reg = &lt;0&gt;;
+
+        reset-gpios = &lt;&amp;gpio0 6 GPIO_ACTIVE_LOW&gt;;
+        reset-assert-us = &lt;10000&gt;;
+        reset-deassert-us = &lt;10000&gt;;
+
+        dsa,member = &lt;0 0&gt;;    <span class="cmt">/* çok-chip: 0. ağaç, 0. switch */</span>
+
+        ports {
+            #address-cells = &lt;1&gt;;
+            #size-cells = &lt;0&gt;;
+
+            port@0 { reg = &lt;0&gt;; label = "lan1"; };
+            port@1 { reg = &lt;1&gt;; label = "lan2"; };
+            port@2 { reg = &lt;2&gt;; label = "lan3"; };
+            port@3 { reg = &lt;3&gt;; label = "lan4"; };
+            port@4 { reg = &lt;4&gt;; label = "wan"; };
+            port@5 {
+                reg = &lt;5&gt;;
+                label = "cpu";
+                ethernet = &lt;&amp;gmac0&gt;;
+                phy-mode = "rgmii-id";
+                fixed-link {
+                    speed = &lt;1000&gt;;
+                    full-duplex;
+                };
+            };
+        };
+    };
+};</code></pre>
+  </div>
+
+  <h3>MediaTek MT7530 — çok yaygın kullanım</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* MT7530 — bağımsız switch (MT7621 SoC entegre değil) */</span>
+&amp;mdio0 {
+    switch@1f {
+        compatible = "mediatek,mt7530";
+        reg = &lt;0x1f&gt;;     <span class="cmt">/* MT7530 MDIO adresi sabit 0x1f */</span>
+
+        reset-gpios = &lt;&amp;gpio 2 GPIO_ACTIVE_LOW&gt;;
+
+        ports {
+            #address-cells = &lt;1&gt;;
+            #size-cells = &lt;0&gt;;
+
+            port@0 { reg = &lt;0&gt;; label = "lan1"; };
+            port@1 { reg = &lt;1&gt;; label = "lan2"; };
+            port@2 { reg = &lt;2&gt;; label = "lan3"; };
+            port@3 { reg = &lt;3&gt;; label = "lan4"; };
+            port@4 { reg = &lt;4&gt;; label = "wan"; };
+
+            <span class="cmt">/* CPU port — RGMII, genellikle port 6 */</span>
+            port@6 {
+                reg = &lt;6&gt;;
+                ethernet = &lt;&amp;eth0&gt;;
+                phy-mode = "rgmii";
+                fixed-link {
+                    speed = &lt;1000&gt;;
+                    full-duplex;
+                    pause;
+                };
+            };
+        };
+    };
+};</code></pre>
+  </div>
+
+  <h3>Realtek RTL8370 — SPI erişimli switch</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* RTL8370 SPI ile bağlı */</span>
+&amp;spi0 {
+    switch@0 {
+        compatible = "realtek,rtl8370b";
+        reg = &lt;0&gt;;
+        spi-max-frequency = &lt;1000000&gt;;
+
+        ports {
+            #address-cells = &lt;1&gt;;
+            #size-cells = &lt;0&gt;;
+
+            port@0 { reg = &lt;0&gt;; label = "lan1"; };
+            port@1 { reg = &lt;1&gt;; label = "lan2"; };
+            port@2 { reg = &lt;2&gt;; label = "lan3"; };
+            port@3 { reg = &lt;3&gt;; label = "lan4"; };
+            port@4 { reg = &lt;4&gt;; label = "wan"; };
+            port@9 {
+                reg = &lt;9&gt;;    <span class="cmt">/* RTL837x CPU port */</span>
+                ethernet = &lt;&amp;gmac0&gt;;
+                phy-mode = "rgmii";
+                fixed-link { speed = &lt;1000&gt;; full-duplex; };
+            };
+        };
+    };
+};</code></pre>
+  </div>
+
+  <h3>Sürücü yapılandırma seçenekleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Kconfig seçeneği</th><th>Sürücü</th><th>Chipset</th></tr></thead>
+      <tbody>
+        <tr><td>CONFIG_NET_DSA_MV88E6XXX</td><td>mv88e6xxx</td><td>Marvell 88E6xxx ailesi</td></tr>
+        <tr><td>CONFIG_NET_DSA_MT7530</td><td>mt7530</td><td>MediaTek MT7530, MT7531, MT7621 entegre</td></tr>
+        <tr><td>CONFIG_NET_DSA_REALTEK</td><td>realtek-smi/mdio</td><td>Realtek RTL8366, RTL8370, RTL838x</td></tr>
+        <tr><td>CONFIG_NET_DSA_SJA1105</td><td>sja1105</td><td>NXP SJA1105 (automotive)</td></tr>
+        <tr><td>CONFIG_NET_DSA_MICROCHIP_KSZ</td><td>ksz</td><td>Microchip KSZ8xxx, KSZ9xxx</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>mv88e6xxx: <code>marvell,mv88e6085</code> compatible — tüm 88E6xxx ailesi için</li>
+      <li>MT7530 MDIO adresi 0x1f'ye sabitlenmiştir, reset GPIO zorunludur</li>
+      <li>RTL8370 SPI üzerinden erişilir; sürücü <code>CONFIG_NET_DSA_REALTEK</code> ile etkinleşir</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Hata ayıklama</h2>
+  <p class="section-lead">DSA sorunlarını teşhis etmek için devlink, ethtool, bridge araçları ve kernel debugfs birlikte kullanılır.</p>
+
+  <h3>devlink ile switch bilgisi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Sistemdeki switch aygıtları</span>
+devlink dev show
+
+<span class="cmt"># Switch portlarını listele</span>
+devlink port show
+
+<span class="cmt"># Belirli port bilgisi</span>
+devlink port show pci/0000:00:00.0/1
+
+<span class="cmt"># Switch bilgi (chip türü, firmware)</span>
+devlink dev info pci/0000:00:00.0
+
+<span class="cmt"># Donanım istatistikleri</span>
+devlink port show -s pci/0000:00:00.0</code></pre>
+  </div>
+
+  <h3>ethtool ile PHY istatistikleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Switch slave port istatistikleri</span>
+ethtool -S lan1
+
+<span class="cmt"># Örnek çıktı:</span>
+<span class="cmt">#  rx_packets: 1234</span>
+<span class="cmt">#  tx_packets: 987</span>
+<span class="cmt">#  rx_errors: 0</span>
+<span class="cmt">#  tx_errors: 0</span>
+<span class="cmt">#  rx_crc_errors: 0</span>
+
+<span class="cmt"># PHY istatistikleri (dahili PHY'ler)</span>
+ethtool --phy-statistics lan1
+
+<span class="cmt"># Link durumu</span>
+ethtool lan1</code></pre>
+  </div>
+
+  <h3>bridge araçları ile FDB ve VLAN denetimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Forwarding Database — öğrenilmiş MAC adresleri</span>
+bridge fdb show dev lan1
+bridge fdb show br br0
+
+<span class="cmt"># Tüm arayüzlerdeki FDB</span>
+bridge fdb show
+
+<span class="cmt"># VLAN üyeliği</span>
+bridge vlan show
+
+<span class="cmt"># MDB (multicast database)</span>
+bridge mdb show dev br0
+
+<span class="cmt"># Port bağlantı bilgisi</span>
+bridge link show</code></pre>
+  </div>
+
+  <h3>Kernel log ve dynamic debug</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># DSA ve switch sürücüsü log</span>
+dmesg | grep -iE "dsa|mv88e6|mt7530|rtl|switch"
+
+<span class="cmt"># Verbose log etkinleştir</span>
+echo "module dsa_core +p" &gt; /sys/kernel/debug/dynamic_debug/control
+echo "module mv88e6xxx +p" &gt; /sys/kernel/debug/dynamic_debug/control
+echo "module mt7530 +p" &gt; /sys/kernel/debug/dynamic_debug/control
+
+<span class="cmt"># DSA notifier trace (gelişmiş)</span>
+echo 1 &gt; /sys/kernel/debug/tracing/events/net/enable</code></pre>
+  </div>
+
+  <h3>Yaygın sorunlar</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Belirti</th><th>Olası Neden</th><th>Çözüm</th></tr></thead>
+      <tbody>
+        <tr><td>Slave netdev'ler görünmüyor</td><td>DSA sürücüsü yüklenmemiş veya DT binding hatası</td><td>dmesg'de DSA hatalarını kontrol et, CONFIG_NET_DSA etkin mi?</td></tr>
+        <tr><td>Portlar arası trafik yok</td><td>Bridge kurulmamış veya VLAN yapılandırma hatası</td><td>bridge fdb show, bridge vlan show çıktılarını kontrol et</td></tr>
+        <tr><td>offloaded bayrağı görünmüyor</td><td>port_vlan_add callback uygulanmamış</td><td>Sürücü dsa_switch_ops'ta bu callback'i sağlamalı</td></tr>
+        <tr><td>CPU port üzerinden trafik geçmiyor</td><td>DSA etiketi protokol uyumsuzluğu</td><td>get_tag_protocol doğru protokolü döndürmeli</td></tr>
+        <tr><td>Reset sonrası switch kayboldu</td><td>reset-deassert-us çok kısa</td><td>DT'de reset zamanlama değerlerini artır</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>devlink dev info</code> switch yonga bilgisi ve firmware versiyonu verir</li>
+      <li><code>bridge fdb show</code> öğrenilmiş MAC adreslerini; <code>bridge vlan show</code> VLAN üyeliğini gösterir</li>
+      <li>dynamic_debug ile dsa_core ve chip sürücülerinde ayrıntılı log alınabilir</li>
+    </ul>
+  </div>
+</section>
+
+</main>

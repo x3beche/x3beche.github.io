@@ -1,0 +1,807 @@
+---
+layout: tutorial
+title: "IOMMU / SMMU — DMA İzolasyonu ve Bellek Koruması"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>BELLEK KORUMASI</span>
+    <span>2026</span>
+  </div>
+  <h1>IOMMU / SMMU<br><em>DMA İzolasyonu ve Bellek Koruması</em></h1>
+  <p class="subtitle">ARM SMMUv2/v3 ile DMA izolasyonu, IOMMU grubu yönetimi, VFIO temelleri ve gömülü güvenli sistem tasarımı.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">IOMMU neden gerekli — tehdit modeli</a></li>
+    <li><a href="#s1">ARM SMMU mimarisi — SMMUv2 ve SMMUv3</a></li>
+    <li><a href="#s2">Linux IOMMU çerçevesi</a></li>
+    <li><a href="#s3">Device Tree ile SMMU yapılandırması</a></li>
+    <li><a href="#s4">IOMMU domain tipleri</a></li>
+    <li><a href="#s5">DMA güvenli tahsis ve IOMMU eşleme</a></li>
+    <li><a href="#s6">VFIO ve SMMU — cihaz geçişi</a></li>
+    <li><a href="#s7">Hata ayıklama ve context fault analizi</a></li>
+    <li><a href="#s8">Gömülü güvenlik tasarımı</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> IOMMU neden gerekli — tehdit modeli</h2>
+  <p class="section-lead">DMA (Direct Memory Access) yetenekli her cihaz, teorik olarak tüm fiziksel belleğe yazabilir. IOMMU bu yetkiyi sınırlandırarak sistem güvenliğinin temel katmanlarından birini oluşturur.</p>
+
+  <h3>DMA Saldırı Yüzeyi</h3>
+  <p>DMA mekanizması, cihazların CPU'yu devre dışı bırakarak belleğe doğrudan erişmesini sağlar. Bu özellik performans için zorunludur; ancak kötü niyetli veya hatalı bir cihaz, DMA üzerinden aşağıdaki saldırıları gerçekleştirebilir:</p>
+
+  <div class="params">
+    <div class="param">
+      <span class="name">Rastgele Bellek Okuma</span>
+      <span class="desc">Cihaz, ayrılan DMA tampon dışındaki adresleri okuyarak kernel veri yapılarına, şifreleme anahtarlarına veya diğer süreçlerin belleğine erişebilir.</span>
+    </div>
+    <div class="param">
+      <span class="name">Rastgele Bellek Yazma</span>
+      <span class="desc">Cihaz, sayfa tablolarını veya kernel kodunu yazarak ayrıcalık yükseltme (privilege escalation) saldırısı gerçekleştirebilir.</span>
+    </div>
+    <div class="param">
+      <span name="name">PCIe Thunderbolt Saldırısı</span>
+      <span class="desc">Fiziksel erişime sahip saldırgan, Thunderbolt veya ExpressCard üzerinden kötü niyetli donanım bağlayarak sistemi ele geçirebilir. IOMMU olmayan sistemlerde bu saldırı saniyeler içinde gerçekleşebilir.</span>
+    </div>
+    <div class="param">
+      <span class="name">AXI Bus Güvenlik Açıkları</span>
+      <span class="desc">ARM SoC'larda AXI fabric üzerindeki bir IP bloğunun ele geçirilmesi, SMMU yoksa tüm bellek haritasına erişim sağlar. Gömülü güvenlik uygulamaları için kritik bir tehdit vektörüdür.</span>
+    </div>
+  </div>
+
+  <h3>IOMMU Nasıl Korur?</h3>
+  <p>IOMMU (Input-Output Memory Management Unit), CPU'nun MMU'sunun (Memory Management Unit) I/O cihazları için olan karşılığıdır. Her cihazın erişebildiği bellek aralığını tanımlayan bir sayfa tablosu tutar. Cihaz, eşlenmemiş bir adrese erişmeye çalışırsa IOMMU işlemi engeller ve bir hata (fault) üretir.</p>
+
+  <div class="flow">
+    <pre>
+Cihaz (DMA Master)
+    |
+    | bus adresi (IOVA)
+    v
+ IOMMU / SMMU
+    |--- Adres eşleme tablosuna bak ---+
+    |                                  |
+    | İzin Var                         | İzin Yok
+    v                                  v
+Fiziksel Bellek             Context Fault (IRQ) -&gt; Kernel Handler
+(erişim gerçekleşir)        (erişim engellendi, hata raporu)</pre>
+  </div>
+
+  <h3>IOVA ve Fiziksel Adres Farkı</h3>
+  <p>Cihaz, fiziksel adresleri değil <strong>IOVA (I/O Virtual Address)</strong> kullanır. IOMMU bu IOVA'ları fiziksel adreslere çevirir. Böylece aynı fiziksel adresin farklı cihazlara farklı IOVA'larla görünmesi mümkündür; bu da izolasyonun temelidir.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Senaryo</th><th>IOMMU Yok</th><th>IOMMU Var</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Cihaz DMA adresi</td><td>Fiziksel adres</td><td>IOVA (sanal)</td></tr>
+        <tr><td>Bellek erişim sınırı</td><td>Tüm fiziksel bellek</td><td>Eşlenmiş bölgeler</td></tr>
+        <tr><td>Saldırı yüzeyi</td><td>Tüm bellek</td><td>Sadece izin verilen aralık</td></tr>
+        <tr><td>Hata tespiti</td><td>Yok (sessiz bozulma)</td><td>Context fault + IRQ</td></tr>
+        <tr><td>VM geçişi (VFIO)</td><td>Mümkün değil (güvensiz)</td><td>Mümkün (izole edilmiş)</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> ARM SMMU mimarisi — SMMUv2 ve SMMUv3</h2>
+  <p class="section-lead">ARM'ın SMMU (System Memory Management Unit) standardı, IOMMU işlevini ARM SoC'ları için tanımlar. SMMUv2 ve SMMUv3 arasında mimari açıdan önemli farklılıklar bulunur.</p>
+
+  <h3>SMMUv2 Mimarisi</h3>
+  <p>SMMUv2 (ARM IHI 0062), Cortex-A53/A57 nesli SoC'larda yaygın kullanılan ilk büyük SMMU revizyonudur. StreamID tabanlı cihaz kimliği kullanır ve iki aşamalı adres çevirisi destekler.</p>
+
+  <div class="params">
+    <div class="param">
+      <span class="name">StreamID</span>
+      <span class="desc">Her cihazın benzersiz kimliği. PCIe'de BDF (Bus:Device:Function) kodundan, AMBA AXI fabric'te ise bus master ID'den türetilir. Aynı SMMU'ya bağlı farklı cihazlar farklı StreamID'ye sahiptir.</span>
+    </div>
+    <div class="param">
+      <span class="name">Stream Match Register (SMR)</span>
+      <span class="desc">StreamID'yi bir Context Bank'a eşleyen kayıt. Maske destekler; bir SMR birden fazla StreamID'yi aynı context'e yönlendirebilir.</span>
+    </div>
+    <div class="param">
+      <span class="name">Context Bank</span>
+      <span class="desc">Her izolasyon domaininin ayrı sayfa tablosu ve TTBR (Translation Table Base Register) bulunur. SMMUv2'de maksimum 128 context bank desteği.</span>
+    </div>
+    <div class="param">
+      <span class="name">Stage-1 Çevirisi</span>
+      <span class="desc">IOVA'dan IPA'ya (Intermediate Physical Address) çeviri. Genellikle OS tarafından yönetilir.</span>
+    </div>
+    <div class="param">
+      <span class="name">Stage-2 Çevirisi</span>
+      <span class="desc">IPA'dan PA'ya (Physical Address) çeviri. Hypervisor (EL2) tarafından yönetilir. Sanallaştırma senaryolarında kullanılır.</span>
+    </div>
+  </div>
+
+  <h3>SMMUv3 Mimarisi</h3>
+  <p>SMMUv3 (ARM IHI 0070), Cortex-A55/A76 nesli ile birlikte gelir. Komut kuyruğu tabanlı (command queue) bir arayüzle önceki sürümden temelden farklılaşır ve ölçeklenebilirliği büyük ölçüde artırır.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Özellik</th><th>SMMUv2</th><th>SMMUv3</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Cihaz kimliği</td><td>StreamID (16 bit)</td><td>StreamID (32 bit) + SubstreamID (20 bit)</td></tr>
+        <tr><td>Context erişimi</td><td>Doğrudan register yazma</td><td>Komut kuyruğu (CMD_QUEUE)</td></tr>
+        <tr><td>Hata raporlama</td><td>Global fault register</td><td>Olay kuyruğu (EVENT_QUEUE)</td></tr>
+        <tr><td>TLB geçersizleştirme</td><td>Senkron, global</td><td>Asenkron, granüler (TLBI_NH_ASID vb.)</td></tr>
+        <tr><td>Sayfa boyutu desteği</td><td>4KB, 64KB</td><td>4KB, 16KB, 64KB, 1GB süper-sayfa</td></tr>
+        <tr><td>PCIe ATS</td><td>Yok</td><td>Var (Address Translation Services)</td></tr>
+        <tr><td>PRI (Page Request Interface)</td><td>Yok</td><td>Var</td></tr>
+        <tr><td>SVA (Shared Virtual Addressing)</td><td>Yok</td><td>Var (PasID ile)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>İki Aşamalı Çeviri Akışı</h3>
+  <div class="flow">
+    <pre>
+Cihaz DMA talebi (IOVA)
+    |
+    v
+SMMU Stage-1 (OS kontrolünde)
+  IOVA --[STE/CD tablosu]--&gt; IPA
+    |
+    v
+SMMU Stage-2 (Hypervisor kontrolünde)
+  IPA  --[S2 sayfa tablosu]--&gt; PA
+    |
+    v
+Fiziksel bellek erişimi</pre>
+  </div>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> Linux IOMMU çerçevesi</h2>
+  <p class="section-lead">Linux kernel, farklı IOMMU donanımlarını (ARM SMMU, Intel VT-d, AMD-Vi) tek bir soyut arayüz altında toplar. Bu arayüz sürücü geliştiricilerine donanımdan bağımsız bir API sunar.</p>
+
+  <h3>Temel Veri Yapıları</h3>
+  <pre><code>/* IOMMU domain — bir izolasyon alanı */
+struct iommu_domain {
+    unsigned type;        /* IOMMU_DOMAIN_DMA, IDENTITY, UNMANAGED */
+    const struct iommu_ops *ops;  /* Donanıma özgü işlemler */
+    unsigned long pgsize_bitmap;  /* Desteklenen sayfa boyutları */
+    iommu_fault_handler_t handler; /* Context fault handler */
+    void *handler_token;
+    struct iommu_domain_geometry geometry; /* IOVA aralığı */
+    struct iommu_dma_cookie *iova_cookie;  /* IOVA havuzu */
+};
+
+/* IOMMU grubu — aynı domaine bağlı cihaz kümesi */
+struct iommu_group {
+    struct kobject kobj;
+    struct kobject *devices_kobj;
+    struct list_head devices;        /* Gruptaki cihazlar */
+    struct mutex mutex;
+    struct blocking_notifier_head notifier;
+    void *iommu_data;
+    void (*iommu_data_release)(void *iommu_data);
+    char *name;
+    int id;
+    struct iommu_domain *default_domain; /* Varsayılan domain */
+    struct iommu_domain *blocking_domain;
+};</code></pre>
+
+  <h3>iommu_ops Arayüzü</h3>
+  <p>Her IOMMU sürücüsü <code>iommu_ops</code> yapısını uygular. Bu yapı, sayfa tablosu yönetiminden TLB geçersizleştirmeye kadar tüm donanım işlemlerini tanımlar:</p>
+  <pre><code>struct iommu_ops {
+    bool (*capable)(struct device *dev, enum iommu_cap);
+    struct iommu_domain *(*domain_alloc)(unsigned iommu_domain_type);
+    void (*domain_free)(struct iommu_domain *);
+    int (*attach_dev)(struct iommu_domain *, struct device *);
+    void (*detach_dev)(struct iommu_domain *, struct device *);
+    int (*map)(struct iommu_domain *, unsigned long iova,
+               phys_addr_t paddr, size_t size, int prot, gfp_t gfp);
+    size_t (*unmap)(struct iommu_domain *, unsigned long iova,
+                    size_t size, struct iommu_iotlb_gather *);
+    phys_addr_t (*iova_to_phys)(struct iommu_domain *, dma_addr_t iova);
+    struct iommu_group *(*device_group)(struct device *);
+    void (*get_resv_regions)(struct device *, struct list_head *);
+    int (*of_xlate)(struct device *, struct of_phandle_args *);
+    /* ... */
+};</code></pre>
+
+  <h3>DMA-API ile Entegrasyon</h3>
+  <p>Sürücüler genellikle doğrudan IOMMU API'sini çağırmaz; bunun yerine <code>dma_map_single</code>, <code>dma_alloc_coherent</code> gibi DMA-API fonksiyonlarını kullanır. IOMMU, bu fonksiyonların altında şeffaf olarak çalışır:</p>
+  <pre><code>/* IOMMU etkinken DMA-API akışı */
+dma_map_single(dev, cpu_ptr, size, DMA_FROM_DEVICE)
+    |
+    v
+iommu_map(domain, iova, phys, size, IOMMU_READ | IOMMU_WRITE)
+    |
+    v
+ARM SMMU: arm_smmu_map() -&gt; sayfa tablosuna giriş ekle
+    |
+    v
+dma_addr_t (IOVA) sürücüye döner
+    |
+    v
+Sürücü bu adresi donanıma yazar (DMA başlar)</code></pre>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> Device Tree ile SMMU yapılandırması</h2>
+  <p class="section-lead">ARM platformlarında SMMU, Device Tree (DT) aracılığıyla yapılandırılır. Cihaz ile SMMU arasındaki ilişki DT bağlantılarıyla tanımlanır; Linux IOMMU altyapısı bu bağlantıları önyükleme sırasında işler.</p>
+
+  <h3>SMMU Node Tanımı</h3>
+  <pre><code>/* ARM64 DT örneği: SMMUv2 tanımı */
+smmu_0: iommu@fd800000 {
+    compatible = "arm,mmu-500";
+    reg = &lt;&amp;smmu_reg 0 0 0 0x20000&gt;;
+    interrupts = &lt;GIC_SPI 32 IRQ_TYPE_LEVEL_HIGH&gt;,
+                 &lt;GIC_SPI 33 IRQ_TYPE_LEVEL_HIGH&gt;,
+                 &lt;GIC_SPI 34 IRQ_TYPE_LEVEL_HIGH&gt;;
+    interrupt-names = "global-faults", "perf-counters",
+                      "context-faults";
+    #iommu-cells = &lt;1&gt;;     /* 1 = StreamID sayısı */
+    #global-interrupts = &lt;2&gt;;
+
+    /* SMMU'nun bağlı olduğu bellek bölgeleri */
+    dma-ranges;
+};</code></pre>
+
+  <h3>Cihaz SMMU Bağlantısı</h3>
+  <pre><code>/* Ethernet MAC — SMMU'ya StreamID 0x42 ile bağlı */
+ethernet@ff000000 {
+    compatible = "vendor,my-eth";
+    reg = &lt;0xff000000 0x10000&gt;;
+    interrupts = &lt;GIC_SPI 50 IRQ_TYPE_LEVEL_HIGH&gt;;
+    clocks = &lt;&amp;clk_eth&gt;;
+
+    /* SMMU bağlantısı: iommu referansı + StreamID */
+    iommus = &lt;&amp;smmu_0 0x42&gt;;
+
+    /* IOMMU grubu ayrımı için gerekirse */
+    iommu-map = &lt;0x0 &amp;smmu_0 0x42 0x1&gt;;
+};
+
+/* Video DMA — farklı StreamID */
+video_dma@fe000000 {
+    compatible = "vendor,my-vdma";
+    reg = &lt;0xfe000000 0x8000&gt;;
+    iommus = &lt;&amp;smmu_0 0x55&gt;;  /* StreamID 0x55 */
+};</code></pre>
+
+  <h3>SMMUv3 DT Tanımı</h3>
+  <pre><code>/* SMMUv3 (daha yeni platformlar) */
+smmu_1: iommu@09050000 {
+    compatible = "arm,smmu-v3";
+    reg = &lt;0x0 0x09050000 0x0 0x80000&gt;;
+    interrupts = &lt;GIC_SPI 74 IRQ_TYPE_EDGE_RISING&gt;,
+                 &lt;GIC_SPI 75 IRQ_TYPE_EDGE_RISING&gt;,
+                 &lt;GIC_SPI 76 IRQ_TYPE_EDGE_RISING&gt;,
+                 &lt;GIC_SPI 77 IRQ_TYPE_EDGE_RISING&gt;;
+    interrupt-names = "eventq", "priq", "cmdq-sync", "gerror";
+    #iommu-cells = &lt;1&gt;;
+    dma-coherent;      /* Donanım cache coherency desteği */
+    /* StreamID genişliği: 16 bit */
+    arm,sid-bits = &lt;16&gt;;
+};</code></pre>
+
+  <h3>Önyükleme Sırasında DT İşleme</h3>
+  <div class="flow">
+    <pre>
+Kernel onyukleme
+    |
+    v
+of_platform_populate() -- DT node'larini tara
+    |
+    v
+iommu node bulundu (compatible = "arm,mmu-500")
+    -&gt; arm_smmu_probe() cagrılır
+    -&gt; SMMU donanimi baslatilir
+    |
+    v
+Cihaz node'u islenirken "iommus" property bulundu
+    -&gt; of_iommu_xlate() cagrılır
+    -&gt; iommu_group olusturulur veya var olana eklenir
+    |
+    v
+Cihaz surucu probe() cagrildiginda:
+    -&gt; iommu_attach_device() ile domain'e baglanir</pre>
+  </div>
+
+  <h3>İlgili Kernel Parametreleri</h3>
+  <div class="params">
+    <div class="param">
+      <span class="name">iommu.passthrough=1</span>
+      <span class="desc">Tüm cihazlar için IOMMU'yu identity (passthrough) moduna alır. Test ve geliştirme amaçlıdır; üretimde kullanılmamalıdır.</span>
+    </div>
+    <div class="param">
+      <span class="name">iommu.strict=1</span>
+      <span class="desc">TLB geçersizleştirme işlemlerini senkron olarak gerçekleştirir. Performans kaybına yol açar ama güvenli bellek serbest bırakma garantisi verir.</span>
+    </div>
+    <div class="param">
+      <span class="name">arm-smmu.disable_bypass=1</span>
+      <span class="desc">StreamID olmayan cihazların (SMMU'ya bağlanmamış) bypass etmesini engeller. Bu cihazlar sıfır erişim izniyle reddedilir.</span>
+    </div>
+  </div>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> IOMMU domain tipleri</h2>
+  <p class="section-lead">Linux IOMMU çerçevesi birden fazla domain tipi tanımlar. Hangi tipin kullanılacağı, cihazın güvenlik gereksinimlerine ve çalışma moduna göre belirlenir.</p>
+
+  <h3>Domain Tipleri</h3>
+  <div class="params">
+    <div class="param">
+      <span class="name">IOMMU_DOMAIN_DMA</span>
+      <span class="desc">Standart sürücü kullanımı için. DMA-API fonksiyonları bu domain tipiyle çalışır. IOVA tahsisi otomatik olarak yönetilir. Linux'ta varsayılan moddur.</span>
+    </div>
+    <div class="param">
+      <span class="name">IOMMU_DOMAIN_IDENTITY</span>
+      <span class="desc">Passthrough modu: IOVA = PA. Cihaz, fiziksel adresle doğrudan çalışır; IOMMU adres çevirisi yapmaz ama erişim denetimi yapabilir. Eski sürücüler için geçiş modu.</span>
+    </div>
+    <div class="param">
+      <span class="name">IOMMU_DOMAIN_UNMANAGED</span>
+      <span class="desc">Manuel domain yönetimi. Kullanıcı (veya VFIO gibi alt sistem) eşlemeleri elle kontrol eder. VM geçişi ve özel güvenlik senaryoları için kullanılır.</span>
+    </div>
+    <div class="param">
+      <span class="name">IOMMU_DOMAIN_BLOCKED</span>
+      <span class="desc">Tüm erişimler engellenir. Güvenli varsayılan: cihaz bir domain'e eklenmeden önce bu modda kalır.</span>
+    </div>
+  </div>
+
+  <h3>Domain Oluşturma ve Cihaz Bağlama</h3>
+  <pre><code>#include &lt;linux/iommu.h&gt;
+
+/* Yeni bir DMA domain oluştur */
+struct iommu_domain *domain = iommu_domain_alloc(&amp;platform_bus_type);
+if (!domain) {
+    pr_err("IOMMU domain oluşturulamadı\n");
+    return -ENOMEM;
+}
+
+/* Cihazı domain'e bağla */
+int ret = iommu_attach_device(domain, dev);
+if (ret) {
+    pr_err("Cihaz domain'e baglanamadi: %d\n", ret);
+    iommu_domain_free(domain);
+    return ret;
+}
+
+/* Bir bellek bölgesi eşle */
+ret = iommu_map(domain,
+    iova,       /* I/O sanal adres */
+    paddr,      /* Fiziksel adres */
+    size,       /* Boyut (sayfa katı) */
+    IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE,
+    GFP_KERNEL
+);
+
+/* Eşlemeyi kaldır */
+size_t unmapped = iommu_unmap(domain, iova, size);
+
+/* Cihazı ayır */
+iommu_detach_device(domain, dev);
+iommu_domain_free(domain);</code></pre>
+
+  <h3>IOMMU Grup Yönetimi</h3>
+  <p>Bir IOMMU grubu, aynı izolasyon birimine dahil edilen cihazların kümesidir. Genellikle aynı PCIe Root Port veya AXI fabric segment'ini paylaşan cihazlar aynı grupta yer alır. Tüm grup aynı domain'e bağlanmak zorundadır:</p>
+  <pre><code>/* Cihazın grubunu al */
+struct iommu_group *group = iommu_group_get(dev);
+if (!group) {
+    pr_err("Cihazın IOMMU grubu yok\n");
+    return -ENODEV;
+}
+
+/* Gruptaki cihaz sayısı */
+int count = iommu_group_get_iommudata(group);
+
+/* Grup ID'sini öğren */
+int gid = iommu_group_id(group);
+pr_info("Cihaz IOMMU grup %d'de\n", gid);
+
+/* Referansı serbest bırak */
+iommu_group_put(group);
+
+# Kullanıcı alanından grup bilgisi:
+ls /sys/bus/platform/devices/ff000000.ethernet/iommu_group/
+# devices/  type  reserved_regions</code></pre>
+
+  <h3>Domain Ayırma Kontrolü</h3>
+  <pre><code># Bir cihazın hangi domain'e bağlı olduğunu kontrol et:
+cat /sys/bus/platform/devices/ff000000.ethernet/iommu_group/type
+# DMA  (veya identity, unmanaged)
+
+# Tüm IOMMU gruplarını listele:
+ls /sys/kernel/iommu_groups/
+
+# Grup 5'in üyelerini göster:
+ls /sys/kernel/iommu_groups/5/devices/</code></pre>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> DMA güvenli tahsis ve IOMMU eşleme</h2>
+  <p class="section-lead">IOMMU etkin bir sistemde DMA tamponları tahsis ederken ve fiziksel adresleri eşlerken özel dikkat gerektirir. Yanlış kullanım hem güvenlik açığı hem de bellek bozulmasına neden olabilir.</p>
+
+  <h3>dma_alloc_coherent ile Tutarlı Bellek</h3>
+  <p>Tutarlı (coherent) DMA belleği, hem CPU hem cihaz tarafından tutarlı şekilde görülen, önbellek senkronizasyonu gerektirmeyen bir bölgedir. IOMMU etkinken bu belleğin IOVA alanına eşlenmesi otomatik gerçekleşir:</p>
+  <pre><code>#include &lt;linux/dma-mapping.h&gt;
+
+/* 4 KB tutarlı DMA belleği tahsis et */
+dma_addr_t dma_handle;
+void *cpu_addr = dma_alloc_coherent(dev, 4096,
+                                    &amp;dma_handle, GFP_KERNEL);
+if (!cpu_addr) {
+    dev_err(dev, "DMA bellek tahsis hatası\n");
+    return -ENOMEM;
+}
+
+/* cpu_addr: CPU'nun eriştiği sanal adres */
+/* dma_handle: Cihaza yazılacak IOVA değeri */
+
+/* Cihaza IOVA adresini bildir */
+writel((u32)dma_handle, dev_base + DMA_ADDR_REG);
+writel(4096,            dev_base + DMA_LEN_REG);
+writel(DMA_START,       dev_base + DMA_CTRL_REG);
+
+/* DMA tamamlandıktan sonra serbest bırak */
+dma_free_coherent(dev, 4096, cpu_addr, dma_handle);</code></pre>
+
+  <h3>Scatter-Gather ile IOMMU Eşleme</h3>
+  <p>Büyük veya parçalı tamponlar için scatter-gather listesi kullanılır. IOMMU, bu parçaları cihazdan tek parçaymış gibi görünen ardışık bir IOVA aralığına eşleyebilir (IOMMU merging):</p>
+  <pre><code>#include &lt;linux/scatterlist.h&gt;
+
+struct scatterlist sg[4];
+struct page *pages[4];
+int i;
+
+/* Sayfaları tahsis et (bitişik olmak zorunda değil) */
+for (i = 0; i &lt; 4; i++) {
+    pages[i] = alloc_page(GFP_KERNEL);
+    sg_set_page(&amp;sg[i], pages[i], PAGE_SIZE, 0);
+}
+sg_mark_end(&amp;sg[3]);
+
+/* IOMMU üzerinden eşle */
+int nents = dma_map_sg(dev, sg, 4, DMA_FROM_DEVICE);
+if (nents == 0) {
+    dev_err(dev, "SG eşleme başarısız\n");
+    goto free_pages;
+}
+
+/* IOMMU birleştirme sonrası nents, 4'ten az olabilir */
+pr_info("SG: %d giriş, %d eşleme sonrası\n", 4, nents);
+
+for (i = 0; i &lt; nents; i++) {
+    pr_info("  sg[%d]: dma_addr=0x%llx len=%u\n",
+            i, (u64)sg_dma_address(&amp;sg[i]),
+               sg_dma_len(&amp;sg[i]));
+}
+
+/* İşlem sonrası eşlemeyi kaldır */
+dma_unmap_sg(dev, sg, 4, DMA_FROM_DEVICE);</code></pre>
+
+  <h3>iommu_map ve iommu_unmap (Manuel)</h3>
+  <p>VFIO veya özel güvenlik alt sistemleri gibi durumlarda eşlemeleri doğrudan IOMMU API üzerinden yönetmek gerekebilir:</p>
+  <pre><code>/* Manuel eşleme — IOMMU_DOMAIN_UNMANAGED domain için */
+ret = iommu_map(domain,
+    0x40000000UL,    /* IOVA: cihazın göreceği adres */
+    phys_addr,       /* PA: gerçek fiziksel adres */
+    SZ_2M,           /* 2 MB eşle */
+    IOMMU_READ | IOMMU_WRITE | IOMMU_NOEXEC | IOMMU_MMIO,
+    GFP_KERNEL
+);
+
+/* Eşlemeyi doğrula */
+phys_addr_t check = iommu_iova_to_phys(domain, 0x40000000UL);
+pr_info("IOVA 0x40000000 -&gt; PA 0x%llx\n", (u64)check);
+
+/* Eşlemeyi kaldır */
+iommu_unmap(domain, 0x40000000UL, SZ_2M);</code></pre>
+
+  <h3>Streaming vs Coherent DMA Karşılaştırması</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Özellik</th><th>dma_alloc_coherent</th><th>dma_map_single (streaming)</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Önbellek yönetimi</td><td>Otomatik (non-cacheable)</td><td>Açık sync gerektirir</td></tr>
+        <tr><td>Kullanım durumu</td><td>Sürekli erişim, kontrol yapıları</td><td>Tek seferlik veri transferi</td></tr>
+        <tr><td>Bellek verimliliği</td><td>Daha az verimli (non-cached)</td><td>Daha verimli</td></tr>
+        <tr><td>IOMMU eşleme ömrü</td><td>Kalıcı (free'ye kadar)</td><td>Transfer süresi kadar</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> VFIO ve SMMU — cihaz geçişi</h2>
+  <p class="section-lead">VFIO (Virtual Function I/O), kullanıcı alanı sürücülerine ve sanal makinelere gerçek donanım cihazlarını güvenli biçimde geçirmek için IOMMU altyapısını kullanır.</p>
+
+  <h3>VFIO Mimarisi</h3>
+  <p>VFIO üç temel kavram üzerine inşa edilmiştir: container, group ve device. Bu üçlü katmanlı yapı, izolasyon garantisini IOMMU ile sağlar.</p>
+
+  <div class="flow">
+    <pre>
+Kullanici alani (VM / QEMU / uygulama)
+    |
+    | /dev/vfio/vfio (container)
+    v
+VFIO Container
+    |--- IOMMU domain yönetimi
+    |--- IOVA adres alanı kontrol
+    |
+    +--&gt; VFIO Group (/dev/vfio/5)
+         |--- Aynı IOMMU grubundaki cihazlar
+         |
+         +--&gt; VFIO Device (bellek/irq/config erişimi)
+              |--- BAR eşleme (mmap)
+              |--- IRQ yönlendirme (eventfd)
+              |--- Config space erişimi</pre>
+  </div>
+
+  <h3>VFIO ile Cihaz Kullanımı (Kullanıcı Alanı)</h3>
+  <pre><code>#include &lt;linux/vfio.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;fcntl.h&gt;
+
+/* 1. Container aç */
+int container = open("/dev/vfio/vfio", O_RDWR);
+
+/* 2. IOMMU tipi ayarla (TYPE1 = standart Linux IOMMU) */
+ioctl(container, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU);
+
+/* 3. Grubu aç */
+int group = open("/dev/vfio/5", O_RDWR);  /* Grup 5 */
+
+/* 4. Grubu container'a bağla */
+ioctl(group, VFIO_GROUP_SET_CONTAINER, &amp;container);
+
+/* 5. Cihazı al */
+int device = ioctl(group, VFIO_GROUP_GET_DEVICE_FD,
+                   "ff000000.ethernet");
+
+/* 6. Cihaz bilgisini oku */
+struct vfio_device_info dev_info = { .argsz = sizeof(dev_info) };
+ioctl(device, VFIO_DEVICE_GET_INFO, &amp;dev_info);
+
+/* 7. Konuk VM belleğini IOMMU'ya eşle */
+struct vfio_iommu_type1_dma_map dma_map = {
+    .argsz = sizeof(dma_map),
+    .flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
+    .vaddr = (uintptr_t)guest_mem,   /* VM bellek tamponu */
+    .iova  = 0x80000000ULL,          /* IOVA adresi */
+    .size  = guest_mem_size,
+};
+ioctl(container, VFIO_IOMMU_MAP_DMA, &amp;dma_map);</code></pre>
+
+  <h3>VFIO-Platform (Gömülü Sistemler için)</h3>
+  <p>PCIe olmayan gömülü MMIO cihazları için VFIO-Platform sürücüsü kullanılır. Platform cihazını VFIO'ya bağlamak için önce mevcut sürücüyü ayırıp vfio-platform'a bağlamak gerekir:</p>
+  <pre><code># Cihazın mevcut sürücüsünü ayır:
+echo ff000000.ethernet &gt; /sys/bus/platform/drivers/vendor-eth/unbind
+
+# VFIO-platform sürücüsüne bağla:
+echo ff000000.ethernet &gt; /sys/bus/platform/drivers/vfio-platform/bind
+
+# IOMMU grubunu kontrol et:
+ls /sys/bus/platform/devices/ff000000.ethernet/iommu_group/devices/
+# Yalnızca tek cihaz varsa güvenli geçiş yapılabilir
+
+# /dev/vfio/ altında grup dosyasının oluştuğunu doğrula:
+ls /dev/vfio/</code></pre>
+
+  <h3>QEMU ile VFIO Cihaz Geçişi</h3>
+  <pre><code># QEMU komut satırı — ARM64 VM'e ethernet cihazı geçişi:
+qemu-system-aarch64 \
+    -M virt \
+    -cpu cortex-a57 \
+    -m 512M \
+    -kernel Image \
+    -device vfio-platform,host=ff000000.ethernet \
+    -nographic
+
+# VM içindeki sürücü cihazı doğrudan donanıma erişir
+# SMMU, VM bellek eşlemesini korur</code></pre>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> Hata ayıklama ve context fault analizi</h2>
+  <p class="section-lead">IOMMU hataları, sürücü geliştirmede karşılaşılan en yaygın ve yanıltıcı sorunlardan biridir. Hata mesajlarını doğru yorumlamak ve debug altyapısını etkin kullanmak gereklidir.</p>
+
+  <h3>CONFIG_IOMMU_DEBUG</h3>
+  <pre><code># Derleme zamanı debug seçenekleri:
+CONFIG_IOMMU_DEBUG=y
+CONFIG_IOMMU_DEFAULT_DMA_STRICT=y  # Senkron TLB geçersizleştirme
+CONFIG_ARM_SMMU_DEBUG=y            # ARM SMMU özel debug
+CONFIG_IOVA_STATISTICS=y           # IOVA istatistikleri
+
+# Çalışma zamanı debug etkinleştirme (kernel parametresi):
+iommu.debug=1
+
+# DebugFS üzerinden IOMMU durumu:
+mount -t debugfs none /sys/kernel/debug
+ls /sys/kernel/debug/iommu/</code></pre>
+
+  <h3>Context Fault Handler</h3>
+  <p>SMMU, yetkisiz bir bellek erişimi tespit ettiğinde bir context fault IRQ üretir. Linux bu IRQ'yu yakalar ve kernel log'una ayrıntılı bilgi yazar:</p>
+  <pre><code>/* Kernel log'da context fault örneği */
+/* arm-smmu 09050000.iommu: Unhandled context fault:
+ *   iova=0x40100000, fsr=0x402 (TF|PF), fsynr=0x1, cb=2
+ *   iova: Erişilmeye çalışılan IOVA adresi
+ *   fsr:  Fault Status Register
+ *   TF:   Translation Fault (eşleme yok)
+ *   PF:   Permission Fault (izin yok, eşleme var)
+ *   cb:   Context Bank numarası (hangi cihaz/domain)
+ */</code></pre>
+
+  <h3>Özel Fault Handler Kaydı</h3>
+  <pre><code>/* Sürücü içinde özel fault handler */
+static int my_iommu_fault(struct iommu_domain *domain,
+                          struct device *dev,
+                          unsigned long iova,
+                          int flags, void *token)
+{
+    dev_err(dev, "IOMMU fault: iova=0x%lx flags=0x%x\n",
+            iova, flags);
+
+    if (flags &amp; IOMMU_FAULT_READ)
+        dev_err(dev, "  Okuma hatasi\n");
+    if (flags &amp; IOMMU_FAULT_WRITE)
+        dev_err(dev, "  Yazma hatasi\n");
+
+    /* -ENOSYS: fault'u işlemedik, default handler devam eder */
+    /* 0: fault işlendi */
+    return -ENOSYS;
+}
+
+/* Domain oluşturulduktan sonra handler'ı kaydet: */
+iommu_set_fault_handler(domain, my_iommu_fault, dev);</code></pre>
+
+  <h3>/sys/kernel/debug/iommu/ Analizi</h3>
+  <pre><code># IOMMU durumu:
+cat /sys/kernel/debug/iommu/iommu_device_list
+
+# ARM SMMU özel debug (CONFIG_ARM_SMMU_DEBUG gerektirir):
+cat /sys/kernel/debug/arm-smmu/09050000.iommu/context_bank
+
+# IOVA tahsis istatistikleri:
+cat /sys/kernel/debug/iova/ff000000.ethernet/iova_rcache
+cat /sys/kernel/debug/iova/ff000000.ethernet/reserved_iova_list</code></pre>
+
+  <h3>Yaygın Hata Senaryoları</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Hata</th><th>Nedeni</th><th>Çözüm</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Translation Fault (TF)</td><td>Cihaz, eşlenmemiş IOVA'ya erişiyor</td><td>dma_map_* çağrısı unutulmuş; sürücü IOVA'yı cihaza yazmadan önce eşleme yapmalı</td></tr>
+        <tr><td>Permission Fault (PF)</td><td>Eşleme var ama izin yok</td><td>iommu_map() çağrısında IOMMU_READ/WRITE/EXEC bayraklarını kontrol et</td></tr>
+        <tr><td>External Abort</td><td>SMMU kendisi bir AXI hata aldı</td><td>Donanım bağlantısı veya clock/power sorunu; DT yapılandırmasını kontrol et</td></tr>
+        <tr><td>IOVA tahsis hatası</td><td>IOVA adres alanı tükenmiş</td><td>dma_unmap_* çağrılarının yapıldığını doğrula; IOVA alanı boyutunu artır</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Gömülü güvenlik tasarımı</h2>
+  <p class="section-lead">SMMU'yu gömülü bir sistemde etkin biçimde kullanmak, donanım tasarımından başlayarak yazılım mimarisine uzanan bütüncül bir yaklaşım gerektirir. Bu bölüm Cortex-A55 tabanlı bir platform üzerinden somut öneriler sunar.</p>
+
+  <h3>SMMUv3 ATS ve PasID</h3>
+  <p>SMMUv3'ün sunduğu iki gelişmiş özellik, gömülü sistemlerde yeni kullanım senaryoları açar:</p>
+  <div class="params">
+    <div class="param">
+      <span class="name">ATS (Address Translation Services)</span>
+      <span class="desc">PCIe cihazlarının kendi adres çevirisini önbelleklemesini sağlar. Cihaz, TLP'lerde doğrudan fiziksel adres kullanır; SMMU latency'si ortadan kalkar. Yüksek bant genişlikli ağ ve depolama cihazları için önemlidir.</span>
+    </div>
+    <div class="param">
+      <span class="name">PasID (Process Address Space ID)</span>
+      <span class="desc">Bir cihazın birden fazla işlemin adres alanını eş zamanlı kullanmasını sağlar. SVA (Shared Virtual Addressing) ile birlikte, cihaz işlemcinin sayfa tablosunu doğrudan paylaşır. Akıllı NIC ve GPU hesaplama için tasarlanmıştır.</span>
+    </div>
+  </div>
+
+  <h3>Cortex-A55 Entegrasyon Örneği</h3>
+  <pre><code>/* Cortex-A55 (ARMv8.2-A) tabanlı SoC, SMMUv3 ile:
+ * - 4 x Cortex-A55 @ 1.8 GHz
+ * - SMMUv3.1 (128 context bank, 64-bit IOVA)
+ * - LPDDR4 512 MB
+ * - GbE, USB3, eMMC — hepsi SMMU'ya bağlı
+ */
+
+/* DT minimal yapılandırma: */
+/*
+    smmu: iommu@c0000000 {
+        compatible = "arm,smmu-v3";
+        reg = &lt;0xc0000000 0x80000&gt;;
+        interrupts = &lt;...&gt;;
+        #iommu-cells = &lt;1&gt;;
+        arm,sid-bits = &lt;16&gt;;
+        dma-coherent;
+    };
+
+    ethernet: eth@80000000 {
+        iommus = &lt;&amp;smmu 0x100&gt;;
+    };
+
+    usb: usb3@81000000 {
+        iommus = &lt;&amp;smmu 0x200&gt;;
+    };
+*/
+
+/* Kernel config (güvenli gömülü imaj için): */
+/*
+    CONFIG_IOMMU_API=y
+    CONFIG_ARM_SMMU_V3=y
+    CONFIG_IOMMU_DEFAULT_DMA_STRICT=y
+    CONFIG_IOMMU_DEFAULT_PASSTHROUGH=n
+*/</code></pre>
+
+  <h3>Güvenli Sistem Mimarisi Önerileri</h3>
+  <div class="params">
+    <div class="param">
+      <span class="name">1. disable_bypass etkinleştirin</span>
+      <span class="desc">SMMU kaydı olmayan cihazların bypass etmesini önleyin. Kernel parametresi: arm-smmu.disable_bypass=1. Bu sayede yanlış DT yapılandırması sessizce geçemez.</span>
+    </div>
+    <div class="param">
+      <span class="name">2. Her cihaza ayrı IOMMU grubu atayın</span>
+      <span class="desc">Birden fazla cihazı aynı gruba koymak izolasyonu zayıflatır. Donanım tasarımında her DMA master'a benzersiz StreamID atanmasını sağlayın.</span>
+    </div>
+    <div class="param">
+      <span class="name">3. Minimum erişim ilkesi uygulayın</span>
+      <span class="desc">Her cihaz yalnızca gerçekten erişmesi gereken bellek bölgelerine eşlenmelidir. Büyük IOVA aralıkları açmak güvenlik açığı yaratır.</span>
+    </div>
+    <div class="param">
+      <span class="name">4. Fault handler'ı üretim koduna ekleyin</span>
+      <span class="desc">İzlenmeyen context fault'lar sessiz bozulmaya yol açabilir. Özel handler ile hataları loglar, isteğe bağlı olarak sistem durumunu güvenli moda alın.</span>
+    </div>
+    <div class="param">
+      <span class="name">5. SMMU sysfs izlemesini düzenli yapın</span>
+      <span class="desc">/sys/kernel/debug/iommu/ üzerinden çalışma zamanı istatistiklerini izleyin. Anormal fault sayısı saldırı veya sürücü hatasının erken göstergesi olabilir.</span>
+    </div>
+  </div>
+
+  <h3>Kısıtlı Bellek Bölgesi Tanımı</h3>
+  <pre><code>/* Belirli bir fiziksel bölgeye erişimi yalnızca güvenilir cihazla sınırla */
+
+/* 1. Güvenli bölgeyi reserved-memory olarak DT'de tanımla: */
+/*
+    reserved-memory {
+        #address-cells = &lt;1&gt;;
+        #size-cells = &lt;1&gt;;
+        secure_region: secure@20000000 {
+            reg = &lt;0x20000000 0x01000000&gt;;  /* 16 MB */
+            no-map;
+        };
+    };
+*/
+
+/* 2. Yalnızca crypto engine'i bu bölgeye eşle: */
+static int setup_secure_dma(struct device *crypto_dev)
+{
+    struct iommu_domain *domain;
+    phys_addr_t secure_phys = 0x20000000;
+    size_t secure_size = SZ_16M;
+    dma_addr_t secure_iova = 0x20000000;  /* 1:1 eşleme */
+
+    domain = iommu_get_domain_for_dev(crypto_dev);
+    if (!domain)
+        return -ENODEV;
+
+    return iommu_map(domain, secure_iova, secure_phys,
+                     secure_size,
+                     IOMMU_READ | IOMMU_WRITE | IOMMU_NOEXEC,
+                     GFP_KERNEL);
+}</code></pre>
+
+  <h3>TrustZone ile SMMU Tümleşimi</h3>
+  <p>ARM TrustZone etkin sistemlerde SMMU, Secure ve Non-Secure dünyaları için ayrı ayrı yapılandırılabilir. Secure monitor (EL3) SMMU'nun güvenlik bölge eşlemesini kontrol eder; Normal Dünya (EL1/EL0) yalnızca kendi bölgesi için yapılandırma yapabilir. Bu yaklaşım, bootloader'dan başlayarak güvenlik mimarisinin temelini oluşturur ve gömülü güvenlik sertifikasyonlarında (IEC 62443, Common Criteria) dikkate alınan bir bileşendir.</p>
+</section>
+
+</main>

@@ -1,0 +1,780 @@
+---
+layout: tutorial
+title: "Trusted Firmware-A — ARM Güvenli Boot Zinciri"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>GÜVENLİK</span>
+    <span>2026</span>
+  </div>
+  <h1>Trusted Firmware-A<br><em>ARM Güvenli Boot Zinciri</em></h1>
+  <p class="subtitle">BL1'den BL33'e her boot aşamasını kavra — EL seviyeleri, PSCI, TrustZone bellek bölümleme ve platform port yazımı.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">ARM Exception Level mimarisi</a></li>
+    <li><a href="#s1">TF-A boot zinciri genel bakış</a></li>
+    <li><a href="#s2">BL1 — ROM stage ve FIP yükleme</a></li>
+    <li><a href="#s3">BL2 — image loader ve bellek düzeni</a></li>
+    <li><a href="#s4">BL31 — EL3 runtime firmware ve SMC</a></li>
+    <li><a href="#s5">PSCI — güç yönetimi servisleri</a></li>
+    <li><a href="#s6">Güvenli/güvensiz bellek bölümleme</a></li>
+    <li><a href="#s7">Platform port yazımı</a></li>
+    <li><a href="#s8">Build, flash ve JTAG debug</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> ARM Exception Level mimarisi</h2>
+  <p class="section-lead">ARMv8-A, çalışma ortamını dört ayrıcalık katmanına (EL0–EL3) ve iki güvenlik durumuna (Secure/Non-Secure) böler; bu yapı TF-A'nın temelini oluşturur.</p>
+
+  <h3>Exception Level hiyerarşisi</h3>
+  <p>ARMv8-A mimarisinde işlemci her zaman belirli bir Exception Level (EL) ve güvenlik durumunda çalışır. EL seviyesi yükseldikçe ayrıcalıklar artar; EL3 en yüksek ayrıcalıklı seviyedir ve her zaman Secure durumundadır.</p>
+
+  <div class="flow">
+    <pre>
+┌─────────────────────────────────────────────────────────┐
+│                    NON-SECURE WORLD                     │
+│  EL0 : User uygulamalar (glibc programları)             │
+│  EL1 : Linux kernel, sürücüler, istisna işleyiciler     │
+│  EL2 : Hypervisor (KVM, Xen) — opsiyonel               │
+└────────────────────┬────────────────────────────────────┘
+                     │  SMC (Secure Monitor Call)
+┌────────────────────▼────────────────────────────────────┐
+│                     SECURE WORLD                        │
+│  EL3 : Secure Monitor (TF-A BL31) — daima Secure       │
+│  S-EL1 : Trusted OS (OP-TEE, Hafnium)                  │
+│  S-EL0 : Trusted Applications                          │
+└─────────────────────────────────────────────────────────┘</pre>
+  </div>
+
+  <h3>EL geçişleri</h3>
+  <p>Normal World'den Secure World'e geçmek için <code>SMC</code> (Secure Monitor Call) komutu kullanılır. EL3'teki Secure Monitor bu çağrıyı alır, bağlamı kaydeder ve uygun dünyaya yönlendirir.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Seviye</th><th>Dünya</th><th>Tipik yazılım</th><th>Geçiş komutu</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>EL0</td><td>Non-Secure</td><td>Kullanıcı uygulamaları</td><td>SVC → EL1</td></tr>
+        <tr><td>EL1</td><td>Non-Secure</td><td>Linux kernel</td><td>HVC → EL2, SMC → EL3</td></tr>
+        <tr><td>EL2</td><td>Non-Secure</td><td>KVM/Xen hypervisor</td><td>SMC → EL3</td></tr>
+        <tr><td>EL3</td><td>Secure</td><td>TF-A BL31 runtime</td><td>ERET → herhangi EL</td></tr>
+        <tr><td>S-EL1</td><td>Secure</td><td>OP-TEE OS</td><td>SMC → EL3</td></tr>
+        <tr><td>S-EL0</td><td>Secure</td><td>Trusted Application</td><td>SVC → S-EL1</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>SCR_EL3 — Secure Configuration Register</h3>
+  <p>EL3'teki <code>SCR_EL3</code> kaydı, Secure/Non-Secure geçişlerini ve SMC yakalama davranışını kontrol eder. TF-A bu kaydı boot aşamasında yapılandırır.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">SCR_EL3.NS</span><span class="desc">0 = Secure World, 1 = Non-Secure World; ERET sonrası hangi dünyaya döneceğini belirler</span></div>
+    <div class="param"><span class="name">SCR_EL3.IRQ/FIQ</span><span class="desc">1 olduğunda EL1/EL2'deki IRQ/FIQ kesmeleri EL3'e yönlenir — Secure interrupt routing</span></div>
+    <div class="param"><span class="name">SCR_EL3.SMD</span><span class="desc">1 = SMC komutunu devre dışı bırak; genelde 0 tutulur, BL31 SMC'leri işler</span></div>
+    <div class="param"><span class="name">SCR_EL3.HCE</span><span class="desc">1 = HVC komutunu EL1'de etkinleştir; hypervisor kullanılıyorsa set edilir</span></div>
+    <div class="param"><span class="name">SCR_EL3.RW</span><span class="desc">1 = alt seviyeler AArch64 modunda çalışır; 0 = AArch32 (32-bit compat)</span></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> TF-A boot zinciri genel bakış</h2>
+  <p class="section-lead">Trusted Firmware-A, ARM platformlarında ROM'dan başlayıp U-Boot veya UEFI'ye devreden beş aşamalı bir boot zinciri tanımlar.</p>
+
+  <h3>Boot loader aşamaları</h3>
+  <div class="flow">
+    <pre>
+ROM (SoC içi, immutable)
+  │
+  ▼
+BL1 — Boot Loader Stage 1
+  │  Genellikle SoC ROM'una gömülü ya da küçük SRAM'de çalışır
+  │  FIP imajını yükler, BL2'ye geçer
+  ▼
+BL2 — Boot Loader Stage 2
+  │  Tüm kalan boot imajlarını (BL31, BL32, BL33) yükler
+  │  Platform init: DDR, clock, güvenlik periferikleri
+  ▼
+BL31 — EL3 Runtime Firmware
+  │  DRAM'de kalıcı olarak çalışır (EL3 resident)
+  │  SMC handler, PSCI, RAS, GIC routing
+  ▼
+BL32 — Secure-EL1 Payload (opsiyonel)
+  │  Genellikle OP-TEE OS — Trusted OS
+  ▼
+BL33 — Non-Secure Firmware
+     U-Boot, UEFI (EDK2), ya da doğrudan Linux</pre>
+  </div>
+
+  <h3>FIP — Firmware Image Package</h3>
+  <p>TF-A tüm boot imajlarını tek bir <strong>FIP (Firmware Image Package)</strong> dosyasında paketler. FIP, UUID tabanlı bir dizin ve binary payload'lardan oluşur; flash'a tek blok olarak yazılır.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>FIP içeriği</th><th>UUID</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>BL2</td><td>5f04 …</td><td>İkinci aşama boot loader</td></tr>
+        <tr><td>BL31</td><td>47d4 …</td><td>EL3 runtime (Secure Monitor)</td></tr>
+        <tr><td>BL32</td><td>05d0 …</td><td>Secure-EL1 payload (OP-TEE)</td></tr>
+        <tr><td>BL33</td><td>d6d0 …</td><td>Non-secure firmware (U-Boot)</td></tr>
+        <tr><td>HW_CONFIG</td><td>08b8 …</td><td>Platform Device Tree</td></tr>
+        <tr><td>TB_FW_CONFIG</td><td>6c07 …</td><td>TF-A firmware config DTB</td></tr>
+        <tr><td>NT_FW_CONFIG</td><td>28da …</td><td>Non-trusted firmware config DTB</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Kaynak dizin yapısı</h3>
+  <pre><code>trusted-firmware-a/
+├── bl1/              # BL1 kaynak kodu
+├── bl2/              # BL2 kaynak kodu
+├── bl31/             # BL31 (EL3 runtime) kaynak kodu
+├── bl32/             # SP_MIN (32-bit TEE stub)
+├── common/           # Ortak kütüphaneler: crypto, fip_parser, uuid
+├── drivers/          # ARM Trusted Board Boot, GIC, TZC, UART vb.
+├── include/          # Platform-bağımsız başlık dosyaları
+├── lib/              # xlat_tables, el3_runtime, libc alt seti
+├── make_helpers/     # Makefile yardımcıları
+├── plat/             # Platform portları
+│   ├── arm/          # ARM referans platformları (FVP, Juno)
+│   ├── st/           # STM32MP1/MP2
+│   ├── xilinx/       # Zynq UltraScale+
+│   ├── mediatek/     # MT8xxx serisi
+│   └── myplatform/   # Kendi platform portunuz
+└── tools/
+    ├── fiptool/      # FIP paketle/aç aracı
+    └── cert_create/  # Güven zinciri sertifika üretici</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> BL1 — ROM stage ve FIP yükleme</h2>
+  <p class="section-lead">BL1, çoğu zaman SoC ROM'una ya da küçük bir SRAM'e yerleştirilen ilk güvenilir kodun bulunduğu aşamadır; FIP'i bulur ve BL2'yi belleğe yükler.</p>
+
+  <h3>BL1 sorumlulukları</h3>
+  <div class="params">
+    <div class="param"><span class="name">CPU early init</span><span class="desc">MMU kapalı, cache temizleme, EL3 vektör tablosunu kurma (bl1/aarch64/bl1_entrypoint.S)</span></div>
+    <div class="param"><span class="name">Trusted SRAM init</span><span class="desc">BSS sıfırlama, xlat_tables için erken bellek düzeni hazırlama</span></div>
+    <div class="param"><span class="name">Platform init</span><span class="desc">bl1_plat_arch_setup() çağrısı — platform UART, clock vb.</span></div>
+    <div class="param"><span class="name">FIP yükleme</span><span class="desc">NOR flash / eMMC'den FIP başlık ayrıştırma, BL2 binary'yi Trusted SRAM'e kopyalama</span></div>
+    <div class="param"><span class="name">BL2'ye geçiş</span><span class="desc">BL2 giriş noktasına ERET ile atlama; EL3 bağlamı hazırlanır</span></div>
+  </div>
+
+  <h3>BL1 entry point akışı (basitleştirilmiş)</h3>
+  <pre><code>/* bl1/aarch64/bl1_entrypoint.S — özet */
+
+el3_entrypoint_common:          /* EL3'e özgü ilk setup */
+    msr     SPSel, #1           /* SP_EL3 seç */
+    bl      bl1_setup           /* Platform early init */
+    bl      bl1_main            /* Ana BL1 fonksiyonu */
+
+/* bl1/bl1_main.c */
+void bl1_main(void)
+{
+    /* 1. EL3 güvenlik ayarları */
+    bl1_arch_setup();
+
+    /* 2. Platform ilklendirme */
+    bl1_platform_setup();
+
+    /* 3. FIP'ten BL2 imajını yükle */
+    image_desc_t *bl2_desc = bl1_plat_get_image_desc(BL2_IMAGE_ID);
+    bl1_load_bl2();
+
+    /* 4. BL2'ye authenticate et (CoT etkinse) */
+    auth_mod_verify_img(BL2_IMAGE_ID, ...);
+
+    /* 5. BL2'ye geç */
+    bl1_prepare_next_image(BL2_IMAGE_ID);
+}</code></pre>
+
+  <h3>Trusted Board Boot (TBBR)</h3>
+  <p>TF-A, <strong>Trusted Board Boot Requirements (TBBR)</strong> standardını destekler. Her boot imajının bir X.509 sertifikasıyla imzalanmasını zorunlu kılar. <code>TRUSTED_BOARD_BOOT=1</code> ile derleme yapıldığında BL1, BL2'nin ROTPK (Root of Trust Public Key) ile imzalandığını doğrular; doğrulama başarısız olursa boot durur.</p>
+
+  <pre><code># TBBR etkin derleme — BL1 imzalı BL2 bekler
+make PLAT=myplatform TRUSTED_BOARD_BOOT=1 \
+     GENERATE_COT=1 \
+     ROT_KEY=keys/rot_key.pem \
+     all fip</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> BL2 — image loader ve bellek düzeni</h2>
+  <p class="section-lead">BL2, FIP içindeki tüm imajları (BL31, BL32, BL33) DRAM'e yükler ve platform periferlerini başlatır; ardından kontrolü BL31'e devreder.</p>
+
+  <h3>BL2'nin yüklediği imajlar</h3>
+  <pre><code>/* bl2/bl2_main.c — yükleme sırası */
+int bl2_main(void)
+{
+    bl2_arch_setup();
+    bl2_plat_preload_setup();   /* Platform erken init: DDR eğitimi vb. */
+
+    /* SCP_BL2 (opsiyonel — System Control Processor firmware) */
+    load_image_flush(SCP_BL2_IMAGE_ID);
+
+    /* BL31 — EL3 runtime, DRAM'in güvenli bölgesine */
+    load_image_flush(BL31_IMAGE_ID);
+
+    /* BL32 — OP-TEE, Secure-EL1 bölgesine (opsiyonel) */
+    load_image_flush(BL32_IMAGE_ID);
+
+    /* BL33 — U-Boot ya da UEFI, Non-Secure DRAM'e */
+    load_image_flush(BL33_IMAGE_ID);
+
+    /* BL31'e geç */
+    bl2_run_next_image(&bl31_ep_info);
+}</code></pre>
+
+  <h3>Bellek düzeni (örnek — Cortex-A55 platformu)</h3>
+  <div class="flow">
+    <pre>
+Adres Aralığı          Kullanım
+─────────────────────────────────────────────────
+0x0000_0000 – 0x0003_FFFF   Trusted SRAM (256 KB)
+  ├── BL1 kodu (ROM'da ya da SRAM başında)
+  └── BL2 kodu + stack
+
+0x4000_0000 – 0x43FF_FFFF   Secure DRAM (64 MB — TZC korumalı)
+  ├── BL31 runtime kodu + data
+  └── BL32 (OP-TEE) kodu + data + heap
+
+0x4400_0000 – 0xFFFF_FFFF   Non-Secure DRAM
+  └── BL33 (U-Boot) yükleme adresi + Linux image</pre>
+  </div>
+
+  <h3>Platform bellek tanımları</h3>
+  <pre><code>/* plat/myplatform/include/platform_def.h */
+
+/* Trusted SRAM */
+#define BL1_RO_BASE         ULL(0x00000000)
+#define BL1_RO_LIMIT        ULL(0x00010000)   /* 64 KB */
+#define BL_RAM_BASE         ULL(0x00010000)
+#define BL_RAM_SIZE         ULL(0x00030000)   /* 192 KB */
+
+/* BL2 SRAM bölgesi */
+#define BL2_BASE            ULL(0x00010000)
+#define BL2_LIMIT           ULL(0x00040000)
+
+/* BL31 Secure DRAM */
+#define BL31_BASE           ULL(0x40000000)
+#define BL31_LIMIT          ULL(0x40040000)   /* 256 KB */
+
+/* BL32 (OP-TEE) */
+#define BL32_BASE           ULL(0x40400000)
+#define BL32_LIMIT          ULL(0x43C00000)   /* 60 MB */
+#define BL32_MEM_SIZE       (BL32_LIMIT - BL32_BASE)
+
+/* BL33 (U-Boot) */
+#define BL33_BASE           ULL(0x44000000)
+#define PLAT_PHY_ADDR_SPACE_SIZE    ULL(0x100000000)</code></pre>
+
+  <h3>DDR eğitimi ve BL2 platform init</h3>
+  <p>Birçok SoC'de DDR kontrolörü BL2 sırasında başlatılır. <code>bl2_plat_handle_pre_image_load()</code> hook'u bu iş için kullanılır. DDR hazır olmadan BL31/BL32 DRAM adreslerine yüklenemez.</p>
+
+  <pre><code>/* plat/myplatform/bl2_plat_setup.c */
+void bl2_plat_preload_setup(void)
+{
+    /* 1. PLL ve clock ağacını başlat */
+    myplat_clock_init();
+
+    /* 2. DDR PHY eğitimi ve kontrolör başlatma */
+    myplat_ddr_init();
+
+    /* 3. GIC, güvenlik periferikleri */
+    myplat_security_setup();
+
+    INFO("BL2: DDR hazir, %u MB\n", DRAM_SIZE_MB);
+}</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> BL31 — EL3 runtime firmware ve SMC işleyici</h2>
+  <p class="section-lead">BL31, sistem çalışır hâldeyken DRAM'de daima aktif kalan EL3 firmware'idir; SMC çağrılarını işler, PSCI servislerini sunar ve dünyalar arası geçişleri yönetir.</p>
+
+  <h3>BL31 başlangıç akışı</h3>
+  <pre><code>/* bl31/bl31_main.c */
+void bl31_main(void)
+{
+    /* 1. EL3 runtime servisleri kaydettir */
+    runtime_svc_init();   /* PSCI, SDEI, SPM, vendor SMC vb. */
+
+    /* 2. GIC CPU interface init (her CPU için) */
+    gicv3_cpuif_enable(plat_my_core_pos());
+
+    /* 3. BL32 (OP-TEE) başlat — varsa */
+    if (bl32_init != NULL)
+        (*bl32_init)();
+
+    /* 4. BL33 (U-Boot) giriş bilgilerini hazırla */
+    bl31_prepare_next_image_entry();
+
+    /* 5. Konsol bırak, BL33'e ERET */
+    console_flush();
+}</code></pre>
+
+  <h3>SMC çağrı mekanizması</h3>
+  <p>Normal World'deki kod <code>smc #0</code> komutuyla EL3'e geçer. ARM SMC Calling Convention (SMCCC) standart kayıt düzenini tanımlar.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">x0[31:24]</span><span class="desc">Çağrı türü: 0=ARM arch, 1=CPU, 2=SiP, 3=OEM, 4=Standard Secure, 5=Standard HV, 6-7=Trusted OS</span></div>
+    <div class="param"><span class="name">x0[16]</span><span class="desc">SMC64 bit: 0 = SMC32 (AArch32 compat), 1 = SMC64 (64-bit argümanlar)</span></div>
+    <div class="param"><span class="name">x0[15:0]</span><span class="desc">Fonksiyon numarası — her servis kendi aralığını tanımlar</span></div>
+    <div class="param"><span class="name">x1–x7</span><span class="desc">Girdi argümanları; x0 dönüş değeri (veya hata kodu)</span></div>
+  </div>
+
+  <h3>Runtime servis kaydı</h3>
+  <pre><code>/* PSCI servis tanımı — services/std_svc/std_svc_setup.c */
+DECLARE_RT_SVC(
+    std_svc,
+    OEN_STD_START,
+    OEN_STD_END,
+    SMC_TYPE_FAST,
+    std_svc_setup,
+    std_svc_smc_handler    /* SMC geldiğinde çağrılan fonksiyon */
+);
+
+uintptr_t std_svc_smc_handler(uint32_t smc_fid,
+                               u_register_t x1, u_register_t x2,
+                               u_register_t x3, u_register_t x4,
+                               void *cookie, void *handle,
+                               u_register_t flags)
+{
+    /* PSCI çağrısı mı? */
+    if (is_psci_fid(smc_fid))
+        return psci_smc_handler(smc_fid, x1, x2, x3, x4,
+                                cookie, handle, flags);
+    /* SDEI (Software Delegated Exception Interface) */
+    if (is_sdei_fid(smc_fid))
+        return sdei_smc_handler(smc_fid, x1, x2, x3, x4,
+                                cookie, handle, flags);
+    SMC_RET1(handle, SMC_UNK);
+}</code></pre>
+
+  <h3>Vendor SiP servis ekleme</h3>
+  <pre><code>/* plat/myplatform/sip_svc.c — özel SiP SMC servisi */
+#define MYPLAT_SIP_SVC_OEM_FUSE     0xC2000001UL
+#define MYPLAT_SIP_SVC_THERMAL_READ 0xC2000002UL
+
+static uintptr_t myplat_sip_handler(uint32_t smc_fid, ...)
+{
+    switch (smc_fid) {
+    case MYPLAT_SIP_SVC_OEM_FUSE:
+        myplat_blow_fuse((uint32_t)x1, (uint32_t)x2);
+        SMC_RET1(handle, 0);
+
+    case MYPLAT_SIP_SVC_THERMAL_READ:
+        SMC_RET1(handle, myplat_read_temperature());
+
+    default:
+        SMC_RET1(handle, SMC_UNK);
+    }
+}
+
+DECLARE_RT_SVC(myplat_sip,
+    OEN_SIP_START, OEN_SIP_END,
+    SMC_TYPE_FAST, NULL, myplat_sip_handler);</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> PSCI — güç yönetimi servisleri</h2>
+  <p class="section-lead">Power State Coordination Interface (PSCI), işlemci çekirdeklerinin açılıp kapanmasını, uyku durumlarını ve sistem sıfırlamasını standart SMC çağrılarıyla Linux'a sunan ARM standardıdır.</p>
+
+  <h3>Temel PSCI fonksiyonları</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>SMC ID (64-bit)</th><th>Fonksiyon</th><th>Kullanım</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>0xC4000001</td><td>CPU_SUSPEND</td><td>Çekirdeği derin uyku moduna al</td></tr>
+        <tr><td>0xC4000002</td><td>CPU_OFF</td><td>Çekirdeği tamamen kapat (hotplug)</td></tr>
+        <tr><td>0xC4000003</td><td>CPU_ON</td><td>Başka bir çekirdeği başlat</td></tr>
+        <tr><td>0xC4000004</td><td>AFFINITY_INFO</td><td>Çekirdek güç durumunu sorgula</td></tr>
+        <tr><td>0xC4000008</td><td>SYSTEM_OFF</td><td>Sistemi kapat</td></tr>
+        <tr><td>0xC4000009</td><td>SYSTEM_RESET</td><td>Sistemi yeniden başlat</td></tr>
+        <tr><td>0xC400000A</td><td>SYSTEM_RESET2</td><td>Sıfırlama sebebi iletme</td></tr>
+        <tr><td>0x84000010</td><td>PSCI_VERSION</td><td>PSCI versiyon sorgula</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Platform PSCI handler implementasyonu</h3>
+  <pre><code>/* plat/myplatform/myplat_pm.c */
+
+static void myplat_cpu_standby(plat_local_state_t cpu_state)
+{
+    uint64_t scr = read_scr_el3();
+    /* IRQ gelene dek WFI */
+    write_scr_el3(scr | SCR_IRQ_BIT);
+    isb();
+    dsb();
+    wfi();
+    write_scr_el3(scr);
+}
+
+static int myplat_pwr_domain_on(u_register_t mpidr)
+{
+    unsigned int cpu_id = plat_core_pos_by_mpidr(mpidr);
+
+    /* CPU başlangıç adresini platform register'a yaz */
+    mmio_write_64(MYPLAT_CPU_RELEASE_ADDR(cpu_id),
+                  (uint64_t)&bl31_warm_entrypoint);
+    /* Cache flush — diğer çekirdek okuyabilmeli */
+    flush_dcache_range(MYPLAT_CPU_RELEASE_ADDR(cpu_id), 8);
+
+    /* CPU'yu GIC üzerinden uyandır (SGI ya da platform reset) */
+    myplat_send_sgi(cpu_id, 0);
+    return PSCI_E_SUCCESS;
+}
+
+static void myplat_pwr_domain_off(const psci_power_state_t *target)
+{
+    /* GIC CPU interface devre dışı */
+    gicv3_cpuif_disable(plat_my_core_pos());
+    /* Platform-specific power gate */
+    myplat_cpu_power_down(plat_my_core_pos());
+}
+
+static void myplat_system_reset(void)
+{
+    /* Watchdog üzerinden sıfırlama */
+    mmio_write_32(MYPLAT_WDT_BASE + WDT_CTL, WDT_RESET_NOW);
+    wfi();   /* Asla dönmemeli */
+}
+
+const plat_psci_ops_t myplat_psci_ops = {
+    .cpu_standby            = myplat_cpu_standby,
+    .pwr_domain_on          = myplat_pwr_domain_on,
+    .pwr_domain_off         = myplat_pwr_domain_off,
+    .pwr_domain_suspend     = myplat_pwr_domain_suspend,
+    .pwr_domain_on_finish   = myplat_pwr_domain_on_finish,
+    .system_off             = myplat_system_off,
+    .system_reset           = myplat_system_reset,
+    .validate_power_state   = myplat_validate_power_state,
+};</code></pre>
+
+  <h3>Linux device tree PSCI düğümü</h3>
+  <pre><code>/* board.dts */
+/ {
+    psci {
+        compatible = "arm,psci-1.0";
+        method = "smc";
+        cpu_on    = &lt;0xC4000003&gt;;
+        cpu_off   = &lt;0xC4000002&gt;;
+        cpu_suspend = &lt;0xC4000001&gt;;
+        sys_poweroff = &lt;0xC4000008&gt;;
+        sys_reset    = &lt;0xC4000009&gt;;
+    };
+
+    cpus {
+        cpu@0 { enable-method = "psci"; };
+        cpu@1 { enable-method = "psci"; };
+        cpu@2 { enable-method = "psci"; };
+        cpu@3 { enable-method = "psci"; };
+    };
+};</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Güvenli/güvensiz bellek bölümleme</h2>
+  <p class="section-lead">TrustZone bellek koruması, TZC-400 (TrustZone Address Space Controller) ve TZASC gibi donanım bileşenleriyle DRAM bölgelerini Secure/Non-Secure olarak erişime kilitler.</p>
+
+  <h3>TZC-400 mimarisi</h3>
+  <p>TZC-400, DRAM kontrolörü ile işlemci arasına yerleştirilen bir adres uzayı denetleyicisidir. Her DRAM işlemi için kaynak (Secure/Non-Secure, CPU/DMA) ve hedef adres aralığını denetler; ihlalde AXI DECERR döndürür.</p>
+
+  <div class="flow">
+    <pre>
+CPU / DMA master → AXI bus → TZC-400 → DRAM kontrolör → DRAM
+
+TZC-400 dahili yapısı:
+  ┌─────────────────────────────────────────┐
+  │  Region 0: Background region (tümü)     │
+  │  Region 1: 0x40000000–0x43FFFFFF        │
+  │    → Secure only (BL31 + OP-TEE)       │
+  │  Region 2: 0x44000000–0xFFFFFFFF        │
+  │    → Non-Secure R/W                    │
+  └─────────────────────────────────────────┘</pre>
+  </div>
+
+  <h3>TZC-400 TF-A konfigürasyonu</h3>
+  <pre><code>/* plat/myplatform/myplat_security.c */
+#include &lt;drivers/arm/tzc400.h&gt;
+
+void myplat_security_setup(void)
+{
+    /* TZC-400 başlat */
+    tzc400_init(MYPLAT_TZC_BASE);
+    tzc400_disable_filters();
+
+    /* Region 0: tüm DRAM — sadece Secure erişim (varsayılan kısıtlayıcı) */
+    tzc400_configure_region0(TZC_REGION_S_RDWR, 0);
+
+    /* Region 1: Secure DRAM — BL31 + OP-TEE */
+    tzc400_configure_region(
+        MYPLAT_TZC_FILTER,
+        1,                          /* region numarası */
+        BL32_BASE,                  /* başlangıç: 0x40000000 */
+        BL32_LIMIT - 1,             /* bitiş: 0x43FFFFFF */
+        TZC_REGION_S_RDWR,          /* sadece Secure okuma/yazma */
+        PLAT_ARM_TZC_NS_DEV_ACCESS  /* Non-Secure erişim yok */
+    );
+
+    /* Region 2: Non-Secure DRAM — U-Boot, Linux */
+    tzc400_configure_region(
+        MYPLAT_TZC_FILTER,
+        2,
+        BL33_BASE,                  /* 0x44000000 */
+        PLAT_ARM_DRAM1_BASE + PLAT_ARM_DRAM1_SIZE - 1,
+        TZC_REGION_S_RDWR,
+        TZC_REGION_ACCESS_RDWR      /* NS okuma/yazma */
+    );
+
+    tzc400_enable_filters();
+    tzc400_set_action(TZC_ACTION_ERR);  /* ihlalde AXI error */
+}</code></pre>
+
+  <h3>TZMP1 — TrustZone Media Protection</h3>
+  <p>Video/kamera pipeline'larında media buffer'ların korunması için TZC'ye ek olarak SMMU (System MMU) güvenlik konfigürasyonu gerekir. Secure World DMA master NSAID'i Secure olarak işaretlenmelidir.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Bileşen</th><th>Görev</th><th>TF-A sürücüsü</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>TZC-400</td><td>DRAM bölge erişim kontrolü</td><td>drivers/arm/tzc/tzc400.c</td></tr>
+        <tr><td>GIC-600</td><td>Güvenli/güvensiz kesme yönlendirme</td><td>drivers/arm/gic/v3/gicv3_main.c</td></tr>
+        <tr><td>TZASC</td><td>TZC-400 benzeri, bazı Xilinx/ST SoC'ler</td><td>drivers/arm/tzc/tzc_dmc620.c</td></tr>
+        <tr><td>SMMU-v3</td><td>DMA master güvenlik izolasyonu</td><td>drivers/arm/smmu/smmu_v3.c</td></tr>
+        <tr><td>NIC-400</td><td>AXI interconnect güvenlik ayarları</td><td>Platform özel</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Platform port yazımı</h2>
+  <p class="section-lead">Yeni bir SoC için TF-A portu, <code>plat/myplatform/</code> dizininde platform makroları, console, clock, güç yönetimi ve bellek düzeni fonksiyonlarının implement edilmesiyle oluşturulur.</p>
+
+  <h3>Minimum platform dizin yapısı</h3>
+  <pre><code>plat/myplatform/
+├── platform.mk              # Derleme sistemi: kaynak listesi, tanımlar
+├── include/
+│   └── platform_def.h       # Adres, boyut, limit makroları
+├── myplat_bl1_setup.c       # bl1_plat_arch_setup, bl1_platform_setup
+├── myplat_bl2_setup.c       # bl2_plat_preload_setup, image listesi
+├── myplat_bl31_setup.c      # bl31_platform_setup, bl31_plat_runtime_setup
+├── myplat_pm.c              # plat_psci_ops implementasyonu
+├── myplat_security.c        # TZC, NIC konfigürasyonu
+├── myplat_topology.c        # plat_core_pos_by_mpidr, cluster topolojisi
+├── myplat_io.c              # FIP'i okuyan IO backend (NOR/eMMC/SPI)
+└── aarch64/
+    └── myplat_helpers.S     # Erken asm init, CPU release address</code></pre>
+
+  <h3>platform.mk — zorunlu değişkenler</h3>
+  <pre><code># plat/myplatform/platform.mk
+
+# İşlemci kütüphanesi (Cortex-A55 çekirdek)
+ARM_CORTEX_A55            := yes
+HW_ASSISTED_COHERENCY     := 1
+USE_COHERENT_MEM          := 0
+
+# Desteklenen boot loader'lar
+MYPLAT_SOURCES := \
+    plat/myplatform/myplat_bl1_setup.c    \
+    plat/myplatform/myplat_bl2_setup.c    \
+    plat/myplatform/myplat_bl31_setup.c   \
+    plat/myplatform/myplat_pm.c           \
+    plat/myplatform/myplat_security.c     \
+    plat/myplatform/myplat_topology.c     \
+    plat/myplatform/myplat_io.c           \
+    plat/myplatform/aarch64/myplat_helpers.S
+
+BL1_SOURCES += $(MYPLAT_SOURCES)
+BL2_SOURCES += $(MYPLAT_SOURCES)
+BL31_SOURCES += $(MYPLAT_SOURCES)
+
+# GICv3 sürücüsü ekle
+include drivers/arm/gic/v3/gicv3.mk
+GIC_SOURCES := $(GICV3_SOURCES)
+BL31_SOURCES += $(GIC_SOURCES)
+
+# TZC-400
+BL2_SOURCES += drivers/arm/tzc/tzc400.c</code></pre>
+
+  <h3>Topoloji tanımlama</h3>
+  <pre><code>/* plat/myplatform/myplat_topology.c */
+/* 4 çekirdek, tek cluster, tek socket */
+
+const mpidr_afflvl_limit_t mpidr_afflvl_limits[MPIDR_AFFLVL_MAX + 1] = {
+    { .min = 0, .max = 3 },  /* Afflvl0: CPU 0-3 */
+    { .min = 0, .max = 0 },  /* Afflvl1: Cluster 0 */
+    { .min = 0, .max = 0 },  /* Afflvl2: System 0 */
+};
+
+int plat_core_pos_by_mpidr(u_register_t mpidr)
+{
+    unsigned int cluster = MPIDR_AFFLVL1_VAL(mpidr);
+    unsigned int cpu     = MPIDR_AFFLVL0_VAL(mpidr);
+
+    if (cluster != 0 || cpu >= PLATFORM_CORE_COUNT)
+        return -1;
+    return (int)cpu;
+}
+
+unsigned int plat_get_syscnt_freq2(void) {
+    return MYPLAT_SYSCNT_FREQ;  /* 24 MHz */
+}</code></pre>
+
+  <h3>IO backend — eMMC'den FIP okuma</h3>
+  <pre><code>/* plat/myplatform/myplat_io.c (özet) */
+static const io_dev_connector_t *emmc_dev_con;
+static uintptr_t emmc_dev_handle;
+
+static const io_block_spec_t fip_block_spec = {
+    .offset = FIP_EMMC_SECTOR * MMC_BLOCK_SIZE,
+    .length = PLAT_ARM_FIP_MAX_SIZE,
+};
+
+void myplat_io_setup(void)
+{
+    register_io_dev_block(&emmc_dev_con);
+    io_dev_open(emmc_dev_con, (uintptr_t)&emmc_dev_spec,
+                &emmc_dev_handle);
+    plat_io_register_img_io(FIP_IMAGE_ID, emmc_dev_handle,
+                            &fip_block_spec);
+}</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Build, flash ve JTAG debug</h2>
+  <p class="section-lead">TF-A'yı derleyip FIP oluşturmak, target'a yazmak ve JTAG üzerinden BL1'den itibaren adım adım debug etmek için gereken komutlar ve yöntemler.</p>
+
+  <h3>Derleme — temel komutlar</h3>
+  <pre><code># Bağımlılıklar (Ubuntu/Debian)
+sudo apt install build-essential gcc-aarch64-linux-gnu \
+     binutils-aarch64-linux-gnu libssl-dev python3 \
+     device-tree-compiler
+
+# Sade BL31 derle (sadece TF-A, BL32/BL33 harici)
+make PLAT=myplatform CROSS_COMPILE=aarch64-linux-gnu- \
+     DEBUG=1 LOG_LEVEL=50 \
+     bl31
+
+# Tam FIP oluştur: BL2 + BL31 + OP-TEE + U-Boot
+make PLAT=myplatform CROSS_COMPILE=aarch64-linux-gnu- \
+     DEBUG=1 LOG_LEVEL=50 \
+     BL32=/path/to/tee.bin \
+     BL33=/path/to/u-boot.bin \
+     all fip
+
+# TBBR ile imzalı FIP
+make PLAT=myplatform CROSS_COMPILE=aarch64-linux-gnu- \
+     TRUSTED_BOARD_BOOT=1 GENERATE_COT=1 \
+     ROT_KEY=keys/rot_key.pem \
+     BL32=/path/to/tee.bin BL33=/path/to/u-boot.bin \
+     all fip certificates
+
+# Çıktı dosyaları
+# build/myplatform/debug/
+#   bl1.bin bl2.bin bl31.bin fip.bin
+#   certificates/ (CoT sertifikaları)</code></pre>
+
+  <h3>FIP aracı — içeriği incele / değiştir</h3>
+  <pre><code># FIP içeriğini listele
+tools/fiptool/fiptool info build/myplatform/debug/fip.bin
+
+# FIP'ten BL31 çıkar
+tools/fiptool/fiptool unpack --bl31 /tmp/bl31.bin fip.bin
+
+# FIP'e yeni BL33 ekle (U-Boot güncellendiğinde)
+tools/fiptool/fiptool update --bl33 /path/to/new-u-boot.bin fip.bin
+
+# FIP boyutu ve UUID listesi
+tools/fiptool/fiptool info --verbose fip.bin</code></pre>
+
+  <h3>Flash yazma — eMMC üzerinden</h3>
+  <pre><code># U-Boot komut satırından (tftp + mmc write):
+# 1. FIP'i TFTP ile DRAM'e çek
+tftp 0x44000000 fip.bin
+
+# 2. eMMC boot0 bölümüne yaz (sektör 64'ten başlayarak)
+mmc dev 0 1                             # boot0 hw partition seç
+mmc write 0x44000000 0x40 0x800         # 0x40 = sektör 64, 0x800 = 1 MB
+
+# OpenOCD + flash_write ile doğrudan programlama:
+openocd -f interface/jlink.cfg \
+        -f target/myplatform.cfg \
+        -c "init; halt; \
+            flash write_image erase fip.bin 0x08000000; \
+            reset run; exit"</code></pre>
+
+  <h3>JTAG debug — BL1'den adım adım</h3>
+  <pre><code># OpenOCD + GDB ile BL1 debug (semboller dahil)
+
+# Terminal 1: OpenOCD başlat
+openocd -f interface/jlink.cfg \
+        -f target/myplatform.cfg
+
+# Terminal 2: GDB bağlan
+aarch64-linux-gnu-gdb build/myplatform/debug/bl1/bl1.elf
+
+(gdb) target remote :3333
+(gdb) monitor reset halt
+(gdb) load                          # ELF sembollerini yükle
+(gdb) break bl1_main               # BL1 main'e breakpoint
+(gdb) continue
+
+# BL31 debug için (DRAM'e yüklendikten sonra)
+(gdb) add-symbol-file build/myplatform/debug/bl31/bl31.elf \
+      -s .text 0x40000000           # BL31 yükleme adresi
+
+# Belirli SMC çağrısında durma
+(gdb) break psci_smc_handler
+(gdb) commands
+  > printf "SMC fid: 0x%x, x1=0x%lx\n", $x0, $x1
+  > continue
+  > end</code></pre>
+
+  <h3>TF-A log seviyeleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">LOG_LEVEL=0</span><span class="desc">Hiç çıktı yok — production release için</span></div>
+    <div class="param"><span class="name">LOG_LEVEL=10</span><span class="desc">Sadece ERROR — kritik hatalar</span></div>
+    <div class="param"><span class="name">LOG_LEVEL=20</span><span class="desc">NOTICE — önemli olaylar (varsayılan release)</span></div>
+    <div class="param"><span class="name">LOG_LEVEL=40</span><span class="desc">INFO — boot aşama bildirimleri (varsayılan debug)</span></div>
+    <div class="param"><span class="name">LOG_LEVEL=50</span><span class="desc">VERBOSE — tüm register değerleri, tablo kurulumu</span></div>
+  </div>
+
+  <pre><code># Tipik BL31 verbose çıktısı (LOG_LEVEL=50):
+# NOTICE:  BL31: v2.9(debug):ceb12bb
+# NOTICE:  BL31: Built: Apr 15 2026 09:00:00
+# INFO:    BL31: Initializing runtime services
+# INFO:    BL31: cortex_a55: CPU workaround for erratum 768277 was applied
+# INFO:    BL31: PSCI v1.1 initialized
+# INFO:    GICv3 with legacy support detected
+# INFO:    BL31: Preparing for EL3 exit to normal world
+# VERBOSE: Entry point address = 0x44000000
+# VERBOSE: SPSR = 0x3c9</code></pre>
+</section>
+
+</main>

@@ -1,0 +1,996 @@
+---
+layout: tutorial
+title: "Linux Interrupt Alt Sistemi — request_irq, GIC, Threaded IRQ"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>IRQ ALT SİSTEMİ</span>
+    <span>2026</span>
+  </div>
+  <h1>Linux Interrupt Alt Sistemi<br><em>request_irq, GIC, Threaded IRQ</em></h1>
+  <p class="subtitle">Kernel interrupt mimarisini GIC donanımından threaded handler'a kadar derinlemesine incele — sürücü yazan her geliştirici için kapsamlı başvuru kaynağı.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Interrupt donanım mimarisi — GIC, APIC, yerel kontrolör</a></li>
+    <li><a href="#s1">request_irq ve free_irq — interrupt kayıt API</a></li>
+    <li><a href="#s2">IRQ handler yazımı — hardirq kısıtlamaları, spin_lock_irqsave</a></li>
+    <li><a href="#s3">Threaded IRQ — request_threaded_irq, RT uyumlu handler</a></li>
+    <li><a href="#s4">Softirq, tasklet ve workqueue — ertelenmiş iş hiyerarşisi</a></li>
+    <li><a href="#s5">IRQ affinity ve CPU pin — /proc/irq, smp_affinity</a></li>
+    <li><a href="#s6">MSI ve MSI-X — PCIe kesme modları</a></li>
+    <li><a href="#s7">IRQ domain — SoC interrupt controller sürücü yazımı</a></li>
+    <li><a href="#s8">Hata ayıklama — /proc/interrupts, irqsoff tracer, lockdep</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> Interrupt Donanım Mimarisi</h2>
+  <p class="section-lead">Bir çevre birimi CPU'ya "işim var" demek istediğinde donanım seviyesinde bir sinyal zinciri devreye girer. Bu zinciri anlamadan kernel tarafını doğru modellemek mümkün değildir.</p>
+
+  <h3>Kesme Türleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">Hardware IRQ</span><span class="desc">Fiziksel pin veya PCIe sinyal hattı üzerinden gelen, donanım tarafından tetiklenen kesme. CPU'yu <em>mevcut bağlamdan çıkarır</em>.</span></div>
+    <div class="param"><span class="name">Software IRQ (SWI)</span><span class="desc">Yazılım tarafından üretilen kesme — ARM'da <code>svc</code> komutu, x86'da <code>int 0x80</code>. Sistem çağrılarının temelini oluşturur.</span></div>
+    <div class="param"><span class="name">NMI</span><span class="desc">Non-Maskable Interrupt — maskelenemez, genellikle donanım hataları (ECC, watchdog) için kullanılır. Kernel bu tür kesmeleri özel handler ile yönetir.</span></div>
+    <div class="param"><span class="name">IPI</span><span class="desc">Inter-Processor Interrupt — çok çekirdekli sistemlerde çekirdekler arası sinyal. TLB flush, scheduler kick gibi amaçlarla kullanılır.</span></div>
+  </div>
+
+  <h3>ARM Generic Interrupt Controller (GIC)</h3>
+  <p>ARM SoC'lerde en yaygın interrupt controller ailesi GIC'tir. Günümüzde Cortex-A serisi sistemler GICv3 veya GICv4 kullanır; eski platformlar GICv2 ile devam eder.</p>
+
+  <div class="flow">
+    <pre>
+Çevre birimi (GPIO, UART, ETH...)
+        │ fiziksel kesme sinyali
+        ▼
+  GIC Distributor (GICD)
+  ├─ IRQ enable/disable
+  ├─ Priority ayarı
+  ├─ CPU hedef seçimi (affinity)
+  └─ Pending / Active takibi
+        │
+        ▼
+  GIC CPU Interface (GICC)  — her CPU çekirdeği için ayrı
+  ├─ IAR (Interrupt Acknowledge Register) — CPU hangi IRQ'yu işlediğini okur
+  └─ EOIR (End of Interrupt Register)   — işlem bitince EOI yazılır
+        │
+        ▼
+  CPU FIQ / IRQ vektörü
+        │
+        ▼
+  Linux vectors_irq → handle_arch_irq() → irq_enter() → handler
+    </pre>
+  </div>
+
+  <h3>GIC Interrupt Numaralandırması</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Aralık</th><th>Tür</th><th>Kısaltma</th><th>Kullanım</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>0–15</td><td>Software Generated</td><td>SGI</td><td>IPI, çekirdekler arası mesajlaşma</td></tr>
+        <tr><td>16–31</td><td>Private Peripheral</td><td>PPI</td><td>Yerel timer (arch_timer), PMU</td></tr>
+        <tr><td>32–1019</td><td>Shared Peripheral</td><td>SPI</td><td>UART, I2C, GPIO, ETH — tüm sistem IRQ'ları</td></tr>
+        <tr><td>1020–1023</td><td>Rezerv</td><td>—</td><td>Özel durum kodları (spurious vb.)</td></tr>
+        <tr><td>8192+</td><td>Locality-specific PPI</td><td>LPI</td><td>GICv3/v4 MSI desteği (ITS)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Device Tree ile IRQ Tanımı</h3>
+  <p>Bir SoC sürücüsünde kesme numarası genellikle Device Tree üzerinden gelir. GICv2 için standart <code>interrupts</code> özelliği şu biçimdedir:</p>
+  <pre><code>/* arch/arm/boot/dts/example-soc.dts */
+uart0: serial@12000000 {
+    compatible = "example,uart-v1";
+    reg = &lt;0x12000000 0x1000&gt;;
+    /*
+     * GICv2: &lt;tip  SPI-numarası  tetikleme&gt;
+     *   tip: 0 = SPI, 1 = PPI
+     *   tetikleme: 1 = kenar (rising), 4 = seviye (high)
+     */
+    interrupts = &lt;0 42 4&gt;;
+    interrupt-parent = &lt;&amp;gic&gt;;
+};</code></pre>
+
+  <h3>x86 APIC Karşılaştırması</h3>
+  <p>x86 mimarisinde yerel kesme kontrolörü <strong>LAPIC</strong> (Local APIC), sistem geneli yönlendirme ise <strong>I/O APIC</strong> tarafından yapılır. ARM GIC'e işlevsel olarak denktir; kernel her iki mimariyi de <code>irq_chip</code> soyutlama katmanı üzerinden yönetir.</p>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> request_irq ve free_irq</h2>
+  <p class="section-lead"><code>request_irq()</code>, bir sürücünün Linux IRQ alt sistemine "bu IRQ numarasının handler'ını benim" demesidir. Tek satır gibi görünse de arka planda IRQ domain çözümlemesi, affinity ayarı ve /proc/interrupts kaydı gerçekleşir.</p>
+
+  <h3>Temel API İmzaları</h3>
+  <pre><code>/* include/linux/interrupt.h */
+
+/**
+ * request_irq - kesme hattı talep et ve handler kaydet
+ * @irq:     Linux sanal IRQ numarası (irq_of_parse_and_map ile elde edilir)
+ * @handler: hardirq bağlamında çalışacak üst yarı handler
+ * @flags:   IRQF_* bayrakları (aşağıda açıklanır)
+ * @name:    /proc/interrupts satırında görünecek isim
+ * @dev_id:  free_irq'da doğrulama ve handler'a aktarılan opak pointer
+ *
+ * Başarıda 0, hata durumunda negatif errno döner.
+ */
+int request_irq(unsigned int irq,
+                irq_handler_t handler,
+                unsigned long flags,
+                const char *name,
+                void *dev_id);
+
+/* Yönetilen (devm) varyant — sürücü kaldırıldığında otomatik serbest bırakır */
+int devm_request_irq(struct device *dev,
+                     unsigned int irq,
+                     irq_handler_t handler,
+                     unsigned long flags,
+                     const char *name,
+                     void *dev_id);
+
+/* Serbest bırakma */
+void free_irq(unsigned int irq, void *dev_id);
+
+/* Handler imzası */
+typedef irqreturn_t (*irq_handler_t)(int irq, void *dev_id);
+/* Dönüş değerleri: IRQ_HANDLED, IRQ_NONE, IRQ_WAKE_THREAD */</code></pre>
+
+  <h3>IRQF_* Bayrakları</h3>
+  <div class="params">
+    <div class="param"><span class="name">IRQF_SHARED</span><span class="desc">Aynı IRQ hattını birden fazla sürücü paylaşabilir. Her handler çağrıldığında kesmenin kendi donanımından gelip gelmediğini kontrol etmeli ve yabancıysa IRQ_NONE dönmelidir.</span></div>
+    <div class="param"><span class="name">IRQF_TRIGGER_RISING</span><span class="desc">Yükselen kenar tetiklemesi. Alternatifler: IRQF_TRIGGER_FALLING, IRQF_TRIGGER_HIGH, IRQF_TRIGGER_LOW. DT'deki değer bu bayrakla çakışmamalıdır.</span></div>
+    <div class="param"><span class="name">IRQF_ONESHOT</span><span class="desc">Threaded IRQ kullanımında zorunludur — thread tamamlanana kadar IRQ hattı yeniden etkinleştirilmez. Seviye tetiklemeli IRQ'larda deadlock'u önler.</span></div>
+    <div class="param"><span class="name">IRQF_NO_THREAD</span><span class="desc">PREEMPT_RT çekirdeğinde bile bu IRQ'yu thread'e taşıma. Gerçekten kritik donanım kesmeleri için kullanılır.</span></div>
+    <div class="param"><span class="name">IRQF_PERF_CRITICAL</span><span class="desc">IRQ latency kritik — bazı RT schedulera ipucu. Çok dikkatli kullanılmalı.</span></div>
+  </div>
+
+  <h3>IRQ Numarası Alma — Device Tree Yolu</h3>
+  <pre><code>#include &lt;linux/platform_device.h&gt;
+#include &lt;linux/of_irq.h&gt;
+#include &lt;linux/interrupt.h&gt;
+
+static int mydrv_probe(struct platform_device *pdev)
+{
+    struct mydrv_priv *priv;
+    int irq, ret;
+
+    priv = devm_kzalloc(&amp;pdev->dev, sizeof(*priv), GFP_KERNEL);
+    if (!priv)
+        return -ENOMEM;
+
+    /*
+     * platform_get_irq() DT'deki "interrupts" özelliğini okur,
+     * IRQ domain aracılığıyla Linux virtual IRQ numarasına çevirir.
+     * İkinci parametre: DT'deki interrupts listesindeki indeks (0-tabanlı).
+     */
+    irq = platform_get_irq(pdev, 0);
+    if (irq &lt; 0) {
+        dev_err(&amp;pdev->dev, "IRQ alınamadı: %d\n", irq);
+        return irq;
+    }
+
+    ret = devm_request_irq(&amp;pdev->dev, irq,
+                           mydrv_irq_handler,
+                           IRQF_TRIGGER_HIGH,
+                           dev_name(&amp;pdev->dev),
+                           priv);
+    if (ret) {
+        dev_err(&amp;pdev->dev, "IRQ %d talep edilemedi: %d\n", irq, ret);
+        return ret;
+    }
+
+    priv->irq = irq;
+    platform_set_drvdata(pdev, priv);
+    return 0;
+}</code></pre>
+
+  <h3>IRQF_SHARED Kullanımı</h3>
+  <pre><code>/* Paylaşımlı IRQ — dev_id NULL olmamalı */
+ret = request_irq(shared_irq,
+                  mydrv_shared_handler,
+                  IRQF_SHARED | IRQF_TRIGGER_RISING,
+                  "mydrv-shared",
+                  priv);   /* dev_id olarak priv kullan */
+
+/* Handler: kendi donanımından mı geliyor? */
+static irqreturn_t mydrv_shared_handler(int irq, void *dev_id)
+{
+    struct mydrv_priv *priv = dev_id;
+
+    /* Donanım register'ı oku — bu kesme bize ait mi? */
+    if (!(readl(priv->base + STATUS_REG) &amp; IRQ_PENDING_BIT))
+        return IRQ_NONE;   /* Başka sürücünün kesmesi, dokunma */
+
+    /* Kendi işlemizi yap */
+    writel(IRQ_CLEAR_BIT, priv->base + STATUS_REG);
+    /* ... */
+    return IRQ_HANDLED;
+}</code></pre>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> IRQ Handler Yazımı</h2>
+  <p class="section-lead">Hardirq bağlamı, kernel'in en kısıtlı çalışma ortamıdır. Bu bağlamda yapılabilecekler ve yapılamayacaklar sürücünün doğruluğunu doğrudan belirler.</p>
+
+  <h3>Hardirq Bağlamı Kısıtları</h3>
+  <div class="params">
+    <div class="param"><span class="name">Uyku yasak</span><span class="desc"><code>sleep()</code>, <code>mutex_lock()</code>, <code>wait_event()</code>, <code>schedule()</code> — tümü yasaktır. Bu fonksiyonlar çağrıldığında <code>might_sleep()</code> DEBUG modda uyarı verir.</span></div>
+    <div class="param"><span class="name">GFP_KERNEL yasak</span><span class="desc">Bellek tahsisi yalnızca <code>GFP_ATOMIC</code> ile yapılabilir. <code>GFP_ATOMIC</code> hata olasılığı yüksek olduğundan tercih edilmemelidir — önceden tahsis edin.</span></div>
+    <div class="param"><span class="name">Preemption kapalı</span><span class="desc">Hardirq handler süresince preemption ve yerel IRQ'lar devre dışıdır. Handler ne kadar uzun olursa sistem o kadar geç yanıt verir.</span></div>
+    <div class="param"><span class="name">in_interrupt() == true</span><span class="desc"><code>in_interrupt()</code> makrosu hardirq ve softirq bağlamlarında true döner. Bu makroyu kontrol eden API'lar (örn. bazı i2c fonksiyonları) bu bağlamda hata verebilir.</span></div>
+  </div>
+
+  <h3>Doğru Handler Yapısı</h3>
+  <pre><code>static irqreturn_t mydrv_irq_handler(int irq, void *dev_id)
+{
+    struct mydrv_priv *priv = dev_id;
+    u32 status;
+
+    /*
+     * 1. Status register'ı oku — hangi kesme kaynağı aktif?
+     *    Okumak aynı zamanda "acknowledge" işlevi görür bazı IP'lerde.
+     */
+    status = readl(priv->base + IRQ_STATUS_REG);
+    if (!status)
+        return IRQ_NONE;   /* Spurious — bu donanım biz değil */
+
+    /*
+     * 2. Kesme kaynağını hemen kapat (level-triggered için kritik)
+     *    Aksi hâlde handler dönünce IRQ tekrar tetiklenir.
+     */
+    writel(status, priv->base + IRQ_CLEAR_REG);
+
+    /*
+     * 3. Veriyi IRQ-safe buffer'a kopyala — softirq/thread erişecek
+     *    spin_lock_irqsave GEREKSİZ: zaten IRQ kapalı bağlamdayız.
+     *    Ama başka CPU'dan erişim olabilirse spin_lock() gerekir.
+     */
+    spin_lock(&amp;priv->lock);
+    priv->pending_status |= status;
+    spin_unlock(&amp;priv->lock);
+
+    /*
+     * 4. Alt yarıyı zamanla — asıl işlem orada yapılsın
+     */
+    tasklet_schedule(&amp;priv->tasklet);
+    /* ya da: queue_work(priv->wq, &amp;priv->work); */
+
+    return IRQ_HANDLED;
+}</code></pre>
+
+  <h3>spin_lock_irqsave — Ne Zaman Gerekir</h3>
+  <pre><code>/*
+ * SENARYO: Process context (örn. file_operations->write) ve IRQ handler
+ * aynı spinlock'u paylaşıyor.
+ *
+ * Process context'te normal spin_lock kullansak:
+ *   CPU A, lock'u tutarken IRQ gelir → IRQ handler lock almaya çalışır
+ *   → Deadlock! (aynı CPU, IRQ kapalı değil)
+ *
+ * Çözüm: process context'te spin_lock_irqsave kullan.
+ */
+
+/* Process context (sysfs, write, ioctl...) */
+static ssize_t mydrv_write(struct file *f, const char __user *buf,
+                           size_t len, loff_t *off)
+{
+    struct mydrv_priv *priv = f->private_data;
+    unsigned long flags;
+
+    spin_lock_irqsave(&amp;priv->lock, flags);   /* yerel IRQ'ları kapat + lock al */
+    /* kritik bölge */
+    spin_unlock_irqrestore(&amp;priv->lock, flags); /* eski IRQ durumunu geri yükle */
+    return len;
+}
+
+/* IRQ handler — zaten IRQ kapalı, sadece spin_lock yeterli */
+static irqreturn_t mydrv_irq_handler(int irq, void *dev_id)
+{
+    struct mydrv_priv *priv = dev_id;
+
+    spin_lock(&amp;priv->lock);   /* başka CPU'nun aynı lock'u tutmasını engelle */
+    /* kritik bölge */
+    spin_unlock(&amp;priv->lock);
+    return IRQ_HANDLED;
+}</code></pre>
+
+  <h3>İdeal Handler Süresi</h3>
+  <p>Hardirq handler mümkün olduğunca kısa tutulmalıdır. Gerçek zamanlı sistemlerde hedef genellikle <strong>&lt;10 µs</strong>'dir. Bunun üzerinde kalan işlemler mutlaka threaded IRQ veya workqueue'ya taşınmalıdır.</p>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> Threaded IRQ</h2>
+  <p class="section-lead">Threaded IRQ, Linux 2.6.30 ile gelen ve PREEMPT_RT'nin temel taşlarından biri olan mekanizmadır. Kesme işleme mantığını bir kernel thread'ine taşıyarak latency ve öncelik yönetimini büyük ölçüde iyileştirir.</p>
+
+  <h3>request_threaded_irq API</h3>
+  <pre><code>/* include/linux/interrupt.h */
+
+/**
+ * request_threaded_irq - üst ve alt yarı handler'ı ayrı kaydet
+ *
+ * @irq:         Linux virtual IRQ numarası
+ * @handler:     Hardirq bağlamında çalışır (üst yarı / primary handler).
+ *               NULL olabilir — kernel varsayılan "wake thread" handler'ı kullanır.
+ * @thread_fn:   Kernel thread bağlamında çalışır (alt yarı).
+ *               Bu fonksiyon uyuyabilir, mutex alabilir, kmalloc yapabilir.
+ * @irqflags:    IRQF_ONESHOT dahil bayraklar
+ * @devname:     /proc/interrupts'ta görünecek isim
+ * @dev_id:      Her iki handler'a aktarılan opak pointer
+ */
+int request_threaded_irq(unsigned int irq,
+                         irq_handler_t handler,
+                         irq_handler_t thread_fn,
+                         unsigned long irqflags,
+                         const char *devname,
+                         void *dev_id);
+
+/* devm varyantı */
+int devm_request_threaded_irq(struct device *dev,
+                               unsigned int irq,
+                               irq_handler_t handler,
+                               irq_handler_t thread_fn,
+                               unsigned long irqflags,
+                               const char *devname,
+                               void *dev_id);</code></pre>
+
+  <h3>Threaded IRQ Akışı</h3>
+  <div class="flow">
+    <pre>
+Donanım IRQ sinyali
+        │
+        ▼
+  hardirq handler() — IRQ kapalı bağlam
+  ├─ Donanımı acknowledge et
+  ├─ Kritik verileri kopyala
+  └─ IRQ_WAKE_THREAD döndür
+        │
+        ▼
+  irq/N-devname (kernel thread) uyanır
+        │  (schedule edilir, normal öncelik ile)
+        ▼
+  thread_fn() — process bağlamı
+  ├─ mutex, semaphore kullanabilir
+  ├─ kmalloc(GFP_KERNEL) yapabilir
+  ├─ i2c/spi transfer başlatabilir
+  └─ IRQ_HANDLED döndür
+        │
+        ▼
+  IRQF_ONESHOT: IRQ hattı tekrar etkinleştirilir
+    </pre>
+  </div>
+
+  <h3>Gerçek Dünya Örneği — I2C Dokunmatik Ekran</h3>
+  <pre><code>/* Dokunmatik ekran: her dokunuşta GPIO IRQ → I2C okuma gerekiyor
+ * I2C okuma uyuyabilir → mutlaka thread'e taşınmalı */
+
+static irqreturn_t ts_hardirq(int irq, void *dev_id)
+{
+    /* Sadece GPIO interrupt pending bitini sil — çok hızlı */
+    /* Gerçek donanım okuma işlemi thread'de yapılacak */
+    return IRQ_WAKE_THREAD;
+}
+
+static irqreturn_t ts_thread_fn(int irq, void *dev_id)
+{
+    struct ts_priv *ts = dev_id;
+    u8 buf[6];
+    int ret;
+
+    /* I2C okuma — uyuyabilir, tamamen güvenli */
+    ret = i2c_master_recv(ts->client, buf, sizeof(buf));
+    if (ret != sizeof(buf)) {
+        dev_err(&amp;ts->client->dev, "I2C okuma hatası: %d\n", ret);
+        return IRQ_HANDLED;
+    }
+
+    /* Input event gönder */
+    input_report_abs(ts->input, ABS_X, (buf[1] &lt;&lt; 8) | buf[2]);
+    input_report_abs(ts->input, ABS_Y, (buf[3] &lt;&lt; 8) | buf[4]);
+    input_report_key(ts->input, BTN_TOUCH, buf[0] &amp; 0x01);
+    input_sync(ts->input);
+
+    return IRQ_HANDLED;
+}
+
+static int ts_probe(struct i2c_client *client)
+{
+    struct ts_priv *ts;
+    int ret;
+
+    ts = devm_kzalloc(&amp;client->dev, sizeof(*ts), GFP_KERNEL);
+    if (!ts)
+        return -ENOMEM;
+
+    ts->client = client;
+    /* irq_to_gpio veya client->irq — I2C sürücüsünde IRQ DT'den gelir */
+
+    ret = devm_request_threaded_irq(&amp;client->dev,
+                                    client->irq,
+                                    ts_hardirq,    /* üst yarı */
+                                    ts_thread_fn,  /* alt yarı */
+                                    IRQF_ONESHOT | IRQF_TRIGGER_FALLING,
+                                    "ts-irq",
+                                    ts);
+    return ret;
+}</code></pre>
+
+  <h3>PREEMPT_RT ile İlişki</h3>
+  <p>PREEMPT_RT yamalı çekirdekte, threaded olmayan tüm IRQ'lar otomatik olarak kernel thread'lerine alınır (forced-threaded IRQ). <code>IRQF_NO_THREAD</code> bayrağı bu dönüşümü engeller. Bu sayede IRQ handler'ların önceliği <code>chrt</code> ile ayarlanabilir:</p>
+  <pre><code># IRQ 45'e hizmet eden thread'i bul
+grep "irq/45" /proc/*/status | grep -o '/proc/[0-9]*/status'
+
+# SCHED_FIFO öncelik 90 ver
+chrt -f -p 90 &lt;PID&gt;
+
+# Alternatif: tüm IRQ thread önceliklerini ayarla
+for pid in $(ps -eo pid,comm | grep "irq/" | awk '{print $1}'); do
+    chrt -f -p 80 $pid 2&gt;/dev/null
+done</code></pre>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> Softirq, Tasklet ve Workqueue</h2>
+  <p class="section-lead">Linux, hardirq handler'dan ertelenen işleri üç farklı mekanizmayla yönetir. Her birinin farklı gecikme garantisi, eşzamanlılık modeli ve kısıtları vardır.</p>
+
+  <h3>Ertelenmiş İş Hiyerarşisi</h3>
+  <div class="flow">
+    <pre>
+Hardirq Handler (en kısıtlı)
+        │
+        │ ertelenmiş iş
+        ▼
+  ┌─────────────┬─────────────┬──────────────────┐
+  │   Softirq   │   Tasklet   │    Workqueue      │
+  │ (static,    │ (softirq    │ (process context) │
+  │  çekirdek   │  üstüne     │                   │
+  │  tarafından │  inşa)      │                   │
+  │  tanımlı)   │             │                   │
+  ├─────────────┼─────────────┼──────────────────┤
+  │ Uyuma: HAYIR│ Uyuma: HAYIR│ Uyuma: EVET       │
+  │ Paralel:EVET│ Paralel:HAYIR│ Paralel: EVET    │
+  │ (farklı CPU)│             │ (WQ_UNBOUND ile)  │
+  └─────────────┴─────────────┴──────────────────┘
+    </pre>
+  </div>
+
+  <h3>Softirq</h3>
+  <p>Softirq'lar çekirdek kaynak kodunda statik olarak tanımlanmıştır; sürücü geliştiricisi yeni softirq ekleyemez. Var olan softirq türleri:</p>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Enum</th><th>Öncelik</th><th>Kullanım Yeri</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>HI_SOFTIRQ</td><td>0 (en yüksek)</td><td>Yüksek öncelikli tasklet'ler</td></tr>
+        <tr><td>TIMER_SOFTIRQ</td><td>1</td><td>Kernel timer wheel işleme</td></tr>
+        <tr><td>NET_TX_SOFTIRQ</td><td>2</td><td>Ağ paketi gönderimi</td></tr>
+        <tr><td>NET_RX_SOFTIRQ</td><td>3</td><td>Ağ paketi alımı (NAPI)</td></tr>
+        <tr><td>BLOCK_SOFTIRQ</td><td>4</td><td>Blok I/O tamamlama</td></tr>
+        <tr><td>SCHED_SOFTIRQ</td><td>6</td><td>CFS görev dağılımı (SMP)</td></tr>
+        <tr><td>TASKLET_SOFTIRQ</td><td>7 (en düşük)</td><td>Sürücü tasklet'leri</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Tasklet API</h3>
+  <pre><code>#include &lt;linux/interrupt.h&gt;
+
+/* Statik tanımlama */
+DECLARE_TASKLET(name, func);            /* enabled */
+DECLARE_TASKLET_DISABLED(name, func);   /* disabled */
+
+/* Dinamik tanımlama (sürücü init'te) */
+tasklet_init(&amp;priv-&gt;tasklet, mydrv_tasklet_fn, (unsigned long)priv);
+
+/* Handler */
+static void mydrv_tasklet_fn(unsigned long data)
+{
+    struct mydrv_priv *priv = (struct mydrv_priv *)data;
+    /* Softirq bağlamı: uyuma yok, GFP_ATOMIC gerekli */
+    /* Aynı tasklet aynı anda yalnızca bir CPU'da çalışır */
+    process_pending(priv);
+}
+
+/* IRQ handler'dan zamanla */
+static irqreturn_t mydrv_irq(int irq, void *dev_id)
+{
+    struct mydrv_priv *priv = dev_id;
+    /* ... hızlı ack ... */
+    tasklet_schedule(&amp;priv-&gt;tasklet);  /* zaten scheduled ise ikinci çağrı yok sayılır */
+    return IRQ_HANDLED;
+}
+
+/* Temizlik */
+tasklet_kill(&amp;priv-&gt;tasklet);  /* bekler, sonra devre dışı bırakır */</code></pre>
+
+  <h3>Tasklet vs Workqueue — Karar Tablosu</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Kriter</th><th>Tasklet</th><th>Workqueue</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Uyuma / blocking I/O</td><td>Yasak</td><td>Serbest</td></tr>
+        <tr><td>Gecikme</td><td>Düşük (~microsaniye)</td><td>Daha yüksek (schedule gecikmesi)</td></tr>
+        <tr><td>Paralel çalışma</td><td>Aynı anda tek CPU</td><td>Birden fazla worker thread</td></tr>
+        <tr><td>Yeni kod önerisi</td><td>Kaçın — deprecated eğilimde</td><td>Tercih edilmeli</td></tr>
+        <tr><td>Bellek ayak izi</td><td>Küçük</td><td>Worker thread stack'i</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> IRQ Affinity ve CPU Pin</h2>
+  <p class="section-lead">IRQ affinity, bir kesmenin hangi CPU çekirdeği tarafından işleneceğini belirler. Yüksek hızlı NIC, gerçek zamanlı kontrol döngüsü veya NUMA topolojisi gerektiren sistemlerde kritik öneme sahiptir.</p>
+
+  <h3>/proc/irq Arayüzü</h3>
+  <pre><code># Sistemdeki tüm IRQ'ların listesi (kısaltılmış)
+cat /proc/interrupts
+#            CPU0       CPU1       CPU2       CPU3
+#   0:    1234567          0          0          0  IR-IO-APIC    2-edge  timer
+#  42:          0     987654          0          0  PCI-MSI 524288-edge  eth0-rx-0
+#  43:          0          0    123456          0  PCI-MSI 524289-edge  eth0-rx-1
+
+# IRQ 42'nin affinity maskesi (hangi CPU'lar işleyebilir)
+cat /proc/irq/42/smp_affinity
+# 2   ← bitmask: CPU1 (0b0010)
+
+cat /proc/irq/42/smp_affinity_list
+# 1   ← aynı şey, CPU numarası formatında
+
+# IRQ 42'yi CPU2 ve CPU3'e ata (bitmask: 0b1100 = 0xc)
+echo c &gt; /proc/irq/42/smp_affinity
+
+# Sadece CPU0'a zorla
+echo 1 &gt; /proc/irq/42/smp_affinity</code></pre>
+
+  <h3>irqbalance Servisi</h3>
+  <p>Çoğu dağıtımda <code>irqbalance</code> daemon'u çalışır ve IRQ'ları CPU'lara otomatik dağıtır. Gerçek zamanlı sistemlerde bu daemon durdurulup affinity manuel ayarlanmalıdır:</p>
+  <pre><code># RT sistemde irqbalance'ı durdur
+systemctl stop irqbalance
+systemctl disable irqbalance
+
+# Belirli IRQ'ları CPU'lara dağıt (başlangıç scripti)
+#!/bin/bash
+# Tüm ağ IRQ'larını CPU2-3'e taşı
+for irq in $(grep eth0 /proc/interrupts | awk -F: '{print $1}'); do
+    echo c &gt; /proc/irq/${irq}/smp_affinity
+done
+# RT görev CPU0-1'de çalışıyor — ağ trafiğini uzak tut</code></pre>
+
+  <h3>Kernel API ile Affinity Ayarı</h3>
+  <pre><code>#include &lt;linux/interrupt.h&gt;
+#include &lt;linux/cpumask.h&gt;
+
+/* Belirli bir CPU'ya IRQ'yu sabitle */
+static int mydrv_set_irq_affinity(struct mydrv_priv *priv, int cpu)
+{
+    struct cpumask mask;
+    int ret;
+
+    cpumask_clear(&amp;mask);
+    cpumask_set_cpu(cpu, &amp;mask);
+
+    ret = irq_set_affinity_hint(priv->irq, &amp;mask);
+    if (ret) {
+        dev_warn(&amp;priv->dev, "IRQ affinity ayarlanamadı: %d\n", ret);
+        return ret;
+    }
+
+    ret = irq_set_affinity(priv->irq, &amp;mask);
+    return ret;
+}
+
+/* Sürücü kaldırıldığında affinity hint'i temizle */
+static void mydrv_remove(struct platform_device *pdev)
+{
+    struct mydrv_priv *priv = platform_get_drvdata(pdev);
+    irq_set_affinity_hint(priv->irq, NULL);
+}</code></pre>
+
+  <h3>NUMA Topolojisinde Affinity</h3>
+  <p>NUMA sistemlerde PCIe cihazının bağlı olduğu NUMA node'undaki CPU'lara IRQ atamak bellek erişim gecikmesini önemli ölçüde azaltır:</p>
+  <pre><code># PCIe cihazının NUMA node'unu öğren
+cat /sys/bus/pci/devices/0000:01:00.0/numa_node
+# 0
+
+# O node'daki CPU'ları listele
+cat /sys/devices/system/node/node0/cpulist
+# 0-7,16-23
+
+# IRQ'ları bu CPU'lara ata
+echo ff &gt; /proc/irq/42/smp_affinity   # CPU 0-7</code></pre>
+
+  <h3>isolcpus ile RT CPU Ayırma</h3>
+  <pre><code># Kernel boot parametresi (grub/cmdline)
+isolcpus=2,3 rcu_nocbs=2,3 nohz_full=2,3
+
+# Sonuç: CPU 2-3'e IRQ ve kernel thread gönderilmez
+# Sadece oraya taşınan RT görevler çalışır</code></pre>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> MSI ve MSI-X</h2>
+  <p class="section-lead">PCI/PCIe cihazları geleneksel pin tabanlı IRQ yerine Message Signaled Interrupts (MSI) kullanır. MSI, paylaşımlı IRQ sorununu ortadan kaldırır ve çok kuyruklu NIC/NVMe gibi yüksek bant genişlikli cihazlar için vazgeçilmezdir.</p>
+
+  <h3>Pin IRQ vs MSI Farkı</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Özellik</th><th>Pin-based IRQ (INTx)</th><th>MSI / MSI-X</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Mekanizma</td><td>Fiziksel sinyal hattı</td><td>Memory write (mesaj)</td></tr>
+        <tr><td>Paylaşım</td><td>IRQF_SHARED gerekebilir</td><td>Her vektör benzersiz</td></tr>
+        <tr><td>Vektör sayısı</td><td>1</td><td>MSI: 32, MSI-X: 2048'e kadar</td></tr>
+        <tr><td>Affinity</td><td>Kısıtlı</td><td>Vektör başına bağımsız</td></tr>
+        <tr><td>NUMA uyumu</td><td>Zayıf</td><td>Güçlü — vektör CPU'ya yakın</td></tr>
+        <tr><td>Hata tespiti</td><td>Zor (paylaşımlı)</td><td>Kolay (cihaz başına)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>MSI Etkinleştirme</h3>
+  <pre><code>#include &lt;linux/pci.h&gt;
+
+static int mypcie_probe(struct pci_dev *pdev,
+                        const struct pci_device_id *id)
+{
+    int ret, irq;
+
+    ret = pci_enable_device(pdev);
+    if (ret)
+        return ret;
+
+    pci_set_master(pdev);
+
+    /*
+     * MSI talep et — başarılı olursa pdev->irq güncellenir.
+     * Başarısız olursa eski INTx kullanılabilir.
+     */
+    ret = pci_enable_msi(pdev);
+    if (ret) {
+        dev_warn(&amp;pdev->dev, "MSI etkinleştirilemedi, INTx kullanılıyor\n");
+        /* INTx yoluna devam et */
+    }
+
+    irq = pdev->irq;   /* MSI veya INTx, hangisi etkinse */
+
+    ret = request_irq(irq, mypcie_irq_handler,
+                      0,   /* MSI'da IRQF_SHARED gerekmez */
+                      "mypcie",
+                      pdev);
+    return ret;
+}
+
+static void mypcie_remove(struct pci_dev *pdev)
+{
+    free_irq(pdev->irq, pdev);
+    pci_disable_msi(pdev);
+    pci_disable_device(pdev);
+}</code></pre>
+
+  <h3>MSI-X — Çok Kuyruklu Cihazlar</h3>
+  <pre><code>#include &lt;linux/pci.h&gt;
+
+#define MAX_QUEUES 8
+
+struct mypcie_priv {
+    struct pci_dev *pdev;
+    int num_queues;
+    struct msix_entry msix[MAX_QUEUES];
+};
+
+static int mypcie_setup_msix(struct mypcie_priv *priv)
+{
+    int i, ret;
+
+    /* msix_entry dizisini hazırla */
+    for (i = 0; i &lt; MAX_QUEUES; i++)
+        priv-&gt;msix[i].entry = i;  /* istenen vektör indeksi */
+
+    /*
+     * pci_enable_msix_range: min ve max vektör sayısı belirt.
+     * Kernel en fazla alabileceği kadar verir.
+     * Dönüş değeri: atanan vektör sayısı (pozitif) veya hata (negatif)
+     */
+    ret = pci_enable_msix_range(priv-&gt;pdev,
+                                priv-&gt;msix,
+                                1,           /* minimum */
+                                MAX_QUEUES); /* maksimum */
+    if (ret &lt; 0)
+        return ret;
+
+    priv-&gt;num_queues = ret;
+    dev_info(&amp;priv-&gt;pdev-&gt;dev, "%d MSI-X vektörü atandı\n", ret);
+
+    /* Her kuyruk için ayrı handler kaydet */
+    for (i = 0; i &lt; priv-&gt;num_queues; i++) {
+        ret = request_irq(priv-&gt;msix[i].vector,
+                          mypcie_queue_irq,
+                          0,
+                          "mypcie-queue",
+                          &amp;priv-&gt;queues[i]);
+        if (ret)
+            goto err_free;
+    }
+
+    return 0;
+
+err_free:
+    while (--i &gt;= 0)
+        free_irq(priv-&gt;msix[i].vector, &amp;priv-&gt;queues[i]);
+    pci_disable_msix(priv-&gt;pdev);
+    return ret;
+}</code></pre>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> IRQ Domain — SoC Interrupt Controller Sürücüsü</h2>
+  <p class="section-lead">IRQ domain, donanım IRQ numaralarını Linux sanal IRQ numaralarına (virq) eşleyen soyutlama katmanıdır. Her interrupt controller bir IRQ domain oluşturur; zincirleme controller'lar (cascade) iç içe domain hiyerarşisi kurar.</p>
+
+  <h3>IRQ Domain Kavramı</h3>
+  <div class="flow">
+    <pre>
+Donanım HW IRQ 42
+        │
+        ▼
+  irq_domain_add_linear()
+  veya irq_domain_add_tree()
+  ile oluşturulan domain
+        │
+        ▼  irq_create_mapping(domain, 42)
+  Linux virq 120   ← /proc/interrupts'ta görünen numara
+        │
+        ▼
+  request_irq(120, handler, ...)
+    </pre>
+  </div>
+
+  <h3>Basit Interrupt Controller Sürücüsü</h3>
+  <pre><code>#include &lt;linux/irq.h&gt;
+#include &lt;linux/irqdomain.h&gt;
+#include &lt;linux/of_irq.h&gt;
+#include &lt;linux/interrupt.h&gt;
+#include &lt;linux/platform_device.h&gt;
+
+#define MY_INTC_NUM_IRQS  32
+#define MY_INTC_STATUS    0x00
+#define MY_INTC_MASK      0x04
+#define MY_INTC_CLEAR     0x08
+
+struct my_intc {
+    void __iomem       *base;
+    struct irq_domain  *domain;
+    int                 parent_irq;
+};
+
+/* irq_chip: donanım üzerindeki mask/unmask/ack işlemleri */
+static void my_intc_mask(struct irq_data *d)
+{
+    struct my_intc *intc = irq_data_get_irq_chip_data(d);
+    u32 mask = readl(intc-&gt;base + MY_INTC_MASK);
+    mask &amp;= ~BIT(d-&gt;hwirq);
+    writel(mask, intc-&gt;base + MY_INTC_MASK);
+}
+
+static void my_intc_unmask(struct irq_data *d)
+{
+    struct my_intc *intc = irq_data_get_irq_chip_data(d);
+    u32 mask = readl(intc-&gt;base + MY_INTC_MASK);
+    mask |= BIT(d-&gt;hwirq);
+    writel(mask, intc-&gt;base + MY_INTC_MASK);
+}
+
+static void my_intc_ack(struct irq_data *d)
+{
+    struct my_intc *intc = irq_data_get_irq_chip_data(d);
+    writel(BIT(d-&gt;hwirq), intc-&gt;base + MY_INTC_CLEAR);
+}
+
+static struct irq_chip my_irq_chip = {
+    .name        = "my-intc",
+    .irq_mask    = my_intc_mask,
+    .irq_unmask  = my_intc_unmask,
+    .irq_ack     = my_intc_ack,
+};
+
+/* irq_domain_ops: HW IRQ → virq eşlemesi */
+static int my_intc_domain_map(struct irq_domain *d,
+                               unsigned int virq,
+                               irq_hw_number_t hwirq)
+{
+    struct my_intc *intc = d-&gt;host_data;
+
+    irq_set_chip_data(virq, intc);
+    irq_set_chip_and_handler(virq, &amp;my_irq_chip, handle_level_irq);
+    irq_set_noprobe(virq);
+    return 0;
+}
+
+static const struct irq_domain_ops my_intc_domain_ops = {
+    .map    = my_intc_domain_map,
+    .xlate  = irq_domain_xlate_onecell,  /* DT'de tek hücreli IRQ tanımı */
+};
+
+/* Parent IRQ handler — chained interrupt controller */
+static void my_intc_handler(struct irq_desc *desc)
+{
+    struct my_intc *intc = irq_desc_get_handler_data(desc);
+    struct irq_chip *chip = irq_desc_get_chip(desc);
+    u32 status;
+    int hwirq;
+
+    chained_irq_enter(chip, desc);
+
+    status = readl(intc-&gt;base + MY_INTC_STATUS);
+    while (status) {
+        hwirq = __ffs(status);   /* en düşük set bit */
+        generic_handle_irq(irq_find_mapping(intc-&gt;domain, hwirq));
+        status &amp;= ~BIT(hwirq);
+    }
+
+    chained_irq_exit(chip, desc);
+}
+
+static int my_intc_probe(struct platform_device *pdev)
+{
+    struct my_intc *intc;
+    struct resource *res;
+    int parent_irq;
+
+    intc = devm_kzalloc(&amp;pdev-&gt;dev, sizeof(*intc), GFP_KERNEL);
+    if (!intc)
+        return -ENOMEM;
+
+    res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+    intc-&gt;base = devm_ioremap_resource(&amp;pdev-&gt;dev, res);
+    if (IS_ERR(intc-&gt;base))
+        return PTR_ERR(intc-&gt;base);
+
+    /* Linear domain — sabit sayıda HW IRQ */
+    intc-&gt;domain = irq_domain_add_linear(pdev-&gt;dev.of_node,
+                                          MY_INTC_NUM_IRQS,
+                                          &amp;my_intc_domain_ops,
+                                          intc);
+    if (!intc-&gt;domain)
+        return -ENOMEM;
+
+    parent_irq = platform_get_irq(pdev, 0);
+    irq_set_chained_handler_and_data(parent_irq,
+                                     my_intc_handler,
+                                     intc);
+
+    platform_set_drvdata(pdev, intc);
+    dev_info(&amp;pdev-&gt;dev, "my-intc: %d IRQ, parent=%d\n",
+             MY_INTC_NUM_IRQS, parent_irq);
+    return 0;
+}</code></pre>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Hata Ayıklama</h2>
+  <p class="section-lead">IRQ sorunları — spurious kesmeler, handler çakışmaları, latency gerilemeleri — sistemin en zor hata ayıklama senaryolarından birini oluşturur. Linux bu amaçla zengin bir araç seti sunar.</p>
+
+  <h3>/proc/interrupts Okuma</h3>
+  <pre><code>cat /proc/interrupts
+#            CPU0       CPU1       CPU2       CPU3
+#   0:   12873456          0          0          0  IR-IO-APIC    2-edge  timer
+#   8:          0          1          0          0  IR-IO-APIC    8-edge  rtc0
+#  42:          0    4567890          0          0  PCI-MSI 524288-edge  eth0-rx-0
+#  43:          0          0    9876543          0  PCI-MSI 524289-edge  eth0-rx-1
+# NMI:         12         11         10         11   Non-maskable interrupts
+# ERR:          0
+# MIS:          0   ← Missed/spurious IRQ sayısı — sıfır olmalı!
+
+# Belirli bir IRQ'yu izle (1 saniye aralıkla)
+watch -n1 'grep eth0 /proc/interrupts'</code></pre>
+
+  <h3>irqsoff Tracer — Maksimum IRQ Kapalı Süre</h3>
+  <pre><code># ftrace irqsoff tracer'ı etkinleştir
+echo 0 &gt; /sys/kernel/debug/tracing/tracing_on
+echo irqsoff &gt; /sys/kernel/debug/tracing/current_tracer
+echo 1 &gt; /sys/kernel/debug/tracing/tracing_on
+
+# Bir süre bekle, sonra durdur
+sleep 5
+echo 0 &gt; /sys/kernel/debug/tracing/tracing_on
+
+# En uzun IRQ kapalı kalma olayını görüntüle
+cat /sys/kernel/debug/tracing/trace
+# irqsoff latency trace v1.1.5 on 6.6.0-rt
+# latency: 47 us, #4/4, CPU#1 | (M:preempt VP:0, KP:0, SP:0 HP:0)
+# -----------------
+# 1)  &lt;idle&gt;-0    |   0.000 us  | _raw_spin_lock_irqsave();
+# 1)  &lt;idle&gt;-0    |  47.123 us  | _raw_spin_unlock_irqrestore();</code></pre>
+
+  <h3>lockdep ile IRQ Lock Doğrulama</h3>
+  <pre><code>/* Kernel CONFIG_LOCKDEP=y ile derlenmişse:
+ *
+ * Yanlış kullanım: process context'te spin_lock() — IRQ handler ile deadlock riski
+ * lockdep bunu boot'ta veya ilk çağrıda tespit eder.
+ *
+ * Uyarı mesajı örneği:
+ *
+ * WARNING: possible irq lock inversion dependency detected
+ * mydrv_write/1234 just changed the state of lock:
+ * (mydrv_lock){....}, at: mydrv_write+0x40/0x80
+ * but this lock took another, HARDIRQ-safe lock in the past:
+ * (mydrv_irq_handler)
+ *
+ * Çözüm: process context'te spin_lock_irqsave kullan
+ */
+
+/* Doğrulama için bilinçli test */
+#include &lt;linux/lockdep.h&gt;
+
+/* Handler'ın gerçekten IRQ bağlamında çalıştığını assert et */
+lockdep_assert_irqs_disabled();
+
+/* Handler'ın process bağlamında çalıştığını assert et */
+lockdep_assert_irqs_enabled();</code></pre>
+
+  <h3>spurious_irq Tespiti</h3>
+  <pre><code>/* Kernel spurious IRQ'yu otomatik raporlar:
+ *
+ * kernel: irq 42: nobody cared (try booting with the "irqpoll" option)
+ * kernel: handlers:
+ * kernel: [&lt;ffffffff81234567&gt;] mydrv_handler
+ * kernel: Disabling IRQ #42
+ *
+ * Neden olur:
+ * 1. IRQ handler IRQ_NONE döndürüyor ama IRQ devam ediyor
+ * 2. Donanım status register okunmadan önce acknowledge edildi
+ * 3. Edge-triggered IRQ'da clear işlemi yanlış sırada yapıldı
+ *
+ * Debug için: irqpoll boot parametresi ile tüm IRQ'lar poll moduna alınır
+ */
+
+/* Her handler'da bu kontrolü yap: */
+static irqreturn_t safe_handler(int irq, void *dev_id)
+{
+    struct mydrv_priv *priv = dev_id;
+    u32 status = readl(priv-&gt;base + STATUS_REG);
+
+    if (!(status &amp; OUR_IRQ_BIT)) {
+        /* Bu satır çok sık görünüyorsa spurious IRQ var */
+        dev_dbg(&amp;priv-&gt;dev, "spurious IRQ (status=0x%08x)\n", status);
+        return IRQ_NONE;
+    }
+    /* ... */
+    return IRQ_HANDLED;
+}</code></pre>
+
+  <h3>perf ile IRQ İstatistikleri</h3>
+  <pre><code># IRQ event'lerini say (1 saniye boyunca)
+perf stat -e irq:irq_handler_entry,irq:irq_handler_exit sleep 1
+
+# Hangi handler en çok çağrılıyor?
+perf record -e irq:irq_handler_entry -ag sleep 10
+perf report
+
+# ftrace ile handler giriş/çıkış zamanlaması
+echo 'irq:irq_handler_entry irq:irq_handler_exit' &gt; \
+    /sys/kernel/debug/tracing/set_event
+cat /sys/kernel/debug/tracing/trace_pipe</code></pre>
+
+  <h3>Yaygın Sorunlar ve Çözümler</h3>
+  <div class="params">
+    <div class="param"><span class="name">IRQ storm</span><span class="desc">Seviye tetiklemeli IRQ'da kaynak temizlenmeden handler dönüyor — IRQ tekrar tekrar tetikleniyor. Çözüm: status/clear sırasını kontrol et, IRQF_ONESHOT kullan.</span></div>
+    <div class="param"><span class="name">Missed interrupt</span><span class="desc">Handler çalışmadan önce ikinci kesme geldi ve edge-triggered kontrolör bunu kaydetmedi. Çözüm: threaded IRQ + IRQF_ONESHOT kombinasyonu veya seviye tetiklemeye geç.</span></div>
+    <div class="param"><span class="name">Handler hiç çağrılmıyor</span><span class="desc">IRQ mask register'ı enable edilmemiş veya DT'de yanlış IRQ numarası. Çözüm: platform_get_irq() dönüş değerini logla, /proc/interrupts'ta sayacı izle.</span></div>
+    <div class="param"><span class="name">Yüksek latency</span><span class="desc">Hardirq handler çok uzun veya spin_lock tutma süresi fazla. Çözüm: irqsoff tracer ile ölç, işlemleri threaded IRQ'ya taşı.</span></div>
+  </div>
+</section>
+
+</main>

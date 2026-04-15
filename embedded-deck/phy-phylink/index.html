@@ -1,0 +1,944 @@
+---
+layout: tutorial
+title: "Ethernet PHY & phylink — Donanım Ağ Katmanı"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>AĞ SÜRÜCÜSÜ</span>
+    <span>2026</span>
+  </div>
+  <h1>Ethernet PHY &amp; phylink<br><em>Donanım Ağ Katmanı</em></h1>
+  <p class="subtitle">Linux Ethernet PHY subsystem'ini, MDIO bus mekanizmasını, phylib/phylink çerçevelerini ve üretim kalitesinde PHY sürücüsü yazmayı adım adım öğrenin.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Ethernet PHY nedir — MAC/PHY/MII</a></li>
+    <li><a href="#s1">MDIO bus — clause 22 ve 45</a></li>
+    <li><a href="#s2">phylib — phy_device ve bağlantı yönetimi</a></li>
+    <li><a href="#s3">phylink — modern MAC-PHY adaptör katmanı</a></li>
+    <li><a href="#s4">PHY sürücüsü yazmak</a></li>
+    <li><a href="#s5">PHY interrupt ve link değişimi</a></li>
+    <li><a href="#s6">SFP modül desteği</a></li>
+    <li><a href="#s7">Device Tree binding</a></li>
+    <li><a href="#s8">Hata ayıklama</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> Ethernet PHY nedir — MAC/PHY/MII</h2>
+  <p class="section-lead">Ethernet iletişimi iki ayrı katmana bölünmüştür: MAC (Media Access Controller) ve PHY (Physical Layer). Bu iki katmanın aralarındaki standart arayüzleri anlamak, Linux ağ sürücüsü geliştirmenin temel taşıdır.</p>
+
+  <h3>MAC ve PHY ayrımı</h3>
+  <p>MAC katmanı Ethernet çerçevelerini (frame) oluşturur, CRC hesaplar ve zamanlama yönetimini yapar. PHY katmanı ise bu dijital sinyali fiziksel ortama (bakır, fiber) uygun analog sinyale dönüştürür. SoC'lerde MAC genellikle entegre gelir; PHY ise ayrı bir yonga olarak devreye bağlanır.</p>
+
+  <div class="flow">
+    <pre>Uygulama Katmanı
+       │
+    TCP/UDP
+       │
+       IP
+       │
+ Linux net stack (sk_buff)
+       │
+   MAC sürücüsü (GMAC, stmmac…)
+       │  ← MII/RMII/RGMII/SGMII arayüzü
+    PHY yonga (DP83867, KSZ9031…)
+       │
+  Fiziksel ortam (RJ45, SFP…)</pre>
+  </div>
+
+  <h3>MII aile arayüzleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Arayüz</th><th>Hız</th><th>Pin sayısı</th><th>Saat</th><th>Tipik kullanım</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>MII</td><td>10/100 Mb/s</td><td>18</td><td>25 MHz</td><td>Eski entegrasyonlar</td></tr>
+        <tr><td>RMII</td><td>10/100 Mb/s</td><td>9</td><td>50 MHz (tek saat)</td><td>Düşük pin sayısı gereken SoC</td></tr>
+        <tr><td>GMII</td><td>10/100/1000 Mb/s</td><td>24</td><td>125 MHz</td><td>Gigabit, nadiren kullanılır</td></tr>
+        <tr><td>RGMII</td><td>10/100/1000 Mb/s</td><td>12</td><td>125 MHz, DDR</td><td>Gigabit embedded, en yaygın</td></tr>
+        <tr><td>SGMII</td><td>1 Gb/s (seri)</td><td>4 (diff)</td><td>SerDes</td><td>SFP, FPGA, yüksek yoğunluk</td></tr>
+        <tr><td>USXGMII</td><td>1/2.5/5/10 Gb/s</td><td>4 (diff)</td><td>SerDes</td><td>Multi-Gig SFP+</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>RGMII zamanlama — RX/TX gecikme</h3>
+  <p>RGMII'de veri 125 MHz saat sinyalinin yükselen ve düşen kenarlarında gönderilir (DDR). MAC veya PHY tarafında 2 ns'lik gecikme (delay) uygulanması gerekir; bu gecikme cihaz ağacında ya da PHY registerlarında ayarlanır.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">rgmii-id</span><span class="desc">MAC hem TX hem RX gecikmesini uygular; PHY'de gecikme yoktur</span></div>
+    <div class="param"><span class="name">rgmii-rxid</span><span class="desc">Yalnızca RX gecikme MAC tarafında; TX gecikmesini PHY uygular</span></div>
+    <div class="param"><span class="name">rgmii-txid</span><span class="desc">Yalnızca TX gecikme MAC tarafında; RX gecikmesini PHY uygular</span></div>
+    <div class="param"><span class="name">rgmii</span><span class="desc">Hiçbir gecikme eklenmez; PCB tasarımıyla çözülür</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>MAC dijital çerçeveleri oluşturur; PHY analog iletimi sağlar</li>
+      <li>RGMII en yaygın Gigabit arayüzüdür: 12 pin, 125 MHz DDR saat</li>
+      <li>SGMII diferansiyel seri hat — SFP modülleri ve FPGA arayüzleri için tercih edilir</li>
+      <li>RGMII gecikmesi doğru ayarlanmazsa link kurulmaz veya hata paketleri oluşur</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> MDIO bus — clause 22 ve 45</h2>
+  <p class="section-lead">MDIO (Management Data Input/Output), MAC'in PHY register'larını okumasını ve yazmasını sağlayan 2 telli yönetim veri yoludur. Linux'ta <code>mdiobus</code> alt sistemi bu yolu soyutlar.</p>
+
+  <h3>MDIO sinyalleri</h3>
+  <p>MDIO yalnızca iki sinyal kullanır: <strong>MDC</strong> (saat, MAC tarafından üretilir, maksimum 2.5 MHz) ve <strong>MDIO</strong> (çift yönlü veri). Tek bir MDC/MDIO çiftine 32 farklı PHY adresi (0–31) bağlanabilir.</p>
+
+  <h3>Clause 22 — standart PHY register erişimi</h3>
+  <p>IEEE 802.3 Clause 22, 5 bitlik PHY adresi (PRTAD) ve 5 bitlik register adresi (DEVAD) içerir; toplamda 32 register erişimi sağlar.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Register</th><th>Adres</th><th>İşlev</th></tr></thead>
+      <tbody>
+        <tr><td>BMCR</td><td>0x00</td><td>Temel Mod Kontrol — auto-neg, reset, hız</td></tr>
+        <tr><td>BMSR</td><td>0x01</td><td>Temel Mod Durum — link, auto-neg tamamlandı</td></tr>
+        <tr><td>PHYIDR1</td><td>0x02</td><td>PHY ID üst 16 bit (OUI)</td></tr>
+        <tr><td>PHYIDR2</td><td>0x03</td><td>PHY ID alt 16 bit (model, revizyon)</td></tr>
+        <tr><td>ANAR</td><td>0x04</td><td>Auto-neg Duyuru — desteklenen hızlar</td></tr>
+        <tr><td>ANLPAR</td><td>0x05</td><td>Link Partner Yeteneği</td></tr>
+        <tr><td>1000BASET_CTRL</td><td>0x09</td><td>1000BASE-T kontrol (Gigabit PHY)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Clause 45 — genişletilmiş register uzayı</h3>
+  <p>10GbE ve daha yüksek hızlar, 32 register ile yetinmez. Clause 45 bu sorunu 5 bitlik MMD (MDIO Manageable Device) ve 16 bitlik register adresiyle çözer; 65536 register/MMD erişimi sağlar.</p>
+
+  <h3>Linux'ta mdiobus_register</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* MAC sürücüsünde MDIO bus oluşturma */</span>
+<span class="kw">static int</span> my_mac_mdio_probe(<span class="kw">struct</span> platform_device *pdev)
+{
+    <span class="kw">struct</span> mii_bus *bus;
+    <span class="kw">int</span> ret;
+
+    bus = devm_mdiobus_alloc(&amp;pdev-&gt;dev);
+    <span class="kw">if</span> (!bus)
+        <span class="kw">return</span> -ENOMEM;
+
+    bus-&gt;name      = <span class="str">"my-mdio-bus"</span>;
+    bus-&gt;read      = my_mdio_read;    <span class="cmt">/* Clause 22 okuma */</span>
+    bus-&gt;write     = my_mdio_write;   <span class="cmt">/* Clause 22 yazma */</span>
+    bus-&gt;read_c45  = my_mdio_read_c45;  <span class="cmt">/* Clause 45 — isteğe bağlı */</span>
+    bus-&gt;write_c45 = my_mdio_write_c45;
+    bus-&gt;parent    = &amp;pdev-&gt;dev;
+    snprintf(bus-&gt;id, MII_BUS_ID_SIZE, <span class="str">"%s"</span>, pdev-&gt;name);
+
+    ret = of_mdiobus_register(bus, pdev-&gt;dev.of_node);
+    <span class="kw">if</span> (ret) {
+        dev_err(&amp;pdev-&gt;dev, <span class="str">"MDIO bus kaydı başarısız: %d\n"</span>, ret);
+        <span class="kw">return</span> ret;
+    }
+    <span class="kw">return</span> 0;
+}
+
+<span class="cmt">/* Clause 22 okuma örneği */</span>
+<span class="kw">static int</span> my_mdio_read(<span class="kw">struct</span> mii_bus *bus, <span class="kw">int</span> phy_addr, <span class="kw">int</span> reg)
+{
+    <span class="kw">struct</span> my_priv *priv = bus-&gt;priv;
+    u32 cmd, val;
+    <span class="kw">int</span> timeout = 1000;
+
+    cmd = MDIO_RD | ((phy_addr &amp; 0x1f) &lt;&lt; 21) | ((reg &amp; 0x1f) &lt;&lt; 16);
+    writel(cmd, priv-&gt;base + MDIO_CMD);
+
+    <span class="kw">while</span> (timeout-- &amp;&amp; (readl(priv-&gt;base + MDIO_STATUS) &amp; MDIO_BUSY))
+        udelay(1);
+
+    <span class="kw">if</span> (timeout &lt; 0)
+        <span class="kw">return</span> -ETIMEDOUT;
+
+    val = readl(priv-&gt;base + MDIO_DATA);
+    <span class="kw">return</span> val &amp; 0xffff;
+}</code></pre>
+  </div>
+
+  <h3>mdio_read / mdio_write yardımcı fonksiyonları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Kullanıcı alanından da mdio_read/write çağrılabilir */</span>
+<span class="cmt">/* Kernel içinde direkt: */</span>
+<span class="kw">int</span> val = mdiobus_read(bus, phy_addr, MII_BMSR);
+mdiobus_write(bus, phy_addr, MII_ADVERTISE, ADVERTISE_ALL | ADVERTISE_PAUSE_CAP);
+
+<span class="cmt">/* Clause 45: */</span>
+<span class="kw">int</span> val = mdiobus_c45_read(bus, phy_addr, MDIO_MMD_AN, MDIO_AN_ADVERTISE);
+mdiobus_c45_write(bus, phy_addr, MDIO_MMD_PMAPMD, MDIO_CTRL1, MDIO_CTRL1_RESET);</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>MDIO: MDC (saat) + MDIO (veri), 32 PHY adresi, 2.5 MHz maks.</li>
+      <li>Clause 22: 32 register; Clause 45: 65536 register/MMD — 10G+ için zorunlu</li>
+      <li><code>of_mdiobus_register()</code> cihaz ağacından PHY adreslerini otomatik tarar</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> phylib — phy_device ve bağlantı yönetimi</h2>
+  <p class="section-lead">phylib, Linux'ta Ethernet PHY sürücülerinin standart çerçevesidir. Her fiziksel PHY için bir <code>phy_device</code> nesnesi oluşturur ve durum makinesini yönetir.</p>
+
+  <h3>phy_device yaşam döngüsü</h3>
+
+  <div class="flow">
+    <pre>mdiobus_scan()
+    │
+    ├─ phy_device_create()   ← PHY ID okunur, phy_device ayrılır
+    │
+    phy_connect()            ← MAC sürücüsü PHY'ye bağlanır
+    │
+    phy_start()              ← durum makinesi başlar
+    │
+    ┌─ PHY_DOWN → PHY_NOLINK → PHY_RUNNING
+    │        link değişiminde adjust_link() çağrılır
+    │
+    phy_stop()               ← durum makinesi durdurulur
+    │
+    phy_disconnect()         ← bağlantı kopar</pre>
+  </div>
+
+  <h3>phy_connect ve adjust_link</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* MAC sürücüsünde PHY bağlantısı */</span>
+<span class="kw">static void</span> my_adjust_link(<span class="kw">struct</span> net_device *ndev)
+{
+    <span class="kw">struct</span> my_priv *priv = netdev_priv(ndev);
+    <span class="kw">struct</span> phy_device *phydev = ndev-&gt;phydev;
+    <span class="kw">bool</span> changed = false;
+
+    <span class="kw">if</span> (priv-&gt;speed != phydev-&gt;speed) {
+        priv-&gt;speed = phydev-&gt;speed;
+        changed = true;
+    }
+    <span class="kw">if</span> (priv-&gt;duplex != phydev-&gt;duplex) {
+        priv-&gt;duplex = phydev-&gt;duplex;
+        changed = true;
+    }
+
+    <span class="kw">if</span> (changed || priv-&gt;link != phydev-&gt;link) {
+        priv-&gt;link = phydev-&gt;link;
+        <span class="kw">if</span> (phydev-&gt;link)
+            my_mac_set_speed(priv, phydev-&gt;speed, phydev-&gt;duplex);
+        <span class="kw">else</span>
+            my_mac_link_down(priv);
+        phy_print_status(phydev);
+    }
+}
+
+<span class="kw">static int</span> my_open(<span class="kw">struct</span> net_device *ndev)
+{
+    <span class="kw">struct</span> my_priv *priv = netdev_priv(ndev);
+    <span class="kw">struct</span> phy_device *phydev;
+
+    phydev = of_phy_connect(ndev,
+                            priv-&gt;phy_node,
+                            my_adjust_link,
+                            0,
+                            PHY_INTERFACE_MODE_RGMII_ID);
+    <span class="kw">if</span> (IS_ERR(phydev))
+        <span class="kw">return</span> PTR_ERR(phydev);
+
+    phy_start(phydev);
+    <span class="kw">return</span> 0;
+}
+
+<span class="kw">static int</span> my_stop(<span class="kw">struct</span> net_device *ndev)
+{
+    phy_stop(ndev-&gt;phydev);
+    phy_disconnect(ndev-&gt;phydev);
+    <span class="kw">return</span> 0;
+}</code></pre>
+  </div>
+
+  <h3>PHY durum makinesi</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">PHY_DOWN</span><span class="desc">PHY henüz başlatılmamış veya bağlantı kesilmiş</span></div>
+    <div class="param"><span class="name">PHY_NOLINK</span><span class="desc">PHY çalışıyor, bağlantı yok; periyodik polling devam eder</span></div>
+    <div class="param"><span class="name">PHY_RUNNING</span><span class="desc">Link aktif; adjust_link() çağrılmış, trafik iletimi mümkün</span></div>
+    <div class="param"><span class="name">PHY_HALTED</span><span class="desc">phy_stop() çağrıldı; anket ve interrupt devre dışı</span></div>
+    <div class="param"><span class="name">PHY_ERROR</span><span class="desc">Read/write hatası; sürücü yeniden başlatma deneyebilir</span></div>
+  </div>
+
+  <h3>genphy_* yardımcı fonksiyonları</h3>
+  <p>Özel bir PHY sürücüsü yazılmadığında Linux, BMSR/BMCR register'larını standart okuma kabiliyetine sahip <code>genphy</code> sürücüsünü kullanır. Özel sürücüler bu fonksiyonları çağırabilir:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code>genphy_config_init(phydev);      <span class="cmt">/* Özellik maskesi — 1G/100M/10M */</span>
+genphy_config_aneg(phydev);      <span class="cmt">/* Auto-negotiation başlat */</span>
+genphy_update_link(phydev);      <span class="cmt">/* BMSR okunur, link durumu güncellenir */</span>
+genphy_read_status(phydev);      <span class="cmt">/* Hız, duplex, link durumu toplu güncelle */</span>
+genphy_restart_aneg(phydev);     <span class="cmt">/* Auto-neg yeniden başlat (BMCR ANRESTART) */</span>
+genphy_suspend(phydev);          <span class="cmt">/* PHY'yi güç tasarruf moduna al */</span>
+genphy_resume(phydev);           <span class="cmt">/* PHY'yi uyandır */</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>phy_connect()</code> → <code>phy_start()</code> → link değişiminde <code>adjust_link()</code></li>
+      <li>phylib durum makinesi polling veya interrupt ile çalışabilir</li>
+      <li><code>genphy_*</code> fonksiyonları standart Clause 22 işlemlerini kapsüller</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> phylink — modern MAC-PHY adaptör katmanı</h2>
+  <p class="section-lead">phylink, 2016'dan itibaren eklenen yeni bir API'dir; MAC ve PHY'yi daha sıkı entegre eder, SFP modüllerini ve birden fazla link modu olasılığını zarif şekilde yönetir.</p>
+
+  <h3>phylib ile phylink karşılaştırması</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Özellik</th><th>phylib (eski)</th><th>phylink (yeni)</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>SFP desteği</td><td>Yok</td><td>Yerleşik sfp-bus entegrasyonu</td></tr>
+        <tr><td>MAC konfigürasyonu</td><td>adjust_link() callback</td><td>mac_config() + mac_link_up()</td></tr>
+        <tr><td>Birden fazla arayüz modu</td><td>Sınırlı</td><td>Evet, runtime değişim</td></tr>
+        <tr><td>Fixed-link</td><td>Sınırlı</td><td>Doğrudan desteklenir</td></tr>
+        <tr><td>PAUSE çerçevesi yönetimi</td><td>Manuel</td><td>Otomatik</td></tr>
+        <tr><td>InBand signalling</td><td>Yok</td><td>1000BASE-X, SGMII desteği</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>phylink_ops — MAC tarafı callback'ler</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code><span class="kw">static void</span> my_mac_validate(<span class="kw">struct</span> phylink_config *config,
+                             <span class="kw">unsigned long</span> *supported,
+                             <span class="kw">struct</span> phylink_link_state *state)
+{
+    __ETHTOOL_DECLARE_LINK_MODE_MASK(mask) = { 0, };
+
+    <span class="cmt">/* MAC'in desteklediği modları belirt */</span>
+    phylink_set(mask, Autoneg);
+    phylink_set(mask, Pause);
+    phylink_set(mask, Asym_Pause);
+    phylink_set_port_modes(mask);
+    phylink_set(mask, 1000baseT_Full);
+    phylink_set(mask, 100baseT_Full);
+    phylink_set(mask, 10baseT_Half);
+    phylink_set(mask, 10baseT_Full);
+
+    <span class="kw">if</span> (state-&gt;interface == PHY_INTERFACE_MODE_RGMII ||
+        state-&gt;interface == PHY_INTERFACE_MODE_RGMII_ID) {
+        phylink_set(mask, 1000baseT_Full);
+    }
+
+    linkmode_and(supported, supported, mask);
+    linkmode_and(state-&gt;advertising, state-&gt;advertising, mask);
+}
+
+<span class="kw">static void</span> my_mac_config(<span class="kw">struct</span> phylink_config *config, <span class="kw">unsigned int</span> mode,
+                           <span class="kw">const struct</span> phylink_link_state *state)
+{
+    <span class="kw">struct</span> my_priv *priv = container_of(config, <span class="kw">struct</span> my_priv, phylink_config);
+    <span class="cmt">/* Hız/duplex değiştiğinde MAC register'larını güncelle */</span>
+    my_mac_update_registers(priv, state-&gt;speed, state-&gt;duplex, state-&gt;pause);
+}
+
+<span class="kw">static void</span> my_mac_link_down(<span class="kw">struct</span> phylink_config *config, <span class="kw">unsigned int</span> mode,
+                              phy_interface_t interface)
+{
+    <span class="kw">struct</span> my_priv *priv = container_of(config, <span class="kw">struct</span> my_priv, phylink_config);
+    my_mac_disable_tx_rx(priv);
+}
+
+<span class="kw">static void</span> my_mac_link_up(<span class="kw">struct</span> phylink_config *config,
+                            <span class="kw">struct</span> phy_device *phy,
+                            <span class="kw">unsigned int</span> mode, phy_interface_t interface,
+                            <span class="kw">int</span> speed, <span class="kw">int</span> duplex,
+                            <span class="kw">bool</span> tx_pause, <span class="kw">bool</span> rx_pause)
+{
+    <span class="kw">struct</span> my_priv *priv = container_of(config, <span class="kw">struct</span> my_priv, phylink_config);
+    my_mac_set_speed_duplex(priv, speed, duplex);
+    my_mac_set_pause(priv, tx_pause, rx_pause);
+    my_mac_enable_tx_rx(priv);
+}
+
+<span class="kw">static const struct</span> phylink_mac_ops my_phylink_ops = {
+    .validate        = my_mac_validate,
+    .mac_config      = my_mac_config,
+    .mac_link_down   = my_mac_link_down,
+    .mac_link_up     = my_mac_link_up,
+};</code></pre>
+  </div>
+
+  <h3>phylink oluşturma ve başlatma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code><span class="kw">static int</span> my_probe(<span class="kw">struct</span> platform_device *pdev)
+{
+    <span class="kw">struct</span> my_priv *priv = /* ... */;
+    <span class="kw">struct</span> phylink *pl;
+
+    priv-&gt;phylink_config.dev = &amp;ndev-&gt;dev;
+    priv-&gt;phylink_config.type = PHYLINK_NETDEV;
+
+    pl = phylink_create(&amp;priv-&gt;phylink_config,
+                        of_fwnode_handle(pdev-&gt;dev.of_node),
+                        priv-&gt;phy_mode,
+                        &amp;my_phylink_ops);
+    <span class="kw">if</span> (IS_ERR(pl))
+        <span class="kw">return</span> PTR_ERR(pl);
+
+    priv-&gt;phylink = pl;
+    <span class="kw">return</span> 0;
+}
+
+<span class="cmt">/* ndo_open içinde */</span>
+phylink_start(priv-&gt;phylink);
+
+<span class="cmt">/* ndo_stop içinde */</span>
+phylink_stop(priv-&gt;phylink);
+phylink_disconnect_phy(priv-&gt;phylink);</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>phylink; SFP, fixed-link ve normal PHY'yi tek API ile yönetir</li>
+      <li>MAC tarafı: <code>validate</code>, <code>mac_config</code>, <code>mac_link_down</code>, <code>mac_link_up</code></li>
+      <li>Yeni sürücüler phylib yerine phylink kullanmalıdır</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> PHY sürücüsü yazmak</h2>
+  <p class="section-lead">Standart <code>genphy</code> sürücüsü çoğu PHY için yeterlidir. Ancak özel register'lar, vendor-specific özellikler veya enerji tasarrufu modu gerektiren durumlarda özel bir PHY sürücüsü yazılır.</p>
+
+  <h3>phy_driver yapısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* drivers/net/phy/myvendor.c */</span>
+#include &lt;linux/phy.h&gt;
+#include &lt;linux/module.h&gt;
+
+<span class="cmt">/* Vendor PHY ID — PHYIDR1:PHYIDR2 register'larından alınır */</span>
+#define MYPHY_ID       0x0283BC30
+#define MYPHY_ID_MASK  0xFFFFFFF0
+
+<span class="cmt">/* Vendor özel register'lar */</span>
+#define MYPHY_EXT_CTRL       0x17
+#define MYPHY_EXT_CTRL_CLKOUT  BIT(0)
+#define MYPHY_LED_CTRL       0x18
+#define MYPHY_LED_LINK_ACT   (0x6 &lt;&lt; 4)
+
+<span class="kw">static int</span> myphy_config_init(<span class="kw">struct</span> phy_device *phydev)
+{
+    <span class="kw">int</span> val, ret;
+
+    <span class="cmt">/* Standart başlatma */</span>
+    ret = genphy_config_init(phydev);
+    <span class="kw">if</span> (ret &lt; 0)
+        <span class="kw">return</span> ret;
+
+    <span class="cmt">/* Enerji tasarruf modunu etkinleştir */</span>
+    val = phy_read(phydev, MYPHY_EXT_CTRL);
+    <span class="kw">if</span> (val &lt; 0)
+        <span class="kw">return</span> val;
+
+    val |= MYPHY_EXT_CTRL_CLKOUT;
+    ret = phy_write(phydev, MYPHY_EXT_CTRL, val);
+    <span class="kw">if</span> (ret)
+        <span class="kw">return</span> ret;
+
+    <span class="cmt">/* LED modunu ayarla: Link/Activity */</span>
+    ret = phy_write(phydev, MYPHY_LED_CTRL, MYPHY_LED_LINK_ACT);
+    <span class="kw">return</span> ret;
+}
+
+<span class="kw">static int</span> myphy_read_status(<span class="kw">struct</span> phy_device *phydev)
+{
+    <span class="kw">int</span> ret;
+
+    <span class="cmt">/* Standart okuma + vendor-specific durum </span>
+<span class="cmt">     * Burada EEE (Energy Efficient Ethernet) kontrolü de yapılabilir */</span>
+    ret = genphy_read_status(phydev);
+    <span class="kw">if</span> (ret)
+        <span class="kw">return</span> ret;
+
+    <span class="cmt">/* Vendor özel kablo tanısı — isteğe bağlı */</span>
+    phydev-&gt;mdix = ETH_TP_MDI_AUTO;
+    <span class="kw">return</span> 0;
+}
+
+<span class="kw">static int</span> myphy_config_aneg(<span class="kw">struct</span> phy_device *phydev)
+{
+    <span class="cmt">/* Vendor özel ayarlar yapıldıktan sonra standart auto-neg */</span>
+    <span class="kw">return</span> genphy_config_aneg(phydev);
+}
+
+<span class="kw">static struct</span> phy_driver myphy_drivers[] = {
+    {
+        PHY_ID_MATCH_MODEL(MYPHY_ID),
+        .name           = <span class="str">"MyVendor PHY"</span>,
+        .features       = PHY_GBIT_FEATURES,
+        .flags          = PHY_HAS_INTERRUPT,
+        .config_init    = myphy_config_init,
+        .config_aneg    = myphy_config_aneg,
+        .read_status    = myphy_read_status,
+        .ack_interrupt  = myphy_ack_interrupt,
+        .config_intr    = myphy_config_intr,
+        .suspend        = genphy_suspend,
+        .resume         = genphy_resume,
+    },
+};
+
+module_phy_driver(myphy_drivers);
+
+<span class="kw">static</span> <span class="kw">const struct</span> mdio_device_id __maybe_unused myphy_tbl[] = {
+    { MYPHY_ID, MYPHY_ID_MASK },
+    { }
+};
+MODULE_DEVICE_TABLE(mdio, myphy_tbl);
+MODULE_AUTHOR(<span class="str">"Emirhan Pehlevan"</span>);
+MODULE_DESCRIPTION(<span class="str">"MyVendor PHY sürücüsü"</span>);
+MODULE_LICENSE(<span class="str">"GPL"</span>);</code></pre>
+  </div>
+
+  <h3>PHY ID nasıl bulunur</h3>
+  <p>PHYIDR1 (register 0x02) üst 16 bit OUI içerir; PHYIDR2 (0x03) model ve revizyon bilgisi taşır. <code>ethtool -i ethX</code> komutu veya <code>cat /sys/bus/mdio_bus/devices/*/phy_id</code> bu değeri verir. Veri sayfasında "PHY Identifier Register" başlığı altında kontrol edilmelidir.</p>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>PHY ID: PHYIDR1 + PHYIDR2 registerlarından oluşur, mask ile eşleştirilir</li>
+      <li><code>phy_driver</code> struct: <code>config_init</code>, <code>read_status</code>, <code>config_aneg</code> minimum alanları</li>
+      <li>Çoğu durumda <code>genphy_*</code> çağırıp vendor özelliklerini eklemek yeterlidir</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> PHY interrupt ve link değişimi</h2>
+  <p class="section-lead">PHY link değişimini algılamanın iki yolu vardır: periyodik polling (basit ama CPU'yu meşgul eder) ve interrupt tabanlı yaklaşım (verimli, donanım desteği gerekir).</p>
+
+  <h3>Polling vs interrupt</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Yöntem</th><th>Avantaj</th><th>Dezavantaj</th></tr></thead>
+      <tbody>
+        <tr><td>Polling (PHY_POLL)</td><td>Tüm PHY'lerde çalışır, basit</td><td>Her 1s'de schedule_delayed_work, CPU kullanımı</td></tr>
+        <tr><td>Interrupt</td><td>Anlık tepki, CPU tasarrufu</td><td>PHY'nin interrupt çıkışı olmalı, GPIO bağlantısı gerekir</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Interrupt callback'leri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* PHY interrupt kaynağını temizle (ack) */</span>
+<span class="kw">static int</span> myphy_ack_interrupt(<span class="kw">struct</span> phy_device *phydev)
+{
+    <span class="kw">int</span> val;
+    <span class="cmt">/* Interrupt Status Register okunarak bit'ler temizlenir */</span>
+    val = phy_read(phydev, MYPHY_ISR);
+    <span class="kw">return</span> (val &lt; 0) ? val : 0;
+}
+
+<span class="cmt">/* Interrupt'ı etkinleştir/devre dışı bırak */</span>
+<span class="kw">static int</span> myphy_config_intr(<span class="kw">struct</span> phy_device *phydev)
+{
+    <span class="kw">int</span> val, ret;
+
+    <span class="kw">if</span> (phydev-&gt;interrupts == PHY_INTERRUPT_ENABLED) {
+        ret = myphy_ack_interrupt(phydev);
+        <span class="kw">if</span> (ret)
+            <span class="kw">return</span> ret;
+        <span class="cmt">/* IMR register'ına link up/down mask'ı yaz */</span>
+        val = MYPHY_IMR_LINK_UP | MYPHY_IMR_LINK_DOWN;
+        ret = phy_write(phydev, MYPHY_IMR, val);
+    } <span class="kw">else</span> {
+        ret = phy_write(phydev, MYPHY_IMR, 0);
+        <span class="kw">if</span> (ret)
+            <span class="kw">return</span> ret;
+        ret = myphy_ack_interrupt(phydev);
+    }
+    <span class="kw">return</span> ret;
+}
+
+<span class="cmt">/* Yeni API: handle_interrupt (Linux 5.12+) */</span>
+<span class="kw">static</span> irqreturn_t myphy_handle_interrupt(<span class="kw">struct</span> phy_device *phydev)
+{
+    <span class="kw">int</span> irq_status;
+
+    irq_status = phy_read(phydev, MYPHY_ISR);
+    <span class="kw">if</span> (irq_status &lt; 0) {
+        phy_error(phydev);
+        <span class="kw">return</span> IRQ_NONE;
+    }
+
+    <span class="kw">if</span> (!(irq_status &amp; (MYPHY_ISR_LINK_UP | MYPHY_ISR_LINK_DOWN)))
+        <span class="kw">return</span> IRQ_NONE;
+
+    phy_trigger_machine(phydev);
+    <span class="kw">return</span> IRQ_HANDLED;
+}</code></pre>
+  </div>
+
+  <h3>genphy_update_link detayı</h3>
+  <p><code>genphy_update_link()</code> BMSR register'ını iki kez okur (latch-low bit için). İkinci okuma gerçek değeri yansıtır. Link takibinde bu davranış kritiktir; tek okuma yanlış <em>link down</em> bildirebilir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Kernel kaynak: drivers/net/phy/phy_device.c */</span>
+<span class="kw">int</span> genphy_update_link(<span class="kw">struct</span> phy_device *phydev)
+{
+    <span class="kw">int</span> status, bmcr;
+
+    bmcr = phy_read(phydev, MII_BMCR);
+    <span class="kw">if</span> (bmcr &lt; 0)
+        <span class="kw">return</span> bmcr;
+
+    <span class="cmt">/* Loopback modda link her zaman var */</span>
+    <span class="kw">if</span> (bmcr &amp; BMCR_LOOPBACK) {
+        phydev-&gt;link = 1;
+        <span class="kw">return</span> 0;
+    }
+
+    <span class="cmt">/* Birinci okuma latch-low bit'i temizler */</span>
+    status = phy_read(phydev, MII_BMSR);
+    <span class="kw">if</span> (status &lt; 0)
+        <span class="kw">return</span> status;
+
+    <span class="cmt">/* İkinci okuma gerçek anlık değeri döndürür */</span>
+    status = phy_read(phydev, MII_BMSR);
+    <span class="kw">if</span> (status &lt; 0)
+        <span class="kw">return</span> status;
+
+    <span class="kw">if</span> (status &amp; BMSR_LSTATUS)
+        phydev-&gt;link = 1;
+    <span class="kw">else</span>
+        phydev-&gt;link = 0;
+    <span class="kw">return</span> 0;
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>PHY_HAS_INTERRUPT bayrak — interrupt etkin; yoksa PHY_POLL modu (1 sn polling)</li>
+      <li>Linux 5.12+: <code>handle_interrupt</code> callback; eski API: <code>ack_interrupt</code> + <code>config_intr</code></li>
+      <li>BMSR iki kez okunmalı: birinci okuma "latch-low" bit'i temizler</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> SFP modül desteği</h2>
+  <p class="section-lead">SFP (Small Form-factor Pluggable) modüller, fiber ve bakır arayüzler arasında hot-plug geçiş imkânı sunar. Linux phylink ile sfp-bus alt sistemi bu modülleri otomatik yönetir.</p>
+
+  <h3>SFP-bus mimarisi</h3>
+
+  <div class="flow">
+    <pre>SFP konnektör (I2C + MDIO + GPIO)
+         │
+    sfp_bus (drivers/net/sfp-bus.c)
+         │
+    ┌────┴────────────┐
+    │                 │
+ SFP sürücüsü     phylink upstream
+ (sfp.c)          (MAC sürücüsü)
+    │                 │
+  EEPROM           mac_config()
+  SFP+1000BASE-SX  mac_link_up()</pre>
+  </div>
+
+  <h3>sfp_register_upstream</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* phylink oluşturduktan sonra SFP upstream kaydı */</span>
+<span class="kw">static int</span> my_probe(<span class="kw">struct</span> platform_device *pdev)
+{
+    <span class="kw">struct</span> my_priv *priv;
+    <span class="kw">struct</span> sfp_bus *sfp_bus;
+    <span class="kw">int</span> ret;
+
+    <span class="cmt">/* ... phylink oluştur ... */</span>
+
+    <span class="cmt">/* Cihaz ağacında sfp = &lt;&amp;sfp_node&gt; varsa otomatik bağlanır */</span>
+    ret = phylink_of_phy_connect(priv-&gt;phylink,
+                                  pdev-&gt;dev.of_node, 0);
+    <span class="kw">if</span> (ret)
+        <span class="kw">return</span> ret;
+
+    <span class="kw">return</span> 0;
+}
+
+<span class="cmt">/* Düşük seviyeli sfp_bus doğrudan kullanım (nadiren gerekir): */</span>
+sfp_bus = sfp_register_upstream(fwnode, &amp;priv-&gt;phylink_config, upstream_ops);
+<span class="kw">if</span> (IS_ERR(sfp_bus))
+    <span class="kw">return</span> PTR_ERR(sfp_bus);
+priv-&gt;sfp_bus = sfp_bus;</code></pre>
+  </div>
+
+  <h3>SFP EEPROM ve modül türleri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">1000BASE-SX</span><span class="desc">Çok modlu fiber, 850 nm, &lt;550 m; SFP EEPROM byte 6 bit 0</span></div>
+    <div class="param"><span class="name">1000BASE-LX</span><span class="desc">Tek modlu fiber, 1310 nm, &lt;10 km; uzak mesafe endüstriyel</span></div>
+    <div class="param"><span class="name">1000BASE-T</span><span class="desc">Bakır (copper) SFP; PHY entegre, MDIO ile yönetilir</span></div>
+    <div class="param"><span class="name">SFP+ 10GBase-SR</span><span class="desc">10 Gb/s kısa mesafe; sfp-bus bunu destekler, MAC 10G uyumlu olmalı</span></div>
+    <div class="param"><span class="name">DAC</span><span class="desc">Direct Attach Copper; kısa bakır kablo, SFP+ konnektörle bitmiş</span></div>
+  </div>
+
+  <h3>Device Tree SFP tanımı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts</span><span class="dot">●</span></div>
+    <pre><code>sfp0: sfp-connector {
+    compatible = "sff,sfp";
+    i2c-bus = &lt;&amp;i2c1&gt;;
+    los-gpios   = &lt;&amp;gpio 14 GPIO_ACTIVE_HIGH&gt;;
+    mod-def0-gpios = &lt;&amp;gpio 15 GPIO_ACTIVE_LOW&gt;;
+    tx-fault-gpios = &lt;&amp;gpio 16 GPIO_ACTIVE_HIGH&gt;;
+    tx-disable-gpios = &lt;&amp;gpio 17 GPIO_ACTIVE_HIGH&gt;;
+    maximum-power-milliwatt = &lt;1000&gt;;
+};
+
+&amp;gmac0 {
+    phy-mode = "sgmii";
+    sfp = &lt;&amp;sfp0&gt;;
+    managed = "in-band-status";
+};</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>sfp-bus, modül takma/çıkarma olaylarını yakalar ve phylink'e bildirir</li>
+      <li>SFP EEPROM (I2C adres 0x50) modül türü, güç, alıcı özelliklerini içerir</li>
+      <li>LOS, MOD-DEF0, TX-FAULT GPIO'ları cihaz ağacında tanımlanmalıdır</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> Device Tree binding</h2>
+  <p class="section-lead">Ethernet PHY'lerin donanım açıklaması, cihaz ağacında (Device Tree) standartlaşmış bir bağlama (binding) ile yapılır. Bu bölümde yaygın senaryolar ve dikkat edilmesi gereken noktalar açıklanır.</p>
+
+  <h3>Temel MDIO + PHY binding</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts</span><span class="dot">●</span></div>
+    <pre><code>/* MAC düğümü */
+&amp;gmac {
+    status = "okay";
+    phy-mode = "rgmii-id";          /* RGMII, MAC her iki gecikmeyi uygular */
+    phy-handle = &lt;&amp;phy0&gt;;          /* Hangi PHY'ye bağlı */
+    pinctrl-names = "default";
+    pinctrl-0 = &lt;&amp;gmac_pins&gt;;
+};
+
+/* MDIO bus */
+&amp;mdio {
+    status = "okay";
+    /* PHY reset GPIO — zorunlu değil ama önerilir */
+    reset-gpios = &lt;&amp;gpio 10 GPIO_ACTIVE_LOW&gt;;
+    reset-deassert-us = &lt;10000&gt;;
+    reset-post-delay-us = &lt;100000&gt;;
+
+    phy0: ethernet-phy@0 {          /* @N = MDIO adresi */
+        reg = &lt;0&gt;;                  /* MDIO adres 0 */
+        compatible = "ethernet-phy-id0283.bc30",  /* PHYID ile eşleşme */
+                     "ethernet-phy-ieee802.3-c22"; /* Clause 22 fallback */
+        interrupt-parent = &lt;&amp;gpio&gt;;
+        interrupts = &lt;18 IRQ_TYPE_EDGE_FALLING&gt;;
+        /* RGMII gecikme ayarları (DP83867 özel özelliği) */
+        ti,rx-internal-delay = &lt;DP83867_RGMIIDCTL_2_00_NS&gt;;
+        ti,tx-internal-delay = &lt;DP83867_RGMIIDCTL_2_00_NS&gt;;
+        ti,fifo-depth = &lt;DP83867_PHYCR_FIFO_DEPTH_4_B_NIB&gt;;
+    };
+};</code></pre>
+  </div>
+
+  <h3>fixed-link — PHY olmayan bağlantılar</h3>
+  <p>Switch chip'e sabit bağlı bir MAC gibi MDIO erişimi olmayan durumlar için <code>fixed-link</code> kullanılır:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>dts</span><span class="dot">●</span></div>
+    <pre><code>&amp;gmac1 {
+    status = "okay";
+    phy-mode = "rgmii";
+    fixed-link {
+        speed    = &lt;1000&gt;;
+        full-duplex;
+        pause;
+        asym-pause;
+    };
+};</code></pre>
+  </div>
+
+  <h3>Önemli DT özellik tablosu</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>Değer örneği</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td>phy-mode</td><td>"rgmii-id"</td><td>MAC-PHY arayüz modu</td></tr>
+        <tr><td>phy-handle</td><td>&lt;&amp;phy0&gt;</td><td>MDIO bus'taki PHY phandle referansı</td></tr>
+        <tr><td>managed</td><td>"in-band-status"</td><td>SGMII/1000BASE-X in-band link bilgisi</td></tr>
+        <tr><td>reset-gpios</td><td>&lt;&amp;gpio 10 ACTIVE_LOW&gt;</td><td>PHY hardware reset pini</td></tr>
+        <tr><td>reset-deassert-us</td><td>&lt;10000&gt;</td><td>Reset deassert bekleme süresi (µs)</td></tr>
+        <tr><td>max-speed</td><td>&lt;100&gt;</td><td>Hız kısıtı — 100 Mb/s ile sınırla</td></tr>
+        <tr><td>ethernet-phy-id</td><td>0x0283bc30</td><td>Vendor-specific uyumluluk dizgisi</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>ethernet-phy@N</code> düğümünde <code>reg</code> MDIO adresini verir</li>
+      <li><code>reset-gpios</code> + zamanlamalar — kararlı başlatma için mutlaka ekleyin</li>
+      <li><code>fixed-link</code> switch-entegre bağlantılarda MDIO gerektirmez</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Hata ayıklama</h2>
+  <p class="section-lead">PHY ve phylink sorunlarını izlemek için çekirdek içi araçlardan kullanıcı alanı yardımcı programlarına kadar kapsamlı bir araç seti mevcuttur.</p>
+
+  <h3>ethtool ile temel tanılama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Bağlantı hızı, duplex, auto-neg durumu</span>
+ethtool eth0
+
+<span class="cmt"># Sürücü bilgisi ve bus-info</span>
+ethtool -i eth0
+
+<span class="cmt"># PHY register'larını oku (clause 22)</span>
+ethtool -d eth0
+
+<span class="cmt"># Belirli MII register oku (BMSR = reg 1)</span>
+ethtool --dump-module eth0
+
+<span class="cmt"># Hız ve duplex zorla (auto-neg bypass)</span>
+ethtool -s eth0 speed 100 duplex full autoneg off
+
+<span class="cmt"># PHY istatistikleri</span>
+ethtool --phy-statistics eth0
+
+<span class="cmt"># EEE (Energy Efficient Ethernet) durumu</span>
+ethtool --show-eee eth0</code></pre>
+  </div>
+
+  <h3>mii-tool ile düşük seviye okuma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Bağlantı durumu</span>
+mii-tool eth0
+
+<span class="cmt"># Ayrıntılı çıktı</span>
+mii-tool -v eth0
+
+<span class="cmt"># Auto-neg yeniden başlat</span>
+mii-tool -r eth0</code></pre>
+  </div>
+
+  <h3>/sys/bus/mdio_bus ile register keşfi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Sistemdeki MDIO bus'ları listele</span>
+ls /sys/bus/mdio_bus/devices/
+
+<span class="cmt"># PHY ID (PHYIDR1:PHYIDR2)</span>
+cat /sys/bus/mdio_bus/devices/0000:00/phy_id
+
+<span class="cmt"># PHY sürücüsü</span>
+cat /sys/bus/mdio_bus/devices/0000:00/modalias
+
+<span class="cmt"># Bağlantı parametreleri</span>
+cat /sys/bus/mdio_bus/devices/0000:00/link
+
+<span class="cmt"># phylink durum makinesi (debugfs)</span>
+cat /sys/kernel/debug/phylink/eth0</code></pre>
+  </div>
+
+  <h3>phylink durum makinesi izleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kernel log — phylink durum geçişleri</span>
+dmesg | grep -E "phylink|PHY|eth0"
+
+<span class="cmt"># Dinamik debug etkinleştir</span>
+echo "module phylink +p" &gt; /sys/kernel/debug/dynamic_debug/control
+echo "module phy_device +p" &gt; /sys/kernel/debug/dynamic_debug/control
+
+<span class="cmt"># MDIO register dump (mdio-tools paketi)</span>
+mdio-tool read 0 BMSR
+mdio-tool read 0 PHYIDR1
+mdio-tool read 0 PHYIDR2</code></pre>
+  </div>
+
+  <h3>Yaygın sorunlar ve çözümleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Belirti</th><th>Olası Neden</th><th>Çözüm</th></tr></thead>
+      <tbody>
+        <tr><td>Link yok, PHY bulunamıyor</td><td>Reset GPIO eksik veya hatalı</td><td>DT'de <code>reset-gpios</code> ve zamanlamaları kontrol et</td></tr>
+        <tr><td>Link var, paket kaybı/hata</td><td>RGMII gecikme yanlış</td><td>phy-mode ve vendor delay register'larını kontrol et</td></tr>
+        <tr><td>Hız 10M'a düşüyor</td><td>Kablo hasarı veya auto-neg uyumsuzluğu</td><td>ethtool -s speed 100 duplex full autoneg off ile test et</td></tr>
+        <tr><td>PHY ID 0xFFFF</td><td>MDIO bağlantı sorunu veya yanlış adres</td><td>MDC/MDIO pinlerini ve DT reg değerini doğrula</td></tr>
+        <tr><td>SFP modül algılanmıyor</td><td>MOD-DEF0 GPIO polaritesi yanlış</td><td>DT'de ACTIVE_HIGH/LOW flag'ini kontrol et</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>ethtool -d eth0</code> ham MII register dump'ı döküm alır</li>
+      <li><code>/sys/bus/mdio_bus/devices/</code> tüm MDIO cihazlarını sysfs'ten gösterir</li>
+      <li>dynamic_debug ile phylink ve phy_device modüllerinde verbose log etkinleştirilebilir</li>
+      <li>PHY ID 0xFFFF → MDIO veri yolu bağlantı sorunu (MDC/MDIO pinleri veya güç)</li>
+    </ul>
+  </div>
+</section>
+
+</main>

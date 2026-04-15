@@ -1,0 +1,1225 @@
+---
+layout: tutorial
+title: "cef168 — Canon EF Lens Kontrol Kartı Analizi"
+back_url: "../index.html"
+back_label: "Project Deck"
+---
+<header class="header">
+  <div class="meta">
+    <span>ANALİZ RAPORU</span>
+    <span>DONANIM · SÜRÜCÜ · PROTOKOL</span>
+    <span>CEF168</span>
+    <span>2026</span>
+  </div>
+  <h1>cef168 — Canon EF<br><em>Lens Kontrol Kartı.</em></h1>
+  <p class="subtitle">Pinefeat cef168 adaptörünün tam protokol analizi: Raspberry Pi tarafında I²C kernel sürücüsü ve V4L2 arayüzü, UART ASCII seri protokolü, Canon EF mount'ındaki düşük seviye SPI-benzeri hat ve tüm bunları entegre eden device-tree / build altyapısı.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Genel Bakış — Sistem Mimarisi ve Dosya Haritası</a></li>
+    <li><a href="#s1">I²C Protokolü — Adres, Paket Yapısı, CRC-8</a></li>
+    <li><a href="#s2">Komut Opcode'ları — Tam Referans (0x22, 0x7A–0x7C, 0x80–0x82)</a></li>
+    <li><a href="#s3">cef168_data Struct'ı — Bayt Düzeni, Endian, CRC Doğrulaması</a></li>
+    <li><a href="#s4">Kernel Sürücüsü — Probe, V4L2 Sub-Device, Control Haritası</a></li>
+    <li><a href="#s5">Kullanıcı Alanı Aracı — calibrate.cpp Derinlemesine</a></li>
+    <li><a href="#s6">UART Seri Arayüz — 115200-8N1 ASCII Protokolü</a></li>
+    <li><a href="#s7">Canon EF Mount — Low-Side Protokolü (SPI Mode 3)</a></li>
+    <li><a href="#s8">Device-Tree Entegrasyonu ve Build Akışı</a></li>
+    <li><a href="#s9">libcamera Entegrasyonu — Tuning ve Autofocus</a></li>
+    <li><a href="#s10">Son Kullanıcı Komutları — Tam Referans</a></li>
+    <li><a href="#s11">Özet Cheat-Sheet</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> Genel Bakış — Sistem Mimarisi ve Dosya Haritası</h2>
+  <p class="section-lead">cef168, Canon EF/EF-S lensi Raspberry Pi kamerasına bağlayan Pinefeat adaptörünün yazılım altyapısıdır. Depo; Linux kernel sürücüsü, kullanıcı alanı kalibrasyon aracı ve device-tree enjeksiyon betiklerinden oluşur.</p>
+
+  <h3>Neden bu adaptör?</h3>
+  <p>Raspberry Pi kamera modülleri kendi lens motorları olmayan sensörler kullanır. Canon EF lensleri ise elektronik odak ve diyafram kontrolüne sahiptir; ancak protokol Canon'a özeldir. cef168 kartı, Raspberry Pi'nin I²C bus'unu Canon EF mount elektriğine köprüler ve protokol çevirisi yapar.</p>
+
+  <h3>Üç katmanlı protokol mimarisi</h3>
+
+  <div class="flow">
+    <pre>
+┌───────────────────┐          ┌───────────────────────┐          ┌──────────────┐
+│   Raspberry Pi    │          │    cef168 kart        │          │  Canon EF /  │
+│                   │          │    (MCU firmware)     │          │  EF-S lens   │
+│  libcamera        │          │                       │          │              │
+│  rpicam-apps  ────┤ I²C      │  ┌─────────────────┐ │  DCL     │              │
+│  V4L2 API     ────┼─────────►│  │ EF Protocol     │─┼─────────►│              │
+│               ◄───┤ 0x0d    │  │ Engine (closed) │◄┼──────────│              │
+│                   │          │  └─────────────────┘ │  DLC     │              │
+│  INDI / serial────┤ UART     │                       │  LCLK    │              │
+│  minicom      ────┼─────────►│                       │          │              │
+└───────────────────┘ 115200   └───────────────────────┘          └──────────────┘
+                                    ↑ bu repoda yok:
+                                    Canon EF protokolü firmware içinde</pre>
+  </div>
+
+  <p>Bu repo yalnızca <strong>sol tarafı</strong> uygular. Canon'un lens protokolü tersine mühendislik ile elde edilmiş olup kart firmware'inin içindedir.</p>
+
+  <h3>Desteklenen sensörler</h3>
+  <div class="code-block">
+    <div class="code-header"><span>sensors.txt</span><span class="dot">●</span></div>
+    <pre><code>imx219   <span class="cmt"># Raspberry Pi Camera Module 2</span>
+imx283
+imx296
+imx477   <span class="cmt"># Raspberry Pi HQ Camera (en yaygın kullanım)</span>
+imx519
+imx708   <span class="cmt"># Raspberry Pi Camera Module 3</span>
+ov5647   <span class="cmt"># Raspberry Pi Camera Module v1</span>
+ov9281</code></pre>
+  </div>
+
+  <h3>Dosya haritası</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Dosya</th><th>Tür</th><th>Rol</th></tr></thead>
+      <tbody>
+        <tr><td>cef168.c</td><td>C — Kernel</td><td>I²C client sürücüsü, V4L2 sub-device, CRC-8 I/O, control handler</td></tr>
+        <tr><td>cef168.h</td><td>C — Başlık</td><td>Kernel + userspace paylaşımlı: opcode sabitler, struct tanımı, CRC polinomu</td></tr>
+        <tr><td>cef168.dtsi</td><td>Device Tree</td><td>Sensor overlay'lerine enjekte edilen lens node snippet'i</td></tr>
+        <tr><td>calibrate.cpp</td><td>C++ — Userspace</td><td>Kalibrasyon aracı; V4L2 ve ham I²C arka uçları, PWL üretimi</td></tr>
+        <tr><td>configure.sh</td><td>Bash</td><td>Orkestratör: sensor seç, overlay indir, yama yap, Makefile oluştur</td></tr>
+        <tr><td>download.sh</td><td>Bash</td><td>RPi firmware versiyonuna karşılık gelen DTS'leri GitHub'dan çek</td></tr>
+        <tr><td>vcm.sh</td><td>Bash + awk</td><td>Sensor .dts dosyasına VCM node ekle/değiştir, fragment yaz</td></tr>
+        <tr><td>Makefile.template</td><td>Makefile</td><td>Kernel modülü (.ko) + kalibrasyon aracı + DTBO derlemesi</td></tr>
+        <tr><td>doc/serial.md</td><td>Markdown</td><td>UART ASCII protokolü tam referans belgesi</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Kurulum özeti</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — tek seferlik kurulum</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1. Repoyu klonla</span>
+<span class="cmd">git</span> clone https://github.com/pinefeat/cef168.git
+<span class="cmd">cd</span> cef168
+
+<span class="cmt"># 2. Sensor seç ve overlay'leri hazırla (imx477 = HQ Camera)</span>
+./configure.sh    <span class="cmt"># menüden imx477 seç</span>
+
+<span class="cmt"># 3. Kernel modülü + kalibrasyon aracı + DTBO derle</span>
+<span class="cmd">make</span>
+
+<span class="cmt"># 4. Kur (/boot/firmware/overlays'e kopyala, modprobe)</span>
+<span class="cmd">sudo</span> <span class="cmd">make</span> install
+
+<span class="cmt"># 5. Yeniden başlat</span>
+<span class="cmd">sudo</span> <span class="cmd">reboot</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> I²C Protokolü — Adres, Paket Yapısı, CRC-8</h2>
+  <p class="section-lead">cef168'in birincil haberleşme yolu I²C'dir. Raspberry Pi, kamera CSI connector'ının I²C bus'unu hem sensörle hem de cef168 kartıyla paylaşır.</p>
+
+  <h3>Bus parametreleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">I²C adresi</span><span class="desc"><strong>0x0d</strong> (7-bit) — Device Tree: <code class="inline">reg = &lt;0x0d&gt;;</code></span></div>
+    <div class="param"><span class="name">compatible</span><span class="desc"><code class="inline">"pinefeat,cef168"</code> — kernel driver bu string ile eşleşir</span></div>
+    <div class="param"><span class="name">Güç</span><span class="desc">3.3 V mantık — <code class="inline">vcc-supply = &lt;&amp;vdd_3v3_reg&gt;;</code></span></div>
+    <div class="param"><span class="name">Media graph adı</span><span class="desc"><code class="inline">cef168*-000d</code> pattern'i — son 4 karakter adres</span></div>
+  </div>
+
+  <h3>Cihazı bul</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — bus ve sub-device tespiti</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Media device'ı bul (unicam = RPi 4, rp1-cfe = RPi 5):</span>
+export DEV_MEDIA=$(v4l2-ctl --list-devices \
+  | awk <span class="str">'/unicam|rp1-cfe/ {found=1} found &amp;&amp; /\/dev\/media/ {print; exit;}'</span>)
+<span class="cmd">echo</span> $DEV_MEDIA
+<span class="cmt"># /dev/media0</span>
+
+<span class="cmt"># Media pipeline'ını göster:</span>
+media-ctl -d $DEV_MEDIA -p | grep entity
+<span class="cmt"># ...  cef168 1-000d (1 pad, 0 link)</span>
+
+<span class="cmt"># Lens sub-device dosyasını bul:</span>
+export DEV_LENS=$(media-ctl -d $DEV_MEDIA -p \
+  | awk <span class="str">'/entity.*cef168.*-000d/ {found=1} found &amp;&amp; /\/dev\/v4l-subdev/ {print $4; exit;}'</span>)
+<span class="cmd">echo</span> $DEV_LENS
+<span class="cmt"># /dev/v4l-subdev2</span>
+
+<span class="cmt"># Tüm kontrolleri listele:</span>
+v4l2-ctl -d $DEV_LENS --list-ctrls-menus
+<span class="cmt"># focus_absolute 0x009a0901 (int) : min=0 max=32767 ...</span>
+<span class="cmt"># iris_absolute 0x009a0903 (int) : min=0 max=32767 ...</span>
+<span class="cmt"># calibrate 0x00980aaa (button) ...</span></code></pre>
+  </div>
+
+  <h3>Yazma paketi formatı (host → kart)</h3>
+  <p>Her yazma işlemi 4 baytlık sabit boyutlu bir pakettir. Bayt sırası:</p>
+
+  <div class="flow">
+    <pre>
+ ┌─────────┬─────────┬─────────┬─────────┐
+ │ bayt 0  │ bayt 1  │ bayt 2  │ bayt 3  │
+ │ opcode  │ val LSB │ val MSB │  CRC-8  │
+ └─────────┴─────────┴─────────┴─────────┘
+  komut     ←── little-endian u16 ───→    poly=168,seed=0xFF</pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>cef168.c:64-84 — paket oluşturma ve gönderme</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">static int</span> cef168_i2c_write(<span class="keyword">struct</span> cef168_device *cef168_dev, u8 cmd, u16 val)
+{
+    <span class="keyword">struct</span> i2c_client *client = v4l2_get_subdevdata(&amp;cef168_dev-&gt;sd);
+    <span class="keyword">int</span> retry, ret;
+
+    <span class="cmt">/* little-endian dönüşümü */</span>
+    __le16 le_data = cpu_to_le16(val);
+    <span class="keyword">char</span> tx_data[4] = { cmd,
+                        ((<span class="keyword">u8</span> *)&amp;le_data)[0],   <span class="cmt">/* LSB */</span>
+                        ((<span class="keyword">u8</span> *)&amp;le_data)[1] };  <span class="cmt">/* MSB */</span>
+
+    <span class="cmt">/* CRC-8 hesapla ve son bayta yaz */</span>
+    tx_data[3] = crc8(cef168_crc8_table, tx_data, 3, CRC8_INIT_VALUE);
+
+    <span class="cmt">/* en fazla 3 deneme (-EIO veya -EREMOTEIO'da) */</span>
+    <span class="keyword">for</span> (retry = 0; retry &lt; 3; retry++) {
+        ret = i2c_master_send(client, tx_data, <span class="keyword">sizeof</span>(tx_data));
+        <span class="keyword">if</span> (ret == <span class="keyword">sizeof</span>(tx_data))
+            <span class="keyword">return</span> 0;
+        <span class="keyword">else if</span> (ret != -EIO &amp;&amp; ret != -EREMOTEIO)
+            <span class="keyword">break</span>;
+    }
+    dev_err(&amp;client-&gt;dev, <span class="str">"I2C write fail after %d retries, ret=%d\n"</span>, retry, ret);
+    <span class="keyword">return</span> -EIO;
+}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NEDEN 3 DENEME?</div>
+    <p>Bazı Canon lensleri (özellikle STM motorlular) motor hareket ederken I²C trafiğine NACK döndürür. Üç deneme, firmware'in meşgul durumu geçmesini beklemeye yetecek kadar zaman tanır; çok daha fazla bekleme libcamera'nın frame zamanlamalarını bozar.</p>
+  </div>
+
+  <h3>Okuma paketi formatı (kart → host)</h3>
+  <p>Okuma işlemi <code class="inline">sizeof(struct cef168_data)</code> bayt döndürür. Son bayt CRC-8'dir; uyuşmazlık durumunda sürücü <code class="inline">-EIO</code> döndürür ve hata mesajı log'a yazar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>cef168.c:87-116 — okuma ve CRC doğrulama</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">static int</span> cef168_i2c_read(<span class="keyword">struct</span> cef168_device *cef168_dev,
+                           <span class="keyword">struct</span> cef168_data *rx_data)
+{
+    <span class="keyword">struct</span> i2c_client *client = v4l2_get_subdevdata(&amp;cef168_dev-&gt;sd);
+
+    <span class="keyword">int</span> ret = i2c_master_recv(client, (<span class="keyword">char</span> *)rx_data,
+                              <span class="keyword">sizeof</span>(<span class="keyword">struct</span> cef168_data));
+    <span class="keyword">if</span> (ret != <span class="keyword">sizeof</span>(<span class="keyword">struct</span> cef168_data)) {
+        dev_err(&amp;client-&gt;dev, <span class="str">"I2C read fail, ret=%d\n"</span>, ret);
+        <span class="keyword">return</span> -EIO;
+    }
+
+    <span class="cmt">/* CRC-8 doğrula (son bayt hariç tüm struct) */</span>
+    u8 computed_crc = crc8(cef168_crc8_table, (<span class="keyword">const</span> u8 *)rx_data,
+                           <span class="keyword">sizeof</span>(<span class="keyword">struct</span> cef168_data) - 1, CRC8_INIT_VALUE);
+    <span class="keyword">if</span> (computed_crc != rx_data-&gt;crc8) {
+        dev_err(&amp;client-&gt;dev,
+                <span class="str">"CRC mismatch calculated=0x%02X read=0x%02X\n"</span>,
+                computed_crc, rx_data-&gt;crc8);
+        <span class="keyword">return</span> -EIO;
+    }
+
+    <span class="cmt">/* little-endian → host byte order */</span>
+    rx_data-&gt;moving_time         = le16_to_cpup((__le16 *)&amp;rx_data-&gt;moving_time);
+    rx_data-&gt;focus_position_min  = le16_to_cpup((__le16 *)&amp;rx_data-&gt;focus_position_min);
+    rx_data-&gt;focus_position_max  = le16_to_cpup((__le16 *)&amp;rx_data-&gt;focus_position_max);
+    rx_data-&gt;focus_position_cur  = le16_to_cpup((__le16 *)&amp;rx_data-&gt;focus_position_cur);
+    rx_data-&gt;focus_distance_min  = le16_to_cpup((__le16 *)&amp;rx_data-&gt;focus_distance_min);
+    rx_data-&gt;focus_distance_max  = le16_to_cpup((__le16 *)&amp;rx_data-&gt;focus_distance_max);
+    <span class="keyword">return</span> 0;
+}</code></pre>
+  </div>
+
+  <h3>CRC-8 detayları</h3>
+  <div class="params">
+    <div class="param"><span class="name">Polinom</span><span class="desc"><strong>168 (0xA8)</strong> — <code class="inline">CEF_CRC8_POLYNOMIAL</code> sabiti; <code class="inline">crc8_populate_msb()</code> ile tablo oluşturulur</span></div>
+    <div class="param"><span class="name">Başlangıç değeri</span><span class="desc"><strong>0xFF</strong> — kernel: <code class="inline">CRC8_INIT_VALUE</code>, userspace I2CDev: explicit <code class="inline">crc = 0xFF</code></span></div>
+    <div class="param"><span class="name">Bit sırası</span><span class="desc">MSB-first — <code class="inline">crc8_populate_msb()</code> çağrısı bu sırayı garantiler</span></div>
+    <div class="param"><span class="name">Kapsam</span><span class="desc">Yazma: bayt 0–2 (3 bayt). Okuma: struct'ın son baytı hariç tamamı.</span></div>
+  </div>
+
+  <div class="callout">
+    <div class="label">DOĞRULAMA: kalibrasyon paketi</div>
+    <p><code class="inline">calibrate.cpp</code>'deki I²C kalibrasyon paketi hardcoded: <code class="inline">{0x22, 0x00, 0x00, 0x30}</code>. <code class="inline">0x30</code>'un <code class="inline">{0x22, 0x00, 0x00}</code> üzerinden polinom 168 / seed 0xFF ile hesaplanan CRC-8 olduğu elle doğrulanabilir. Bu, tam protokol formatını bağımsız olarak kanıtlar.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Komut Opcode'ları — Tam Referans</h2>
+  <p class="section-lead">Yedi opcode, cef168.h'de sabit olarak tanımlanmıştır. Tüm komutlar 4 baytlık yazma paketiyle gönderilir; kart onay vermez (write-only akış).</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>cef168.h:22-28 — opcode sabitleri</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#define</span> INP_CALIBRATE     0x22
+<span class="keyword">#define</span> INP_SET_FOCUS      0x80
+<span class="keyword">#define</span> INP_SET_FOCUS_P    0x81
+<span class="keyword">#define</span> INP_SET_FOCUS_N    0x82
+<span class="keyword">#define</span> INP_SET_APERTURE   0x7A
+<span class="keyword">#define</span> INP_SET_APERTURE_P 0x7B
+<span class="keyword">#define</span> INP_SET_APERTURE_N 0x7C</code></pre>
+  </div>
+
+  <h3>Opcode tablosu</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Hex</th><th>Sembol</th><th>Fonksiyon</th><th>Değer (u16, LE)</th><th>Örnek paket</th></tr></thead>
+      <tbody>
+        <tr><td><strong>0x22</strong></td><td><code class="inline">INP_CALIBRATE</code></td><td>Tam odak aralığı kalibrasyonu başlat</td><td>0 (kullanılmaz)</td><td><code class="inline">22 00 00 30</code></td></tr>
+        <tr><td><strong>0x7A</strong></td><td><code class="inline">INP_SET_APERTURE</code></td><td>Mutlak diyafram — f-stop × 100</td><td>ör. 560 = f/5.6</td><td><code class="inline">7A 38 02 XX</code></td></tr>
+        <tr><td><strong>0x7B</strong></td><td><code class="inline">INP_SET_APERTURE_P</code></td><td>Diyaframı N × 0.01 f-stop aç (+)</td><td>100 = 1 f-stop</td><td><code class="inline">7B 64 00 XX</code></td></tr>
+        <tr><td><strong>0x7C</strong></td><td><code class="inline">INP_SET_APERTURE_N</code></td><td>Diyaframı N × 0.01 f-stop kapat (−)</td><td>100 = 1 f-stop</td><td><code class="inline">7C 64 00 XX</code></td></tr>
+        <tr><td><strong>0x80</strong></td><td><code class="inline">INP_SET_FOCUS</code></td><td>Mutlak odak adımı — kalibrasyon sonrası geçerli</td><td>0 .. max</td><td><code class="inline">80 F4 01 XX</code></td></tr>
+        <tr><td><strong>0x81</strong></td><td><code class="inline">INP_SET_FOCUS_P</code></td><td>Odağı sonsuza doğru N adım kaydır (+)</td><td>adım sayısı</td><td><code class="inline">81 64 00 XX</code></td></tr>
+        <tr><td><strong>0x82</strong></td><td><code class="inline">INP_SET_FOCUS_N</code></td><td>Odağı minimuma doğru N adım kaydır (−)</td><td>adım sayısı</td><td><code class="inline">82 64 00 XX</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><em>XX</em> alanı CRC-8'dir; her pakette farklıdır.</p>
+
+  <h3>Diyafram değeri kodlaması</h3>
+  <p>Diyafram değerleri <strong>f-stop × 100</strong> tam sayısı olarak gönderilir:</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>f-stop</th><th>Kontrol değeri</th><th>Örnek v4l2-ctl</th></tr></thead>
+      <tbody>
+        <tr><td>f/3.5</td><td>350</td><td><code class="inline">iris_absolute=350</code></td></tr>
+        <tr><td>f/5.6</td><td>560</td><td><code class="inline">iris_absolute=560</code></td></tr>
+        <tr><td>f/8.0</td><td>800</td><td><code class="inline">iris_absolute=800</code></td></tr>
+        <tr><td>f/11.0</td><td>1100</td><td><code class="inline">iris_absolute=1100</code></td></tr>
+        <tr><td>f/16.0</td><td>1600</td><td><code class="inline">iris_absolute=1600</code></td></tr>
+        <tr><td>f/22.6</td><td>2260</td><td><code class="inline">iris_absolute=2260</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">ZOOM LENS UYARISI</div>
+    <p>Zoom lenslerde focal length değiştikçe geçerli diyafram aralığı da değişir. Firmware, her komut öncesinde mevcut aralığı low-side protokol üzerinden sorgular. Aralık dışı değer gönderilirse lens engage olmaz ve kontrol sessizce görmezden gelinir. <code class="inline">iris_relative</code>'in etki etmesi için önce en az bir kez <code class="inline">iris_absolute</code> gönderilmiş olması gerekir.</p>
+  </div>
+
+  <h3>V4L2 → opcode eşleme kodu</h3>
+  <div class="code-block">
+    <div class="code-header"><span>cef168.c:118-139 — cef168_set_ctrl()</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">static int</span> cef168_set_ctrl(<span class="keyword">struct</span> v4l2_ctrl *ctrl)
+{
+    <span class="keyword">struct</span> cef168_device *dev = to_cef168(ctrl);
+    u8 cmd;
+
+    <span class="keyword">switch</span> (ctrl-&gt;id) {
+    <span class="keyword">case</span> V4L2_CID_FOCUS_ABSOLUTE:
+        <span class="keyword">return</span> cef168_i2c_write(dev, INP_SET_FOCUS, ctrl-&gt;val);
+
+    <span class="keyword">case</span> V4L2_CID_FOCUS_RELATIVE:
+        cmd = ctrl-&gt;val &lt; 0 ? INP_SET_FOCUS_N : INP_SET_FOCUS_P;
+        <span class="keyword">return</span> cef168_i2c_write(dev, cmd, abs(ctrl-&gt;val));
+
+    <span class="keyword">case</span> V4L2_CID_IRIS_ABSOLUTE:
+        <span class="keyword">return</span> cef168_i2c_write(dev, INP_SET_APERTURE, ctrl-&gt;val);
+
+    <span class="keyword">case</span> V4L2_CID_IRIS_RELATIVE:
+        cmd = ctrl-&gt;val &lt; 0 ? INP_SET_APERTURE_N : INP_SET_APERTURE_P;
+        <span class="keyword">return</span> cef168_i2c_write(dev, cmd, abs(ctrl-&gt;val));
+
+    <span class="keyword">case</span> CEF168_V4L2_CID_CUSTOM(calibrate):
+        <span class="keyword">return</span> cef168_i2c_write(dev, INP_CALIBRATE, 0);
+    }
+    <span class="keyword">return</span> -EINVAL;
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> cef168_data Struct'ı — Bayt Düzeni, Endian, CRC</h2>
+  <p class="section-lead">Karttan dönen her yanıt bu sabit boyutlu packed struct'tır. Hem kernel hem userspace aynı tanımı kullanır; <code class="inline">cef168.h</code> her iki tarafın ortak başlığıdır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>cef168.h:9-20 — yanıt struct'ı</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">struct</span> cef168_data {
+    __u8  lens_id;              <span class="cmt">// [0]    Canon lens tip baytı (ör. 0xEB)</span>
+    __u8  moving      : 1;      <span class="cmt">// [1] b0 motor aktif mi</span>
+    __u8  calibrating : 2;      <span class="cmt">// [1] b1-b2  0=boş, 2=kalibrasyon aktif</span>
+    __u16 moving_time;          <span class="cmt">// [2-3]  son işlem süresi (ms), LE</span>
+    __u16 focus_position_min;   <span class="cmt">// [4-5]  kalibrasyon sonrası min adım, LE</span>
+    __u16 focus_position_max;   <span class="cmt">// [6-7]  kalibrasyon sonrası max adım, LE</span>
+    __u16 focus_position_cur;   <span class="cmt">// [8-9]  mevcut odak adımı, LE</span>
+    __u16 focus_distance_min;   <span class="cmt">// [10-11] cm cinsinden yakın mesafe, LE</span>
+    __u16 focus_distance_max;   <span class="cmt">// [12-13] cm cinsinden uzak mesafe, LE (0xFFFF ≈ sonsuz)</span>
+    __u8  crc8;                 <span class="cmt">// [14]  önceki 14 bayt üzerinden CRC-8</span>
+} __packed;                     <span class="cmt">// toplam: 15 bayt</span></code></pre>
+  </div>
+
+  <h3>Bayt düzeni diyagramı</h3>
+  <div class="flow">
+    <pre>
+ Offset:  0      1      2    3    4    5    6    7    8    9   10   11   12   13   14
+          ┌──────┬──────┬────┴────┬────┴────┬────┴────┬────┴────┬────┴────┬────┴────┐
+          │lens  │flags │moving_  │pos_min  │pos_max  │pos_cur  │dist_min │dist_max │ crc
+          │  id  │[1b2b]│  time   │  (LE)   │  (LE)   │  (LE)   │  (LE)   │  (LE)  │  8
+          └──────┴──────┴─────────┴─────────┴─────────┴─────────┴─────────┴─────────┘
+                  bit0=moving
+                  bit1-2=calibrating</pre>
+  </div>
+
+  <h3>Alan açıklamaları</h3>
+  <div class="params">
+    <div class="param"><span class="name">lens_id</span><span class="desc">Canon lens tipi. Her lens modelinin kendine özgü ID baytı vardır (ör. EF-S 10-18mm = 0xEB). Kalibrasyon EEPROM'a bu ID ile kaydedilir; lens değiştirildiğinde kalibrasyon korunur.</span></div>
+    <div class="param"><span class="name">moving</span><span class="desc">1 bit — odak veya diyafram motoru hareket ediyorken 1 olarak set edilir. libcamera bu biti <code class="inline">FOCUS_ABSOLUTE</code> control'ün volatile okumalarında kullanmaz; kullanıcı alanı için bilgilendirme amaçlıdır.</span></div>
+    <div class="param"><span class="name">calibrating</span><span class="desc">2 bit durum alanı: 0 = hazır / boşta, 2 = kalibrasyon taraması devam ediyor. <code class="inline">calibrate.cpp</code> bu alanı polling döngüsünde her 500 µs'de bir kontrol eder.</span></div>
+    <div class="param"><span class="name">moving_time</span><span class="desc">Son odak veya diyafram hareketinin milisaniye cinsinden süresi. Kalibrasyon aracı bu değerden <code class="inline">step_frames</code> parametresini hesaplar: &lt;300ms→4, &lt;350ms→5, else→6.</span></div>
+    <div class="param"><span class="name">focus_position_{min,max,cur}</span><span class="desc">Kalibrasyon tamamlanmadan önce min/max değerleri anlamlı değildir (genellikle 0). Kalibrasyon sonrası libcamera bu aralığı <code class="inline">FOCUS_ABSOLUTE</code> control'ün min/max değeri olarak kullanır.</span></div>
+    <div class="param"><span class="name">focus_distance_{min,max}</span><span class="desc">Odak motorunun bulunduğu pozisyona göre lens'in netlediği mesafe aralığı (cm). 65535 (0xFFFF) sonsuzu temsil eder — gerçek bir mesafe değildir. Kalibrasyon sırasında bu değer her hareket adımında güncellenir.</span></div>
+    <div class="param"><span class="name">crc8</span><span class="desc">Önceki 14 bayt üzerinden hesaplanan CRC-8. Kernel sürücüsü ve <code class="inline">calibrate.cpp</code> uyuşmazlık durumunda okumayı hata olarak işaretler.</span></div>
+  </div>
+
+  <h3>Endian dönüşümü</h3>
+  <p>Struct kabloda little-endian gelir. Sürücü, tüm <code class="inline">__u16</code> alanlarını <code class="inline">le16_to_cpup()</code> ile host byte sırasına çevirir. Userspace <code class="inline">calibrate.cpp</code> da aynı dönüşümü <code class="inline">__le16_to_cpu()</code> ile yapar. ARM ve x86 küçük-endian olduğundan pratikte bu dönüşüm no-op'tur; ancak big-endian mimariler için doğruluk açısından zorunludur.</p>
+
+  <div class="callout">
+    <div class="label">STRUCT'I OKUMA</div>
+    <p>Custom <code class="inline">data</code> control'ü (<code class="inline">CEF168_V4L2_CID_CUSTOM(data)</code>) tam struct snapshot'ını döndürür. <code class="inline">v4l2-ctl</code> ile doğrudan okunabilir:</p>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — ham struct okuma</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 15 baytlık veri kontrolünü oku (hexdump olarak göster):</span>
+v4l2-ctl -d $DEV_LENS --get-ctrl=0x00980aa9 | xxd
+<span class="cmt"># Çıktı (örnek): EB 00 5F 00 00 00 B4 04 95 02 17 00 A8 19 CRC</span>
+<span class="cmt">#                ↑lens_id  ↑mt    ↑min   ↑max   ↑cur   ↑dmin  ↑dmax</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Kernel Sürücüsü — Probe, V4L2 Sub-Device, Control Haritası</h2>
+  <p class="section-lead"><code class="inline">cef168.c</code> standart bir Linux I²C client sürücüsüdür; kendini V4L2 medya grafiğine <code class="inline">MEDIA_ENT_F_LENS</code> tipiyle kaydettirir.</p>
+
+  <h3>Sürücü kaydı</h3>
+  <div class="code-block">
+    <div class="code-header"><span>cef168.c:302-317 — device table ve driver yapısı</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Device Tree eşleme tablosu */</span>
+<span class="keyword">static const struct</span> of_device_id cef168_of_table[] = {
+    { .compatible = <span class="str">"pinefeat,cef168"</span> },
+    { <span class="cmt">/* sentinel */</span> }
+};
+MODULE_DEVICE_TABLE(of, cef168_of_table);
+
+<span class="keyword">static struct</span> i2c_driver cef168_i2c_driver = {
+    .driver = {
+        .name = CEF168_NAME,
+        .of_match_table = cef168_of_table,
+    },
+    .probe  = cef168_probe,
+    .remove = cef168_remove,
+};
+module_i2c_driver(cef168_i2c_driver);</code></pre>
+  </div>
+
+  <h3>Probe fonksiyonu</h3>
+  <div class="code-block">
+    <div class="code-header"><span>cef168.c:253-290 — cef168_probe()</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">static int</span> cef168_probe(<span class="keyword">struct</span> i2c_client *client)
+{
+    <span class="keyword">struct</span> cef168_device *cef168_dev;
+    <span class="keyword">int</span> rval;
+
+    <span class="cmt">/* sürücü özel yapısını tahsis et */</span>
+    cef168_dev = devm_kzalloc(&amp;client-&gt;dev, <span class="keyword">sizeof</span>(*cef168_dev), GFP_KERNEL);
+    <span class="keyword">if</span> (!cef168_dev)
+        <span class="keyword">return</span> -ENOMEM;
+
+    <span class="cmt">/* I²C client → sub-device bağlantısını kur */</span>
+    v4l2_i2c_subdev_init(&amp;cef168_dev-&gt;sd, client, &amp;cef168_ops);
+    cef168_dev-&gt;sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE |
+                            V4L2_SUBDEV_FL_HAS_EVENTS;
+
+    <span class="cmt">/* V4L2 control handler'ı başlat */</span>
+    rval = cef168_init_controls(cef168_dev);
+    <span class="keyword">if</span> (rval) <span class="keyword">goto</span> err_cleanup;
+
+    <span class="cmt">/* media entity: sıfır pad, fonksiyon = LENS */</span>
+    rval = media_entity_pads_init(&amp;cef168_dev-&gt;sd.entity, 0, NULL);
+    <span class="keyword">if</span> (rval &lt; 0) <span class="keyword">goto</span> err_cleanup;
+    cef168_dev-&gt;sd.entity.function = MEDIA_ENT_F_LENS;
+
+    <span class="cmt">/* asenkron kayıt: kamera sensörü hazır olduğunda otomatik bağlanır */</span>
+    rval = v4l2_async_register_subdev(&amp;cef168_dev-&gt;sd);
+    <span class="keyword">if</span> (rval &lt; 0) <span class="keyword">goto</span> err_cleanup;
+
+    <span class="cmt">/* CRC-8 tablosunu başlat (polinom 168, MSB-first) */</span>
+    crc8_populate_msb(cef168_crc8_table, CEF_CRC8_POLYNOMIAL);
+    <span class="keyword">return</span> 0;
+
+err_cleanup:
+    v4l2_ctrl_handler_free(&amp;cef168_dev-&gt;ctrls);
+    media_entity_cleanup(&amp;cef168_dev-&gt;sd.entity);
+    <span class="keyword">return</span> rval;
+}</code></pre>
+  </div>
+
+  <h3>V4L2 control haritası</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Control ID</th><th>Hex</th><th>Yön</th><th>Flag'ler</th><th>Opcode</th></tr></thead>
+      <tbody>
+        <tr><td><code class="inline">V4L2_CID_FOCUS_ABSOLUTE</code></td><td>0x009a0901</td><td>R/W</td><td>VOLATILE · EXECUTE_ON_WRITE</td><td>0x80 (yaz) / struct (oku)</td></tr>
+        <tr><td><code class="inline">V4L2_CID_FOCUS_RELATIVE</code></td><td>0x009a0902</td><td>W</td><td>—</td><td>0x81 (+) / 0x82 (−)</td></tr>
+        <tr><td><code class="inline">V4L2_CID_IRIS_ABSOLUTE</code></td><td>0x009a0903</td><td>W only</td><td>WRITE_ONLY · EXECUTE_ON_WRITE</td><td>0x7A</td></tr>
+        <tr><td><code class="inline">V4L2_CID_IRIS_RELATIVE</code></td><td>0x009a0904</td><td>W</td><td>—</td><td>0x7B (+) / 0x7C (−)</td></tr>
+        <tr><td><code class="inline">CEF168_V4L2_CID_CUSTOM(lens_id)</code></td><td>0x00980aa8</td><td>R only</td><td>VOLATILE · READ_ONLY · U8</td><td>struct.lens_id</td></tr>
+        <tr><td><code class="inline">CEF168_V4L2_CID_CUSTOM(data)</code></td><td>0x00980aa9</td><td>R only</td><td>VOLATILE · READ_ONLY · U8[]</td><td>tüm struct (15 bayt)</td></tr>
+        <tr><td><code class="inline">CEF168_V4L2_CID_CUSTOM(calibrate)</code></td><td>0x00980aaa</td><td>W only</td><td>WRITE_ONLY · EXECUTE_ON_WRITE · Button</td><td>0x22</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Özel ID'ler: <code class="inline">V4L2_CID_USER_BASE | 168 + {0,1,2}</code> = <code class="inline">0x00980000 | 0xA8 + idx</code>.</p>
+
+  <h3>FOCUS_ABSOLUTE: dinamik aralık güncellemesi</h3>
+  <p>Control, başlangıçta <code class="inline">[0, S16_MAX]</code> yer tutucu aralıkla oluşturulur. Her <code class="inline">g_volatile_ctrl</code> çağrısında karttan okunan gerçek değerlerle güncellenir:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>cef168.c:141-166 — cef168_get_ctrl()</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">static int</span> cef168_get_ctrl(<span class="keyword">struct</span> v4l2_ctrl *ctrl)
+{
+    <span class="keyword">struct</span> cef168_data data;
+    <span class="keyword">struct</span> cef168_device *dev = to_cef168(ctrl);
+    <span class="keyword">int</span> rval = cef168_i2c_read(dev, &amp;data);
+    <span class="keyword">if</span> (rval &lt; 0) <span class="keyword">return</span> rval;
+
+    <span class="keyword">switch</span> (ctrl-&gt;id) {
+    <span class="keyword">case</span> V4L2_CID_FOCUS_ABSOLUTE:
+        <span class="cmt">/* min/max aralığını kartın gerçek değerleriyle güncelle */</span>
+        __v4l2_ctrl_modify_range(ctrl,
+                                 data.focus_position_min,
+                                 data.focus_position_max, 1, 0);
+        ctrl-&gt;val = data.focus_position_cur;
+        <span class="keyword">return</span> 0;
+
+    <span class="keyword">case</span> CEF168_V4L2_CID_CUSTOM(lens_id):
+        ctrl-&gt;p_new.p_u8[0] = data.lens_id;
+        <span class="keyword">return</span> 0;
+
+    <span class="keyword">case</span> CEF168_V4L2_CID_CUSTOM(data):
+        memcpy(ctrl-&gt;p_new.p_u8, &amp;data, <span class="keyword">sizeof</span>(data));
+        <span class="keyword">return</span> 0;
+    }
+    <span class="keyword">return</span> -EINVAL;
+}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">VOLATILE FLAG NEDİR?</div>
+    <p><code class="inline">V4L2_CTRL_FLAG_VOLATILE</code>, kernel'e "bu control'ün değeri asenkron olarak değişebilir, her seferinde cihazdan oku" der. cef168 için bu kritiktir: fokus motoru libcamera'nın isteği dışında (AF/MF switch, self-test) hareket edebilir. <code class="inline">EXECUTE_ON_WRITE</code> ise write işleminin cache'e değil doğrudan donanıma gitmesini garantiler.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Kullanıcı Alanı Aracı — calibrate.cpp Derinlemesine</h2>
+  <p class="section-lead"><code class="inline">calibrate.cpp</code>, lens'e özgü odak parametrelerini üretir. Çıktısı libcamera'nın <code class="inline">rpi.af</code> tuning bölümüne eklenir ve autofocus algoritmasının temelini oluşturur.</p>
+
+  <h3>Sınıf hiyerarşisi</h3>
+  <div class="code-block">
+    <div class="code-header"><span>calibrate.cpp:18-43 — IDevice arayüzü</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">class</span> IDevice {
+  <span class="keyword">protected</span>:
+    <span class="keyword">int</span> fd;
+    <span class="keyword">const char</span> *dev;
+  <span class="keyword">public</span>:
+    IDevice(<span class="keyword">const char</span> *dev);        <span class="cmt">// open(dev, O_RDWR)</span>
+    <span class="keyword">virtual</span> ~IDevice();             <span class="cmt">// close(fd)</span>
+    <span class="keyword">virtual void</span> calibrate() = 0;  <span class="cmt">// saf sanal — arka uca göre davranır</span>
+    <span class="keyword">virtual void</span> getData(<span class="keyword">struct</span> cef168_data &amp;data) = 0;
+};
+
+<span class="keyword">class</span> V4L2SubDev : <span class="keyword">public</span> IDevice { ... }; <span class="cmt">// ioctl (VIDIOC_S_CTRL, VIDIOC_G_EXT_CTRLS)</span>
+<span class="keyword">class</span> I2CDev    : <span class="keyword">public</span> IDevice { ... }; <span class="cmt">// ham write(4) / read(sizeof struct)</span></code></pre>
+  </div>
+
+  <h3>V4L2SubDev arka ucu</h3>
+  <div class="code-block">
+    <div class="code-header"><span>calibrate.cpp:52-93 — V4L2 üzerinden kalibrasyon ve okuma</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">void</span> V4L2SubDev::calibrate()
+{
+    <span class="keyword">struct</span> v4l2_control cal = {
+        .id = CEF168_V4L2_CID_CUSTOM(calibrate),
+        .value = 0,
+    };
+    <span class="keyword">if</span> (ioctl(fd, VIDIOC_S_CTRL, &amp;cal) &lt; 0) { ... }
+}
+
+<span class="keyword">void</span> V4L2SubDev::getData(<span class="keyword">struct</span> cef168_data &amp;data)
+{
+    <span class="keyword">struct</span> v4l2_ext_control ext_ctrl = {
+        .id   = CEF168_V4L2_CID_CUSTOM(data),
+        .size = <span class="keyword">sizeof</span>(<span class="keyword">struct</span> cef168_data),
+        .ptr  = &amp;data,
+    };
+    <span class="keyword">struct</span> v4l2_ext_controls ctrls = {
+        .ctrl_class = V4L2_CTRL_CLASS_USER,
+        .count      = 1,
+        .controls   = &amp;ext_ctrl,
+    };
+    <span class="keyword">if</span> (ioctl(fd, VIDIOC_G_EXT_CTRLS, &amp;ctrls) &lt; 0) { ... }
+}</code></pre>
+  </div>
+
+  <h3>I2CDev arka ucu</h3>
+  <div class="code-block">
+    <div class="code-header"><span>calibrate.cpp:96-170 — ham I²C erişimi</span><span class="dot">●</span></div>
+    <pre><code>I2CDev::I2CDev(<span class="keyword">const char</span> *dev, <span class="keyword">const int</span> addr) : IDevice(dev), addr(addr)
+{
+    <span class="keyword">if</span> (ioctl(fd, I2C_SLAVE, addr) &lt; 0) { ... }  <span class="cmt">// adres 0x0d</span>
+}
+
+<span class="keyword">void</span> I2CDev::calibrate()
+{
+    <span class="cmt">/* hardcoded paket: {0x22, 0x00, 0x00, CRC} — CRC = 0x30 */</span>
+    <span class="keyword">const</span> __u8 tx[4] = { INP_CALIBRATE, 0, 0, 0x30 };
+    <span class="keyword">if</span> (write(fd, &amp;tx, <span class="keyword">sizeof</span>(tx)) != <span class="keyword">sizeof</span>(tx)) { ... }
+}
+
+<span class="keyword">void</span> I2CDev::getData(<span class="keyword">struct</span> cef168_data &amp;rx)
+{
+    <span class="keyword">if</span> (read(fd, &amp;rx, <span class="keyword">sizeof</span>(rx)) != <span class="keyword">sizeof</span>(rx)) { ... }
+    <span class="cmt">/* CRC doğrula */</span>
+    u8 crc = crc8_msb((u8*)&amp;rx, <span class="keyword">sizeof</span>(rx) - 1);
+    <span class="keyword">if</span> (crc != rx.crc8) <span class="keyword">throw</span> std::runtime_error(<span class="str">"CRC mismatch"</span>);
+    <span class="cmt">/* endian dönüşümü */</span>
+    rx.moving_time        = __le16_to_cpu(rx.moving_time);
+    rx.focus_position_min = __le16_to_cpu(rx.focus_position_min);
+    <span class="cmt">/* ... */</span>
+}</code></pre>
+  </div>
+
+  <h3>PWL (Piecewise Linear) noktası toplama</h3>
+  <div class="code-block">
+    <div class="code-header"><span>calibrate.cpp:304-329 — kalibrasyon döngüsü</span><span class="dot">●</span></div>
+    <pre><code>device-&gt;calibrate();
+
+cef168_data data;
+<span class="keyword">do</span> {
+    usleep(500);                  <span class="cmt">// ~2 kHz polling</span>
+    device-&gt;getData(data);
+
+    <span class="keyword">if</span> (data.calibrating == 2 &amp;&amp; data.focus_distance_min != 0) {
+        <span class="cmt">/* mesafe cm → diyoptri dönüşümü: 1/m = 100/cm */</span>
+        update(points, {
+            100 / (<span class="keyword">double</span>)data.focus_distance_min,  <span class="cmt">// x ekseni: ters mesafe (m⁻¹)</span>
+            data.focus_position_cur,               <span class="cmt">// y ekseni: donanım adımı</span>
+        });
+    }
+} <span class="keyword">while</span> (data.calibrating != 0 ||
+          elapsed_ms() &lt; 100);    <span class="cmt">// en az 100 ms bekle</span>
+
+<span class="cmt">/* step_frames: son hareket süresinden hesapla */</span>
+<span class="keyword">int</span> stepFrames = data.moving_time &lt; 300 ? 4 :
+                 data.moving_time &lt; 350 ? 5 : 6;</code></pre>
+  </div>
+
+  <p>Kalibrasyon taraması sırasında (calibrating == 2) odak motoru minimum'dan sonsuz'a hareket eder. Her adımda <code class="inline">focus_distance_min</code> mevcut netleme mesafesini verir. Araç bu değeri diyoptri (ters metre) birimine dönüştürür çünkü libcamera autofocus algoritması diyoptri uzayında çalışır.</p>
+
+  <h3>Örnek kalibrasyon çıktısı</h3>
+  <div class="code-block">
+    <div class="code-header"><span>terminal — ./calibrate -d $DEV_LENS -v</span><span class="dot">●</span></div>
+    <pre><code>Focus:     0, time:   0 ms, distance: 655.35 -655.35 m, status: 0/2
+Focus:   108, time:  95 ms, distance:   6.50 -  6.50 m, status: 1/2
+Focus:   280, time:  87 ms, distance:   2.25 -  2.25 m, status: 1/2
+Focus:   512, time:  92 ms, distance:   0.88 -  0.88 m, status: 1/2
+Focus:   780, time:  88 ms, distance:   0.46 -  0.46 m, status: 1/2
+Focus:  1069, time:  95 ms, distance:   0.23 -  0.23 m, status: 0/0
+------------------------------------------------------------
+Parameters for "rpi.af" section of camera tuning JSON file
+------------------------------------------------------------
+Inverse of focus distance, m⁻¹:
+    "min": 0.00153,
+    "max": 4.35,
+    "default": 4.35,
+Speed:
+    step_frames: 4
+PWL function:
+    "map": [ 0.00153, 1069, 0.154, 1042, 0.446, 996, 0.719, 969,
+             0.971, 941, 1.2, 901, 1.45, 860, 1.72, 805, 2.04, 764,
+             2.44, 682, 2.86, 559, 3.45, 388, 3.85, 252, 4.35, 0 ]</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">ARKA UÇ SEÇİMİ</div>
+    <p><code class="inline">--device</code> argümanı "i2c" içeriyorsa <code class="inline">I2CDev</code> seçilir, yoksa <code class="inline">V4L2SubDev</code>. Kernel sürücüsü kurulu değilken debug için I²C modu kullanışlıdır. Üretim ortamında her zaman V4L2 modu tercih edilmeli.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> UART Seri Arayüz — 115200-8N1 ASCII Protokolü</h2>
+  <p class="section-lead">I²C'den tamamen bağımsız ikincil arabirim. Kernel sürücüsü gerektirmez; INDI, Python script'leri veya herhangi bir terminal ile kullanılabilir.</p>
+
+  <h3>Fiziksel katman</h3>
+  <div class="params">
+    <div class="param"><span class="name">Konnektör</span><span class="desc">Molex PicoBlade, 1.25 mm pitch — 4 pin</span></div>
+    <div class="param"><span class="name">Pinout</span><span class="desc">Pin 1: GND · Pin 2: RXD (kart girişi) · Pin 3: TXD (kart çıkışı) · Pin 4: VCC</span></div>
+    <div class="param"><span class="name">Voltaj</span><span class="desc">3.3 V TTL</span></div>
+    <div class="param"><span class="name">Baud rate</span><span class="desc">115200</span></div>
+    <div class="param"><span class="name">Frame formatı</span><span class="desc">8 data bit · parity yok · 1 stop bit (8N1)</span></div>
+    <div class="param"><span class="name">Akış kontrolü</span><span class="desc">Yok</span></div>
+    <div class="param"><span class="name">Satır sonu</span><span class="desc"><code class="inline">\r</code>, <code class="inline">\n</code> veya her ikisi</span></div>
+    <div class="param"><span class="name">Yanıt sonu</span><span class="desc"><code class="inline">\r\n</code></span></div>
+  </div>
+
+  <h3>Terminal kurulumu</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — minicom veya picocom</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># minicom ile bağlan (local echo açık, satırsonu çevirisi kapalı):</span>
+<span class="cmd">sudo</span> minicom -D /dev/ttyUSB0 -b 115200 --noinit
+
+<span class="cmt"># picocom ile (daha minimal):</span>
+<span class="cmd">picocom</span> -b 115200 --echo /dev/ttyUSB0
+
+<span class="cmt"># pyserial ile (script'ten test):</span>
+python3 -c <span class="str">"
+import serial, time
+s = serial.Serial('/dev/ttyUSB0', 115200, timeout=1)
+s.write(b'h\r'); time.sleep(0.1); print(s.read(200).decode())
+"</span></code></pre>
+  </div>
+
+  <h3>Tam komut tablosu</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Komut</th><th>Örnek</th><th>Açıklama</th><th>Yanıt örneği</th><th>I²C eşdeğeri</th></tr></thead>
+      <tbody>
+        <tr><td><code class="inline">h</code></td><td><code class="inline">h</code></td><td>Lens bilgisi (ID, focal length, zoom, diyafram, odak)</td><td><code class="inline">Lens ID: 0xEB...</code></td><td>—</td></tr>
+        <tr><td><code class="inline">c</code></td><td><code class="inline">c</code></td><td>Kalibrasyon başlat (EEPROM'a lens ID ile yaz)</td><td><code class="inline">ok</code></td><td>0x22</td></tr>
+        <tr><td><code class="inline">l</code></td><td><code class="inline">l</code></td><td>Focal length (mm)</td><td><code class="inline">12</code></td><td>—</td></tr>
+        <tr><td><code class="inline">d</code></td><td><code class="inline">d</code></td><td>Odak mesafesi aralığı (m)</td><td><code class="inline">2.24-6.48</code></td><td>struct alanları</td></tr>
+        <tr><td><code class="inline">r</code></td><td><code class="inline">r</code></td><td>Odak pozisyonu aralığı (fw ≥1.3)</td><td><code class="inline">0-1203</code></td><td>struct alanları</td></tr>
+        <tr><td><code class="inline">f</code> · <code class="inline">p</code></td><td><code class="inline">f</code></td><td>Mutlak odak pozisyonunu oku</td><td><code class="inline">405</code></td><td>struct.pos_cur</td></tr>
+        <tr><td><code class="inline">f&lt;val&gt;</code> · <code class="inline">m&lt;val&gt;</code></td><td><code class="inline">f500</code></td><td>Mutlak odak ayarla</td><td><code class="inline">ok</code></td><td>0x80</td></tr>
+        <tr><td><code class="inline">f+&lt;val&gt;</code> · <code class="inline">m+&lt;val&gt;</code></td><td><code class="inline">f+100</code></td><td>Sonsuza doğru kaydır</td><td><code class="inline">ok</code></td><td>0x81</td></tr>
+        <tr><td><code class="inline">f-&lt;val&gt;</code> · <code class="inline">m-&lt;val&gt;</code></td><td><code class="inline">f-200</code></td><td>Minimuma doğru kaydır</td><td><code class="inline">ok</code></td><td>0x82</td></tr>
+        <tr><td><code class="inline">a</code></td><td><code class="inline">a</code></td><td>Diyafram aralığını oku (f-stop)</td><td><code class="inline">3.5-22.6</code></td><td>—</td></tr>
+        <tr><td><code class="inline">a&lt;val&gt;</code></td><td><code class="inline">a5.6</code></td><td>Mutlak diyafram (f-stop)</td><td><code class="inline">ok</code></td><td>0x7A</td></tr>
+        <tr><td><code class="inline">a+&lt;val&gt;</code></td><td><code class="inline">a+4.0</code></td><td>Göreceli aç</td><td><code class="inline">ok</code></td><td>0x7B</td></tr>
+        <tr><td><code class="inline">a-&lt;val&gt;</code></td><td><code class="inline">a-1.0</code></td><td>Göreceli kapat</td><td><code class="inline">ok</code></td><td>0x7C</td></tr>
+        <tr><td><code class="inline">i</code></td><td><code class="inline">i</code></td><td>Odağı sonsuza taşı</td><td><code class="inline">ok</code></td><td>—</td></tr>
+        <tr><td><code class="inline">m</code></td><td><code class="inline">m</code></td><td>Odağı minimuma taşı</td><td><code class="inline">ok</code></td><td>—</td></tr>
+        <tr><td><code class="inline">s&lt;val&gt;</code></td><td><code class="inline">s2</code></td><td>Odaklama hızı 1–4 (STM/USM)</td><td><code class="inline">ok</code></td><td>yalnızca UART</td></tr>
+        <tr><td><code class="inline">e</code></td><td><code class="inline">e</code></td><td>Motor aktif mi?</td><td><code class="inline">y</code> / <code class="inline">n</code></td><td>struct.moving</td></tr>
+        <tr><td><code class="inline">t</code></td><td><code class="inline">t</code></td><td>Son işlem süresi (ms)</td><td><code class="inline">95</code></td><td>struct.moving_time</td></tr>
+        <tr><td><code class="inline">n</code></td><td><code class="inline">n</code></td><td>Kart seri numarası</td><td><code class="inline">PINEFEAT CEF1680000011</code></td><td>yalnızca UART</td></tr>
+        <tr><td><code class="inline">v</code></td><td><code class="inline">v</code></td><td>Firmware sürümü</td><td><code class="inline">1.3</code></td><td>yalnızca UART</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Örnek oturum</h3>
+  <div class="code-block">
+    <div class="code-header"><span>terminal oturumu</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">> v</span>
+1.3
+<span class="cmt">> n</span>
+PINEFEAT CEF1680000011
+<span class="cmt">> h</span>
+Lens ID: 0xEB
+Focal length: 10-22 mm
+Zoom: 1x
+Aperture: f/3.5-22.6
+Focus distance: 0.23-0.23 m
+<span class="cmt">> c</span>
+ok
+<span class="cmt">> e</span>
+y
+<span class="cmt">> e</span>
+n
+<span class="cmt">> r</span>
+0-1069
+<span class="cmt">> f</span>
+1069
+<span class="cmt">> f500</span>
+ok
+<span class="cmt">> a5.6</span>
+ok
+<span class="cmt">> a</span>
+3.5-22.6</code></pre>
+  </div>
+
+  <h3>Hata kodları</h3>
+  <div class="params">
+    <div class="param"><span class="name"><code class="inline">ok</code></span><span class="desc">Komut başarıyla uygulandı</span></div>
+    <div class="param"><span class="name"><code class="inline">er</code></span><span class="desc">Bilinmeyen komut veya geçersiz parametre</span></div>
+    <div class="param"><span class="name"><code class="inline">nc</code></span><span class="desc">Lens fiziksel olarak bağlı değil veya EF bağlantısında hata var</span></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Canon EF Mount — Low-Side Protokolü (SPI Mode 3)</h2>
+  <p class="section-lead">Kartın lens ile konuştuğu katman. Bu repoda implementasyonu yoktur; Canon'ın EF protokolü tersine mühendislik ile elde edilmiş olup kart MCU firmware'inin içindedir.</p>
+
+  <div class="callout warn">
+    <div class="label">KAYNAK NOTU</div>
+    <p>Bu bölüm kamuya açık EF tersine mühendislik çalışmalarından ve host tarafındaki kodun bu katman hakkında dolaylı olarak ortaya koyduklarından derlenmektedir. Canon bu protokolü hiç belgelememiştir.</p>
+  </div>
+
+  <h3>Mount kontakları</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Pin</th><th>İsim</th><th>Yön</th><th>Açıklama</th><th>Gerilim</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><strong>VBAT</strong></td><td>Güç</td><td>Motor / IS güç hattı</td><td>~6 V</td></tr>
+        <tr><td>2</td><td><strong>P-GND</strong></td><td>GND</td><td>Motor akımı dönüş yolu</td><td>—</td></tr>
+        <tr><td>3</td><td><strong>VDD</strong></td><td>Güç</td><td>Lens MCU mantık beslemesi</td><td>~5 V</td></tr>
+        <tr><td>4</td><td><strong>DCL</strong></td><td>Kamera → Lens</td><td>Komut veri hattı (MOSI karşılığı)</td><td>5 V CMOS</td></tr>
+        <tr><td>5</td><td><strong>DLC</strong></td><td>Lens → Kamera</td><td>Yanıt veri hattı (MISO karşılığı)</td><td>5 V CMOS</td></tr>
+        <tr><td>6</td><td><strong>LCLK</strong></td><td>Kamera → Lens</td><td>Paylaşılan shift clock (master = cef168)</td><td>5 V CMOS</td></tr>
+        <tr><td>7</td><td><strong>D-GND</strong></td><td>GND</td><td>Mantık toprağı (P-GND'den ayrı — motor EMI'yi izole eder)</td><td>—</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">LEVEL SHIFT</div>
+    <p>cef168 kartının MCU'su 3.3 V'ta çalışır (host I²C/UART ile uyumlu), ancak Canon EF bus 5 V CMOS mantık kullanır. Kart bu iki voltaj alanı arasında level shifting yapar.</p>
+  </div>
+
+  <h3>Sinyalleme analizi</h3>
+  <div class="flow">
+    <pre>
+  LCLK ───┐  ┌──┐  ┌──┐  ┌──┐  ┌──┐  ┌──┐  ┌──┐  ┌──┐
+           └──┘  └──┘  └──┘  └──┘  └──┘  └──┘  └──┘  └─
+  DCL  ─ D7 ─ D6 ─ D5 ─ D4 ─ D3 ─ D2 ─ D1 ─ D0 ─────
+  DLC  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ R7 ─
+          MSB                                    LSB  (sonraki byte)</pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">SPI Modu</span><span class="desc"><strong>Mode 3</strong> (CPOL=1, CPHA=1) — saat boşta yüksek, yükselen kenarda örnekleme. MSB-first, 8 bit.</span></div>
+    <div class="param"><span class="name">Saat hızı</span><span class="desc">Lens tipine göre değişir: klasik EF ~<strong>62.5 kHz</strong>, yeni EF-S/STM/IS nesil ~<strong>96 kHz</strong></span></div>
+    <div class="param"><span class="name">Chip Select</span><span class="desc"><strong>Yok</strong> — lens ile bire bir bağlantı; çerçeveleme komut baytları ve inter-byte zamanlama ile yapılır</span></div>
+    <div class="param"><span class="name">Duplex</span><span class="desc">Pratikte <strong>yarı-duplex</strong>: kamera DCL'de komut gönderirken lens sonraki clock döngülerinde DLC'de yanıt verir. DLC, lens konuşmadığında high-Z / pull-up'ta bekler.</span></div>
+  </div>
+
+  <h3>Neden "SPI değil"?</h3>
+  <div class="params">
+    <div class="param"><span class="name">CS eksikliği</span><span class="desc">Standart SPI'da her slave'in CS/SS hattı vardır. EF bus bu hattı kullanmaz; bus tek bir lens için ayrılmıştır.</span></div>
+    <div class="param"><span class="name">Inter-byte zamanlama</span><span class="desc">Lens, iki byte arasında işlem zamanı ister. Bu süre protokol açısından anlamlıdır; DLC'nin durumu "meşgul" sinyali verir. Standart SPI bu kavramı bilmez.</span></div>
+    <div class="param"><span class="name">Üst katman</span><span class="desc">Komut byte değerleri, yanıt uzunlukları ve frame yapısı Canon'a özgüdür. SPI bir fiziksel katman tanımıdır, bu protokol ise uygulama katmanı içerir.</span></div>
+    <div class="param"><span class="name">Voltaj</span><span class="desc">5 V — tipik gömülü SPI uygulamaları 3.3 V veya daha düşük kullanır.</span></div>
+  </div>
+
+  <h3>Mantıksal komut katmanı</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>İşlem (topluluk adı)</th><th>Yön</th><th>Host arayüzündeki iz</th></tr></thead>
+      <tbody>
+        <tr><td><code class="inline">LENS_ID</code></td><td>Lens → Kamera</td><td><code class="inline">lens_id</code> alanı, UART <code class="inline">h</code> çıktısı</td></tr>
+        <tr><td><code class="inline">GET_FOCAL_LEN</code></td><td>Lens → Kamera</td><td>UART <code class="inline">l</code> → <code class="inline">12</code> (mm)</td></tr>
+        <tr><td><code class="inline">GET_APERTURE_RANGE</code></td><td>Lens → Kamera</td><td>UART <code class="inline">a</code> → <code class="inline">3.5-22.6</code></td></tr>
+        <tr><td><code class="inline">GET_FOCUS_DISTANCE</code></td><td>Lens → Kamera</td><td><code class="inline">focus_distance_{min,max}</code></td></tr>
+        <tr><td><code class="inline">FOCUS_DRIVE_NEAR</code></td><td>Kamera → Lens</td><td>I²C 0x82, UART <code class="inline">f-</code></td></tr>
+        <tr><td><code class="inline">FOCUS_DRIVE_INF</code></td><td>Kamera → Lens</td><td>I²C 0x81, UART <code class="inline">f+</code></td></tr>
+        <tr><td><code class="inline">FOCUS_STOP</code></td><td>Kamera → Lens</td><td>Limiter tespitinde firmware tetikler</td></tr>
+        <tr><td><code class="inline">FOCUS_STATUS</code></td><td>Lens → Kamera</td><td><code class="inline">moving</code> biti, UART <code class="inline">e</code></td></tr>
+        <tr><td><code class="inline">APERTURE_DRIVE</code></td><td>Kamera → Lens</td><td>I²C 0x7A/0x7B/0x7C, UART <code class="inline">a/a+/a-</code></td></tr>
+        <tr><td><code class="inline">SET_SPEED</code></td><td>Kamera → Lens</td><td>UART <code class="inline">s&lt;val&gt;</code> (STM/USM)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Odak adım tabanlı tasarımın kanıtı</h3>
+  <p>Canon EF lensleri mutlak pozisyon bildirmez; yalnızca <em>göreceli hareket</em> komutlarına yanıt verir ve hareketi tamamladığında "bitti" sinyali verir. Bu yüzden:</p>
+  <ul style="margin:16px 0 16px 24px; color:var(--text-body); font-size:14px; line-height:2;">
+    <li>Kalibrasyon zorunludur — min/max adım sayısını bulmak için limiterlerden limiterlere tarama yapılır.</li>
+    <li>EEPROM'a lens ID ile kayıt yapılır — lens değiştirilince yeniden tarama yapılmaması için.</li>
+    <li><code class="inline">focus_position_cur</code> kart tarafından yazılım sayacı olarak tutulur, lens'ten okunmaz.</li>
+    <li><code class="inline">step_frames</code>, motor + mekanik yerleşme süresine göre ayarlanır — sabit tablo değil.</li>
+  </ul>
+
+  <h3>Motor tipleri ve zamanlama etkisi</h3>
+  <div class="params">
+    <div class="param"><span class="name">DC / AFD</span><span class="desc">Yavaş, gürültülü, büyük mekanik adımlar. Tuning dosyasında <code class="inline">step_frames</code> artırılmalı (genellikle 6+). Hareketi durdurulabilir ama pozisyon geri bildirimi yok.</span></div>
+    <div class="param"><span class="name">USM (Ultrasonic Motor)</span><span class="desc">Hızlı, sessiz, kısa pulse'lara duyarlı. Yüksek end lenslerde (EF 70-200 f/2.8 vb.). step_frames=4 genellikle yeterli.</span></div>
+    <div class="param"><span class="name">STM (Stepping Motor)</span><span class="desc">En sessiz ve yumuşak. Video AF için ideal. 1–4 hız kademesi (UART <code class="inline">s</code> komutu). Bu proje için en uygun motor tipi.</span></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Device-Tree Entegrasyonu ve Build Akışı</h2>
+  <p class="section-lead">Kernel sürücüsü tek başına yeterli değildir. libcamera'nın cef168'i lens sürücüsü olarak tanıması için kamera sensörünün Device Tree overlay'ine enjeksiyon gerekir; bu işlem üç betik tarafından otomatikleştirilir.</p>
+
+  <h3>Enjekte edilen DT node'u (cef168.dtsi)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>cef168.dtsi — sensor overlay'lerine eklenen node</span><span class="dot">●</span></div>
+    <pre><code>vcm_node: cef168@d {
+    compatible = <span class="str">"pinefeat,cef168"</span>;
+    reg = &lt;0x0d&gt;;
+    status = <span class="str">"disabled"</span>;          <span class="cmt">/* dtoverlay=...,vcm parametresiyle etkinleştirilir */</span>
+    vcc-supply = &lt;&amp;vdd_3v3_reg&gt;;
+};</code></pre>
+  </div>
+
+  <p>Kamera node'una eklenen lens-focus fragment'ı:</p>
+  <div class="code-block">
+    <div class="code-header"><span>fragment — cam_node'a lens bağlantısı</span><span class="dot">●</span></div>
+    <pre><code>fragment@N {
+    target = &lt;&amp;cam_node&gt;;
+    __overlay__ {
+        lens-focus = &lt;&amp;vcm_node&gt;;
+    };
+};
+
+<span class="cmt">/* __overrides__ bölümüne vcm parametresi: */</span>
+vcm = &lt;&amp;vcm_node&gt;, <span class="str">"status"</span>,
+      &lt;0&gt;, <span class="str">"=0"</span>;   <span class="cmt">/* fragment index */</span>
+
+<span class="cmt">/* dosya sonunda: */</span>
+&amp;vcm_node {
+    status = <span class="str">"okay"</span>;
+};</code></pre>
+  </div>
+
+  <h3>vcm.sh — iki strateji</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Strateji 1: Değiştir</span><span class="desc">Overlay'de zaten <code class="inline">vcm: vcmX@addr { ... }</code> varsa (IMX708, OV5647, IMX219 gibi yerleşik VCM'li sensörler): node bloku cef168.dtsi içeriğiyle <strong>yerinde değiştirilir</strong>. <code class="inline">__overrides__</code>'dan eski güç rail referansı silinir.</span></div>
+    <div class="param"><span class="name">Strateji 2: Ekle</span><span class="desc">VCM yoksa (IMX477 HQ Camera vb.): cef168 node kamera node'unun hemen arkasına <strong>eklenir</strong>. <code class="inline">fragment@N</code> oluşturulur, <code class="inline">__overrides__</code> güncellenir, sona <code class="inline">&amp;vcm_node { status = "okay"; };</code> yazılır.</span></div>
+  </div>
+
+  <h3>download.sh — sürüm sabitleme</h3>
+  <div class="code-block">
+    <div class="code-header"><span>download.sh — firmware versiyonu ile DTS indirme</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1. Kurulu RPi firmware versiyonunu bul:</span>
+upstream_version=$(zgrep <span class="str">'raspi-firmware'</span> \
+    <span class="str">'/usr/share/doc/raspi-firmware/changelog.Debian.gz'</span> \
+    | head -1 | awk <span class="str">'-F[ ():-]' '{print $5}'</span>)
+<span class="cmt"># ör: 1:1.20240902+ds-1</span>
+
+<span class="cmt"># 2. Bu versiyona karşılık gelen kernel Git hash'ini bul:</span>
+commit=$(wget -qO- \
+    <span class="str">"https://raw.githubusercontent.com/raspberrypi/firmware/refs/tags/${upstream_version}/extra/git_hash"</span>)
+<span class="cmt"># ör: abc123def456...</span>
+
+<span class="cmt"># 3. Sensor overlay DTS dosyasını indir (#include zinciri takip edilir):</span>
+wget "${download_path}${file}"  <span class="cmt"># ör: imx477-overlay.dts + içerdiği .dtsi'lar</span></code></pre>
+  </div>
+
+  <p>Bu yaklaşım <strong>sürüm sabitler</strong>: overlay, kurulu firmware ile aynı kernel commit'ten gelir. Firmware güncellendikten sonra <code class="inline">configure.sh</code> tekrar çalıştırılmalıdır.</p>
+
+  <h3>Makefile.template — derleme hedefleri</h3>
+  <div class="code-block">
+    <div class="code-header"><span>Makefile.template</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Kernel modülü + sensor DTBO'ları (configure.sh sensor isimlerini ekler)</span>
+obj-m := cef168.o
+
+KERNEL_SRC ?= /lib/modules/`uname -r`/build
+
+default:
+    $(MAKE) -C "$(KERNEL_SRC)" M="$(CURDIR)"    <span class="cmt"># cef168.ko</span>
+    $(CXX) -Wall -Wextra -o calibrate calibrate.cpp  <span class="cmt"># kalibrasyon aracı</span>
+
+install:
+    $(MAKE) ... modules_install  <span class="cmt"># /lib/modules/.../kernel/drivers/media/i2c/</span>
+    depmod -A
+    cp *.dtbo /boot/firmware/overlays --backup=numbered  <span class="cmt"># eski dosya korunur</span></code></pre>
+  </div>
+
+  <h3>Boot sonrası doğrulama</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — kurulum sonrası kontrol</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Modül yüklenmiş mi?</span>
+<span class="cmd">lsmod</span> | grep cef168
+<span class="cmt"># cef168   16384  0</span>
+
+<span class="cmt"># Kernel log'unda hata var mı?</span>
+<span class="cmd">dmesg</span> | grep cef168
+<span class="cmt"># [  2.341] cef168 1-000d: cef168_init_controls ok</span>
+
+<span class="cmt"># Media grafiğinde görünüyor mu?</span>
+media-ctl -d $DEV_MEDIA -p | grep -A3 cef168
+<span class="cmt"># entity 3: cef168 1-000d (1 pad, 0 link)</span>
+<span class="cmt">#   type V4L2 subdev subtype Lens</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 09 ═══════════════════ -->
+<section id="s9">
+  <h2><span class="num">09</span> libcamera Entegrasyonu — Tuning ve Autofocus</h2>
+  <p class="section-lead">V4L2 altyapısı kurulduktan sonra libcamera, lens sürücüsünü otomatik bulur. Autofocus'un doğru çalışması için kalibrasyon çıktısının kamera tuning JSON dosyasına eklenmesi gerekir.</p>
+
+  <h3>Tuning dosyasını bul</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Raspberry Pi 5 (pisp ISP):</span>
+ls /usr/share/libcamera/ipa/rpi/pisp/
+<span class="cmt"># imx477.json  imx708.json  ov5647.json  ...</span>
+
+<span class="cmt"># Raspberry Pi 4 (vc4):</span>
+ls /usr/share/libcamera/ipa/rpi/vc4/
+<span class="cmt"># Çalışma kopyasını oluştur:</span>
+cp /usr/share/libcamera/ipa/rpi/vc4/imx477.json ~/imx477-EF-S10-18mm.json</code></pre>
+  </div>
+
+  <h3>rpi.af bölümü — kalibrasyon değerleri ile</h3>
+  <div class="code-block">
+    <div class="code-header"><span>imx477-EF-S10-18mm.json — rpi.af bölümü</span><span class="dot">●</span></div>
+    <pre><code>{
+    <span class="str">"rpi.af"</span>:
+    {
+        <span class="str">"ranges"</span>:
+        {
+            <span class="str">"normal"</span>:
+            {
+                <span class="str">"min"</span>: 0.00153,      <span class="cmt">// calibrate çıktısından</span>
+                <span class="str">"max"</span>: 4.35,
+                <span class="str">"default"</span>: 4.35
+            }
+        },
+        <span class="str">"speeds"</span>:
+        {
+            <span class="str">"normal"</span>:
+            {
+                <span class="str">"step_coarse"</span>: 0.2,
+                <span class="str">"step_fine"</span>: 0.05,
+                <span class="str">"contrast_ratio"</span>: 0.75,
+                <span class="str">"retrigger_ratio"</span>: 0.8,
+                <span class="str">"retrigger_delay"</span>: 10,
+                <span class="str">"pdaf_gain"</span>: 0.0,       <span class="cmt">// Canon lensle PDAF kapalı</span>
+                <span class="str">"pdaf_squelch"</span>: 0.0,
+                <span class="str">"max_slew"</span>: 2.0,
+                <span class="str">"pdaf_frames"</span>: 0,
+                <span class="str">"dropout_frames"</span>: 0,
+                <span class="str">"step_frames"</span>: 4        <span class="cmt">// calibrate çıktısından</span>
+            }
+        },
+        <span class="str">"conf_epsilon"</span>: 0,
+        <span class="str">"conf_thresh"</span>: 0,
+        <span class="str">"conf_clip"</span>: 0,
+        <span class="str">"skip_frames"</span>: 5,
+        <span class="str">"check_for_ir"</span>: false,
+        <span class="str">"map"</span>: [ 0.00153, 1069, 0.154, 1042, 0.446, 996, 4.35, 0 ]
+    }
+}</code></pre>
+  </div>
+
+  <h3>Otofokusla çekim</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Sürekli AF ile önizleme:</span>
+rpicam-hello --tuning-file ~/imx477-EF-S10-18mm.json --timeout 0
+
+<span class="cmt"># AF debug logu:</span>
+LIBCAMERA_LOG_LEVELS=RPiAf:DEBUG rpicam-hello \
+    --tuning-file ~/imx477-EF-S10-18mm.json --timeout 0
+
+<span class="cmt"># Fotoğraf çek (AF tamamlanana kadar bekle):</span>
+rpicam-still --tuning-file ~/imx477-EF-S10-18mm.json -o photo.jpg
+
+<span class="cmt"># Video (AF aktif):</span>
+rpicam-vid --tuning-file ~/imx477-EF-S10-18mm.json -o video.h264 -t 10000</code></pre>
+  </div>
+
+  <h3>AF parametrelerini ayarlama</h3>
+  <div class="params">
+    <div class="param"><span class="name">step_coarse</span><span class="desc">İlk tarama adım büyüklüğü (diyoptri). Büyük değer → hızlı ama titrek. Küçük değer → yavaş ama kararlı. Başlangıç: 0.2</span></div>
+    <div class="param"><span class="name">step_fine</span><span class="desc">İnce ayar adımı. Çok küçük → uzun süre. Çok büyük → hassas değil. Başlangıç: 0.05</span></div>
+    <div class="param"><span class="name">step_frames</span><span class="desc">Her odak hareketi sonrası beklenen kare sayısı. DC motorlu lensler için artır (6+). STM için 4 yeterli.</span></div>
+    <div class="param"><span class="name">skip_frames</span><span class="desc">Başlangıçta geçilen kare sayısı (ISP stabilizasyonu için). 5 önerilen değer.</span></div>
+    <div class="param"><span class="name">pdaf_*</span><span class="desc">Canon lenslerle PDAF çalışmaz (sensör-lens uyumsuzluğu). Tüm pdaf parametreleri 0 olmalı.</span></div>
+  </div>
+
+  <h3>Öz-Test Modu</h3>
+  <div class="code-block">
+    <div class="code-header"><span>prosedür</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1. Raspberry Pi'nin açık ve kartı besliyor olması gerekiyor</span>
+<span class="cmt"># 2. Lens üzerindeki AF/MF switch'ini 15 saniye içinde 3 kez değiştir</span>
+<span class="cmt"># 3. Kart otomatik olarak şu diziyi çalıştırır:</span>
+<span class="cmt">#    - Odağı minimumdan sonsuza 4 adımda götür</span>
+<span class="cmt">#    - Tekrar minimuma döndür</span>
+<span class="cmt">#    - Diyaframı tam kapat</span>
+<span class="cmt">#    - 4 adımda tam açıklığa aç</span>
+<span class="cmt"># Yazılım komutu gerekmez — firmware tarafından tetiklenir</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 10 ═══════════════════ -->
+<section id="s10">
+  <h2><span class="num">10</span> Son Kullanıcı Komutları — Tam Referans</h2>
+  <p class="section-lead">Kurulum tamamlandıktan sonra günlük kullanım için gereken tüm komutlar.</p>
+
+  <h3>Ortam değişkenleri (bir kez tanımla)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — ~/.bashrc</span><span class="dot">●</span></div>
+    <pre><code>export DEV_MEDIA=$(v4l2-ctl --list-devices \
+    | awk <span class="str">'/unicam|rp1-cfe/ {found=1} found &amp;&amp; /\/dev\/media/ {print; exit;}'</span>)
+
+export DEV_LENS=$(media-ctl -d $DEV_MEDIA -p \
+    | awk <span class="str">'/entity.*cef168.*-000d/ {found=1} found &amp;&amp; /\/dev\/v4l-subdev/ {print $4; exit;}'</span>)</code></pre>
+  </div>
+
+  <h3>Kalibrasyon</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Zorunlu — her lens için bir kez. Sonucu tuning dosyasına ekle.</span>
+./calibrate -d $DEV_LENS
+
+<span class="cmt"># Adım adım görmek için verbose:</span>
+./calibrate -d $DEV_LENS -v
+
+<span class="cmt"># Kernel sürücüsü kurulu değilse — ham I²C ile:</span>
+./calibrate -d /dev/i2c-1 -a 0x0d</code></pre>
+  </div>
+
+  <h3>Diyafram kontrolü</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — v4l2-ctl diyafram komutları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Mutlak diyafram (f-stop × 100):</span>
+v4l2-ctl -d $DEV_LENS -c iris_absolute=350   <span class="cmt"># f/3.5 — tam açık</span>
+v4l2-ctl -d $DEV_LENS -c iris_absolute=560   <span class="cmt"># f/5.6</span>
+v4l2-ctl -d $DEV_LENS -c iris_absolute=800   <span class="cmt"># f/8.0</span>
+v4l2-ctl -d $DEV_LENS -c iris_absolute=2260  <span class="cmt"># f/22.6 — tam kapalı</span>
+
+<span class="cmt"># Göreceli (minimum adım = 100 = 1 f-stop):</span>
+v4l2-ctl -d $DEV_LENS -c iris_relative=+100  <span class="cmt"># 1 f-stop kapat</span>
+v4l2-ctl -d $DEV_LENS -c iris_relative=-100  <span class="cmt"># 1 f-stop aç</span></code></pre>
+  </div>
+
+  <h3>Odak kontrolü</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — v4l2-ctl odak komutları</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Mevcut konumu oku:</span>
+v4l2-ctl -d $DEV_LENS --get-ctrl=focus_absolute
+<span class="cmt"># focus_absolute: 500</span>
+
+<span class="cmt"># Mutlak konum:</span>
+v4l2-ctl -d $DEV_LENS -c focus_absolute=0     <span class="cmt"># minimum (sonsuz)</span>
+v4l2-ctl -d $DEV_LENS -c focus_absolute=1069  <span class="cmt"># maximum (yakın)</span>
+
+<span class="cmt"># Göreceli hareket:</span>
+v4l2-ctl -d $DEV_LENS -c focus_relative=+100  <span class="cmt"># sonsuza doğru</span>
+v4l2-ctl -d $DEV_LENS -c focus_relative=-100  <span class="cmt"># yakına doğru</span></code></pre>
+  </div>
+
+  <h3>Autofocus ile çekim</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Sürekli AF — önizleme:</span>
+rpicam-hello --tuning-file ~/imx477-EF-S10-18mm.json --timeout 0
+
+<span class="cmt"># Tek fotoğraf:</span>
+rpicam-still --tuning-file ~/imx477-EF-S10-18mm.json -o photo.jpg
+
+<span class="cmt"># Video:</span>
+rpicam-vid --tuning-file ~/imx477-EF-S10-18mm.json -o video.h264 -t 10000
+
+<span class="cmt"># AF debug çıktısı ile:</span>
+LIBCAMERA_LOG_LEVELS=RPiAf:DEBUG rpicam-hello \
+    --tuning-file ~/imx477-EF-S10-18mm.json --timeout 0 2&gt;&amp;1 | grep AF</code></pre>
+  </div>
+
+  <h3>Lens durumunu oku</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm kontrolleri listele:</span>
+v4l2-ctl -d $DEV_LENS --list-ctrls
+
+<span class="cmt"># Lens ID oku:</span>
+v4l2-ctl -d $DEV_LENS --get-ctrl=0x00980aa8
+<span class="cmt"># User class 0x00980aa8 (u8) : 0xEB</span>
+
+<span class="cmt"># Ham data struct oku (15 bayt hex):</span>
+v4l2-ctl -d $DEV_LENS --get-ctrl=0x00980aa9</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 11 ═══════════════════ -->
+<section id="s11">
+  <h2><span class="num">11</span> Özet Cheat-Sheet</h2>
+  <p class="section-lead">Üç katmanın tamamını tek sayfada özetleyen referans tablosu.</p>
+
+  <div class="summary">
+    <h4>Katman 1 — I²C (birincil, kernel)</h4>
+    <ul>
+      <li>Adres: <strong>0x0d</strong> · compatible: <code class="inline">"pinefeat,cef168"</code> · 3.3 V</li>
+      <li>Yazma: 4 bayt {opcode, LSB, MSB, CRC8} · little-endian u16 · polinom 168 · seed 0xFF</li>
+      <li>Okuma: 15 bayt struct · son bayt CRC8 · LE→host dönüşümü gerekli</li>
+      <li>Opcode: 0x22 kal., 0x7A/7B/7C diyafram abs/+/−, 0x80/81/82 odak abs/+/−</li>
+      <li>Retry: 3× −EIO veya −EREMOTEIO'da</li>
+    </ul>
+  </div>
+
+  <div class="summary">
+    <h4>Katman 2 — V4L2 / libcamera (kernel → kullanıcı)</h4>
+    <ul>
+      <li>Sub-device: MEDIA_ENT_F_LENS · v4l2_async_register_subdev</li>
+      <li>FOCUS_ABSOLUTE: R/W volatile, aralık her okumada güncellenir</li>
+      <li>FOCUS_RELATIVE / IRIS_ABSOLUTE / IRIS_RELATIVE: write-only</li>
+      <li>Custom: lens_id (RO) · data snapshot (RO 15 bayt) · calibrate button</li>
+      <li>Custom base: V4L2_CID_USER_BASE | 168 + {0,1,2}</li>
+    </ul>
+  </div>
+
+  <div class="summary">
+    <h4>Katman 3 — UART ASCII (opsiyonel, kernel gerekmez)</h4>
+    <ul>
+      <li>115200-8-N-1 · 3.3 V TTL · Molex PicoBlade: GND/RXD/TXD/VCC</li>
+      <li>Tek karakter komut + opsiyonel parametre + CR/LF</li>
+      <li>I²C üst kümesi: n,v,s,l,t,e,i,m yalnızca UART'ta</li>
+      <li>Yanıtlar: <code class="inline">ok</code> / <code class="inline">er</code> / <code class="inline">nc</code></li>
+    </ul>
+  </div>
+
+  <div class="summary">
+    <h4>Low-Side — Canon EF Mount (firmware içinde)</h4>
+    <ul>
+      <li>Kontaklar: VBAT (~6V), P-GND, VDD (~5V), DCL (MOSI), DLC (MISO), LCLK (SCK), D-GND</li>
+      <li>Topoloji: SPI Mode 3 · MSB-first · 5V CMOS · CS yok · yarı-duplex</li>
+      <li>Hız: ~62.5 kHz (klasik EF) / ~96 kHz (STM/USM yeni nesil)</li>
+      <li>Protokol: bayt komut/yanıt, adım tabanlı odak, 1/8-stop diyafram, lens ID</li>
+    </ul>
+  </div>
+
+  <h3>Hızlı komut referansı</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Hedef</th><th>Komut</th></tr></thead>
+      <tbody>
+        <tr><td>Kalibrasyon (V4L2)</td><td><code class="inline">./calibrate -d $DEV_LENS</code></td></tr>
+        <tr><td>Kalibrasyon (ham I²C)</td><td><code class="inline">./calibrate -d /dev/i2c-1 -a 0x0d</code></td></tr>
+        <tr><td>Diyafram f/5.6</td><td><code class="inline">v4l2-ctl -d $DEV_LENS -c iris_absolute=560</code></td></tr>
+        <tr><td>Diyafram 1 stop kapat</td><td><code class="inline">v4l2-ctl -d $DEV_LENS -c iris_relative=+100</code></td></tr>
+        <tr><td>Diyafram 1 stop aç</td><td><code class="inline">v4l2-ctl -d $DEV_LENS -c iris_relative=-100</code></td></tr>
+        <tr><td>Odak adımı oku</td><td><code class="inline">v4l2-ctl -d $DEV_LENS --get-ctrl=focus_absolute</code></td></tr>
+        <tr><td>Odak ayarla</td><td><code class="inline">v4l2-ctl -d $DEV_LENS -c focus_absolute=500</code></td></tr>
+        <tr><td>AF önizleme</td><td><code class="inline">rpicam-hello --tuning-file &lt;dosya&gt;.json --timeout 0</code></td></tr>
+        <tr><td>Lens bilgisi (UART)</td><td><code class="inline">h</code></td></tr>
+        <tr><td>UART kalibrasyon</td><td><code class="inline">c</code></td></tr>
+        <tr><td>UART odak ayarla</td><td><code class="inline">f500</code></td></tr>
+        <tr><td>UART diyafram</td><td><code class="inline">a5.6</code></td></tr>
+        <tr><td>UART firmware ver.</td><td><code class="inline">v</code></td></tr>
+        <tr><td>Öz-Test</td><td>AF/MF switch'i 15 sn içinde 3×</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+</section>
+
+</main>
+
+<footer>
+  <span class="glyph">◆</span> EMİRHAN PEHLEVAN <span class="glyph">◆</span><br><br>
+  emirpehlevan@outlook.com &nbsp;·&nbsp; <a href="https://www.linkedin.com/in/emirhanpehlevan/">linkedin.com/in/emirhanpehlevan</a>
+</footer>

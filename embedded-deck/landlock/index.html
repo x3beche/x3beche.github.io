@@ -1,0 +1,873 @@
+---
+layout: tutorial
+title: "Landlock — Kullanıcı Alanı Erişim Kontrolü"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span><span>GÖMÜLÜ LİNUX</span><span>GÜVENLİK</span><span>2026</span>
+  </div>
+  <h1>Landlock<br><em>Kullanıcı Alanı Erişim Kontrolü</em></h1>
+  <p class="subtitle">
+    Linux 5.13+ Landlock LSM ile süreç kendi erişim haklarını kısıtlar; gömülü uygulama
+    sandbox'ı, minimal ayrıcalık ilkesi uygulaması ve daemon güvenlik hapsı.
+  </p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Landlock Neden?</a></li>
+    <li><a href="#s1">Landlock Kavramları</a></li>
+    <li><a href="#s2">Temel Kullanım</a></li>
+    <li><a href="#s3">Dosya Sistemi Kısıtları</a></li>
+    <li><a href="#s4">Ağ Kısıtları</a></li>
+    <li><a href="#s5">Kalıtım ve fork</a></li>
+    <li><a href="#s6">Gömülü Daemon Sandboxing</a></li>
+    <li><a href="#s7">Mevcut Araçlarla Entegrasyon</a></li>
+    <li><a href="#s8">Hata Ayıklama</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> Landlock Neden?</h2>
+  <p class="section-lead">
+    Landlock, Linux 5.13'te ana çekirdeğe dahil edilen ve süreçlerin kendi erişim haklarını
+    programatik olarak kısıtlamasına olanak tanıyan bir LSM (Linux Security Module)
+    mekanizmasıdır. Geleneksel güvenlik modellerinde kısıtlamalar dışarıdan (root, sistem
+    yöneticisi) uygulanırken Landlock bu kısıtlamayı uygulamanın kendisine bırakır.
+  </p>
+
+  <p>
+    Gömülü sistemlerde daemon güvenliği kritik bir konudur: bir saldırgan savunmasız bir
+    sistem servisini (MQTT broker, HTTP sunucusu, CANBUS daemon) ele geçirirse tüm dosya
+    sistemine erişim kazanabilir. Landlock bu saldırı yüzeyini dramatik biçimde daraltır;
+    daemon yalnızca gerçekten ihtiyaç duyduğu dizinlere ve ağ işlemlerine erişebilir.
+  </p>
+
+  <div class="flow"><pre>
+Landlock öncesi — saldırı yüzeyi:
+  Güvenlik açığı bulunan daemon
+        |
+        v
+  Tüm dosya sistemine erişim
+  /etc/passwd, /root/.ssh, /var/lib/...
+  Tüm ağ portlarına bağlanma
+  [saldırgan tam kontrolü ele geçirir]
+
+Landlock sonrası — saldırı yüzeyi:
+  Güvenlik açığı bulunan daemon
+        |
+        v
+  Yalnızca /var/lib/mqtt/ okuma/yazma
+  Yalnızca port 1883'te dinleme
+  Başka hiçbir dizin veya port erişilemez
+  [saldırgan etkisi kapsamlı biçimde sınırlandırılır]
+  </pre></div>
+
+  <p>
+    <strong>seccomp ile karşılaştırma:</strong> seccomp sistem çağrısı düzeyinde filtre
+    uygular (hangi syscall'ların kullanılabileceğini kısıtlar); Landlock ise kaynak
+    erişimi düzeyinde çalışır (hangi dosya ve ağ kaynaklarına erişilebileceğini kısıtlar).
+    İki mekanizma birbirini tamamlar ve sıkı güvenlik politikaları için birlikte kullanılabilir.
+  </p>
+
+  <div class="file-table"><table>
+    <tr><th>Özellik</th><th>seccomp</th><th>Landlock</th><th>SELinux/AppArmor</th></tr>
+    <tr><td>Kısıtlama düzeyi</td><td>Syscall</td><td>Kaynak erişimi</td><td>Kaynak + syscall</td></tr>
+    <tr><td>Politika konumu</td><td>Uygulama içi</td><td>Uygulama içi</td><td>Sistem geneli</td></tr>
+    <tr><td>Kök gerektiriyor mu</td><td>Hayır (PR_SET_NO_NEW_PRIVS)</td><td>Hayır</td><td>Evet (politika yüklemek için)</td></tr>
+    <tr><td>Kernel versiyonu</td><td>3.5+</td><td>5.13+</td><td>Çok eski</td></tr>
+    <tr><td>Yapılandırma karmaşıklığı</td><td>Orta</td><td>Düşük</td><td>Yüksek</td></tr>
+    <tr><td>Gömülü kullanım kolaylığı</td><td>İyi</td><td>Çok iyi</td><td>Orta</td></tr>
+  </table></div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> Landlock Kavramları</h2>
+  <p class="section-lead">
+    Landlock üç temel kavram üzerine inşa edilmiştir: ruleset (kural kümesi), rule (kural)
+    ve handled_access_fs bayrakları. Bu kavramları anlamak doğru bir sandbox politikası
+    tasarlamak için gereklidir.
+  </p>
+
+  <p>
+    <strong>Ruleset (kural kümesi):</strong> Bir Landlock politikasının en üst düzey
+    nesnesidir. Ruleset, hangi erişim türlerinin bu politika tarafından yönetileceğini
+    tanımlar. Örneğin "bu ruleset dosya yazma ve dosya çalıştırma erişimlerini yönetir"
+    şeklinde bir tanım yapılır.
+  </p>
+
+  <p>
+    <strong>Rule (kural):</strong> Belirli bir kaynak (dosya yolu, ağ portu) için izin
+    verilen erişim türlerini belirtir. Ruleset varsayılan olarak her şeyi reddeder;
+    kurallar yalnızca izin verilen kaynakları açıkça tanımlar.
+  </p>
+
+  <p>
+    <strong>Handled access bayrakları:</strong> Ruleset'in aktif olarak yönettiği erişim
+    türleridir. Bir erişim türü handled olarak işaretlenmemişse Landlock o erişim türü
+    üzerinde herhangi bir kısıtlama uygulamaz.
+  </p>
+
+  <div class="flow"><pre>
+Landlock politika modeli:
+
+  landlock_create_ruleset(handled_access_fs = OKUMA | YAZMA | ÇALISTIRMA)
+        |
+        v
+  Ruleset oluşturuldu (her şey varsayılan olarak reddedildi)
+        |
+        +-- landlock_add_rule(ruleset, "/var/lib/app", OKUMA | YAZMA)
+        +-- landlock_add_rule(ruleset, "/usr/bin/app", OKUMA | ÇALISTIRMA)
+        +-- landlock_add_rule(ruleset, "/lib",          OKUMA)
+        |
+        v
+  landlock_restrict_self(ruleset)
+        |
+        v
+  Süreç artık yalnızca tanımlı kaynaklara erişebilir
+  </pre></div>
+
+  <p>
+    Landlock ABI versiyonu zaman içinde genişlemiştir: ABI 1 (kernel 5.13) temel dosya
+    sistemi kısıtlarını, ABI 2 (kernel 5.19) sembolik bağ oluşturma desteğini,
+    ABI 3 (kernel 6.2) inode başına kural sayısı artışını, ABI 4 (kernel 6.7) ağ
+    kısıtlarını getirmiştir. Uygulamanızın desteklediği ABI'yi tespit etmek için
+    <code>landlock_create_ruleset</code> syscall'ını özel bir flag ile çağırabilirsiniz.
+  </p>
+
+  <pre><code>/* Desteklenen Landlock ABI versiyonunu tespit et */
+#include &lt;linux/landlock.h&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;stdio.h&gt;
+
+int landlock_get_abi_version(void) {
+    int abi = syscall(SYS_landlock_create_ruleset,
+                      NULL, 0,
+                      LANDLOCK_CREATE_RULESET_VERSION);
+    return abi;
+}
+
+int main(void) {
+    int abi = landlock_get_abi_version();
+    if (abi &lt; 0) {
+        perror("Landlock desteklenmiyor");
+        return 1;
+    }
+    printf("Landlock ABI versiyonu: %d\n", abi);
+    return 0;
+}</code></pre>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> Temel Kullanım</h2>
+  <p class="section-lead">
+    Landlock politikası uygulamak üç syscall ile gerçekleşir:
+    <code>landlock_create_ruleset</code>, <code>landlock_add_rule</code> ve
+    <code>landlock_restrict_self</code>. Bu bölümde eksiksiz bir C örneği üzerinden
+    temel kullanım gösterilmektedir.
+  </p>
+
+  <p>
+    Önemli ön koşul: <code>landlock_restrict_self</code> çağrısından önce sürecin
+    <code>no_new_privs</code> bayrağını ayarlaması gerekir. Bu, Landlock kısıtlamalarını
+    <code>setuid</code> ikilileri aracılığıyla atlatma girişimlerini engeller.
+  </p>
+
+  <pre><code>/* landlock_demo.c — temel Landlock kullanımı */
+#define _GNU_SOURCE
+#include &lt;linux/landlock.h&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;sys/prctl.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;errno.h&gt;
+
+/* Landlock syscall sarmalayıcıları (glibc henüz eklemediyse) */
+static int landlock_create_ruleset(
+        const struct landlock_ruleset_attr *attr,
+        size_t size, uint32_t flags) {
+    return syscall(SYS_landlock_create_ruleset, attr, size, flags);
+}
+
+static int landlock_add_rule(int ruleset_fd,
+        enum landlock_rule_type type,
+        const void *attr, uint32_t flags) {
+    return syscall(SYS_landlock_add_rule, ruleset_fd, type, attr, flags);
+}
+
+static int landlock_restrict_self(int ruleset_fd, uint32_t flags) {
+    return syscall(SYS_landlock_restrict_self, ruleset_fd, flags);
+}
+
+/* Yardımcı: bir dizine okuma/yazma erişimi ekle */
+static int add_path_rule(int ruleset_fd,
+                         const char *path,
+                         uint64_t allowed_access) {
+    struct landlock_path_beneath_attr attr = {
+        .allowed_access = allowed_access,
+    };
+    int fd = open(path, O_PATH | O_CLOEXEC);
+    if (fd &lt; 0) {
+        fprintf(stderr, "Yol acilamadi: %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    attr.parent_fd = fd;
+    int ret = landlock_add_rule(ruleset_fd,
+                                LANDLOCK_RULE_PATH_BENEATH,
+                                &attr, 0);
+    close(fd);
+    return ret;
+}
+
+int main(void) {
+    /* 1. Adım: Ruleset oluştur */
+    struct landlock_ruleset_attr ruleset_attr = {
+        .handled_access_fs =
+            LANDLOCK_ACCESS_FS_READ_FILE   |
+            LANDLOCK_ACCESS_FS_WRITE_FILE  |
+            LANDLOCK_ACCESS_FS_READ_DIR    |
+            LANDLOCK_ACCESS_FS_EXECUTE,
+    };
+
+    int ruleset_fd = landlock_create_ruleset(&ruleset_attr,
+                                             sizeof(ruleset_attr), 0);
+    if (ruleset_fd &lt; 0) {
+        perror("landlock_create_ruleset basarisiz");
+        return 1;
+    }
+
+    /* 2. Adım: İzin verilen kaynakları tanımla */
+    /* Yalnızca /tmp dizinine okuma+yazma izni */
+    if (add_path_rule(ruleset_fd, "/tmp",
+            LANDLOCK_ACCESS_FS_READ_FILE |
+            LANDLOCK_ACCESS_FS_WRITE_FILE |
+            LANDLOCK_ACCESS_FS_READ_DIR) &lt; 0) {
+        close(ruleset_fd);
+        return 1;
+    }
+
+    /* /usr/bin dizinine yalnızca okuma+çalıştırma izni */
+    if (add_path_rule(ruleset_fd, "/usr/bin",
+            LANDLOCK_ACCESS_FS_READ_FILE |
+            LANDLOCK_ACCESS_FS_EXECUTE   |
+            LANDLOCK_ACCESS_FS_READ_DIR) &lt; 0) {
+        close(ruleset_fd);
+        return 1;
+    }
+
+    /* 3. Adım: no_new_privs bayragini ayarla (zorunlu) */
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) &lt; 0) {
+        perror("prctl PR_SET_NO_NEW_PRIVS basarisiz");
+        close(ruleset_fd);
+        return 1;
+    }
+
+    /* 4. Adım: Kısıtlamayı uygula */
+    if (landlock_restrict_self(ruleset_fd, 0) &lt; 0) {
+        perror("landlock_restrict_self basarisiz");
+        close(ruleset_fd);
+        return 1;
+    }
+    close(ruleset_fd);
+
+    printf("Landlock kısıtlaması aktif.\n");
+    printf("/tmp/test.txt yazma deneyi...\n");
+
+    /* Bu izin verildi: /tmp altında */
+    int fd = open("/tmp/test.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd &gt;= 0) {
+        write(fd, "merhaba\n", 8);
+        close(fd);
+        printf("OK: /tmp/test.txt yazildi\n");
+    }
+
+    /* Bu reddedilecek: /etc izin verilmedi */
+    fd = open("/etc/passwd", O_RDONLY);
+    if (fd &lt; 0)
+        printf("REDDEDILDI: /etc/passwd erisilemez (beklenen)\n");
+    else {
+        printf("HATA: /etc/passwd erisilebildi!\n");
+        close(fd);
+    }
+
+    return 0;
+}</code></pre>
+
+  <pre><code># Derleme
+gcc -o landlock_demo landlock_demo.c
+
+# Çalıştır
+./landlock_demo</code></pre>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> Dosya Sistemi Kısıtları</h2>
+  <p class="section-lead">
+    Landlock dosya sistemi erişim bayrakları, uygulamanın hangi işlemleri hangi dizinlerde
+    yapabileceğini ince tanecikli (fine-grained) şekilde belirler. Her bayrağın anlamını
+    ve tipik kullanım senaryosunu bu bölümde ele alacağız.
+  </p>
+
+  <p><strong>LANDLOCK_ACCESS_FS_* bayraklarının tamamı:</strong></p>
+  <div class="params">
+    <div class="param"><span class="name">READ_FILE</span><span class="desc">Dosya içeriğini oku (open+read); kütüphane yüklemek için gerekli</span></div>
+    <div class="param"><span class="name">WRITE_FILE</span><span class="desc">Dosya içeriğine yaz (open+write); log ve veri dosyaları için gerekli</span></div>
+    <div class="param"><span class="name">EXECUTE</span><span class="desc">Dosyayı çalıştır (execve); yalnızca binary yürütme gerektiren dizinlerde açılır</span></div>
+    <div class="param"><span class="name">READ_DIR</span><span class="desc">Dizin içeriğini listele (opendir/readdir); dizin gezinimi için gerekli</span></div>
+    <div class="param"><span class="name">REMOVE_DIR</span><span class="desc">Dizin sil (rmdir); geçici dizin temizliği için gerekebilir</span></div>
+    <div class="param"><span class="name">REMOVE_FILE</span><span class="desc">Dosya sil (unlink); log rotasyonu, geçici dosya temizliği</span></div>
+    <div class="param"><span class="name">MAKE_CHAR</span><span class="desc">Karakter aygıt dosyası oluştur (mknod); nadiren gerekli</span></div>
+    <div class="param"><span class="name">MAKE_DIR</span><span class="desc">Alt dizin oluştur (mkdir); dinamik dizin yapısı gerektiren uygulamalar</span></div>
+    <div class="param"><span class="name">MAKE_REG</span><span class="desc">Yeni düzenli dosya oluştur; yazma işlemleri için CREATE bayrağı ile birlikte gerekli</span></div>
+    <div class="param"><span class="name">MAKE_SOCK</span><span class="desc">Unix domain soket dosyası oluştur; IPC kullanan daemon'lar için gerekli</span></div>
+    <div class="param"><span class="name">MAKE_FIFO</span><span class="desc">İsimli boru (FIFO) oluştur</span></div>
+    <div class="param"><span class="name">MAKE_BLOCK</span><span class="desc">Blok aygıt dosyası oluştur</span></div>
+    <div class="param"><span class="name">MAKE_SYM</span><span class="desc">Sembolik bağ oluştur (kernel 5.19+)</span><br></div>
+    <div class="param"><span class="name">REFER</span><span class="desc">Dosyayı başka bir dizine taşı/yeniden adlandır (kernel 5.19+)</span></div>
+    <div class="param"><span class="name">TRUNCATE</span><span class="desc">Dosyayı kırp/boyutunu değiştir (kernel 6.2+)</span></div>
+  </div>
+
+  <p>
+    Tipik bir daemon için minimum izin kümesi örneği:
+  </p>
+
+  <pre><code>/*
+ * Minimal daemon izin kümesi:
+ * - /etc/myapp/   : yapılandırmayı oku
+ * - /var/lib/myapp: durum verisi okuma/yazma
+ * - /var/log/myapp: log dosyaları yaz
+ * - /tmp          : geçici dosyalar
+ * - /lib, /usr/lib: kütüphaneleri oku/çalıştır
+ * - /usr/bin      : yardımcı ikililer
+ */
+
+struct {
+    const char *path;
+    uint64_t   access;
+} rules[] = {
+    { "/etc/myapp",       FS_READ },
+    { "/var/lib/myapp",   FS_READ | FS_WRITE | FS_MAKE_REG | FS_REMOVE_FILE },
+    { "/var/log/myapp",   FS_WRITE | FS_MAKE_REG | FS_REMOVE_FILE },
+    { "/tmp",             FS_READ | FS_WRITE | FS_MAKE_REG | FS_REMOVE_FILE },
+    { "/lib",             FS_READ | FS_EXECUTE },
+    { "/usr/lib",         FS_READ | FS_EXECUTE },
+    { "/usr/bin",         FS_READ | FS_EXECUTE },
+    { NULL, 0 }
+};
+
+/* Buradaki FS_READ, FS_WRITE vb. kısaltmalardır;
+ * gerçek kodda LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR
+ * gibi tam bayrak adları kullanılmalıdır. */</code></pre>
+
+  <p>
+    <strong>Dikkat gerektiren nokta:</strong> Bir dizine <code>WRITE_FILE</code> izni
+    vermek yeni dosya oluşturmayı kapsamaz. Yeni dosya oluşturabilmek için
+    <code>MAKE_REG</code> bayrağı da gereklidir. Benzer şekilde var olan bir dosyayı
+    silmek için <code>REMOVE_FILE</code>, alt dizin silmek için <code>REMOVE_DIR</code>
+    ayrıca belirtilmelidir.
+  </p>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> Ağ Kısıtları</h2>
+  <p class="section-lead">
+    Linux 6.7 ile birlikte Landlock, TCP ağ operasyonlarını da kısıtlayabilir hale gelmiştir.
+    <code>LANDLOCK_ACCESS_NET_BIND_TCP</code> ve <code>LANDLOCK_ACCESS_NET_CONNECT_TCP</code>
+    bayrakları ile sürecin hangi portlarda dinleyebileceği ve bağlanabileceği kontrol altına
+    alınır.
+  </p>
+
+  <p>
+    Ağ kısıtları dosya sistemi kısıtlarından bağımsızdır; aynı ruleset içinde her ikisi
+    birlikte tanımlanabilir veya ayrı ruleset'ler oluşturulabilir.
+  </p>
+
+  <pre><code>/* Landlock ağ kısıtlaması örneği (kernel 6.7+) */
+#define _GNU_SOURCE
+#include &lt;linux/landlock.h&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;sys/prctl.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;string.h&gt;
+
+/* ABI versiyonunu kontrol et */
+static int check_landlock_abi(void) {
+    return syscall(SYS_landlock_create_ruleset,
+                   NULL, 0, LANDLOCK_CREATE_RULESET_VERSION);
+}
+
+int apply_network_sandbox(void) {
+    int abi = check_landlock_abi();
+    if (abi &lt; 4) {
+        fprintf(stderr, "Ag kisitlari icin ABI 4 gerekli (kernel 6.7+), mevcut: %d\n", abi);
+        return -1;
+    }
+
+    struct landlock_ruleset_attr rs_attr = {
+        .handled_access_net =
+            LANDLOCK_ACCESS_NET_BIND_TCP    |
+            LANDLOCK_ACCESS_NET_CONNECT_TCP,
+    };
+
+    int ruleset_fd = syscall(SYS_landlock_create_ruleset,
+                             &rs_attr, sizeof(rs_attr), 0);
+    if (ruleset_fd &lt; 0) {
+        perror("ruleset olusturulamadi");
+        return -1;
+    }
+
+    /* Yalnızca port 1883 (MQTT) üzerinde dinlemeye izin ver */
+    struct landlock_net_port_attr net_attr = {
+        .allowed_access = LANDLOCK_ACCESS_NET_BIND_TCP,
+        .port = 1883,
+    };
+    if (syscall(SYS_landlock_add_rule, ruleset_fd,
+                LANDLOCK_RULE_NET_PORT, &net_attr, 0) &lt; 0) {
+        perror("net kural eklenemedi (bind 1883)");
+        close(ruleset_fd);
+        return -1;
+    }
+
+    /* Port 5432 (PostgreSQL) bağlantısına izin ver */
+    net_attr.allowed_access = LANDLOCK_ACCESS_NET_CONNECT_TCP;
+    net_attr.port = 5432;
+    if (syscall(SYS_landlock_add_rule, ruleset_fd,
+                LANDLOCK_RULE_NET_PORT, &net_attr, 0) &lt; 0) {
+        perror("net kural eklenemedi (connect 5432)");
+        close(ruleset_fd);
+        return -1;
+    }
+
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) &lt; 0) {
+        perror("prctl basarisiz");
+        close(ruleset_fd);
+        return -1;
+    }
+
+    if (syscall(SYS_landlock_restrict_self, ruleset_fd, 0) &lt; 0) {
+        perror("restrict_self basarisiz");
+        close(ruleset_fd);
+        return -1;
+    }
+
+    close(ruleset_fd);
+    printf("Ag sandbox aktif: yalnizca bind:1883 ve connect:5432\n");
+    return 0;
+}</code></pre>
+
+  <p><strong>Ağ kısıt bayrakları:</strong></p>
+  <div class="params">
+    <div class="param"><span class="name">LANDLOCK_ACCESS_NET_BIND_TCP</span><span class="desc">TCP portunda dinleme (bind + listen); sunucu süreçler için gerekli</span></div>
+    <div class="param"><span class="name">LANDLOCK_ACCESS_NET_CONNECT_TCP</span><span class="desc">TCP bağlantısı kurma (connect); istemci bağlantıları için gerekli</span></div>
+  </div>
+
+  <p>
+    Önemli sınırlamalar: Landlock ağ kısıtları yalnızca TCP'yi kapsar; UDP, Unix domain
+    soketleri veya ham soketler (raw sockets) için Landlock ağ kısıtları uygulanamaz.
+    Bu erişimleri kısıtlamak için seccomp ile birlikte kullanmak gerekmektedir.
+    Ayrıca halihazırda açık olan soket bağlantıları Landlock politikası uygulandıktan
+    sonra da çalışmaya devam eder; politika yalnızca yeni bağlantı girişimlerini etkiler.
+  </p>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> Kalıtım ve fork</h2>
+  <p class="section-lead">
+    Landlock kısıtlamaları süreç kalıtımı yoluyla child süreçlere aktarılır.
+    <code>fork()</code> ile oluşturulan alt süreçler, üst sürecin Landlock politikasını
+    devralır ve bu politika daraltılabilir ancak genişletilemez.
+  </p>
+
+  <p>
+    Bu davranış güvenlik açısından kritik bir garantidir: kısıtlı bir süreç
+    <code>fork()</code> ile bir child oluşturduğunda, o child daha az kısıtlı olamaz.
+    Alt süreç ek kısıtlamalar ekleyebilir ancak mevcut kısıtlamaları kaldıramaz.
+  </p>
+
+  <div class="flow"><pre>
+Landlock kalıtım modeli:
+
+  Ana süreç (kısıtsız)
+       |
+       |  landlock_restrict_self (politika A: /tmp, /var/lib/app)
+       v
+  Ana süreç (politika A aktif)
+       |
+       |  fork()
+       |
+       +----------> Child süreç (politika A devralındı)
+                         |
+                         |  landlock_restrict_self (politika B: yalnızca /tmp)
+                         v
+                    Child süreç (politika A + B: kesişim = /tmp)
+                    [Politika A'yı kaldıramaz, yalnızca daraltabilir]
+  </pre></div>
+
+  <p>
+    <strong>no_new_privs zorunluluğu:</strong> <code>landlock_restrict_self</code>
+    çağrısından önce <code>prctl(PR_SET_NO_NEW_PRIVS, 1, ...)</code> ayarlanmalıdır.
+    Bu bayrak da kalıtımla child süreçlere geçer; bir kez ayarlandığında geri alınamaz.
+    Amaç: setuid veya setcap ikilileri çalıştırarak Landlock kısıtlamalarını atlatmayı
+    engellemektir.
+  </p>
+
+  <pre><code>/* Çok işlemli daemon — güvenli kalıtım örneği */
+#include &lt;sys/prctl.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;stdio.h&gt;
+
+void apply_worker_sandbox(void);  /* ek kısıtlamalar */
+
+int main(void) {
+    /* 1. Adım: Ana süreç için Landlock kur (geniş izinler) */
+    setup_landlock_main();
+
+    /* 2. Adım: Worker fork'larını başlat */
+    for (int i = 0; i &lt; WORKER_COUNT; i++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            /* Child: ana politikayı devraldı, daha da kısıt */
+            apply_worker_sandbox();
+            worker_loop();
+            _exit(0);
+        }
+    }
+
+    /* Ana süreç: kabul döngüsü */
+    accept_loop();
+    return 0;
+}</code></pre>
+
+  <p>
+    <strong>exec() ve Landlock:</strong> <code>execve()</code> sonrasında Landlock
+    kısıtlamaları korunur. Yeni çalıştırılan ikili, önceki süreçten kalan politikayı
+    devralır. Bu davranış sayesinde bir sarmalayıcı (wrapper) script veya launcher
+    süreci Landlock'u kurup ardından asıl programı <code>exec()</code> ile başlatabilir;
+    asıl program Landlock API'sini hiç çağırmak zorunda kalmaz.
+  </p>
+
+  <pre><code>/* Landlock launcher: politikayı kur, ardından programı exec et */
+int main(int argc, char *argv[]) {
+    if (argc &lt; 2) {
+        fprintf(stderr, "Kullanim: %s PROGRAM [ARGS...]\n", argv[0]);
+        return 1;
+    }
+
+    /* Politikayı kur */
+    if (setup_landlock_policy() &lt; 0)
+        return 1;
+
+    /* Asıl programı başlat — politika devredilir */
+    execvp(argv[1], &argv[1]);
+    perror("execvp basarisiz");
+    return 1;
+}</code></pre>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> Gömülü Daemon Sandboxing</h2>
+  <p class="section-lead">
+    Gerçek dünya gömülü senaryolarında MQTT broker, hafif web sunucusu ve CANBUS daemon
+    uygulamaları için Landlock sandbox politikaları tasarlanmaktadır. Her uygulamanın
+    ihtiyaç duyduğu kaynaklar dikkatle analiz edilmelidir.
+  </p>
+
+  <p>
+    <strong>MQTT Broker (Mosquitto) Sandbox:</strong> Mosquitto tipik olarak yapılandırma
+    dosyasını, kalıcı mesaj veritabanını ve PID dosyasını kullanır; ağda yalnızca
+    1883 (MQTT) ve 8883 (MQTT/TLS) portlarında dinler.
+  </p>
+
+  <pre><code>/* mosquitto_sandbox.c — Mosquitto için Landlock sarmalayıcı */
+#include &lt;linux/landlock.h&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;sys/prctl.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;stdio.h&gt;
+
+#define FS_R   (LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR)
+#define FS_RW  (FS_R | LANDLOCK_ACCESS_FS_WRITE_FILE | \
+                LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_REMOVE_FILE)
+#define FS_RX  (FS_R | LANDLOCK_ACCESS_FS_EXECUTE)
+
+static const struct {
+    const char *path;
+    uint64_t    access;
+} mosquitto_rules[] = {
+    { "/etc/mosquitto",        FS_R   },  /* yapılandırma */
+    { "/var/lib/mosquitto",    FS_RW  },  /* kalıcı veritabanı */
+    { "/var/log/mosquitto",    FS_RW  },  /* log dosyaları */
+    { "/var/run",              FS_RW  },  /* PID dosyası */
+    { "/tmp",                  FS_RW  },  /* geçici dosyalar */
+    { "/lib",                  FS_RX  },  /* sistem kütüphaneleri */
+    { "/usr/lib",              FS_RX  },  /* uygulama kütüphaneleri */
+    { "/usr/sbin",             FS_RX  },  /* mosquitto ikilisi */
+    { "/etc/ssl",              FS_R   },  /* TLS sertifikaları */
+    { "/dev/urandom",          FS_R   },  /* rassal sayı üretici */
+    { NULL, 0 }
+};
+
+int apply_mosquitto_sandbox(void) {
+    /* Tam uygulama için önceki bölümlerdeki yardımcı işlevler kullanılır */
+    return 0; /* kısaltılmış örnek */
+}</code></pre>
+
+  <p>
+    <strong>CANBUS daemon sandbox:</strong> SocketCAN kullanan bir CAN daemon genellikle
+    yapılandırma dizinine okuma, log dizinine yazma ve CAN soketlerine erişim ister.
+    Ağ soketleri (SOCK_RAW CAN) Landlock ağ kısıtlamalarının kapsamı dışındadır; bu
+    kısıtlama için seccomp filtreleri kullanılmalıdır.
+  </p>
+
+  <pre><code>/* can_daemon_sandbox.c — CAN daemon için minimal politika */
+static const struct {
+    const char *path;
+    uint64_t    access;
+} can_daemon_rules[] = {
+    { "/etc/can-daemon",       FS_R   },  /* yapılandırma */
+    { "/var/lib/can-daemon",   FS_RW  },  /* durum verisi */
+    { "/var/log/can-daemon",   FS_RW  },  /* günlükler */
+    { "/tmp",                  FS_RW  },  /* geçici dosyalar */
+    { "/lib",                  FS_RX  },  /* kütüphaneler */
+    { "/usr/lib",              FS_RX  },  /* kütüphaneler */
+    { "/dev",                  FS_R   },  /* aygıt dosyası okuma (vcan0 vb.) */
+    { NULL, 0 }
+    /* Not: CAN ham soketleri ağ kısıtları yerine seccomp ile yönetilir */
+};</code></pre>
+
+  <p>
+    <strong>Web sunucusu sandbox (lighttpd örneği):</strong>
+  </p>
+
+  <pre><code>static const struct {
+    const char *path;
+    uint64_t    access;
+} lighttpd_rules[] = {
+    { "/etc/lighttpd",         FS_R   },  /* yapılandırma */
+    { "/var/www/html",         FS_R   },  /* statik web içeriği */
+    { "/var/log/lighttpd",     FS_RW  },  /* erişim ve hata logları */
+    { "/var/run",              FS_RW  },  /* PID dosyası, FastCGI soketleri */
+    { "/tmp",                  FS_RW  },  /* geçici dosyalar */
+    { "/lib",                  FS_RX  },
+    { "/usr/lib",              FS_RX  },
+    { "/usr/sbin",             FS_RX  },
+    { "/etc/ssl",              FS_R   },  /* HTTPS sertifikaları */
+    { "/etc/mime.types",       FS_R   },  /* MIME türleri */
+    { NULL, 0 }
+};</code></pre>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> Mevcut Araçlarla Entegrasyon</h2>
+  <p class="section-lead">
+    Landlock, systemd servis birimlerindeki ek güvenlik seçenekleri, bubblewrap sandbox
+    aracı ve diğer Linux güvenlik mekanizmaları ile birlikte kullanılabilir.
+  </p>
+
+  <p>
+    <strong>systemd servis birimi ile Landlock:</strong> systemd 254+ sürümünde
+    <code>LandlockAccessFS</code> ve ilgili direktifler eklenmiştir. Bu sayede C kodu
+    yazmadan systemd birim dosyası üzerinden Landlock politikası tanımlanabilir.
+    Ancak eski systemd sürümlerinde (gömülü dağıtımlarda yaygın) bu direktifler
+    yoktur; bu durumda servis başlatma betiği içinden Landlock uygulanması gerekir.
+  </p>
+
+  <pre><code># /etc/systemd/system/mqtt-broker.service — systemd 254+ özelliği
+[Unit]
+Description=MQTT Broker (Mosquitto)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mosquitto
+Group=mosquitto
+ExecStart=/usr/sbin/mosquitto -c /etc/mosquitto/mosquitto.conf
+
+# Landlock dosya sistemi kısıtları (systemd 254+)
+# Tüm dosya sistemi erişimini kısıtla
+LandlockInodesAccessFilesystems=read execute
+
+# Güvenlik katmanlarını birleştir
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/mosquitto /var/log/mosquitto
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+
+  <p>
+    <strong>Eski systemd sürümleri için ExecStartPre yaklaşımı:</strong>
+  </p>
+
+  <pre><code># /etc/systemd/system/mqtt-broker.service — eski systemd uyumlu
+[Service]
+User=mosquitto
+NoNewPrivileges=yes
+ExecStartPre=/usr/sbin/mqtt-sandbox-setup
+ExecStart=/usr/sbin/mosquitto -c /etc/mosquitto/mosquitto.conf</code></pre>
+
+  <p>
+    <strong>bubblewrap ile karşılaştırma:</strong> bubblewrap (<code>bwrap</code>),
+    namespace tabanlı izolasyon sağlar ve daha kapsamlı bir sandbox oluşturabilir.
+    Landlock ise daha hafif ve uygulama içine entegre bir çözümdür. İkisi farklı
+    sorunları çözer ve birlikte kullanılabilir.
+  </p>
+
+  <div class="file-table"><table>
+    <tr><th>Özellik</th><th>Landlock</th><th>bubblewrap</th></tr>
+    <tr><td>Mekanizma</td><td>LSM (çekirdek yetki bayrakları)</td><td>Linux namespace (mount, pid, net vb.)</td></tr>
+    <tr><td>Uygulama değişikliği</td><td>Gerekli (syscall çağrısı)</td><td>Gerekmez (dışarıdan sarmalama)</td></tr>
+    <tr><td>Çekirdek gereksinimleri</td><td>Linux 5.13+, CONFIG_SECURITY_LANDLOCK=y</td><td>Namespace desteği (çoğu çekirdekte mevcut)</td></tr>
+    <tr><td>Overhead</td><td>Çok düşük</td><td>Orta (namespace kurulum maliyeti)</td></tr>
+    <tr><td>Ağ yalıtımı</td><td>Yalnızca TCP port (6.7+)</td><td>Tam ağ namespace yalıtımı</td></tr>
+    <tr><td>Gömülü uygunluk</td><td>Yüksek</td><td>Orta (namespace desteği gerektirir)</td></tr>
+  </table></div>
+
+  <p>
+    Landlock ve seccomp kombinasyonu gömülü güvenlik için güçlü bir temel oluşturur:
+    seccomp syscall yüzeyini minimize eder, Landlock ise erişilebilir kaynakları
+    kısıtlar. İkisi birlikte kullanıldığında saldırı yüzeyi çok katmanlı biçimde
+    daraltılır.
+  </p>
+
+  <pre><code>/* Landlock + seccomp kombinasyonu */
+int secure_daemon_init(void) {
+    /* 1. Landlock: dosya sistemi ve ağ kısıtları */
+    if (apply_landlock_policy() &lt; 0)
+        return -1;
+
+    /* 2. seccomp: gereksiz syscall'ları kapat */
+    if (apply_seccomp_filter() &lt; 0)
+        return -1;
+
+    /* 3. Artık güvenli ortamda çalışıyoruz */
+    return 0;
+}</code></pre>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Hata Ayıklama</h2>
+  <p class="section-lead">
+    Landlock politikası uygulandıktan sonra reddedilen erişimleri teşhis etmek için
+    strace ile syscall izleme, EACCES/EPERM hata ayrımı ve audit log mekanizmasından
+    yararlanılır.
+  </p>
+
+  <p><strong>strace ile Landlock syscall'larını izle:</strong></p>
+  <pre><code># Landlock syscall'larını izle
+strace -e trace=landlock_create_ruleset,landlock_add_rule,landlock_restrict_self \
+    ./myapp
+
+# Tüm dosya erişimlerini ve hataları izle
+strace -e trace=openat,open,read,write,execve \
+    -e fault=openat:error=EACCES \
+    ./myapp 2>&1 | grep -E "EACCES|EPERM"
+
+# Daha ayrıntılı: reddedilen tüm sistem çağrıları
+strace -P /etc/passwd ./myapp 2>&1</code></pre>
+
+  <p><strong>EACCES ve EPERM ayrımı:</strong></p>
+  <div class="params">
+    <div class="param"><span class="name">EACCES (13)</span><span class="desc">Landlock politikası tarafından reddedildi; politikayı genişletmeniz gerekiyor</span></div>
+    <div class="param"><span class="name">EPERM (1)</span><span class="desc">Yetki yetersizliği — no_new_privs ayarlanmamış veya farklı bir güvenlik mekanizması reddetti</span></div>
+  </div>
+
+  <pre><code>/* Hata yönetimi örneği */
+int fd = open("/path/to/file", O_RDONLY);
+if (fd &lt; 0) {
+    if (errno == EACCES) {
+        fprintf(stderr, "Landlock reddi: %s\n", strerror(errno));
+        /* Landlock politikasında ilgili dizini kontrol et */
+    } else if (errno == EPERM) {
+        fprintf(stderr, "Yetki hatasi: %s\n", strerror(errno));
+        /* no_new_privs veya başka bir LSM kontrolü */
+    } else {
+        perror("Beklenmedik hata");
+    }
+}</code></pre>
+
+  <p><strong>Linux audit ile Landlock olaylarını kaydet:</strong></p>
+  <pre><code># auditd kurulumu
+sudo apt-get install auditd
+
+# Landlock reddiyatlarını kaydet
+sudo auditctl -a always,exit -F arch=b64 \
+    -S landlock_create_ruleset,landlock_add_rule,landlock_restrict_self \
+    -k landlock_ops
+
+# Redleri izle
+sudo ausearch -k landlock_ops | aureport --file
+
+# Gerçek zamanlı audit izleme
+sudo tail -f /var/log/audit/audit.log | grep landlock</code></pre>
+
+  <p><strong>Politika geliştirme iş akışı:</strong></p>
+  <div class="flow"><pre>
+Politika geliştirme adımları:
+
+  1. Uygulamayı strace altında çalıştır
+     strace -e trace=openat,connect ./myapp 2>trace.log
+
+  2. Erişilen kaynakları analiz et
+     grep "openat" trace.log | awk '{print $2}' | sort -u
+
+  3. Minimal Landlock politikası oluştur
+     (yalnızca adım 2'de tespit edilen kaynaklar)
+
+  4. Politika ile test et
+     ./myapp 2>test.log
+     grep "EACCES\|EPERM" test.log
+
+  5. Eksik izinleri ekle ve adım 4'e dön
+
+  6. Production öncesi güvenlik incelemesi:
+     izin verilen kaynaklar gerçekten gerekli mi?
+  </pre></div>
+
+  <p>
+    <strong>Çekirdek yapılandırması doğrulama:</strong> Landlock'un aktif olup olmadığını
+    ve hangi ABI versiyonunun desteklendiğini doğrulamak için:
+  </p>
+
+  <pre><code># Landlock çekirdek yapılandırmasını kontrol et
+zcat /proc/config.gz | grep LANDLOCK
+# Beklenen çıktı:
+# CONFIG_SECURITY_LANDLOCK=y
+
+# LSM listesini kontrol et
+cat /sys/kernel/security/lsm
+# Çıktıda "landlock" görünmelidir
+
+# ABI versiyonunu C'den değil shell'den test et
+python3 -c "
+import ctypes, os
+libc = ctypes.CDLL(None, use_errno=True)
+# SYS_landlock_create_ruleset = 444 (x86_64)
+abi = libc.syscall(444, None, 0, 1)
+print(f'Landlock ABI: {abi}')
+"</code></pre>
+
+  <p>
+    Landlock desteği yoksa (<code>CONFIG_SECURITY_LANDLOCK</code> ayarlanmamış veya
+    LSM listesinde "landlock" yok) uygulamanızın Landlock olmadan da çalışabilmesi
+    için ABI kontrolünü zorunlu adım yerine isteğe bağlı güvenlik katmanı olarak
+    tasarlamanız önerilir. Bu yaklaşım farklı kernel versiyonlarında çalışan
+    taşınabilir bir gömülü uygulama için doğru pratiktir.
+  </p>
+</section>
+
+</main>

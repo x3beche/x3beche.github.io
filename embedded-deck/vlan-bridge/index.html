@@ -1,0 +1,1023 @@
+---
+layout: tutorial
+title: "VLAN, Bridge & Bonding — Linux L2 Ağ Altyapısı"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>AĞ YAPISI</span>
+    <span>2026</span>
+  </div>
+  <h1>VLAN, Bridge &amp; Bonding<br><em>Linux L2 Ağ Altyapısı</em></h1>
+  <p class="subtitle">802.1Q VLAN, yazılım köprüsü, bonding/team ve gerçek embedded gateway yapılandırmasını iproute2 araçlarıyla adım adım inşa edin.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">L2 ağ mimarisi — temel kavramlar</a></li>
+    <li><a href="#s1">802.1Q VLAN — etiketleme ve yapılandırma</a></li>
+    <li><a href="#s2">Linux bridge — FDB, STP, RSTP</a></li>
+    <li><a href="#s3">Bridge + VLAN aware mod</a></li>
+    <li><a href="#s4">macvlan ve ipvlan</a></li>
+    <li><a href="#s5">Bonding — aktif-pasif, LACP, balance-rr</a></li>
+    <li><a href="#s6">team sürücüsü — teamd ve runner'lar</a></li>
+    <li><a href="#s7">Embedded gateway örneği</a></li>
+    <li><a href="#s8">Hata ayıklama</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> L2 ağ mimarisi — temel kavramlar</h2>
+  <p class="section-lead">Katman 2 (L2), OSI modelinin veri bağlantı katmanıdır. MAC adresleme, çerçeve iletimi ve yayın alanı (broadcast domain) bu katmanda yönetilir. Embedded gateway tasarımında L2 kararları ağ topolojisini doğrudan belirler.</p>
+
+  <h3>MAC iletimi ve FDB</h3>
+  <p>Bir Ethernet switch, gelen çerçevenin kaynak MAC adresini giriş portunun kimliğiyle birlikte <em>Forwarding Database (FDB)</em>'ye öğrenir. Hedef MAC FDB'de varsa doğrudan hedefe iletilir; yoksa tüm portlara yayın (flood) yapılır. Linux yazılım bridge de aynı mantıkla çalışır.</p>
+
+  <div class="flow">
+    <pre>Gelen çerçeve (src MAC-A, dst MAC-B)
+         │
+         ▼
+  Kaynak öğrenme: FDB[MAC-A] = port P1
+         │
+         ▼
+  Hedef arama: FDB[MAC-B] var mı?
+    ├── EVET → sadece hedef porta ilet
+    └── HAYIR → tüm portlara flood (broadcast, multicast, unknown-unicast)</pre>
+  </div>
+
+  <h3>Broadcast domain ve VLAN</h3>
+  <p>Aynı broadcast domain'deki tüm cihazlar ARP, DHCP gibi yayın trafiğini alır. Bu durum büyük ağlarda hem bant genişliği hem güvenlik sorunu yaratır. VLAN bu sorunu çözer: her VLAN ayrı bir broadcast domain'dir.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Kavram</th><th>Açıklama</th><th>Linux karşılığı</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Broadcast domain</td><td>Yayın trafiğinin ulaştığı cihaz kümesi</td><td>Bridge arayüzü veya VLAN</td></tr>
+        <tr><td>VLAN (802.1Q)</td><td>Mantıksal ağ bölümleme, 12-bit VID (1–4094)</td><td><code>ip link add eth0.10 type vlan id 10</code></td></tr>
+        <tr><td>Tagged port</td><td>VLAN etiketi taşıyan çerçeveler — trunk link</td><td>VLAN arayüz, bridge vlan tagged</td></tr>
+        <tr><td>Untagged port</td><td>Etiketsiz çerçeveler — access/erişim bağlantısı</td><td>PVID ile bridge vlan untagged</td></tr>
+        <tr><td>FDB</td><td>Forwarding Database — MAC → port eşlemesi</td><td>bridge fdb show</td></tr>
+        <tr><td>STP</td><td>Spanning Tree Protocol — döngü önleme</td><td>bridge stp_state 1</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>iproute2 vs brctl/vconfig/ifenslave</h3>
+  <p>Modern Linux dağıtımlarında tüm L2 yapılandırması <code>ip link</code> komutuyla yapılır. Eski araçlar hâlâ çalışsa da önerilmez:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">ip link</span><span class="desc">VLAN, bridge, bond, team, macvlan, ipvlan oluşturma/silme — hepsini kapsar</span></div>
+    <div class="param"><span class="name">bridge</span><span class="desc">Bridge FDB, VLAN, STP, MDB yönetimi — iproute2 paketinin parçası</span></div>
+    <div class="param"><span class="name">brctl</span><span class="desc">Eski bridge aracı — net-tools paketi; yeni sistemlerde kullanmayın</span></div>
+    <div class="param"><span class="name">vconfig</span><span class="desc">Eski VLAN aracı — net-tools paketi; <code>ip link type vlan</code> ile değiştirildi</span></div>
+    <div class="param"><span class="name">ifenslave</span><span class="desc">Eski bonding aracı; <code>ip link type bond</code> ile değiştirildi</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>L2 anahtar: FDB öğrenimi, flood ve MAC iletimi</li>
+      <li>VLAN broadcast domain'leri böler — güvenlik ve bant genişliği için kritik</li>
+      <li>Tüm modern L2 yapılandırması <code>ip link</code> + <code>bridge</code> araçlarıyla yapılır</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> 802.1Q VLAN — etiketleme ve yapılandırma</h2>
+  <p class="section-lead">IEEE 802.1Q standardı, Ethernet çerçevesine 4 baytlık VLAN etiketi ekler. Linux bu etiketi <code>8021q</code> modülü aracılığıyla çekirdek içinde işler.</p>
+
+  <h3>802.1Q çerçeve yapısı</h3>
+
+  <div class="flow">
+    <pre>┌────────────┬───────────┬──────────┬────────────────────────┬─────┐
+│ Dst MAC    │ Src MAC   │ 0x8100   │ TCI (PCP 3b+DEI 1b+    │     │
+│ (6 bayt)   │ (6 bayt)  │(EtherType│  VID 12b)              │...  │
+│            │           │  2 bayt) │ (2 bayt)               │     │
+└────────────┴───────────┴──────────┴────────────────────────┴─────┘
+                              ▲               ▲
+                         VLAN etiketi    VID: 1–4094
+                         0x8100         (0=untagged, 4095=rezerve)</pre>
+  </div>
+
+  <h3>VLAN arayüzü oluşturma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 8021q modülünü yükle</span>
+modprobe 8021q
+
+<span class="cmt"># eth0 üzerinde VLAN 10 arayüzü oluştur</span>
+ip link add link eth0 name eth0.10 type vlan id 10
+
+<span class="cmt"># Arayüzü etkinleştir</span>
+ip link set eth0.10 up
+
+<span class="cmt"># IP adresi ata</span>
+ip addr add 192.168.10.1/24 dev eth0.10
+
+<span class="cmt"># Birden fazla VLAN</span>
+ip link add link eth0 name eth0.20 type vlan id 20
+ip link add link eth0 name eth0.30 type vlan id 30
+ip link set eth0.20 up
+ip link set eth0.30 up
+
+<span class="cmt"># Tüm VLAN arayüzleri listele</span>
+ip -d link show type vlan
+
+<span class="cmt"># VLAN arayüzünü sil</span>
+ip link del eth0.10</code></pre>
+  </div>
+
+  <h3>VLAN filtreleme ve egress seçenekleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># VLAN arayüzü ayrıntıları</span>
+ip -d link show eth0.10
+<span class="cmt"># Örnek çıktı:</span>
+<span class="cmt">#  4: eth0.10@eth0: mtu 1500 qdisc noqueue state UP</span>
+<span class="cmt">#      vlan protocol 802.1Q id 10 &lt;REORDER_HDR&gt;</span>
+
+<span class="cmt"># VLAN QoS eşlemesi (ingress: wire priority → Linux skb priority)</span>
+ip link add link eth0 name eth0.10 type vlan id 10 \
+    ingress-qos-map 0:0 1:1 2:2 3:3 4:4 5:5 6:6 7:7
+
+<span class="cmt"># Egress QoS: Linux priority → wire 802.1p PCP</span>
+ip link add link eth0 name eth0.10 type vlan id 10 \
+    egress-qos-map 0:0 1:1 2:2 6:6 7:7
+
+<span class="cmt"># GVRP (GARP VLAN Registration Protocol) etkinleştir</span>
+ip link add link eth0 name eth0.10 type vlan id 10 gvrp on
+
+<span class="cmt"># MVRP etkinleştir</span>
+ip link add link eth0 name eth0.10 type vlan id 10 mvrp on</code></pre>
+  </div>
+
+  <h3>Q-in-Q (802.1ad) — iç içe VLAN</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Dış VLAN (S-Tag, 0x88a8 — provider etiketi)</span>
+ip link add link eth0 name eth0.100 type vlan \
+    id 100 proto 802.1ad
+
+<span class="cmt"># İç VLAN (C-Tag, 0x8100 — müşteri etiketi)</span>
+ip link add link eth0.100 name eth0.100.10 type vlan \
+    id 10 proto 802.1Q
+
+ip link set eth0.100 up
+ip link set eth0.100.10 up
+ip addr add 192.168.10.1/24 dev eth0.100.10</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>802.1Q etiketi: EtherType 0x8100 + TCI (PCP 3b + DEI 1b + VID 12b)</li>
+      <li><code>ip link add link eth0 name eth0.VID type vlan id VID</code> — standart VLAN oluşturma</li>
+      <li>Q-in-Q: dış tag 802.1ad (0x88a8), iç tag 802.1Q (0x8100)</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> Linux bridge — FDB, STP, RSTP</h2>
+  <p class="section-lead">Linux yazılım köprüsü (bridge), ağ arayüzlerini Katman 2'de birleştiren sanal bir switch gibi davranır. Donanım switch olmayan sistemlerde ya da ek esneklik gerektiren durumlarda kullanılır.</p>
+
+  <h3>Bridge oluşturma ve port ekleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Bridge oluştur</span>
+ip link add name br0 type bridge
+ip link set br0 up
+
+<span class="cmt"># Portları bridge'e ekle</span>
+ip link set eth0 master br0
+ip link set eth1 master br0
+ip link set eth0 up
+ip link set eth1 up
+
+<span class="cmt"># Bridge'e IP adresi ata (yönetim)</span>
+ip addr add 192.168.1.1/24 dev br0
+
+<span class="cmt"># Bridge bilgisi</span>
+ip -d link show type bridge
+ip -d link show master br0
+
+<span class="cmt"># Bridge slave port durumu</span>
+ip link show master br0</code></pre>
+  </div>
+
+  <h3>Bridge parametreleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># STP etkinleştir</span>
+ip link set br0 type bridge stp_state 1
+
+<span class="cmt"># STP önceliği ayarla (root bridge için düşük)</span>
+ip link set br0 type bridge priority 4096
+
+<span class="cmt"># Forward delay (STP geçiş süresi, saniye)</span>
+ip link set br0 type bridge forward_delay 4
+
+<span class="cmt"># Hello time</span>
+ip link set br0 type bridge hello_time 2
+
+<span class="cmt"># Max age</span>
+ip link set br0 type bridge max_age 12
+
+<span class="cmt"># FDB ageing süresi (saniye)</span>
+ip link set br0 type bridge ageing_time 300
+
+<span class="cmt"># Multicast snooping</span>
+ip link set br0 type bridge mcast_snooping 1
+
+<span class="cmt"># Tüm parametreleri görüntüle</span>
+ip -d link show br0</code></pre>
+  </div>
+
+  <h3>Port düzeyinde STP ayarları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Port path cost (düşük = tercihli)</span>
+ip link set eth0 type bridge_slave cost 2
+ip link set eth1 type bridge_slave cost 4
+
+<span class="cmt"># Port önceliği</span>
+ip link set eth0 type bridge_slave priority 32
+
+<span class="cmt"># PortFast (edge port — STP gecikme yok)</span>
+ip link set eth0 type bridge_slave state 3
+
+<span class="cmt"># Guard port — BPDU'ları reddet</span>
+ip link set eth0 type bridge_slave guard 1
+
+<span class="cmt"># Root guard — bu porttan root bridge reklamı engelle</span>
+ip link set eth0 type bridge_slave root_block 1
+
+<span class="cmt"># Flood modu</span>
+ip link set eth0 type bridge_slave flood 1</code></pre>
+  </div>
+
+  <h3>FDB (Forwarding Database) yönetimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm FDB girdileri</span>
+bridge fdb show
+
+<span class="cmt"># Belirli bridge için</span>
+bridge fdb show br br0
+
+<span class="cmt"># Belirli port için</span>
+bridge fdb show dev eth0
+
+<span class="cmt"># Statik FDB girdisi ekle</span>
+bridge fdb add 00:11:22:33:44:55 dev eth0 static
+
+<span class="cmt"># FDB girdisini sil</span>
+bridge fdb del 00:11:22:33:44:55 dev eth0
+
+<span class="cmt"># Perma girdi (ageing'den muaf)</span>
+bridge fdb add 00:11:22:33:44:55 dev eth0 permanent
+
+<span class="cmt"># Yerel (local) girdi — bridge kendi MAC'i</span>
+bridge fdb show | grep permanent</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>ip link add name br0 type bridge</code> + <code>ip link set ethX master br0</code></li>
+      <li>STP: <code>stp_state 1</code> ile etkinleştirilir; port cost ve öncelik ayarlanabilir</li>
+      <li>FDB: dinamik öğrenme (ageing ile silinir) + statik/permanent girdiler</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> Bridge + VLAN aware mod</h2>
+  <p class="section-lead">Linux bridge'in VLAN aware modu, her port için bağımsız VLAN üyeliği ve PVID tanımına izin vererek donanım switch gibi davranmasını sağlar.</p>
+
+  <h3>VLAN aware bridge oluşturma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># VLAN filtreleme etkin bridge</span>
+ip link add name br0 type bridge vlan_filtering 1
+ip link set br0 up
+
+<span class="cmt"># Port ekle</span>
+ip link set eth0 master br0
+ip link set eth1 master br0
+ip link set eth2 master br0
+ip link set eth0 up
+ip link set eth1 up
+ip link set eth2 up
+
+<span class="cmt"># Mevcut VLAN yapılandırması</span>
+bridge vlan show</code></pre>
+  </div>
+
+  <h3>VLAN üyeliği senaryosu</h3>
+  <p>Tipik bir senaryo: eth0 ve eth1 LAN erişim portu (VLAN 10, untagged), eth2 uplink trunk portu (VLAN 10 ve VLAN 20, tagged).</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># Varsayılan VID 1'i tüm portlardan kaldır</span>
+bridge vlan del dev eth0 vid 1
+bridge vlan del dev eth1 vid 1
+bridge vlan del dev eth2 vid 1
+bridge vlan del dev br0  vid 1 self
+
+<span class="cmt"># eth0: erişim portu — VLAN 10, untagged, PVID</span>
+bridge vlan add dev eth0 vid 10 pvid untagged
+
+<span class="cmt"># eth1: erişim portu — VLAN 20, untagged, PVID</span>
+bridge vlan add dev eth1 vid 20 pvid untagged
+
+<span class="cmt"># eth2: trunk — VLAN 10 ve 20, tagged</span>
+bridge vlan add dev eth2 vid 10
+bridge vlan add dev eth2 vid 20
+
+<span class="cmt"># CPU (br0 kendisi) her iki VLAN'a dahil</span>
+bridge vlan add dev br0 vid 10 self
+bridge vlan add dev br0 vid 20 self
+
+<span class="cmt"># Yapılandırmayı doğrula</span>
+bridge vlan show</code></pre>
+  </div>
+
+  <h3>VLAN interface ile yönetim erişimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># VLAN 10 için bridge VLAN arayüzü oluştur</span>
+ip link add link br0 name br0.10 type vlan id 10
+ip link set br0.10 up
+ip addr add 192.168.10.1/24 dev br0.10
+
+<span class="cmt"># VLAN 20 için</span>
+ip link add link br0 name br0.20 type vlan id 20
+ip link set br0.20 up
+ip addr add 192.168.20.1/24 dev br0.20</code></pre>
+  </div>
+
+  <h3>PVID ve egress untagged tablo</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Port tipi</th><th>Gelen (ingress)</th><th>Çıkan (egress)</th><th>Komut</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Erişim (access)</td><td>Etiketlenmemiş → PVID'ye atanır</td><td>Etiket soyulur</td><td>pvid untagged</td></tr>
+        <tr><td>Trunk</td><td>Tagged çerçeve kabul</td><td>Etiket korunur</td><td>vid N (etiket yok)</td></tr>
+        <tr><td>Hibrit</td><td>Hem tagged hem untagged</td><td>Konfigürasyona göre</td><td>pvid + ek vid'ler</td></tr>
+        <tr><td>CPU (self)</td><td>Kernel yığınına yönlendirilir</td><td>Kernel'den gönderilir</td><td>vid N self</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>VLAN aware bridge: <code>vlan_filtering 1</code> parametresiyle oluşturulur</li>
+      <li>Erişim portu: <code>pvid untagged</code> — trunk portu: sadece <code>vid N</code></li>
+      <li>CPU portuna (<code>self</code>) eklenmesi gereken VLAN'lar bridge'den trafik alabilmek için zorunludur</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> macvlan ve ipvlan</h2>
+  <p class="section-lead">macvlan ve ipvlan, tek bir fiziksel arayüz üzerinden birden fazla bağımsız ağ kimliği oluşturmayı sağlayan sanal arayüz türleridir. Konteyner ve sanal makine ağ yapılandırmalarında yaygınca kullanılır.</p>
+
+  <h3>macvlan modları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">MACVLAN_MODE_PRIVATE</span><span class="desc">Aynı fiziksel arayüzdeki macvlan'lar birbirini göremez; en yalıtılmış mod</span></div>
+    <div class="param"><span class="name">MACVLAN_MODE_VEPA</span><span class="desc">Virtual Ethernet Port Aggregator — trafik dışarı çıkıp geri gelir; harici switch gerektirir</span></div>
+    <div class="param"><span class="name">MACVLAN_MODE_BRIDGE</span><span class="desc">Aynı fiziksel arayüzdeki macvlan'lar doğrudan iletişim kurabilir; dahili switch gibi davranır</span></div>
+    <div class="param"><span class="name">MACVLAN_MODE_PASSTHRU</span><span class="desc">Tek macvlan, fiziksel arayüzü devralan mod — sanal makinede doğrudan NIC kullanımı</span></div>
+    <div class="param"><span class="name">MACVLAN_MODE_SOURCE</span><span class="desc">Sadece belirli kaynak MAC adreslerinden gelen trafiği kabul eder; filtreleme için</span></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># macvlan BRIDGE modunda oluştur</span>
+ip link add link eth0 name macvlan0 type macvlan mode bridge
+ip link set macvlan0 up
+ip addr add 192.168.1.10/24 dev macvlan0
+
+<span class="cmt"># macvlan PRIVATE modunda</span>
+ip link add link eth0 name macvlan1 type macvlan mode private
+ip link set macvlan1 up
+
+<span class="cmt"># macvlan VEPA modunda (harici switch VEPA destekli olmalı)</span>
+ip link add link eth0 name macvlan2 type macvlan mode vepa
+ip link set macvlan2 up
+
+<span class="cmt"># macvlan bilgisi</span>
+ip -d link show type macvlan
+
+<span class="cmt"># Silme</span>
+ip link del macvlan0</code></pre>
+  </div>
+
+  <h3>ipvlan — MAC paylaşımlı sanal arayüz</h3>
+  <p>ipvlan, macvlan'dan farklı olarak aynı MAC adresini paylaşır; bunun yerine IP adresine göre ayrım yapar. Bu, bazı switch'lerin MAC sınırı kısıtlamasını aşar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ipvlan L2 modunda (katman 2 yalıtım)</span>
+ip link add link eth0 name ipvlan0 type ipvlan mode l2
+ip link set ipvlan0 up
+ip addr add 192.168.1.11/24 dev ipvlan0
+
+<span class="cmt"># ipvlan L3 modunda (katman 3 yönlendirme)</span>
+ip link add link eth0 name ipvlan1 type ipvlan mode l3
+ip link set ipvlan1 up
+ip addr add 10.0.0.1/24 dev ipvlan1
+
+<span class="cmt"># ipvlan L3s modunda (L3 + src-ip seçici — source validation)</span>
+ip link add link eth0 name ipvlan2 type ipvlan mode l3s</code></pre>
+  </div>
+
+  <h3>macvlan ve ipvlan karşılaştırması</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Özellik</th><th>macvlan</th><th>ipvlan</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>MAC adresi</td><td>Her arayüze ayrı MAC</td><td>Fiziksel MAC paylaşılır</td></tr>
+        <tr><td>Switch MAC sınırı</td><td>Etkilenir</td><td>Etkilenmez</td></tr>
+        <tr><td>ARP davranışı</td><td>Her arayüz kendi ARP'ı yanıtlar</td><td>IP'ye göre yönlendirme</td></tr>
+        <tr><td>L3 modda routing</td><td>Hayır</td><td>Evet (ipvlan L3/L3s)</td></tr>
+        <tr><td>Promiscuous mod</td><td>Gerektirir</td><td>Gerekmez</td></tr>
+        <tr><td>Kullanım senaryosu</td><td>Konteyner ağı, test arayüzü</td><td>Çok-IP, network namespace</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>macvlan: her sanal arayüze ayrı MAC — BRIDGE/PRIVATE/VEPA/PASSTHRU modları</li>
+      <li>ipvlan: MAC paylaşımlı, IP bazlı ayrım — switch MAC limiti aşılır</li>
+      <li>Konteyner ağında macvlan BRIDGE modu, sanal makinede PASSTHRU yaygın kullanılır</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> Bonding — aktif-pasif, LACP, balance-rr</h2>
+  <p class="section-lead">Linux bonding, birden fazla fiziksel ağ arayüzünü tek bir mantıksal arayüzde birleştirerek yedeklilik (redundancy) ve/veya bant genişliği birleştirme (link aggregation) sağlar.</p>
+
+  <h3>Bonding modları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Mod</th><th>Adı</th><th>Açıklama</th><th>Switch gereksinimi</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>0</td><td>balance-rr</td><td>Round-robin — paket başına sıralı iletim; yük dengeleme</td><td>LAG/LACP değil, sadece flood</td></tr>
+        <tr><td>1</td><td>active-backup</td><td>Bir aktif, diğerleri yedek; failover</td><td>Gereksiz — standart switch</td></tr>
+        <tr><td>2</td><td>balance-xor</td><td>XOR hash — src/dst MAC bazlı yük dengeleme</td><td>Static LAG</td></tr>
+        <tr><td>3</td><td>broadcast</td><td>Tüm portlardan aynı paket gönderilir</td><td>Özel — genellikle kullanılmaz</td></tr>
+        <tr><td>4</td><td>802.3ad (LACP)</td><td>Dinamik LAG — IEEE 802.3ad, switch ile müzakere</td><td>LACP destekli switch zorunlu</td></tr>
+        <tr><td>5</td><td>balance-tlb</td><td>Uyarlanabilir TX yük dengeleme; RX tek porttan</td><td>Gereksiz</td></tr>
+        <tr><td>6</td><td>balance-alb</td><td>Uyarlanabilir yük dengeleme; TX+RX dağıtım</td><td>Gereksiz</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>active-backup (mod 1) kurulumu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Bond arayüzü oluştur — mod 1 active-backup</span>
+ip link add name bond0 type bond mode active-backup
+
+<span class="cmt"># Miimon: link izleme aralığı ms cinsinden</span>
+ip link set bond0 type bond miimon 100
+
+<span class="cmt"># Slave portları ekle (önce down yapılmalı)</span>
+ip link set eth0 down
+ip link set eth1 down
+ip link set eth0 master bond0
+ip link set eth1 master bond0
+
+<span class="cmt"># Bond ve slave'leri etkinleştir</span>
+ip link set bond0 up
+ip link set eth0 up
+ip link set eth1 up
+
+<span class="cmt"># Aktif portu belirle (primary)</span>
+ip link set bond0 type bond primary eth0
+
+<span class="cmt"># Durum kontrolü</span>
+cat /proc/net/bonding/bond0</code></pre>
+  </div>
+
+  <h3>802.3ad LACP (mod 4) kurulumu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># LACP bond oluştur</span>
+ip link add name bond0 type bond mode 802.3ad
+ip link set bond0 type bond miimon 100
+
+<span class="cmt"># LACP hızı: slow (30s) veya fast (1s)</span>
+ip link set bond0 type bond lacp_rate fast
+
+<span class="cmt"># Transmission hash policy: layer2, layer2+3, layer3+4, encap2+3</span>
+ip link set bond0 type bond xmit_hash_policy layer3+4
+
+<span class="cmt"># Minimum aktif slave sayısı</span>
+ip link set bond0 type bond min_links 1
+
+<span class="cmt"># Slave ekle</span>
+ip link set eth0 down
+ip link set eth1 down
+ip link set eth0 master bond0
+ip link set eth1 master bond0
+ip link set bond0 up
+ip link set eth0 up
+ip link set eth1 up
+
+<span class="cmt"># LACP müzakere durumu</span>
+cat /proc/net/bonding/bond0 | grep -A2 "Slave Interface"</code></pre>
+  </div>
+
+  <h3>balance-rr (mod 0) ve balance-xor (mod 2)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># balance-rr: paket başına round-robin</span>
+ip link add name bond0 type bond mode balance-rr
+ip link set bond0 type bond miimon 100
+
+<span class="cmt"># balance-xor: hash ile belirli akışları belirli porta yönlendir</span>
+ip link add name bond0 type bond mode balance-xor
+ip link set bond0 type bond xmit_hash_policy layer3+4
+
+<span class="cmt"># Bonding istatistikleri</span>
+cat /proc/net/bonding/bond0
+
+<span class="cmt"># sysfs üzerinden parametreler</span>
+cat /sys/class/net/bond0/bonding/mode
+cat /sys/class/net/bond0/bonding/slaves
+cat /sys/class/net/bond0/bonding/active_slave
+cat /sys/class/net/bond0/bonding/miimon</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>active-backup (mod 1): yedeklilik, switch LACP gerektirmez — üretimde en güvenli</li>
+      <li>802.3ad (mod 4): LACP ile dinamik yük dengeleme — switch desteği zorunlu</li>
+      <li><code>miimon</code> ile link izleme ayarlanır; <code>/proc/net/bonding/bond0</code> tüm durumu gösterir</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> team sürücüsü — teamd ve runner'lar</h2>
+  <p class="section-lead">team sürücüsü, bonding'e alternatif bir yük dengeleme ve yedeklilik çözümüdür. Kullanıcı alanında <code>teamd</code> arka plan süreci JSON yapılandırmasıyla yönetilir.</p>
+
+  <h3>bonding ve team karşılaştırması</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Özellik</th><th>bonding</th><th>team</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Kernel modülü</td><td>bonding.ko</td><td>team.ko + team_mode_*.ko</td></tr>
+        <tr><td>Yapılandırma</td><td>sysfs / ip link</td><td>teamd JSON + teamdctl</td></tr>
+        <tr><td>Runner mantığı</td><td>Kernel içi</td><td>Kullanıcı alanı (teamd)</td></tr>
+        <tr><td>LACP uygulama</td><td>Kernel</td><td>teamd (daha esnek)</td></tr>
+        <tr><td>BPF/lwtunnel</td><td>Sınırlı</td><td>Daha esnek</td></tr>
+        <tr><td>Yaygınlık</td><td>Çok yaygın</td><td>Daha az, NetworkManager entegreli</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>teamd yapılandırması — activebackup</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>json</span><span class="dot">●</span></div>
+    <pre><code>{
+  "device": "team0",
+  "runner": {
+    "name": "activebackup",
+    "hwaddr_policy": "same_all"
+  },
+  "link_watch": {
+    "name": "ethtool",
+    "delay_up": 2500,
+    "delay_down": 1000
+  },
+  "ports": {
+    "eth0": {
+      "prio": 100,
+      "sticky": true
+    },
+    "eth1": {
+      "prio": 10
+    }
+  }
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># teamd başlat</span>
+teamd -d -f /etc/teamd/team0.conf -t team0
+
+<span class="cmt"># Durum izle</span>
+teamdctl team0 state
+
+<span class="cmt"># Aktif portu görüntüle</span>
+teamdctl team0 state item get runner.active_port
+
+<span class="cmt"># Aktif portu değiştir</span>
+teamdctl team0 port config update eth1 '{"prio": 200}'</code></pre>
+  </div>
+
+  <h3>teamd yapılandırması — LACP runner</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>json</span><span class="dot">●</span></div>
+    <pre><code>{
+  "device": "team0",
+  "runner": {
+    "name": "lacp",
+    "active": true,
+    "fast_rate": true,
+    "tx_hash": ["eth", "ipv4", "ipv6"],
+    "tx_balancer": {
+      "name": "basic"
+    }
+  },
+  "link_watch": {
+    "name": "ethtool"
+  },
+  "ports": {
+    "eth0": {},
+    "eth1": {}
+  }
+}</code></pre>
+  </div>
+
+  <h3>teamd yapılandırması — loadbalance runner</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>json</span><span class="dot">●</span></div>
+    <pre><code>{
+  "device": "team0",
+  "runner": {
+    "name": "loadbalance",
+    "tx_hash": ["eth", "ipv4", "ipv6", "tcp", "udp"],
+    "tx_balancer": {
+      "name": "basic",
+      "balancing_interval": 50
+    }
+  },
+  "ports": {
+    "eth0": {},
+    "eth1": {}
+  }
+}</code></pre>
+  </div>
+
+  <h3>link_watch türleri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">ethtool</span><span class="desc">Sürücü seviyesi link durumu — en hızlı, donanım IRQ tabanlı</span></div>
+    <div class="param"><span class="name">arp_ping</span><span class="desc">Belirli IP adresine ARP gönderir; yanıt yoksa bağlantı down sayılır</span></div>
+    <div class="param"><span class="name">nsna_ping</span><span class="desc">IPv6 Neighbor Solicitation ile link izleme</span></div>
+    <div class="param"><span class="name">tipc</span><span class="desc">TIPC protokolü ile cluster link izleme</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>teamd: JSON yapılandırmalı, kullanıcı alanı tabanlı link aggregation</li>
+      <li>runner: activebackup, lacp, loadbalance, roundrobin, broadcast, random</li>
+      <li>link_watch: ethtool (hızlı) veya arp_ping (uçtan uca bağlantı testi)</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> Embedded gateway örneği</h2>
+  <p class="section-lead">Gerçekçi bir embedded Linux gateway senaryosu: WAN arayüzü eth0, LAN switch portları eth1 + VLAN'lar, WLAN arayüzü wlan0 — hepsinin bridge ve VLAN ile entegrasyonu.</p>
+
+  <h3>Hedef topoloji</h3>
+
+  <div class="flow">
+    <pre>              İnternet
+                 │
+              eth0 (WAN)
+                 │
+         ┌───────┴───────┐
+         │  Linux Router  │
+         │               │
+    ┌────┴───────────────┴────┐
+    │         br-lan          │  ← VLAN aware bridge
+    │  eth1.10  eth1.20  wlan0│
+    └────────────────────────-┘
+         │          │
+      LAN VLAN10  GUEST VLAN20
+     192.168.10.0 192.168.20.0</pre>
+  </div>
+
+  <h3>Yapılandırma scripti</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">#!/bin/sh</span>
+<span class="cmt"># embedded-gateway-setup.sh</span>
+<span class="cmt"># WAN + LAN (VLAN10) + Guest (VLAN20) + WLAN bridge</span>
+
+<span class="cmt">### 1. Modüller ###</span>
+modprobe 8021q
+modprobe bridge
+
+<span class="cmt">### 2. Arayüzleri hazırla ###</span>
+ip link set eth0 up      <span class="cmt"># WAN</span>
+ip link set eth1 up      <span class="cmt"># Switch uplink</span>
+ip link set wlan0 up     <span class="cmt"># Wi-Fi (hostapd tarafından yönetilir)</span>
+
+<span class="cmt">### 3. VLAN arayüzleri ###</span>
+ip link add link eth1 name eth1.10 type vlan id 10
+ip link add link eth1 name eth1.20 type vlan id 20
+ip link set eth1.10 up
+ip link set eth1.20 up
+
+<span class="cmt">### 4. LAN bridge — VLAN 10 ###</span>
+ip link add name br-lan type bridge vlan_filtering 0
+ip link set br-lan up
+ip link set eth1.10 master br-lan
+ip link set wlan0   master br-lan
+ip addr add 192.168.10.1/24 dev br-lan
+
+<span class="cmt">### 5. Guest bridge — VLAN 20 (izole) ###</span>
+ip link add name br-guest type bridge vlan_filtering 0
+ip link set br-guest up
+ip link set eth1.20 master br-guest
+ip addr add 192.168.20.1/24 dev br-guest
+
+<span class="cmt">### 6. WAN IP (DHCP client) ###</span>
+udhcpc -i eth0 -b -p /var/run/udhcpc.eth0.pid
+
+<span class="cmt">### 7. NAT ve IP yönlendirme ###</span>
+echo 1 &gt; /proc/sys/net/ipv4/ip_forward
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+iptables -A FORWARD -i br-lan   -o eth0 -j ACCEPT
+iptables -A FORWARD -i br-guest -o eth0 -j ACCEPT
+<span class="cmt"># LAN - Guest arası erişimi engelle</span>
+iptables -A FORWARD -i br-guest -o br-lan   -j DROP
+iptables -A FORWARD -i br-lan   -o br-guest -j DROP
+
+<span class="cmt">### 8. DHCP sunucusu ###</span>
+<span class="cmt"># /etc/dnsmasq.conf içeriği:</span>
+<span class="cmt"># interface=br-lan</span>
+<span class="cmt"># dhcp-range=192.168.10.100,192.168.10.200,12h</span>
+<span class="cmt"># interface=br-guest</span>
+<span class="cmt"># dhcp-range=192.168.20.100,192.168.20.200,12h</span>
+dnsmasq --conf-file=/etc/dnsmasq.conf</code></pre>
+  </div>
+
+  <h3>Daha gelişmiş — tek bridge VLAN aware ile</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tek VLAN aware bridge ile aynı yapı</span>
+ip link add name br0 type bridge vlan_filtering 1
+ip link set br0 up
+
+<span class="cmt"># eth1 trunk — her iki VLAN tagged</span>
+ip link set eth1 master br0
+bridge vlan add dev eth1 vid 10
+bridge vlan add dev eth1 vid 20
+bridge vlan del dev eth1 vid 1
+
+<span class="cmt"># wlan0 LAN VLAN10, untagged erişim</span>
+ip link set wlan0 master br0
+bridge vlan add dev wlan0 vid 10 pvid untagged
+bridge vlan del dev wlan0 vid 1
+
+<span class="cmt"># CPU — her iki VLAN</span>
+bridge vlan add dev br0 vid 10 self
+bridge vlan add dev br0 vid 20 self
+bridge vlan del dev br0 vid 1 self
+
+<span class="cmt"># VLAN arayüzleri ile yönetim</span>
+ip link add link br0 name br0.10 type vlan id 10
+ip link add link br0 name br0.20 type vlan id 20
+ip link set br0.10 up
+ip link set br0.20 up
+ip addr add 192.168.10.1/24 dev br0.10
+ip addr add 192.168.20.1/24 dev br0.20</code></pre>
+  </div>
+
+  <h3>Kalıcı yapılandırma — systemd-networkd</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>ini</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># /etc/systemd/network/10-eth1.network</span>
+[Match]
+Name=eth1
+
+[Network]
+Bridge=br-lan
+VLAN=eth1.10
+VLAN=eth1.20</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>ini</span><span class="dot">●</span></div>
+    <pre><code"><span class="cmt"># /etc/systemd/network/20-br-lan.netdev</span>
+[NetDev]
+Name=br-lan
+Kind=bridge
+
+[Bridge]
+VLANFiltering=yes
+STP=yes</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>VLAN arayüzleri (eth1.10, eth1.20) ile LAN/Guest segmentasyonu</li>
+      <li>iptables MASQUERADE + ip_forward ile NAT tabanlı gateway</li>
+      <li>Guest VLAN ile LAN arası izolasyon DROP kuralıyla sağlanır</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Hata ayıklama</h2>
+  <p class="section-lead">L2 ağ sorunlarını teşhis etmek için bridge araçları, ip komutu ve kernel izleme mekanizmaları sistematik biçimde kullanılır.</p>
+
+  <h3>bridge araçlarıyla kapsamlı inceleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm bridge'ler</span>
+bridge link show
+
+<span class="cmt"># FDB — MAC öğrenme tablosu</span>
+bridge fdb show
+bridge fdb show br br0
+bridge fdb show dev eth0
+
+<span class="cmt"># VLAN üyeliği</span>
+bridge vlan show
+bridge vlan show dev eth0
+
+<span class="cmt"># MDB — multicast üyelik</span>
+bridge mdb show
+bridge mdb show dev br0
+
+<span class="cmt"># STP durumu</span>
+bridge link show | grep -E "state|cost"</code></pre>
+  </div>
+
+  <h3>ip -d link show — ayrıntılı arayüz bilgisi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Tüm arayüzlerin ayrıntılı çıktısı</span>
+ip -d link show
+
+<span class="cmt"># Bridge arayüzleri</span>
+ip -d link show type bridge
+
+<span class="cmt"># VLAN arayüzleri</span>
+ip -d link show type vlan
+
+<span class="cmt"># Bond arayüzleri</span>
+ip -d link show type bond
+
+<span class="cmt"># macvlan</span>
+ip -d link show type macvlan
+
+<span class="cmt"># Belirli bridge üyelerinin durumu</span>
+ip -d link show master br0</code></pre>
+  </div>
+
+  <h3>Bonding durumu ve istatistikleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Bonding genel durumu</span>
+cat /proc/net/bonding/bond0
+
+<span class="cmt"># Aktif slave</span>
+cat /sys/class/net/bond0/bonding/active_slave
+
+<span class="cmt"># Tüm slave'ler</span>
+cat /sys/class/net/bond0/bonding/slaves
+
+<span class="cmt"># LACP PDU istatistikleri</span>
+cat /proc/net/bonding/bond0 | grep -A4 "LACP"
+
+<span class="cmt"># ethtool ile slave port istatistikleri</span>
+ethtool -S eth0
+ethtool -S eth1
+
+<span class="cmt"># Link durumu izleme</span>
+watch -n1 "cat /proc/net/bonding/bond0 | grep -E 'Currently|MII'"</code></pre>
+  </div>
+
+  <h3>ss ve ip neigh ile L2/L3 tablo</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ARP tablosu</span>
+ip neigh show
+ip neigh show dev br0
+
+<span class="cmt"># ARP girdisi ekle (statik)</span>
+ip neigh add 192.168.10.5 lladdr 00:aa:bb:cc:dd:ee dev br0
+
+<span class="cmt"># Belirli interface trafiğini yakala</span>
+tcpdump -i br0 -n -e   <span class="cmt"># -e: L2 başlıkları göster</span>
+tcpdump -i br0 arp     <span class="cmt"># sadece ARP</span>
+tcpdump -i eth1 vlan   <span class="cmt"># sadece VLAN etiketli çerçeveler</span>
+
+<span class="cmt"># Aktif bağlantılar ve socket</span>
+ss -tuln</code></pre>
+  </div>
+
+  <h3>Yaygın sorunlar ve çözümleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Belirti</th><th>Olası Neden</th><th>Çözüm</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Bridge portlar arası trafik yok</td><td>Port down veya STP blocking</td><td><code>ip link show master br0</code> ile port durumu kontrol</td></tr>
+        <tr><td>VLAN trafiği geçmiyor</td><td>PVID eksik veya VLAN üyeliği yanlış</td><td><code>bridge vlan show</code> ile üyeliği doğrula</td></tr>
+        <tr><td>Bond failover çalışmıyor</td><td>miimon 0 veya sürücü link bildirmez</td><td>miimon 100 ayarla; <code>cat /proc/net/bonding/bond0</code></td></tr>
+        <tr><td>LACP müzakere yok</td><td>Switch LACP desteği yok veya port grubu yanlış</td><td>Switch tarafı konfigürasyonu doğrula</td></tr>
+        <tr><td>macvlan host ile iletişim kuramıyor</td><td>Loopback kısıtı — VEPA/PRIVATE modları</td><td>macvlan BRIDGE moduna geç veya sanal loopback ekle</td></tr>
+        <tr><td>ARP cevabı yok</td><td>proxy_arp veya ebtables bloğu</td><td><code>sysctl net.ipv4.conf.br0.proxy_arp</code> ve ebtables kuralları kontrol</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>ebtables — L2 filtreleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Mevcut ebtables kuralları</span>
+ebtables -L --Lmac2
+
+<span class="cmt"># Belirli MAC adresini bridge'de engelle</span>
+ebtables -A FORWARD -s 00:11:22:33:44:55 -j DROP
+
+<span class="cmt"># Sadece ARP'a izin ver, diğerlerini engelle</span>
+ebtables -A FORWARD -p ARP -j ACCEPT
+ebtables -A FORWARD -j DROP
+
+<span class="cmt"># VLAN etiketli trafiği filtrele</span>
+ebtables -A FORWARD -p 802_1Q --vlan-id 20 -j DROP
+
+<span class="cmt"># ebtables kurallarını sıfırla</span>
+ebtables -F</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>bridge fdb/vlan/mdb show</code> — FDB, VLAN üyeliği, multicast tabloları</li>
+      <li><code>ip -d link show type bridge/vlan/bond</code> — arayüz türüne göre filtreleme</li>
+      <li><code>/proc/net/bonding/bond0</code> — bonding durum, aktif slave, LACP bilgisi</li>
+      <li>ebtables ile Katman 2'de MAC ve VLAN bazlı filtreleme yapılabilir</li>
+    </ul>
+  </div>
+</section>
+
+</main>

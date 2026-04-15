@@ -1,0 +1,655 @@
+---
+layout: tutorial
+title: "syzkaller — Linux Kernel Fuzzing"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>KERNEL GÜVENLİK</span>
+    <span>2026</span>
+  </div>
+  <h1>syzkaller<br><em>Linux Kernel Fuzzing</em></h1>
+  <p class="subtitle">Coverage-guided syscall fuzzer ile kernel güvenlik açıklarını bul — KCOV, KASAN, QEMU VM havuzu ve otomatik reproducer üretimi.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Kernel fuzzing neden önemli</a></li>
+    <li><a href="#s1">syzkaller mimarisi</a></li>
+    <li><a href="#s2">QEMU ile syzkaller kurulumu</a></li>
+    <li><a href="#s3">syz-manager yapılandırması</a></li>
+    <li><a href="#s4">Coverage-guided fuzzing</a></li>
+    <li><a href="#s5">Syscall tanımlama dili (syzlang)</a></li>
+    <li><a href="#s6">Crash triage</a></li>
+    <li><a href="#s7">Reproducer üretimi</a></li>
+    <li><a href="#s8">Gerçek CVE örnekleri ve gömülü sürücü fuzz</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> Kernel fuzzing neden önemli</h2>
+  <p class="section-lead">Linux kernel, kullanıcı alanından gelen her syscall'ı işler; hatalı bir sürücü tek bir syscall'la kernel panik üretebilir, ayrıcalık yükseltme sağlayabilir ya da bellek bozulmasına neden olabilir. Fuzzing, bu yüzeyi otomatik olarak tarar.</p>
+
+  <h3>Saldırı yüzeyi neden bu kadar geniş</h3>
+  <p>Linux kernel, yaklaşık 400 syscall ve binlerce ioctl koduyla kullanıcı alanına devasa bir arayüz sunar. Her ioctl handler, her read/write implementasyonu bir girdi ayrıştırma noktasıdır. Gömülü sistemlerde ise durum daha kritiktir: üçüncü taraf BSP sürücüleri genellikle minimum test görür.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Bellek bozulması</span><span class="desc">Buffer overflow, use-after-free, double-free — KASAN bu sınıfı dinamik olarak yakalar</span></div>
+    <div class="param"><span class="name">Tanımsız davranış</span><span class="desc">İşaret taşması, hizalama hatası, null pointer dereference — UBSAN tespit eder</span></div>
+    <div class="param"><span class="name">Yarış koşulları</span><span class="desc">Eş zamanlı syscall çiftleriyle tetiklenen data race — KCSAN ile izlenir</span></div>
+    <div class="param"><span class="name">Kaynak sızıntısı</span><span class="desc">fd, memory, lock sızıntıları — kmemleak entegrasyonu mevcut</span></div>
+    <div class="param"><span class="name">Ayrıcalık yükseltme</span><span class="desc">Unprivileged sürecin kernel belleğini yazması — güvenlik araştırmasının odak noktası</span></div>
+  </div>
+
+  <h3>Manuel test neden yetersiz kalır</h3>
+  <p>Kernel sürücü testleri genellikle "mutlu yol" senaryolarını kapsar. Aşırı büyük uzunluk değerleri, NULL göstericiler, eş zamanlı kapatma ile okuma gibi kenar durumları elle yazılmış testlerle nadiren kapsanır. Fuzzing, milyarlarca rastgele ama yapısal olarak geçerli giriş kombinasyonunu otomatik dener.</p>
+
+  <h3>Tarihsel başarılar</h3>
+  <p>syzkaller 2016'dan bu yana 5000'den fazla kernel hatasını ortaya çıkarmıştır. Bunların büyük bölümü CVE numarası almış, kritik güvenlik yamalarına yol açmıştır. BlueZ, net subsystem, btrfs ve V4L2 sürücülerinde çok sayıda yüksek önem dereceli güvenlik açığı syzkaller tarafından keşfedilmiştir.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Fuzzer</th><th>Yaklaşım</th><th>Kernel Uyumu</th><th>Coverage</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>syzkaller</td><td>Coverage-guided, syscall-aware</td><td>Linux, FreeBSD, NetBSD, Fuchsia</td><td>KCOV bitmap</td></tr>
+        <tr><td>Trinity</td><td>Rastgele syscall, tip farkındalığı yok</td><td>Yalnızca Linux</td><td>Yok</td></tr>
+        <tr><td>AFL++ (kernel modu)</td><td>Mutasyon bazlı, user-space odaklı</td><td>Sınırlı</td><td>lcov</td></tr>
+        <tr><td>kAFL</td><td>Hypervisor tabanlı, donanım PT</td><td>Linux, Windows</td><td>Intel PT</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> syzkaller mimarisi</h2>
+  <p class="section-lead">syzkaller üç ana bileşenden oluşur: merkezi koordinatör syz-manager, her VM'de çalışan syz-fuzzer ve syscall'ları doğrudan çalıştıran syz-executor.</p>
+
+  <div class="flow">
+    <pre>
+  ┌─────────────────────────────────────────────────────────┐
+  │                    HOST MAKİNE                          │
+  │  ┌──────────────┐      ┌───────────────────────────┐   │
+  │  │  syz-manager │─────▶│   HTTP Dashboard :56741   │   │
+  │  │  (koordinatör)│     │   crash/, corpus/ dizini  │   │
+  │  └──────┬───────┘      └───────────────────────────┘   │
+  │         │  SSH / gRPC                                   │
+  │  ┌──────▼───────────────────────────┐                  │
+  │  │   QEMU VM Havuzu (N instance)    │                  │
+  │  │  ┌───────────┐  ┌───────────┐   │                  │
+  │  │  │syz-fuzzer │  │syz-fuzzer │   │                  │
+  │  │  │    +      │  │    +      │   │                  │
+  │  │  │syz-executor│ │syz-executor│  │                  │
+  │  │  └───────────┘  └───────────┘   │                  │
+  │  └──────────────────────────────────┘                  │
+  └─────────────────────────────────────────────────────────┘
+    </pre>
+  </div>
+
+  <h3>syz-manager</h3>
+  <p>Tüm fuzzing oturumunu yönetir. VM'leri başlatır ve izler; crash tespit ettiğinde VM'i durdurur, crash log'unu kaydeder ve reproducer üretme sürecini başlatır. HTTP üzerinden canlı durum paneli sunar.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">corpus yönetimi</span><span class="desc">Coverage artıran programları corpus'a ekler, küçültür, döndürür</span></div>
+    <div class="param"><span class="name">VM havuzu</span><span class="desc">Yapılandırmadaki count kadar QEMU instance ayağa kaldırır, crash'te yeniden oluşturur</span></div>
+    <div class="param"><span class="name">Triage</span><span class="desc">Aynı crash'i tekrar test ederek gürültüyü filtreler, unique başlıkla gruplar</span></div>
+    <div class="param"><span class="name">Bisect</span><span class="desc">git bisect entegrasyonuyla hangi commit'in hatayı getirdiğini otomatik bulur</span></div>
+  </div>
+
+  <h3>syz-fuzzer</h3>
+  <p>Her VM içinde çalışır. syz-manager'dan syscall programları alır, mutasyona uğratır ve syz-executor aracılığıyla çalıştırır. KCOV'dan gelen coverage bilgisini okuyarak hangi mutasyonların yeni dal kapsama açtığını ölçer.</p>
+
+  <h3>syz-executor</h3>
+  <p>Minimal C programı; gerçek syscall'ları çalıştırır. Güvenlik için ayrı bir süreç olarak fork'lanır. Sandboxing (CLONE_NEWUSER, CLONE_NEWNET) ile izole edilmiş ortamda çalışabilir. syz-fuzzer ile shared memory üzerinden iletişim kurar.</p>
+
+  <h3>İletişim protokolü</h3>
+  <p>syz-manager ile syz-fuzzer arasındaki iletişim RPC tabanlıdır. syz-fuzzer, TCP üzerinden syz-manager'a bağlanır; yeni programlar, coverage deltas ve crash raporları bu kanal üzerinden iletilir.</p>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> QEMU ile syzkaller kurulumu</h2>
+  <p class="section-lead">syzkaller'ın çalışması için KCOV ve KASAN etkin bir kernel, Debian tabanlı minimal bir VM imajı ve Go ile derlenmiş syzkaller binary'leri gerekir.</p>
+
+  <h3>Adım 1 — Go ve syzkaller derleme</h3>
+  <pre><code># Go kurulumu (1.21+)
+wget https://go.dev/dl/go1.21.5.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf go1.21.5.linux-amd64.tar.gz
+export PATH=$PATH:/usr/local/go/bin
+
+# syzkaller kaynak kodu
+git clone https://github.com/google/syzkaller.git
+cd syzkaller
+make -j$(nproc)
+# Üretilen binary'ler: bin/ altında
+ls bin/
+# syz-manager  syz-fuzzer  syz-executor  syz-repro  syz-db ...</code></pre>
+
+  <h3>Adım 2 — Kernel yapılandırması</h3>
+  <p>Fuzzing kernel'i için minimum gereken CONFIG seçenekleri:</p>
+
+  <pre><code># .config minimum fuzzing seçenekleri
+CONFIG_KCOV=y                    # Coverage toplama — zorunlu
+CONFIG_KCOV_INSTRUMENT_ALL=y     # Tüm alt sistemleri enstrümante et
+CONFIG_DEBUG_FS=y                # /sys/kernel/debug/kcov için
+
+CONFIG_KASAN=y                   # Kernel Address Sanitizer
+CONFIG_KASAN_INLINE=y            # Satır içi enstrümanasyon (hız için)
+CONFIG_UBSAN=y                   # Undefined Behavior Sanitizer
+CONFIG_UBSAN_TRAP=n              # Raporla ama durdurma
+CONFIG_FAULT_INJECTION=y
+CONFIG_FAULT_INJECTION_DEBUG_FS=y
+CONFIG_FAILSLAB=y
+CONFIG_FAIL_PAGE_ALLOC=y
+CONFIG_FAIL_FUTEX=y
+
+CONFIG_NAMESPACES=y
+CONFIG_UTS_NS=y
+CONFIG_IPC_NS=y
+CONFIG_PID_NS=y
+CONFIG_NET_NS=y
+CONFIG_USER_NS=y                 # Unprivileged fuzzing için
+
+CONFIG_DEBUG_KMEMLEAK=y
+CONFIG_DEBUG_INFO_DWARF4=y      # debuginfo — reproducer için
+CONFIG_RANDOMIZE_BASE=n         # KASLR kapalı — stable crash addr için
+CONFIG_LOCKDEP=y
+CONFIG_PROVE_LOCKING=y</code></pre>
+
+  <pre><code># Kernel derleme (x86_64 hedef)
+make defconfig
+scripts/config --enable KCOV --enable KASAN --enable UBSAN \
+               --enable NAMESPACES --enable USER_NS
+make -j$(nproc) 2&gt;&amp;1 | tee build.log
+ls arch/x86/boot/bzImage</code></pre>
+
+  <h3>Adım 3 — Debian VM imajı oluşturma</h3>
+  <pre><code># syzkaller'ın create-image.sh scripti
+cd syzkaller
+sudo apt-get install debootstrap
+./tools/create-image.sh -d bullseye -s 4096
+
+# Üretilen dosyalar:
+# bullseye.img      — ext4 disk imajı
+# bullseye.id_rsa   — SSH anahtarı
+
+# Manuel test: QEMU ile boot
+qemu-system-x86_64 \
+  -kernel /path/to/linux/arch/x86/boot/bzImage \
+  -drive file=bullseye.img,format=raw \
+  -append "root=/dev/sda rw console=ttyS0 earlyprintk=serial" \
+  -net nic,model=e1000 -net user,host=10.0.2.10,hostfwd=tcp::10022-:22 \
+  -nographic -m 2G</code></pre>
+
+  <h3>Adım 4 — SSH bağlantısını doğrula</h3>
+  <pre><code>ssh -i bullseye.id_rsa -p 10022 -o StrictHostKeyChecking=no root@localhost
+# KCOV kontrolü
+ls /sys/kernel/debug/kcov  # dosya mevcutsa kernel hazır</code></pre>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> syz-manager yapılandırması</h2>
+  <p class="section-lead">syz-manager, JSON formatında bir yapılandırma dosyası okur. Bu dosya VM türünü, kernel yolunu, SSH bilgilerini ve hangi syscall'ların fuzz edileceğini belirler.</p>
+
+  <h3>Temel config.cfg</h3>
+  <pre><code>{
+  "target": "linux/amd64",
+  "http": "127.0.0.1:56741",
+  "workdir": "/home/user/syzkaller-workdir",
+  "kernel_obj": "/home/user/linux",
+  "kernel_src": "/home/user/linux",
+  "image": "/home/user/syzkaller/bullseye.img",
+  "sshkey": "/home/user/syzkaller/bullseye.id_rsa",
+  "syzkaller": "/home/user/syzkaller",
+  "procs": 8,
+  "type": "qemu",
+  "vm": {
+    "count": 4,
+    "kernel": "/home/user/linux/arch/x86/boot/bzImage",
+    "cpu": 2,
+    "mem": 2048
+  }
+}</code></pre>
+
+  <h3>Gelişmiş yapılandırma parametreleri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">target</span><span class="desc">Hedef OS ve mimari: linux/amd64, linux/arm64, linux/riscv64, freebsd/amd64</span></div>
+    <div class="param"><span class="name">procs</span><span class="desc">Her VM'de eş zamanlı çalışan fuzzer işlemi sayısı; CPU çekirdeğiyle orantılı tut</span></div>
+    <div class="param"><span class="name">enable_syscalls</span><span class="desc">Fuzz edilecek syscall listesi; boş bırakılırsa tümü denenir</span></div>
+    <div class="param"><span class="name">disable_syscalls</span><span class="desc">Gürültülü veya VM'i donduran syscall'ları dışla</span></div>
+    <div class="param"><span class="name">sandbox</span><span class="desc">none / setuid / namespace / android; namespace önerilir</span></div>
+    <div class="param"><span class="name">cover</span><span class="desc">true — KCOV coverage toplama aktif; false — kör fuzzing modu</span></div>
+    <div class="param"><span class="name">reproduce</span><span class="desc">true — crash tespit edilince otomatik reproducer üretimi başlat</span></div>
+    <div class="param"><span class="name">hub_addr</span><span class="desc">Birden fazla syz-manager makinesini birleştiren hub servisi adresi</span></div>
+  </div>
+
+  <h3>Belirli syscall kümesiyle hedefli fuzzing</h3>
+  <pre><code>{
+  "enable_syscalls": [
+    "socket$nl_generic",
+    "sendmsg$nl_generic",
+    "bind$nl_generic",
+    "ioctl$sock",
+    "setsockopt$sock_int"
+  ],
+  "sandbox": "namespace",
+  "cover": true,
+  "reproduce": true,
+  "crash_retry_count": 3
+}</code></pre>
+
+  <h3>syz-manager başlatma ve dashboard</h3>
+  <pre><code># Fuzzing başlat
+./bin/syz-manager -config config.cfg
+
+# HTTP dashboard
+# http://127.0.0.1:56741
+# Gösterilen bilgiler:
+#   corpus boyutu, coverage bitmap doluluk oranı,
+#   crash sayısı, her VM'in durumu, çalıştırılan program/sn</code></pre>
+
+  <h3>Workdir yapısı</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Dizin / Dosya</th><th>İçerik</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>workdir/corpus/</td><td>Coverage artıran syscall programları (syz formatı)</td></tr>
+        <tr><td>workdir/crashes/</td><td>Her benzersiz crash için alt dizin; log, report, repro</td></tr>
+        <tr><td>workdir/coverage/</td><td>HTML coverage raporları</td></tr>
+        <tr><td>workdir/syz-manager.log</td><td>Koordinatör log dosyası</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> Coverage-guided fuzzing</h2>
+  <p class="section-lead">syzkaller'ı diğer fuzzers'tan ayıran temel özellik, KCOV enstrümantasyonundan gelen dallanma coverage bilgisini kullanarak corpus evrimini yönlendirmesidir.</p>
+
+  <h3>KCOV nasıl çalışır</h3>
+  <p>KCOV, Linux kernel'e GCC/LLVM enstrümantasyon geçişiyle eklenir. Her temel blok başında kernel, coverage array'indeki sayacı artırır. Kullanıcı alanı bu diziyi <code>/sys/kernel/debug/kcov</code> üzerinden mmap ile okur.</p>
+
+  <pre><code>/* Basit KCOV kullanım örneği (C) */
+#include &lt;stdio.h&gt;
+#include &lt;stddef.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;sys/ioctl.h&gt;
+
+#define KCOV_INIT_TRACE     _IOR('c', 1, unsigned long)
+#define KCOV_ENABLE         _IO('c', 100)
+#define KCOV_DISABLE        _IO('c', 101)
+#define COVER_SIZE          (64 * 1024)
+
+int main(void) {
+    int fd = open("/sys/kernel/debug/kcov", O_RDWR);
+    ioctl(fd, KCOV_INIT_TRACE, COVER_SIZE);
+    uint64_t *cover = mmap(NULL, COVER_SIZE * sizeof(uint64_t),
+                           PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    ioctl(fd, KCOV_ENABLE, 0);
+
+    /* İzlemek istediğimiz syscall */
+    read(0, NULL, 0);
+
+    ioctl(fd, KCOV_DISABLE, 0);
+
+    uint64_t count = cover[0];
+    printf("Kapsanan adres sayisi: %lu\n", count);
+    for (uint64_t i = 0; i &lt; count; i++)
+        printf("  0x%lx\n", cover[i + 1]);
+    return 0;
+}</code></pre>
+
+  <h3>Coverage bitmap ve corpus seçimi</h3>
+  <p>syz-fuzzer her programı çalıştırdıktan sonra yeni keşfedilen PC adreslerini bitmap'te işaretler. Daha önce görülmemiş adresler içeren bir program "ilginç" sayılır ve corpus'a eklenir. Bu evrimsel yaklaşım, fuzzer'ın derinlere inen kod yollarını keşfetmesini sağlar.</p>
+
+  <div class="flow">
+    <pre>
+  Başlangıç corpus (minimal programlar)
+           │
+           ▼
+  Program seç ──▶ Mutasyon uygula ──▶ VM'de çalıştır
+           ▲                               │
+           │                               ▼
+  Corpus'a ekle ◀── Yeni coverage var mı? ─── Hayır ──▶ Atla
+           │              (KCOV bitmap)
+           │ Evet
+           ▼
+  Crash var mı? ──▶ Evet ──▶ Crash kaydı + triage
+    </pre>
+  </div>
+
+  <h3>Mutasyon stratejileri</h3>
+  <div class="params">
+    <div class="param"><span class="name">Argüman mutasyonu</span><span class="desc">Syscall argümanlarını tip bilgisine göre rastgele değiştirir; fd, pointer, flag, boyut</span></div>
+    <div class="param"><span class="name">Program splice</span><span class="desc">İki corpus programını birleştirerek yeni program oluşturur</span></div>
+    <div class="param"><span class="name">Syscall ekleme/çıkarma</span><span class="desc">Programa yeni syscall ekler veya mevcut olanı kaldırır</span></div>
+    <div class="param"><span class="name">Bağımlılık çıkarımı</span><span class="desc">socket() dönüşü bir sonraki send()'e argüman olarak verilir — syzlang bağımlılık grafı</span></div>
+  </div>
+
+  <h3>Comparisons coverage (KCOV_MODE_TRACE_CMP)</h3>
+  <pre><code># syz-manager config'e ekle
+"cover": true,
+"cover_filter_bitmap": "",
+"enable_cgroups": false</code></pre>
+  <p>KCOV_MODE_TRACE_CMP modu, karşılaştırma operandlarını da kaydeder. Bu özellik sihirli sayı karşılaştırmalarını (örn. <code>if (magic == 0xDEADBEEF)</code>) geçmek için gereken değerleri fuzzer'a sağlar.</p>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> Syscall tanımlama dili (syzlang)</h2>
+  <p class="section-lead">syzlang, syscall imzalarını, argüman tiplerini ve aralarındaki bağımlılıkları tanımlayan syzkaller'a özgü bir DSL'dir. Doğru tanımlar daha yüksek kaliteli fuzzing programları üretir.</p>
+
+  <h3>Temel sözdizimi</h3>
+  <pre><code># sys/linux/socket.txt içinden örnek
+socket(domain flags[socket_domain], type flags[socket_type], proto int32) sock
+bind(fd sock, addr ptr[in, sockaddr], addrlen len[addr]) (fails)
+connect(fd sock, addr ptr[in, sockaddr], addrlen len[addr]) (fails)
+sendmsg(fd sock, msg ptr[in, msghdr], f flags[send_flags]) (fails)
+recvmsg(fd sock, msg ptr[out, msghdr], f flags[recv_flags]) (fails)
+
+socket_domain = AF_UNIX, AF_INET, AF_INET6, AF_NETLINK, AF_PACKET
+socket_type   = SOCK_STREAM, SOCK_DGRAM, SOCK_RAW, SOCK_NONBLOCK, SOCK_CLOEXEC</code></pre>
+
+  <h3>Tip sistemi</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Tip</th><th>Açıklama</th><th>Örnek</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>int8, int16, int32, int64</td><td>Tam sayı; işaretli veya işaretsiz</td><td>int32[0:255]</td></tr>
+        <tr><td>flags</td><td>Sabit listesinden biri</td><td>flags[socket_type]</td></tr>
+        <tr><td>ptr[in, T]</td><td>T tipine girdi göstericisi</td><td>ptr[in, ifreq]</td></tr>
+        <tr><td>ptr[out, T]</td><td>T tipine çıktı göstericisi</td><td>ptr[out, stat]</td></tr>
+        <tr><td>len[field]</td><td>field boyutunu otomatik hesapla</td><td>len[buf]</td></tr>
+        <tr><td>bytesize[field]</td><td>bayt cinsinden boyut</td><td>bytesize[data]</td></tr>
+        <tr><td>array[T, N]</td><td>N elemanlı dizi</td><td>array[int8, 16]</td></tr>
+        <tr><td>string</td><td>Null-terminated C string</td><td>string[filename]</td></tr>
+        <tr><td>sock</td><td>Socket fd kaynağı</td><td>fd sock</td></tr>
+        <tr><td>fd</td><td>Genel dosya tanımlayıcı</td><td>fd[opt]</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Özel ioctl tanımı — gömülü sürücü örneği</h3>
+  <pre><code># sys/linux/dev_my_sensor.txt
+# Varsayımsal /dev/mysensor sürücüsü için tanım
+
+include &lt;linux/ioctl.h&gt;
+include &lt;uapi/linux/mysensor.h&gt;
+
+# Sürücüye özel veri yapıları
+mysensor_config {
+  sample_rate  int32[1:1000]
+  gain         int32[0:7]
+  mode         flags[mysensor_mode]
+  reserved     array[int8, 4]
+}
+
+mysensor_data {
+  value  int32
+  status int16
+  flags  int16
+  ts_ns  int64
+}
+
+mysensor_mode = MYSENSOR_MODE_CONT, MYSENSOR_MODE_ONESHOT, MYSENSOR_MODE_SLEEP
+
+# ioctl tanımları
+ioctl$MYSENSOR_SET_CONFIG(fd fd_mysensor, cmd const[MYSENSOR_SET_CONFIG],
+                          arg ptr[in, mysensor_config])
+ioctl$MYSENSOR_GET_DATA(fd fd_mysensor, cmd const[MYSENSOR_GET_DATA],
+                        arg ptr[out, mysensor_data])
+ioctl$MYSENSOR_RESET(fd fd_mysensor, cmd const[MYSENSOR_RESET])
+
+# Fd kaynağı
+openat$mysensor(fd const[AT_FDCWD], file ptr[in, string["/dev/mysensor"]],
+                flags flags[open_flags], mode const[0]) fd_mysensor</code></pre>
+
+  <h3>Tanımı derleme ve doğrulama</h3>
+  <pre><code># Sözdizimi kontrolü
+go run ./tools/syz-check -input sys/linux/dev_my_sensor.txt
+
+# Yeni tanımları dahil ederek syzkaller yeniden derle
+make generate  # proto ve tanım dosyalarını günceller
+make -j$(nproc)</code></pre>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> Crash triage</h2>
+  <p class="section-lead">Fuzzing sırasında üretilen crash log'ları ham kernel çıktısı içerir. Triage süreci bu log'ları sınıflandırır, tekilleştirir ve önceliklendirir.</p>
+
+  <h3>Crash dizini yapısı</h3>
+  <pre><code>workdir/crashes/
+├── KASAN_use-after-free_in_skb_free_datagram/
+│   ├── description     # Kısa başlık
+│   ├── log0            # Ham kernel log (ilk oluşum)
+│   ├── report0         # Ayrıştırılmış crash raporu
+│   ├── repro.prog      # syz dili reproducer
+│   └── repro.cprog     # C reproducer (varsa)
+└── BUG_unable_to_handle_page_fault/
+    ├── description
+    ├── log0
+    └── report0</code></pre>
+
+  <h3>Kernel oops anatomisi</h3>
+  <pre><code>[ 1234.567890] BUG: KASAN: use-after-free in skb_free_datagram+0x45/0x80
+[ 1234.567891] Read of size 8 at addr ffff8881234abc00 by task syz-executor/1234
+[ 1234.567892]
+[ 1234.567893] CPU: 1 PID: 1234 Comm: syz-executor Not tainted 6.7.0-syzkaller #1
+[ 1234.567894] Call Trace:
+[ 1234.567895]  &lt;TASK&gt;
+[ 1234.567896]  dump_stack_lvl+0x4c/0x70
+[ 1234.567897]  print_report+0xd4/0x620
+[ 1234.567898]  kasan_report+0xb8/0x100
+[ 1234.567899]  skb_free_datagram+0x45/0x80
+[ 1234.567900]  unix_dgram_recvmsg+0x3c1/0xa80
+[ 1234.567901]  sock_recvmsg+0xc8/0x100
+[ 1234.567902]  __sys_recvmsg+0x1b4/0x360
+[ 1234.567903]  do_syscall_64+0x3c/0x80
+[ 1234.567904]  entry_SYSCALL_64_after_hwframe+0x46/0xb0</code></pre>
+
+  <h3>KASAN raporu yorumlama</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">use-after-free</span><span class="desc">Serbest bırakılmış belleğe erişim — en kritik sınıf, genellikle istismar edilebilir</span></div>
+    <div class="param"><span class="name">heap-buffer-overflow</span><span class="desc">Tahsis sınırı dışında yazma/okuma — kmalloc bölgesinde overflow</span></div>
+    <div class="param"><span class="name">stack-buffer-overflow</span><span class="desc">Yığıt değişkeninin sınırları dışına taşma</span></div>
+    <div class="param"><span class="name">global-out-of-bounds</span><span class="desc">Global değişken sınırı dışı erişim</span></div>
+    <div class="param"><span class="name">null-ptr-deref</span><span class="desc">NULL gösterici dereference — her zaman istismar edilemez ama daima düzeltilmeli</span></div>
+  </div>
+
+  <h3>UBSAN raporları</h3>
+  <pre><code>[ 5678.901234] UBSAN: signed-integer-overflow in drivers/net/ethernet/mydrv.c:234:15
+[ 5678.901235] -2147483648 - 1 cannot be represented in type 'int'
+[ 5678.901236] CPU: 0 PID: 5678 Comm: syz-executor
+[ 5678.901237] Call Trace:
+[ 5678.901238]  ubsan_epilogue+0x9/0x40
+[ 5678.901239]  handle_overflow+0xd2/0xe0
+[ 5678.901240]  mydrv_calculate_offset+0x78/0xa0</code></pre>
+
+  <h3>addr2line ile kaynak konumu bulma</h3>
+  <pre><code># Crash adresini kaynak satırına dönüştür
+addr2line -e vmlinux -i ffff8881234abc00
+# veya
+scripts/faddr2line vmlinux skb_free_datagram+0x45/0x80
+
+# Alternatif: decode_stacktrace.sh
+cat crash_log | scripts/decode_stacktrace.sh vmlinux</code></pre>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> Reproducer üretimi</h2>
+  <p class="section-lead">syzkaller bir crash tespit ettiğinde otomatik olarak minimal bir reproducer üretmeye çalışır — önce syz dilinde, ardından C dilinde. Bu reproducer, yamayı doğrulamak ve bisect yapmak için kullanılır.</p>
+
+  <h3>Otomatik reproducer üretimi</h3>
+  <p>syz-manager, reproduce=true olduğunda şu adımları izler:</p>
+
+  <div class="flow">
+    <pre>
+  Crash tespit edildi
+         │
+         ▼
+  Crash'e yol açan program corpus'ta mı?
+         │
+         ▼
+  Program minimize et (crash hâlâ tetikleniyor mu?)
+         │
+         ▼
+  Syscall sayısını azalt (ikili arama)
+         │
+         ▼
+  Bireysel argümanları minimize et
+         │
+         ▼
+  syz reproducer kaydet (repro.prog)
+         │
+         ▼
+  C reproducer üret (repro.cprog)
+    </pre>
+  </div>
+
+  <h3>syz-repro ile manuel reproducer</h3>
+  <pre><code># Mevcut crash log'undan reproducer üret
+./bin/syz-repro \
+  -config config.cfg \
+  -crash workdir/crashes/KASAN_use-after-free/log0
+
+# Belirli bir programı test et
+./bin/syz-repro \
+  -config config.cfg \
+  workdir/crashes/KASAN_use-after-free/repro.prog</code></pre>
+
+  <h3>Örnek syz reproducer</h3>
+  <pre><code># Üretilmiş minimal syz reproducer (repro.prog)
+r0 = socket$nl_generic(0x10, 0x3, 0x10)
+r1 = socket$nl_generic(0x10, 0x3, 0x10)
+sendmsg$nl_generic(r0, &amp;(0x7f0000000000)={
+  &amp;(0x7f0000000040)={0x1c, 0x20, 0x5, 0x0, 0x0,
+  {0x8, 0x1, 0x0, 0x0}}, 0x1, 0x0, 0x0, 0x0}, 0x0)
+close(r1)</code></pre>
+
+  <h3>C reproducer derleme ve çalıştırma</h3>
+  <pre><code># Üretilmiş C reproducer
+gcc -o repro repro.cprog -lpthread
+./repro
+# Çalıştırıldığında kernel crash yeniden tetiklenmeli</code></pre>
+
+  <h3>git bisect entegrasyonu</h3>
+  <pre><code># config.cfg'ye ekle
+"bisect_bin": "/home/user/syzkaller/bin/syz-bisect",
+"bisect_compilers": [{
+  "cc": "gcc",
+  "cxx": "g++"
+}]
+
+# Manuel bisect
+./bin/syz-bisect \
+  -config config.cfg \
+  -crash workdir/crashes/KASAN_use-after-free/
+
+# Çıktı: ilk hatalı commit SHA + yamayı kim yazdı</code></pre>
+
+  <div class="params">
+    <div class="param"><span class="name">-crash</span><span class="desc">Bisect edilecek crash dizini; repro.prog veya repro.cprog içermeli</span></div>
+    <div class="param"><span class="name">-kernel_src</span><span class="desc">Bisect yapılacak git reposunun yolu; config'den alınır</span></div>
+    <div class="param"><span class="name">-fix</span><span class="desc">İlk hatalı commit yerine düzeltici commit'i bul</span></div>
+  </div>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Gerçek CVE örnekleri ve gömülü sürücü fuzz</h2>
+  <p class="section-lead">syzkaller'ın keşfettiği gerçek güvenlik açıkları incelenerek hem aracın gücü hem de gömülü sürücülere uygulanabilirlik gösterilmektedir.</p>
+
+  <h3>CVE-2022-0435 — TIPC yığıt overflow</h3>
+  <p>syzkaller, TIPC (Transparent Inter-Process Communication) ağ protokolünde yığıt tabanlı buffer overflow keşfetti. Uzak saldırgan, özel hazırlanmış TIPC mesajıyla kernel yığıtını taşırarak ayrıcalık yükseltebiliyordu.</p>
+
+  <pre><code># syzkaller'ın ürettiği reproducer benzeri
+r0 = socket(0x1e, 0x2, 0x0)   # AF_TIPC, SOCK_DGRAM
+bind(r0, &amp;(0x7f0000000000)=@tipc={0x1e, 0x1, {0x1, 0x0, 0x0}, 0x0}, 0x10)
+sendto(r0, &amp;(0x7f0000000100)="oversized_payload...", 0x200, 0x0,
+       &amp;(0x7f0000000200)=@tipc={0x1e, 0x1, {0x1, 0x1, 0x0}, 0x0}, 0x10)</code></pre>
+
+  <h3>CVE-2021-3490 — eBPF verifier bypass</h3>
+  <p>eBPF verifier'da işaret aralığı takibindeki hata, sınır dışı bellek erişimine izin veriyordu. syzkaller, BPF syscall kombinasyonlarını fuzz ederken bu açığı ortaya çıkardı.</p>
+
+  <h3>Gömülü sürücü fuzz senaryosu: V4L2 kamera sürücüsü</h3>
+  <pre><code># sys/linux/dev_v4l2_custom.txt — BSP kamera sürücüsü için ek tanım
+include &lt;linux/videodev2.h&gt;
+
+# Özel format tanımları
+my_cam_fmt = V4L2_PIX_FMT_MJPEG, V4L2_PIX_FMT_H264, V4L2_PIX_FMT_YUYV
+
+v4l2_pix_format_custom {
+  width       int32[1:4096]
+  height      int32[1:4096]
+  pixelformat flags[my_cam_fmt]
+  field       int32[0:8]
+  bytesperline int32[0:16384]
+  sizeimage   int32[0:67108864]
+  colorspace  int32[0:12]
+  priv        const[0x00feca8349]  # V4L2_PIX_FMT_PRIV_MAGIC
+}
+
+ioctl$VIDIOC_S_FMT_custom(fd fd_video, cmd const[VIDIOC_S_FMT],
+  arg ptr[in, v4l2_format_custom])</code></pre>
+
+  <h3>ARM64 cross-fuzzing konfigürasyonu</h3>
+  <pre><code>># ARM64 fiziksel donanım veya QEMU için config
+{
+  "target": "linux/arm64",
+  "type": "qemu",
+  "vm": {
+    "count": 2,
+    "kernel": "/path/to/arm64/Image",
+    "cpu": 4,
+    "mem": 4096,
+    "machine": "virt",
+    "cpu_model": "cortex-a57"
+  },
+  "enable_syscalls": [
+    "ioctl$v4l2_camera",
+    "mmap",
+    "read",
+    "write"
+  ]
+}</code></pre>
+
+  <h3>Sürekli fuzzing CI/CD entegrasyonu</h3>
+  <pre><code>#!/bin/bash
+# ci-fuzz.sh — günlük 8 saatlik fuzzing oturumu
+TIMEOUT=28800  # 8 saat
+
+./bin/syz-manager -config config.cfg &amp;
+SYZ_PID=$!
+
+sleep $TIMEOUT
+kill $SYZ_PID
+
+# Yeni crash var mı kontrol et
+CRASH_COUNT=$(ls workdir/crashes/ 2&gt;/dev/null | wc -l)
+if [ "$CRASH_COUNT" -gt "0" ]; then
+  echo "UYARI: $CRASH_COUNT yeni crash tespit edildi" | \
+    mail -s "[syzkaller] Crash tespit edildi" ekip@sirket.com
+  exit 1
+fi
+echo "Fuzzing temiz tamamlandi"</code></pre>
+
+  <div class="params">
+    <div class="param"><span class="name">syzbot</span><span class="desc">Google'ın sürekli çalışan syzkaller altyapısı; kernel.org mainline ve stabil dalları sürekli fuzz eder</span></div>
+    <div class="param"><span class="name">Tanım katkısı</span><span class="desc">Yeni sürücü tanımları github.com/google/syzkaller/sys/linux/ altında pull request ile katkılanabilir</span></div>
+    <div class="param"><span class="name">Gömülü fayda</span><span class="desc">BSP sürücülerinin sevk öncesi fuzzlanması müşteri sahasında crash riskini önemli ölçüde azaltır</span></div>
+  </div>
+</section>
+
+</main>

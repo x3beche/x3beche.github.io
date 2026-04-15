@@ -1,0 +1,862 @@
+---
+layout: tutorial
+title: "VFIO — Sanal Fonksiyon I/O Çerçevesi"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span><span>GÖMÜLÜ LİNUX</span><span>VİRTÜELLEŞTİRME</span><span>2026</span>
+  </div>
+  <h1>VFIO<br><em>Sanal Fonksiyon I/O Çerçevesi</em></h1>
+  <p class="subtitle">VFIO ile donanım cihazlarını güvenli biçimde kullanıcı alanına veya sanal makinelere doğrudan geçirme, DMA güvenliği ve IOMMU entegrasyonu.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">VFIO Neden Gerekli?</a></li>
+    <li><a href="#s1">VFIO Mimarisi</a></li>
+    <li><a href="#s2">Cihaz Bağlama</a></li>
+    <li><a href="#s3">Kullanıcı Alanından DMA</a></li>
+    <li><a href="#s4">Kesme Yönetimi</a></li>
+    <li><a href="#s5">VFIO-platform</a></li>
+    <li><a href="#s6">DPDK ve VFIO</a></li>
+    <li><a href="#s7">QEMU/KVM ile Cihaz Geçişi</a></li>
+    <li><a href="#s8">Hata Ayıklama</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> VFIO Neden Gerekli?</h2>
+  <p class="section-lead">
+    VFIO (Virtual Function I/O), donanım cihazlarını çekirdek sürücüleri olmaksızın — ve güvenli biçimde — kullanıcı alanı uygulamalarına ya da sanal makinelere doğrudan erişilebilir kılan bir Linux kernel alt sistemidir.
+  </p>
+
+  <h3>UIO'nun Sınırları</h3>
+  <p>
+    UIO (Userspace I/O), donanım kayıtlarını <code>mmap()</code> ile kullanıcı alanına açar; ancak ciddi güvenlik açıkları taşır. DMA işlemlerini denetleme mekanizması yoktur: kötü niyetli ya da hatalı bir UIO kullanıcısı, DMA motoruna çekirdek belleğine işaret eden adresler yazabilir ve tüm sistem belleğini okuyup değiştirebilir. Bu, özellikle sanallaştırma ortamlarında kabul edilemez bir tehdittir.
+  </p>
+
+  <div class="params">
+    <div class="param"><span class="name">UIO</span><span class="desc">MMIO mmap var, DMA koruması yok, kesme destekli; güvenlik açığı taşır</span></div>
+    <div class="param"><span class="name">VFIO</span><span class="desc">IOMMU tabanlı DMA koruması, güvenli cihaz geçişi, tam sürücü soyutlaması</span></div>
+    <div class="param"><span class="name">vfio-pci</span><span class="desc">PCIe cihazlar için özelleştirilmiş VFIO backend sürücüsü</span></div>
+    <div class="param"><span class="name">vfio-platform</span><span class="desc">MMIO tabanlı platform (DT) cihazlar için VFIO backend</span></div>
+  </div>
+
+  <h3>DMA Güvenliği Sorunu</h3>
+  <p>
+    Kullanıcı alanındaki bir süreç, bir PCIe cihazına DMA adresi gönderebilir. IOMMU olmadan bu adres doğrudan fiziksel bellek adresidir ve cihaz herhangi bir bellek bölgesine erişebilir. IOMMU, cihazın gördüğü IOVA (I/O Virtual Address) ile fiziksel adres arasına bir çeviri tablosu koyar; böylece cihaz yalnızca kendisine ayrılan belleği görebilir.
+  </p>
+
+  <div class="flow"><pre>
+  IOMMU Olmadan:
+  Kullanıcı Alani -&gt; DMA adres yaz -&gt; PCIe Cihaz -&gt; RAM fiziksel adres
+                                                     (TUM BELLEGE ERISIM)
+
+  IOMMU Ile (VFIO):
+  Kullanıcı Alani -&gt; IOVA yaz -&gt; PCIe Cihaz -&gt; IOMMU -&gt; Izinli RAM bölgesi
+                                                         (SINIRLI ERISIM)
+  </pre></div>
+
+  <h3>SR-IOV ve Geçiş Motivasyonu</h3>
+  <p>
+    SR-IOV (Single Root I/O Virtualization) özellikli bir NIC veya FPGA, tek bir fiziksel fonksiyonu (PF) onlarca sanal fonksiyona (VF) bölebilir. VFIO, her VF'yi ayrı bir sanal makineye güvenle geçirir: VM, donanıma doğrudan erişir ve hipervisör kopyalama yüküne maruz kalmaz. Gömülü Linuxta ise VFIO kullanıcı alanı sürücüleri (DPDK, SPDK) için temel altyapıdır.
+  </p>
+
+  <h3>VFIO'nun Sunduğu Güvenceler</h3>
+  <p>
+    VFIO, aşağıdaki güvenlik özelliklerini bir arada sunar:
+  </p>
+  <ul>
+    <li>IOMMU korumalı DMA: Cihaz yalnızca haritalaması yapılmış belleğe erişebilir.</li>
+    <li>Cihaz izolasyonu: Bir gruptaki cihazlar diğer grupları göremez.</li>
+    <li>Kesme izolasyonu: Her kullanıcı alanı süreci yalnızca kendi cihazının kesmelerini alır.</li>
+    <li>Hata kapsama: Cihaz hatası yalnızca ilgili kullanıcı sürecini etkiler; sistemi çöküşe götürmez.</li>
+  </ul>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> VFIO Mimarisi</h2>
+  <p class="section-lead">
+    VFIO üç hiyerarşik nesne modeli üzerine kuruludur: konteyner (container), grup (group) ve cihaz (device). Bu modelin anlaşılması, VFIO kullanımının temelidir.
+  </p>
+
+  <div class="flow"><pre>
+  +--------------------------------------------------+
+  |               VFIO Container                     |
+  |  (tek IOMMU adresi uzayi -- /dev/vfio/vfio)      |
+  |                                                  |
+  |  +---------------+    +---------------+          |
+  |  |  VFIO Group   |    |  VFIO Group   |          |
+  |  |  /dev/vfio/0  |    |  /dev/vfio/1  |          |
+  |  |               |    |               |          |
+  |  |  +---------+  |    |  +---------+  |          |
+  |  |  |  Cihaz  |  |    |  |  Cihaz  |  |          |
+  |  |  |  (PCI)  |  |    |  |  (PCI)  |  |          |
+  |  |  +---------+  |    |  +---------+  |          |
+  |  +---------------+    +---------------+          |
+  +--------------------------------------------------+
+  </pre></div>
+
+  <h3>Container (Konteyner)</h3>
+  <p>
+    Konteyner, <code>/dev/vfio/vfio</code> aygıt dosyasıyla temsil edilir. Bir IOMMU adresi uzayını kapsar. Kullanıcı alanı uygulaması bu dosyayı açarak IOMMU türünü sorgular ve DMA haritalamaları oluşturur. Birden fazla grup aynı konteynere bağlanabilir; bu durumda hepsi aynı IOMMU adresi uzayını paylaşır.
+  </p>
+
+  <h3>Group (Grup)</h3>
+  <p>
+    Grup, IOMMU'nun izolasyon birimini temsil eder. Aynı IOMMU grubundaki tüm cihazlar birbirini görür (ACS — Access Control Services yoksa). Güvenli geçiş için bir gruptaki tüm cihazların VFIO'ya bağlanmış olması gerekir. Gruplar <code>/dev/vfio/N</code> dosyaları olarak görünür.
+  </p>
+
+  <h3>Device (Cihaz)</h3>
+  <p>
+    Cihaz nesnesi, PCI konfigürasyon alanı okuma/yazma, MMIO bölgelerinin mmap'i ve kesme yapılandırması işlemlerini ioctl arayüzü ile sunar. Bir kullanıcı alanı sürücüsü, cihaz nesnesi aracılığıyla donanıma sanki çekirdek sürücüsüymüş gibi erişir.
+  </p>
+
+  <h3>IOMMU Domain Bağlaması</h3>
+  <p>
+    Bir grup konteynere bağlandığında, VFIO o gruba ait cihazları kernel'in IOMMU sürücüsü aracılığıyla konteyner IOMMU domain'ine atar. Artık DMA haritalamaları (<code>VFIO_IOMMU_MAP_DMA</code> ioctl) fiziksel bellekle IOVA arasında birebir eşlemeler oluşturur.
+  </p>
+
+<pre><code>/* VFIO acilis sirasi */
+int container = open("/dev/vfio/vfio", O_RDWR);
+int group     = open("/dev/vfio/42",   O_RDWR);
+
+/* Grubu konteynere bagla */
+ioctl(group, VFIO_GROUP_SET_CONTAINER, &container);
+
+/* IOMMU turunu etkinlestir */
+ioctl(container, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU);
+
+/* Cihaz taniticisi al */
+int device = ioctl(group, VFIO_GROUP_GET_DEVICE_FD, "0000:03:00.0");
+</code></pre>
+
+  <h3>IOMMU Türleri</h3>
+
+  <div class="file-table"><table>
+    <tr><th>IOMMU Türü</th><th>Açıklama</th><th>Platform</th></tr>
+    <tr><td>VFIO_TYPE1_IOMMU</td><td>Temel IOVA çeviri, pinned pages</td><td>x86 Intel VT-d / AMD-Vi</td></tr>
+    <tr><td>VFIO_TYPE1v2_IOMMU</td><td>MAP sırasında sayfa pinleme + dirty tracking</td><td>x86 gelişmiş</td></tr>
+    <tr><td>VFIO_ARM_SMMU_V3_IOMMU</td><td>ARM SMMUv3 doğrudan destek</td><td>ARM64 SoC</td></tr>
+    <tr><td>VFIO_NOIOMMU_IOMMU</td><td>IOMMU koruması YOK; yalnızca test için</td><td>Tüm platformlar</td></tr>
+  </table></div>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> Cihaz Bağlama</h2>
+  <p class="section-lead">
+    Bir PCIe cihazını VFIO'ya bağlamak için önce mevcut çekirdek sürücüsünü ayırmak (unbind), ardından cihazı vfio-pci sürücüsüne bağlamak (bind) gerekir.
+  </p>
+
+  <h3>Gerekli Çekirdek Modülleri</h3>
+
+<pre><code># IOMMU desteğini kernel komut satırında etkinlestir
+# GRUB: intel_iommu=on veya amd_iommu=on
+# /etc/default/grub dosyasinda:
+# GRUB_CMDLINE_LINUX="intel_iommu=on iommu=pt"
+
+# VFIO modullerini yukle
+modprobe vfio
+modprobe vfio_pci
+modprobe vfio_iommu_type1
+
+# Modullerın yuklendigini dogrula
+lsmod | grep vfio
+# vfio_pci              65536  0
+# vfio_iommu_type1      36864  0
+# vfio                  36864  2 vfio_pci,vfio_iommu_type1
+</code></pre>
+
+  <h3>Cihazı Belirleme</h3>
+
+<pre><code># Hedef PCI cihazini bul (ornek: Ethernet kontroloru)
+lspci -nn | grep -i ethernet
+# 03:00.0 Ethernet controller [0200]: Intel XL710 [8086:1572]
+
+# Cihazin IOMMU grubunu bul
+readlink /sys/bus/pci/devices/0000:03:00.0/iommu_group
+# ../../../kernel/iommu_groups/42
+
+# Gruptaki tum cihazlari listele (hepsini VFIO'ya baglamak gerekebilir)
+ls /sys/kernel/iommu_groups/42/devices/
+# 0000:03:00.0
+# 0000:03:00.1
+</code></pre>
+
+  <h3>Mevcut Sürücüyü Ayır (Unbind)</h3>
+
+<pre><code># Mevcut surucuyu bul
+cat /sys/bus/pci/devices/0000:03:00.0/driver/module/drivers
+
+# Suruculen ayir
+echo "0000:03:00.0" &gt; /sys/bus/pci/devices/0000:03:00.0/driver/unbind
+
+# Cihazin surucusuz kaldığını dogrula
+ls -l /sys/bus/pci/devices/0000:03:00.0/driver
+# (baglantin yok)
+</code></pre>
+
+  <h3>vfio-pci'ye Bağla (Bind)</h3>
+
+<pre><code># Vendor/Device ID ogren
+cat /sys/bus/pci/devices/0000:03:00.0/vendor  # 0x8086
+cat /sys/bus/pci/devices/0000:03:00.0/device  # 0x1572
+
+# Cihazi vfio-pci'ye yonlendir
+echo "8086 1572" &gt; /sys/bus/pci/drivers/vfio-pci/new_id
+
+# Alternatif: dogrudan bind
+echo "0000:03:00.0" &gt; /sys/bus/pci/drivers/vfio-pci/bind
+
+# Basariyi dogrula
+ls /dev/vfio/
+# vfio  42
+</code></pre>
+
+  <h3>Otomatik Bağlama: vfio-pci Modül Parametresi</h3>
+
+<pre><code># Sistem baslangicindan itibaren otomatik baglama icin
+# /etc/modprobe.d/vfio.conf dosyasina ekle:
+options vfio-pci ids=8086:1572,8086:1573
+
+# GRUB'da da belirtilabilir:
+# vfio-pci.ids=8086:1572,8086:1573
+</code></pre>
+
+  <h3>IOMMU Grup Durumunu Kontrol Et</h3>
+
+<pre><code># Tum cihazlarin gruba baglandigini dogrula
+for dev in /sys/kernel/iommu_groups/42/devices/*; do
+    bdf=$(basename $dev)
+    driver=$(readlink $dev/driver | awk -F/ '{print $NF}')
+    echo "$bdf: $driver"
+done
+# 0000:03:00.0: vfio-pci  -- dogru
+# 0000:03:00.1: vfio-pci  -- dogru (her ikisi de bağlı olmali)
+</code></pre>
+
+  <div class="params">
+    <div class="param"><span class="name">iommu=pt</span><span class="desc">Pass-through modu: IOMMU yalnızca cihaz geçişinde devreye girer, sistem genelinde ek yük azalır</span></div>
+    <div class="param"><span class="name">iommu=on</span><span class="desc">Tüm cihazlar için IOMMU çevirisi; en güvenli ama en yüksek yük</span></div>
+    <div class="param"><span class="name">intel_iommu=on</span><span class="desc">Intel VT-d etkinleştirme parametresi</span></div>
+    <div class="param"><span class="name">amd_iommu=on</span><span class="desc">AMD-Vi etkinleştirme parametresi</span></div>
+  </div>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> Kullanıcı Alanından DMA</h2>
+  <p class="section-lead">
+    VFIO'nun en güçlü özelliği, kullanıcı alanından DMA haritalamaları oluşturabilmektir. IOMMU koruması altında, kullanıcı alanı belleği cihaza güvenle gösterilebilir.
+  </p>
+
+  <h3>DMA Belleği Tahsis Etme</h3>
+  <p>
+    DMA tamponu için kullanılacak bellek, sayfaların fiziksel olarak sabitlenmiş (pinned) ve ardışık (contiguous) veya IOMMU ile eşlenmiş olması gerekir. Tipik yaklaşım huge pages kullanmaktır; VFIO, sayfaları otomatik olarak pinler.
+  </p>
+
+<pre><code>#include &lt;linux/vfio.h&gt;
+#include &lt;sys/mman.h&gt;
+
+/* 2 MB huge page tahsis et */
+void *dma_buf = mmap(NULL, 2 * 1024 * 1024,
+                     PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS |
+                     MAP_HUGETLB | MAP_HUGE_2MB,
+                     -1, 0);
+
+if (dma_buf == MAP_FAILED) {
+    perror("mmap huge page");
+    exit(1);
+}
+</code></pre>
+
+  <h3>VFIO_IOMMU_MAP_DMA ile IOVA Eşleme</h3>
+  <p>
+    Bellek tahsis edildikten sonra <code>VFIO_IOMMU_MAP_DMA</code> ioctl ile IOMMU'ya kaydettirilir. Cihaza verilecek adres IOVA'dır (fiziksel adres değil).
+  </p>
+
+<pre><code>struct vfio_iommu_type1_dma_map dma_map = {
+    .argsz = sizeof(dma_map),
+    .flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
+    .vaddr = (uint64_t)(uintptr_t)dma_buf,  /* Sanal adres */
+    .iova  = 0x10000000,                    /* Cihazin gorecegi IOVA */
+    .size  = 2 * 1024 * 1024,
+};
+
+if (ioctl(container, VFIO_IOMMU_MAP_DMA, &dma_map)) {
+    perror("VFIO_IOMMU_MAP_DMA");
+    exit(1);
+}
+
+/* Artik cihaza 0x10000000 adresi verilebilir */
+printf("DMA haritasi kuruldu: IOVA=0x%lx\n", dma_map.iova);
+</code></pre>
+
+  <h3>MMIO Bölgelerini mmap ile Açma</h3>
+  <p>
+    Cihazın BAR (Base Address Register) bölgeleri <code>VFIO_DEVICE_GET_REGION_INFO</code> ile sorgulanır, ardından mmap ile kullanıcı alanına açılır.
+  </p>
+
+<pre><code>struct vfio_region_info reg = {
+    .argsz = sizeof(reg),
+    .index = VFIO_PCI_BAR0_REGION_INDEX,
+};
+
+ioctl(device, VFIO_DEVICE_GET_REGION_INFO, &reg);
+
+/* BAR0'i mmap et */
+void *bar0 = mmap(NULL, reg.size,
+                  PROT_READ | PROT_WRITE,
+                  MAP_SHARED,
+                  device,
+                  reg.offset);
+
+if (bar0 == MAP_FAILED) {
+    perror("BAR0 mmap");
+    exit(1);
+}
+
+/* Dogrudan kayit erisimi */
+volatile uint32_t *ctrl_reg = (uint32_t *)bar0;
+*ctrl_reg = 0x1;  /* DMA baslat */
+
+/* Tamamlanma bitini bekle */
+while (!(*ctrl_reg &amp; 0x2))
+    ;
+</code></pre>
+
+  <h3>DMA Eşlemesini Kaldırma</h3>
+
+<pre><code>struct vfio_iommu_type1_dma_unmap dma_unmap = {
+    .argsz = sizeof(dma_unmap),
+    .flags = 0,
+    .iova  = 0x10000000,
+    .size  = 2 * 1024 * 1024,
+};
+
+ioctl(container, VFIO_IOMMU_UNMAP_DMA, &dma_unmap);
+munmap(dma_buf, 2 * 1024 * 1024);
+</code></pre>
+
+  <h3>Çoklu DMA Bölgesi Yönetimi</h3>
+  <p>
+    Gerçek uygulamalarda birden fazla DMA bölgesi (RX halkası, TX halkası, kontrol yapıları) gerekir. Her biri için ayrı <code>VFIO_IOMMU_MAP_DMA</code> çağrısı yapılır ve IOVA uzayı çakışmayacak biçimde planlanır.
+  </p>
+
+<pre><code>#define IOVA_RX_BASE   0x10000000
+#define IOVA_TX_BASE   0x20000000
+#define IOVA_CTRL_BASE 0x30000000
+#define DMA_BUF_SIZE   (2 * 1024 * 1024)
+
+/* RX tamponu */
+void *rx_buf = mmap_hugepage(DMA_BUF_SIZE);
+vfio_map_dma(container, rx_buf, IOVA_RX_BASE, DMA_BUF_SIZE);
+
+/* TX tamponu */
+void *tx_buf = mmap_hugepage(DMA_BUF_SIZE);
+vfio_map_dma(container, tx_buf, IOVA_TX_BASE, DMA_BUF_SIZE);
+</code></pre>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> Kesme Yönetimi</h2>
+  <p class="section-lead">
+    VFIO, cihaz kesmelerini kullanıcı alanına eventfd mekanizması aracılığıyla iletir. Bu yaklaşım, kullanıcı alanı sürücüsünün busy-poll yapmak zorunda kalmadan kesmeleri verimli biçimde almasını sağlar.
+  </p>
+
+  <h3>Kesme Bilgisi Sorgulama</h3>
+
+<pre><code>#include &lt;linux/vfio.h&gt;
+
+struct vfio_irq_info irq_info = {
+    .argsz = sizeof(irq_info),
+    .index = VFIO_PCI_MSI_IRQ_INDEX,
+};
+
+if (ioctl(device, VFIO_DEVICE_GET_IRQ_INFO, &irq_info)) {
+    perror("VFIO_DEVICE_GET_IRQ_INFO");
+    exit(1);
+}
+
+printf("MSI kesmesi sayisi: %u\n", irq_info.count);
+printf("Flags: 0x%x\n", irq_info.flags);
+/* VFIO_IRQ_INFO_EVENTFD: eventfd destekli */
+/* VFIO_IRQ_INFO_MASKABLE: maskelenebilir  */
+/* VFIO_IRQ_INFO_AUTOMASKED: otomatik maskeleme */
+</code></pre>
+
+  <h3>eventfd ile Kesme Yapılandırma</h3>
+  <p>
+    Her MSI/MSI-X vektörü için bir eventfd oluşturulur. <code>VFIO_DEVICE_SET_IRQS</code> ioctl bu eventfd'leri cihaz kesmelerine bağlar.
+  </p>
+
+<pre><code>#include &lt;sys/eventfd.h&gt;
+
+/* Kesme basina eventfd olustur */
+int irq_fd = eventfd(0, 0);
+if (irq_fd &lt; 0) {
+    perror("eventfd");
+    exit(1);
+}
+
+/* VFIO_DEVICE_SET_IRQS yapisi dinamik boyutludur */
+struct vfio_irq_set *irq_set;
+int irq_set_size = sizeof(*irq_set) + sizeof(int);
+irq_set = calloc(1, irq_set_size);
+
+irq_set-&gt;argsz = irq_set_size;
+irq_set-&gt;flags = VFIO_IRQ_SET_DATA_EVENTFD |
+                 VFIO_IRQ_SET_ACTION_TRIGGER;
+irq_set-&gt;index = VFIO_PCI_MSI_IRQ_INDEX;
+irq_set-&gt;start = 0;
+irq_set-&gt;count = 1;
+
+/* eventfd dosya taniticisini yerlestiр */
+memcpy(irq_set-&gt;data, &irq_fd, sizeof(irq_fd));
+
+if (ioctl(device, VFIO_DEVICE_SET_IRQS, irq_set)) {
+    perror("VFIO_DEVICE_SET_IRQS");
+    exit(1);
+}
+free(irq_set);
+</code></pre>
+
+  <h3>Kesme Bekleme ve İşleme</h3>
+
+<pre><code>#include &lt;poll.h&gt;
+
+struct pollfd pfd = {
+    .fd     = irq_fd,
+    .events = POLLIN,
+};
+
+while (1) {
+    int ret = poll(&pfd, 1, -1);  /* Sonsuz bekleme */
+    if (ret &lt; 0) {
+        perror("poll");
+        break;
+    }
+
+    if (pfd.revents &amp; POLLIN) {
+        uint64_t count;
+        read(irq_fd, &count, sizeof(count));
+        printf("Kesme alindi! Sayac: %lu\n", count);
+        /* Donanim kesme isleyicisi... */
+        handle_interrupt();
+    }
+}
+</code></pre>
+
+  <h3>IRQ Maskeleme ve Aç</h3>
+  <p>
+    İşlem süresince kesmeler maskelenebilir; bu, boyutlu işleme (batched processing) için gereklidir.
+  </p>
+
+<pre><code>/* Maskeleme icin eventfd olustur */
+int mask_fd = eventfd(0, 0);
+
+irq_set-&gt;flags = VFIO_IRQ_SET_DATA_EVENTFD |
+                 VFIO_IRQ_SET_ACTION_MASK;
+memcpy(irq_set-&gt;data, &mask_fd, sizeof(mask_fd));
+ioctl(device, VFIO_DEVICE_SET_IRQS, irq_set);
+
+/* Kesmeyi maskele */
+uint64_t val = 1;
+write(mask_fd, &val, sizeof(val));
+
+/* ... toplu isleme ... */
+
+/* Kesmeyi ac (unmask) */
+irq_set-&gt;flags = VFIO_IRQ_SET_DATA_NONE |
+                 VFIO_IRQ_SET_ACTION_UNMASK;
+ioctl(device, VFIO_DEVICE_SET_IRQS, irq_set);
+</code></pre>
+
+  <div class="file-table"><table>
+    <tr><th>Kesme Türü</th><th>VFIO İndeksi</th><th>Açıklama</th></tr>
+    <tr><td>INTx (legacy)</td><td>VFIO_PCI_INTX_IRQ_INDEX</td><td>Eski PCIe kesmesi; paylaşımlı, yavaş</td></tr>
+    <tr><td>MSI</td><td>VFIO_PCI_MSI_IRQ_INDEX</td><td>Mesaj tabanlı kesme; genellikle 1 vektör</td></tr>
+    <tr><td>MSI-X</td><td>VFIO_PCI_MSIX_IRQ_INDEX</td><td>Çok vektörlü MSI; NIC queue başına kesme</td></tr>
+    <tr><td>Hata</td><td>VFIO_PCI_ERR_IRQ_INDEX</td><td>PCIe hata bildirimleri</td></tr>
+  </table></div>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> VFIO-platform</h2>
+  <p class="section-lead">
+    <code>vfio-pci</code> PCIe cihazlar içindir; gömülü sistemlerdeki platform cihazları (MMIO tabanlı, DT ile tanımlı IP blokları) için <code>vfio-platform</code> kullanılır. Bu, ARM SoC'larında FPGA blokları veya doğrudan adreslenebilir donanım hızlandırıcıları için kritik öneme sahiptir.
+  </p>
+
+  <h3>vfio-platform Mimarisi</h3>
+  <p>
+    vfio-platform, <code>vfio_platform_device</code> yapısı aracılığıyla platform cihazının MMIO bölgelerini ve kesmelerini, PCI'ya özgü olmayan bir arayüzle kullanıcı alanına sunar. SMMU (ARM'ın IOMMU'su) ile birlikte DMA koruması da sağlanır.
+  </p>
+
+<pre><code># Gerekli moduller
+modprobe vfio
+modprobe vfio_platform
+modprobe vfio_iommu_type1
+</code></pre>
+
+  <h3>Platform Cihazını VFIO'ya Bağlama</h3>
+
+<pre><code># Platform cihazini bul
+ls /sys/bus/platform/devices/ | grep fpga
+# fpga@40000000
+
+# Mevcut suruculen ayir
+echo "fpga@40000000" &gt; \
+  /sys/bus/platform/devices/fpga@40000000/driver/unbind
+
+# vfio-platform'a bagla
+echo "fpga@40000000" &gt; \
+  /sys/bus/platform/drivers/vfio-platform/bind
+
+# VFIO grubu olustu mu?
+ls /dev/vfio/
+</code></pre>
+
+  <h3>Device Tree'de Reset Sağlayıcısı</h3>
+  <p>
+    Platform cihazları için VFIO, cihazın kullanıcı alanına geçmeden önce sıfırlanıp sıfırlanamayacağını kontrol eder. Cihazın bir reset mekanizması yoksa DT'ye özellik eklenmesi gerekebilir:
+  </p>
+
+<pre><code>/* DT'de vfio-platform icin reset saglayicisi */
+fpga: fpga@40000000 {
+    compatible = "vendor,my-fpga";
+    reg = &lt;0x40000000 0x10000&gt;;
+    interrupts = &lt;GIC_SPI 42 IRQ_TYPE_LEVEL_HIGH&gt;;
+    resets = &lt;&amp;reset_controller 5&gt;;
+    reset-names = "fpga-reset";
+    iommus = &lt;&amp;smmu 0x100&gt;; /* SMMU stream ID */
+};
+</code></pre>
+
+  <h3>Gömülü Kullanım Senaryosu</h3>
+  <p>
+    Gerçek zamanlı bir sinyal işleme uygulamasında FPGA hızlandırıcısının vfio-platform ile kullanıcı alanına geçirilmesi şu avantajları sağlar: çekirdek modülü yazma gerekmez, güncelleme için yeniden başlatma gerekmez ve süreç izolasyonu garanti edilir.
+  </p>
+
+<pre><code>/* vfio-platform kullanici alani erisimi -- platform'a ozgu bolgeler */
+struct vfio_region_info reg = {
+    .argsz = sizeof(reg),
+    .index = 0,  /* Ilk MMIO bolgesi */
+};
+ioctl(device_fd, VFIO_DEVICE_GET_REGION_INFO, &reg);
+
+void *mmio = mmap(NULL, reg.size,
+                  PROT_READ | PROT_WRITE,
+                  MAP_SHARED, device_fd, reg.offset);
+
+/* FPGA registerlerina dogrudan eris */
+volatile uint32_t *fpga_ctrl = (uint32_t *)mmio;
+fpga_ctrl[0] = 0x1;  /* Islemi baslat */
+
+/* Islem tamamlandi mi? */
+while (!(fpga_ctrl[1] &amp; 0x1))
+    ;  /* Durum bitini bekle */
+</code></pre>
+
+  <h3>vfio-platform ve vfio-pci Karşılaştırması</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">vfio-pci</span><span class="desc">PCIe veri yolu; BAR bölgeleri, PCIe config space, MSI/MSI-X; x86 ve ARM</span></div>
+    <div class="param"><span class="name">vfio-platform</span><span class="desc">Platform veri yolu (DT); MMIO bölgeleri, GIC kesmesi; gömülü ARM SoC</span></div>
+    <div class="param"><span class="name">SMMU</span><span class="desc">ARM SystemMMU; vfio-platform için IOMMU sağlayıcısı</span></div>
+    <div class="param"><span class="name">reset zorunluluğu</span><span class="desc">vfio-platform, cihaz reset mekanizması olmadan çalışmayı reddedebilir</span></div>
+  </div>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> DPDK ve VFIO</h2>
+  <p class="section-lead">
+    DPDK (Data Plane Development Kit), yüksek hızlı ağ paketi işlemesi için kullanıcı alanı PMD (Poll Mode Driver) sürücüleri sunar. VFIO, DPDK'nın IOMMU korumalı DMA ortamında çalışması için tercih edilen altyapıdır.
+  </p>
+
+  <h3>DPDK VFIO Mimarisi</h3>
+
+  <div class="flow"><pre>
+  Kullanici Alani:
+  +------------------------------------------+
+  |           DPDK Uygulamasi                |
+  |  +---------------+  +----------------+  |
+  |  | rte_eal_init  |  |  PMD Surucusu  |  |
+  |  | (VFIO init)   |-&gt;| (i40e, ixgbe)  |  |
+  |  +---------------+  +----------------+  |
+  +---------------------+--------------------+
+                        | VFIO ioctl
+  +---------------------v--------------------+
+  |      Linux Kernel (VFIO + IOMMU)         |
+  +------------------------------------------+
+  </pre></div>
+
+  <h3>Huge Pages Yapılandırması</h3>
+  <p>
+    DPDK, DMA tamponları için büyük sayfa (huge page) kullanır. Bu sayfalar <code>VFIO_IOMMU_MAP_DMA</code> ile IOMMU'ya kaydettirilir.
+  </p>
+
+<pre><code># 1 GB huge page rezervasyonu (kernel komut satirinda)
+# hugepagesz=1G hugepages=4 default_hugepagesz=1G
+
+# Calisma aninda 2 MB huge page
+echo 1024 &gt; /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+
+# Huge page mount noktasi
+mkdir -p /dev/hugepages
+mount -t hugetlbfs nodev /dev/hugepages
+
+# Hugepage durumu kontrol et
+cat /proc/meminfo | grep Huge
+# HugePages_Total: 1024
+# HugePages_Free:  1024
+# Hugepagesize:    2048 kB
+</code></pre>
+
+  <h3>DPDK ile NIC Bağlama</h3>
+
+<pre><code># dpdk-devbind.py ile cihazi VFIO'ya bagla
+dpdk-devbind.py --bind=vfio-pci 03:00.0
+
+# Baglama durumunu kontrol et
+dpdk-devbind.py --status-dev net
+
+# DPDK uygulamasini VFIO ile baslat
+./dpdk-testpmd \
+    -l 0-3 \
+    -n 4 \
+    --vfio-intr=msi \
+    -- \
+    --portmask=0x1 \
+    --nb-cores=2 \
+    --rxq=2 \
+    --txq=2 \
+    -i
+</code></pre>
+
+  <h3>Zero-Copy Paket İşleme</h3>
+  <p>
+    DPDK + VFIO kombinasyonu sayesinde ağ paketi NIC DMA tamponundan doğrudan uygulama belleğine kopyalanır; çekirdek arabelleği devreye girmez. Bu, 10 Gbps üzerindeki hızlarda bile düşük gecikme garantisi sağlar.
+  </p>
+
+<pre><code>/* DPDK mbuf dogrudan NIC DMA bolgesinden geliyor */
+struct rte_mbuf *pkt;
+while (rte_eth_rx_burst(port_id, queue_id, &pkt, 1) == 1) {
+    /* Sifir kopya: veri NIC DMA tamponunda, mbuf pointer tutuyor */
+    uint8_t  *data = rte_pktmbuf_mtod(pkt, uint8_t *);
+    uint16_t  len  = rte_pktmbuf_data_len(pkt);
+
+    /* Basit islem: UDP payload'i al */
+    process_packet(data, len);
+
+    rte_pktmbuf_free(pkt);
+}
+</code></pre>
+
+  <div class="params">
+    <div class="param"><span class="name">Avantaj: Gecikme</span><span class="desc">Çekirdek kopyalaması yok; tek DMA transferi yeterli</span></div>
+    <div class="param"><span class="name">Avantaj: Güvenlik</span><span class="desc">IOMMU DMA koruma, NIC yalnızca ayrılmış belleğe erişebilir</span></div>
+    <div class="param"><span class="name">Gereksinim: IOMMU</span><span class="desc">intel_iommu=on veya amd_iommu=on kernel parametresi şart</span></div>
+    <div class="param"><span class="name">Gereksinim: Huge Pages</span><span class="desc">DMA tamponları için büyük sayfa şart; küçük sayfa DMA eşlemesi pahalıdır</span></div>
+  </div>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> QEMU/KVM ile Cihaz Geçişi</h2>
+  <p class="section-lead">
+    VFIO'nun en yaygın kullanım senaryolarından biri, bir PCIe cihazı (GPU, NIC, FPGA) doğrudan bir KVM sanal makinesine geçirmektir. Sanal makine cihaza doğrudan erişir; hipervisör öykünme yükü sıfıra yaklaşır.
+  </p>
+
+  <h3>QEMU ile PCIe Geçişi</h3>
+
+<pre><code>qemu-system-x86_64 \
+  -enable-kvm \
+  -m 8192 \
+  -cpu host \
+  -smp 4 \
+  \
+  -device vfio-pci,host=03:00.0,id=passthrough_nic \
+  \
+  -drive file=vm.qcow2,format=qcow2 \
+  \
+  -netdev user,id=mgmt \
+  -device virtio-net,netdev=mgmt \
+  \
+  -nographic
+</code></pre>
+
+  <h3>Çoklu Cihaz Geçişi (SR-IOV VF)</h3>
+  <p>
+    SR-IOV destekli bir NIC'ten sanal fonksiyonlar (VF) oluşturarak her VM'e ayrı VF geçirilebilir. Bu, ağ yoğun iş yüklerinde fiziksel NIC'i birden fazla VM arasında doğrudan paylaştırır.
+  </p>
+
+<pre><code># PF uzerinde VF olustur (i40e surucusu)
+echo 4 &gt; /sys/bus/pci/devices/0000:03:00.0/sriov_numvfs
+
+# Olusturulan VF'leri listele
+lspci | grep "Virtual Function"
+# 03:02.0 Ethernet controller: Intel XL710 VF
+# 03:02.1 Ethernet controller: Intel XL710 VF
+
+# Her VF'yi ayri VFIO grubuna bagla
+dpdk-devbind.py --bind=vfio-pci 03:02.0
+dpdk-devbind.py --bind=vfio-pci 03:02.1
+
+# VM1'e VF gecir
+qemu-system-x86_64 -enable-kvm \
+    -device vfio-pci,host=03:02.0 \
+    -m 4096 vm1.qcow2 &amp;
+
+# VM2'ye VF gecir
+qemu-system-x86_64 -enable-kvm \
+    -device vfio-pci,host=03:02.1 \
+    -m 4096 vm2.qcow2 &amp;
+</code></pre>
+
+  <h3>Huge Page ve IOMMU Zorunlulukları</h3>
+
+<pre><code># KVM + VFIO icin GRUB parametreleri (/etc/default/grub)
+# GRUB_CMDLINE_LINUX="intel_iommu=on iommu=pt
+#   hugepagesz=1G hugepages=16
+#   default_hugepagesz=1G"
+
+# QEMU'ya huge page bellek tahsisi
+qemu-system-x86_64 \
+  -m 8G \
+  -mem-path /dev/hugepages \
+  -mem-prealloc \
+  -enable-kvm \
+  -cpu host \
+  -device vfio-pci,host=03:00.0
+</code></pre>
+
+  <h3>PCIe ACS (Access Control Services)</h3>
+  <p>
+    IOMMU izolasyonu için PCIe cihazlar arası ACS etkinleştirilmelidir. Aksi takdirde aynı PCIe köprüsü altındaki cihazlar birbirinin DMA trafiğini görebilir ve aynı IOMMU grubuna düşer.
+  </p>
+
+<pre><code># ACS durumunu kontrol et
+lspci -vvv | grep -A2 "Access Control"
+
+# ACS override (test ortami -- uretimde dikkatli kullan)
+# Kernel parametresi: pcie_acs_override=downstream,multifunction
+</code></pre>
+
+  <h3>GPU Geçişi Örneği</h3>
+
+<pre><code># Nvidia GPU'yu VFIO'ya bagla
+echo "10de:2204" &gt; /sys/bus/pci/drivers/vfio-pci/new_id
+
+# QEMU ile GPU passthrough
+qemu-system-x86_64 \
+  -enable-kvm \
+  -m 16G \
+  -cpu host,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time \
+  -device vfio-pci,host=01:00.0,multifunction=on,x-vga=on \
+  -device vfio-pci,host=01:00.1 \
+  -vga none \
+  -nographic \
+  win11.qcow2
+</code></pre>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Hata Ayıklama</h2>
+  <p class="section-lead">
+    VFIO sorunlarının büyük çoğunluğu IOMMU yapılandırması, grup izolasyonu veya sürücü çakışmalarından kaynaklanır. Sistematik bir hata ayıklama süreci bu sorunları hızla tespit eder.
+  </p>
+
+  <h3>IOMMU ve VFIO Durumu Kontrolü</h3>
+
+<pre><code># IOMMU etkin mi?
+dmesg | grep -i iommu | head -20
+# [    0.123456] DMAR: IOMMU enabled
+# [    0.234567] iommu: Default domain type: Translated
+
+# VFIO grup durumu
+ls -la /dev/vfio/
+# crw------- 1 root root 246, 0 ... /dev/vfio/vfio
+# crw------- 1 root root 246, 1 ... /dev/vfio/42
+
+# Grup sahipligini kullaniciya ver
+chown emirpehlevan /dev/vfio/42
+</code></pre>
+
+  <h3>dmesg IOMMU Hata Mesajları</h3>
+
+<pre><code># IOMMU fault loglarini izle
+dmesg -w | grep -E "iommu|DMAR|vfio"
+
+# Yaygin IOMMU hata mesajlari:
+# DMAR: DRHD: handling fault status reg 3
+# DMAR: [DMA Read] Request device [03:00.0] fault addr 0xdeadbeef
+# Bunlar genellikle IOVA eslenenmis adrese DMA denemesini gosterir
+
+# IOMMU domain bilgisi (debugfs)
+cat /sys/kernel/debug/iommu/devices
+</code></pre>
+
+  <h3>VFIO Grup Durumu Sorgulama</h3>
+
+<pre><code>#include &lt;linux/vfio.h&gt;
+
+/* Grup durumunu sorgula */
+struct vfio_group_status status = {
+    .argsz = sizeof(status),
+};
+
+int group_fd = open("/dev/vfio/42", O_RDWR);
+ioctl(group_fd, VFIO_GROUP_GET_STATUS, &status);
+
+if (!(status.flags &amp; VFIO_GROUP_FLAGS_VIABLE)) {
+    fprintf(stderr, "Grup uygun degil: "
+            "grupdaki tum cihazlar vfio-pci'ye baglanmali\n");
+}
+if (!(status.flags &amp; VFIO_GROUP_FLAGS_CONTAINER_SET)) {
+    fprintf(stderr, "Grup henuz konteynere baglanmamis\n");
+}
+</code></pre>
+
+  <h3>lspci ile Cihaz Sürücü Kontrolü</h3>
+
+<pre><code># Cihaz suruculunu dogrula
+lspci -k -s 03:00.0
+# 03:00.0 Ethernet controller: Intel XL710
+#         Subsystem: Intel Ethernet CNA X710
+#         Kernel driver in use: vfio-pci
+#         Kernel modules: i40e
+
+# Tum VFIO cihazlarini listele
+for bdf in /sys/bus/pci/drivers/vfio-pci/*/; do
+    echo $(basename $bdf)
+done
+</code></pre>
+
+  <h3>IOMMU Bilgi Sorgulama</h3>
+
+<pre><code>/* IOMMU bilgisini ioctl ile al */
+struct vfio_iommu_type1_info iommu_info = {
+    .argsz = sizeof(iommu_info),
+};
+ioctl(container, VFIO_IOMMU_GET_INFO, &iommu_info);
+
+printf("IOMMU flags: 0x%x\n",  iommu_info.flags);
+printf("IOMMU PGSIZE: 0x%lx\n", iommu_info.iova_pgsizes);
+/* Desteklenen sayfa boyutlari: 0x1000 (4KB), 0x200000 (2MB) */
+</code></pre>
+
+  <div class="file-table"><table>
+    <tr><th>Sorun</th><th>Olası Neden</th><th>Çözüm</th></tr>
+    <tr><td>VFIO_GROUP_FLAGS_VIABLE değil</td><td>Gruptaki bir cihaz hâlâ kernel sürücüsüne bağlı</td><td>Tüm grup cihazlarını unbind + vfio-pci bind</td></tr>
+    <tr><td>VFIO_IOMMU_MAP_DMA EINVAL</td><td>IOVA hizalaması veya aralık sorunu</td><td>IOMMU sayfa boyutuna hizala (4KB/2MB/1GB)</td></tr>
+    <tr><td>IOMMU DMA fault</td><td>Eşlenmemiş IOVA'ya DMA denemesi</td><td>DMA adres hesabını ve MAP_DMA çağrısını kontrol et</td></tr>
+    <tr><td>lspci sürücü "vfio-pci" değil</td><td>bind komutu başarısız</td><td>dmesg'de hata oku; cihaz ID doğrula</td></tr>
+    <tr><td>Kesme alınamıyor</td><td>MSI desteklenmiyor ya da grup konteynere bağlanmamış</td><td>VFIO_PCI_INTX_IRQ_INDEX ile başla; group container set kontrol et</td></tr>
+  </table></div>
+</section>
+
+</main>

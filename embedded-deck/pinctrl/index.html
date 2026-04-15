@@ -1,0 +1,1252 @@
+---
+layout: tutorial
+title: "pinctrl — Linux Pin Kontrol Alt Sistemi"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>PINCTRL / GPIO</span>
+    <span>2026</span>
+  </div>
+  <h1>pinctrl — Linux Pin Kontrol Alt Sistemi<br><em>Pin Mux, Pin Config &amp; GPIO Entegrasyonu</em></h1>
+  <p class="subtitle">SoC pin multiplexing mimarisi, controller sürücü yazımı, DT binding ve GPIO entegrasyonu — üretim kalitesinde pinctrl rehberi.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">pinctrl neden var — pin multiplexing ve GPIO çakışması</a></li>
+    <li><a href="#s1">pinctrl_desc ve pinctrl_ops — controller sürücü yazımı</a></li>
+    <li><a href="#s2">pinmux_ops — pin fonksiyon seçimi</a></li>
+    <li><a href="#s3">pinconf_ops — pull-up/down, drive strength, slew rate</a></li>
+    <li><a href="#s4">Device Tree pinctrl binding — pinctrl-names, pinctrl-0</a></li>
+    <li><a href="#s5">Generic pinctrl DT binding — pin-controller, pinmux, pinconf</a></li>
+    <li><a href="#s6">GPIO + pinctrl entegrasyonu — gpiochip_add_pin_range</a></li>
+    <li><a href="#s7">Durum yönetimi — default, sleep, idle state geçişleri</a></li>
+    <li><a href="#s8">Hata ayıklama — debugfs pinctrl/, pin_dump</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> pinctrl neden var — pin multiplexing ve GPIO çakışması</h2>
+  <p class="section-lead">Modern SoC'larda her fiziksel pin birden fazla fonksiyon için kullanılabilir; pinctrl bu çakışmayı merkezi, çekişme-önleyici bir framework ile çözer.</p>
+
+  <p>Bir ARM SoC'da yüzlerce fiziksel pin bulunur, ancak bunların büyük çoğunluğu birden fazla donanım bloğuna bağlanabilir: aynı pin hem UART TX hem SPI MOSI hem de GPIO olarak kullanılabilir. Hangi fonksiyonun aktif olduğunu belirlemek için SoC içinde pin multiplexer (mux) register'ları vardır. Linux pinctrl alt sistemi (<code class="inline">drivers/pinctrl/</code>) bu register'ları merkezi biçimde yönetir; iki sürücünün aynı pini talep etmesini engeller.</p>
+
+  <div class="flow">
+    <pre>
+  Fiziksel pin PA7
+  ┌─────────────────────────────────────────────────────┐
+  │  Olası fonksiyonlar:                                │
+  │    func0: GPIO_A7                                   │
+  │    func1: UART2_TX                                  │
+  │    func2: SPI1_MOSI                                 │
+  │    func3: PWM3                                      │
+  └────────────────┬────────────────────────────────────┘
+                   │
+         MUX_REG[15:14] = 0b01 → UART2_TX seçili
+                   │
+  +----------------v--------------------------------+
+  |          pinctrl core                           |
+  |  - Çakışma tespiti: aynı pin iki kez talep?    |
+  |  - state yönetimi: default / sleep / idle       |
+  |  - consumer API: pinctrl_get/select_state()     |
+  +----------------+--------------------------------+
+                   |
+     +-------------+------------+
+     |             |            |
+  UART sürücü  SPI sürücü  GPIO sürücü
+  (fonksiyon   (reddedilir  (GPIO mod
+   seçildi)     çakışma)     talep eder)
+    </pre>
+  </div>
+
+  <h3>Pinctrl olmadan yaşanan sorunlar</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Sorun</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Pin çakışması</td><td>İki sürücü aynı pini farklı fonksiyon için yapılandırır — öngörülemeyen davranış</td></tr>
+        <tr><td>Enerji israfı</td><td>Kullanılmayan pin'lerin floating bırakılması akım tüketimine neden olur</td></tr>
+        <tr><td>Güvenlik açığı</td><td>Debug/JTAG pinleri üretimde devre dışı bırakılmazsa saldırı vektörü oluşur</td></tr>
+        <tr><td>Uyku sorunu</td><td>Uyku sırasında pin'ler yanlış durumda kalırsa uyku akımı artar</td></tr>
+        <tr><td>Platform kodu tekrarı</td><td>Her SoC kendi mux kodu yazıyordu — kernel 3.3 öncesi kaos</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">pin</span><span class="desc">Fiziksel bağlantı noktası; pinctrl'de unique ID ile temsil edilir</span></div>
+    <div class="param"><span class="name">pin group</span><span class="desc">Birlikte yapılandırılan pin kümesi (ör. UART0 = {TX, RX, CTS, RTS})</span></div>
+    <div class="param"><span class="name">function</span><span class="desc">Bir pin grubunun alabileceği donanım bloğu rolü (uart0, spi1, gpio)</span></div>
+    <div class="param"><span class="name">state</span><span class="desc">Belirli bir ana durumda geçerli olan pin konfigürasyonu kümesi</span></div>
+    <div class="param"><span class="name">pinctrl_map</span><span class="desc">Device ↔ state ↔ group ↔ function eşleştirme tablosu</span></div>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>pinctrl başlık dosyaları: <code class="inline">&lt;linux/pinctrl/consumer.h&gt;</code> (consumer API — çoğu sürücünün doğrudan kullanmadığı, framework otomatik uygular), <code class="inline">&lt;linux/pinctrl/pinctrl.h&gt;</code> ve <code class="inline">&lt;linux/pinctrl/pinmux.h&gt;</code> ve <code class="inline">&lt;linux/pinctrl/pinconf.h&gt;</code> (provider API).</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>SoC pin mux: her fiziksel pin birden fazla fonksiyon arasında donanım register'ıyla seçilir</li>
+      <li>Çakışma tespiti, enerji yönetimi, güvenlik: pinctrl'in sağladığı merkezi kontrol</li>
+      <li>Pin, pin group, function, state: temel pinctrl kavramları</li>
+      <li>Linux 3.3: pinctrl framework birleşik hale geldi</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> pinctrl_desc ve pinctrl_ops — controller sürücü yazımı</h2>
+  <p class="section-lead">Pinctrl controller sürücüsünün çekirdeğe sunduğu pinctrl_desc yapısı ve zorunlu ops callback'leri.</p>
+
+  <h3>pinctrl_desc ve pin tanımları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>my_pinctrl.c — pinctrl_desc</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;linux/pinctrl/pinctrl.h&gt;
+<span class="keyword">#include</span> &lt;linux/pinctrl/pinmux.h&gt;
+<span class="keyword">#include</span> &lt;linux/pinctrl/pinconf.h&gt;
+<span class="keyword">#include</span> &lt;linux/pinctrl/pinconf-generic.h&gt;
+
+<span class="cmt">/* SoC'un tüm pin'lerini tanımla */</span>
+<span class="keyword">static const struct</span> pinctrl_pin_desc my_soc_pins[] = {
+    PINCTRL_PIN(<span class="num">0</span>,  <span class="str">"PA0"</span>),
+    PINCTRL_PIN(<span class="num">1</span>,  <span class="str">"PA1"</span>),
+    PINCTRL_PIN(<span class="num">2</span>,  <span class="str">"PA2"</span>),
+    <span class="cmt">/* ... */</span>
+    PINCTRL_PIN(<span class="num">7</span>,  <span class="str">"PA7"</span>),
+    PINCTRL_PIN(<span class="num">8</span>,  <span class="str">"PB0"</span>),
+    PINCTRL_PIN(<span class="num">9</span>,  <span class="str">"PB1"</span>),
+    <span class="cmt">/* ... toplam N pin */</span>
+    PINCTRL_PIN(<span class="num">127</span>, <span class="str">"PH7"</span>),
+};
+
+<span class="cmt">/* pinctrl controller private data */</span>
+<span class="keyword">struct</span> my_pinctrl_priv {
+    <span class="keyword">void</span>                __iomem     *base;
+    <span class="keyword">struct</span> pinctrl_dev             *pctldev;
+    <span class="keyword">struct</span> gpio_chip                gc;
+    <span class="keyword">struct</span> device                  *dev;
+    <span class="keyword">spinlock_t</span>                      lock;
+};
+
+<span class="cmt">/* pinctrl_ops: pin/group sorgulama callback'leri */</span>
+<span class="keyword">static int</span> my_get_groups_count(<span class="keyword">struct</span> pinctrl_dev *pctldev)
+{
+    <span class="keyword">return</span> ARRAY_SIZE(my_soc_groups);
+}
+
+<span class="keyword">static const char</span> *my_get_group_name(<span class="keyword">struct</span> pinctrl_dev *pctldev,
+                                      <span class="keyword">unsigned</span> selector)
+{
+    <span class="keyword">return</span> my_soc_groups[selector].name;
+}
+
+<span class="keyword">static int</span> my_get_group_pins(<span class="keyword">struct</span> pinctrl_dev *pctldev,
+                               <span class="keyword">unsigned</span>           selector,
+                               <span class="keyword">const unsigned int</span> **pins,
+                               <span class="keyword">unsigned int</span>       *num_pins)
+{
+    *pins     = my_soc_groups[selector].pins;
+    *num_pins = my_soc_groups[selector].num_pins;
+    <span class="keyword">return</span> <span class="num">0</span>;
+}
+
+<span class="keyword">static void</span> my_pin_dbg_show(<span class="keyword">struct</span> pinctrl_dev *pctldev,
+                             <span class="keyword">struct</span> seq_file    *s,
+                             <span class="keyword">unsigned</span>            offset)
+{
+    <span class="keyword">struct</span> my_pinctrl_priv *priv = pinctrl_dev_get_drvdata(pctldev);
+    <span class="keyword">u32</span> mux_val = readl(priv-&gt;base + MUX_REG(offset));
+
+    seq_printf(s, <span class="str">" func=%u pull=%s drv=%umA"</span>,
+               FIELD_GET(MUX_FUNC_MASK, mux_val),
+               (mux_val &amp; PIN_PULL_UP) ? <span class="str">"up"</span> :
+               (mux_val &amp; PIN_PULL_DN) ? <span class="str">"down"</span> : <span class="str">"none"</span>,
+               FIELD_GET(DRV_MA_MASK, mux_val) * <span class="num">4</span> + <span class="num">4</span>);
+}
+
+<span class="keyword">static const struct</span> pinctrl_ops my_pctrl_ops = {
+    .get_groups_count  = my_get_groups_count,
+    .get_group_name    = my_get_group_name,
+    .get_group_pins    = my_get_group_pins,
+    .pin_dbg_show      = my_pin_dbg_show,
+    .dt_node_to_map    = pinconf_generic_dt_node_to_map_all,
+    .dt_free_map       = pinctrl_utils_free_map,
+};
+
+<span class="keyword">static const struct</span> pinctrl_desc my_pinctrl_desc = {
+    .name    = <span class="str">"my-soc-pinctrl"</span>,
+    .pins    = my_soc_pins,
+    .npins   = ARRAY_SIZE(my_soc_pins),
+    .pctlops = &amp;my_pctrl_ops,
+    .pmxops  = &amp;my_pinmux_ops,   <span class="cmt">/* Bölüm 02 */</span>
+    .confops = &amp;my_pinconf_ops,  <span class="cmt">/* Bölüm 03 */</span>
+    .owner   = THIS_MODULE,
+};</code></pre>
+  </div>
+
+  <h3>Pin group tanımları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>my_pinctrl.c — pin groups</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* UART0 pin grubu — TX, RX, CTS, RTS */</span>
+<span class="keyword">static const unsigned int</span> uart0_pins[] = { <span class="num">2</span>, <span class="num">3</span>, <span class="num">4</span>, <span class="num">5</span> };
+
+<span class="cmt">/* SPI1 pin grubu — CLK, MOSI, MISO, CS0 */</span>
+<span class="keyword">static const unsigned int</span> spi1_pins[] = { <span class="num">10</span>, <span class="num">11</span>, <span class="num">12</span>, <span class="num">13</span> };
+
+<span class="cmt">/* I2C0 pin grubu — SCL, SDA */</span>
+<span class="keyword">static const unsigned int</span> i2c0_pins[] = { <span class="num">20</span>, <span class="num">21</span> };
+
+<span class="keyword">struct</span> my_pin_group {
+    <span class="keyword">const char</span>         *name;
+    <span class="keyword">const unsigned int</span> *pins;
+    <span class="keyword">unsigned int</span>        num_pins;
+};
+
+<span class="keyword">static const struct</span> my_pin_group my_soc_groups[] = {
+    { <span class="str">"uart0_grp"</span>, uart0_pins, ARRAY_SIZE(uart0_pins) },
+    { <span class="str">"spi1_grp"</span>,  spi1_pins,  ARRAY_SIZE(spi1_pins)  },
+    { <span class="str">"i2c0_grp"</span>,  i2c0_pins,  ARRAY_SIZE(i2c0_pins)  },
+    <span class="cmt">/* ... */</span>
+};</code></pre>
+  </div>
+
+  <h3>Probe ve pinctrl_register</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>my_pinctrl.c — probe</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">static int</span> my_pinctrl_probe(<span class="keyword">struct</span> platform_device *pdev)
+{
+    <span class="keyword">struct</span> my_pinctrl_priv *priv;
+    <span class="keyword">struct</span> pinctrl_dev     *pctldev;
+
+    priv = devm_kzalloc(&amp;pdev-&gt;dev, <span class="keyword">sizeof</span>(*priv), GFP_KERNEL);
+    <span class="keyword">if</span> (!priv)
+        <span class="keyword">return</span> -ENOMEM;
+
+    priv-&gt;base = devm_platform_ioremap_resource(pdev, <span class="num">0</span>);
+    <span class="keyword">if</span> (IS_ERR(priv-&gt;base))
+        <span class="keyword">return</span> PTR_ERR(priv-&gt;base);
+
+    priv-&gt;dev = &amp;pdev-&gt;dev;
+    spin_lock_init(&amp;priv-&gt;lock);
+    platform_set_drvdata(pdev, priv);
+
+    <span class="cmt">/* Pinctrl'e kaydet — devm_ versiyonu otomatik unregister */</span>
+    pctldev = devm_pinctrl_register(&amp;pdev-&gt;dev,
+                                     &amp;my_pinctrl_desc,
+                                     priv);
+    <span class="keyword">if</span> (IS_ERR(pctldev))
+        <span class="keyword">return</span> dev_err_probe(&amp;pdev-&gt;dev, PTR_ERR(pctldev),
+                             <span class="str">"pinctrl kaydi basarisiz\n"</span>);
+
+    priv-&gt;pctldev = pctldev;
+    <span class="keyword">return</span> <span class="num">0</span>;
+}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>PINCTRL_PIN(id, "isim") makrosuyla pin tanımları; tüm fiziksel pinler listelenmeli</li>
+      <li>pinctrl_ops: get_groups_count, get_group_name, get_group_pins — zorunlu trio</li>
+      <li>dt_node_to_map = pinconf_generic_dt_node_to_map_all: generic DT parsing</li>
+      <li>devm_pinctrl_register(): probe'da tercih edilmeli; driver_data olarak priv</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> pinmux_ops — pin fonksiyon seçimi</h2>
+  <p class="section-lead">pinmux_ops, pin gruplarına hangi donanım fonksiyonunun atanacağını belirleyen callback kümesidir.</p>
+
+  <h3>Function (fonksiyon) tanımları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>my_pinctrl.c — functions</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">struct</span> my_pmx_func {
+    <span class="keyword">const char</span>  *name;
+    <span class="keyword">const char</span> **groups;      <span class="cmt">/* Bu fonksiyonun kullandığı grup isimleri */</span>
+    <span class="keyword">unsigned int</span> num_groups;
+};
+
+<span class="keyword">static const char</span> *uart0_groups[]  = { <span class="str">"uart0_grp"</span> };
+<span class="keyword">static const char</span> *spi1_groups[]   = { <span class="str">"spi1_grp"</span> };
+<span class="keyword">static const char</span> *i2c0_groups[]   = { <span class="str">"i2c0_grp"</span> };
+<span class="keyword">static const char</span> *gpio_a_groups[] = { <span class="str">"gpio_a_grp"</span> };
+
+<span class="keyword">static const struct</span> my_pmx_func my_soc_funcs[] = {
+    [<span class="num">0</span>] = { <span class="str">"uart0"</span>,  uart0_groups,  ARRAY_SIZE(uart0_groups)  },
+    [<span class="num">1</span>] = { <span class="str">"spi1"</span>,   spi1_groups,   ARRAY_SIZE(spi1_groups)   },
+    [<span class="num">2</span>] = { <span class="str">"i2c0"</span>,   i2c0_groups,   ARRAY_SIZE(i2c0_groups)   },
+    [<span class="num">3</span>] = { <span class="str">"gpio_a"</span>, gpio_a_groups, ARRAY_SIZE(gpio_a_groups) },
+};</code></pre>
+  </div>
+
+  <h3>pinmux_ops callback implementasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>my_pinctrl.c — pinmux_ops</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">static int</span> my_pmx_get_functions_count(<span class="keyword">struct</span> pinctrl_dev *pctldev)
+{
+    <span class="keyword">return</span> ARRAY_SIZE(my_soc_funcs);
+}
+
+<span class="keyword">static const char</span> *my_pmx_get_function_name(<span class="keyword">struct</span> pinctrl_dev *pctldev,
+                                              <span class="keyword">unsigned</span>            selector)
+{
+    <span class="keyword">return</span> my_soc_funcs[selector].name;
+}
+
+<span class="keyword">static int</span> my_pmx_get_function_groups(<span class="keyword">struct</span> pinctrl_dev  *pctldev,
+                                       <span class="keyword">unsigned</span>             selector,
+                                       <span class="keyword">const char</span>        * <span class="keyword">const</span> **groups,
+                                       <span class="keyword">unsigned</span>            *num_groups)
+{
+    *groups     = my_soc_funcs[selector].groups;
+    *num_groups = my_soc_funcs[selector].num_groups;
+    <span class="keyword">return</span> <span class="num">0</span>;
+}
+
+<span class="cmt">/*
+ * set_mux: gerçek donanım yazımı — mux register'ına fonksiyon bitlerini yaz
+ * group_selector: hangi pin grubu
+ * func_selector:  hangi fonksiyon
+ */</span>
+<span class="keyword">static int</span> my_pmx_set_mux(<span class="keyword">struct</span> pinctrl_dev *pctldev,
+                           <span class="keyword">unsigned int</span>        func_selector,
+                           <span class="keyword">unsigned int</span>        group_selector)
+{
+    <span class="keyword">struct</span> my_pinctrl_priv    *priv = pinctrl_dev_get_drvdata(pctldev);
+    <span class="keyword">const struct</span> my_pin_group *grp  = &amp;my_soc_groups[group_selector];
+    <span class="keyword">unsigned long</span>              flags;
+    <span class="keyword">int</span>                        i;
+
+    spin_lock_irqsave(&amp;priv-&gt;lock, flags);
+
+    <span class="keyword">for</span> (i = <span class="num">0</span>; i &lt; grp-&gt;num_pins; i++) {
+        <span class="keyword">unsigned int</span> pin = grp-&gt;pins[i];
+        <span class="keyword">u32</span> reg_val      = readl(priv-&gt;base + MUX_REG(pin));
+
+        <span class="cmt">/* Fonksiyon bitlerini temizle ve yaz */</span>
+        reg_val = (reg_val &amp; ~MUX_FUNC_MASK) |
+                  FIELD_PREP(MUX_FUNC_MASK, func_selector);
+
+        writel(reg_val, priv-&gt;base + MUX_REG(pin));
+    }
+
+    spin_unlock_irqrestore(&amp;priv-&gt;lock, flags);
+    <span class="keyword">return</span> <span class="num">0</span>;
+}
+
+<span class="cmt">/* GPIO request: pin'i GPIO moduna al */</span>
+<span class="keyword">static int</span> my_pmx_gpio_request_enable(<span class="keyword">struct</span> pinctrl_dev *pctldev,
+                                       <span class="keyword">struct</span> pinctrl_gpio_range *range,
+                                       <span class="keyword">unsigned int</span>              offset)
+{
+    <span class="keyword">struct</span> my_pinctrl_priv *priv = pinctrl_dev_get_drvdata(pctldev);
+    <span class="keyword">u32</span> reg_val;
+    <span class="keyword">unsigned long</span> flags;
+
+    spin_lock_irqsave(&amp;priv-&gt;lock, flags);
+    reg_val = readl(priv-&gt;base + MUX_REG(offset));
+    reg_val = (reg_val &amp; ~MUX_FUNC_MASK) |
+              FIELD_PREP(MUX_FUNC_MASK, MUX_FUNC_GPIO);
+    writel(reg_val, priv-&gt;base + MUX_REG(offset));
+    spin_unlock_irqrestore(&amp;priv-&gt;lock, flags);
+
+    <span class="keyword">return</span> <span class="num">0</span>;
+}
+
+<span class="keyword">static const struct</span> pinmux_ops my_pinmux_ops = {
+    .get_functions_count  = my_pmx_get_functions_count,
+    .get_function_name    = my_pmx_get_function_name,
+    .get_function_groups  = my_pmx_get_function_groups,
+    .set_mux              = my_pmx_set_mux,
+    .gpio_request_enable  = my_pmx_gpio_request_enable,
+    .gpio_disable_free    = my_pmx_gpio_disable_free,
+    .strict               = <span class="keyword">true</span>,  <span class="cmt">/* çakışma = hata */</span>
+};</code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">set_mux</span><span class="desc">Donanım mux register'ına fonksiyon bitlerini yazar; spinlock ile korunmalı</span></div>
+    <div class="param"><span class="name">gpio_request_enable</span><span class="desc">gpiod_request() çağrıldığında pin'i GPIO fonksiyonuna alır</span></div>
+    <div class="param"><span class="name">gpio_disable_free</span><span class="desc">gpiod_free() sonrası pin'i başlangıç durumuna döndürür</span></div>
+    <div class="param"><span class="name">strict = true</span><span class="desc">Aynı pin iki kez talep edilirse -EBUSY döner; üretim için önerilir</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Function: birden fazla grubu kapsayan donanım bloğu rolü (uart0, spi1, gpio)</li>
+      <li>set_mux: MUX_REG'e fonksiyon indeksi yazar; tüm grup pinlerine uygulanır</li>
+      <li>gpio_request_enable: gpiod_request() → pin GPIO moduna geçer</li>
+      <li>strict = true: çakışma tespiti; iki sürücü aynı pini talep edemez</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> pinconf_ops — pull-up/down, drive strength, slew rate</h2>
+  <p class="section-lead">pinconf_ops, bireysel pinlerin elektriksel konfigürasyonunu — pull-up, pull-down, drive strength, slew rate, schmitt trigger — yönetir.</p>
+
+  <h3>Generic pinconf parametreleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Parametre enum</th><th>Anlamı</th><th>Tipik değer</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>PIN_CONFIG_BIAS_PULL_UP</td><td>Pull-up direnci etkinleştir</td><td>Direnç değeri (Ohm) veya 1</td></tr>
+        <tr><td>PIN_CONFIG_BIAS_PULL_DOWN</td><td>Pull-down direnci etkinleştir</td><td>Direnç değeri veya 1</td></tr>
+        <tr><td>PIN_CONFIG_BIAS_DISABLE</td><td>Pull-up/down devre dışı</td><td>—</td></tr>
+        <tr><td>PIN_CONFIG_BIAS_HIGH_IMPEDANCE</td><td>Hi-Z (yüksek empedans)</td><td>—</td></tr>
+        <tr><td>PIN_CONFIG_DRIVE_STRENGTH</td><td>Çıkış akımı kapasitesi</td><td>mA cinsinden (4, 8, 12, 16…)</td></tr>
+        <tr><td>PIN_CONFIG_SLEW_RATE</td><td>Kenar hızı sınırı</td><td>0=yavaş, 1=hızlı</td></tr>
+        <tr><td>PIN_CONFIG_INPUT_SCHMITT_ENABLE</td><td>Schmitt trigger etkinleştir</td><td>1=etkin</td></tr>
+        <tr><td>PIN_CONFIG_OUTPUT</td><td>Çıkış modunda başlat</td><td>0=low, 1=high</td></tr>
+        <tr><td>PIN_CONFIG_INPUT_ENABLE</td><td>Giriş buffer'ı etkinleştir</td><td>—</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>pinconf_ops implementasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>my_pinctrl.c — pinconf_ops</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Pin konfigürasyon register offset'leri */</span>
+<span class="keyword">#define</span> CONF_REG(pin)       (priv-&gt;base + <span class="num">0x200</span> + (pin) * <span class="num">4</span>)
+<span class="keyword">#define</span> CONF_PULL_MASK      GENMASK(<span class="num">3</span>, <span class="num">2</span>)
+<span class="keyword">#define</span> CONF_PULL_NONE      <span class="num">0</span>
+<span class="keyword">#define</span> CONF_PULL_UP        <span class="num">1</span>
+<span class="keyword">#define</span> CONF_PULL_DOWN      <span class="num">2</span>
+<span class="keyword">#define</span> CONF_DRV_MASK       GENMASK(<span class="num">6</span>, <span class="num">4</span>)  <span class="cmt">/* 0=4mA, 1=8mA, 2=12mA, 3=16mA */</span>
+<span class="keyword">#define</span> CONF_SLEW_BIT       BIT(<span class="num">7</span>)
+<span class="keyword">#define</span> CONF_SCHMITT_BIT    BIT(<span class="num">8</span>)
+
+<span class="keyword">static int</span> my_pinconf_get(<span class="keyword">struct</span> pinctrl_dev  *pctldev,
+                           <span class="keyword">unsigned int</span>         pin,
+                           <span class="keyword">unsigned long</span>       *config)
+{
+    <span class="keyword">struct</span> my_pinctrl_priv *priv = pinctrl_dev_get_drvdata(pctldev);
+    <span class="keyword">enum</span> pin_config_param  param = pinconf_to_config_param(*config);
+    <span class="keyword">u32</span> reg_val = readl(CONF_REG(pin));
+    <span class="keyword">u32</span> arg = <span class="num">0</span>;
+
+    <span class="keyword">switch</span> (param) {
+    <span class="keyword">case</span> PIN_CONFIG_BIAS_PULL_UP:
+        <span class="keyword">if</span> (FIELD_GET(CONF_PULL_MASK, reg_val) != CONF_PULL_UP)
+            <span class="keyword">return</span> -EINVAL;
+        arg = <span class="num">1</span>;
+        <span class="keyword">break</span>;
+    <span class="keyword">case</span> PIN_CONFIG_BIAS_PULL_DOWN:
+        <span class="keyword">if</span> (FIELD_GET(CONF_PULL_MASK, reg_val) != CONF_PULL_DOWN)
+            <span class="keyword">return</span> -EINVAL;
+        arg = <span class="num">1</span>;
+        <span class="keyword">break</span>;
+    <span class="keyword">case</span> PIN_CONFIG_BIAS_DISABLE:
+        arg = (FIELD_GET(CONF_PULL_MASK, reg_val) == CONF_PULL_NONE);
+        <span class="keyword">break</span>;
+    <span class="keyword">case</span> PIN_CONFIG_DRIVE_STRENGTH:
+        arg = (FIELD_GET(CONF_DRV_MASK, reg_val) + <span class="num">1</span>) * <span class="num">4</span>;  <span class="cmt">/* mA */</span>
+        <span class="keyword">break</span>;
+    <span class="keyword">case</span> PIN_CONFIG_SLEW_RATE:
+        arg = !!(reg_val &amp; CONF_SLEW_BIT);
+        <span class="keyword">break</span>;
+    <span class="keyword">case</span> PIN_CONFIG_INPUT_SCHMITT_ENABLE:
+        arg = !!(reg_val &amp; CONF_SCHMITT_BIT);
+        <span class="keyword">break</span>;
+    <span class="keyword">default</span>:
+        <span class="keyword">return</span> -ENOTSUPP;
+    }
+
+    *config = pinconf_to_config_packed(param, arg);
+    <span class="keyword">return</span> <span class="num">0</span>;
+}
+
+<span class="keyword">static int</span> my_pinconf_set(<span class="keyword">struct</span> pinctrl_dev  *pctldev,
+                           <span class="keyword">unsigned int</span>         pin,
+                           <span class="keyword">unsigned long</span>       *configs,
+                           <span class="keyword">unsigned int</span>         num_configs)
+{
+    <span class="keyword">struct</span> my_pinctrl_priv *priv = pinctrl_dev_get_drvdata(pctldev);
+    <span class="keyword">unsigned long</span>           flags;
+    <span class="keyword">u32</span>                     reg_val;
+    <span class="keyword">int</span>                     i;
+
+    spin_lock_irqsave(&amp;priv-&gt;lock, flags);
+    reg_val = readl(CONF_REG(pin));
+
+    <span class="keyword">for</span> (i = <span class="num">0</span>; i &lt; num_configs; i++) {
+        <span class="keyword">enum</span> pin_config_param param = pinconf_to_config_param(configs[i]);
+        <span class="keyword">u32</span>                  arg   = pinconf_to_config_argument(configs[i]);
+
+        <span class="keyword">switch</span> (param) {
+        <span class="keyword">case</span> PIN_CONFIG_BIAS_PULL_UP:
+            reg_val = (reg_val &amp; ~CONF_PULL_MASK) |
+                      FIELD_PREP(CONF_PULL_MASK, CONF_PULL_UP);
+            <span class="keyword">break</span>;
+        <span class="keyword">case</span> PIN_CONFIG_BIAS_PULL_DOWN:
+            reg_val = (reg_val &amp; ~CONF_PULL_MASK) |
+                      FIELD_PREP(CONF_PULL_MASK, CONF_PULL_DOWN);
+            <span class="keyword">break</span>;
+        <span class="keyword">case</span> PIN_CONFIG_BIAS_DISABLE:
+            reg_val = (reg_val &amp; ~CONF_PULL_MASK) |
+                      FIELD_PREP(CONF_PULL_MASK, CONF_PULL_NONE);
+            <span class="keyword">break</span>;
+        <span class="keyword">case</span> PIN_CONFIG_DRIVE_STRENGTH:
+            <span class="cmt">/* arg: mA cinsinden; 4, 8, 12, 16 geçerli */</span>
+            {
+                <span class="keyword">u32</span> drv = (arg / <span class="num">4</span>) - <span class="num">1</span>;
+                drv = clamp_val(drv, <span class="num">0</span>, <span class="num">3</span>);
+                reg_val = (reg_val &amp; ~CONF_DRV_MASK) |
+                          FIELD_PREP(CONF_DRV_MASK, drv);
+            }
+            <span class="keyword">break</span>;
+        <span class="keyword">case</span> PIN_CONFIG_SLEW_RATE:
+            <span class="keyword">if</span> (arg)
+                reg_val |= CONF_SLEW_BIT;
+            <span class="keyword">else</span>
+                reg_val &amp;= ~CONF_SLEW_BIT;
+            <span class="keyword">break</span>;
+        <span class="keyword">case</span> PIN_CONFIG_INPUT_SCHMITT_ENABLE:
+            <span class="keyword">if</span> (arg)
+                reg_val |= CONF_SCHMITT_BIT;
+            <span class="keyword">else</span>
+                reg_val &amp;= ~CONF_SCHMITT_BIT;
+            <span class="keyword">break</span>;
+        <span class="keyword">default</span>:
+            spin_unlock_irqrestore(&amp;priv-&gt;lock, flags);
+            <span class="keyword">return</span> -ENOTSUPP;
+        }
+    }
+
+    writel(reg_val, CONF_REG(pin));
+    spin_unlock_irqrestore(&amp;priv-&gt;lock, flags);
+    <span class="keyword">return</span> <span class="num">0</span>;
+}
+
+<span class="keyword">static const struct</span> pinconf_ops my_pinconf_ops = {
+    .is_generic  = <span class="keyword">true</span>,       <span class="cmt">/* generic DT parsing kullan */</span>
+    .pin_config_get  = my_pinconf_get,
+    .pin_config_set  = my_pinconf_set,
+    .pin_config_group_set = my_pinconf_group_set,
+};</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>pinconf_to_config_param / pinconf_to_config_argument: packed config encoding'i çöz</li>
+      <li>is_generic = true: DT'deki bias-pull-up, drive-strength vb. otomatik parse edilir</li>
+      <li>spin_lock_irqsave + readl/writel: register R-M-W atomik erişim</li>
+      <li>pin_config_group_set: tüm gruba aynı konfigürasyonu uygulama</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Device Tree pinctrl binding — pinctrl-names, pinctrl-0</h2>
+  <p class="section-lead">Consumer cihazlarının DT'de pinctrl state'lerini nasıl tanımladığı ve framework'ün bunları otomatik uygulama mekanizması.</p>
+
+  <h3>pinctrl-names ve pinctrl-N property'leri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>my-board.dts — consumer pinctrl binding</span><span class="dot">●</span></div>
+    <pre><code>&amp;uart0 {
+    status = "okay";
+
+    /*
+     * pinctrl-names: state isimlerinin listesi
+     * pinctrl-0:     "default" state için pin konfigürasyonları
+     * pinctrl-1:     "sleep"   state için pin konfigürasyonları
+     *
+     * Framework, probe() sırasında otomatik olarak "default" state'i uygular.
+     * suspend sırasında "sleep" state'i uygulanır (driver destekliyorsa).
+     */</span>
+    pinctrl-names = "default", "sleep";
+    pinctrl-0 = &lt;&amp;uart0_pins_default&gt;;
+    pinctrl-1 = &lt;&amp;uart0_pins_sleep&gt;;
+};
+
+&amp;spi1 {
+    status = "okay";
+    pinctrl-names = "default";
+    pinctrl-0 = &lt;&amp;spi1_pins&gt;;
+};
+
+&amp;i2c0 {
+    status = "okay";
+    /* Yalnızca default state — sleep state yok */</span>
+    pinctrl-names = "default";
+    pinctrl-0 = &lt;&amp;i2c0_pins&gt;;
+};</code></pre>
+  </div>
+
+  <h3>Pin konfigürasyon node'larının tanımlanması</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>my-soc.dtsi — pinctrl node ve konfigürasyonlar</span><span class="dot">●</span></div>
+    <pre><code>pinctrl: pinctrl@11000000 {
+    compatible = "myvendor,mysoc-pinctrl";
+    reg = &lt;0x11000000 0x2000&gt;;
+
+    uart0_pins_default: uart0-default {
+        pins = "PA2", "PA3", "PA4", "PA5";
+        function = "uart0";
+        bias-pull-up;
+        drive-strength = &lt;8&gt;;     /* 8 mA */
+    };
+
+    uart0_pins_sleep: uart0-sleep {
+        pins = "PA2", "PA3", "PA4", "PA5";
+        function = "gpio";         /* GPIO moduna al */
+        bias-pull-down;            /* floating önle */
+        output-low;                /* low çek */
+    };
+
+    spi1_pins: spi1-default {
+        /* CLK, MOSI, MISO ayrı konfigürasyon */
+        spi1-clk-mosi {
+            pins = "PB2", "PB3";
+            function = "spi1";
+            drive-strength = &lt;12&gt;; /* yüksek hız */
+            slew-rate = &lt;1&gt;;       /* hızlı kenar */
+        };
+        spi1-miso {
+            pins = "PB4";
+            function = "spi1";
+            bias-pull-up;
+            input-schmitt-enable;
+        };
+    };
+
+    i2c0_pins: i2c0-default {
+        pins = "PC4", "PC5";
+        function = "i2c0";
+        bias-pull-up;
+        drive-strength = &lt;4&gt;;
+    };
+};</code></pre>
+  </div>
+
+  <h3>Framework'ün otomatik uygulaması</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>drivers/base/dd.c — otomatik state uygulama (kavramsal)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/*
+ * Framework, driver probe() çağrılmadan önce "default" state'i uygular.
+ * Sürücü pinctrl_select_state() çağırmak zorunda değildir.
+ *
+ * Sürücü manuel state seçimi yapmak istiyorsa:
+ */</span>
+<span class="keyword">static int</span> my_uart_probe(<span class="keyword">struct</span> platform_device *pdev)
+{
+    <span class="keyword">struct</span> pinctrl       *pc;
+    <span class="keyword">struct</span> pinctrl_state *sleep_state;
+
+    <span class="cmt">/* Framework default state'i zaten uyguladı.
+     * Ama sleep state handle'ını saklayabiliriz: */</span>
+    pc = devm_pinctrl_get(&amp;pdev-&gt;dev);
+    <span class="keyword">if</span> (IS_ERR(pc))
+        <span class="keyword">return</span> dev_err_probe(&amp;pdev-&gt;dev, PTR_ERR(pc),
+                             <span class="str">"pinctrl alinamadi\n"</span>);
+
+    sleep_state = pinctrl_lookup_state(pc, PINCTRL_STATE_SLEEP);
+    <span class="keyword">if</span> (IS_ERR(sleep_state))
+        sleep_state = NULL;  <span class="cmt">/* sleep state isteğe bağlı */</span>
+
+    <span class="cmt">/* Suspend callback'inde: */</span>
+    <span class="keyword">if</span> (sleep_state)
+        pinctrl_select_state(pc, sleep_state);
+
+    <span class="keyword">return</span> <span class="num">0</span>;
+}</code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">pinctrl-names = "default"</span><span class="desc">Zorunlu; framework probe öncesi otomatik uygular</span></div>
+    <div class="param"><span class="name">pinctrl-names = "sleep"</span><span class="desc">Opsiyonel; suspend sırasında framework veya sürücü seçer</span></div>
+    <div class="param"><span class="name">pinctrl-names = "idle"</span><span class="desc">Opsiyonel; düşük aktivite durumu için; sürücü manuel seçer</span></div>
+    <div class="param"><span class="name">pinctrl-0 / pinctrl-1 / ...</span><span class="desc">pinctrl-names sırasına karşılık gelen konfigürasyon phandle listesi</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>pinctrl-names + pinctrl-N: sıra eşleşmeli; "default" framework tarafından otomatik uygulanır</li>
+      <li>Alt node'lar: pins, function, bias-pull-up/down, drive-strength, slew-rate</li>
+      <li>Aynı node içinde birden fazla alt grup: farklı elektriksel konfigürasyonlar için</li>
+      <li>devm_pinctrl_get + pinctrl_lookup_state: sürücü taraflı manuel state yönetimi</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Generic pinctrl DT binding — pin-controller, pinmux, pinconf</h2>
+  <p class="section-lead">Vendor-bağımsız "generic" DT pinctrl binding standardı ve eski vendor-specific binding ile karşılaştırma.</p>
+
+  <p>Linux 3.14 ile birlikte "generic pinctrl DT binding" standardize edildi. Bu binding, <code class="inline">pinmux</code> ve <code class="inline">pinconf</code> property'lerini pin numarası bazlı tanımlar; vendor-specific property adları yerine standart parametreler kullanılır. Yeni SoC sürücüleri bu binding'i kullanmalıdır.</p>
+
+  <h3>Generic binding örneği</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>my-soc.dtsi — generic pinctrl binding</span><span class="dot">●</span></div>
+    <pre><code>pinctrl: pin-controller@11000000 {
+    compatible = "myvendor,mysoc-pinctrl";
+    reg = &lt;0x11000000 0x2000&gt;;
+
+    /*
+     * Generic binding: pinmux = &lt;pin_id mux_selector ...&gt;
+     * PIN_FUNC_ID(pin, func) makrosu veya elle sayısal değer
+     *
+     * my_soc_iomux.h dosyasında:
+     *   #define MY_PIN_PA2_UART0 (2 | (1 << 8))   // pin 2, func 1
+     */</span>
+
+    uart0_pins_default: uart0-default {
+        pinmux = &lt;MY_PIN_PA2_UART0   /* PA2 = UART0_TX */
+                   MY_PIN_PA3_UART0   /* PA3 = UART0_RX */
+                   MY_PIN_PA4_UART0   /* PA4 = UART0_CTS */
+                   MY_PIN_PA5_UART0&gt;; /* PA5 = UART0_RTS */
+        bias-pull-up;
+        drive-strength-microamp = &lt;8000&gt;;  /* 8 mA */
+    };
+
+    <span class="cmt">/* GPIO konfigürasyonu da generic binding ile */</span>
+    gpios_default: gpios-default {
+        pinmux = &lt;MY_PIN_PC0_GPIO
+                   MY_PIN_PC1_GPIO&gt;;
+        bias-pull-down;
+    };
+
+    <span class="cmt">/* Sadece pinconf (fonksiyon yok, sadece elektrik) */</span>
+    i2c0_pins: i2c0-default {
+        pinmux = &lt;MY_PIN_PC4_I2C0_SCL
+                   MY_PIN_PC5_I2C0_SDA&gt;;
+        drive-open-drain;   /* I2C için open-drain */
+        bias-pull-up;
+    };
+};</code></pre>
+  </div>
+
+  <h3>Vendor-specific vs generic binding karşılaştırması</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Özellik</th><th>Vendor-specific</th><th>Generic binding</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Mux tanımı</td><td>function = "uart0"; pins = "PA2"</td><td>pinmux = &lt;PIN_FUNC_ID&gt;</td></tr>
+        <tr><td>Pull konfigürasyonu</td><td>myvendor,pull-mode = &lt;1&gt;</td><td>bias-pull-up / bias-pull-down</td></tr>
+        <tr><td>Drive strength</td><td>myvendor,drive-strength = &lt;2&gt;</td><td>drive-strength = &lt;8&gt; (mA)</td></tr>
+        <tr><td>DT parsing</td><td>dt_node_to_map özel implementasyon</td><td>pinconf_generic_dt_node_to_map_all</td></tr>
+        <tr><td>Taşınabilirlik</td><td>Vendor'a özgü, belgelenmesi zor</td><td>Standart; tüm araçlar tanır</td></tr>
+        <tr><td>Bakım</td><td>Her SoC farklı property adları</td><td>Tek standart; yeni sürücüler için tercih edilmeli</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>dt_node_to_map_all ile otomatik parsing</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>my_pinctrl.c — generic DT parsing</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/*
+ * pinconf_generic_dt_node_to_map_all kullanılıyorsa
+ * özel dt_node_to_map implementasyonu gerekmez.
+ *
+ * is_generic = true ile pinconf_ops tanımlanır ve
+ * DT'deki bias-pull-up, drive-strength vb. parametreler
+ * otomatik olarak PIN_CONFIG_* enum'larına dönüştürülür.
+ */</span>
+<span class="keyword">static const struct</span> pinctrl_ops my_pctrl_ops = {
+    .get_groups_count = my_get_groups_count,
+    .get_group_name   = my_get_group_name,
+    .get_group_pins   = my_get_group_pins,
+    .dt_node_to_map   = pinconf_generic_dt_node_to_map_all,
+    .dt_free_map      = pinctrl_utils_free_map,
+};
+
+<span class="cmt">/*
+ * pinmux = &lt;pin_id&gt; için PIN_FUNC_ID makrosu örneği
+ * (vendor header dosyasında tanımlanır):
+ */</span>
+<span class="cmt">/* my_soc_iomux.h */</span>
+<span class="keyword">#define</span> MY_PINMUX(pin, func) ((pin) | ((func) &lt;&lt; <span class="num">8</span>))
+<span class="keyword">#define</span> MY_PIN_PA2_GPIO      MY_PINMUX(<span class="num">2</span>, <span class="num">0</span>)
+<span class="keyword">#define</span> MY_PIN_PA2_UART0_TX  MY_PINMUX(<span class="num">2</span>, <span class="num">1</span>)
+<span class="keyword">#define</span> MY_PIN_PA2_SPI1_MOSI MY_PINMUX(<span class="num">2</span>, <span class="num">2</span>)</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Generic pinctrl binding'de <code class="inline">pinmux</code> property'si, pin ID ve fonksiyon ID'yi tek bir 32-bit değerde kodlar. Exact encoding SoC'a özgüdür (vendordan PINMUX makrosu alınır), ancak DT property adı standarttır. Yeni kernel sürücülerinde <code class="inline">pinconf_generic_dt_node_to_map_all</code> kullanmak kodunuzu önemli ölçüde kısaltır.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Generic binding: pinmux = &lt;PIN_FUNC_ID&gt;, bias-pull-up, drive-strength — standart property'ler</li>
+      <li>pinconf_generic_dt_node_to_map_all: vendor dt_node_to_map yazmaktan kurtarır</li>
+      <li>Vendor-specific vs generic: yeni sürücülerde generic tercih edilmeli</li>
+      <li>MY_PINMUX(pin, func): encoding vendor header'da, DT property adı standart</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> GPIO + pinctrl entegrasyonu — gpiochip_add_pin_range</h2>
+  <p class="section-lead">pinctrl ve GPIO alt sistemlerinin entegrasyonu: GPIO talep edildiğinde pin otomatik olarak GPIO moduna alınır.</p>
+
+  <p>Linux GPIO alt sistemi ve pinctrl alt sistemi birbirine bağlıdır: <code class="inline">gpiod_request()</code> çağrıldığında pinctrl, ilgili pini GPIO fonksiyonuna geçirir. Bu entegrasyon <code class="inline">gpiochip_add_pin_range()</code> çağrısıyla kurulur; ardından <code class="inline">gpio_request_enable</code> callback otomatik tetiklenir.</p>
+
+  <h3>gpio_chip ve pinctrl entegrasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>my_pinctrl.c — gpio_chip entegrasyonu</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#include</span> &lt;linux/gpio/driver.h&gt;
+
+<span class="keyword">static int</span> my_gpio_direction_input(<span class="keyword">struct</span> gpio_chip *gc,
+                                    <span class="keyword">unsigned int</span>      offset)
+{
+    <span class="keyword">struct</span> my_pinctrl_priv *priv = gpiochip_get_data(gc);
+    <span class="keyword">u32</span> reg = readl(priv-&gt;base + GPIO_DIR_REG);
+    reg &amp;= ~BIT(offset);  <span class="cmt">/* 0 = input */</span>
+    writel(reg, priv-&gt;base + GPIO_DIR_REG);
+    <span class="keyword">return</span> <span class="num">0</span>;
+}
+
+<span class="keyword">static int</span> my_gpio_direction_output(<span class="keyword">struct</span> gpio_chip *gc,
+                                     <span class="keyword">unsigned int</span>      offset,
+                                     <span class="keyword">int</span>               value)
+{
+    <span class="keyword">struct</span> my_pinctrl_priv *priv = gpiochip_get_data(gc);
+    <span class="keyword">u32</span> reg;
+
+    <span class="cmt">/* Önce değeri ayarla, sonra output'a çevir (glitch önleme) */</span>
+    reg = readl(priv-&gt;base + GPIO_DATA_REG);
+    <span class="keyword">if</span> (value)
+        reg |= BIT(offset);
+    <span class="keyword">else</span>
+        reg &amp;= ~BIT(offset);
+    writel(reg, priv-&gt;base + GPIO_DATA_REG);
+
+    reg = readl(priv-&gt;base + GPIO_DIR_REG);
+    reg |= BIT(offset);   <span class="cmt">/* 1 = output */</span>
+    writel(reg, priv-&gt;base + GPIO_DIR_REG);
+    <span class="keyword">return</span> <span class="num">0</span>;
+}
+
+<span class="keyword">static int</span> my_gpio_get(<span class="keyword">struct</span> gpio_chip *gc, <span class="keyword">unsigned int</span> offset)
+{
+    <span class="keyword">struct</span> my_pinctrl_priv *priv = gpiochip_get_data(gc);
+    <span class="keyword">return</span> !!(readl(priv-&gt;base + GPIO_DATA_REG) &amp; BIT(offset));
+}
+
+<span class="keyword">static void</span> my_gpio_set(<span class="keyword">struct</span> gpio_chip *gc,
+                         <span class="keyword">unsigned int</span>      offset,
+                         <span class="keyword">int</span>               value)
+{
+    <span class="keyword">struct</span> my_pinctrl_priv *priv = gpiochip_get_data(gc);
+    <span class="keyword">u32</span> reg = readl(priv-&gt;base + GPIO_DATA_REG);
+    <span class="keyword">if</span> (value)
+        reg |= BIT(offset);
+    <span class="keyword">else</span>
+        reg &amp;= ~BIT(offset);
+    writel(reg, priv-&gt;base + GPIO_DATA_REG);
+}
+
+<span class="keyword">static int</span> my_gpio_request(<span class="keyword">struct</span> gpio_chip *gc, <span class="keyword">unsigned int</span> offset)
+{
+    <span class="cmt">/* pinctrl entegrasyonu: gpiochip_generic_request yeterli */</span>
+    <span class="keyword">return</span> gpiochip_generic_request(gc, offset);
+}
+
+<span class="keyword">static void</span> my_gpio_free(<span class="keyword">struct</span> gpio_chip *gc, <span class="keyword">unsigned int</span> offset)
+{
+    gpiochip_generic_free(gc, offset);
+}
+
+<span class="keyword">static int</span> my_pinctrl_probe(<span class="keyword">struct</span> platform_device *pdev)
+{
+    <span class="keyword">struct</span> my_pinctrl_priv *priv = /* ... init ... */
+    <span class="keyword">int</span> ret;
+
+    <span class="cmt">/* gpio_chip tanımı */</span>
+    priv-&gt;gc.label            = <span class="str">"my-soc-gpio"</span>;
+    priv-&gt;gc.parent           = &amp;pdev-&gt;dev;
+    priv-&gt;gc.owner            = THIS_MODULE;
+    priv-&gt;gc.base             = <span class="num">-1</span>;       <span class="cmt">/* otomatik numaralandırma */</span>
+    priv-&gt;gc.ngpio            = MY_GPIO_COUNT;
+    priv-&gt;gc.of_node          = pdev-&gt;dev.of_node;
+    priv-&gt;gc.request          = my_gpio_request;
+    priv-&gt;gc.free             = my_gpio_free;
+    priv-&gt;gc.direction_input  = my_gpio_direction_input;
+    priv-&gt;gc.direction_output = my_gpio_direction_output;
+    priv-&gt;gc.get              = my_gpio_get;
+    priv-&gt;gc.set              = my_gpio_set;
+
+    ret = devm_gpiochip_add_data(&amp;pdev-&gt;dev, &amp;priv-&gt;gc, priv);
+    <span class="keyword">if</span> (ret)
+        <span class="keyword">return</span> dev_err_probe(&amp;pdev-&gt;dev, ret,
+                             <span class="str">"gpiochip kaydi basarisiz\n"</span>);
+
+    <span class="cmt">/* pinctrl'i kaydet */</span>
+    priv-&gt;pctldev = devm_pinctrl_register(&amp;pdev-&gt;dev,
+                                           &amp;my_pinctrl_desc, priv);
+    <span class="keyword">if</span> (IS_ERR(priv-&gt;pctldev))
+        <span class="keyword">return</span> PTR_ERR(priv-&gt;pctldev);
+
+    <span class="cmt">/* GPIO ve pinctrl'i bağla: GPIO 0..N-1 → pin 0..N-1 eşleştirmesi */</span>
+    ret = gpiochip_add_pin_range(&amp;priv-&gt;gc,
+                                  dev_name(&amp;pdev-&gt;dev),
+                                  <span class="num">0</span>,           <span class="cmt">/* gpio offset */</span>
+                                  <span class="num">0</span>,           <span class="cmt">/* pin offset */</span>
+                                  MY_GPIO_COUNT);
+    <span class="keyword">if</span> (ret)
+        dev_warn(&amp;pdev-&gt;dev, <span class="str">"pin range eklenemedi: %d\n"</span>, ret);
+
+    <span class="keyword">return</span> <span class="num">0</span>;
+}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">ÖNEMLİ</div>
+    <p><code class="inline">gpiochip_add_pin_range()</code> çağrısının ardından <code class="inline">gpiod_request()</code> çağrıldığında pinctrl otomatik olarak <code class="inline">gpio_request_enable</code> callback'ini tetikler — bu da pini GPIO moduna alır. <code class="inline">gpiochip_generic_request()</code> kullanıldığında bu bağlantı otomatik kurulur.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>gpiochip_add_pin_range(): GPIO offset → pinctrl pin ID eşleştirmesi</li>
+      <li>gpiochip_generic_request / free: pinctrl gpio_request_enable callback'ini tetikler</li>
+      <li>gc.base = -1: GPIO numarası otomatik atanır (dinamik GPIO)</li>
+      <li>Entegrasyon sonrası: gpiod_request → pin GPIO fonksiyonuna otomatik geçer</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Durum yönetimi — default, sleep, idle state geçişleri</h2>
+  <p class="section-lead">Pinctrl state'lerinin yaşam döngüsü: framework otomasyonu ve sürücü taraflı manuel state geçişleri.</p>
+
+  <h3>State yaşam döngüsü</h3>
+
+  <div class="flow">
+    <pre>
+  probe()
+    |
+    v
+  [default state uygulanır]  ← framework otomatik yapar
+    |                           (pinctrl-names[0] = "default")
+    v
+  Normal çalışma
+    |
+    +-----------+
+    |           |
+  suspend()  runtime idle
+    |           |
+    v           v
+  [sleep]    [idle]      ← sürücü manuel seçer
+    |
+    v
+  resume()
+    |
+    v
+  [default state geri]   ← framework otomatik geri getirir
+    |
+    v
+  remove()
+    |
+    v
+  [state kaldırılır]
+    </pre>
+  </div>
+
+  <h3>Sürücü taraflı state yönetimi</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>my_uart.c — suspend/resume state geçişi</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">struct</span> my_uart_priv {
+    <span class="keyword">struct</span> pinctrl       *pc;
+    <span class="keyword">struct</span> pinctrl_state *default_state;
+    <span class="keyword">struct</span> pinctrl_state *sleep_state;
+    <span class="keyword">struct</span> pinctrl_state *idle_state;
+    <span class="cmt">/* ... */</span>
+};
+
+<span class="keyword">static int</span> my_uart_probe(<span class="keyword">struct</span> platform_device *pdev)
+{
+    <span class="keyword">struct</span> my_uart_priv *priv;
+    <span class="keyword">int</span> ret;
+
+    priv = devm_kzalloc(&amp;pdev-&gt;dev, <span class="keyword">sizeof</span>(*priv), GFP_KERNEL);
+    <span class="keyword">if</span> (!priv)
+        <span class="keyword">return</span> -ENOMEM;
+
+    priv-&gt;pc = devm_pinctrl_get(&amp;pdev-&gt;dev);
+    <span class="keyword">if</span> (IS_ERR(priv-&gt;pc))
+        <span class="keyword">return</span> dev_err_probe(&amp;pdev-&gt;dev, PTR_ERR(priv-&gt;pc),
+                             <span class="str">"pinctrl alinamadi\n"</span>);
+
+    <span class="cmt">/* default state — framework zaten uyguladı, handle'ı sakla */</span>
+    priv-&gt;default_state = pinctrl_lookup_state(priv-&gt;pc,
+                                                PINCTRL_STATE_DEFAULT);
+    <span class="keyword">if</span> (IS_ERR(priv-&gt;default_state))
+        <span class="keyword">return</span> dev_err_probe(&amp;pdev-&gt;dev,
+                             PTR_ERR(priv-&gt;default_state),
+                             <span class="str">"default state bulunamadi\n"</span>);
+
+    <span class="cmt">/* sleep state — opsiyonel */</span>
+    priv-&gt;sleep_state = pinctrl_lookup_state(priv-&gt;pc,
+                                              PINCTRL_STATE_SLEEP);
+    <span class="keyword">if</span> (IS_ERR(priv-&gt;sleep_state))
+        priv-&gt;sleep_state = NULL;
+
+    <span class="cmt">/* idle state — opsiyonel */</span>
+    priv-&gt;idle_state = pinctrl_lookup_state(priv-&gt;pc, <span class="str">"idle"</span>);
+    <span class="keyword">if</span> (IS_ERR(priv-&gt;idle_state))
+        priv-&gt;idle_state = NULL;
+
+    platform_set_drvdata(pdev, priv);
+    <span class="keyword">return</span> <span class="num">0</span>;
+}
+
+<span class="keyword">static int</span> my_uart_suspend(<span class="keyword">struct</span> device *dev)
+{
+    <span class="keyword">struct</span> my_uart_priv *priv = dev_get_drvdata(dev);
+
+    <span class="keyword">if</span> (priv-&gt;sleep_state)
+        <span class="keyword">return</span> pinctrl_select_state(priv-&gt;pc, priv-&gt;sleep_state);
+
+    <span class="keyword">return</span> <span class="num">0</span>;
+}
+
+<span class="keyword">static int</span> my_uart_resume(<span class="keyword">struct</span> device *dev)
+{
+    <span class="keyword">struct</span> my_uart_priv *priv = dev_get_drvdata(dev);
+    <span class="keyword">return</span> pinctrl_select_state(priv-&gt;pc, priv-&gt;default_state);
+}
+
+<span class="cmt">/* Runtime PM için idle state kullanımı */</span>
+<span class="keyword">static int</span> my_uart_runtime_suspend(<span class="keyword">struct</span> device *dev)
+{
+    <span class="keyword">struct</span> my_uart_priv *priv = dev_get_drvdata(dev);
+
+    <span class="keyword">if</span> (priv-&gt;idle_state)
+        pinctrl_select_state(priv-&gt;pc, priv-&gt;idle_state);
+
+    <span class="keyword">return</span> <span class="num">0</span>;
+}
+
+<span class="keyword">static const struct</span> dev_pm_ops my_uart_pm_ops = {
+    SET_SYSTEM_SLEEP_PM_OPS(my_uart_suspend, my_uart_resume)
+    SET_RUNTIME_PM_OPS(my_uart_runtime_suspend,
+                       my_uart_runtime_resume, NULL)
+};</code></pre>
+  </div>
+
+  <h3>State isimlerinin standartları</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>State ismi</th><th>Makro sabiti</th><th>Uygulama zamanı</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>"default"</td><td>PINCTRL_STATE_DEFAULT</td><td>probe() öncesi framework otomasyonu</td></tr>
+        <tr><td>"sleep"</td><td>PINCTRL_STATE_SLEEP</td><td>system suspend — enerji tasarrufu</td></tr>
+        <tr><td>"idle"</td><td>(string sabit)</td><td>runtime PM idle — düşük aktivite</td></tr>
+        <tr><td>"init"</td><td>(string sabit)</td><td>bootloader sonrası ilk init</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">GÜÇ TASARRUFU</div>
+    <p>Uyku sırasında pin'leri GPIO moduna alıp pull-down yapmak <code class="inline">sleep</code> state'inin en yaygın kullanım amacıdır. Floating pin'ler yüksek frekansla toggling yaparak önemli uyku akımı tüketimine yol açabilir — özellikle uzun hat veya kapasitif yük olan pin'lerde bu 50–200 µA düzeyinde fazladan akıma neden olur.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>default: framework tarafından probe öncesi otomatik uygulanır</li>
+      <li>sleep: system suspend callback'inde sürücü manuel seçer; floating önleme</li>
+      <li>idle: runtime PM için — periyodik aktivite olmayan dönemlerde akım tasarrufu</li>
+      <li>pinctrl_lookup_state + pinctrl_select_state: sürücü taraflı state geçiş API</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Hata ayıklama — debugfs pinctrl/, pin_dump</h2>
+  <p class="section-lead">/sys/kernel/debug/pinctrl/ arayüzü ve çalışan sistemde pin konfigürasyonlarını doğrulama yöntemleri.</p>
+
+  <h3>debugfs pinctrl/ dosyaları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — debugfs pinctrl/ keşfi</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># debugfs mount</span>
+mount -t debugfs none /sys/kernel/debug
+
+<span class="cmt"># Tüm pinctrl controller'larını listele</span>
+ls /sys/kernel/debug/pinctrl/
+<span class="cmt"># Çıktı: my-soc-pinctrl  pinctrl-maps</span>
+
+<span class="cmt"># Controller içindeki dosyalar</span>
+ls /sys/kernel/debug/pinctrl/my-soc-pinctrl/
+<span class="cmt"># gpio-ranges  pingroups  pinmux-functions  pinmux-pins  pins</span>
+
+<span class="cmt"># Tüm pin'lerin listesi ve ID'leri</span>
+cat /sys/kernel/debug/pinctrl/my-soc-pinctrl/pins
+<span class="cmt"># Çıktı:</span>
+<span class="cmt"># registered pins: 128</span>
+<span class="cmt"># pin 0 (PA0) my-soc-pinctrl</span>
+<span class="cmt"># pin 1 (PA1) my-soc-pinctrl</span>
+<span class="cmt"># pin 2 (PA2) my-soc-pinctrl</span>
+<span class="cmt"># ...</span>
+
+<span class="cmt"># Pin grupları</span>
+cat /sys/kernel/debug/pinctrl/my-soc-pinctrl/pingroups
+<span class="cmt"># Çıktı:</span>
+<span class="cmt"># registered pin groups:</span>
+<span class="cmt"># group: uart0_grp</span>
+<span class="cmt"># pin 2 (PA2)</span>
+<span class="cmt"># pin 3 (PA3)</span>
+<span class="cmt"># pin 4 (PA4)</span>
+<span class="cmt"># pin 5 (PA5)</span>
+
+<span class="cmt"># Fonksiyon listesi</span>
+cat /sys/kernel/debug/pinctrl/my-soc-pinctrl/pinmux-functions
+<span class="cmt"># Çıktı:</span>
+<span class="cmt"># function: uart0, groups = [ uart0_grp ]</span>
+<span class="cmt"># function: spi1,  groups = [ spi1_grp  ]</span></code></pre>
+  </div>
+
+  <h3>pinmux-pins — hangi pin neye bağlanmış?</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — pinmux-pins ve pin_dump</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Mux edilmiş pin'ler — en yararlı debug çıktısı</span>
+cat /sys/kernel/debug/pinctrl/my-soc-pinctrl/pinmux-pins
+<span class="cmt"># Çıktı:</span>
+<span class="cmt"># Pinmux settings per pin</span>
+<span class="cmt"># Format: pin (name): mux_owner gpio_owner hog?</span>
+<span class="cmt"># pin 2 (PA2): uart0 (GPIO UNCLAIMED) function uart0 group uart0_grp</span>
+<span class="cmt"># pin 3 (PA3): uart0 (GPIO UNCLAIMED) function uart0 group uart0_grp</span>
+<span class="cmt"># pin 10 (PB2): spi1 (GPIO UNCLAIMED) function spi1 group spi1_grp</span>
+<span class="cmt"># pin 7 (PA7): (MUX UNCLAIMED) (GPIO UNCLAIMED)</span>
+
+<span class="cmt"># GPIO range bilgisi</span>
+cat /sys/kernel/debug/pinctrl/my-soc-pinctrl/gpio-ranges
+<span class="cmt"># Çıktı:</span>
+<span class="cmt"># GPIO ranges handled:</span>
+<span class="cmt"># 0: my-soc-gpio GPIOS [480 - 607] PINS [0 - 127]</span>
+
+<span class="cmt"># pinctrl-maps: tüm device-state eşleştirmeleri</span>
+cat /sys/kernel/debug/pinctrl/pinctrl-maps
+<span class="cmt"># Çıktı:</span>
+<span class="cmt"># Pinctrl maps:</span>
+<span class="cmt"># device uart0</span>
+<span class="cmt"># state default</span>
+<span class="cmt"># type MUX_GROUP (2)</span>
+<span class="cmt"># controlling device my-soc-pinctrl</span>
+<span class="cmt"># group uart0_grp</span>
+<span class="cmt"># function uart0</span></code></pre>
+  </div>
+
+  <h3>Yaygın sorunlar ve çözümleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Belirti</th><th>Olası neden</th><th>Kontrol</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>-EPROBE_DEFER</td><td>pinctrl controller sürücüsü yüklenmemiş</td><td>dmesg; pinctrl compatible string DTS eşleşmesi</td></tr>
+        <tr><td>-EBUSY pin talep hatası</td><td>Başka sürücü pini mux etmiş (strict=true)</td><td>pinmux-pins dosyası; mux_owner alanı</td></tr>
+        <tr><td>default state uygulanamıyor</td><td>DTS'te pinctrl-names / pinctrl-0 eksik</td><td>DTS doğrulama; pinctrl-maps çıktısı</td></tr>
+        <tr><td>GPIO çalışmıyor</td><td>gpiochip_add_pin_range eksik</td><td>gpio-ranges dosyası; pin GPIO modunda mı?</td></tr>
+        <tr><td>set_mux başarısız</td><td>func_selector geçersiz aralıkta</td><td>pinmux-functions listesi; sürücü array sınırı</td></tr>
+        <tr><td>Pull-up etkisiz</td><td>pinconf_ops is_generic eksik</td><td>is_generic=true; pinconf_generic_* helpers</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Kernel config gereksinimleri</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>Kconfig — pinctrl</span><span class="dot">●</span></div>
+    <pre><code>CONFIG_PINCTRL=y
+CONFIG_PINMUX=y
+CONFIG_PINCONF=y
+CONFIG_GENERIC_PINCTRL_GROUPS=y
+CONFIG_GENERIC_PINMUX_FUNCTIONS=y
+CONFIG_GENERIC_PINCONF=y
+CONFIG_DEBUG_FS=y
+<span class="cmt"># Vendor-specific sürücü</span>
+<span class="cmt"># CONFIG_PINCTRL_MYSOC=y</span></code></pre>
+  </div>
+
+  <h3>Pin state doğrulama scripti</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — pin state doğrulama</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">#!/bin/sh
+# Pin durumunu kontrol et</span>
+PCTRL=/sys/kernel/debug/pinctrl/my-soc-pinctrl
+
+<span class="cmt"># UART0 pinlerinin beklenen mux'ta olduğunu doğrula</span>
+<span class="keyword">for</span> pin <span class="keyword">in</span> <span class="str">"PA2"</span> <span class="str">"PA3"</span> <span class="str">"PA4"</span> <span class="str">"PA5"</span>; <span class="keyword">do</span>
+    result=$(grep -w $pin $PCTRL/pinmux-pins)
+    <span class="keyword">if</span> echo $result | grep -q <span class="str">"uart0"</span>; <span class="keyword">then</span>
+        echo <span class="str">"OK: $pin -> uart0"</span>
+    <span class="keyword">else</span>
+        echo <span class="str">"HATA: $pin uart0'a baglanmamis: $result"</span>
+    <span class="keyword">fi</span>
+<span class="keyword">done</span>
+
+<span class="cmt"># Talep edilmemiş kritik pinleri bul</span>
+echo <span class="str">"Talep edilmemis pinler:"</span>
+grep <span class="str">"UNCLAIMED.*UNCLAIMED"</span> $PCTRL/pinmux-pins | head -20</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>pins: pin ID ve isim listesi; pingroups: her gruptaki pin'ler</li>
+      <li>pinmux-pins: mux_owner + gpio_owner — en kritik debug çıktısı</li>
+      <li>pinctrl-maps: device-state-group-function eşleştirmelerinin tam listesi</li>
+      <li>-EBUSY: strict=true ile çakışma tespiti; pinmux-pins ile owner belirleme</li>
+      <li>Uyku akımı: unclaimed floating pin'ler — pinmux-pins UNCLAIMED satırlarını takip et</li>
+    </ul>
+  </div>
+</section>
+
+</main>

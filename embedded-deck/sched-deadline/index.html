@@ -1,0 +1,903 @@
+---
+layout: tutorial
+title: "SCHED_DEADLINE — Gerçek Zamanlı Görev Zamanlayıcı"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>GERÇEK ZAMANLILIK</span>
+    <span>2026</span>
+  </div>
+  <h1>SCHED_DEADLINE<br><em>Gerçek Zamanlı Görev Zamanlayıcı</em></h1>
+  <p class="subtitle">EDF algoritmasına dayalı SCHED_DEADLINE politikasının parametreleri, admission control ve gömülü gerçek zamanlı görev tasarımı.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">EDF teorisi — Earliest Deadline First</a></li>
+    <li><a href="#s1">SCHED_DEADLINE parametreleri</a></li>
+    <li><a href="#s2">Görev oluşturma — sched_setattr syscall</a></li>
+    <li><a href="#s3">Admission control mekanizması</a></li>
+    <li><a href="#s4">CPU pinning ve bant genişliği yönetimi</a></li>
+    <li><a href="#s5">GRUB — Kullanılmayan Bant Genişliğini Geri Kazanma</a></li>
+    <li><a href="#s6">SCHED_DEADLINE ve SCHED_FIFO karşılaştırması</a></li>
+    <li><a href="#s7">Gömülü senaryo örneği</a></li>
+    <li><a href="#s8">Hata ayıklama ve izleme</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> EDF teorisi — Earliest Deadline First</h2>
+  <p class="section-lead">SCHED_DEADLINE politikasının temeli, 1973 yılında Liu ve Layland tarafından yayımlanan klasik gerçek zamanlı zamanlama teorisine dayanır. EDF algoritması, dinamik öncelikli optimal bir zamanlayıcıdır.</p>
+
+  <h3>EDF Algoritması</h3>
+  <p>EDF (Earliest Deadline First), hazır görevler arasında en erken mutlak son tarihe (absolute deadline) sahip olana CPU'yu verir. Öncelikler statik değil; her an yeniden hesaplanır. Bu dinamik yapı, EDF'yi sabit öncelikli algoritmalardan (Rate Monotonic, Deadline Monotonic) daha esnek kılar.</p>
+
+  <div class="flow">
+    <pre>
+t=0  Görev A hazır (deadline t=10)
+     Görev B hazır (deadline t=15)
+     Görev C hazır (deadline t=8)
+
+EDF kararı: C çalıştır (deadline=8 en küçük)
+
+t=3  C tamamlandı
+     EDF kararı: A çalıştır (deadline=10 &lt; 15)
+
+t=7  A tamamlandı
+     EDF kararı: B çalıştır (deadline=15)
+
+Sonuç: Tüm görevler kendi son tarihlerinden önce tamamlandı</pre>
+  </div>
+
+  <h3>Liu ve Layland Teoremi — Utilization Bound</h3>
+  <p>Liu ve Layland (1973), periyodik görevler için EDF'nin kullanılabilirlik sınırını kanıtladı. N görev için toplam işlemci kullanımı aşağıdaki koşulu sağladığı sürece tüm son tarihler karşılanır:</p>
+
+  <div class="flow">
+    <pre>
+U = toplam(Ci / Ti) &lt;= 1
+
+Ci: Görev i'nin en kötü durum çalışma süresi (WCET)
+Ti: Görev i'nin periyodu
+U: Toplam işlemci kullanımı
+
+Örnek:
+  Görev A: C=2ms, T=10ms  -&gt; U_A = 0.20 (yuzde 20)
+  Görev B: C=3ms, T=15ms  -&gt; U_B = 0.20 (yuzde 20)
+  Görev C: C=1ms, T=5ms   -&gt; U_C = 0.20 (yuzde 20)
+  Toplam U = 0.60          -&gt; EDF planlanabilir (0.60 &lt;= 1.0)</pre>
+  </div>
+
+  <h3>Rate Monotonic ile Karşılaştırma</h3>
+  <p>Sabit öncelikli Rate Monotonic (RM) algoritmasının utilization bound'u N görev için yaklaşık <code>N * (2^(1/N) - 1)</code> formülüyle hesaplanır; N sonsuza giderken bu değer ln(2) ≈ 0.69'a yaklaşır. EDF ise teorik olarak 1.0'a (yüzde 100 CPU kullanımı) kadar planlanabilir yük destekler.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Algoritma</th><th>Öncelik Tipi</th><th>Utilization Bound</th><th>Aşım Durumu</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Rate Monotonic (RM)</td><td>Statik (periyoda göre)</td><td>~0.69 (N sonsuza giderken)</td><td>Son tarih kaçırılabilir ama deterministik</td></tr>
+        <tr><td>Deadline Monotonic (DM)</td><td>Statik (deadline'a göre)</td><td>RM'den biraz yüksek</td><td>Deterministik</td></tr>
+        <tr><td>EDF (SCHED_DEADLINE)</td><td>Dinamik</td><td>1.0 (teorik)</td><td>Herhangi bir görev kaçırabilir (domino etkisi)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>EDF'nin Pratik Sınırları</h3>
+  <p>Teorik mükemmelliğine karşın EDF'nin uygulamada dikkat gerektiren yanları vardır. U &gt; 1 durumunda EDF'de herhangi bir görev son tarihini kaçırabilirken RM'de yalnızca düşük öncelikli görevler kaçırır. Öte yandan WCET tahminindeki hatalar, tüm sistemin kararlılığını etkileyebilir. Linux'ta SCHED_DEADLINE bu sorunları admission control (kabul denetimi) mekanizmasıyla hafifletir.</p>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> SCHED_DEADLINE parametreleri</h2>
+  <p class="section-lead">SCHED_DEADLINE, görevin zamanlama karakterini üç parametre üzerinden tanımlar. Bu parametreler CBS (Constant Bandwidth Server) algoritmasının implementasyonunda kullanılır.</p>
+
+  <h3>sched_attr Yapısı</h3>
+  <pre><code>#include &lt;linux/sched/types.h&gt;
+
+struct sched_attr {
+    __u32 size;            /* struct boyutu (version uyumluluğu) */
+    __u32 sched_policy;    /* SCHED_DEADLINE = 6 */
+    __u64 sched_flags;     /* Ek bayraklar */
+    __s32 sched_nice;      /* SCHED_OTHER için (DL'de kullanılmaz) */
+    __u32 sched_priority;  /* RT öncelik (DL'de 0 olmak zorunda) */
+
+    /* SCHED_DEADLINE özel parametreler (nanosaniye cinsinden): */
+    __u64 sched_runtime;   /* Ct: En kötü durum çalışma süresi */
+    __u64 sched_deadline;  /* Dt: Göreli son tarih */
+    __u64 sched_period;    /* Pt: Periyot */
+};</code></pre>
+
+  <h3>Üç Temel Parametre</h3>
+  <div class="params">
+    <div class="param">
+      <span class="name">sched_runtime (Ct)</span>
+      <span class="desc">Görevin her periyotta CPU'da çalışmayı talep ettiği maksimum süre (nanosaniye). WCET (Worst Case Execution Time) ölçümüne dayanmalıdır. Bu süre tüketildiğinde görev throttle edilir (sched_deadline periyodun sonuna kadar kısıtlanır).</span>
+    </div>
+    <div class="param">
+      <span class="name">sched_deadline (Dt)</span>
+      <span class="desc">Görevin aktivasyonundan itibaren çalışmasını tamamlaması gereken göreli süre (nanosaniye). EDF öncelik hesabında kullanılan değer budur: mutlak_deadline = aktivasyon_zamanı + sched_deadline. sched_deadline &lt;= sched_period olmak zorundadır.</span>
+    </div>
+    <div class="param">
+      <span class="name">sched_period (Pt)</span>
+      <span class="desc">Görevin tekrar eden aktivasyon periyodu (nanosaniye). sched_runtime / sched_period oranı görevin CPU kullanım yoğunluğunu verir. sched_period == 0 ise sched_deadline değeri kullanılır.</span>
+    </div>
+  </div>
+
+  <h3>Parametre İlişkileri ve Kısıtlar</h3>
+  <div class="flow">
+    <pre>
+sched_runtime &lt;= sched_deadline &lt;= sched_period
+
+Görev aktivasyonu (t=0):
+|&lt;---- sched_runtime ----&gt;|
+|&lt;---------- sched_deadline ----------&gt;|
+|&lt;-------------- sched_period ---------------&gt;|
+
+CBS sunucu modeli:
+  - Bütçe (budget) = sched_runtime
+  - Yenileme periyodu = sched_period
+  - Deadline = aktivasyon + sched_deadline
+  - Budget tükenince: throttle (periyot sonuna kadar bekle)</pre>
+  </div>
+
+  <h3>Parametre Seçim Rehberi</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Parametre</th><th>Önerilen Değer</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>sched_runtime</td><td>WCET * 1.1 - 1.5</td><td>WCET'in biraz üstünde bir güvenlik payı. Fazla yüksek vermek CPU israfına yol açar.</td></tr>
+        <tr><td>sched_deadline</td><td>= sched_period (çoğunlukla)</td><td>Implicit deadline: deadline == period. Daha sıkı son tarih gerekiyorsa daha küçük verin.</td></tr>
+        <tr><td>sched_period</td><td>Görevin fiziksel aktivasyon süresi</td><td>Motor kontrol: 1ms, ses işleme: 5-10ms, video: 16ms (60 Hz).</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> Görev oluşturma — sched_setattr syscall</h2>
+  <p class="section-lead"><code>sched_setattr</code> syscall'ı, SCHED_DEADLINE politikasını bir işleme veya iş parçacığına atar. Bu işlem CAP_SYS_NICE ayrıcalığı gerektirir.</p>
+
+  <h3>syscall Kullanımı</h3>
+  <pre><code>#include &lt;linux/sched/types.h&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;string.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;stdio.h&gt;
+
+/* Glibc henüz sched_setattr'ı doğrudan sunmayabilir */
+static int sched_setattr(pid_t pid,
+                         const struct sched_attr *attr,
+                         unsigned int flags)
+{
+    return syscall(SYS_sched_setattr, pid, attr, flags);
+}
+
+static int sched_getattr(pid_t pid,
+                         struct sched_attr *attr,
+                         unsigned int size,
+                         unsigned int flags)
+{
+    return syscall(SYS_sched_getattr, pid, attr, size, flags);
+}</code></pre>
+
+  <h3>Motor Kontrol Görevi Örneği</h3>
+  <pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;time.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;linux/sched/types.h&gt;
+
+#define NSEC_PER_MSEC 1000000ULL
+
+/* Motor kontrol döngüsü: 1 ms periyot, 300 us WCET */
+static struct sched_attr motor_ctrl_attr = {
+    .size          = sizeof(struct sched_attr),
+    .sched_policy  = SCHED_DEADLINE,
+    .sched_flags   = 0,
+    .sched_runtime  = 300 * 1000ULL,      /* 300 us cinsinden ns */
+    .sched_deadline = 1 * NSEC_PER_MSEC,  /* 1 ms */
+    .sched_period   = 1 * NSEC_PER_MSEC,  /* 1 ms */
+};
+
+static void motor_control_task(void)
+{
+    struct timespec next_wakeup;
+    int ret;
+
+    /* SCHED_DEADLINE politikasını uygula (PID=0: kendisi) */
+    ret = sched_setattr(0, &amp;motor_ctrl_attr, 0);
+    if (ret &lt; 0) {
+        perror("sched_setattr");
+        if (errno == EPERM)
+            fprintf(stderr, "CAP_SYS_NICE gerekli\n");
+        if (errno == EBUSY)
+            fprintf(stderr, "Admission control reddetti\n");
+        exit(1);
+    }
+
+    printf("Motor kontrol gorevi SCHED_DEADLINE modunda\n");
+
+    while (1) {
+        /* Gerçek zamanlı iş: motor PWM güncelleme */
+        update_motor_pwm();
+        read_encoder_feedback();
+        compute_pid_output();
+
+        /* Bir sonraki döneme kadar bekle */
+        /* sched_yield() SCHED_DEADLINE altında CBS süresini
+           tüketmeden sonraki periyoda geçişi tetikler */
+        sched_yield();
+    }
+}
+
+int main(void)
+{
+    motor_control_task();
+    return 0;
+}</code></pre>
+
+  <h3>İş Parçacığı (Thread) ile Kullanım</h3>
+  <pre><code>#include &lt;pthread.h&gt;
+
+static void *rt_thread_func(void *arg)
+{
+    struct sched_attr attr;
+    memset(&amp;attr, 0, sizeof(attr));
+    attr.size           = sizeof(attr);
+    attr.sched_policy   = SCHED_DEADLINE;
+    attr.sched_runtime  = 500000ULL;      /* 500 us */
+    attr.sched_deadline = 2000000ULL;     /* 2 ms */
+    attr.sched_period   = 5000000ULL;     /* 5 ms */
+
+    /* Mevcut thread'e uygula */
+    if (sched_setattr(0, &amp;attr, 0) &lt; 0) {
+        perror("sched_setattr");
+        return NULL;
+    }
+
+    while (!should_exit) {
+        do_realtime_work();
+        sched_yield();  /* Periyot sonu: CPU'yu bırak */
+    }
+    return NULL;
+}
+
+int main(void)
+{
+    pthread_t tid;
+    pthread_attr_t tattr;
+
+    pthread_attr_init(&amp;tattr);
+    /* SCHED_DEADLINE thread'lerin önden oluşturulmuş stack'i olmalı */
+    pthread_attr_setstacksize(&amp;tattr, 1024 * 1024);  /* 1 MB */
+    pthread_create(&amp;tid, &amp;tattr, rt_thread_func, NULL);
+    pthread_join(tid, NULL);
+    return 0;
+}</code></pre>
+
+  <h3>CAP_SYS_NICE Gerekliliği</h3>
+  <p>SCHED_DEADLINE, yanlış parametrelerle sistem kararlılığını bozabileceğinden root veya <code>CAP_SYS_NICE</code> kapasitesi gerektirir. Gömülü sistemlerde bu kapasiteyi özel bir hizmet daemon'ına vermek için:</p>
+  <pre><code># systemd service dosyasında:
+[Service]
+AmbientCapabilities=CAP_SYS_NICE
+CapabilityBoundingSet=CAP_SYS_NICE
+
+# Veya setcap ile ikili dosyaya atama:
+setcap cap_sys_nice+ep /usr/bin/motor_ctrl
+
+# Doğrulama:
+getcap /usr/bin/motor_ctrl</code></pre>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> Admission control mekanizması</h2>
+  <p class="section-lead">SCHED_DEADLINE, CPU aşırı yüklenmesini önlemek için görev kabul denetimi (admission control) uygular. Yeni bir görev eklendiğinde kernel, toplam kullanımın izin verilen üst sınırı aşıp aşmadığını kontrol eder.</p>
+
+  <h3>Utilization Hesabı</h3>
+  <p>Her SCHED_DEADLINE görevi bir kullanım katkısı (utilization contribution) ekler. Bu katkı, görevin bant genişliğidir:</p>
+
+  <div class="flow">
+    <pre>
+Görev katkısı = sched_runtime / sched_period
+
+Sistem toplam kullanımı:
+U_toplam = toplam(runtime_i / period_i), tüm DL görevleri için
+
+Kabul koşulu: U_toplam &lt;= dl_bw.bw / 2^BW_SHIFT
+
+dl_bw.bw varsayılan = (1 - 0.03) * 2^BW_SHIFT
+  yani CPU kapasitesinin yuzde 97'si DL görevlerine ayrılır
+  yuzde 3 OS overhead için rezerve</pre>
+  </div>
+
+  <h3>Sistem Reddi Davranışı</h3>
+  <p>Admission control başarısız olduğunda <code>sched_setattr</code> çağrısı <code>EBUSY</code> hatasıyla döner. Görev mevcut zamanlama politikasında (genellikle SCHED_NORMAL) kalmaya devam eder:</p>
+  <pre><code>ret = sched_setattr(0, &amp;attr, 0);
+if (ret &lt; 0) {
+    if (errno == EBUSY) {
+        /* Admission control reddi:
+         * Toplam DL kullanımı sınırı aştı.
+         * Seçenekler:
+         *   1. runtime'ı azalt
+         *   2. period'u artır
+         *   3. Başka bir görevi kaldır/azalt
+         */
+        fprintf(stderr, "DL admission control reddi: "
+                "toplam kullanim siniri asildi\n");
+    } else if (errno == EINVAL) {
+        /* Parametre geçersiz: runtime &gt; deadline vb. */
+        fprintf(stderr, "Gecersiz DL parametresi\n");
+    }
+    return -1;
+}</code></pre>
+
+  <h3>Admission Control Sınırlarını Görüntüleme</h3>
+  <pre><code># Sistem geneli DL bant genişliği limiti:
+cat /proc/sys/kernel/sched_rt_runtime_us
+# -1: sınırsız
+# 950000: toplam RT/DL görevleri maks 950ms/saniye (yuzde 95)
+
+cat /proc/sys/kernel/sched_rt_period_us
+# 1000000 (1 saniye)
+
+# Admission oranı: sched_rt_runtime / sched_rt_period
+# 950000 / 1000000 = 0.95 = yuzde 95
+
+# Mevcut DL kullanımını görüntüle (/proc veya ftrace ile):
+cat /proc/sched_debug | grep -A5 "dl_bw"</code></pre>
+
+  <h3>Admission Control Sınırını Ayarlama</h3>
+  <pre><code># DL + RT görevlerin toplamda CPU'nun yüzde 90'ını kullanmasına izin ver:
+echo 900000 &gt; /proc/sys/kernel/sched_rt_runtime_us
+
+# Sınırsız mod (üretimde önerilmez — sistem kilitlenebilir):
+echo -1 &gt; /proc/sys/kernel/sched_rt_runtime_us
+
+# CPU başına admission limit (NUMA/SMP sistemler):
+# /proc/sys/kernel/sched_rt_* değerleri sistemin tamamına uygulanır
+# Per-CPU limit için cpuset + dl_bw kombinasyonu gerekir</code></pre>
+
+  <h3>Admission Control Örnek Hesabı</h3>
+  <div class="flow">
+    <pre>
+Mevcut sistem: 4 çekirdek, sched_rt_runtime_us=950000
+
+Görev A: runtime=2ms, period=10ms  -&gt; katkı = 0.20
+Görev B: runtime=3ms, period=15ms  -&gt; katkı = 0.20
+Görev C: runtime=1ms, period=5ms   -&gt; katkı = 0.20
+
+Toplam mevcut U = 0.60
+
+Yeni görev D: runtime=3ms, period=8ms -&gt; katkı = 0.375
+Toplam olurdu: 0.60 + 0.375 = 0.975 &gt; 0.95 (limit)
+
+Sonuç: EBUSY — Görev D reddedildi
+
+Düzeltme: Görev D: runtime=3ms, period=10ms -&gt; katkı = 0.30
+Toplam: 0.60 + 0.30 = 0.90 &lt;= 0.95
+
+Sonuç: Kabul edildi</pre>
+  </div>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> CPU pinning ve bant genişliği yönetimi</h2>
+  <p class="section-lead">Çok çekirdekli gömülü sistemlerde SCHED_DEADLINE görevlerini belirli CPU'lara bağlamak hem öngörülebilirliği artırır hem de bant genişliği yönetimini kolaylaştırır.</p>
+
+  <h3>SCHED_DEADLINE ve CPU Pinning</h3>
+  <p>SCHED_DEADLINE görevleri varsayılan olarak tüm CPU'lara migrate edebilir. Ancak gerçek zamanlı sistemlerde göçü (migration) sınırlamak, önbellek tutarlılığı ve gecikme öngörülebilirliği açısından avantajlıdır.</p>
+
+  <pre><code>#include &lt;sched.h&gt;
+
+/* CPU 2 ve 3'e SCHED_DEADLINE görevi bağla */
+cpu_set_t cpus;
+CPU_ZERO(&amp;cpus);
+CPU_SET(2, &amp;cpus);
+CPU_SET(3, &amp;cpus);
+
+/* Önce affinity ayarla */
+if (sched_setaffinity(0, sizeof(cpus), &amp;cpus) &lt; 0) {
+    perror("sched_setaffinity");
+    return -1;
+}
+
+/* Sonra SCHED_DEADLINE uygula */
+struct sched_attr attr = {
+    .size           = sizeof(attr),
+    .sched_policy   = SCHED_DEADLINE,
+    .sched_runtime  = 1000000ULL,   /* 1 ms */
+    .sched_deadline = 5000000ULL,   /* 5 ms */
+    .sched_period   = 5000000ULL,   /* 5 ms */
+};
+
+if (sched_setattr(0, &amp;attr, 0) &lt; 0) {
+    perror("sched_setattr");
+    return -1;
+}</code></pre>
+
+  <h3>cpuset ile İzole CPU Havuzu</h3>
+  <p>cgroup v1 cpuset veya cgroup v2 cpuset.cpus ile belirli CPU'ları yalnızca gerçek zamanlı görevlere ayırmak mümkündür. Bu yaklaşım, yönetim görevleri ve kesintilerin RT çekirdeklere girmesini engeller:</p>
+  <pre><code># cgroup v1 ile RT CPU havuzu oluşturma:
+mkdir /sys/fs/cgroup/cpuset/realtime
+echo 2-3 &gt; /sys/fs/cgroup/cpuset/realtime/cpuset.cpus
+echo 0   &gt; /sys/fs/cgroup/cpuset/realtime/cpuset.mems
+echo 1   &gt; /sys/fs/cgroup/cpuset/realtime/cpuset.cpu_exclusive
+
+# PID'yi RT grubuna ekle:
+echo MOTOR_CTRL_PID &gt; /sys/fs/cgroup/cpuset/realtime/cgroup.procs
+
+# CPU 2 ve 3'ü genel zamanlayıcıdan izole et (önyükleme parametresi):
+# isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3</code></pre>
+
+  <h3>dl_bw.bw — Per-CPU Bant Genişliği Limiti</h3>
+  <p>Admission control, SCHED_DEADLINE görevlerinin CPU başına tüketebileceği maksimum bant genişliğini <code>dl_bw</code> yapısıyla takip eder. cpuset ile birden fazla CPU'yu bir göreve tahsis ettiğinizde, toplam bant genişliği o CPU'ların sayısıyla çarpılır:</p>
+  <pre><code>/* Çekirdek içi dl_bw yapısı (basitleştirilmiş) */
+struct dl_bw {
+    raw_spinlock_t lock;
+    u64 bw;     /* Maksimum izin verilen toplam bant genişliği */
+    u64 total_bw; /* Mevcut kullanılan toplam bant genişliği */
+};
+
+/* Per-root-domain bant genişliği kontrolü:
+ * 2 CPU'lu bir root domain için bant genişliği 2x artar.
+ * Gorev affinity 2 CPU'ya yayılırsa 2x bant genişliğinden yararlanır.
+ */</code></pre>
+
+  <h3>/proc/sys/kernel/sched_rt_* Parametreleri</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Parametre</th><th>Varsayılan</th><th>Açıklama</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>sched_rt_period_us</td><td>1000000 (1 s)</td><td>RT/DL bant genişliği ölçüm periyodu (mikrosaniye)</td></tr>
+        <tr><td>sched_rt_runtime_us</td><td>950000 (950 ms)</td><td>Periyot başına RT/DL görevlere ayrılan maksimum CPU süresi. -1 = sınırsız</td></tr>
+        <tr><td>sched_deadline_period</td><td>Görev başına</td><td>SCHED_DEADLINE görevine özgü; sched_setattr ile ayarlanır</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>CPU İzolasyonu ve Kesinti Denetimi</h3>
+  <pre><code># Önyükleme zamanı tam izolasyon (Yocto/Buildroot bootargs):
+isolcpus=2,3      # CPU 2,3 genel zamanlayıcıdan çıkar
+nohz_full=2,3     # Zamanlayıcı tick'i devre dışı (tickless)
+rcu_nocbs=2,3     # RCU callback'leri bu CPU'lara gönderilmez
+
+# Çalışma zamanında donanım kesintilerini CPU 0,1'e yönlendir:
+for irq in /proc/irq/*/smp_affinity; do
+    echo 3 &gt; $irq 2&gt;/dev/null  /* CPU 0 ve 1 (binary 11) */
+done
+
+# RT görevin CPU 2'de kesintisiz çalıştığını doğrula:
+taskset -p MOTOR_CTRL_PID
+cat /proc/MOTOR_CTRL_PID/status | grep Cpus_allowed</code></pre>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> GRUB — Kullanılmayan Bant Genişliğini Geri Kazanma</h2>
+  <p class="section-lead">GRUB (Greedy Reclaiming of Unused Bandwidth), SCHED_DEADLINE görevleri bütçelerini tam olarak tüketmediğinde kalan bant genişliğini diğer görevlere aktaran bir mekanizmadır.</p>
+
+  <h3>GRUB Çalışma Prensibi</h3>
+  <p>CBS (Constant Bandwidth Server) modelinde her görevin bir bütçesi (runtime) ve bir yenileme periyodu (period) vardır. Görev, bütçesini tükenmeden işini bitirip <code>sched_yield()</code> çağırdığında kalan bütçe atıl kalabilir. GRUB bu atıl bütçeyi sisteme geri kazandırır.</p>
+
+  <div class="flow">
+    <pre>
+Görev A: runtime=3ms, period=10ms
+t=0: Görev A çalışmaya başlar
+t=1: Görev A işini tamamlar (1ms kullandı, 2ms kaldı)
+     sched_yield() çağrılır
+
+GRUB etkin değilse:
+  Kalan 2ms bütçe heba olur, toplam CPU kullanımı yuzde 10 olur
+
+GRUB etkin (aktif bant genişliği takibi):
+  CBS aktif kalır, kalan bütçe düşük öncelikli görevlere sunulur
+  Gerçek CPU kullanımı yuzde 10'un altında, sistem daha verimli</pre>
+  </div>
+
+  <h3>Aktif Bant Genişliği (Active Bandwidth)</h3>
+  <p>Linux'ta GRUB, <strong>aktif bant genişliği</strong> (dbf_active) kavramıyla uygulanır. Yalnızca çalışmak isteyen (runnable) görevlerin bant genişliği hesaba katılır. Bekleyen bir görevin bant genişliği aktif değildir ve diğer görevler bu fırsatı değerlendirmek için zamanlayıcı tarafından yönlendirilir:</p>
+  <pre><code>/* Kernel içi GRUB mantığı (basitleştirilmiş):
+ *
+ * Her döngüde aktif_bw hesaplanır:
+ *   aktif_bw = toplam(runtime_i / period_i), yalnızca runnable DL görevleri
+ *
+ * Mevcut görev çalışırken bütçesi şu hızda azalır:
+ *   azalma_hizi = aktif_bw / toplam_bw
+ *
+ * aktif_bw &lt; toplam_bw ise bütçe daha yavaş tükenir
+ * (bant genişliği "geri kazanılıyor" demektir)
+ */</code></pre>
+
+  <h3>GRUB Etkisini Gözlemleme</h3>
+  <pre><code># Bir DL görevinin bütçe tüketim hızını izle:
+# /proc/PID/sched çıktısında se.sum_exec_runtime'ı takip et
+cat /proc/MOTOR_PID/sched | grep sum_exec
+
+# ftrace ile CBS bütçe yenileme olaylarını izle:
+echo 1 &gt; /sys/kernel/debug/tracing/events/sched/sched_switch/enable
+echo 1 &gt; /sys/kernel/debug/tracing/events/sched/sched_wakeup/enable
+cat /sys/kernel/debug/tracing/trace | grep "motor_ctrl"</code></pre>
+
+  <h3>GRUB ve SCHED_NORMAL Görevleri</h3>
+  <p>GRUB yalnızca SCHED_DEADLINE katmanı içinde çalışır. SCHED_NORMAL (CFS) görevleri, SCHED_DEADLINE görevleri CPU'yu boş bıraktığında çalışma fırsatı bulur. Bu mekanizma gömülü sistemlerde arka plan görevlerinin (log daemon, network stack) gerçek zamanlı görevler boştayken kaynak kullanmasını sağlar ve sistem genelinde CPU verimliliğini artırır.</p>
+
+  <h3>Bütçe Aşımı ve Throttling</h3>
+  <pre><code>/* Görev runtime bütçesini aşarsa ne olur? */
+
+/* CBS modeli: bütçe tükenince görev throttle edilir */
+/* Throttle: görev SCHED_DEADLINE listesinden çıkar,
+ *           bir sonraki periyot başlayana kadar çalışamaz */
+
+/* Bu durumu tespit etmek için: */
+# cat /proc/PID/sched | grep throttled
+# veya perf stat ile:
+perf stat -e sched:sched_stat_sleep,sched:sched_stat_blocked \
+    -p MOTOR_PID sleep 5</code></pre>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> SCHED_DEADLINE ve SCHED_FIFO karşılaştırması</h2>
+  <p class="section-lead">Gömülü gerçek zamanlı görev tasarımında SCHED_FIFO ile SCHED_DEADLINE arasında seçim yapmak, sistemin gereksinimlerine bağlıdır. Her iki politikanın güçlü ve zayıf yönlerini anlamak doğru karar almayı sağlar.</p>
+
+  <h3>Temel Farklılıklar</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Özellik</th><th>SCHED_FIFO</th><th>SCHED_DEADLINE</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Öncelik tipi</td><td>Statik (1-99)</td><td>Dinamik (deadline'a göre)</td></tr>
+        <tr><td>Preemption</td><td>Daha yüksek öncelik önce</td><td>Daha yakın deadline önce</td></tr>
+        <tr><td>CPU kullanım garantisi</td><td>Yok (açlık riski)</td><td>Var (admission control)</td></tr>
+        <tr><td>Throttling</td><td>Yok</td><td>Var (bütçe aşınca)</td></tr>
+        <tr><td>Starvation riski</td><td>Düşük öncelikli görevler açlık çekebilir</td><td>Yok (admission ile sınırlanmış)</td></tr>
+        <tr><td>Konfigürasyon karmaşıklığı</td><td>Düşük (tek sayı: öncelik)</td><td>Orta (3 parametre + WCET ölçümü)</td></tr>
+        <tr><td>Teorik temel</td><td>Rate Monotonic uyumlu</td><td>EDF optimal</td></tr>
+        <tr><td>Deadline kaçırma davranışı</td><td>Öncelik sırasına göre devam</td><td>Throttle (sonraki periyot bekler)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Gecikme Garantisi</h3>
+  <p>SCHED_DEADLINE, CBS mekanizması sayesinde bir görevin periyot başına kullanacağı CPU süresini garanti eder. Başka bir görev ne kadar yoğun olursa olsun, DL görevi bütçesi kadar CPU alacaktır. SCHED_FIFO'da ise daha yüksek öncelikli bir görev sürekli çalışırsa düşük öncelikli görev hiç CPU almayabilir:</p>
+  <pre><code>/* SCHED_FIFO ile starvation riski */
+/* Görev A: SCHED_FIFO öncelik=99, sürekli çalışıyor */
+/* Görev B: SCHED_FIFO öncelik=50 */
+/* Sonuç: Görev A çalıştığı sürece Görev B çalışamaz */
+
+/* SCHED_DEADLINE ile garanti */
+/* Görev A: DL runtime=8ms, period=10ms */
+/* Görev B: DL runtime=1ms, period=10ms */
+/* Sonuç: Görev B her 10ms'de en az 1ms CPU garantisi alır */</code></pre>
+
+  <h3>Hangi Durumda Hangisi?</h3>
+  <div class="params">
+    <div class="param">
+      <span class="name">SCHED_FIFO tercih edin</span>
+      <span class="desc">Görevin periyodik değil olay güdümlü (event-driven) olduğu durumlarda. Örneğin: donanım kesintisine tepki veren handler, mutex bekleyen kritik bölüm, tek seferlik başlatma rutinleri. WCET ölçümü güçse veya gereksizse SCHED_FIFO daha basittir.</span>
+    </div>
+    <div class="param">
+      <span class="name">SCHED_DEADLINE tercih edin</span>
+      <span class="desc">Görevin kesin periyodik karakteri varsa ve CPU bant genişliğinin garanti edilmesi gerekiyorsa. Motor kontrol döngüsü, ses codec işleme, video karesi hazırlama, sensör veri toplama gibi senaryolar için idealdir.</span>
+    </div>
+    <div class="param">
+      <span class="name">Karma kullanım</span>
+      <span class="desc">Sistem tasarımında SCHED_DEADLINE periyodik görevler için, SCHED_FIFO ise olay güdümlü bileşenler için kullanılabilir. Ancak SCHED_FIFO görevleri admission control kapsamı dışında olduğundan DL bant genişliğini çalmadıklarına dikkat edin.</span>
+    </div>
+  </div>
+
+  <h3>SCHED_FIFO'dan SCHED_DEADLINE'a Geçiş</h3>
+  <pre><code>/* Mevcut SCHED_FIFO görevini SCHED_DEADLINE'a dönüştürme */
+
+/* Adım 1: WCET ölçümü — en kötü durumda kaç ns çalışıyor? */
+struct timespec t_start, t_end;
+clock_gettime(CLOCK_THREAD_CPUTIME_ID, &amp;t_start);
+do_realtime_work();
+clock_gettime(CLOCK_THREAD_CPUTIME_ID, &amp;t_end);
+long wcet_ns = (t_end.tv_sec - t_start.tv_sec) * 1e9
+             + (t_end.tv_nsec - t_start.tv_nsec);
+
+/* Adım 2: Güvenlik payı ile runtime belirle */
+long runtime = wcet_ns * 1.3;   /* yüzde 30 pay */
+
+/* Adım 3: sched_setattr ile politikayı değiştir */
+struct sched_attr attr = {
+    .size           = sizeof(attr),
+    .sched_policy   = SCHED_DEADLINE,
+    .sched_runtime  = runtime,
+    .sched_deadline = period_ns,
+    .sched_period   = period_ns,
+};
+sched_setattr(0, &amp;attr, 0);</code></pre>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> Gömülü senaryo örneği</h2>
+  <p class="section-lead">Bu bölümde endüstriyel bir motor kontrol sisteminde üç farklı gerçek zamanlı görevin SCHED_DEADLINE ile nasıl planlanacağı, Rate Monotonic ile karşılaştırılarak incelenir.</p>
+
+  <h3>Sistem Tanımı</h3>
+  <p>Bir CNC tezgahı denetleyicisinde üç temel gerçek zamanlı görev bulunmaktadır:</p>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Görev</th><th>Açıklama</th><th>WCET</th><th>Periyot</th><th>Son Tarih</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>motor_ctrl</td><td>Eksen motoru PWM ve encoder okuma</td><td>300 µs</td><td>1 ms</td><td>1 ms</td></tr>
+        <tr><td>sensor_read</td><td>ADC sensör verisi toplama ve filtre</td><td>500 µs</td><td>5 ms</td><td>5 ms</td></tr>
+        <tr><td>comm_task</td><td>EtherCAT / Modbus çerçeve gönderme</td><td>800 µs</td><td>10 ms</td><td>10 ms</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Utilization Analizi</h3>
+  <div class="flow">
+    <pre>
+EDF utilization hesabı:
+  U_motor   = 300µs / 1000µs  = 0.30 (yuzde 30)
+  U_sensor  = 500µs / 5000µs  = 0.10 (yuzde 10)
+  U_comm    = 800µs / 10000µs = 0.08 (yuzde 8)
+  U_toplam  = 0.48            = yuzde 48
+
+EDF planlanabilir? 0.48 &lt;= 1.0 ✓
+
+Rate Monotonic utilization bound (N=3):
+  U_rm_bound = 3 * (2^(1/3) - 1) ≈ 0.78
+
+RM ile planlanabilir? 0.48 &lt;= 0.78 ✓
+(Her iki algoritma da çalışır, EDF daha geniş marjla)</pre>
+  </div>
+
+  <h3>SCHED_DEADLINE Yapılandırması</h3>
+  <pre><code>#include &lt;stdio.h&gt;
+#include &lt;pthread.h&gt;
+#include &lt;string.h&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;linux/sched/types.h&gt;
+
+#define US_TO_NS(x) ((x) * 1000ULL)
+
+/* Görev parametreleri tablosu */
+struct task_params {
+    const char *name;
+    unsigned long runtime_ns;
+    unsigned long deadline_ns;
+    unsigned long period_ns;
+    void (*work_fn)(void);
+};
+
+static struct task_params tasks[] = {
+    {
+        .name        = "motor_ctrl",
+        .runtime_ns  = US_TO_NS(390),  /* 300us + yüzde 30 pay */
+        .deadline_ns = US_TO_NS(1000),
+        .period_ns   = US_TO_NS(1000),
+        .work_fn     = do_motor_control,
+    },
+    {
+        .name        = "sensor_read",
+        .runtime_ns  = US_TO_NS(650),  /* 500us + yüzde 30 pay */
+        .deadline_ns = US_TO_NS(5000),
+        .period_ns   = US_TO_NS(5000),
+        .work_fn     = do_sensor_read,
+    },
+    {
+        .name        = "comm_task",
+        .runtime_ns  = US_TO_NS(1040), /* 800us + yüzde 30 pay */
+        .deadline_ns = US_TO_NS(10000),
+        .period_ns   = US_TO_NS(10000),
+        .work_fn     = do_comm_frame,
+    },
+};
+
+static void *rt_task_main(void *arg)
+{
+    struct task_params *p = arg;
+    struct sched_attr attr;
+
+    memset(&amp;attr, 0, sizeof(attr));
+    attr.size           = sizeof(attr);
+    attr.sched_policy   = SCHED_DEADLINE;
+    attr.sched_runtime  = p-&gt;runtime_ns;
+    attr.sched_deadline = p-&gt;deadline_ns;
+    attr.sched_period   = p-&gt;period_ns;
+
+    if (sched_setattr(0, &amp;attr, 0) &lt; 0) {
+        perror(p-&gt;name);
+        return NULL;
+    }
+
+    printf("[%s] SCHED_DEADLINE aktif: "
+           "runtime=%luus period=%lums\n",
+           p-&gt;name,
+           p-&gt;runtime_ns / 1000,
+           p-&gt;period_ns / 1000000);
+
+    while (1) {
+        p-&gt;work_fn();
+        sched_yield();  /* Periyot sonu */
+    }
+    return NULL;
+}
+
+int main(void)
+{
+    pthread_t tids[3];
+    int i;
+
+    for (i = 0; i &lt; 3; i++) {
+        pthread_create(&amp;tids[i], NULL, rt_task_main, &amp;tasks[i]);
+    }
+
+    for (i = 0; i &lt; 3; i++)
+        pthread_join(tids[i], NULL);
+
+    return 0;
+}</code></pre>
+
+  <h3>Rate Monotonic ile Karşılaştırma</h3>
+  <div class="params">
+    <div class="param">
+      <span class="name">EDF (SCHED_DEADLINE) Avantajları</span>
+      <span class="desc">Teorik utilization bound 1.0; daha yüksek CPU kullanımına izin verir. Bant genişliği garantisi ile starvation önlenir. Parametre değişikliği dinamik olarak yapılabilir.</span>
+    </div>
+    <div class="param">
+      <span class="name">Rate Monotonic (SCHED_FIFO) Avantajları</span>
+      <span class="desc">Statik öncelik; daha basit analiz. Deadline kaçırma deterministik: yalnızca düşük öncelikli görevler kaçırır. WCET ölçümü gerekmez (ama önerilir). Uygulama simpleliği ile küçük gömülü sistemlerde tercih edilir.</span>
+    </div>
+    <div class="param">
+      <span class="name">CNC Senaryosu için Tavsiye</span>
+      <span class="desc">U=0.48 ile her iki algoritma da çalışır. Gelecekte görev ekleneceği veya periyotların değişeceği öngörülüyorsa SCHED_DEADLINE; sabit ve az sayıda görev varsa SCHED_FIFO tercih edilebilir.</span>
+    </div>
+  </div>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Hata ayıklama ve izleme</h2>
+  <p class="section-lead">SCHED_DEADLINE görevlerinin davranışını izlemek, deadline kaçırmalarını ve bütçe aşımlarını tespit etmek için Linux'un tracing altyapısını etkin kullanmak gerekir.</p>
+
+  <h3>trace_sched_switch ile Zamanlama İzleme</h3>
+  <pre><code># ftrace ile zamanlama olaylarını kaydet:
+cd /sys/kernel/debug/tracing
+
+# Gerekli olayları etkinleştir:
+echo 1 &gt; events/sched/sched_switch/enable
+echo 1 &gt; events/sched/sched_wakeup/enable
+echo 1 &gt; events/sched/sched_wakeup_new/enable
+
+# İzlemeyi başlat:
+echo 1 &gt; tracing_on
+
+# Birkaç saniye bekle, sonra durdur:
+sleep 5
+echo 0 &gt; tracing_on
+
+# Sonuçları incele — motor_ctrl görevini filtrele:
+grep "motor_ctrl" trace | head -30
+
+# Örnek çıktı:
+# kworker-5  [002] d...  1234.567890: sched_switch:
+#   prev_comm=motor_ctrl prev_pid=1234 prev_prio=0 prev_state=S
+#   next_comm=sensor_read next_pid=1235 next_prio=0</code></pre>
+
+  <h3>/proc/PID/sched ile Görev İstatistikleri</h3>
+  <pre><code># Görev zamanlama istatistiklerini görüntüle:
+cat /proc/MOTOR_PID/sched
+
+# Önemli alanlar:
+# se.sum_exec_runtime    : Toplam çalışma süresi (ns)
+# nr_involuntary_switches: Zorla bağlam değişimi sayısı
+# nr_voluntary_switches  : Gönüllü bağlam değişimi (sched_yield)
+# policy                 : Zamanlama politikası (6 = SCHED_DEADLINE)
+# dl.runtime             : Mevcut bütçe (ns)
+# dl.deadline            : Mutlak son tarih (ns, CLOCK_MONOTONIC)
+# dl.period              : Periyot (ns)
+# dl.flags               : CBS bayrakları
+
+# SCHED_DEADLINE bilgisini doğrula:
+cat /proc/MOTOR_PID/sched | grep -E "policy|dl\."</code></pre>
+
+  <h3>Deadline Kaçırma Tespiti</h3>
+  <p>Linux'ta SCHED_DEADLINE, deadline kaçırmayı kernel log'una yazar. Bunu izlemek için:</p>
+  <pre><code># Kernel log'da deadline kaçırma:
+# kernel: sched: DEADLINE period overrun for PID 1234 (motor_ctrl)
+# kernel: sched: dl_runtime=300000 dl_deadline=1000000 dl_period=1000000
+
+# Gerçek zamanlı izleme:
+dmesg -w | grep -i "deadline\|DEADLINE"
+
+# Daha ayrıntılı: trace event aktifleştir
+echo 1 &gt; /sys/kernel/debug/tracing/events/sched/sched_deadline_exceeded/enable
+cat /sys/kernel/debug/tracing/trace | grep "deadline_exceeded"</code></pre>
+
+  <h3>latency-top ile Gecikme Analizi</h3>
+  <pre><code># latency-top kurulumu ve kullanımı:
+# (latency-top aracı kernel CONFIG_LATENCYTOP gerektirir)
+
+CONFIG_LATENCYTOP=y
+CONFIG_SCHEDSTATS=y
+
+# Çalıştır (root gerekli):
+latency-top
+
+# Alternatif: cyclictest ile SCHED_DEADLINE gecikme ölçümü
+# cyclictest, gerçek zamanlı görev gecikmelerini mikrosaniye
+# hassasiyetiyle ölçer:
+cyclictest --policy=dl \
+           --dl-runtime=300 \
+           --dl-deadline=1000 \
+           --dl-period=1000 \
+           --loops=10000 \
+           --histogram=1000
+
+# Çıktı: min/avg/max gecikme (microsaniye)
+# T: 0 ( 1234) P: 0 I:1000 C:  10000
+# Min:      3 Avg:      7 Max:     42</code></pre>
+
+  <h3>perf ile Zamanlayıcı Profili</h3>
+  <pre><code># SCHED_DEADLINE görev geçişlerini perf ile izle:
+perf sched record -a -- sleep 5
+perf sched latency | head -20
+
+# Bağlam değişim istatistikleri:
+perf sched timehist -p MOTOR_PID | head -20
+
+# Örnek çıktı:
+# time    cpu task name  wait time  sch delay run time
+# ------- --- ---------  ---------  --------- --------
+# 1234.5  002 motor_ctrl     0.012      0.003   0.287 ms</code></pre>
+
+  <h3>Sysctl ile Dinamik Tuning</h3>
+  <pre><code># Zamanlayıcı istatistiklerini etkinleştir:
+echo 1 &gt; /proc/sys/kernel/sched_schedstats
+
+# CFS bandwidth throttling'i izle (DL görevleri etkiler):
+cat /proc/schedstat | grep -A3 "cpu2"
+
+# Admission control sınırını acil artır (geçici):
+echo 990000 &gt; /proc/sys/kernel/sched_rt_runtime_us
+
+# Tüm çekirdeklerin SCHED_DEADLINE durumunu görüntüle:
+cat /proc/sched_debug | grep -E "runnable_avg|dl_bw|nr_deadline"</code></pre>
+
+  <h3>Özet: SCHED_DEADLINE Kullanım Kontrol Listesi</h3>
+  <div class="params">
+    <div class="param">
+      <span class="name">1. WCET ölçümü yapın</span>
+      <span class="desc">sched_runtime değerini WCET'in en az yüzde 20-30 üzerinde ayarlayın. Yetersiz runtime bütçesi throttling'e ve deadline kaçırmalarına neden olur.</span>
+    </div>
+    <div class="param">
+      <span class="name">2. Utilization toplamını hesaplayın</span>
+      <span class="desc">Tüm DL görevlerinin runtime/period oranlarını toplayın. sched_rt_runtime_us / sched_rt_period_us sınırını geçmediğinizden emin olun.</span>
+    </div>
+    <div class="param">
+      <span class="name">3. sched_yield() kullanın</span>
+      <span class="desc">Periyodik görevlerin her döngü sonunda sched_yield() çağırması gerekir. Bu çağrı olmadan görev bütçesi tükenene kadar CPU'da kalır ve diğer görevlerin deadline'ını tehdit eder.</span>
+    </div>
+    <div class="param">
+      <span class="name">4. CPU izolasyonu yapılandırın</span>
+      <span class="desc">İzole CPU'larda isolcpus, nohz_full ve rcu_nocbs parametrelerini kullanarak jitter'ı minimize edin.</span>
+    </div>
+    <div class="param">
+      <span class="name">5. cyclictest ile doğrulayın</span>
+      <span class="desc">Üretim imajında cyclictest çalıştırarak gerçek gecikme dağılımını ölçün. Maksimum gecikme, sched_deadline - sched_runtime farkını aşmamalıdır.</span>
+    </div>
+  </div>
+</section>
+
+</main>

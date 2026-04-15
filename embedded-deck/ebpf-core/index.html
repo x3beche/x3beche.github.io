@@ -1,0 +1,868 @@
+---
+layout: tutorial
+title: "eBPF CO-RE & libbpf — Taşınabilir BPF Programlama"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>EBPF / CO-RE</span>
+    <span>2026</span>
+  </div>
+  <h1>eBPF CO-RE &amp; libbpf<br><em>Taşınabilir BPF Programlama</em></h1>
+  <p class="subtitle">Compile Once — Run Everywhere yaklaşımıyla kernel versiyon bağımsız BPF programları yaz; BTF, libbpf ve BPF skeleton ile üretim kalitesinde gözlemlenebilirlik araçları geliştir.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">CO-RE neden gerekli — kernel versiyon bağımsızlığı sorunu</a></li>
+    <li><a href="#s1">BTF (BPF Type Format) — vmlinux.h üretimi</a></li>
+    <li><a href="#s2">libbpf ile BPF program iskeleti</a></li>
+    <li><a href="#s3">BPF skeleton — bpftool gen skeleton</a></li>
+    <li><a href="#s4">CO-RE erişim makroları — BPF_CORE_READ</a></li>
+    <li><a href="#s5">BPF ring buffer — ringbuf_map ve user-space consumer</a></li>
+    <li><a href="#s6">BPF map türleri karşılaştırması</a></li>
+    <li><a href="#s7">Gömülü sistemlerde eBPF — minimal kernel config</a></li>
+    <li><a href="#s8">Hata ayıklama — bpftool, libbpf log, verifier</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> CO-RE neden gerekli — kernel versiyon bağımsızlığı sorunu</h2>
+  <p class="section-lead">Geleneksel BPF programları kernel veri yapılarına doğrudan offset erişimiyle ulaşır; bu durum her kernel versiyonunda binary uyumsuzluğuna yol açar. CO-RE bu sorunu derleme zamanı meta verisi ve çalışma zamanı yeniden konumlandırma ile çözer.</p>
+
+  <h3>Eski yaklaşımın kırılganlığı</h3>
+  <p>BCC (BPF Compiler Collection) tabanlı araçlar, hedef makinede LLVM + kernel başlık dosyalarının kurulu olmasını gerektirdi. Gömülü sistemlerde bu mümkün değildir: 50–100 MB geliştirme araç zinciri üretim cihazına sığmaz. Daha da önemlisi, <code>struct task_struct</code> veya <code>struct sk_buff</code> içindeki bir alanın konumu kernel versiyonlar arasında değişir; sabit offset kullanan bir BPF programı yanlış veri okur ya da doğrulayıcı (verifier) tarafından reddedilir.</p>
+
+  <div class="flow">
+    <pre>BCC yaklaşımı:
+  hedef makinede kaynak → runtime LLVM compile → BPF bytecode
+  Sorun: kernel başlıkları + LLVM hedef makinede şart
+
+CO-RE yaklaşımı:
+  geliştirici makinesinde kaynak → Clang + BTF bilgisi → taşınabilir BPF object
+  Hedef makinede: libbpf BTF farkını tespit eder → offset'leri çalışma zamanında düzeltir</pre>
+  </div>
+
+  <h3>CO-RE bileşenleri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">BTF (BPF Type Format)</span><span class="desc">Kernel ve BPF programı tip bilgisini taşıyan kompakt format; vmlinux imajına veya ayrı dosyaya gömülür</span></div>
+    <div class="param"><span class="name">Clang CO-RE desteği</span><span class="desc">-g -target bpf ile derlenen programlara BTF relocations gömülür; hangi alan hangi struct'tan erişildiği kayıt altına alınır</span></div>
+    <div class="param"><span class="name">libbpf çalışma zamanı</span><span class="desc">BPF object'i yüklerken kernel BTF ile program BTF'ini karşılaştırır; alan offset'lerini, boyutlarını ve varlığını gerçek kernel'a göre düzeltir</span></div>
+    <div class="param"><span class="name">BPF_CORE_READ makrosu</span><span class="desc">Pointer zinciri boyunca güvenli CO-RE erişim sağlar; her seviyede BTF relocation kaydı üretir</span></div>
+  </div>
+
+  <h3>Desteklenen kernel versiyonu</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Gereksinim</th><th>Minimum Kernel</th><th>Not</th></tr></thead>
+      <tbody>
+        <tr><td>Temel eBPF</td><td>3.18</td><td>Sınırlı map ve program türleri</td></tr>
+        <tr><td>BTF kernel desteği</td><td>4.18</td><td>CONFIG_DEBUG_INFO_BTF gerekli</td></tr>
+        <tr><td>CO-RE + libbpf 0.1</td><td>5.2</td><td>İlk production-ready CO-RE</td></tr>
+        <tr><td>BPF ring buffer</td><td>5.8</td><td>IORING_OP ile karıştırılmamalı</td></tr>
+        <tr><td>BPF skeleton v2</td><td>5.11</td><td>bpftool gen skeleton tam destek</td></tr>
+        <tr><td>kfunc desteği</td><td>5.15</td><td>Kernel fonksiyon doğrudan çağrısı</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>CO-RE olmadan neler olur</h3>
+  <p>Kernel 5.10 üzerinde derlenen bir BPF programı <code>task_struct-&gt;files</code> alanına offset <code>0x8f0</code> ile erişiyorsa, kernel 5.15'te bu alan <code>0x918</code>'e taşınmış olabilir. CO-RE relocation olmadan program hatalı veri okur; verifier strict modda ise yükleme bile başarısız olur. CO-RE ile libbpf, yükleme anında hedef kernel'ın BTF'inden doğru offset'i bulur ve instruction'ı yamalar.</p>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> BTF (BPF Type Format) — vmlinux.h üretimi</h2>
+  <p class="section-lead">BTF, DWARF'ın BPF için optimize edilmiş hafif alternatifidir. Kernel tüm tip bilgisini sıkıştırılmış BTF formatında <code>/sys/kernel/btf/vmlinux</code> dosyasına yazar; bu dosya CO-RE'nin çalışma zamanı kaynağıdır.</p>
+
+  <h3>BTF dosya yapısı</h3>
+  <p>BTF ikili formatı bir başlık (<code>btf_header</code>), tip bölümü ve string tablosundan oluşur. Tipler struct, union, enum, typedef, pointer, array, function ve function prototype gibi kategorilerde kodlanır. DWARF'a kıyasla çok daha küçüktür: tipik bir kernel'da DWARF ~1 GB, BTF ise ~5 MB boyutundadır.</p>
+
+  <div class="flow">
+    <pre>/sys/kernel/btf/vmlinux   ← tüm kernel tipleri (struct, enum, typedef)
+/sys/kernel/btf/&lt;modul&gt;  ← modüle özgü tipler (kernel 5.11+)
+bpftool btf dump file /sys/kernel/btf/vmlinux format c &gt; vmlinux.h</pre>
+  </div>
+
+  <h3>vmlinux.h üretimi</h3>
+  <p>Geliştirici tek bir başlık dosyasıyla tüm kernel tiplerine erişebilir. Bu dosyayı hedef platformun kernel'ından üretmek gerekir; derleme makinasında üretilen vmlinux.h farklı yapı offset'leri taşıyabilir, bu nedenle CO-RE relocation her zaman açık tutulmalıdır.</p>
+
+<pre><code># Hedef makinede (kernel BTF varsa):
+bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+
+# Cross-geliştirme için: vmlinux imajından üret
+bpftool btf dump file /path/to/vmlinux format c > vmlinux.h
+
+# Çıktı: tek büyük başlık dosyası (~50k satır)
+# struct task_struct, struct sock, struct sk_buff, tüm kernel tipleri
+</code></pre>
+
+  <h3>BTF'nin içeriği — örnek struct</h3>
+
+<pre><code>/* vmlinux.h'dan otomatik üretilen — elle yazılmaz */
+struct task_struct {
+    struct thread_info thread_info;
+    unsigned int __state;
+    void *stack;
+    /* ... yüzlerce alan ... */
+    pid_t pid;
+    pid_t tgid;
+    struct task_struct *real_parent;
+    struct task_struct *parent;
+    char comm[16];
+    /* ... */
+} __attribute__((preserve_access_index));
+</code></pre>
+
+  <p>Dikkat: <code>__attribute__((preserve_access_index))</code> Clang'a bu struct'a yapılan her erişim için BTF relocation kaydı üretmesini söyler. <code>vmlinux.h</code> tüm struct'lara bu attribute'ü zaten ekler.</p>
+
+  <h3>BTF sağlık kontrolü</h3>
+
+<pre><code># BTF mevcut mu?
+ls -la /sys/kernel/btf/vmlinux
+
+# Kernel tiplerini listele
+bpftool btf dump file /sys/kernel/btf/vmlinux | head -50
+
+# Belirli bir struct'ı bul
+bpftool btf dump file /sys/kernel/btf/vmlinux format raw | grep -A5 "task_struct"
+
+# CONFIG kontrolü
+zcat /proc/config.gz | grep BTF
+# CONFIG_DEBUG_INFO_BTF=y
+# CONFIG_DEBUG_INFO_BTF_MODULES=y  (modül BTF desteği)
+</code></pre>
+
+  <h3>Modül BTF</h3>
+  <p>Kernel 5.11 itibarıyla yüklü her modül kendi BTF bilgisini <code>/sys/kernel/btf/&lt;modül_adı&gt;</code> altında sunar. BPF programlar <code>struct bpf_link</code> ile modül hook'larına eklenebildiğinde modül BTF'inden CO-RE erişimi kullanabilir. Bu özellik gömülü sistemlerde özellikle değerlidir: out-of-tree modüllerle çalışan BPF araçları yazılabilir.</p>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> libbpf ile BPF program iskeleti</h2>
+  <p class="section-lead">libbpf, BPF object dosyalarını yükleyen, map'leri oluşturan, programları çekirdeğe bağlayan ve CO-RE relocation uygulayan resmi C kütüphanesidir. BCC'nin yerini almış; modern BPF geliştirmenin standart API'sidir.</p>
+
+  <h3>libbpf temel nesneleri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">bpf_object</span><span class="desc">ELF BPF dosyasını temsil eder; tüm program ve map tanımlarını içerir. bpf_object__open() ile açılır, bpf_object__load() ile kernel'a yüklenir</span></div>
+    <div class="param"><span class="name">bpf_program</span><span class="desc">Tek bir BPF programını temsil eder (örn. kprobe veya tracepoint handler). bpf_object__find_program_by_name() ile bulunur</span></div>
+    <div class="param"><span class="name">bpf_map</span><span class="desc">BPF map'i temsil eder — kernel ve user-space arasında veri paylaşım noktası. bpf_object__find_map_by_name() ile erişilir</span></div>
+    <div class="param"><span class="name">bpf_link</span><span class="desc">Programı hook noktasına bağlar — kprobe, tracepoint, perf_event. bpf_program__attach() ile oluşturulur; destroy edilince hook kaldırılır</span></div>
+  </div>
+
+  <h3>Tam yaşam döngüsü</h3>
+
+<pre><code>#include &lt;bpf/libbpf.h&gt;
+#include &lt;bpf/bpf.h&gt;
+
+int main(void)
+{
+    struct bpf_object *obj;
+    struct bpf_program *prog;
+    struct bpf_link    *link;
+    int err;
+
+    /* 1. ELF BPF dosyasını aç */
+    obj = bpf_object__open("myprog.bpf.o");
+    if (libbpf_get_error(obj)) {
+        fprintf(stderr, "bpf_object__open failed\n");
+        return 1;
+    }
+
+    /* 2. Kernel'a yükle: map'ler oluşturulur, CO-RE relocations uygulanır */
+    err = bpf_object__load(obj);
+    if (err) {
+        fprintf(stderr, "bpf_object__load: %d\n", err);
+        goto cleanup;
+    }
+
+    /* 3. Program'ı bul */
+    prog = bpf_object__find_program_by_name(obj, "handle_exec");
+    if (!prog) {
+        fprintf(stderr, "program bulunamadi\n");
+        goto cleanup;
+    }
+
+    /* 4. Hook noktasına bağla */
+    link = bpf_program__attach(prog);
+    if (libbpf_get_error(link)) {
+        fprintf(stderr, "attach failed\n");
+        goto cleanup;
+    }
+
+    printf("BPF programi calisiyor...\n");
+    pause();  /* sinyal gelene kadar bekle */
+
+    bpf_link__destroy(link);
+cleanup:
+    bpf_object__close(obj);
+    return err != 0;
+}
+</code></pre>
+
+  <h3>libbpf log callback</h3>
+
+<pre><code>static int libbpf_print_fn(enum libbpf_print_level level,
+                            const char *format, va_list args)
+{
+    if (level == LIBBPF_DEBUG)
+        return 0;  /* debug mesajlarini sustur */
+    return vfprintf(stderr, format, args);
+}
+
+/* main() icinde: */
+libbpf_set_print(libbpf_print_fn);
+</code></pre>
+
+  <h3>Derleme adımları</h3>
+
+<pre><code># BPF kernel tarafı: .bpf.c → .bpf.o
+clang -g -O2 -target bpf -D__TARGET_ARCH_x86 \
+      -I/usr/include/bpf \
+      -c myprog.bpf.c -o myprog.bpf.o
+
+# User-space tarafı: .c → binary
+gcc -o myprog myprog.c \
+    -lbpf -lelf -lz
+
+# Makefile ile (tipik):
+CLANG    ?= clang
+ARCH     := $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
+BPF_CFLAGS := -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH)
+</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> BPF skeleton — bpftool gen skeleton</h2>
+  <p class="section-lead">BPF skeleton, bpftool tarafından otomatik üretilen C başlık dosyasıdır. Tüm obje yönetimi, map ve program erişimini type-safe fonksiyonlara sarar; boilerplate kodu sıfıra indirir.</p>
+
+  <h3>Skeleton üretimi</h3>
+
+<pre><code># 1. BPF kernel tarafını derle
+clang -g -O2 -target bpf -c myprog.bpf.c -o myprog.bpf.o
+
+# 2. Skeleton başlık dosyasını üret
+bpftool gen skeleton myprog.bpf.o > myprog.skel.h
+
+# Üretilen dosya: myprog.skel.h
+# İçerir: struct myprog_bpf, open/load/attach/destroy fonksiyonları
+</code></pre>
+
+  <h3>Üretilen skeleton yapısı</h3>
+
+<pre><code>/* myprog.skel.h — otomatik üretilir, elle düzenlenmez */
+struct myprog_bpf {
+    struct bpf_object_skeleton *skeleton;
+    struct bpf_object *obj;
+
+    struct {
+        struct bpf_map *events;      /* ring buffer map */
+        struct bpf_map *pid_map;     /* pid filtre map */
+    } maps;
+
+    struct {
+        struct bpf_program *handle_exec;
+        struct bpf_program *handle_exit;
+    } progs;
+
+    struct {
+        struct bpf_link *handle_exec;
+        struct bpf_link *handle_exit;
+    } links;
+
+    struct myprog_bpf__rodata {
+        int target_pid;
+    } *rodata;
+};
+
+static inline struct myprog_bpf *myprog_bpf__open(void);
+static inline int                myprog_bpf__load(struct myprog_bpf *);
+static inline int                myprog_bpf__attach(struct myprog_bpf *);
+static inline void               myprog_bpf__destroy(struct myprog_bpf *);
+</code></pre>
+
+  <h3>Skeleton ile kullanım</h3>
+
+<pre><code>#include "vmlinux.h"
+#include &lt;bpf/bpf_helpers.h&gt;
+#include "myprog.skel.h"
+
+int main(int argc, char **argv)
+{
+    struct myprog_bpf *skel;
+    int err;
+
+    /* 1. Ac ve konfigüre et */
+    skel = myprog_bpf__open();
+    if (!skel) { perror("open"); return 1; }
+
+    /* 2. rodata araciligiyla BPF tarafina parametre gonder */
+    skel->rodata->target_pid = atoi(argv[1]);
+
+    /* 3. Yükle */
+    err = myprog_bpf__load(skel);
+    if (err) { perror("load"); goto cleanup; }
+
+    /* 4. Otomatik olarak tüm programlari uygun hook'lara bagla */
+    err = myprog_bpf__attach(skel);
+    if (err) { perror("attach"); goto cleanup; }
+
+    /* 5. Map'e erişim: tip güvenceli */
+    int map_fd = bpf_map__fd(skel->maps.pid_map);
+
+    printf("Izleme basliyor, PID=%d\n", skel->rodata->target_pid);
+    pause();
+
+cleanup:
+    myprog_bpf__destroy(skel);
+    return err != 0;
+}
+</code></pre>
+
+  <h3>rodata ve global değişkenler</h3>
+  <p>BPF programındaki global değişkenler skeleton üzerinden user-space'den yüklemeden önce ayarlanabilir. Yükleme sonrası <code>rodata</code> salt okunur olur; BPF programı bu değerlere sabit olarak erişir, verifier optimizasyon yapabilir.</p>
+
+<pre><code>/* myprog.bpf.c kernel tarafinda: */
+const volatile int target_pid = 0;   /* rodata — user-space'den set edilir */
+volatile int       event_count = 0;  /* bss — okunabilir/yazılabilir */
+
+SEC("tracepoint/syscalls/sys_enter_execve")
+int handle_exec(struct trace_event_raw_sys_enter *ctx)
+{
+    if (target_pid != 0 &amp;&amp; bpf_get_current_pid_tgid() &gt;&gt; 32 != target_pid)
+        return 0;
+    __sync_fetch_and_add(&amp;event_count, 1);
+    return 0;
+}
+</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> CO-RE erişim makroları — BPF_CORE_READ</h2>
+  <p class="section-lead">CO-RE erişim makroları, kernel struct alanlarına BTF relocation kaydederek erişim sağlar. Doğrudan pointer dereference yerine bu makroların kullanılması zorunludur; aksi hâlde versiyon bağımsızlığı kırılır.</p>
+
+  <h3>BPF_CORE_READ</h3>
+
+<pre><code>#include "vmlinux.h"
+#include &lt;bpf/bpf_core_read.h&gt;
+
+SEC("kprobe/do_sys_openat2")
+int trace_openat(struct pt_regs *ctx)
+{
+    struct task_struct *task;
+    pid_t pid;
+    char comm[16];
+
+    task = (struct task_struct *)bpf_get_current_task();
+
+    /* YANLIS: doğrudan pointer erişimi — CO-RE relocation yok */
+    /* pid = task->pid; */
+
+    /* DOGRU: BPF_CORE_READ makrosu — BTF relocation kaydedilir */
+    pid  = BPF_CORE_READ(task, pid);
+
+    /* Zincirleme erişim: task->parent->pid */
+    pid_t ppid = BPF_CORE_READ(task, real_parent, pid);
+
+    /* Dizi erişimi: task->comm */
+    BPF_CORE_READ_STR_INTO(&amp;comm, task, comm);
+
+    bpf_printk("openat: pid=%d ppid=%d comm=%s\n", pid, ppid, comm);
+    return 0;
+}
+</code></pre>
+
+  <h3>Makro ailesi</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Makro</th><th>Kullanım</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td><code>BPF_CORE_READ(src, a, b, c)</code></td><td>Değer okuma</td><td>src-&gt;a-&gt;b-&gt;c pointer zinciri; her seviyede CO-RE relocation</td></tr>
+        <tr><td><code>BPF_CORE_READ_INTO(dst, src, a)</code></td><td>Belleğe kopyala</td><td>Sonucu dst'e yazar; struct kopyalama için</td></tr>
+        <tr><td><code>BPF_CORE_READ_STR_INTO(dst, src, a)</code></td><td>String kopyala</td><td>bpf_core_read_str() çağırır; null-terminated güvencesi</td></tr>
+        <tr><td><code>BPF_CORE_READ_BITFIELD(src, field)</code></td><td>Bit field</td><td>Bit field'lara CO-RE erişim; mask ve shift otomatik</td></tr>
+        <tr><td><code>bpf_core_field_exists(expr)</code></td><td>Alan varlığı</td><td>Kernel versiyonunda alan var mı? 1 veya 0 döner</td></tr>
+        <tr><td><code>bpf_core_type_exists(type)</code></td><td>Tip varlığı</td><td>Verilen tip kernel BTF'de mevcut mu?</td></tr>
+        <tr><td><code>bpf_core_field_size(expr)</code></td><td>Alan boyutu</td><td>Hedef kernel'daki gerçek sizeof</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Koşullu kernel versiyonu uyumu</h3>
+
+<pre><code>SEC("kprobe/tcp_v4_connect")
+int trace_connect(struct pt_regs *ctx)
+{
+    struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
+    __u16 dport;
+
+    /* Kernel 5.x'te alan adı değişti: __sk_common.skc_dport */
+    if (bpf_core_field_exists(sk->__sk_common.skc_dport)) {
+        dport = BPF_CORE_READ(sk, __sk_common, skc_dport);
+    } else {
+        /* Eski kernel: struct sock doğrudan içeriyor */
+        dport = BPF_CORE_READ(sk, sk_dport);
+    }
+
+    bpf_printk("tcp connect dport=%u\n", bpf_ntohs(dport));
+    return 0;
+}
+</code></pre>
+
+  <h3>Enum değer CO-RE</h3>
+
+<pre><code>/* Enum değerinin kernel versiyonuna göre değişmesi durumu */
+int flags = BPF_CORE_READ(task, __state);
+
+/* Enum sabit değeri — TASK_RUNNING her versiyonda aynı ama garantilemek için: */
+if (bpf_core_type_exists(enum task_state)) {
+    /* Modern kernel: enum tanımlı */
+} else {
+    /* Eski kernel: #define sabitleri */
+}
+</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> BPF ring buffer — ringbuf_map ve user-space consumer</h2>
+  <p class="section-lead">BPF ring buffer (RINGBUF), kernel 5.8'de tanıtılan ve perf event buffer'ın yerini alan modern veri iletim mekanizmasıdır. Çok CPU'lu sistemlerde paylaşımlı tek buffer, sıralı olaylar ve sıfır kopya tüketim sunar.</p>
+
+  <h3>perf buffer ile karşılaştırma</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>perf_event buffer</th><th>ring buffer</th></tr></thead>
+      <tbody>
+        <tr><td>CPU başına buffer</td><td>Evet — her CPU ayrı</td><td>Hayır — tek paylaşımlı buffer</td></tr>
+        <tr><td>Sıralı olaylar</td><td>Hayır — CPU sırasını korumaz</td><td>Evet — timestamp ile sıralı</td></tr>
+        <tr><td>Bellek kullanımı</td><td>N_CPU × buffer_size</td><td>1 × buffer_size</td></tr>
+        <tr><td>Sıfır kopya tüketim</td><td>Hayır — kopyalanır</td><td>Evet — mmap ile doğrudan erişim</td></tr>
+        <tr><td>Kayıt boyutu</td><td>Sabit yapı</td><td>Dinamik boyut</td></tr>
+        <tr><td>Minimum kernel</td><td>4.15</td><td>5.8</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Kernel tarafı: ring buffer tanımı ve yazma</h3>
+
+<pre><code>#include "vmlinux.h"
+#include &lt;bpf/bpf_helpers.h&gt;
+#include &lt;bpf/bpf_core_read.h&gt;
+
+/* Olay yapisi — user-space ile paylasimlı */
+struct event {
+    __u32 pid;
+    __u32 ppid;
+    __u64 ts_ns;
+    char  comm[16];
+    char  filename[256];
+};
+
+/* Ring buffer map tanımı */
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024);  /* 256 KB — 2'nin kati olmali */
+} rb SEC(".maps");
+
+SEC("tracepoint/syscalls/sys_enter_execve")
+int handle_exec(struct trace_event_raw_sys_enter *ctx)
+{
+    struct event *e;
+    struct task_struct *task;
+
+    /* Reserve: atomik olarak buffer alanı ayır */
+    e = bpf_ringbuf_reserve(&amp;rb, sizeof(*e), 0);
+    if (!e) return 0;   /* buffer dolu — kayıt at */
+
+    /* Alanları doldur */
+    task  = (struct task_struct *)bpf_get_current_task();
+    e-&gt;pid  = bpf_get_current_pid_tgid() &gt;&gt; 32;
+    e-&gt;ppid = BPF_CORE_READ(task, real_parent, pid);
+    e-&gt;ts_ns = bpf_ktime_get_ns();
+    bpf_get_current_comm(&amp;e-&gt;comm, sizeof(e-&gt;comm));
+    bpf_probe_read_user_str(&amp;e-&gt;filename, sizeof(e-&gt;filename),
+                            (const char *)ctx-&gt;args[0]);
+
+    /* Submit: user-space'e ilet */
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+char LICENSE[] SEC("license") = "GPL";
+</code></pre>
+
+  <h3>User-space: ring buffer consumer</h3>
+
+<pre><code>#include &lt;bpf/libbpf.h&gt;
+#include "myprog.skel.h"
+#include "myprog.h"   /* struct event tanımı */
+
+static int handle_event(void *ctx, void *data, size_t data_sz)
+{
+    const struct event *e = data;
+    struct tm *tm;
+    char ts[32];
+    time_t t;
+
+    time(&amp;t);
+    tm = localtime(&amp;t);
+    strftime(ts, sizeof(ts), "%H:%M:%S", tm);
+
+    printf("%-8s %-7d %-7d %-16s %s\n",
+           ts, e-&gt;pid, e-&gt;ppid, e-&gt;comm, e-&gt;filename);
+    return 0;
+}
+
+int main(void)
+{
+    struct myprog_bpf *skel;
+    struct ring_buffer *rb = NULL;
+    int err;
+
+    skel = myprog_bpf__open_and_load();
+    if (!skel) return 1;
+
+    err = myprog_bpf__attach(skel);
+    if (err) goto cleanup;
+
+    /* Ring buffer oluştur: map_fd + callback */
+    rb = ring_buffer__new(bpf_map__fd(skel-&gt;maps.rb),
+                          handle_event, NULL, NULL);
+    if (!rb) { err = -1; goto cleanup; }
+
+    printf("%-8s %-7s %-7s %-16s %s\n",
+           "TIME", "PID", "PPID", "COMM", "FILENAME");
+
+    while (true) {
+        /* Olayları işle: poll + callback */
+        err = ring_buffer__poll(rb, 100 /* ms timeout */);
+        if (err == -EINTR) { err = 0; break; }
+        if (err &lt; 0) {
+            fprintf(stderr, "ring_buffer__poll: %d\n", err);
+            break;
+        }
+    }
+
+cleanup:
+    ring_buffer__free(rb);
+    myprog_bpf__destroy(skel);
+    return err &lt; 0 ? 1 : 0;
+}
+</code></pre>
+
+  <h3>ring_buffer__consume vs ring_buffer__poll</h3>
+  <p><code>ring_buffer__poll(rb, timeout_ms)</code> epoll tabanlıdır; kernel bildirimi bekler, CPU kullanmaz. <code>ring_buffer__consume(rb)</code> polling yapar; düşük latency gerekiyorsa tercih edilir ama CPU tüketir. Yüksek frekanslı olaylar için <code>ring_buffer__poll(rb, 0)</code> ile sıfır timeout kullanılabilir.</p>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> BPF map türleri karşılaştırması</h2>
+  <p class="section-lead">BPF map'leri kernel ile user-space arasındaki veri köprüsüdür. Her türün farklı performans özellikleri, atomiklik garantileri ve kullanım senaryoları vardır; doğru seçim hem doğruluk hem de performans açısından kritiktir.</p>
+
+  <h3>Map türleri özet tablosu</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Map Türü</th><th>Yapı</th><th>Arama O()</th><th>Max Giriş</th><th>Tipik Kullanım</th></tr></thead>
+      <tbody>
+        <tr><td>HASH</td><td>Hash tablosu</td><td>O(1) amortize</td><td>2^32</td><td>PID/IP → istatistik eşleme</td></tr>
+        <tr><td>ARRAY</td><td>Düz dizi</td><td>O(1)</td><td>2^32</td><td>Sayaçlar, sabit konfigürasyon</td></tr>
+        <tr><td>PERCPU_HASH</td><td>CPU başına hash</td><td>O(1)</td><td>2^32</td><td>Yüksek hızlı sayaçlar, lock yok</td></tr>
+        <tr><td>PERCPU_ARRAY</td><td>CPU başına dizi</td><td>O(1)</td><td>2^32</td><td>Per-CPU istatistik, sıcak yol</td></tr>
+        <tr><td>LRU_HASH</td><td>Hash + LRU</td><td>O(1)</td><td>Otomatik evict</td><td>Bağlantı takibi, sınırsız akış</td></tr>
+        <tr><td>LRU_PERCPU_HASH</td><td>CPU başına LRU</td><td>O(1)</td><td>Otomatik evict</td><td>Per-CPU LRU, düşük contention</td></tr>
+        <tr><td>RINGBUF</td><td>Ring buffer</td><td>N/A (stream)</td><td>max_entries byte</td><td>Olayları user-space'e ilet</td></tr>
+        <tr><td>PERF_EVENT_ARRAY</td><td>perf event</td><td>N/A</td><td>CPU sayısı</td><td>Eski kernel'larda olay iletimi</td></tr>
+        <tr><td>STACK_TRACE</td><td>Stack ID</td><td>O(1)</td><td>2^32</td><td>Kernel/user stack profili</td></tr>
+        <tr><td>PROG_ARRAY</td><td>Program FD dizisi</td><td>O(1)</td><td>2^32</td><td>Tail call — program zinciri</td></tr>
+        <tr><td>HASH_OF_MAPS</td><td>İç içe map</td><td>O(1)×2</td><td>2^32</td><td>Dinamik iç map yönetimi</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>PERCPU map kullanımı</h3>
+
+<pre><code>/* Kernel tarafı: per-CPU sayaç */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} packet_count SEC(".maps");
+
+SEC("xdp")
+int count_packets(struct xdp_md *ctx)
+{
+    __u32 key = 0;
+    __u64 *cnt = bpf_map_lookup_elem(&amp;packet_count, &amp;key);
+    if (cnt) (*cnt)++;   /* lock free: her CPU kendi elemanina yazar */
+    return XDP_PASS;
+}
+
+/* User-space: tüm CPU'lardan topla */
+__u64 values[MAX_CPUS];
+__u32 key = 0;
+bpf_map_lookup_elem(map_fd, &amp;key, values);
+__u64 total = 0;
+for (int i = 0; i &lt; nr_cpus; i++) total += values[i];
+</code></pre>
+
+  <h3>LRU_HASH — bağlantı takibi</h3>
+
+<pre><code>struct conn_info {
+    __u32 saddr, daddr;
+    __u16 sport, dport;
+    __u64 bytes;
+    __u64 start_ns;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);   /* en fazla 64K eş zamanlı bağlantı */
+    __type(key,   __u64);         /* socket pointer */
+    __type(value, struct conn_info);
+} connections SEC(".maps");
+/* max_entries dolunca en eski kullanılan giriş otomatik silinir */
+</code></pre>
+
+  <h3>HASH vs ARRAY seçim kriterleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">ARRAY kullan</span><span class="desc">Anahtar 0..N-1 tam sayı ise; tüm elemanlar sıklıkla erişiliyorsa; cache locality kritikse</span></div>
+    <div class="param"><span class="name">HASH kullan</span><span class="desc">Anahtar sparse dağılımlı ise (IP, PID); değer sayısı önceden bilinmiyorsa</span></div>
+    <div class="param"><span class="name">PERCPU tercih et</span><span class="desc">Sayaçlar veya toplamlar için; atomic işlem maliyeti önemliyse; her CPU bağımsız güncelliyorsa</span></div>
+    <div class="param"><span class="name">LRU_HASH tercih et</span><span class="desc">Sınırsız anahtar kümesi varken bellek sınırı korunacaksa; eski girişlerin otomatik temizlenmesi isteniyorsa</span></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Gömülü sistemlerde eBPF — minimal kernel config</h2>
+  <p class="section-lead">Gömülü Linux'ta eBPF kullanımı kaynak kısıtları nedeniyle dikkatli kernel yapılandırması gerektirir. BTF, JIT ve temel BPF altyapısı etkinleştirilmeli; gereksiz program türleri devre dışı bırakılmalıdır.</p>
+
+  <h3>Zorunlu kernel konfigürasyonu</h3>
+
+<pre><code># Temel BPF altyapısı
+CONFIG_BPF=y
+CONFIG_BPF_SYSCALL=y
+CONFIG_BPF_JIT=y
+CONFIG_BPF_JIT_ALWAYS_ON=y      # Interpreter'i devre dışı bırak (güvenlik + perf)
+
+# BTF — CO-RE için şart
+CONFIG_DEBUG_INFO_BTF=y
+CONFIG_DEBUG_INFO_BTF_MODULES=y  # Modül BTF (opsiyonel)
+
+# Tracing desteği
+CONFIG_BPF_EVENTS=y
+CONFIG_TRACEPOINTS=y
+CONFIG_KPROBE_EVENTS=y
+CONFIG_UPROBE_EVENTS=y
+
+# Program türleri (ihtiyaca göre seç)
+CONFIG_CGROUP_BPF=y              # cgroup hook'ları
+# CONFIG_NET_ACT_BPF=y           # TC eBPF (ağ gerekliyse)
+# CONFIG_XDP_SOCKETS=y           # AF_XDP (yüksek hız ağ)
+
+# Geliştirme araçları (üretimde gerekmeyebilir)
+# CONFIG_BPF_PRELOAD=y
+</code></pre>
+
+  <h3>Bellek kısıtları ve sınırlar</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Kaynak</th><th>Varsayılan Sınır</th><th>Gömülü Öneri</th><th>Değiştirme</th></tr></thead>
+      <tbody>
+        <tr><td>BPF program boyutu</td><td>1M instruction</td><td>64K instruction</td><td>/proc/sys/kernel/bpf_jit_limit</td></tr>
+        <tr><td>Stack boyutu</td><td>512 byte</td><td>Aynı (sabit)</td><td>Değiştirilemez — verifier kısıtı</td></tr>
+        <tr><td>Map başına bellek</td><td>Sınırsız (ulimit)</td><td>max_entries sınırla</td><td>MAP tanımında</td></tr>
+        <tr><td>Kilitli bellek</td><td>RLIMIT_MEMLOCK</td><td>8 MB minimum</td><td>ulimit -l veya CAP_BPF</td></tr>
+        <tr><td>Açık BPF fd sayısı</td><td>RLIMIT_NOFILE</td><td>1024 yeterli</td><td>ulimit -n</td></tr>
+        <tr><td>Verifier karmaşıklığı</td><td>1M instruction</td><td>Aynı</td><td>BPF_COMPLEXITY_LIMIT_INSNS</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>ARM64 gömülü sistemde BTF</h3>
+
+<pre><code># Yocto meta-layer'da kernel fragment:
+# meta-custom/recipes-kernel/linux/linux-%.bbappend
+# files/bpf.cfg:
+
+CONFIG_BPF=y
+CONFIG_BPF_SYSCALL=y
+CONFIG_BPF_JIT=y
+CONFIG_DEBUG_INFO=y
+CONFIG_DEBUG_INFO_BTF=y
+CONFIG_DEBUG_INFO_REDUCED=n  # BTF için tam debug info şart
+
+# Dikkat: DEBUG_INFO_BTF, paket boyutunu artırır
+# vmlinux BTF ~2-5 MB; sadece /sys/kernel/btf/vmlinux'a yansır
+# vmlinux imajının boyutu artmaz (BTF zaten debug bölümünde)
+
+# Cross-derleme ile BTF üretimi:
+bitbake linux-custom
+# tmp/deploy/images/myboard/vmlinux içinden BTF extract:
+bpftool btf dump file tmp/deploy/images/myboard/vmlinux format c \
+    > vmlinux-myboard.h
+</code></pre>
+
+  <h3>libbpf statik bağlama</h3>
+
+<pre><code># Gömülü sistemde dinamik libbpf olmayabilir; statik bağla:
+# CMakeLists.txt veya Makefile:
+
+# libbpf'yi statik derle:
+git clone https://github.com/libbpf/libbpf.git
+cd libbpf/src
+make BUILD_STATIC_ONLY=1 OBJDIR=build
+
+# Uygulamayı statik bağla:
+gcc -static myprog.c -I libbpf/src \
+    libbpf/src/build/libbpf.a \
+    -lelf -lz -o myprog
+
+# Binary boyutu: ~400 KB (stripped)
+# Hedef cihazda libelf ve libz kurulu olmalı (veya statik bağla)
+</code></pre>
+
+  <h3>Kaynak tasarrufu — minimal BPF programı</h3>
+  <p>Gömülü sistemlerde BPF programlarını küçük tutmak verifier süresini ve JIT belleğini azaltır. 4 KB'tan küçük BPF programları çoğu ARM Cortex-A gömülü sistemde sorunsuz çalışır. Ring buffer yerine PERCPU_ARRAY tercih etmek bellek tüketimini öngörülebilir kılar.</p>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Hata ayıklama — bpftool, libbpf log, verifier</h2>
+  <p class="section-lead">BPF verifier hataları, CO-RE relocation sorunları ve map erişim hataları en sık karşılaşılan sorunlardır. bpftool ve libbpf log mekanizmaları bu sorunları teşhis etmek için kapsamlı araçlar sunar.</p>
+
+  <h3>bpftool: yüklü programları incele</h3>
+
+<pre><code># Çalışan tüm BPF programlarını listele
+bpftool prog list
+# 42: kprobe  name handle_exec  tag abc123def456  gpl
+#     loaded_at 2026-03-15T10:22:31+0000  uid 0
+#     xlated 312B  jited 256B  memlock 4096B  map_ids 7,8
+
+# Program bytecode'unu dök (xlated = verifier sonrası)
+bpftool prog dump xlated id 42
+
+# JIT edilmiş makine kodunu dök
+bpftool prog dump jited id 42
+
+# BTF bilgisiyle birlikte program dök
+bpftool prog dump xlated id 42 linum
+
+# Programı dosyaya kaydet (başka makinede analiz için)
+bpftool prog dump xlated id 42 file prog.bpf
+</code></pre>
+
+  <h3>bpftool: map inceleme</h3>
+
+<pre><code># Tüm map'leri listele
+bpftool map list
+# 7: hash  name pid_map  flags 0x0
+#    key 4B  value 8B  max_entries 1024  memlock 81920B
+
+# Map içeriğini dök
+bpftool map dump id 7
+
+# Belirli anahtarı sorgula
+bpftool map lookup id 7 key 0x12 0x34 0x00 0x00
+
+# Map'e değer yaz (test için)
+bpftool map update id 7 key 0x01 0x00 0x00 0x00 value 0x01 0x00 0x00 0x00 0x00 0x00 0x00 0x00
+</code></pre>
+
+  <h3>bpftool: BTF inceleme</h3>
+
+<pre><code># Kernel BTF'deki tüm tipleri listele
+bpftool btf dump id 1
+
+# Belirli bir struct bul
+bpftool btf dump file /sys/kernel/btf/vmlinux | grep -A 20 "struct task_struct {"
+
+# BPF program BTF'ini incele
+bpftool prog dump xlated id 42 visual | dot -Tpng -o prog_cfg.png
+
+# CO-RE relocation bilgisini göster
+llvm-readelf -S myprog.bpf.o | grep BTF
+llvm-objdump --section=.BTF.ext myprog.bpf.o
+</code></pre>
+
+  <h3>libbpf verbose log</h3>
+
+<pre><code>/* Maksimum log seviyesi: verifier hatalarını da gösterir */
+static int print_all(enum libbpf_print_level level,
+                     const char *fmt, va_list args)
+{
+    return vfprintf(stderr, fmt, args);
+}
+
+libbpf_set_print(print_all);
+
+/* Verifier log'u doğrudan almak için: */
+char log_buf[1 &lt;&lt; 20];  /* 1 MB log tamponu */
+struct bpf_object_open_opts opts = {
+    .sz = sizeof(opts),
+};
+struct bpf_program *prog = /* ... */;
+bpf_program__set_log_buf(prog, log_buf, sizeof(log_buf));
+bpf_program__set_log_level(prog, 2);  /* 1=verifier, 2=verbose, 4=stats */
+
+err = bpf_object__load(obj);
+if (err)
+    fprintf(stderr, "Verifier log:\n%s\n", log_buf);
+</code></pre>
+
+  <h3>Yaygın verifier hataları ve çözümleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Hata Mesajı</th><th>Neden</th><th>Çözüm</th></tr></thead>
+      <tbody>
+        <tr><td><code>R0 unbounded memory access</code></td><td>Map lookup dönüş değeri NULL kontrolsüz kullanılmış</td><td>Pointer'ı NULL kontrolüyle kullan</td></tr>
+        <tr><td><code>invalid access to map value</code></td><td>map value offset sınır dışı erişim</td><td>sizeof kontrolü ekle; bound check yap</td></tr>
+        <tr><td><code>back-edge from insn N to M</code></td><td>Geri döngü — verifier geçişlerde izin vermez</td><td>Döngüyü bounded loop pragma ile yeniden yaz</td></tr>
+        <tr><td><code>cannot pass map_type 3 into func</code></td><td>Map türü helper ile uyumsuz</td><td>Doğru map türünü seç</td></tr>
+        <tr><td><code>Unreachable insn N</code></td><td>Ölü kod — verifier optimizasyon sonucu</td><td>Derleyici uyarılarını açık tut: -Wall</td></tr>
+        <tr><td><code>CO-RE relocations: field not found</code></td><td>vmlinux.h, hedef kernel BTF ile uyumsuz</td><td>Hedef kernel'dan vmlinux.h üret</td></tr>
+        <tr><td><code>libbpf: failed to load BTF</code></td><td>CONFIG_DEBUG_INFO_BTF=y değil</td><td>Kernel yeniden derle veya BTF sidecar kullan</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>bpf_printk ile çalışma zamanı debug</h3>
+
+<pre><code>/* Kernel tarafı: trace_pipe'e yazar */
+bpf_printk("pid=%d comm=%s bytes=%llu\n",
+            e-&gt;pid, e-&gt;comm, e-&gt;bytes);
+
+/* User-space: çıktıyı oku */
+/* sudo cat /sys/kernel/debug/tracing/trace_pipe */
+
+/* Dikkat: bpf_printk çok pahalıdır — sadece debug build'da kullan */
+/* Üretimde ring buffer kullan */
+
+#ifdef DEBUG
+#define BPF_LOG(...) bpf_printk(__VA_ARGS__)
+#else
+#define BPF_LOG(...) do {} while (0)
+#endif
+</code></pre>
+
+</section>
+
+</main>

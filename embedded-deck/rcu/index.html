@@ -1,0 +1,653 @@
+---
+layout: tutorial
+title: "RCU — Read-Copy-Update Kernel Senkronizasyonu"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>KERNEL SENKRONIZASYON</span>
+    <span>2026</span>
+  </div>
+  <h1>RCU<br><em>Read-Copy-Update Kernel Senkronizasyonu</em></h1>
+  <p class="subtitle">Okuyucuları kilitsiz tutan, yazıcıları grace period ile senkronize eden Linux kernel'ın en performanslı senkronizasyon primitifi.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">RCU neden var</a></li>
+    <li><a href="#s1">RCU temel modeli</a></li>
+    <li><a href="#s2">rcu_read_lock / rcu_read_unlock</a></li>
+    <li><a href="#s3">rcu_assign_pointer / rcu_dereference</a></li>
+    <li><a href="#s4">synchronize_rcu / call_rcu / kfree_rcu</a></li>
+    <li><a href="#s5">SRCU — Sleepable RCU</a></li>
+    <li><a href="#s6">RCU-protected linked list</a></li>
+    <li><a href="#s7">RCU vs diğer mekanizmalar</a></li>
+    <li><a href="#s8">Hata ayıklama</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> RCU neden var</h2>
+  <p class="section-lead">Geleneksel okuyucu-yazıcı kilitleri, çok çekirdekli sistemlerde okuyucu sayısı arttıkça önbellek çatışması ve boş döngü maliyetiyle yavaşlar. RCU bu maliyeti sıfıra indirir.</p>
+
+  <h3>rwlock ve seqlock'un sınırları</h3>
+  <p>Klasik <code>rwlock_t</code> ile birden fazla okuyucu eş zamanlı okuyabilir, ancak her <code>read_lock()</code> çağrısı kilidin referans sayacını artırmak için paylaşılan bir atomik değişkene yazar. 64 çekirdekli bir sistemde 64 okuyucunun aynı cache line'a sürekli yazması, <strong>önbellek satırı ping-pong</strong> (false sharing) sorununa yol açar ve ölçeklenebilirliği dramatik biçimde düşürür.</p>
+
+  <div class="flow">
+    <pre>CPU0 read_lock() → atomic_inc(rwlock.count) → cache line invalid eder
+CPU1 read_lock() → cache miss → refetch → atomic_inc → invalidate
+CPU2 read_lock() → cache miss → ...
+→ O(N) maliyet, N = çekirdek sayısı</pre>
+  </div>
+
+  <h3>Lockless okuma motivasyonu</h3>
+  <p>RCU'nun temel fikri şudur: okuyucu tarafında <em>hiçbir paylaşılan değişkene yazmadan</em> okuma yapılabilir. Bunun bedeli yazıcı tarafına yüklenir; yazıcı yeni bir kopya üretir, atomik pointer ataması yapar ve eski kopyanın güvenle silinebileceği noktayı bekler.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Okuyucu maliyeti</span><span class="desc">Yalnızca preemption disable/enable — önbellek yazısı yok, atomik işlem yok</span></div>
+    <div class="param"><span class="name">Yazıcı maliyeti</span><span class="desc">Kopyalama + atomic pointer swap + grace period bekleme (synchronize_rcu)</span></div>
+    <div class="param"><span class="name">Bellek modeli</span><span class="desc">Pointer yayını için smp_store_release, okuma için smp_load_acquire (memory barrier)</span></div>
+    <div class="param"><span class="name">Ölçeklenebilirlik</span><span class="desc">Okuyucu sayısından bağımsız O(1) okuma maliyeti</span></div>
+  </div>
+
+  <h3>Kullanım alanları</h3>
+  <p>Linux kernel'ında RCU en yaygın biçimde aşağıdaki yapılarda kullanılır:</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Alt sistem</th><th>RCU kullanımı</th></tr></thead>
+      <tbody>
+        <tr><td>VFS / dcache</td><td>Dizin girişleri (dentry) okuma yolunda RCU ile korunur</td></tr>
+        <tr><td>Ağ yönlendirme</td><td>FIB (routing table) aramaları RCU okuma tarafında yapılır</td></tr>
+        <tr><td>Task listesi</td><td>for_each_process() — PID araması RCU ile kilitsiz</td></tr>
+        <tr><td>Module listesi</td><td>Modül aramaları okuma tarafında RCU korumalı</td></tr>
+        <tr><td>SELinux AVC</td><td>Erişim vektör önbelleği RCU ile hızlı aranır</td></tr>
+        <tr><td>netfilter</td><td>kural zinciri güncellemeleri RCU pointer swap ile atomik</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">TEMEL KISIT</div>
+    <p>RCU yalnızca <strong>pointer tabanlı veri yapıları</strong> için uygundur. İntegers veya skalarları doğrudan korumak için kullanılamaz. Okuyucu kritik bölgesi <strong>uyku içeremez</strong> (CONFIG_PREEMPT_RCU olmayan kernelde).</p>
+  </div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> RCU temel modeli</h2>
+  <p class="section-lead">Grace period, quiescent state ve publish-subscribe idiom — RCU'nun üç temel kavramı birlikte anlaşıldığında mekanizma netleşir.</p>
+
+  <h3>Grace period ve quiescent state</h3>
+  <p>RCU, eski pointer'a erişebilecek tüm okuyucuların işini bitirmesini bekler. Bu bekleme süresine <strong>grace period</strong> denir. Bir CPU'nun RCU okuma kritik bölgesi dışında olduğu her ana <strong>quiescent state</strong> (sessiz durum) denir. Tüm CPU'lar en az bir quiescent state geçirdiğinde bir grace period tamamlanmış sayılır.</p>
+
+  <div class="flow">
+    <pre>Yazıcı: yeni kopya oluştur → rcu_assign_pointer() → synchronize_rcu() bekle
+                                                             |
+CPU0: [rcu_read_lock ... rcu_read_unlock] ← quiescent state burada
+CPU1: [rcu_read_lock ... rcu_read_unlock] ← quiescent state burada
+CPU2: context switch (scheduler) ← quiescent state
+                                                             |
+                                              grace period bitti → kfree(eski)</pre>
+  </div>
+
+  <h3>Quiescent state örnekleri</h3>
+  <p>Bir CPU aşağıdaki durumlarda quiescent state'e girer:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Context switch</span><span class="desc">Scheduler başka bir process'e geçtiğinde — okuyucu kritik bölgesi içinde context switch olmaz</span></div>
+    <div class="param"><span class="name">User space</span><span class="desc">CPU kullanıcı alanında çalışıyorsa — kernel RCU kritik bölgesi dışındadır</span></div>
+    <div class="param"><span class="name">Idle</span><span class="desc">CPU idle döngüsündeyse — hiçbir kernel kodu çalışmıyor</span></div>
+    <div class="param"><span class="name">Offline</span><span class="desc">CPU hotplug ile offline yapılmışsa — hiçbir RCU okuyucu kalmaz</span></div>
+  </div>
+
+  <h3>Publish-subscribe idiom</h3>
+  <p>RCU, veri yapısı güncellemelerini publish-subscribe modeli ile yapar. Yazıcı yeni veriyi <em>yayınlar</em> (<code>rcu_assign_pointer</code>), okuyucu <em>abone olur</em> (<code>rcu_dereference</code>). İkisi arasında bellek bariyeri garanti edilir.</p>
+
+  <pre><code>/* Yazıcı — publish */
+struct config *new_cfg = kmalloc(sizeof(*new_cfg), GFP_KERNEL);
+memcpy(new_cfg, old_cfg, sizeof(*new_cfg));
+new_cfg->value = 42;
+rcu_assign_pointer(global_cfg, new_cfg);  /* smp_store_release içerir */
+
+/* Okuyucu — subscribe */
+rcu_read_lock();
+struct config *cfg = rcu_dereference(global_cfg);  /* smp_load_acquire içerir */
+do_something(cfg->value);
+rcu_read_unlock();</code></pre>
+
+  <h3>Memory ordering garantisi</h3>
+  <p><code>rcu_assign_pointer()</code> içindeki <code>smp_store_release()</code>, önceki tüm yazmaların okuyucu tarafından görünmesini garanti eder. <code>rcu_dereference()</code> içindeki <code>smp_load_acquire()</code> ise pointer okunduktan sonra yapılan erişimlerin doğru sıralandığını garantiler. Bu çift bariyer olmadan okuyucu yarı-başlatılmış veri görebilir.</p>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> rcu_read_lock / rcu_read_unlock</h2>
+  <p class="section-lead">Okuyucu tarafı API son derece hafiftir: çoğu konfigürasyonda tek instruction — preemption disable/enable.</p>
+
+  <h3>API kullanımı</h3>
+
+  <pre><code>#include &lt;linux/rcupdate.h&gt;
+
+rcu_read_lock();
+/* RCU korumalı pointer'lara erişim */
+struct my_data *p = rcu_dereference(global_ptr);
+if (p)
+    use(p-&gt;field);
+rcu_read_unlock();</code></pre>
+
+  <h3>Preemption modlarına göre davranış</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Kernel konfigürasyonu</th><th>rcu_read_lock() ne yapar</th><th>Uyku izni</th></tr></thead>
+      <tbody>
+        <tr><td>CONFIG_PREEMPTION=n (server)</td><td>Boş makro — maliyet sıfır</td><td>Hayır</td></tr>
+        <tr><td>CONFIG_PREEMPTION=y (desktop/RT)</td><td>preempt_disable()</td><td>Hayır</td></tr>
+        <tr><td>CONFIG_PREEMPT_RCU</td><td>preempt_disable() + counter güncelleme</td><td>Hayır</td></tr>
+        <tr><td>SRCU (ayrı API)</td><td>srcu_read_lock(&amp;srcu_struct)</td><td>Evet</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Nested okuma kritik bölgeleri</h3>
+  <p>RCU okuma kritik bölgeleri iç içe geçebilir. Her <code>rcu_read_lock()</code> için bir <code>rcu_read_unlock()</code> gerekir. Preemptible RCU'da sayaç tutulur:</p>
+
+  <pre><code>rcu_read_lock();          /* derinlik 1 */
+  p = rcu_dereference(ptr_a);
+  rcu_read_lock();        /* derinlik 2 — tamam */
+    q = rcu_dereference(ptr_b);
+    use(p, q);
+  rcu_read_unlock();      /* derinlik 2 */
+rcu_read_unlock();        /* derinlik 1 */</code></pre>
+
+  <h3>Yasak işlemler</h3>
+  <p>Okuma kritik bölgesi içinde aşağıdakiler yasaktır:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Uyku / bekleme</span><span class="desc">msleep(), wait_event(), mutex_lock() — preemption disable iken uyku kernel'ı kilitler</span></div>
+    <div class="param"><span class="name">synchronize_rcu()</span><span class="desc">Grace period beklemek için okuyucu kritik bölgesinden çıkılması gerekir — deadlock</span></div>
+    <div class="param"><span class="name">kfree() — doğrudan</span><span class="desc">RCU korumalı pointer'ı okuma tarafında serbest bırakmak race condition'a yol açar</span></div>
+  </div>
+
+  <h3>rcu_read_lock_bh / rcu_read_lock_sched</h3>
+  <p>Ağ alt sisteminde BH-disabled bağlamda çalışırken <code>rcu_read_lock_bh()</code> kullanılır. Scheduler bağlamında <code>rcu_read_lock_sched()</code> tercih edilir. Bu varyantlar farklı quiescent state tanımları kullanır ve performans açısından <code>rcu_read_lock()</code> ile eşdeğerdir.</p>
+
+  <pre><code>/* Ağ RX yolunda softirq bağlamı */
+rcu_read_lock_bh();
+struct neighbour *n = __ipv4_neigh_lookup_noref(dev, nexthop);
+if (n)
+    neigh_output(n, skb, false);
+rcu_read_unlock_bh();</code></pre>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> rcu_assign_pointer / rcu_dereference</h2>
+  <p class="section-lead">Pointer yayınlama ve okuma API'si — bellek bariyerlerini doğru yerleştirerek yarı-başlatılmış veriye erişimi engeller.</p>
+
+  <h3>rcu_assign_pointer</h3>
+  <p>Yazıcı tarafında kullanılır. Yeni pointer değerini önceki tüm yazmaları görünür kılarak atomik biçimde yayınlar. Derleyici ve işlemci yeniden sıralamalarını engeller.</p>
+
+  <pre><code>/* Tanım (basitleştirilmiş) */
+#define rcu_assign_pointer(p, v)                    \
+do {                                                \
+    smp_store_release(&amp;(p),                         \
+        RCU_INITIALIZER(v));                        \
+} while (0)
+
+/* Kullanım */
+struct node *new_node = kzalloc(sizeof(*new_node), GFP_KERNEL);
+new_node-&gt;data = 100;
+rcu_assign_pointer(list_head, new_node);</code></pre>
+
+  <h3>rcu_dereference</h3>
+  <p>Okuyucu tarafında <code>rcu_read_lock()</code> ile korunan bölgede kullanılır. Alpha mimarisinde <code>smp_read_barrier_depends()</code>, diğer mimarilerde <code>READ_ONCE()</code> eşdeğeridir. Derleyicinin pointer bağımlı yüklemeleri optimize etmesini engeller.</p>
+
+  <pre><code>rcu_read_lock();
+struct node *p = rcu_dereference(list_head);
+/* p artık güvenli — grace period boyunca geçerli */
+if (p != NULL) {
+    int val = p-&gt;data;    /* Bu erişim korumalı */
+    pr_info("value: %d\n", val);
+}
+rcu_read_unlock();
+/* p burada artık güvenli DEĞİL — erişim yapılamaz */</code></pre>
+
+  <h3>rcu_dereference_protected</h3>
+  <p>Yazıcı tarafında, kilit tutulurken yapılan erişimlerde kullanılır. Sparse aracının RCU kontrollerini atlatan bir varyantıdır:</p>
+
+  <pre><code>spin_lock(&amp;update_lock);
+struct node *p = rcu_dereference_protected(list_head,
+                     lockdep_is_held(&amp;update_lock));
+/* Güvenle değişiklik yap */
+p-&gt;data = new_value;
+spin_unlock(&amp;update_lock);</code></pre>
+
+  <h3>rcu_access_pointer</h3>
+  <p>Pointer'ın NULL olup olmadığını kontrol etmek için <code>rcu_read_lock()</code> dışında kullanılabilir. Yalnızca NULL kontrolü yapılacaksa <code>rcu_dereference()</code> gerekmez:</p>
+
+  <pre><code>/* rcu_read_lock gerekmez — sadece NULL kontrolü */
+if (rcu_access_pointer(global_ptr) == NULL)
+    return -ENODEV;</code></pre>
+
+  <h3>Sparse ile statik analiz</h3>
+  <p><code>__rcu</code> tip niteleyicisi sparse aracına RCU kullanımlarını kontrol ettirir. Yanlış bağlamda <code>rcu_dereference()</code> çağrılmadığında sparse uyarı verir:</p>
+
+  <pre><code>struct config __rcu *global_cfg;  /* __rcu etiketi */
+
+/* sparse: rcu_read_lock() olmadan erişim — uyarı */
+struct config *p = global_cfg;       /* YANLIŞ */
+struct config *p = rcu_dereference(global_cfg);  /* DOĞRU */</code></pre>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> synchronize_rcu / call_rcu / kfree_rcu</h2>
+  <p class="section-lead">Yazıcı, yeni pointer'ı yayınladıktan sonra eski veriyi ancak tüm okuyucuların işini bitirdiğinden emin olarak silebilir. Bu üç API farklı bağlamlara hitap eder.</p>
+
+  <h3>synchronize_rcu — bloklu bekleme</h3>
+  <p>Çağrıyı yapan thread, mevcut grace period tamamlanana kadar uyur. Process bağlamında, yüksek öncelikli kodda kullanılamaz.</p>
+
+  <pre><code>struct config *old_cfg;
+
+spin_lock(&amp;cfg_lock);
+old_cfg = rcu_dereference_protected(global_cfg,
+              lockdep_is_held(&amp;cfg_lock));
+rcu_assign_pointer(global_cfg, new_cfg);
+spin_unlock(&amp;cfg_lock);
+
+synchronize_rcu();    /* tüm okuyucular bitene kadar blokla */
+kfree(old_cfg);       /* artık güvenli */</code></pre>
+
+  <h3>call_rcu — asenkron geri çağrım</h3>
+  <p>Grace period beklemek yerine bir callback kaydeder. Softirq bağlamında, interrupt handler'dan çağrılabilir. Grace period dolduğunda callback çalışır:</p>
+
+  <pre><code>struct my_obj {
+    int data;
+    struct rcu_head rcu;  /* callback için head alanı */
+};
+
+static void my_obj_reclaim(struct rcu_head *head)
+{
+    struct my_obj *obj = container_of(head, struct my_obj, rcu);
+    kfree(obj);
+}
+
+/* Yazıcı — asenkron silme */
+rcu_assign_pointer(global_obj, new_obj);
+call_rcu(&amp;old_obj-&gt;rcu, my_obj_reclaim);</code></pre>
+
+  <h3>kfree_rcu — basitleştirilmiş silme</h3>
+  <p>Yalnızca <code>kfree()</code> yapılacaksa callback yazmak gerekmez. <code>kfree_rcu()</code> bunu otomatik halleder. Linux 5.12'den itibaren <code>rcu</code> alanı olmadan da kullanılabilir:</p>
+
+  <pre><code>struct my_obj {
+    int data;
+    struct rcu_head rcu;
+};
+
+/* Eski yol — rcu_head gerektirir */
+kfree_rcu(old_obj, rcu);
+
+/* Linux 5.12+ — rcu_head gerektirmez */
+kfree_rcu(old_obj);</code></pre>
+
+  <h3>synchronize_rcu_expedited</h3>
+  <p>Normal <code>synchronize_rcu()</code>'dan daha hızlı tamamlanır — IPI (inter-processor interrupt) göndererek CPU'ları aktif olarak quiescent state'e zorlar. Sistem yükünü artırdığı için sadece test ve hata ayıklama için önerilir:</p>
+
+  <pre><code>/* Hızlı ama pahalı — sadece non-production kullanım */
+synchronize_rcu_expedited();</code></pre>
+
+  <h3>Bellek modeli özeti</h3>
+
+  <div class="flow">
+    <pre>Yazıcı:
+  [1] new = alloc() + init
+  [2] rcu_assign_pointer(ptr, new)  ← smp_store_release
+  [3] synchronize_rcu()             ← tüm CPU'lar quiescent
+  [4] kfree(old)                    ← güvenli
+
+Okuyucu (grace period öncesi başlar):
+  rcu_read_lock()
+  p = rcu_dereference(ptr)          ← smp_load_acquire
+  use(p)                            ← [3] bitmeden grace period aktif
+  rcu_read_unlock()                 ← quiescent state başladı</pre>
+  </div>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> SRCU — Sleepable RCU</h2>
+  <p class="section-lead">Standart RCU okuma kritik bölgesinde uyku yasakken, SRCU (Sleepable RCU) okuyucuların uyumasına izin verir. Bu esnekliğin bedeli daha ağır başlatma ve per-srcu-struct grace period maliyetidir.</p>
+
+  <h3>SRCU ne zaman gerekir</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Uyuyan okuyucu</span><span class="desc">Okuma kritik bölgesinde mutex, semaphore veya I/O beklenmesi gerekiyorsa</span></div>
+    <div class="param"><span class="name">Filesystem notifier</span><span class="desc">fsnotify gibi dosya sistemi olaylarında callback uyuyabilir</span></div>
+    <div class="param"><span class="name">KVM vCPU</span><span class="desc">Guest CPU'lar uyurken SRCU ile korunan yapılara erişim gerekebilir</span></div>
+    <div class="param"><span class="name">Netfilter hook</span><span class="desc">Bazı netfilter hook'ları uyku gerektiren işlemler yapar</span></div>
+  </div>
+
+  <h3>init_srcu_struct ve DEFINE_SRCU</h3>
+
+  <pre><code>#include &lt;linux/srcu.h&gt;
+
+/* Statik tanım */
+DEFINE_SRCU(my_srcu);
+
+/* Dinamik tanım */
+struct srcu_struct my_srcu;
+int ret = init_srcu_struct(&amp;my_srcu);
+if (ret)
+    return ret;
+
+/* Temizlik */
+cleanup_srcu_struct(&amp;my_srcu);</code></pre>
+
+  <h3>SRCU okuyucu API</h3>
+
+  <pre><code>int idx;
+
+idx = srcu_read_lock(&amp;my_srcu);    /* integer döner — indeks */
+/* Bu bölgede uyku mümkün */
+struct data *p = srcu_dereference(global_data, &amp;my_srcu);
+if (p) {
+    mutex_lock(&amp;p-&gt;lock);          /* uyku — SRCU'da izinli */
+    process(p);
+    mutex_unlock(&amp;p-&gt;lock);
+}
+srcu_read_unlock(&amp;my_srcu, idx);  /* indeks geri verilir */</code></pre>
+
+  <h3>synchronize_srcu ve call_srcu</h3>
+
+  <pre><code>/* Bloklu — bu srcu_struct için tüm okuyucuları bekle */
+synchronize_srcu(&amp;my_srcu);
+
+/* Asenkron callback */
+call_srcu(&amp;my_srcu, &amp;old_obj-&gt;rcu, my_reclaim);
+
+/* Hızlı (expedited) varyant */
+synchronize_srcu_expedited(&amp;my_srcu);</code></pre>
+
+  <h3>SRCU ile standart RCU farkı</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>RCU</th><th>SRCU</th></tr></thead>
+      <tbody>
+        <tr><td>Okuyucu uyku</td><td>Yasak</td><td>İzinli</td></tr>
+        <tr><td>Okuyucu maliyeti</td><td>~0 (preempt_disable)</td><td>Per-CPU sayaç güncelleme</td></tr>
+        <tr><td>Grace period</td><td>Global</td><td>Per-srcu_struct</td></tr>
+        <tr><td>Birden fazla domain</td><td>Yok</td><td>Her srcu_struct bağımsız</td></tr>
+        <tr><td>init gerektirme</td><td>Statik, init yok</td><td>init_srcu_struct() gerekli</td></tr>
+        <tr><td>Kullanım alanı</td><td>Genel amaç</td><td>Uyuyan okuyucu senaryoları</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>SRCU iç mekanizması</h3>
+  <p>SRCU iki adet per-CPU sayaç çifti tutar (A ve B). Okuyucular aktif çifte kaydolur. <code>synchronize_srcu()</code> çağrıldığında geçiş yapılır ve eski çiftteki sayaçların sıfırlanması beklenir. Bu mekanizma preemption disable gerektirmez çünkü CPU'ların quiescent state'ini beklemez; doğrudan okuyucu sayısını takip eder.</p>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> RCU-protected linked list</h2>
+  <p class="section-lead">Linux kernel, RCU ile korunan bağlı listeler için özel API sağlar. Bu API standart list API'sine paralel bir arayüz sunar.</p>
+
+  <h3>Temel API</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">list_add_rcu()</span><span class="desc">Listeye yeni eleman ekler — smp_store_release ile pointer güncellemesi</span></div>
+    <div class="param"><span class="name">list_del_rcu()</span><span class="desc">Elemanı listeden çıkarır — ancak kfree için grace period beklenmeli</span></div>
+    <div class="param"><span class="name">list_replace_rcu()</span><span class="desc">Bir elemanı atomik olarak başkasıyla değiştirir</span></div>
+    <div class="param"><span class="name">list_for_each_entry_rcu()</span><span class="desc">RCU okuma kritik bölgesinde listeyi güvenle iterate eder</span></div>
+  </div>
+
+  <h3>Tam örnek — global cihaz listesi</h3>
+
+  <pre><code>#include &lt;linux/list.h&gt;
+#include &lt;linux/rcupdate.h&gt;
+#include &lt;linux/spinlock.h&gt;
+
+struct device_entry {
+    int id;
+    char name[32];
+    struct list_head node;
+    struct rcu_head rcu;
+};
+
+static LIST_HEAD(device_list);
+static DEFINE_SPINLOCK(device_lock);
+
+/* Okuyucu — kilit yok, sadece rcu_read_lock */
+struct device_entry *find_device(int id)
+{
+    struct device_entry *entry;
+
+    rcu_read_lock();
+    list_for_each_entry_rcu(entry, &amp;device_list, node) {
+        if (entry-&gt;id == id) {
+            rcu_read_unlock();
+            return entry;  /* Dikkat: caller grace period bitince erişmemeli */
+        }
+    }
+    rcu_read_unlock();
+    return NULL;
+}
+
+/* Yazıcı — spinlock + rcu_assign */
+int add_device(int id, const char *name)
+{
+    struct device_entry *entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+    if (!entry)
+        return -ENOMEM;
+
+    entry-&gt;id = id;
+    strscpy(entry-&gt;name, name, sizeof(entry-&gt;name));
+    INIT_LIST_HEAD(&amp;entry-&gt;node);
+
+    spin_lock(&amp;device_lock);
+    list_add_rcu(&amp;entry-&gt;node, &amp;device_list);
+    spin_unlock(&amp;device_lock);
+    return 0;
+}
+
+/* Yazıcı — silme */
+static void device_free_rcu(struct rcu_head *head)
+{
+    struct device_entry *entry =
+        container_of(head, struct device_entry, rcu);
+    kfree(entry);
+}
+
+void remove_device(int id)
+{
+    struct device_entry *entry;
+
+    spin_lock(&amp;device_lock);
+    list_for_each_entry(entry, &amp;device_list, node) {
+        if (entry-&gt;id == id) {
+            list_del_rcu(&amp;entry-&gt;node);
+            spin_unlock(&amp;device_lock);
+            call_rcu(&amp;entry-&gt;rcu, device_free_rcu);
+            return;
+        }
+    }
+    spin_unlock(&amp;device_lock);
+}</code></pre>
+
+  <h3>hlist_for_each_entry_rcu</h3>
+  <p>Hash table yapıları için <code>hlist</code> varyantları da mevcuttur. Kernel'ın pid hash table'ı bu yapıyı kullanır:</p>
+
+  <pre><code>struct hlist_head hash[256];
+
+/* Ekleme */
+spin_lock(&amp;hash_lock);
+hlist_add_head_rcu(&amp;obj-&gt;hnode, &amp;hash[h]);
+spin_unlock(&amp;hash_lock);
+
+/* Arama */
+rcu_read_lock();
+hlist_for_each_entry_rcu(obj, &amp;hash[h], hnode) {
+    if (obj-&gt;key == key)
+        break;
+}
+rcu_read_unlock();</code></pre>
+
+  <h3>list_for_each_entry_rcu ile concurrent güncelleme</h3>
+  <p>Okuyucu iterate ederken yazıcı eleman ekleyebilir/silebilir. <code>list_for_each_entry_rcu()</code> makrosu <code>READ_ONCE()</code> ile her adımda pointer okur, böylece yeni eklenen elemanları görebilir ancak tutarsız pointer görmez.</p>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> RCU vs diğer mekanizmalar</h2>
+  <p class="section-lead">RCU her senaryoya uygun değildir. Spinlock, seqlock ve hazard pointer ile karşılaştırmalı analiz doğru aracı seçmeye yardımcı olur.</p>
+
+  <h3>Kapsamlı karşılaştırma tablosu</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr>
+          <th>Özellik</th>
+          <th>spinlock</th>
+          <th>rwlock</th>
+          <th>seqlock</th>
+          <th>RCU</th>
+          <th>Hazard ptr</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>Okuyucu maliyeti</td><td>Spin (yüksek)</td><td>Atomic inc/dec</td><td>2x okuma (retry)</td><td>~Sıfır</td><td>Store + fence</td></tr>
+        <tr><td>Yazıcı maliyeti</td><td>Spin</td><td>Exclusive lock</td><td>Seqcount güncelle</td><td>Kopya + GP bekleme</td><td>Spin + tarama</td></tr>
+        <tr><td>Okuyucu ölçeği</td><td>Kötü</td><td>Orta</td><td>İyi</td><td>Mükemmel</td><td>İyi</td></tr>
+        <tr><td>Okuyucu uyku</td><td>Hayır</td><td>Hayır</td><td>Hayır</td><td>Hayır (SRCU: Evet)</td><td>Hayır</td></tr>
+        <tr><td>Bellek overhead</td><td>Minimal</td><td>Minimal</td><td>Minimal</td><td>Eski kopya grace period süresince</td><td>Per-thread hazard ptr</td></tr>
+        <tr><td>Veri büyüklüğü</td><td>Her büyüklük</td><td>Her büyüklük</td><td>Küçük/skalar</td><td>Pointer tabanlı</td><td>Pointer tabanlı</td></tr>
+        <tr><td>Yazıcı sayısı</td><td>Tek</td><td>Tek</td><td>Tek/çoklu</td><td>Çoklu (kilit ile)</td><td>Çoklu</td></tr>
+        <tr><td>Kullanım alanı</td><td>Kısa kritik bölge</td><td>Çok okuyucu</td><td>Küçük veri, çok okuma</td><td>Çok okuyucu, nadir yazma</td><td>Lock-free yapılar</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>seqlock ile RCU karşılaştırması</h3>
+  <p><code>seqlock</code>, okuyucunun tutarsız veri okumasını tespit edip yeniden denemesine dayanır. Küçük, hızlı okunabilen veri (zaman damgaları, sayaçlar) için idealdir. RCU ise büyük veri yapıları için uygundur çünkü okuyucu retry gerekmez.</p>
+
+  <pre><code>/* seqlock okuyucu */
+unsigned int seq;
+do {
+    seq = read_seqbegin(&amp;my_seqlock);
+    memcpy(&amp;local_copy, &amp;shared_data, sizeof(local_copy));
+} while (read_seqretry(&amp;my_seqlock, seq));
+
+/* RCU okuyucu — retry yok */
+rcu_read_lock();
+p = rcu_dereference(global_ptr);
+memcpy(&amp;local_copy, p, sizeof(*p));
+rcu_read_unlock();</code></pre>
+
+  <h3>Hangi durumda ne kullanmalı</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">spinlock</span><span class="desc">Kısa kritik bölge, interrupt context, az çekirdekli sistem</span></div>
+    <div class="param"><span class="name">rwlock</span><span class="desc">Çok okuyucu orta ölçekli sistem, eski kod uyumluluğu</span></div>
+    <div class="param"><span class="name">seqlock</span><span class="desc">Küçük veri (jiffies, timespec), sık okuma, nadir yazma</span></div>
+    <div class="param"><span class="name">RCU</span><span class="desc">Pointer tabanlı yapı, ölçeklenebilir okuma, okuma &gt;&gt; yazma</span></div>
+    <div class="param"><span class="name">SRCU</span><span class="desc">Okuma kritik bölgesinde uyku gereken durum</span></div>
+  </div>
+
+  <h3>Overhead ölçümü</h3>
+  <p>Bir 64 çekirdekli sunucuda 100 ns periyotla yapılan ölçümlerde RCU okuyucu maliyeti spinlock'tan ~50x daha düşük çıkar. Yazıcı tarafında <code>synchronize_rcu()</code> birkaç ms sürebilir — bu süre sistemdeki en uzun scheduler tick periyoduna bağlıdır.</p>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Hata ayıklama</h2>
+  <p class="section-lead">RCU hataları — grace period ihlali, use-after-free, okuma kritik bölgesinde uyku — sessiz veri bozulmasına yol açar. Kernel, bu hataları yakalamak için çeşitli araçlar sunar.</p>
+
+  <h3>CONFIG_PROVE_RCU ve lockdep</h3>
+  <p>Lockdep'in RCU uzantısı, yanlış bağlamda <code>rcu_dereference()</code> kullanımını, <code>rcu_read_lock()</code> içinde <code>synchronize_rcu()</code> çağrısını ve <code>__rcu</code> işaretli pointer'lara korumasız erişimi tespit eder:</p>
+
+  <pre><code>CONFIG_DEBUG_LOCK_ALLOC=y
+CONFIG_PROVE_LOCKING=y
+CONFIG_PROVE_RCU=y
+CONFIG_RCU_TRACE=y</code></pre>
+
+  <p>Bu konfigürasyonlarla kernel, illegal RCU kullanımını stack trace ile birlikte loglar:</p>
+
+  <pre><code>[ 1234.567890] WARNING: suspicious RCU usage
+[ 1234.567891] kernel/sched/core.c:1234
+[ 1234.567892] rcu_dereference() called without rcu_read_lock()
+[ 1234.567893] Call Trace:
+[ 1234.567894]  dump_stack+0x48
+[ 1234.567895]  lockdep_rcu_suspicious+0x12c
+[ 1234.567896]  my_driver_read+0x34</code></pre>
+
+  <h3>rcutorture — stres testi modülü</h3>
+  <p><code>rcutorture</code> kernel modülü RCU implementasyonunu sistematik biçimde test eder. Writer ve reader thread'leri yoğun şekilde çalıştırarak grace period ve memory ordering'i doğrular:</p>
+
+  <pre><code># rcutorture modülünü yükle
+modprobe rcutorture torture_type=rcu nreaders=8 nfakewriters=4 \
+         stutter=5 irqreader=1 stat_interval=60
+
+# Test sonuçlarını izle
+dmesg | grep -i torture
+
+# Temizle
+echo 0 &gt; /sys/module/rcutorture/parameters/shutdown_secs</code></pre>
+
+  <h3>RCU stall — CPU askıda kalması</h3>
+  <p>Bir CPU uzun süre quiescent state'e girmezse (varsayılan 21 saniye) kernel RCU stall mesajı basar. Bu genellikle softirq, NMI veya interrupt handler içinde uzun döngü anlamına gelir:</p>
+
+  <pre><code>[ 5678.901234] INFO: rcu_sched detected stalls on CPUs/tasks: { 3 } (detected by 0, 21016 jiffies)
+[ 5678.901235] Sending NMI from CPU 0 to CPUs 3:
+[ 5678.901236] NMI backtrace for cpu 3
+[ 5678.901237] Call Trace:
+[ 5678.901238]  my_broken_handler+0x8c    &lt;-- sonsuz döngü burada
+
+# Stall timeout ayarı (saniye)
+echo 60 &gt; /sys/module/rcupdate/parameters/rcu_cpu_stall_timeout</code></pre>
+
+  <h3>RCU istatistikleri — debugfs</h3>
+
+  <pre><code># RCU state bilgisi
+cat /sys/kernel/debug/rcu/rcu_sched/rcudata
+
+# Grace period sayacı
+cat /sys/kernel/debug/rcu/rcu_sched/rcu_gp
+
+# SRCU istatistikleri
+cat /sys/kernel/debug/rcu/rcu_srcu</code></pre>
+
+  <h3>Yaygın hatalar ve çözümleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Hata</th><th>Belirti</th><th>Çözüm</th></tr></thead>
+      <tbody>
+        <tr><td>rcu_read_unlock() eksik</td><td>RCU stall, grace period hiç bitmez</td><td>Her lock/unlock çiftini eşle, PROVE_RCU kullan</td></tr>
+        <tr><td>Grace period beklemeden kfree</td><td>Use-after-free, KASAN uyarısı</td><td>synchronize_rcu() veya kfree_rcu() kullan</td></tr>
+        <tr><td>Kritik bölgede uyku</td><td>Kernel panic (might_sleep kontrolü)</td><td>SRCU'ya geç veya uyku kodu dışarı taşı</td></tr>
+        <tr><td>rcu_dereference() dışarıda</td><td>Alpha'da veri bozulması, PROVE_RCU uyarısı</td><td>Her erişim rcu_read_lock() içinde olmalı</td></tr>
+        <tr><td>call_rcu callback'te kilit</td><td>Deadlock — softirq bağlamında mutex yasak</td><td>Callback'te yalnızca spinlock kullan</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>KCSAN ile veri yarışı tespiti</h3>
+  <p>Kernel Concurrency Sanitizer (KCSAN), RCU olmadan yapılan eş zamanlı bellek erişimlerini tespit eder. <code>CONFIG_KCSAN=y</code> ile derlenen kernelde veri yarışları raporlanır:</p>
+
+  <pre><code>CONFIG_KCSAN=y
+CONFIG_KCSAN_REPORT_ONCE_IN_MS=3000
+
+# Çıktı örneği:
+# KCSAN: data-race in my_func / my_func
+# write to 0xffff... by task 123:
+# read to 0xffff... by task 456:</code></pre>
+
+  <div class="callout">
+    <div class="label">ÖNERİ</div>
+    <p>Geliştirme sırasında <strong>CONFIG_PROVE_RCU</strong>, <strong>CONFIG_DEBUG_LOCK_ALLOC</strong> ve <strong>CONFIG_KCSAN</strong> birlikte etkinleştirin. Bu üç araç birlikte RCU kaynaklı hataların büyük çoğunluğunu derleme veya ilk çalışma anında yakalar.</p>
+  </div>
+</section>
+
+</main>

@@ -1,0 +1,723 @@
+---
+layout: tutorial
+title: "FUSE — Kullanıcı Alanı Dosya Sistemi Çerçevesi"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>DOSYA SİSTEMİ</span>
+    <span>2026</span>
+  </div>
+  <h1>FUSE<br><em>Kullanıcı Alanı Dosya Sistemi Çerçevesi</em></h1>
+  <p class="subtitle">FUSE kernel modülü ve libfuse ile kullanıcı alanında özel dosya sistemi geliştirme, gömülü sistemlerde uzak veri kaynağı montajı ve güvenli dosya sistemi sanallaştırması.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">FUSE neden kullanılır?</a></li>
+    <li><a href="#s1">FUSE mimarisi</a></li>
+    <li><a href="#s2">libfuse API temelleri</a></li>
+    <li><a href="#s3">Basit bellek-içi dosya sistemi</a></li>
+    <li><a href="#s4">Gerçekçi FS: HTTP/S3 üzerinden dosya okuma</a></li>
+    <li><a href="#s5">Write işlemleri ve tutarlılık</a></li>
+    <li><a href="#s6">Performans optimizasyonu</a></li>
+    <li><a href="#s7">Güvenlik</a></li>
+    <li><a href="#s8">Hata ayıklama</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> FUSE neden kullanılır?</h2>
+  <p class="section-lead">FUSE (Filesystem in Userspace), kernel alanında çalışan geleneksel dosya sistemi sürücüsü yazmadan, standart POSIX dosya arayüzü sunan özel dosya sistemleri oluşturmayı mümkün kılar.</p>
+
+  <h3>Geleneksel kernel FS ile karşılaştırma</h3>
+  <p>Klasik bir dosya sistemi sürücüsü yazmak, kernel modülü geliştirme becerisi, VFS katmanını anlama ve çekirdek güvenliği konusunda derin bilgi gerektirir. Herhangi bir hata doğrudan kernel panikine yol açabilir. FUSE bu sorunu tersine çevirir: dosya sistemi mantığı tamamen kullanıcı alanında çalışır; kernel yalnızca istekleri iletir.</p>
+
+  <div class="flow">
+    <pre>
+Geleneksel yol:
+  Uygulama --syscall--&gt; VFS --&gt; ext4/btrfs.ko --&gt; blok sürücüsü
+
+FUSE yolu:
+  Uygulama --syscall--&gt; VFS --&gt; fuse.ko --&gt; /dev/fuse --&gt; FUSE daemon (kullanıcı alanı)
+    </pre>
+  </div>
+
+  <h3>FUSE'un tercih edildiği senaryolar</h3>
+  <div class="params">
+    <div class="param"><span class="name">Hızlı prototipleme</span><span class="desc">Kernel modülü olmadan yeni bir FS fikri denemek, CI/CD ortamında test edilebilir</span></div>
+    <div class="param"><span class="name">Güvenlik izolasyonu</span><span class="desc">FS kodu kullanıcı alanında çöktüğünde sistemi çökertemez, sandboxed çalışabilir</span></div>
+    <div class="param"><span class="name">Uzak/sanal veri kaynakları</span><span class="desc">S3, SSH, HTTP, veritabanı gibi kaynakları dosya sistemi olarak sunmak</span></div>
+    <div class="param"><span class="name">Gömülü şifreleme FS</span><span class="desc">Özel şifreleme/sıkıştırma mantığını standart FS arayüzünün arkasına gizlemek</span></div>
+    <div class="param"><span class="name">Sanal konfigürasyon FS</span><span class="desc">Cihaz parametrelerini dosya olarak sunan özel /proc benzeri yapılar</span></div>
+  </div>
+
+  <h3>FUSE'un sınırlamaları</h3>
+  <p>FUSE, her I/O isteği için kullanıcı alanına geçiş yapması nedeniyle geleneksel kernel FS'ye kıyasla daha yüksek gecikme sergiler. Yüksek IOPS gerektiren uygulamalar için bu fark belirleyici olabilir. Ayrıca <code>mmap(MAP_SHARED)</code> desteği sınırlıdır ve bazı POSIX anlam garantileri kırılgan olabilir.</p>
+
+  <div class="file-table">
+    <table>
+      <tr><th>Özellik</th><th>Kernel FS</th><th>FUSE</th></tr>
+      <tr><td>Geliştirme kolaylığı</td><td>Düşük (kernel API)</td><td>Yüksek (C/C++/Python/Go)</td></tr>
+      <tr><td>Hata izolasyonu</td><td>Yok (kernel panic)</td><td>Var (daemon çöker, mount kalır)</td></tr>
+      <tr><td>I/O gecikme ek yükü</td><td>~0 ek yük</td><td>~1–10 µs ek yük (context switch)</td></tr>
+      <tr><td>Root yetkisi</td><td>Zorunlu</td><td>Opsiyonel (allow_other hariç)</td></tr>
+    </table>
+  </div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> FUSE mimarisi</h2>
+  <p class="section-lead">FUSE, üç bileşenden oluşur: kernel içindeki <code>fuse.ko</code> modülü, kullanıcı-kernel köprüsü olan <code>/dev/fuse</code> karakter aygıtı ve gerçek FS mantığını uygulayan kullanıcı alanı daemon'ı.</p>
+
+  <h3>İstek-Yanıt Döngüsü</h3>
+  <div class="flow">
+    <pre>
+1. Uygulama: open("/mnt/myfuse/dosya.txt", O_RDONLY)
+2. VFS: FUSE mount noktasını tanır, fuse.ko'ya iletir
+3. fuse.ko: isteği sıraya koyar
+4. /dev/fuse: daemon isteği poll()/read() ile okur
+5. Daemon: isteği işler (örn. HTTP'den veri çeker)
+6. /dev/fuse: daemon yanıtı write() ile kernel'e gönderir
+7. fuse.ko: yanıtı VFS'e iletir
+8. Uygulama: read() çağrısı veriyi alır
+    </pre>
+  </div>
+
+  <h3>Kernel modülü</h3>
+  <p><code>fuse.ko</code> modülü çoğu dağıtımda yerleşik (built-in) gelir veya otomatik yüklenir. Modülün yüklü olup olmadığını şöyle kontrol edilir:</p>
+
+  <pre><code># fuse.ko durumu
+lsmod | grep fuse
+# fuse                  135168  3
+
+# Yoksa yükle
+modprobe fuse
+
+# /dev/fuse karakter aygıtını doğrula
+ls -la /dev/fuse
+# crw-rw-rw- 1 root fuse 10, 229 ... /dev/fuse</code></pre>
+
+  <h3>libfuse sürümleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">libfuse 2.x (eski API)</span><span class="desc">fuse_main() + struct fuse_operations — basit, tek iş parçacığı veya çok iş parçacıklı mod</span></div>
+    <div class="param"><span class="name">libfuse 3.x (modern API)</span><span class="desc">fuse_new() / fuse_mount() ayrımı, session tabanlı, asenkron low-level API</span></div>
+    <div class="param"><span class="name">High-level API</span><span class="desc">Yollar ve inode'lar otomatik yönetilir; basit FS'ler için uygun</span></div>
+    <div class="param"><span class="name">Low-level API</span><span class="desc">inode numaraları manuel yönetilir; yüksek performans için gerekli</span></div>
+  </div>
+
+  <h3>Kurulum</h3>
+  <pre><code># Ubuntu/Debian
+sudo apt-get install libfuse-dev fuse
+
+# Alpine (gömülü)
+apk add fuse fuse-dev
+
+# Yocto recipe içinde
+DEPENDS += "fuse"
+IMAGE_INSTALL += "fuse"</code></pre>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> libfuse API temelleri</h2>
+  <p class="section-lead"><code>fuse_operations</code> yapısı, dosya sistemi işlemlerini (getattr, read, write, readdir vb.) uygulayan callback fonksiyon işaretçilerini tutar. Yalnızca desteklemek istediğiniz operasyonları doldurmanız yeterlidir.</p>
+
+  <h3>fuse_operations yapısı — temel callback'ler</h3>
+  <pre><code>#define FUSE_USE_VERSION 31
+#include &lt;fuse.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include &lt;errno.h&gt;
+
+static int myfs_getattr(const char *path, struct stat *stbuf,
+                        struct fuse_file_info *fi) {
+    /* Dosya/dizin meta verisi döndür */
+    memset(stbuf, 0, sizeof(struct stat));
+    if (strcmp(path, "/") == 0) {
+        stbuf-&gt;st_mode = S_IFDIR | 0755;
+        stbuf-&gt;st_nlink = 2;
+        return 0;
+    }
+    return -ENOENT;
+}
+
+static int myfs_readdir(const char *path, void *buf,
+                        fuse_fill_dir_t filler, off_t offset,
+                        struct fuse_file_info *fi,
+                        enum fuse_readdir_flags flags) {
+    if (strcmp(path, "/") != 0) return -ENOENT;
+    filler(buf, ".",  NULL, 0, 0);
+    filler(buf, "..", NULL, 0, 0);
+    return 0;
+}
+
+static int myfs_read(const char *path, char *buf, size_t size,
+                     off_t offset, struct fuse_file_info *fi) {
+    return -ENOENT;
+}
+
+static const struct fuse_operations myfs_ops = {
+    .getattr = myfs_getattr,
+    .readdir = myfs_readdir,
+    .read    = myfs_read,
+};</code></pre>
+
+  <h3>Temel callback sözlüğü</h3>
+  <div class="file-table">
+    <table>
+      <tr><th>Callback</th><th>Karşılık gelen syscall</th><th>Zorunlu mu?</th></tr>
+      <tr><td>getattr</td><td>stat(), lstat()</td><td>Evet — her dizin/dosya için</td></tr>
+      <tr><td>readdir</td><td>opendir() / readdir()</td><td>Dizinler varsa</td></tr>
+      <tr><td>open</td><td>open()</td><td>Hayır — yoksa izin kontrolü varsayılan</td></tr>
+      <tr><td>read</td><td>read(), pread()</td><td>Dosya okuma için</td></tr>
+      <tr><td>write</td><td>write(), pwrite()</td><td>Yazma desteği için</td></tr>
+      <tr><td>create</td><td>creat(), open() + O_CREAT</td><td>Yeni dosya oluşturma için</td></tr>
+      <tr><td>unlink</td><td>unlink()</td><td>Dosya silme için</td></tr>
+      <tr><td>mkdir / rmdir</td><td>mkdir(), rmdir()</td><td>Dizin yönetimi için</td></tr>
+      <tr><td>truncate</td><td>truncate(), ftruncate()</td><td>Dosya boyutu değiştirme için</td></tr>
+      <tr><td>flush / fsync</td><td>close(), fsync()</td><td>Veri kalıcılığı için</td></tr>
+    </table>
+  </div>
+
+  <h3>main() — fuse_main ile başlatma</h3>
+  <pre><code>int main(int argc, char *argv[]) {
+    return fuse_main(argc, argv, &amp;myfs_ops, NULL);
+}
+
+/* Derleme */
+/* gcc -Wall myfs.c -o myfs $(pkg-config fuse3 --cflags --libs) */
+
+/* Kullanım */
+/* mkdir /mnt/test */
+/* ./myfs /mnt/test */
+/* ls /mnt/test */
+/* fusermount3 -u /mnt/test */</code></pre>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> Basit bellek-içi dosya sistemi</h2>
+  <p class="section-lead">hello-fuse örneği, statik içerikli tek bir dosyayı gösterir. Gerçek bir uygulama için başlangıç noktası olarak kullanılabilir.</p>
+
+  <h3>hello-fuse: tam kaynak</h3>
+  <pre><code>#define FUSE_USE_VERSION 31
+#include &lt;fuse.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include &lt;errno.h&gt;
+
+static const char *hello_path = "/merhaba.txt";
+static const char *hello_str  = "Merhaba FUSE Dunyasi!\n";
+
+static int hello_getattr(const char *path, struct stat *stbuf,
+                         struct fuse_file_info *fi) {
+    int res = 0;
+    memset(stbuf, 0, sizeof(struct stat));
+
+    if (strcmp(path, "/") == 0) {
+        stbuf-&gt;st_mode  = S_IFDIR | 0755;
+        stbuf-&gt;st_nlink = 2;
+    } else if (strcmp(path, hello_path) == 0) {
+        stbuf-&gt;st_mode  = S_IFREG | 0444;
+        stbuf-&gt;st_nlink = 1;
+        stbuf-&gt;st_size  = (off_t)strlen(hello_str);
+    } else {
+        res = -ENOENT;
+    }
+    return res;
+}
+
+static int hello_readdir(const char *path, void *buf,
+                         fuse_fill_dir_t filler, off_t offset,
+                         struct fuse_file_info *fi,
+                         enum fuse_readdir_flags flags) {
+    if (strcmp(path, "/") != 0) return -ENOENT;
+    filler(buf, ".",           NULL, 0, 0);
+    filler(buf, "..",          NULL, 0, 0);
+    filler(buf, "merhaba.txt", NULL, 0, 0);
+    return 0;
+}
+
+static int hello_open(const char *path, struct fuse_file_info *fi) {
+    if (strcmp(path, hello_path) != 0) return -ENOENT;
+    if ((fi-&gt;flags &amp; O_ACCMODE) != O_RDONLY) return -EACCES;
+    return 0;
+}
+
+static int hello_read(const char *path, char *buf, size_t size,
+                      off_t offset, struct fuse_file_info *fi) {
+    size_t len;
+    if (strcmp(path, hello_path) != 0) return -ENOENT;
+
+    len = strlen(hello_str);
+    if (offset &gt;= (off_t)len) return 0;
+    if (offset + size &gt; len) size = len - (size_t)offset;
+
+    memcpy(buf, hello_str + offset, size);
+    return (int)size;
+}
+
+static const struct fuse_operations hello_ops = {
+    .getattr = hello_getattr,
+    .readdir = hello_readdir,
+    .open    = hello_open,
+    .read    = hello_read,
+};
+
+int main(int argc, char *argv[]) {
+    return fuse_main(argc, argv, &amp;hello_ops, NULL);
+}</code></pre>
+
+  <h3>Derleme ve test</h3>
+  <pre><code># Derle
+gcc -Wall hello_fuse.c -o hello_fuse $(pkg-config fuse3 --cflags --libs)
+
+# Mount noktası oluştur
+mkdir -p /tmp/hello_mount
+
+# Arka planda mount et
+./hello_fuse /tmp/hello_mount -f &amp;
+
+# Test et
+ls /tmp/hello_mount
+cat /tmp/hello_mount/merhaba.txt
+# "Merhaba FUSE Dunyasi!"
+
+# Unmount
+fusermount3 -u /tmp/hello_mount</code></pre>
+
+  <h3>Bellek-içi dinamik FS — veri yapısı tasarımı</h3>
+  <p>Birden fazla dosya desteklemek için bir düğüm ağacı (inode tree) tutulur. Basit bir yaklaşım, yol adını anahtar olarak kullanan bir hash tablosudur:</p>
+
+  <pre><code>#include &lt;stdlib.h&gt;
+#include &lt;stdint.h&gt;
+
+#define MAX_FILES 128
+#define MAX_PATH  256
+#define MAX_DATA  (64 * 1024)  /* 64 KB maks dosya boyutu */
+
+typedef struct {
+    char path[MAX_PATH];
+    char data[MAX_DATA];
+    size_t size;
+    int used;
+    mode_t mode;
+} memfs_node_t;
+
+static memfs_node_t nodes[MAX_FILES];
+
+static memfs_node_t *find_node(const char *path) {
+    int i;
+    for (i = 0; i &lt; MAX_FILES; i++) {
+        if (nodes[i].used &amp;&amp; strcmp(nodes[i].path, path) == 0)
+            return &amp;nodes[i];
+    }
+    return NULL;
+}
+
+static memfs_node_t *alloc_node(const char *path) {
+    int i;
+    for (i = 0; i &lt; MAX_FILES; i++) {
+        if (!nodes[i].used) {
+            nodes[i].used = 1;
+            strncpy(nodes[i].path, path, MAX_PATH - 1);
+            nodes[i].size = 0;
+            return &amp;nodes[i];
+        }
+    }
+    return NULL;  /* kapasite dolu */
+}</code></pre>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> Gerçekçi FS: HTTP/S3 üzerinden dosya okuma</h2>
+  <p class="section-lead">HTTP veya S3 protokolü üzerinden erişilen uzak blob'ları dosya sistemi olarak sunmak, FUSE'un en yaygın gömülü kullanım senaryolarından biridir. libcurl ile getirilen veriler bellekte önbelleğe alınır.</p>
+
+  <h3>Mimari</h3>
+  <div class="flow">
+    <pre>
+ls /mnt/remoteblobs/
+    |
+    v
+FUSE daemon (readdir callback)
+    |-- Uzak index dosyasını getir (HTTP GET /index.json)
+    |-- JSON'u ayrıştır, dosya adlarını listele
+    v
+cat /mnt/remoteblobs/veri.bin
+    |
+    v
+FUSE daemon (read callback)
+    |-- Önbellekte var mı? -- EVET --> bellekten oku
+    |                      -- HAYIR--> HTTP GET /blobs/veri.bin
+    |-- Yanıtı önbelleğe al
+    v
+uygulama veriye ulaşır
+    </pre>
+  </div>
+
+  <h3>libcurl ile HTTP blob getirme</h3>
+  <pre><code>#include &lt;curl/curl.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+
+typedef struct {
+    char  *data;
+    size_t size;
+} http_buf_t;
+
+static size_t write_cb(void *ptr, size_t sz, size_t nmemb, void *ud) {
+    http_buf_t *buf = (http_buf_t *)ud;
+    size_t new_sz = buf-&gt;size + sz * nmemb;
+    buf-&gt;data = realloc(buf-&gt;data, new_sz + 1);
+    memcpy(buf-&gt;data + buf-&gt;size, ptr, sz * nmemb);
+    buf-&gt;size = new_sz;
+    buf-&gt;data[new_sz] = '\0';
+    return sz * nmemb;
+}
+
+int http_get(const char *url, http_buf_t *out) {
+    CURL *curl = curl_easy_init();
+    if (!curl) return -1;
+
+    out-&gt;data = malloc(1);
+    out-&gt;size = 0;
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, out);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+
+    CURLcode rc = curl_easy_perform(curl);
+    curl_easy_cleanup(curl);
+    return (rc == CURLE_OK) ? 0 : -1;
+}</code></pre>
+
+  <h3>read callback — HTTP ile entegrasyon</h3>
+  <pre><code>#define BASE_URL   "https://ornek-sunucu.yerel/blobs"
+#define CACHE_SIZE 16
+
+typedef struct {
+    char  name[256];
+    char *data;
+    size_t size;
+} cache_entry_t;
+
+static cache_entry_t cache[CACHE_SIZE];
+
+static cache_entry_t *cache_get(const char *name) {
+    int i;
+    for (i = 0; i &lt; CACHE_SIZE; i++) {
+        if (cache[i].data &amp;&amp; strcmp(cache[i].name, name) == 0)
+            return &amp;cache[i];
+    }
+    return NULL;
+}
+
+static int remfs_read(const char *path, char *buf, size_t size,
+                      off_t offset, struct fuse_file_info *fi) {
+    const char *fname = path + 1;  /* baştaki / karakterini atla */
+    cache_entry_t *entry = cache_get(fname);
+
+    if (!entry) {
+        /* Önbellekte yok — HTTP'den getir */
+        char url[512];
+        snprintf(url, sizeof(url), "%s/%s", BASE_URL, fname);
+
+        http_buf_t hbuf = {0};
+        if (http_get(url, &amp;hbuf) != 0) return -EIO;
+
+        /* Önbelleğe ekle (round-robin slot seçimi) */
+        static int slot = 0;
+        free(cache[slot].data);
+        strncpy(cache[slot].name, fname, 255);
+        cache[slot].data = hbuf.data;
+        cache[slot].size = hbuf.size;
+        entry = &amp;cache[slot];
+        slot = (slot + 1) % CACHE_SIZE;
+    }
+
+    if (offset &gt;= (off_t)entry-&gt;size) return 0;
+    size_t avail = entry-&gt;size - (size_t)offset;
+    if (size &gt; avail) size = avail;
+
+    memcpy(buf, entry-&gt;data + offset, size);
+    return (int)size;
+}</code></pre>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> Write işlemleri ve tutarlılık</h2>
+  <p class="section-lead">Yazma desteği eklemek, okumaya göre daha karmaşık tutarlılık garantileri gerektirir. WAL (Write-Ahead Logging) yaklaşımı, güç kesintilerinde veri kaybını en aza indirir.</p>
+
+  <h3>write ve create callback'leri</h3>
+  <pre><code>static int memfs_create(const char *path, mode_t mode,
+                        struct fuse_file_info *fi) {
+    memfs_node_t *node = find_node(path);
+    if (!node) {
+        node = alloc_node(path);
+        if (!node) return -ENOSPC;
+    }
+    node-&gt;mode = mode;
+    node-&gt;size = 0;
+    return 0;
+}
+
+static int memfs_write(const char *path, const char *buf,
+                       size_t size, off_t offset,
+                       struct fuse_file_info *fi) {
+    memfs_node_t *node = find_node(path);
+    if (!node) return -ENOENT;
+
+    size_t end = (size_t)offset + size;
+    if (end &gt; MAX_DATA) return -ENOSPC;
+
+    memcpy(node-&gt;data + offset, buf, size);
+    if (end &gt; node-&gt;size) node-&gt;size = end;
+    return (int)size;
+}
+
+static int memfs_truncate(const char *path, off_t size,
+                          struct fuse_file_info *fi) {
+    memfs_node_t *node = find_node(path);
+    if (!node) return -ENOENT;
+    if ((size_t)size &gt; MAX_DATA) return -EFBIG;
+    if ((size_t)size &gt; node-&gt;size)
+        memset(node-&gt;data + node-&gt;size, 0, (size_t)size - node-&gt;size);
+    node-&gt;size = (size_t)size;
+    return 0;
+}</code></pre>
+
+  <h3>fsync ve flush</h3>
+  <pre><code>/* flush: dosya kapatılırken çağrılır — tamponları diske yaz */
+static int myfs_flush(const char *path, struct fuse_file_info *fi) {
+    /* Burada veriyi kalıcı depolamaya yaz */
+    /* Örnek: SQLite veritabanına commit */
+    return persist_to_storage(path);
+}
+
+/* fsync: açık dosyayı güvenli yap (uygulamadan explicit çağrı) */
+static int myfs_fsync(const char *path, int isdatasync,
+                      struct fuse_file_info *fi) {
+    /* isdatasync != 0: yalnızca veri (metadata hariç) yeterli */
+    return myfs_flush(path, fi);
+}</code></pre>
+
+  <h3>WAL tabanlı yazma tutarlılığı</h3>
+  <p>Güç kesintisine dayanıklı bir FUSE FS için Write-Ahead Log yaklaşımı uygulanır: her yazma işlemi önce bir log dosyasına sıralı olarak kaydedilir, ardından asıl veri yapısına uygulanır. Başlangıçta log yeniden oynatılarak tutarlılık sağlanır.</p>
+
+  <pre><code>/* WAL giriş yapısı */
+typedef struct {
+    uint32_t magic;    /* 0xWAL1 */
+    uint32_t op;       /* 1=write, 2=delete, 3=create */
+    char     path[256];
+    off_t    offset;
+    size_t   size;
+    /* data[size] takip eder */
+} wal_entry_t;
+
+int wal_append(int wal_fd, wal_entry_t *entry, const char *data) {
+    /* Atomic: entry + data aynı write() çağrısıyla yaz */
+    struct iovec iov[2];
+    iov[0].iov_base = entry;
+    iov[0].iov_len  = sizeof(*entry);
+    iov[1].iov_base = (void *)data;
+    iov[1].iov_len  = entry-&gt;size;
+    return (writev(wal_fd, iov, 2) &gt; 0) ? 0 : -1;
+}</code></pre>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> Performans optimizasyonu</h2>
+  <p class="section-lead">FUSE'un context-switch maliyeti, doğru seçenekler ve zero-copy teknikler kullanılarak önemli ölçüde azaltılabilir.</p>
+
+  <h3>Kritik mount seçenekleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">-o direct_io</span><span class="desc">VFS sayfa önbelleğini devre dışı bırakır; FUSE daemon her okuma isteğini alır (taze veri garantisi)</span></div>
+    <div class="param"><span class="name">-o kernel_cache</span><span class="desc">Sayfa önbelleği etkin; dosya değişmeyecekse okuma hızını artırır</span></div>
+    <div class="param"><span class="name">-o auto_cache</span><span class="desc">mtime değişince önbellek otomatik geçersiz kılınır; dinamik içerik için önerilir</span></div>
+    <div class="param"><span class="name">-o writeback_cache</span><span class="desc">Kernel write tamponlaması etkin — küçük yazmaları birleştirerek büyük I/O bloğu üretir</span></div>
+    <div class="param"><span class="name">-o max_read=N</span><span class="desc">Tek read isteğinde maksimum bayt sayısı; varsayılan genellikle 128 KB</span></div>
+  </div>
+
+  <h3>splice ile zero-copy</h3>
+  <p><code>splice()</code> sistem çağrısı, kullanıcı alanı tamponu olmadan çekirdek arasında veri transferi sağlar. FUSE low-level API ile birleştirildiğinde yüksek bant genişlikli okumalar için kullanışlıdır:</p>
+
+  <pre><code>/* Low-level FUSE read callback — splice ile */
+static void ll_read(fuse_req_t req, fuse_ino_t ino, size_t size,
+                    off_t off, struct fuse_file_info *fi) {
+    int fd = (int)(uintptr_t)fi-&gt;fh;
+    struct fuse_bufvec buf = FUSE_BUFVEC_INIT(size);
+
+    buf.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK;
+    buf.buf[0].fd    = fd;
+    buf.buf[0].pos   = off;
+
+    /* fuse_reply_data: kernel splice'ı kullanır, kullanıcı kopyası yok */
+    fuse_reply_data(req, &amp;buf, FUSE_BUF_SPLICE_MOVE);
+}</code></pre>
+
+  <h3>Çok iş parçacıklı mod</h3>
+  <pre><code>/* Çok iş parçacıklı FUSE oturumu başlatma */
+struct fuse_loop_config config;
+memset(&amp;config, 0, sizeof(config));
+config.clone_fd         = 1;
+config.max_idle_threads = 10;
+
+ret = fuse_loop_mt(fuse, &amp;config);
+
+/* Ya da komut satırından: */
+/* ./myfs /mnt/test -o clone_fd */</code></pre>
+
+  <h3>Performans karşılaştırma tablosu</h3>
+  <div class="file-table">
+    <table>
+      <tr><th>Seçenek</th><th>Sıralı okuma</th><th>Rastgele okuma</th><th>Açıklama</th></tr>
+      <tr><td>Varsayılan</td><td>Orta</td><td>Düşük</td><td>Her istek için context switch</td></tr>
+      <tr><td>direct_io</td><td>Orta</td><td>Orta</td><td>Önbellek bypass, taze veri</td></tr>
+      <tr><td>kernel_cache</td><td>Yüksek</td><td>Yüksek</td><td>Tekrar okumalarda önbellekten</td></tr>
+      <tr><td>writeback_cache</td><td>—</td><td>—</td><td>Yazma gecikmeyi azaltır</td></tr>
+      <tr><td>splice + ll API</td><td>Çok yüksek</td><td>Yüksek</td><td>Zero-copy, en yüksek verim</td></tr>
+    </table>
+  </div>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> Güvenlik</h2>
+  <p class="section-lead">FUSE varsayılan olarak yalnızca mount işlemini yapan kullanıcının erişimine izin verir. Gömülü sistemlerde çok kullanıcılı erişim, CAP_SYS_ADMIN gereklilikleri ve daemon izolasyonu dikkatli tasarlanmalıdır.</p>
+
+  <h3>allow_other ve allow_root</h3>
+  <pre><code>/* Mount seçenekleri */
+/* -o allow_other: mount sahibi dışındaki kullanıcılara erişim */
+/* -o allow_root:  yalnızca root ve mount sahibi erişebilir */
+
+/* /etc/fuse.conf içinde etkinleştirme (sistem geneli) */
+/* user_allow_other */
+
+./myfs /mnt/test -o allow_other
+
+/* Güvenlik notu: allow_other olmadan diğer kullanıcılar EACCES alır */</code></pre>
+
+  <h3>CAP_SYS_ADMIN gereklilikleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">Root mount</span><span class="desc">Root olmayan kullanıcılar /etc/fuse.conf'da user_allow_other olmadan allow_other kullanamaz</span></div>
+    <div class="param"><span class="name">nodev / nosuid</span><span class="desc">Root olmayan FUSE mount'larına kernel otomatik olarak nodev ve nosuid uygular</span></div>
+    <div class="param"><span class="name">Namespace izolasyonu</span><span class="desc">Mount namespace'ler kullanılarak FUSE mount'u konteynere hapsedilebilir</span></div>
+  </div>
+
+  <h3>Gömülü güvenlik önerileri</h3>
+  <pre><code># FUSE daemon'ı ayrıcalık düşürme ile çalıştırma
+# Gerçek root ile başla, mount sonrası ayrıcalıkları bırak
+
+int main(int argc, char *argv[]) {
+    /* Mount işlemi öncesi hazırlık (root gerekiyorsa) */
+    setup_privileged_resources();
+
+    /* ayrıcalıkları düşür */
+    if (setuid(DAEMON_UID) != 0 || setgid(DAEMON_GID) != 0) {
+        perror("setuid/setgid");
+        return 1;
+    }
+
+    /* Root olmayan kullanıcı olarak FUSE çalıştır */
+    return fuse_main(argc, argv, &amp;myfs_ops, NULL);
+}
+
+# Systemd service ile güvenli çalıştırma:
+# [Service]
+# User=fuseuser
+# AmbientCapabilities=
+# NoNewPrivileges=true
+# PrivateTmp=true</code></pre>
+
+  <h3>Güvenli dosya izinleri</h3>
+  <pre><code>/* getattr içinde gömülü cihaza özel izin kısıtlaması */
+static int myfs_getattr(const char *path, struct stat *stbuf,
+                        struct fuse_file_info *fi) {
+    memset(stbuf, 0, sizeof(*stbuf));
+
+    if (strcmp(path, "/config") == 0) {
+        /* Konfigürasyon dizini: yalnızca sahip okuyabilir/yazabilir */
+        stbuf-&gt;st_mode  = S_IFDIR | 0700;
+        stbuf-&gt;st_nlink = 2;
+        stbuf-&gt;st_uid   = getuid();
+        return 0;
+    }
+    if (strcmp(path, "/firmware.bin") == 0) {
+        /* Firmware dosyası: salt okunur, herkes okuyabilir */
+        stbuf-&gt;st_mode  = S_IFREG | 0444;
+        stbuf-&gt;st_nlink = 1;
+        stbuf-&gt;st_size  = firmware_size();
+        return 0;
+    }
+    return -ENOENT;
+}</code></pre>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Hata ayıklama</h2>
+  <p class="section-lead">FUSE sorunlarını tespit etmenin en hızlı yolu <code>-d</code> veya <code>-f</code> seçenekleri ve <code>strace</code> ile mount sürecini izlemektir. <code>/sys/fs/fuse/connections/</code> dizini bağlantı istatistiklerini sunar.</p>
+
+  <h3>Debug modunda çalıştırma</h3>
+  <pre><code># -f: ön planda çalış (daemon olmadan)
+./myfs /mnt/test -f
+
+# -d: debug modu — her FUSE isteğini yazdırır (en ayrıntılı)
+./myfs /mnt/test -d
+
+# Örnek -d çıktısı:
+# LOOKUP  /dosya.txt
+# GETATTR /dosya.txt
+# OPEN    /dosya.txt fi-&gt;flags=0x8000
+# READ    /dosya.txt off=0 size=4096</code></pre>
+
+  <h3>strace ile mount izleme</h3>
+  <pre><code># Uygulamanın FUSE mount'una yaptığı syscall'ları izle
+strace -e trace=openat,read,write,getdents64 \
+       cat /mnt/test/dosya.txt
+
+# FUSE daemon sürecini izle
+strace -p $(pidof myfs) -e trace=read,write</code></pre>
+
+  <h3>/sys/fs/fuse/connections/</h3>
+  <pre><code># Aktif FUSE bağlantılarını listele
+ls /sys/fs/fuse/connections/
+# 42/  (bağlantı ID)
+
+# Bağlantı istatistiklerini oku
+cat /sys/fs/fuse/connections/42/waiting
+# 0  (bekleyen istek sayısı)
+
+cat /sys/fs/fuse/connections/42/max_background
+# 12  (eş zamanlı arka plan istek sınırı)
+
+# Bağlantıyı zorla kapat (donmuş FUSE kurtarma)
+echo 1 | sudo tee /sys/fs/fuse/connections/42/abort</code></pre>
+
+  <h3>Yaygın sorunlar ve çözümleri</h3>
+  <div class="file-table">
+    <table>
+      <tr><th>Sorun</th><th>Neden</th><th>Çözüm</th></tr>
+      <tr><td>Transport endpoint not connected</td><td>Daemon çöktü, mount noktası asılı kaldı</td><td>fusermount3 -u -z /mnt/test ile lazy unmount</td></tr>
+      <tr><td>ls: cannot access: Permission denied</td><td>allow_other yok veya sahip farklı</td><td>/etc/fuse.conf'a user_allow_other ekle</td></tr>
+      <tr><td>FUSE mount sonrası dosyalar görünmüyor</td><td>readdir NULL döndürüyor</td><td>filler çağrılarını ve dönüş değerini kontrol et</td></tr>
+      <tr><td>Yüksek CPU kullanımı</td><td>Busy-wait veya spinlock daemon içinde</td><td>libfuse poll ile olay tabanlı döngüye geç</td></tr>
+      <tr><td>Veri tutarsızlığı</td><td>flush/fsync implement edilmemiş</td><td>flush callback'inde kalıcı yazmayı zorla</td></tr>
+    </table>
+  </div>
+
+  <h3>valgrind ile bellek sızıntısı tespiti</h3>
+  <pre><code># FUSE daemon'ı valgrind altında çalıştır
+valgrind --leak-check=full --track-origins=yes \
+         ./myfs /mnt/test -f -s
+
+# -s: tek iş parçacıklı mod — valgrind ile daha temiz izleme
+# Bir sonraki terminalde test et, ardından fusermount3 -u ile kapat</code></pre>
+</section>
+
+</main>

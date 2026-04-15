@@ -1,0 +1,959 @@
+---
+layout: tutorial
+title: "workqueue & kthread — Kernel Ertelenmiş İş ve Thread"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>WORKQUEUE &amp; KTHREAD</span>
+    <span>2026</span>
+  </div>
+  <h1>workqueue &amp; kthread<br><em>Kernel Ertelenmiş İş ve Thread</em></h1>
+  <p class="subtitle">IRQ bağlamından process bağlamına geçişin tüm yolları — workqueue, delayed work, kthread ve tasklet API'larını gerçek sürücü örnekleriyle öğren.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Ertelenmiş iş neden gerekli — interrupt context kısıtları</a></li>
+    <li><a href="#s1">workqueue türleri — system_wq, alloc_workqueue, WQ_UNBOUND</a></li>
+    <li><a href="#s2">INIT_WORK, queue_work, cancel_work_sync — temel API</a></li>
+    <li><a href="#s3">INIT_DELAYED_WORK ve schedule_delayed_work</a></li>
+    <li><a href="#s4">kthread_run, kthread_stop, kthread_should_stop</a></li>
+    <li><a href="#s5">kthread_worker API — sıralı iş gönderimi</a></li>
+    <li><a href="#s6">tasklet — eski API, kullanım ve kaçınma rehberi</a></li>
+    <li><a href="#s7">cmwq iç mimarisi — concurrency-managed workqueue</a></li>
+    <li><a href="#s8">Hata ayıklama — hung task, lockdep, ftrace workqueue events</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> Ertelenmiş İş Neden Gerekli</h2>
+  <p class="section-lead">Linux çekirdeği, interrupt işlemeyi iki yarıya böler: <em>üst yarı</em> (hardirq) donanımı hızlıca susturup kritik verileri alır; <em>alt yarı</em> gerçek işi daha sonra, daha az kısıtlı bir bağlamda yapar.</p>
+
+  <h3>Interrupt Context Kısıtları</h3>
+  <p>Bir IRQ handler yürütülürken CPU şu kısıtlar altındadır:</p>
+  <div class="params">
+    <div class="param"><span class="name">Uyuma yasak</span><span class="desc"><code>schedule()</code>, <code>mutex_lock()</code>, <code>down()</code>, <code>wait_event()</code> — tümü çekirdek içinde uyumaya yol açar ve interrupt bağlamında çağrılması BUG üretir.</span></div>
+    <div class="param"><span class="name">GFP_KERNEL yasak</span><span class="desc">Bellek baskısı altında <code>GFP_KERNEL</code> alloc uyuyabilir. Interrupt bağlamında yalnızca <code>GFP_ATOMIC</code> kullanılabilir; bu da başarısız olabilir.</span></div>
+    <div class="param"><span class="name">Uzun işlem yasak</span><span class="desc">Her işlenmeyen CPU döngüsü sistem gecikmesine eklenir. IRQ handler süresi ölçülmeli; 10 µs üzerindeyse ertelenmeli.</span></div>
+    <div class="param"><span class="name">Bazı kernel API'ları yasak</span><span class="desc">I2C/SPI transfer fonksiyonları, dosya sistemi operasyonları, networking stack çağrıları — tümü uyuyabilir veya mutex kullanır.</span></div>
+  </div>
+
+  <h3>Neden Üst/Alt Yarı Ayrımı</h3>
+  <div class="flow">
+    <pre>
+Donanım Kesme
+      │
+      ▼
+  ÜST YARI (hardirq)           ALT YARI (deferred work)
+  ┌─────────────────────┐       ┌──────────────────────────┐
+  │ • Donanımı acknowledge│      │ • Gerçek veri işleme     │
+  │ • Veriyi ring buffer │      │ • Protokol stack işleme  │
+  │   veya FIFO'ya koy  │      │ • I2C/SPI okuma          │
+  │ • Zamanlayıcıyı     │      │ • kmalloc(GFP_KERNEL)    │
+  │   başlat/signal ver │      │ • mutex/semaphore alma   │
+  │ • &lt;10 µs hedef      │      │ • user-space uyanıklık   │
+  └─────────────────────┘      └──────────────────────────┘
+                                       ▲
+                        ┌──────────────┼──────────────┐
+                    tasklet      workqueue          kthread
+                   (softirq)   (process ctx)    (sürekli döngü)
+    </pre>
+  </div>
+
+  <h3>Mekanizma Seçim Rehberi</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Senaryo</th><th>Önerilen Mekanizma</th><th>Neden</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>IRQ'dan kısa, non-blocking iş</td><td>tasklet</td><td>Düşük overhead, softirq bağlamı</td></tr>
+        <tr><td>IRQ'dan blocking I/O (I2C, SPI)</td><td>workqueue veya threaded IRQ</td><td>Process bağlamı, uyuyabilir</td></tr>
+        <tr><td>Belirli bir CPU'da sıralı iş</td><td>ordered workqueue</td><td>Tek worker, FIFO garantisi</td></tr>
+        <tr><td>Gecikmeli (timer-based) iş</td><td>delayed_work</td><td>schedule_delayed_work() ile ms hassasiyeti</td></tr>
+        <tr><td>Sürekli çalışan polling döngüsü</td><td>kthread</td><td>Bağımsız thread, tam kontrol</td></tr>
+        <tr><td>Periyodik RT iş</td><td>kthread + hrtimer</td><td>Yüksek çözünürlüklü uyanış</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> Workqueue Türleri</h2>
+  <p class="section-lead">Linux 2.6.36 ile gelen <strong>cmwq</strong> (concurrency-managed workqueue) önceki API'yı yeniden tasarladı. Günümüzde sürücüler genellikle sistem geneli workqueue'leri kullanır; özel gereksinimler için <code>alloc_workqueue()</code> ile yeni workqueue oluşturulur.</p>
+
+  <h3>Sistem Geneli Workqueue'ler</h3>
+  <div class="params">
+    <div class="param"><span class="name">system_wq</span><span class="desc">Genel amaçlı, sınırsız (unbound) workqueue. Kısa süreli, non-blocking iş için. <code>schedule_work()</code> bu workqueue'yi kullanır.</span></div>
+    <div class="param"><span class="name">system_highpri_wq</span><span class="desc">Yüksek öncelikli worker thread'leri. Gecikmeye duyarlı ama CPU-bağlı olmayan işler için. <code>queue_work(system_highpri_wq, w)</code></span></div>
+    <div class="param"><span class="name">system_long_wq</span><span class="desc">Uzun süreli (saniyeler) işler için. Normal system_wq'deki starvation riskini azaltır.</span></div>
+    <div class="param"><span class="name">system_unbound_wq</span><span class="desc">CPU affinity olmadan çalışır — NUMA topanjını gözetir. Yoğun hesaplama işleri için.</span></div>
+    <div class="param"><span class="name">system_freezable_wq</span><span class="desc">Suspend/hibernate sırasında dondurulur. Power-aware driver'lar için.</span></div>
+    <div class="param"><span class="name">system_power_efficient_wq</span><span class="desc">WQ_POWER_EFFICIENT bayrağı — mevcut CPU'ya affinity yerine güç tasarrufu öncelikli.</span></div>
+  </div>
+
+  <h3>alloc_workqueue ile Özel Workqueue</h3>
+  <pre><code>#include &lt;linux/workqueue.h&gt;
+
+/**
+ * alloc_workqueue - yeni workqueue oluştur
+ *
+ * @fmt:      İsim formatı (printf stili) — worker thread ismi için kullanılır
+ * @flags:    WQ_* bayrakları (aşağıda açıklanır)
+ * @max_active: Aynı anda çalışabilecek maksimum work sayısı (0 = varsayılan)
+ *
+ * Başarıda workqueue pointer, başarısızda NULL döner.
+ */
+struct workqueue_struct *alloc_workqueue(const char *fmt,
+                                         unsigned int flags,
+                                         int max_active, ...);
+
+/* Örnek: sürücü başına özel workqueue */
+static int mydrv_probe(struct platform_device *pdev)
+{
+    struct mydrv_priv *priv = /* ... */;
+
+    /* Tek worker, sıralı çalışma garantisi */
+    priv-&gt;wq = alloc_ordered_workqueue("mydrv/%s",
+                                        WQ_MEM_RECLAIM,
+                                        dev_name(&amp;pdev-&gt;dev));
+    if (!priv-&gt;wq)
+        return -ENOMEM;
+
+    /* ... */
+    return 0;
+}
+
+static void mydrv_remove(struct platform_device *pdev)
+{
+    struct mydrv_priv *priv = platform_get_drvdata(pdev);
+    destroy_workqueue(priv-&gt;wq);  /* bekler, sonra serbest bırakır */
+}</code></pre>
+
+  <h3>WQ_* Bayrakları</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Bayrak</th><th>Anlam</th><th>Ne Zaman Kullanılır</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>WQ_UNBOUND</td><td>Worker thread'leri CPU'ya bağlı değil</td><td>Uzun hesaplama, NUMA farkındalığı gerekmeyen iş</td></tr>
+        <tr><td>WQ_MEM_RECLAIM</td><td>Bellek baskısında bile çalışmaya devam eder</td><td>Blok sürücüler, swap path — ölümcül deadlock'u önler</td></tr>
+        <tr><td>WQ_HIGHPRI</td><td>Yüksek öncelikli worker thread'leri</td><td>Düşük gecikme, CPU-bağlı olmayan kritik yol</td></tr>
+        <tr><td>WQ_CPU_INTENSIVE</td><td>Hesaplama yoğun — scheduler'a ipucu</td><td>Şifreleme, sıkıştırma işleri</td></tr>
+        <tr><td>WQ_FREEZABLE</td><td>Sistem askıya alındığında dondurulur</td><td>Güç yönetimi ile entegre çalışan sürücüler</td></tr>
+        <tr><td>WQ_SYSFS</td><td>sysfs altında görünür olur</td><td>Debug / tuning için workqueue'yi expose etmek</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>alloc_ordered_workqueue</h3>
+  <pre><code>/*
+ * alloc_ordered_workqueue — max_active=1 olan WQ_UNBOUND workqueue kısayolu.
+ * İşler sıraya girdiği sırayla çalışır (FIFO).
+ * Aynı anda yalnızca bir work yürütülür.
+ *
+ * Ne zaman kullanılır:
+ *  - Sıralama önemli (örn. DMA transfer zinciri)
+ *  - Mutex yerine sıralı workqueue ile eşzamanlılığı önlemek
+ *  - Tek bir kaynak üzerinde sıralı güvenli erişim
+ */
+priv-&gt;ordered_wq = alloc_ordered_workqueue("mydrv-ordered", WQ_MEM_RECLAIM);</code></pre>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> INIT_WORK, queue_work, cancel_work_sync</h2>
+  <p class="section-lead">Workqueue kullanımının temel döngüsü: struct work_struct'ı başlat, sırayı tetikle, sürücü kaldırılırken güvenle iptal et.</p>
+
+  <h3>struct work_struct ve Başlatma</h3>
+  <pre><code>#include &lt;linux/workqueue.h&gt;
+
+/* Statik tanımlama (modül seviyesi veya global) */
+static DECLARE_WORK(my_work, my_work_handler);
+
+/* Dinamik tanımlama (struct içinde) */
+struct mydrv_priv {
+    struct workqueue_struct *wq;
+    struct work_struct       work;
+    /* work handler'ın ihtiyaç duyduğu veriler */
+    spinlock_t               lock;
+    u32                      pending_data;
+};
+
+/* probe'da başlat */
+static int mydrv_probe(struct platform_device *pdev)
+{
+    struct mydrv_priv *priv;
+
+    priv = devm_kzalloc(&amp;pdev-&gt;dev, sizeof(*priv), GFP_KERNEL);
+    if (!priv)
+        return -ENOMEM;
+
+    spin_lock_init(&amp;priv-&gt;lock);
+    INIT_WORK(&amp;priv-&gt;work, mydrv_work_fn);
+
+    priv-&gt;wq = alloc_ordered_workqueue("mydrv", WQ_MEM_RECLAIM);
+    if (!priv-&gt;wq)
+        return -ENOMEM;
+
+    platform_set_drvdata(pdev, priv);
+    return 0;
+}</code></pre>
+
+  <h3>Work Handler Yazımı</h3>
+  <pre><code>/*
+ * Work handler: process bağlamında çalışır.
+ * container_of ile çevreleyen struct'a erişilir.
+ */
+static void mydrv_work_fn(struct work_struct *work)
+{
+    struct mydrv_priv *priv =
+        container_of(work, struct mydrv_priv, work);
+    unsigned long flags;
+    u32 data;
+
+    /* Spinlock ile IRQ-safe veri al */
+    spin_lock_irqsave(&amp;priv-&gt;lock, flags);
+    data = priv-&gt;pending_data;
+    priv-&gt;pending_data = 0;
+    spin_unlock_irqrestore(&amp;priv-&gt;lock, flags);
+
+    /* Artık process bağlamındayız — her şey mümkün */
+    if (data &amp; DATA_FLAG_I2C) {
+        /* I2C okuma — uyuyabilir */
+        mydrv_i2c_transfer(priv, data);
+    }
+
+    if (data &amp; DATA_FLAG_ALLOC) {
+        /* Güvenli bellek tahsisi */
+        void *buf = kmalloc(4096, GFP_KERNEL);
+        if (buf) {
+            process_buffer(priv, buf);
+            kfree(buf);
+        }
+    }
+
+    /* Yeni work queue edebilir: kendini yeniden zamanla */
+    if (priv-&gt;needs_retry)
+        queue_work(priv-&gt;wq, &amp;priv-&gt;work);
+}</code></pre>
+
+  <h3>queue_work — IRQ Handler'dan Tetikleme</h3>
+  <pre><code>static irqreturn_t mydrv_irq(int irq, void *dev_id)
+{
+    struct mydrv_priv *priv = dev_id;
+    u32 status;
+
+    status = readl(priv-&gt;base + STATUS_REG);
+    if (!status)
+        return IRQ_NONE;
+
+    writel(status, priv-&gt;base + CLEAR_REG);
+
+    /* Veriyi IRQ-safe biçimde aktar */
+    spin_lock(&amp;priv-&gt;lock);  /* IRQ bağlamında, irqsave gerekmiyor */
+    priv-&gt;pending_data |= status;
+    spin_unlock(&amp;priv-&gt;lock);
+
+    /*
+     * queue_work: eğer work zaten sıradaysa veya çalışıyorsa
+     * yeniden kuyruğa alınmaz — güvenli tekrar çağrılabilir.
+     * Dönüş değeri: true = yeni kuyruğa alındı, false = zaten vardı
+     */
+    queue_work(priv-&gt;wq, &amp;priv-&gt;work);
+
+    return IRQ_HANDLED;
+}
+
+/* system_wq kısayolu: özel workqueue oluşturmak gerekmiyorsa */
+schedule_work(&amp;priv-&gt;work);   /* queue_work(system_wq, ...) eşdeğeri */</code></pre>
+
+  <h3>Güvenli Temizlik — cancel_work_sync</h3>
+  <pre><code>static void mydrv_remove(struct platform_device *pdev)
+{
+    struct mydrv_priv *priv = platform_get_drvdata(pdev);
+
+    /*
+     * cancel_work_sync:
+     *  1. Work sıradaysa sıradan çıkar
+     *  2. Work çalışıyorsa bitmesini bekler
+     *  3. Sonra döner — handler artık çalışmıyor, priv güvenle serbest
+     *
+     * DEV DRVDATA SIFIRLANMADAN ÖNCE ÇAĞIRILMALI!
+     * Aksi hâlde work handler serbest bırakılmış priv'e erişebilir.
+     */
+    cancel_work_sync(&amp;priv-&gt;work);
+
+    destroy_workqueue(priv-&gt;wq);
+    /* devm ile tahsis edilen kaynaklar otomatik serbest bırakılır */
+}</code></pre>
+
+  <h3>flush_work ve flush_workqueue</h3>
+  <pre><code>/*
+ * flush_work: belirli bir work'ün bitmesini bekler (iptal etmez)
+ * Örnek: konfigürasyon değişikliği sonrası pending work'ün tamamlanmasını bekle
+ */
+flush_work(&amp;priv-&gt;work);
+
+/*
+ * flush_workqueue: tüm workqueue'deki mevcut work'lerin bitmesini bekler
+ * Yeni eklenenler beklenmez.
+ */
+flush_workqueue(priv-&gt;wq);</code></pre>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> INIT_DELAYED_WORK ve schedule_delayed_work</h2>
+  <p class="section-lead">Delayed work, normal work'e bir timer gecikme ekler. Donanım stabilizasyon süreleri, yeniden deneme mantığı ve periyodik polling için yaygın kullanılır.</p>
+
+  <h3>struct delayed_work ve Başlatma</h3>
+  <pre><code>#include &lt;linux/workqueue.h&gt;
+
+struct mydrv_priv {
+    struct workqueue_struct *wq;
+    struct delayed_work      dwork;
+    unsigned int             retry_count;
+};
+
+static int mydrv_probe(struct platform_device *pdev)
+{
+    struct mydrv_priv *priv = /* ... */;
+
+    INIT_DELAYED_WORK(&amp;priv-&gt;dwork, mydrv_dwork_fn);
+
+    priv-&gt;wq = alloc_workqueue("mydrv", WQ_MEM_RECLAIM, 0);
+    if (!priv-&gt;wq)
+        return -ENOMEM;
+
+    return 0;
+}</code></pre>
+
+  <h3>schedule_delayed_work API</h3>
+  <pre><code>/* msecs_to_jiffies ile ms cinsinden gecikme */
+#define STABILIZE_MS 50   /* donanım stabilizasyon süresi */
+
+/* İlk zamanlama */
+queue_delayed_work(priv-&gt;wq, &amp;priv-&gt;dwork,
+                   msecs_to_jiffies(STABILIZE_MS));
+
+/* system_wq kısayolu */
+schedule_delayed_work(&amp;priv-&gt;dwork, msecs_to_jiffies(STABILIZE_MS));
+
+/* Belirli bir CPU'da çalıştır */
+queue_delayed_work_on(cpu, priv-&gt;wq, &amp;priv-&gt;dwork,
+                      msecs_to_jiffies(STABILIZE_MS));</code></pre>
+
+  <h3>Gerçek Kullanım: Yeniden Deneme Mantığı</h3>
+  <pre><code>#define RETRY_DELAY_MS   100
+#define MAX_RETRIES      5
+
+static void mydrv_dwork_fn(struct work_struct *work)
+{
+    struct delayed_work *dwork = to_delayed_work(work);
+    struct mydrv_priv *priv =
+        container_of(dwork, struct mydrv_priv, dwork);
+    int ret;
+
+    ret = mydrv_hw_init(priv);
+    if (ret == 0) {
+        dev_info(&amp;priv-&gt;dev, "Donanım başarıyla başlatıldı\n");
+        priv-&gt;retry_count = 0;
+        return;
+    }
+
+    priv-&gt;retry_count++;
+    if (priv-&gt;retry_count &gt;= MAX_RETRIES) {
+        dev_err(&amp;priv-&gt;dev, "Donanım başlatılamadı (%d deneme)\n",
+                priv-&gt;retry_count);
+        return;
+    }
+
+    dev_warn(&amp;priv-&gt;dev, "Yeniden deneniyor (%d/%d)...\n",
+             priv-&gt;retry_count, MAX_RETRIES);
+
+    /* Üstel geri çekilme */
+    queue_delayed_work(priv-&gt;wq, &amp;priv-&gt;dwork,
+                       msecs_to_jiffies(RETRY_DELAY_MS * (1 &lt;&lt; priv-&gt;retry_count)));
+}</code></pre>
+
+  <h3>Gerçek Kullanım: GPIO Debounce</h3>
+  <pre><code>/* GPIO IRQ'dan sonra donanımı tekrar oku (debounce) */
+#define DEBOUNCE_MS 20
+
+static irqreturn_t gpio_irq_handler(int irq, void *dev_id)
+{
+    struct gpio_priv *priv = dev_id;
+
+    /*
+     * GPIO hattı kararlı değil — hemen okuma güvenilmez.
+     * 20 ms sonra okumayı ertele.
+     */
+    mod_delayed_work(priv-&gt;wq, &amp;priv-&gt;dwork,
+                     msecs_to_jiffies(DEBOUNCE_MS));
+    return IRQ_HANDLED;
+}
+
+static void gpio_dwork_fn(struct work_struct *work)
+{
+    struct delayed_work *dwork = to_delayed_work(work);
+    struct gpio_priv *priv = container_of(dwork, struct gpio_priv, dwork);
+    int val;
+
+    val = gpiod_get_value_cansleep(priv-&gt;gpio);
+    /* Kararlı değeri işle */
+    input_report_key(priv-&gt;input, KEY_ENTER, val);
+    input_sync(priv-&gt;input);
+}</code></pre>
+
+  <h3>Temizlik</h3>
+  <pre><code>static void mydrv_remove(struct platform_device *pdev)
+{
+    struct mydrv_priv *priv = platform_get_drvdata(pdev);
+
+    /*
+     * cancel_delayed_work_sync:
+     * - Zamanlayıcı beklemedeyse iptal et
+     * - Zaten kuyruktaysa veya çalışıyorsa bitene kadar bekle
+     */
+    cancel_delayed_work_sync(&amp;priv-&gt;dwork);
+    destroy_workqueue(priv-&gt;wq);
+}</code></pre>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> kthread_run, kthread_stop, kthread_should_stop</h2>
+  <p class="section-lead">Kernel thread'leri, workqueue'den farklı olarak bağımsız çalışma döngüsü gerektiren senaryolar için kullanılır: sürekli polling, producer/consumer kuyrukları ve RT görevleri.</p>
+
+  <h3>Temel kthread API</h3>
+  <pre><code>#include &lt;linux/kthread.h&gt;
+
+/**
+ * kthread_run - yeni kernel thread oluştur ve başlat
+ *
+ * @threadfn: Thread fonksiyonu — int döndürür
+ * @data:     threadfn'e aktarılan opak pointer
+ * @namefmt:  Thread ismi (ps çıktısında görünür, printf formatı)
+ *
+ * Başarıda task_struct pointer, hata durumunda ERR_PTR döner.
+ */
+struct task_struct *kthread_run(int (*threadfn)(void *data),
+                                void *data,
+                                const char namefmt[], ...);
+
+/**
+ * kthread_stop - thread'i durdur ve tamamlanmasını bekle
+ *
+ * kthread_should_stop()'u true yapar, thread uyanıksa uyandırır,
+ * sonra thread'in sonlanmasını bekler.
+ * Dönüş: threadfn'in dönüş değeri.
+ */
+int kthread_stop(struct task_struct *k);
+
+/**
+ * kthread_should_stop - thread durma sinyali var mı?
+ *
+ * Thread döngüsünde düzenli kontrol edilmeli.
+ * kthread_stop() çağrıldığında true döner.
+ */
+bool kthread_should_stop(void);
+
+/**
+ * kthread_freezable_should_stop - suspend/freeze kontrolü de yapar
+ * Güç yönetimi ile entegre thread'ler için tercih edilmeli.
+ */
+bool kthread_freezable_should_stop(bool *was_frozen);</code></pre>
+
+  <h3>Tipik kthread Döngüsü</h3>
+  <pre><code>struct mydrv_priv {
+    struct task_struct  *kthread;
+    wait_queue_head_t    wq;           /* thread'i uyandırmak için */
+    atomic_t             work_pending; /* yeni iş var mı? */
+};
+
+static int mydrv_thread_fn(void *data)
+{
+    struct mydrv_priv *priv = data;
+
+    /* Thread önceliğini ayarla — RT kritik ise */
+    /* sched_set_fifo(current);  -- SCHED_FIFO, öncelik 50 */
+
+    while (!kthread_should_stop()) {
+        /*
+         * Yeni iş bekle — CPU boşa harcama.
+         * wait_event_interruptible ile sinyal alabilir.
+         */
+        wait_event_interruptible(priv-&gt;wq,
+            atomic_read(&amp;priv-&gt;work_pending) ||
+            kthread_should_stop());
+
+        if (kthread_should_stop())
+            break;
+
+        atomic_set(&amp;priv-&gt;work_pending, 0);
+
+        /* Asıl işi yap — uyuyabilir, blocking I/O yapabilir */
+        mydrv_process_data(priv);
+    }
+
+    return 0;
+}
+
+/* IRQ handler'dan thread'i uyandır */
+static irqreturn_t mydrv_irq(int irq, void *dev_id)
+{
+    struct mydrv_priv *priv = dev_id;
+
+    /* Hızlı acknowledge */
+    writel(IRQ_CLEAR, priv-&gt;base + CLEAR_REG);
+
+    /* Thread'i uyandır */
+    atomic_set(&amp;priv-&gt;work_pending, 1);
+    wake_up_interruptible(&amp;priv-&gt;wq);
+
+    return IRQ_HANDLED;
+}
+
+static int mydrv_probe(struct platform_device *pdev)
+{
+    struct mydrv_priv *priv = /* ... */;
+
+    init_waitqueue_head(&amp;priv-&gt;wq);
+    atomic_set(&amp;priv-&gt;work_pending, 0);
+
+    priv-&gt;kthread = kthread_run(mydrv_thread_fn, priv, "mydrv/%s",
+                                 dev_name(&amp;pdev-&gt;dev));
+    if (IS_ERR(priv-&gt;kthread)) {
+        dev_err(&amp;pdev-&gt;dev, "kthread oluşturulamadı\n");
+        return PTR_ERR(priv-&gt;kthread);
+    }
+
+    return 0;
+}
+
+static void mydrv_remove(struct platform_device *pdev)
+{
+    struct mydrv_priv *priv = platform_get_drvdata(pdev);
+
+    /*
+     * kthread_stop: should_stop bayrağını set et,
+     * eğer wait_event'te bekliyorsa uyandır,
+     * thread tamamlanana kadar bekle.
+     */
+    kthread_stop(priv-&gt;kthread);
+}</code></pre>
+
+  <h3>kthread Öncelik Ayarı</h3>
+  <pre><code>#include &lt;linux/sched.h&gt;
+#include &lt;uapi/linux/sched/types.h&gt;
+
+static int rt_thread_fn(void *data)
+{
+    /* Kernel içinden SCHED_FIFO öncelik 80 ver */
+    struct sched_attr attr = {
+        .size       = sizeof(attr),
+        .sched_policy  = SCHED_FIFO,
+        .sched_priority = 80,
+    };
+    sched_setattr_nocheck(current, &amp;attr);
+
+    /* Belirli bir CPU'ya bağla */
+    set_cpus_allowed_ptr(current, cpumask_of(2));
+
+    while (!kthread_should_stop()) {
+        /* RT görev döngüsü */
+        do_rt_work(data);
+        /* Bir sonraki periyoda kadar uyu */
+        schedule_timeout_interruptible(usecs_to_jiffies(1000)); /* 1ms */
+    }
+    return 0;
+}</code></pre>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> kthread_worker API</h2>
+  <p class="section-lead">kthread_worker, tek bir kernel thread etrafında iş kuyruğu soyutlaması sunar. Workqueue ile kthread arasında bir köprüdür: sıralı çalışma garantisi, düşük overhead ve tam thread kontrolü bir arada.</p>
+
+  <h3>kthread_worker Yapısı</h3>
+  <div class="flow">
+    <pre>
+kthread_worker
+├─ worker_list: kthread_work listesi
+├─ task: worker kernel thread
+└─ lock: liste koruma spinlock
+
+kthread_work (her iş birimi)
+├─ node: worker_list'teki bağlı liste düğümü
+├─ func: yürütülecek fonksiyon
+└─ worker: bağlı olduğu kthread_worker
+
+API Akışı:
+  kthread_init_worker()  →  worker oluştur
+  kthread_init_work()    →  iş birimi tanımla
+  kthread_queue_work()   →  kuyruğa ekle
+  worker thread          →  sırayla çalıştırır
+  kthread_flush_work()   →  bitmesini bekle
+  kthread_cancel_work_sync() → iptal et
+    </pre>
+  </div>
+
+  <h3>Tam Kullanım Örneği</h3>
+  <pre><code>#include &lt;linux/kthread.h&gt;
+
+struct mydrv_priv {
+    struct kthread_worker  worker;
+    struct task_struct    *worker_task;
+    struct kthread_work    work;
+    struct kthread_work    cleanup_work;
+};
+
+static void mydrv_kwork_fn(struct kthread_work *work)
+{
+    struct mydrv_priv *priv =
+        container_of(work, struct mydrv_priv, work);
+
+    /* Process bağlamı — uyuyabilir */
+    mydrv_process(priv);
+}
+
+static void mydrv_cleanup_fn(struct kthread_work *work)
+{
+    struct mydrv_priv *priv =
+        container_of(work, struct mydrv_priv, cleanup_work);
+    mydrv_hw_cleanup(priv);
+}
+
+static int mydrv_probe(struct platform_device *pdev)
+{
+    struct mydrv_priv *priv;
+    int ret;
+
+    priv = devm_kzalloc(&amp;pdev-&gt;dev, sizeof(*priv), GFP_KERNEL);
+    if (!priv)
+        return -ENOMEM;
+
+    /* Worker'ı başlat — henüz thread yok */
+    kthread_init_worker(&amp;priv-&gt;worker);
+
+    /* İş birimlerini tanımla */
+    kthread_init_work(&amp;priv-&gt;work, mydrv_kwork_fn);
+    kthread_init_work(&amp;priv-&gt;cleanup_work, mydrv_cleanup_fn);
+
+    /* Worker thread'i oluştur ve başlat */
+    priv-&gt;worker_task = kthread_run(kthread_worker_fn,
+                                    &amp;priv-&gt;worker,
+                                    "mydrv-worker/%s",
+                                    dev_name(&amp;pdev-&gt;dev));
+    if (IS_ERR(priv-&gt;worker_task))
+        return PTR_ERR(priv-&gt;worker_task);
+
+    platform_set_drvdata(pdev, priv);
+    return 0;
+}
+
+/* İş kuyruğa alma — IRQ handler'dan veya başka yerden */
+static irqreturn_t mydrv_irq(int irq, void *dev_id)
+{
+    struct mydrv_priv *priv = dev_id;
+    kthread_queue_work(&amp;priv-&gt;worker, &amp;priv-&gt;work);
+    return IRQ_HANDLED;
+}
+
+static void mydrv_remove(struct platform_device *pdev)
+{
+    struct mydrv_priv *priv = platform_get_drvdata(pdev);
+
+    /* Cleanup work kuyruğa al ve bekle */
+    kthread_queue_work(&amp;priv-&gt;worker, &amp;priv-&gt;cleanup_work);
+    kthread_flush_worker(&amp;priv-&gt;worker);
+
+    /* Worker thread'i durdur */
+    kthread_stop(priv-&gt;worker_task);
+}</code></pre>
+
+  <h3>kthread_worker vs workqueue Karşılaştırması</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Kriter</th><th>kthread_worker</th><th>workqueue</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Thread sayısı</td><td>Tam kontrol (1 thread)</td><td>cmwq yönetir (değişken)</td></tr>
+        <tr><td>Öncelik ayarı</td><td>Doğrudan (sched_setattr)</td><td>WQ_HIGHPRI bayrağı ile sınırlı</td></tr>
+        <tr><td>CPU affinity</td><td>set_cpus_allowed_ptr</td><td>WQ_UNBOUND veya affinity_scope</td></tr>
+        <tr><td>Sıralı çalışma</td><td>Garantili (tek thread)</td><td>ordered_workqueue gerektirir</td></tr>
+        <tr><td>Overhead</td><td>Düşük</td><td>Biraz daha yüksek (pool yönetimi)</td></tr>
+        <tr><td>Önerilen kullanım</td><td>RT, sıralı, özel öncelik</td><td>Genel sürücü ertelenmiş iş</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> tasklet — Eski API</h2>
+  <p class="section-lead">Tasklet'ler softirq üzerine inşa edilmiş, eski Linux sürücülerinde yaygın kullanılan bir erteleme mekanizmasıdır. Yeni kodda workqueue tercih edilmelidir; ancak eski sürücüleri okumak ve bakımını yapmak için tam olarak anlaşılmalıdır.</p>
+
+  <h3>tasklet Çalışma Modeli</h3>
+  <div class="params">
+    <div class="param"><span class="name">Softirq bağlamı</span><span class="desc">Tasklet'ler TASKLET_SOFTIRQ veya HI_SOFTIRQ bağlamında çalışır — process bağlamı değil. Uyuyamaz, GFP_ATOMIC gerektirir.</span></div>
+    <div class="param"><span class="name">Aynı anda tek CPU</span><span class="desc">Aynı tasklet, aynı anda yalnızca bir CPU'da çalışabilir. Farklı tasklet'ler farklı CPU'larda paralel çalışabilir.</span></div>
+    <div class="param"><span class="name">Atomik işlem</span><span class="desc">Tasklet işlemi atomik — bir kez başlarsa tamamlanır. Preempt edilemez (softirq preemption olmaz).</span></div>
+    <div class="param"><span class="name">Çift zamanlama koruması</span><span class="desc">tasklet_schedule() aynı tasklet için birden fazla çağrıda sadece bir kez kuyruğa alır. IRQ handler'dan güvenle tekrar çağrılabilir.</span></div>
+  </div>
+
+  <h3>tasklet API</h3>
+  <pre><code>#include &lt;linux/interrupt.h&gt;
+
+/* ---- Başlatma ---- */
+
+/* Statik: modül yükleme anında hazır */
+DECLARE_TASKLET(my_tasklet, my_tasklet_handler);
+DECLARE_TASKLET_DISABLED(my_tasklet, my_tasklet_handler);  /* devre dışı başlar */
+
+/* Dinamik (struct içinde): */
+struct mydrv_priv {
+    struct tasklet_struct tasklet;
+    unsigned long         tasklet_data;
+};
+
+/* probe'da: */
+tasklet_init(&amp;priv-&gt;tasklet, mydrv_tasklet_fn, (unsigned long)priv);
+
+/* ---- Handler ---- */
+static void mydrv_tasklet_fn(unsigned long data)
+{
+    struct mydrv_priv *priv = (struct mydrv_priv *)data;
+    /* Softirq bağlamı: uyuma yok, GFP_ATOMIC gerekli */
+    process_data(priv);
+}
+
+/* ---- Zamanlama ---- */
+/* IRQ handler'dan: */
+tasklet_schedule(&amp;priv-&gt;tasklet);       /* TASKLET_SOFTIRQ */
+tasklet_hi_schedule(&amp;priv-&gt;tasklet);    /* HI_SOFTIRQ — yüksek öncelik */
+
+/* ---- Kontrol ---- */
+tasklet_disable(&amp;priv-&gt;tasklet);        /* çalışıyorsa bitmesini bekle, sonra devre dışı */
+tasklet_enable(&amp;priv-&gt;tasklet);         /* yeniden etkinleştir */
+tasklet_kill(&amp;priv-&gt;tasklet);           /* çalışıyorsa bekle, pending iptal et */</code></pre>
+
+  <h3>Yeni Kodda Kaçınma Nedenleri</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Sorun</th><th>Açıklama</th><th>Workqueue Avantajı</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Uyuma yasak</td><td>Tüm blocking işlemler imkânsız</td><td>Workqueue'de GFP_KERNEL, mutex, I2C serbest</td></tr>
+        <tr><td>PREEMPT_RT uyumsuzluğu</td><td>RT yamalarında tasklet sorunlu</td><td>Workqueue RT uyumlu</td></tr>
+        <tr><td>Hata ayıklama zorluğu</td><td>Softirq bağlamı stack trace karmaşık</td><td>Normal process bağlamı — kolay debug</td></tr>
+        <tr><td>Deprecation eğilimi</td><td>Kernel geliştiricileri yeni API önermiyor</td><td>Aktif geliştirme ve bakım var</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>tasklet → workqueue Geçişi</h3>
+  <pre><code>/* ESKİ KOD (tasklet) */
+static void old_tasklet_fn(unsigned long data)
+{
+    struct mydrv_priv *priv = (struct mydrv_priv *)data;
+    do_work_no_sleep(priv);
+}
+tasklet_schedule(&amp;priv-&gt;tasklet);
+
+/* YENİ KOD (workqueue) — sadece birkaç satır fark */
+static void new_work_fn(struct work_struct *work)
+{
+    struct mydrv_priv *priv =
+        container_of(work, struct mydrv_priv, work);
+    do_work_with_sleep(priv);   /* artık uyuyabilir */
+}
+queue_work(priv-&gt;wq, &amp;priv-&gt;work);</code></pre>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> cmwq İç Mimarisi</h2>
+  <p class="section-lead">Concurrency-Managed Workqueue (cmwq), Linux 2.6.36'da geleneksel workqueue'nin yerini aldı. Temel yeniliği, CPU başına sabit worker thread yerine dinamik thread havuzu yönetimidir.</p>
+
+  <h3>cmwq Öncesi Sorunlar</h3>
+  <div class="params">
+    <div class="param"><span class="name">Tek worker thread</span><span class="desc">Eski API'da her singlethread_workqueue tek bir worker thread kullanıyordu. Bir work uyuduğunda tüm kuyruk duruyordu.</span></div>
+    <div class="param"><span class="name">CPU başına ayrı thread</span><span class="desc">create_workqueue() her CPU için ayrı thread oluşturuyordu. 64 CPU'lu sistemde 64 worker — kaynak israfı.</span></div>
+    <div class="param"><span class="name">Starvation riski</span><span class="desc">Uzun çalışan work'ler diğerlerini engelliyor, CPU'lar atıl bekliyordu.</span></div>
+  </div>
+
+  <h3>cmwq Çalışma Prensibi</h3>
+  <div class="flow">
+    <pre>
+workqueue (soyut kuyruk)
+    │
+    │ queue_work()
+    ▼
+worker_pool (CPU başına veya unbound)
+├─ worker thread havuzu (dinamik boyut)
+├─ pending work listesi
+├─ running count (şu an çalışan work sayısı)
+└─ idle worker listesi
+
+Kural: running_count &lt; 1 iken idle worker uyandırılır.
+       running_count &gt;= 1 iken yeni worker oluşturulmaz
+       (mevcut yeterli concurrent work sağlıyor).
+
+Eğer tek work çalışıyor ve uyursa:
+  running_count 0'a düşer
+  → idle worker uyandırılır veya yeni thread oluşturulur
+  → diğer work'ler devam eder
+
+Bu sayede:
+  • Bloke olan work diğerlerini engellemez
+  • CPU sayısı kadar minimum thread
+  • Yoğun dönemde geçici ek worker
+    </pre>
+  </div>
+
+  <h3>Worker Pool Tipleri</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Pool Tipi</th><th>Özellik</th><th>Kullanılan Bayrak</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>per-CPU bound</td><td>Her CPU için ayrı pool, work o CPU'da çalışır</td><td>Varsayılan (bayrak yok)</td></tr>
+        <tr><td>per-CPU highpri</td><td>Yüksek öncelikli per-CPU pool</td><td>WQ_HIGHPRI</td></tr>
+        <tr><td>unbound</td><td>CPU affinity yok, NUMA aware</td><td>WQ_UNBOUND</td></tr>
+        <tr><td>unbound highpri</td><td>Unbound + yüksek öncelik</td><td>WQ_UNBOUND | WQ_HIGHPRI</td></tr>
+        <tr><td>ordered</td><td>max_active=1, FIFO garantisi</td><td>alloc_ordered_workqueue()</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Parametre Ayarlama</h3>
+  <pre><code>/* Workqueue'nun maksimum eşzamanlı work sayısını ayarla */
+/* alloc_workqueue'nin 3. parametresi: max_active */
+priv-&gt;wq = alloc_workqueue("mydrv", WQ_UNBOUND | WQ_MEM_RECLAIM,
+                             4);  /* aynı anda max 4 work */
+
+/* Sysfs üzerinden çalışma zamanında izleme (WQ_SYSFS ile) */
+priv-&gt;wq = alloc_workqueue("mydrv", WQ_UNBOUND | WQ_SYSFS, 0);
+/* /sys/bus/workqueue/devices/mydrv/ altında görünür */
+
+/* Pool istatistikleri */
+/* cat /sys/kernel/debug/workqueue  -- kernel debug build'de */</code></pre>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Hata Ayıklama</h2>
+  <p class="section-lead">Workqueue hataları genellikle sessizdir: ölü kilit, hung worker, yanlış sıralama. Bu araçlar sorunları erken tespit eder.</p>
+
+  <h3>Hung Task Dedektörü</h3>
+  <pre><code>/*
+ * CONFIG_DETECT_HUNG_TASK=y
+ *
+ * Kernel, TASK_UNINTERRUPTIBLE durumunda kalan thread'leri izler.
+ * Varsayılan eşik: 120 saniye (kernel.hung_task_timeout_secs)
+ *
+ * Tetiklendiğinde dmesg'de:
+ * kernel: INFO: task mydrv-worker:1234 blocked for more than 120 seconds.
+ * kernel: "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+ * kernel: task:mydrv-worker state:D stack:0 pid:1234 ...
+ * kernel: Call Trace:
+ * kernel:  __schedule+0x...
+ * kernel:  schedule+0x...
+ * kernel:  mutex_lock+0x...
+ * kernel:  mydrv_work_fn+0x...
+ */
+
+/* Eşiği düşür (debug için) */
+echo 30 &gt; /proc/sys/kernel/hung_task_timeout_secs
+
+/* Hung task panic: ürün sistem için tehlikeli, sadece test'te */
+echo 1 &gt; /proc/sys/kernel/hung_task_panic</code></pre>
+
+  <h3>ftrace workqueue Events</h3>
+  <pre><code># workqueue event'lerini etkinleştir
+echo 1 &gt; /sys/kernel/debug/tracing/events/workqueue/enable
+
+# Trace başlat
+echo 1 &gt; /sys/kernel/debug/tracing/tracing_on
+
+# ... test senaryosunu çalıştır ...
+
+echo 0 &gt; /sys/kernel/debug/tracing/tracing_on
+cat /sys/kernel/debug/tracing/trace
+
+# Örnek çıktı:
+# kworker/2:1-42    [002]  1234.567890: workqueue_queue_work: work struct=0xffff... function=mydrv_work_fn workqueue=0xffff... req_cpu=2 cpu=2
+# kworker/2:1-42    [002]  1234.567891: workqueue_execute_start: work struct=0xffff... function=mydrv_work_fn
+# kworker/2:1-42    [002]  1234.567950: workqueue_execute_end: work struct=0xffff... function=mydrv_work_fn
+
+# Sadece belirli workqueue filtrele
+echo 'function == mydrv_work_fn' &gt; /sys/kernel/debug/tracing/events/workqueue/workqueue_execute_start/filter</code></pre>
+
+  <h3>lockdep ile Deadlock Tespiti</h3>
+  <pre><code>/*
+ * Yaygın hata: work handler'dan flush_workqueue() veya cancel_work_sync()
+ * çağırmak — deadlock!
+ *
+ * Örnek:
+ *   work_fn() çalışıyor
+ *     → flush_workqueue(wq) çağrılıyor
+ *     → tüm work'lerin bitmesini bekliyor
+ *     → work_fn() bitmesi için kendisinin bitmesini bekliyor
+ *     → Deadlock!
+ *
+ * CONFIG_LOCKDEP=y ile kernel bu durumu tespit eder:
+ *
+ * WARNING: possible circular locking dependency detected
+ * kworker/u8:2/1234 is trying to acquire lock:
+ * ((&amp;wq-&gt;completion)){+.+.}, ...
+ * but task is already holding lock:
+ * ((&amp;work-&gt;work_func))
+ *
+ * Çözüm: queue_work kullan (senkron bekleme yapma)
+ *         veya farklı workqueue'ye flush et
+ */</code></pre>
+
+  <h3>/proc/PID/wchan — Nerede Bekliyor</h3>
+  <pre><code># Tüm kworker thread'lerinin bekleme noktasını göster
+for pid in $(ps -eo pid,comm | grep kworker | awk '{print $1}'); do
+    comm=$(cat /proc/$pid/comm 2&gt;/dev/null)
+    wchan=$(cat /proc/$pid/wchan 2&gt;/dev/null)
+    echo "$comm ($pid): $wchan"
+done
+
+# Örnek çıktı:
+# kworker/0:1 (45): worker_thread
+# kworker/u8:2 (89): worker_thread
+# mydrv-worker (1234): mutex_lock   ← burada bekliyor!</code></pre>
+
+  <h3>Workqueue Dump — Kernel Panic Sonrası</h3>
+  <pre><code>/* CONFIG_WQ_WATCHDOG=y — workqueue watchdog
+ *
+ * Bir worker thread belirli süre çalışmaya devam ederse:
+ * BUG: workqueue lockup - pool cpus=2 node=0 flags=0x0 nice=0 stuck for 30s!
+ * Showing busy workqueues and worker pools:
+ * workqueue mydrv: flags=0xa0
+ *   pwq 4: cpus=2 node=0 flags=0x0 nice=0 active=1/256 refcnt=2
+ *     in-flight: 1234:mydrv_work_fn
+ *     pending: (diğer work listesi)
+ */
+
+/* Watchdog zaman aşımı ayarı (saniye, 0=devre dışı) */
+/* kernel cmdline: workqueue.watchdog_thresh=30 */</code></pre>
+
+  <h3>Sorun Giderme Kontrol Listesi</h3>
+  <div class="params">
+    <div class="param"><span class="name">Work hiç çalışmıyor</span><span class="desc">INIT_WORK çağrıldı mı? queue_work dönüş değeri kontrol edildi mi? destroy_workqueue çok erken çağrıldı mı?</span></div>
+    <div class="param"><span class="name">Work tamamlanmıyor</span><span class="desc">Handler içinde sonsuz döngü veya deadlock var mı? /proc/PID/wchan ile bekleme noktasını kontrol et.</span></div>
+    <div class="param"><span class="name">Sıralama bozuk</span><span class="desc">alloc_ordered_workqueue kullanılıyor mu? Yoksa varsayılan workqueue FIFO garantisi vermez.</span></div>
+    <div class="param"><span class="name">UAF (Use-After-Free)</span><span class="desc">cancel_work_sync çağrılmadan sürücü struct'ı serbest bırakıldı. remove() içinde her zaman cancel_work_sync çağır.</span></div>
+  </div>
+</section>
+
+</main>

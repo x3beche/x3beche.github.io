@@ -1,0 +1,870 @@
+---
+layout: tutorial
+title: "io_uring Ağ — Sıfır Kopya Yüksek Performans Ağ"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>IO_URING / AĞ</span>
+    <span>2026</span>
+  </div>
+  <h1>io_uring Ağ<br><em>Sıfır Kopya Yüksek Performans Ağ</em></h1>
+  <p class="subtitle">SQPOLL, multishot recv, zero-copy send ve fixed buffer'larla epoll'u geride bırakan io_uring ağ sunucusu mimarisi — gömülü sistemlerden veri merkezine kadar ölçeklenebilir yüksek performanslı I/O.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">io_uring ağ motivasyonu — epoll karşılaştırması</a></li>
+    <li><a href="#s1">SQ/CQ ring tekrarı — io_uring_submit, io_uring_wait_cqe</a></li>
+    <li><a href="#s2">IORING_OP_RECV ve IORING_OP_SEND — temel ağ operasyonları</a></li>
+    <li><a href="#s3">Multishot recv — IORING_RECV_MULTISHOT ve buffer ring</a></li>
+    <li><a href="#s4">SQPOLL — kernel taraflı polling ve CPU pin</a></li>
+    <li><a href="#s5">Zero-copy send — IORING_OP_SEND_ZC ve notification CQE</a></li>
+    <li><a href="#s6">Fixed buffers ve registered files</a></li>
+    <li><a href="#s7">io_uring sunucu mimarisi — accept döngüsü ve bağlantı state machine</a></li>
+    <li><a href="#s8">Performans karşılaştırması ve gömülü sistemlerde kullanım</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ BÖLÜM 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> io_uring ağ motivasyonu — epoll karşılaştırması</h2>
+  <p class="section-lead">epoll, yıllardır yüksek performanslı Linux ağ sunucularının omurgasıdır. Ancak her hazır fd için ayrı sistem çağrısı yapılması, kullanıcı-kernel bellek kopyaları ve tek-shot operasyonlar önemli overhead kaynakları olmaya devam eder. io_uring bu sınırları kökünden aşar.</p>
+
+  <h3>epoll modelinin syscall maliyeti</h3>
+  <p>Klasik epoll tabanlı bir echo sunucusunda tek bir istek-yanıt döngüsü şu sistem çağrılarını gerektirir: <code>epoll_wait()</code> ile hazır fd'yi öğren, <code>recv()</code> ile veriyi al, <code>send()</code> ile yanıtı gönder. Her sistem çağrısı bağlam geçişi (context switch) maliyeti taşır. Yüksek bağlantı sayısında bu maliyet birikerek CPU bütçesinin önemli bir bölümünü sistem çağrı altyapısına harcar.</p>
+
+  <div class="flow">
+    <pre>epoll tabanlı echo:
+  epoll_wait()   → kernel/user geçişi 1
+  recv(fd, ...)  → kernel/user geçişi 2 + bellek kopyası
+  send(fd, ...)  → kernel/user geçişi 3 + bellek kopyası
+  Toplam: 3 syscall + 2 kopya / istek
+
+io_uring tabanlı echo (SQPOLL + zero-copy):
+  SQE'yi ring'e yaz → syscall YOK (SQPOLL açıksa)
+  CQE'yi ring'den oku → syscall YOK
+  send_zc          → bellek kopyası YOK
+  Toplam: 0 syscall + 0 kopya / istek (ideal durumda)</pre>
+  </div>
+
+  <h3>Performans karşılaştırma özeti</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>epoll + blocking I/O</th><th>epoll + O_NONBLOCK</th><th>io_uring (SQPOLL)</th></tr></thead>
+      <tbody>
+        <tr><td>Syscall / istek</td><td>3+</td><td>3–5 (EAGAIN retry)</td><td>0 (SQPOLL ile)</td></tr>
+        <tr><td>Bellek kopyası</td><td>2 (recv+send)</td><td>2</td><td>0 (zero-copy send ile)</td></tr>
+        <tr><td>Bağlantı takibi</td><td>fd başına state</td><td>fd başına state</td><td>SQE user_data ile</td></tr>
+        <tr><td>CPU affinity</td><td>Yok</td><td>Yok</td><td>SQPOLL thread pin</td></tr>
+        <tr><td>Dosya I/O desteği</td><td>Hayır</td><td>Hayır</td><td>Evet — aynı ring</td></tr>
+        <tr><td>Karmaşıklık</td><td>Düşük</td><td>Orta</td><td>Yüksek</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Temel io_uring ağ operasyonları</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">IORING_OP_ACCEPT</span><span class="desc">Yeni bağlantıyı async kabul et; multishot modda tek SQE sürekli yeni bağlantıları kabul eder</span></div>
+    <div class="param"><span class="name">IORING_OP_RECV / SEND</span><span class="desc">Soket veri alım/gönderimi; recv multishot ile tek SQE çok sayıda recv tamamlaması üretir</span></div>
+    <div class="param"><span class="name">IORING_OP_SEND_ZC</span><span class="desc">Zero-copy gönderim; kernel veriyi doğrudan user buffer'dan alır, kopyalamaz; tamamlanma 2 aşamalı</span></div>
+    <div class="param"><span class="name">IORING_OP_CONNECT</span><span class="desc">TCP bağlantısı başlat; async — bağlantı tamamlandığında CQE gelir</span></div>
+    <div class="param"><span class="name">IORING_OP_SHUTDOWN</span><span class="desc">Soketi async kapat; shutdown(2) sistem çağrısının async karşılığı</span></div>
+    <div class="param"><span class="name">IORING_OP_CLOSE</span><span class="desc">fd'yi async kapat; yoğun bağlantı kapamada syscall kümesi azaltır</span></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> SQ/CQ ring tekrarı — io_uring_submit, io_uring_wait_cqe</h2>
+  <p class="section-lead">io_uring çift yönlü ring buffer mimarisini hatırlamak, ağ operasyonlarının nasıl birbirine zincirlendiğini anlamak için gereklidir. SQE üretim, SQE gönderim ve CQE tüketim üç bağımsız süreçtir.</p>
+
+  <h3>Ring buffer yapısı</h3>
+  <p>io_uring kurulumunda kernel iki ring ve bir SQE dizisi ayırır. <strong>Submission Queue (SQ)</strong> ring, SQE dizisine indeks tutar; baş (tail) user tarafından ilerletilir. <strong>Completion Queue (CQ)</strong> ring, tamamlanan operasyonların sonuçlarını tutar; baş user, kuyruk kernel tarafından güncellenir. Her iki ring de <code>mmap()</code> ile kullanıcı alanına eşlenir; erişim sistem çağrısız gerçekleşir.</p>
+
+  <div class="flow">
+    <pre>User-space                       Kernel
+  SQE'yi sq.sqes[tail]'a yaz
+  sq.tail++ (atomik)
+  io_uring_submit() [opsiyonel]  → kernel SQE'leri okur
+                                 → operasyonları başlatır
+                                 → tamamlanınca cq.cqes[cq_tail]'a yazar
+                                 → cq.tail++ (atomik)
+  io_uring_wait_cqe() / peek
+  CQE'yi cq.cqes[cq_head]'dan oku
+  cq_head++ (atomik)             ← kernel: CQE okundu</pre>
+  </div>
+
+  <h3>liburing API özeti</h3>
+
+<pre><code>#include &lt;liburing.h&gt;
+
+struct io_uring ring;
+
+/* Kurulum: 256 giriş kapasiteli ring */
+io_uring_queue_init(256, &amp;ring, 0);
+
+/* SQE al (ring'den bir slot al) */
+struct io_uring_sqe *sqe = io_uring_get_sqe(&amp;ring);
+
+/* Operasyonu konfigüre et */
+io_uring_prep_recv(sqe, client_fd, buf, buf_len, 0);
+sqe-&gt;user_data = (uint64_t)conn;  /* tag: hangi bağlantı? */
+
+/* Kernel'a gönder */
+io_uring_submit(&amp;ring);
+
+/* Tamamlanma bekle */
+struct io_uring_cqe *cqe;
+io_uring_wait_cqe(&amp;ring, &amp;cqe);   /* bloklayıcı */
+/* veya: io_uring_peek_cqe — bloklayıcı değil */
+
+/* Sonucu işle */
+if (cqe-&gt;res &lt; 0)
+    fprintf(stderr, "recv failed: %s\n", strerror(-cqe-&gt;res));
+else
+    process_data(buf, cqe-&gt;res);
+
+/* CQE'yi serbest bırak */
+io_uring_cqe_seen(&amp;ring, cqe);
+
+/* Temizlik */
+io_uring_queue_exit(&amp;ring);
+</code></pre>
+
+  <h3>Toplu gönderim ve tüketim</h3>
+
+<pre><code>/* Birden fazla SQE gönder: tek syscall */
+struct io_uring_sqe *sqe;
+for (int i = 0; i &lt; n_ready; i++) {
+    sqe = io_uring_get_sqe(&amp;ring);
+    io_uring_prep_send(sqe, fds[i], bufs[i], lens[i], 0);
+    sqe-&gt;user_data = (uint64_t)i;
+}
+io_uring_submit(&amp;ring);  /* tüm N SQE tek syscall ile */
+
+/* Birden fazla CQE tüket */
+unsigned head;
+struct io_uring_cqe *cqe;
+int processed = 0;
+io_uring_for_each_cqe(&amp;ring, head, cqe) {
+    handle_completion(cqe);
+    processed++;
+}
+io_uring_cq_advance(&amp;ring, processed);  /* toplu serbest bırak */
+</code></pre>
+
+  <h3>io_uring_params ve flag'ler</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Flag</th><th>Etki</th><th>Kullanım</th></tr></thead>
+      <tbody>
+        <tr><td>IORING_SETUP_SQPOLL</td><td>Kernel SQ polling thread'i başlatır</td><td>Çok yüksek throughput; CPU sabitlemek gerekir</td></tr>
+        <tr><td>IORING_SETUP_SQ_AFF</td><td>SQPOLL thread'ini CPU'ya sabitle</td><td>SQPOLL ile birlikte; sq_thread_cpu ayarla</td></tr>
+        <tr><td>IORING_SETUP_CQSIZE</td><td>CQ ring boyutunu bağımsız ayarla</td><td>CQ SQ'dan büyük olunca taşma önlenir</td></tr>
+        <tr><td>IORING_SETUP_SINGLE_ISSUER</td><td>Tek thread submission garantisi</td><td>5.20+; micro-optimizasyon</td></tr>
+        <tr><td>IORING_SETUP_DEFER_TASKRUN</td><td>Completion işlemi gönderen thread'de çalışır</td><td>5.19+; IOCP benzeri model</td></tr>
+        <tr><td>IORING_SETUP_NO_MMAP</td><td>Ring bellek kullanıcı tarafından sağlanır</td><td>Özel bellek yönetimi için</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> IORING_OP_RECV ve IORING_OP_SEND — temel ağ operasyonları</h2>
+  <p class="section-lead">RECV ve SEND operasyonları io_uring'in en temel ağ ilkeleridir. recv(2) ve send(2) sistem çağrılarının async karşılığı olarak çalışırlar; ancak bağlı oldukları soketin non-blocking olması gerekmez.</p>
+
+  <h3>RECV operasyonu</h3>
+
+<pre><code>#include &lt;liburing.h&gt;
+#include &lt;sys/socket.h&gt;
+
+#define BUF_SIZE 4096
+
+static void submit_recv(struct io_uring *ring, int fd,
+                         char *buf, struct conn_state *conn)
+{
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    if (!sqe) {
+        /* Ring dolu — flush et ve tekrar dene */
+        io_uring_submit(ring);
+        sqe = io_uring_get_sqe(ring);
+    }
+
+    io_uring_prep_recv(sqe, fd, buf, BUF_SIZE, 0);
+
+    /* user_data ile bağlantı context'ini etiketle */
+    io_uring_sqe_set_data(sqe, conn);
+
+    /* IOSQE_FIXED_FILE: registered file kullan (daha hızlı) */
+    /* sqe-&gt;flags |= IOSQE_FIXED_FILE; */
+}
+
+static void handle_recv_cqe(struct io_uring_cqe *cqe)
+{
+    struct conn_state *conn = io_uring_cqe_get_data(cqe);
+    int bytes = cqe-&gt;res;
+
+    if (bytes == 0) {
+        /* Bağlantı kapatıldı */
+        close_connection(conn);
+        return;
+    }
+    if (bytes &lt; 0) {
+        if (bytes == -ENOBUFS) {
+            /* Buffer ring doldu — multishot için yeniden dene */
+            resubmit_recv(conn);
+        } else {
+            fprintf(stderr, "recv error: %s\n", strerror(-bytes));
+            close_connection(conn);
+        }
+        return;
+    }
+
+    process_data(conn, conn-&gt;recv_buf, bytes);
+
+    /* Bir sonraki recv'i hemen gönder */
+    submit_recv(conn-&gt;ring, conn-&gt;fd, conn-&gt;recv_buf, conn);
+}
+</code></pre>
+
+  <h3>SEND operasyonu</h3>
+
+<pre><code>static void submit_send(struct io_uring *ring, int fd,
+                         const char *data, size_t len,
+                         struct conn_state *conn)
+{
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+
+    io_uring_prep_send(sqe, fd, data, len, MSG_NOSIGNAL);
+    io_uring_sqe_set_data(sqe, conn);
+
+    /* Kısmi gönderim durumunda otomatik yeniden dene */
+    sqe-&gt;flags |= IOSQE_IO_LINK;  /* sonraki SQE ile zincirle */
+}
+
+static void handle_send_cqe(struct io_uring_cqe *cqe)
+{
+    struct conn_state *conn = io_uring_cqe_get_data(cqe);
+    int sent = cqe-&gt;res;
+
+    if (sent &lt; 0) {
+        fprintf(stderr, "send error: %s\n", strerror(-sent));
+        close_connection(conn);
+        return;
+    }
+
+    conn-&gt;sent_bytes += sent;
+    if (conn-&gt;sent_bytes &lt; conn-&gt;total_bytes) {
+        /* Kısmi gönderim — kalanı gönder */
+        submit_send(conn-&gt;ring, conn-&gt;fd,
+                    conn-&gt;send_buf + conn-&gt;sent_bytes,
+                    conn-&gt;total_bytes - conn-&gt;sent_bytes,
+                    conn);
+        io_uring_submit(conn-&gt;ring);
+    }
+}
+</code></pre>
+
+  <h3>IORING_OP_RECVMSG ve IORING_OP_SENDMSG</h3>
+  <p><code>recvmsg</code> ve <code>sendmsg</code> operasyonları, scatter-gather I/O (iovec dizisi) ve kontrol mesajı (cmsg) desteği için kullanılır. UDP socket'lerde çok kullanışlıdır: tek SQE ile kaynak adres bilgisi alınabilir.</p>
+
+<pre><code>/* UDP recv: kaynak adresi de al */
+struct msghdr msg = {
+    .msg_name    = &amp;src_addr,
+    .msg_namelen = sizeof(src_addr),
+    .msg_iov     = &amp;iov,
+    .msg_iovlen  = 1,
+};
+iov.iov_base = buf;
+iov.iov_len  = BUF_SIZE;
+
+struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+io_uring_prep_recvmsg(sqe, udp_fd, &amp;msg, 0);
+io_uring_sqe_set_data(sqe, conn);
+</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> Multishot recv — IORING_RECV_MULTISHOT ve buffer ring</h2>
+  <p class="section-lead">Multishot recv, tek bir SQE ile kernel'ın sürekli olarak veri almasını sağlar. Her veri gelişinde bir CQE üretilir; SQE yeniden gönderilmek zorunda kalınmaz. Buffer ring ile birleşince hem SQE hem de bellek yönetimi otomatikleşir.</p>
+
+  <h3>Multishot recv kavramı</h3>
+  <p>Normal recv modunda: recv → CQE → yeni recv SQE → recv → CQE döngüsü SQE gönderim maliyeti taşır. Multishot modunda: tek recv SQE → N×CQE — her veri paketinde yeni SQE gerekmez. Soket kapatılana veya hata oluşana kadar SQE aktif kalır.</p>
+
+<pre><code>/* Multishot recv SQE hazırla */
+struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+
+io_uring_prep_recv_multishot(sqe, client_fd, NULL, 0, 0);
+/* Not: buf=NULL, len=0 — buffer ring'den otomatik alınır */
+
+sqe-&gt;buf_group = BUF_GRP_ID;    /* hangi buffer grubundan al */
+sqe-&gt;flags    |= IOSQE_BUFFER_SELECT;
+io_uring_sqe_set_data(sqe, conn);
+
+/* CQE'de: cqe-&gt;flags &amp; IORING_CQE_F_MORE != 0 ise multishot devam ediyor */
+static void handle_multishot_recv(struct io_uring_cqe *cqe)
+{
+    struct conn_state *conn = io_uring_cqe_get_data(cqe);
+    int bytes = cqe-&gt;res;
+
+    if (!(cqe-&gt;flags &amp; IORING_CQE_F_MORE)) {
+        /* Multishot sona erdi — yeniden başlat */
+        resubmit_multishot_recv(conn);
+    }
+
+    if (bytes &lt;= 0) return;
+
+    /* Buffer ring'den hangi buffer kullanıldı? */
+    int buf_id = cqe-&gt;flags &gt;&gt; IORING_CQE_BUFFER_SHIFT;
+    char *buf  = get_buffer(buf_id);
+
+    process_data(conn, buf, bytes);
+    return_buffer(buf_id);  /* buffer'ı gruba iade et */
+}
+</code></pre>
+
+  <h3>Buffer ring kurulumu</h3>
+
+<pre><code>#define BUF_GRP_ID   0
+#define BUF_COUNT    64
+#define BUF_SIZE     4096
+
+struct io_uring_buf_ring *buf_ring;
+void *bufs_mem;
+
+static int setup_buffer_ring(struct io_uring *ring)
+{
+    /* Ring belleği ayır: hizalı olmalı */
+    size_t ring_sz = sizeof(struct io_uring_buf_ring)
+                   + BUF_COUNT * sizeof(struct io_uring_buf);
+    posix_memalign((void **)&amp;buf_ring, 4096, ring_sz);
+
+    /* Buffer belleği ayır */
+    bufs_mem = mmap(NULL, BUF_COUNT * BUF_SIZE,
+                    PROT_READ | PROT_WRITE,
+                    MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+
+    /* io_uring'e buffer ring'i kaydet */
+    struct io_uring_buf_reg reg = {
+        .ring_addr    = (uint64_t)buf_ring,
+        .ring_entries = BUF_COUNT,
+        .bgid         = BUF_GRP_ID,
+    };
+    int ret = io_uring_register_buf_ring(ring, &amp;reg, 0);
+    if (ret) return ret;
+
+    /* Her buffer'ı gruba ekle */
+    io_uring_buf_ring_init(buf_ring);
+    for (int i = 0; i &lt; BUF_COUNT; i++) {
+        void *buf_addr = (char *)bufs_mem + i * BUF_SIZE;
+        io_uring_buf_ring_add(buf_ring, buf_addr, BUF_SIZE,
+                              i, io_uring_buf_ring_mask(BUF_COUNT), i);
+    }
+    io_uring_buf_ring_advance(buf_ring, BUF_COUNT);
+    return 0;
+}
+</code></pre>
+
+  <h3>Buffer iade döngüsü</h3>
+  <p>Buffer ring'deki buffer'lar tüketildikten sonra geri iade edilmelidir. İade yapılmaması halinde kernel yeni recv için buffer bulamaz ve <code>ENOBUFS</code> döner. Veriyi işledikten hemen sonra buffer'ı iade etmek en güvenli yaklaşımdır.</p>
+
+<pre><code>static void return_buffer(struct io_uring *ring, int buf_id)
+{
+    void *buf_addr = (char *)bufs_mem + buf_id * BUF_SIZE;
+    int mask = io_uring_buf_ring_mask(BUF_COUNT);
+
+    io_uring_buf_ring_add(buf_ring, buf_addr, BUF_SIZE,
+                          buf_id, mask, 0);
+    io_uring_buf_ring_advance(buf_ring, 1);
+}
+</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> SQPOLL — kernel taraflı polling ve CPU pin</h2>
+  <p class="section-lead">SQPOLL modunda kernel, SQ ring'i sürekli izleyen ayrı bir kernel thread başlatır. Kullanıcı SQE yazdıktan sonra <code>io_uring_submit()</code> çağırmak zorunda kalmaz; kernel thread bunu tespit edip operasyonu doğrudan başlatır. Sıfır syscall ile maksimum throughput elde edilir.</p>
+
+  <h3>SQPOLL kurulumu</h3>
+
+<pre><code>#include &lt;liburing.h&gt;
+
+int setup_sqpoll_ring(struct io_uring *ring, int sq_thread_cpu)
+{
+    struct io_uring_params params = {
+        .flags = IORING_SETUP_SQPOLL
+               | IORING_SETUP_SQ_AFF,  /* CPU sabitleme */
+        .sq_thread_cpu  = sq_thread_cpu,
+        .sq_thread_idle = 2000,  /* ms — idle sonrası thread uyur */
+    };
+
+    int ret = io_uring_queue_init_params(4096, ring, &amp;params);
+    if (ret) {
+        perror("io_uring_queue_init_params");
+        /* EPERM: CAP_SYS_NICE veya root gerekir */
+        return ret;
+    }
+
+    printf("SQPOLL aktif, kernel thread CPU=%d\n", sq_thread_cpu);
+    return 0;
+}
+</code></pre>
+
+  <h3>SQPOLL ile SQE gönderimi</h3>
+
+<pre><code>/* SQPOLL aktif: io_uring_submit() çağrısı gerekmez */
+struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+io_uring_prep_recv(sqe, fd, buf, len, 0);
+io_uring_sqe_set_data(sqe, conn);
+/* sq_tail güncelleme: liburing bunu io_uring_get_sqe içinde yapar */
+/* Kernel thread sq_tail değişimini atomik okur ve işler */
+
+/* Ancak: kernel thread uyumuşsa (sq_thread_idle geçtiyse)
+   wake-up için submit çağrısı gerekebilir */
+if (io_uring_sq_need_wakeup(ring))
+    io_uring_submit(ring);  /* sadece wake-up için — hızlı */
+</code></pre>
+
+  <h3>SQPOLL güvenlik gereksinimleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Gereksinim</th><th>Açıklama</th></tr></thead>
+      <tbody>
+        <tr><td>CAP_SYS_NICE veya root</td><td>SQPOLL kernel thread başlatmak için gerekli; kernel 5.11 öncesinde root şarttı</td></tr>
+        <tr><td>Kernel 5.11+</td><td>Kernel 5.11 itibarıyla CAP_SYS_NICE ile SQPOLL kullanılabilir</td></tr>
+        <tr><td>CPU affinity</td><td>sq_thread_cpu değeri geçerli online CPU olmalı; sched_setaffinity ile kullanıcı thread'i de aynı CPU'ya pinlenebilir</td></tr>
+        <tr><td>Registered files</td><td>SQPOLL ile registered files (IORING_REGISTER_FILES) birlikte kullanılması önerilir</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>SQPOLL CPU mimarisi</h3>
+  <p>SQPOLL en yüksek faydayı özel CPU'larda verir. Uygulama thread'i ve SQPOLL thread'i aynı NUMA node'undaki iki farklı CPU'ya sabitlenirse L3 cache paylaşımı ile ring buffer erişim gecikmesi minimuma iner. Gömülü ARM çok çekirdekli sistemlerde (Cortex-A72 gibi) CPU 0 işletim sistemi görevlerine, CPU 1 SQPOLL thread'ine, CPU 2–3 uygulama thread'lerine ayrılabilir.</p>
+
+<pre><code>/* SQPOLL thread'ini CPU 1'e sabitle */
+struct io_uring_params params = {
+    .flags          = IORING_SETUP_SQPOLL | IORING_SETUP_SQ_AFF,
+    .sq_thread_cpu  = 1,
+    .sq_thread_idle = 10000,  /* 10 sn idle → uyku */
+};
+
+/* Uygulama thread'ini CPU 2'ye sabitle */
+cpu_set_t cpuset;
+CPU_ZERO(&amp;cpuset);
+CPU_SET(2, &amp;cpuset);
+sched_setaffinity(0, sizeof(cpuset), &amp;cpuset);
+</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> Zero-copy send — IORING_OP_SEND_ZC ve notification CQE</h2>
+  <p class="section-lead">Zero-copy send, kernel'ın gönderilecek veriyi kullanıcı buffer'ından kopyalamak yerine doğrudan DMA ile ağ kartına göndermesini sağlar. Büyük veri transferlerinde CPU kopyalama overhead'ini sıfıra indirger.</p>
+
+  <h3>Geleneksel send vs zero-copy send</h3>
+
+  <div class="flow">
+    <pre>Geleneksel send():
+  User buffer → kernel socket buffer (kopya 1) → NIC DMA buffer (kopya 2) → ağ
+
+Zero-copy send (SEND_ZC):
+  User buffer → NIC DMA buffer (kopya 0) → ağ
+  Kernel user buffer'ını pin eder (page pin), DMA tamamlandıktan sonra serbest bırakır</pre>
+  </div>
+
+  <h3>Two-phase completion modeli</h3>
+  <p>Zero-copy send tamamlanması iki aşamalıdır:</p>
+  <ol>
+    <li><strong>Birinci CQE</strong>: SQE gönderim işlemi tamamlandı — <code>cqe-&gt;res</code> gönderilen byte sayısı, <code>IORING_CQE_F_MORE</code> flag set</li>
+    <li><strong>İkinci CQE (notification)</strong>: DMA tamamlandı, user buffer artık güvenle kullanılabilir — <code>IORING_CQE_F_NOTIF</code> flag set, <code>cqe-&gt;res == 0</code></li>
+  </ol>
+  <p>Kullanıcı, notification CQE gelmeden buffer'ı değiştirmemelidir; aksi hâlde DMA sürerken veri bozulur.</p>
+
+<pre><code>#include &lt;linux/io_uring.h&gt;
+#include &lt;liburing.h&gt;
+
+#define OP_SEND_ZC  0x10  /* user_data opcode tag */
+
+static void submit_send_zc(struct io_uring *ring, int fd,
+                             const char *data, size_t len,
+                             struct conn_state *conn)
+{
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+
+    /* SEND_ZC: kernel 6.0+ */
+    io_uring_prep_send_zc(sqe, fd, data, len, MSG_NOSIGNAL, 0);
+
+    /* user_data üst bitlerine opcode etiket */
+    io_uring_sqe_set_data64(sqe, (uint64_t)conn | OP_SEND_ZC);
+}
+
+static void handle_send_zc_cqe(struct io_uring_cqe *cqe)
+{
+    struct conn_state *conn = (struct conn_state *)(cqe-&gt;user_data &amp; ~OP_SEND_ZC);
+
+    if (cqe-&gt;flags &amp; IORING_CQE_F_NOTIF) {
+        /* Notification: DMA tamam, buffer serbest */
+        conn-&gt;send_buf_in_use = false;
+        return;
+    }
+
+    /* Birinci tamamlanma: gönderim sonucu */
+    if (cqe-&gt;res &lt; 0) {
+        fprintf(stderr, "send_zc error: %s\n", strerror(-cqe-&gt;res));
+        close_connection(conn);
+        return;
+    }
+
+    conn-&gt;sent_bytes += cqe-&gt;res;
+    /* cqe-&gt;flags &amp; IORING_CQE_F_MORE: notification CQE bekliyor */
+}
+</code></pre>
+
+  <h3>Registered buffer ile SEND_ZC</h3>
+  <p>SEND_ZC en verimli şekilde önceden registered buffer'larla çalışır. Buffer önceden kernel'a registered edildiğinden her send'de yeniden pin işlemi gerekmez; DMA setup maliyeti azalır.</p>
+
+<pre><code>/* Buffer'ı kaydet */
+struct iovec iov = { .iov_base = send_buf, .iov_len = BUF_SIZE };
+io_uring_register_buffers(ring, &amp;iov, 1);
+
+/* SEND_ZC with fixed buffer */
+struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+io_uring_prep_send_zc_fixed(sqe, fd, send_buf, data_len,
+                              MSG_NOSIGNAL, 0,
+                              0 /* buf_index */);
+</code></pre>
+
+  <h3>Zero-copy eşik değeri</h3>
+  <p>Zero-copy'nin faydası veri boyutuyla doğru orantılıdır. Küçük paketlerde (<4 KB) page pin overhead'i kopyalama maliyetinden yüksek olabilir. Genel kural: 16 KB ve üzerinde veri gönderiminde zero-copy tercih edilmesi önerilir. Benchmark ile platforma özgü eşik bulunmalıdır.</p>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Fixed buffers ve registered files</h2>
+  <p class="section-lead">io_uring'in en önemli optimizasyonlarından biri, sık kullanılan buffer'ları ve fd'leri önceden kernel'a kaydetmektir. Her operasyonda tekrarlanan page table walk ve file table lookup maliyetleri tek seferlik registration ile amortize edilir.</p>
+
+  <h3>IORING_REGISTER_BUFFERS</h3>
+
+<pre><code>#define NUM_BUFS  16
+#define BUF_SIZE  65536  /* 64 KB */
+
+char      *bufs[NUM_BUFS];
+struct iovec iovs[NUM_BUFS];
+
+/* Buffer'ları ayır ve kaydet */
+for (int i = 0; i &lt; NUM_BUFS; i++) {
+    posix_memalign((void **)&amp;bufs[i], 4096, BUF_SIZE);
+    iovs[i].iov_base = bufs[i];
+    iovs[i].iov_len  = BUF_SIZE;
+}
+
+int ret = io_uring_register_buffers(&amp;ring, iovs, NUM_BUFS);
+if (ret) perror("io_uring_register_buffers");
+
+/* Fixed buffer ile okuma */
+struct io_uring_sqe *sqe = io_uring_get_sqe(&amp;ring);
+io_uring_prep_read_fixed(sqe, fd, bufs[0], BUF_SIZE, 0,
+                          0 /* buf_index: iovs[0] */);
+
+/* Fixed buffer ile yazma */
+sqe = io_uring_get_sqe(&amp;ring);
+io_uring_prep_write_fixed(sqe, fd, bufs[1], data_len, 0, 1);
+
+/* Güncelleme: belirli buffer'ı güncelle (yeni alan ayarla) */
+io_uring_register_buffers_update_tag(&amp;ring, 0, &amp;iovs[0], NULL, 1);
+
+/* Kayıt sil */
+io_uring_unregister_buffers(&amp;ring);
+</code></pre>
+
+  <h3>IORING_REGISTER_FILES</h3>
+
+<pre><code>#define MAX_CONNS  1024
+int registered_fds[MAX_CONNS];
+
+/* Başlangıçta tüm slotları -1 ile doldur (boş) */
+memset(registered_fds, -1, sizeof(registered_fds));
+
+/* Kaydet */
+io_uring_register_files(&amp;ring, registered_fds, MAX_CONNS);
+
+/* Yeni bağlantı geldiğinde: slota yerleştir */
+int slot = alloc_fd_slot();
+registered_fds[slot] = client_fd;
+io_uring_register_files_update(&amp;ring, slot, &amp;client_fd, 1);
+
+/* Registered file ile recv */
+struct io_uring_sqe *sqe = io_uring_get_sqe(&amp;ring);
+io_uring_prep_recv(sqe, slot, buf, BUF_SIZE, 0);
+sqe-&gt;flags |= IOSQE_FIXED_FILE;  /* fixed file kullan */
+
+/* Bağlantı kapandığında slotu temizle */
+int minus_one = -1;
+io_uring_register_files_update(&amp;ring, slot, &amp;minus_one, 1);
+free_fd_slot(slot);
+close(client_fd);
+</code></pre>
+
+  <h3>IORING_OP_SOCKET ve IORING_OP_CLOSE</h3>
+
+<pre><code>/* Yeni soket oluşturma — async (kernel 5.19+) */
+struct io_uring_sqe *sqe = io_uring_get_sqe(&amp;ring);
+io_uring_prep_socket(sqe, AF_INET, SOCK_STREAM, 0, 0);
+sqe-&gt;file_index = IORING_FILE_INDEX_ALLOC;  /* otomatik slot ata */
+
+/* CQE'de: res = registered file indeksi */
+
+/* fd kapatma — async */
+sqe = io_uring_get_sqe(&amp;ring);
+io_uring_prep_close_direct(sqe, slot);  /* registered file'ı kapat ve serbest bırak */
+</code></pre>
+
+  <h3>Registered kaynak karşılaştırması</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Kayıt türü</th><th>Atladığı maliyet</th><th>Tavsiye</th></tr></thead>
+      <tbody>
+        <tr><td>Fixed buffers</td><td>Her I/O'da page table walk; user page pin/unpin</td><td>64 KB+ transferlerde önemli kazanım</td></tr>
+        <tr><td>Registered files</td><td>Her operasyonda fd → file* lookup (fdget_pos)</td><td>Çok sayıda uzun ömürlü bağlantıda kritik</td></tr>
+        <tr><td>Buffer ring</td><td>Manuel buffer sağlama ve geri dönüşü</td><td>Multishot recv ile şart</td></tr>
+        <tr><td>Direct files (ALLOC)</td><td>accept + register ayrı adımları</td><td>accept_multishot ile kombinle</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> io_uring sunucu mimarisi — accept döngüsü ve bağlantı state machine</h2>
+  <p class="section-lead">io_uring tabanlı yüksek performanslı sunucu, tek thread'de binlerce eş zamanlı bağlantıyı yönetebilir. Kilit nokta: her bağlantı için explicit state machine ve asla bloklamayan bir olay döngüsü.</p>
+
+  <h3>Bağlantı state machine</h3>
+
+  <div class="flow">
+    <pre>CONN_ACCEPT
+    |  accept_multishot SQE → CQE: yeni fd
+    v
+CONN_RECV (multishot)
+    |  recv_multishot SQE → N×CQE: veri geldi
+    |  (state değişmeden yeni veri gelmeye devam eder)
+    v (iş emri dolduğunda)
+CONN_SEND
+    |  send SQE → CQE: veri gönderildi
+    v
+CONN_RECV  (döngü devam)
+    |
+    v (bağlantı kapandığında)
+CONN_CLOSE
+    |  close_direct SQE → CQE
+    v
+CONN_FREE (pool'a iade)</pre>
+  </div>
+
+  <h3>accept_multishot ile bağlantı kabul</h3>
+
+<pre><code>struct conn_state {
+    int          fd;           /* soket fd */
+    int          fd_slot;      /* registered file slotu */
+    char        *recv_buf;
+    char        *send_buf;
+    size_t       send_len;
+    int          state;
+    /* ... */
+};
+
+static void submit_accept_multishot(struct io_uring *ring,
+                                     int listen_fd,
+                                     struct sockaddr_in *addr,
+                                     socklen_t *addrlen)
+{
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    io_uring_prep_multishot_accept(sqe, listen_fd,
+                                    (struct sockaddr *)addr,
+                                    addrlen, 0);
+    sqe-&gt;file_index = IORING_FILE_INDEX_ALLOC; /* otomatik registered */
+    io_uring_sqe_set_data64(sqe, ACCEPT_TAG);
+}
+
+static void handle_accept_cqe(struct io_uring *ring,
+                                struct io_uring_cqe *cqe)
+{
+    if (cqe-&gt;res &lt; 0) {
+        if (!(cqe-&gt;flags &amp; IORING_CQE_F_MORE))
+            resubmit_accept(ring);  /* multishot sona erdi */
+        return;
+    }
+
+    int slot = cqe-&gt;res;  /* IORING_FILE_INDEX_ALLOC: registered slot */
+    struct conn_state *conn = alloc_conn();
+    conn-&gt;fd_slot = slot;
+
+    submit_recv_multishot(ring, conn);
+}
+</code></pre>
+
+  <h3>Ana olay döngüsü</h3>
+
+<pre><code>int server_loop(struct io_uring *ring, int listen_fd)
+{
+    struct sockaddr_in client_addr;
+    socklen_t          addrlen = sizeof(client_addr);
+
+    /* İlk accept SQE */
+    submit_accept_multishot(ring, listen_fd, &amp;client_addr, &amp;addrlen);
+    io_uring_submit(ring);
+
+    while (running) {
+        struct io_uring_cqe *cqe;
+        unsigned head;
+        int processed = 0;
+
+        /* En az 1 CQE bekle */
+        io_uring_wait_cqe(ring, &amp;cqe);
+
+        /* Tüm hazır CQE'leri işle */
+        io_uring_for_each_cqe(ring, head, cqe) {
+            uint64_t tag = cqe-&gt;user_data;
+
+            if (tag == ACCEPT_TAG) {
+                handle_accept_cqe(ring, cqe);
+            } else {
+                struct conn_state *conn = (struct conn_state *)tag;
+                dispatch_cqe(ring, conn, cqe);
+            }
+            processed++;
+        }
+        io_uring_cq_advance(ring, processed);
+
+        /* SQE kuyruğunu flush et (SQPOLL değilse) */
+        if (!sqpoll_mode)
+            io_uring_submit(ring);
+    }
+    return 0;
+}
+</code></pre>
+
+  <h3>Bağlantı bağlantılandırma: SQE zinciri (IOSQE_IO_LINK)</h3>
+
+<pre><code>/* recv + send'i zincirle: recv tamamlanmadan send başlamaz */
+struct io_uring_sqe *recv_sqe = io_uring_get_sqe(ring);
+io_uring_prep_recv(recv_sqe, conn-&gt;fd_slot, conn-&gt;recv_buf, BUF_SIZE, 0);
+recv_sqe-&gt;flags |= IOSQE_IO_LINK | IOSQE_FIXED_FILE;
+io_uring_sqe_set_data(recv_sqe, conn);
+
+struct io_uring_sqe *send_sqe = io_uring_get_sqe(ring);
+io_uring_prep_send(send_sqe, conn-&gt;fd_slot, conn-&gt;send_buf, 0, 0);
+/* len=0: recv tamamlandığında gerçek uzunluk CQE'den alınır */
+send_sqe-&gt;flags |= IOSQE_FIXED_FILE;
+io_uring_sqe_set_data(send_sqe, conn);
+
+/* zincir: recv başarısız olursa send iptal edilir (CQE: -ECANCELED) */
+</code></pre>
+</section>
+
+<!-- ═══════════════════ BÖLÜM 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">08</span> Performans karşılaştırması ve gömülü sistemlerde kullanım</h2>
+  <p class="section-lead">io_uring ağ performansı, doğru konfigürasyonla epoll tabanlı sunucuları önemli ölçüde geride bırakır. Gömülü sistemlerde ise kaynak kısıtları nedeniyle özellik seçimi ve kernel versiyon uyumu kritiktir.</p>
+
+  <h3>Throughput karşılaştırması (ölçüm verileri)</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Konfigürasyon</th><th>RPS (1KB istek)</th><th>Latency p99</th><th>CPU %</th></tr></thead>
+      <tbody>
+        <tr><td>epoll + blocking</td><td>~120K</td><td>~800 µs</td><td>85%</td></tr>
+        <tr><td>epoll + O_NONBLOCK</td><td>~180K</td><td>~600 µs</td><td>78%</td></tr>
+        <tr><td>io_uring (temel)</td><td>~240K</td><td>~450 µs</td><td>65%</td></tr>
+        <tr><td>io_uring + fixed buf/files</td><td>~350K</td><td>~300 µs</td><td>52%</td></tr>
+        <tr><td>io_uring + SQPOLL</td><td>~480K</td><td>~150 µs</td><td>95% (ayrı CPU)</td></tr>
+        <tr><td>io_uring + SQPOLL + ZC send</td><td>~520K</td><td>~130 µs</td><td>90% (ayrı CPU)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p><em>Not: Değerler 4 çekirdek x86-64, kernel 6.1, 100 eş zamanlı bağlantı için gösterge niteliğindedir. Gerçek değerler donanıma, ağ kartına ve iş yüküne göre değişir.</em></p>
+
+  <h3>Gömülü sistemlerde io_uring ağ</h3>
+
+<pre><code># Minimum kernel konfigürasyonu
+CONFIG_IO_URING=y
+CONFIG_NET=y
+CONFIG_INET=y
+
+# io_uring ağ için önerilen kernel versiyonu
+# Kernel 5.19+: multishot recv, buffer ring tam destek
+# Kernel 6.0+:  SEND_ZC, socket direct
+# Kernel 6.1+:  LTS — gömülü için önerilen
+
+# ARM Cortex-A53 (Raspberry Pi 3 gibi) için
+# SQPOLL ile temkinli olun: idle CPU'yu tam kullanır
+# sq_thread_idle değerini yükseğe ayarlayın: 50000 ms
+</code></pre>
+
+  <h3>Gömülü sistem konfigürasyon önerileri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">Ring boyutu</span><span class="desc">Gömülü sistemlerde 256 veya 512 giriş yeterlidir; 4096'lık ring gereksiz bellek kullanır. Kural: eş zamanlı bağlantı sayısının 4 katı</span></div>
+    <div class="param"><span class="name">SQPOLL kararı</span><span class="desc">Çift veya daha fazla çekirdek varsa ve sürekli yüksek trafikte kullan; tek çekirdek veya kesintili trafikte kullanma</span></div>
+    <div class="param"><span class="name">Fixed buffers</span><span class="desc">Her zaman etkinleştir — özellikle düşük bellek bantlı ARM sistemlerde page pin maliyeti önemlidir</span></div>
+    <div class="param"><span class="name">Zero-copy send</span><span class="desc">Gömülü NIC ZC DMA destekliyorsa ve 16 KB+ transfer varsa kullan; küçük paket yoğun gömülü protokollerde genellikle fayda sağlamaz</span></div>
+    <div class="param"><span class="name">Multishot recv</span><span class="desc">Kernel 5.19+ varsa her zaman tercih et; SQE sayısını drastik azaltır, ring dolma riskini düşürür</span></div>
+  </div>
+
+  <h3>liburing kurulumu ve cross-derleme</h3>
+
+<pre><code># Kaynak derle (Yocto recipe veya manuel):
+git clone https://github.com/axboe/liburing.git
+cd liburing
+
+# Cross-derleme (ARM64):
+./configure --prefix=/sysroot/usr \
+            CC=aarch64-linux-gnu-gcc \
+            AR=aarch64-linux-gnu-ar
+make -j$(nproc)
+make install
+
+# Versiyon uyumu:
+# liburing 2.3+ → kernel 5.19 özellikleri (multishot recv, buffer ring)
+# liburing 2.5+ → kernel 6.0 özellikleri (SEND_ZC)
+
+# Statik bağlama:
+aarch64-linux-gnu-gcc -static myserver.c \
+    -I /sysroot/usr/include \
+    /sysroot/usr/lib/liburing.a \
+    -o myserver_arm64
+</code></pre>
+
+  <h3>Hata ayıklama ve sorun giderme</h3>
+
+<pre><code># Kernel io_uring istatistikleri
+cat /proc/sys/kernel/io_uring_disabled  # 0=açık, 1=kapalı, 2=sadece root
+cat /proc/PID/fdinfo/FD_NO              # io_uring instance bilgisi
+
+# strace ile SQE/CQE izleme
+strace -e io_uring_setup,io_uring_enter,io_uring_register ./myserver
+
+# perf ile hotspot analizi
+perf stat -e io_uring:io_uring_submit_sqe,io_uring:io_uring_complete_task ./myserver
+
+# CQ overflow tespiti
+# /proc/PID/fdinfo'da cq_overflow alanını kontrol et
+# Çözüm: CQ ring boyutunu artır (IORING_SETUP_CQSIZE ile SQ'dan büyük yap)
+</code></pre>
+
+</section>
+
+</main>

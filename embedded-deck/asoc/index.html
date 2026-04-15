@@ -1,0 +1,908 @@
+---
+layout: tutorial
+title: "ASoC — ALSA System on Chip Ses Sürücüsü"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>SES ALT SİSTEMİ</span>
+    <span>2026</span>
+  </div>
+  <h1>ASoC<br><em>ALSA System on Chip Ses Sürücüsü</em></h1>
+  <p class="subtitle">Codec, platform ve machine üçlü mimarisini anlayarak gömülü Linux ses sürücüsü yaz; DAPM ile güç yönetimini uygula.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">ASoC neden var — ALSA ile farkı</a></li>
+    <li><a href="#s1">Codec sürücüsü</a></li>
+    <li><a href="#s2">Platform sürücüsü — I2S ve DMA</a></li>
+    <li><a href="#s3">Machine sürücüsü</a></li>
+    <li><a href="#s4">DAPM — Dynamic Audio Power Management</a></li>
+    <li><a href="#s5">Kontroller — kcontrol ve mixer</a></li>
+    <li><a href="#s6">Device Tree ASoC binding</a></li>
+    <li><a href="#s7">Gerçek dünya codec örnekleri</a></li>
+    <li><a href="#s8">Hata ayıklama</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> ASoC neden var — ALSA ile farkı</h2>
+  <p class="section-lead">Standart ALSA sürücüleri masaüstü ses kartları için tasarlanmıştır; gömülü SoC'larda bulunan codec + I2S + DMA üçlüsünü yönetmek için ASoC katmanı geliştirilmiştir.</p>
+
+  <h3>Standart ALSA'nın yetersiz kaldığı noktalar</h3>
+  <p>Klasik ALSA modeli, ses donanımını tek bir monolitik sürücü olarak ele alır. Gömülü sistemlerde ise ses alt sistemi en az üç ayrı donanım parçasından oluşur:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Codec</span><span class="desc">Analog/dijital dönüşüm, mikrofon preamp, DAC/ADC — genellikle ayrı bir I2C/SPI aygıtı (WM8960, ES8316 vb.)</span></div>
+    <div class="param"><span class="name">Platform (SoC I2S/PCM)</span><span class="desc">SoC içindeki dijital ses arayüzü ve DMA motoru — Raspberry Pi SAI, i.MX SAI, Allwinner DAI vb.</span></div>
+    <div class="param"><span class="name">Machine</span><span class="desc">Codec ile platform'u birbirine bağlayan, kart/board özgü yapıştırıcı kod — GPIO, mclk kaynağı, enerji sıralaması</span></div>
+  </div>
+
+  <p>Standart ALSA'da bu üçü tek sürücüde birleşirdi; codec değiştiğinde tüm sürücü yeniden yazılırdı. ASoC, her parçayı ayrı bir modül olarak kayıt ettirir ve bunları <strong>dai_link</strong> üzerinden çalışma zamanında birleştirir.</p>
+
+  <div class="flow">
+    <pre>
+Kullanıcı alanı (ALSA lib, PulseAudio, PipeWire)
+         |
+    ALSA core (PCM, mixer, control)
+         |
+   ┌─────┴──────┐
+   ASoC core
+   ├── Codec sürücüsü   (snd_soc_codec_driver)
+   ├── Platform sürücüsü (snd_soc_component_driver + DMA)
+   └── Machine sürücüsü (snd_soc_card + dai_link)
+    </pre>
+  </div>
+
+  <h3>ALSA vs ASoC — temel farklar</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Özellik</th><th>Klasik ALSA</th><th>ASoC</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Sürücü yapısı</td><td>Tek monolitik sürücü</td><td>Codec + Platform + Machine üçlüsü</td></tr>
+        <tr><td>Güç yönetimi</td><td>Manuel suspend/resume</td><td>DAPM — widget bazlı otomatik</td></tr>
+        <tr><td>Codec yeniden kullanımı</td><td>Yok — board bağımlı</td><td>Tam — codec sürücüsü boarddan bağımsız</td></tr>
+        <tr><td>Çoklu codec</td><td>Çok zor</td><td>dai_link listesiyle doğal destek</td></tr>
+        <tr><td>DMA entegrasyonu</td><td>Sürücü içinde elle yazılır</td><td>dmaengine_pcm ile generic altyapı</td></tr>
+        <tr><td>Device Tree</td><td>Kısmi</td><td>audio-graph-card / simple-audio-card ile tam DT desteği</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Kaynak kodun dizin yapısı</h3>
+  <pre><code>sound/
+├── core/          # ALSA core — PCM, control, timer
+├── soc/           # ASoC framework
+│   ├── soc-core.c         # snd_soc_register_card vb.
+│   ├── soc-dapm.c         # DAPM motoru
+│   ├── soc-pcm.c          # PCM ops köprüsü
+│   ├── codecs/            # WM8960, ES8316, TLV320AIC3x ...
+│   ├── generic/           # simple-audio-card, audio-graph-card
+│   └── &lt;platform&gt;/       # imx/, rockchip/, bcm/ ...
+└── drivers/       # USB ses, HDMI ses vb.</code></pre>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> Codec sürücüsü</h2>
+  <p class="section-lead">Codec sürücüsü, DAC/ADC ve kayıt defterlerini yöneten bileşendir; <code>snd_soc_component_driver</code> ve <code>snd_soc_dai_driver</code> ile çekirdeğe kaydedilir.</p>
+
+  <h3>Temel veri yapıları</h3>
+  <p>Çekirdek 5.x'ten itibaren <code>snd_soc_codec</code> kaldırılmış, yerini <code>snd_soc_component</code> almıştır. Her codec sürücüsü iki ana yapı tanımlar:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">snd_soc_component_driver</span><span class="desc">DAPM widget'ları, route'ları, kcontrol listesi, set_sysclk/set_pll gibi clock callback'leri barındırır</span></div>
+    <div class="param"><span class="name">snd_soc_dai_driver</span><span class="desc">DAI (Digital Audio Interface) yeteneklerini — format (I2S, DSP_A), hız, kanal sayısı, ops callback'leri — bildirir</span></div>
+  </div>
+
+  <pre><code>/* include/sound/soc.h'den özet */
+struct snd_soc_component_driver {
+    const char *name;
+
+    /* DAPM */
+    const struct snd_soc_dapm_widget  *dapm_widgets;
+    int                                num_dapm_widgets;
+    const struct snd_soc_dapm_route   *dapm_routes;
+    int                                num_dapm_routes;
+
+    /* Kontroller */
+    const struct snd_kcontrol_new     *controls;
+    int                                num_controls;
+
+    /* Callbacks */
+    int  (*probe)  (struct snd_soc_component *);
+    void (*remove) (struct snd_soc_component *);
+    int  (*set_sysclk)(struct snd_soc_component *, int clk_id,
+                       int source, unsigned int freq, int dir);
+    int  (*set_pll)   (struct snd_soc_component *, int pll_id,
+                       int source, unsigned int freq_in,
+                       unsigned int freq_out);
+
+    /* Kayıt defteri */
+    bool (*readable_register)  (struct device *, unsigned int);
+    bool (*writeable_register) (struct device *, unsigned int);
+    bool (*volatile_register)  (struct device *, unsigned int);
+};
+
+struct snd_soc_dai_driver {
+    const char *name;
+    struct snd_soc_dai_ops  ops;         /* hw_params, set_fmt, trigger ... */
+    struct snd_soc_pcm_stream playback;  /* rate, formats, channels */
+    struct snd_soc_pcm_stream capture;
+};</code></pre>
+
+  <h3>Minimal codec sürücüsü iskeleti</h3>
+  <pre><code>#include &lt;linux/module.h&gt;
+#include &lt;linux/i2c.h&gt;
+#include &lt;linux/regmap.h&gt;
+#include &lt;sound/soc.h&gt;
+
+#define MYCODEC_REG_CTRL  0x00
+#define MYCODEC_REG_VOL   0x01
+
+static const struct regmap_config mycodec_regmap = {
+    .reg_bits  = 8,
+    .val_bits  = 8,
+    .max_register = 0x1F,
+};
+
+/* DAI ops ---------------------------------------------------------- */
+static int mycodec_hw_params(struct snd_pcm_substream *substream,
+                              struct snd_pcm_hw_params *params,
+                              struct snd_soc_dai *dai)
+{
+    struct snd_soc_component *component = dai-&gt;component;
+    unsigned int rate = params_rate(params);
+    /* Codec PLL / MCLK oranı burada ayarlanır */
+    dev_dbg(component-&gt;dev, "hw_params: %u Hz\n", rate);
+    return 0;
+}
+
+static int mycodec_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
+{
+    /* I2S / LJ / RJ / DSP format seçimi */
+    switch (fmt &amp; SND_SOC_DAIFMT_FORMAT_MASK) {
+    case SND_SOC_DAIFMT_I2S:
+        /* I2S bit pattern yaz */
+        break;
+    default:
+        return -EINVAL;
+    }
+    return 0;
+}
+
+static const struct snd_soc_dai_ops mycodec_dai_ops = {
+    .hw_params = mycodec_hw_params,
+    .set_fmt   = mycodec_set_fmt,
+};
+
+/* DAI sürücüsü ------------------------------------------------------ */
+static struct snd_soc_dai_driver mycodec_dai = {
+    .name = "mycodec-hifi",
+    .playback = {
+        .stream_name  = "Playback",
+        .channels_min = 1,
+        .channels_max = 2,
+        .rates        = SNDRV_PCM_RATE_8000_192000,
+        .formats      = SNDRV_PCM_FMTBIT_S16_LE |
+                        SNDRV_PCM_FMTBIT_S24_LE,
+    },
+    .capture = {
+        .stream_name  = "Capture",
+        .channels_min = 1,
+        .channels_max = 2,
+        .rates        = SNDRV_PCM_RATE_8000_48000,
+        .formats      = SNDRV_PCM_FMTBIT_S16_LE,
+    },
+    .ops = &amp;mycodec_dai_ops,
+};
+
+/* Component sürücüsü ------------------------------------------------ */
+static const struct snd_soc_component_driver mycodec_component = {
+    .name = "mycodec",
+    /* DAPM widget/route ve kontroller sonraki bölümlerde eklenir */
+};
+
+/* I2C probe --------------------------------------------------------- */
+static int mycodec_i2c_probe(struct i2c_client *client)
+{
+    struct regmap *regmap;
+
+    regmap = devm_regmap_init_i2c(client, &amp;mycodec_regmap);
+    if (IS_ERR(regmap))
+        return PTR_ERR(regmap);
+
+    return devm_snd_soc_register_component(&amp;client-&gt;dev,
+                                           &amp;mycodec_component,
+                                           &amp;mycodec_dai, 1);
+}
+
+static const struct of_device_id mycodec_of_match[] = {
+    { .compatible = "myvendor,mycodec" },
+    {}
+};
+MODULE_DEVICE_TABLE(of, mycodec_of_match);
+
+static struct i2c_driver mycodec_driver = {
+    .driver = {
+        .name           = "mycodec",
+        .of_match_table = mycodec_of_match,
+    },
+    .probe = mycodec_i2c_probe,
+};
+module_i2c_driver(mycodec_driver);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Örnek ASoC Codec Sürücüsü");</code></pre>
+
+  <h3>Kayıt defteri erişimi — regmap</h3>
+  <p>Codec kayıtlarına doğrudan i2c_smbus_* yerine <strong>regmap</strong> API'si kullanılır. Bu sayede önbellek, bulk-read, bit-field güncelleme otomatik yapılır:</p>
+  <pre><code>/* Tek kayıt yaz */
+regmap_write(regmap, MYCODEC_REG_VOL, 0xB0);
+
+/* Bit alanı güncelle (diğer bitlere dokunma) */
+regmap_update_bits(regmap, MYCODEC_REG_CTRL,
+                   BIT(3) | BIT(2),   /* mask */
+                   BIT(3));            /* value */
+
+/* Oku */
+unsigned int val;
+regmap_read(regmap, MYCODEC_REG_VOL, &amp;val);</code></pre>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> Platform sürücüsü — I2S ve DMA</h2>
+  <p class="section-lead">Platform sürücüsü, SoC'un dijital ses arayüzünü (I2S, PCM, SAI) ve DMA motorunu yönetir; <code>snd_soc_component_driver</code> ve <code>snd_dmaengine_pcm</code> altyapısıyla kaydedilir.</p>
+
+  <h3>Temel görevler</h3>
+  <div class="params">
+    <div class="param"><span class="name">I2S / SAI donanımı</span><span class="desc">Bit clock (BCLK), frame sync (LRCLK), MCLK üretimi; TX/RX FIFO yönetimi</span></div>
+    <div class="param"><span class="name">DMA kanalı</span><span class="desc">Ses tamponunu FIFO'ya (playback) veya FIFO'dan belleğe (capture) DMA ile aktarma</span></div>
+    <div class="param"><span class="name">PCM ops</span><span class="desc">open/close/hw_params/prepare/trigger/pointer callback'leri — ALSA PCM makinesiyle konuşur</span></div>
+  </div>
+
+  <h3>dmaengine_pcm ile generic platform sürücüsü</h3>
+  <p>Çoğu modern SoC, özel bir PCM sürücüsü yazmak yerine <code>devm_snd_dmaengine_pcm_register()</code> ile hazır altyapıyı kullanır:</p>
+
+  <pre><code>#include &lt;linux/module.h&gt;
+#include &lt;linux/platform_device.h&gt;
+#include &lt;linux/clk.h&gt;
+#include &lt;linux/dmaengine.h&gt;
+#include &lt;sound/dmaengine_pcm.h&gt;
+#include &lt;sound/soc.h&gt;
+
+struct myplat_priv {
+    void __iomem   *base;
+    struct clk     *mclk;
+    struct clk     *bclk;
+    /* tx/rx DMA kanalı bilgisi */
+    struct snd_dmaengine_dai_dma_data tx_dma_data;
+    struct snd_dmaengine_dai_dma_data rx_dma_data;
+};
+
+static int myplat_dai_hw_params(struct snd_pcm_substream *substream,
+                                 struct snd_pcm_hw_params *params,
+                                 struct snd_soc_dai *dai)
+{
+    struct myplat_priv *priv = snd_soc_dai_get_drvdata(dai);
+    unsigned int rate    = params_rate(params);
+    unsigned int bclk_hz = rate * params_channels(params) *
+                           params_physical_width(params);
+
+    /* BCLK frekansını ayarla */
+    clk_set_rate(priv-&gt;bclk, bclk_hz);
+
+    /* I2S donanım kayıtlarını yapılandır */
+    /* writel(I2S_CTRL_ENABLE | fmt_bits, priv-&gt;base + I2S_CTRL); */
+    return 0;
+}
+
+static int myplat_dai_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
+{
+    /* master/slave, I2S/LJ seçimi */
+    return 0;
+}
+
+static const struct snd_soc_dai_ops myplat_dai_ops = {
+    .hw_params = myplat_dai_hw_params,
+    .set_fmt   = myplat_dai_set_fmt,
+};
+
+static struct snd_soc_dai_driver myplat_dai_drv = {
+    .name = "myplat-i2s",
+    .playback = {
+        .stream_name  = "Playback",
+        .channels_min = 1, .channels_max = 8,
+        .rates        = SNDRV_PCM_RATE_8000_192000,
+        .formats      = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S32_LE,
+    },
+    .capture = {
+        .stream_name  = "Capture",
+        .channels_min = 1, .channels_max = 2,
+        .rates        = SNDRV_PCM_RATE_8000_48000,
+        .formats      = SNDRV_PCM_FMTBIT_S16_LE,
+    },
+    .ops = &amp;myplat_dai_ops,
+};
+
+static const struct snd_soc_component_driver myplat_component = {
+    .name = "myplat-i2s",
+};
+
+static const struct snd_dmaengine_pcm_config myplat_dmaengine_cfg = {
+    .prepare_slave_config = snd_dmaengine_pcm_prepare_slave_config,
+};
+
+static int myplat_probe(struct platform_device *pdev)
+{
+    struct myplat_priv *priv;
+    struct resource *res;
+    int ret;
+
+    priv = devm_kzalloc(&amp;pdev-&gt;dev, sizeof(*priv), GFP_KERNEL);
+    if (!priv)
+        return -ENOMEM;
+
+    res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+    priv-&gt;base = devm_ioremap_resource(&amp;pdev-&gt;dev, res);
+    if (IS_ERR(priv-&gt;base))
+        return PTR_ERR(priv-&gt;base);
+
+    priv-&gt;mclk = devm_clk_get(&amp;pdev-&gt;dev, "mclk");
+    priv-&gt;bclk = devm_clk_get(&amp;pdev-&gt;dev, "bclk");
+
+    /* DMA adres bilgisi — FIFO TX/RX adresi */
+    priv-&gt;tx_dma_data.addr        = res-&gt;start + I2S_TX_FIFO;
+    priv-&gt;tx_dma_data.addr_width  = DMA_SLAVE_BUSWIDTH_4_BYTES;
+    priv-&gt;tx_dma_data.maxburst    = 16;
+    priv-&gt;rx_dma_data.addr        = res-&gt;start + I2S_RX_FIFO;
+    priv-&gt;rx_dma_data.addr_width  = DMA_SLAVE_BUSWIDTH_4_BYTES;
+    priv-&gt;rx_dma_data.maxburst    = 16;
+
+    platform_set_drvdata(pdev, priv);
+
+    ret = devm_snd_soc_register_component(&amp;pdev-&gt;dev,
+                                          &amp;myplat_component,
+                                          &amp;myplat_dai_drv, 1);
+    if (ret)
+        return ret;
+
+    return devm_snd_dmaengine_pcm_register(&amp;pdev-&gt;dev,
+                                           &amp;myplat_dmaengine_cfg, 0);
+}
+
+static const struct of_device_id myplat_of_match[] = {
+    { .compatible = "myvendor,myplat-i2s" },
+    {}
+};
+MODULE_DEVICE_TABLE(of, myplat_of_match);
+
+static struct platform_driver myplat_driver = {
+    .driver = { .name = "myplat-i2s", .of_match_table = myplat_of_match },
+    .probe  = myplat_probe,
+};
+module_platform_driver(myplat_driver);</code></pre>
+
+  <h3>DMA tampon parametreleri</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Parametre</th><th>Açıklama</th><th>Tipik değer</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>buffer_bytes_max</td><td>DMA tamponunun azami boyutu</td><td>512 KB – 4 MB</td></tr>
+        <tr><td>period_bytes_min</td><td>Tek DMA aktarımının asgari boyutu</td><td>256 B</td></tr>
+        <tr><td>period_bytes_max</td><td>Tek DMA aktarımının azami boyutu</td><td>64 KB</td></tr>
+        <tr><td>periods_min</td><td>En az kaç dönem (kesme) olacağı</td><td>2</td></tr>
+        <tr><td>periods_max</td><td>En fazla dönem sayısı</td><td>128</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> Machine sürücüsü</h2>
+  <p class="section-lead">Machine sürücüsü, codec ve platform bileşenlerini bir <code>snd_soc_card</code> altında <code>dai_link</code> dizisiyle birleştiren, board özgü yapıştırıcı katmandır.</p>
+
+  <h3>snd_soc_card ve dai_link</h3>
+  <pre><code>#include &lt;linux/module.h&gt;
+#include &lt;linux/platform_device.h&gt;
+#include &lt;sound/soc.h&gt;
+
+/* dai_link ops: format, saatin kaynağı vb. */
+static int myboard_hw_params(struct snd_pcm_substream *substream,
+                              struct snd_pcm_hw_params *params)
+{
+    struct snd_soc_pcm_runtime *rtd    = substream-&gt;private_data;
+    struct snd_soc_dai         *cpu_dai   = asoc_rtd_to_cpu(rtd, 0);
+    struct snd_soc_dai         *codec_dai = asoc_rtd_to_codec(rtd, 0);
+    unsigned int mclk = 12288000; /* 256 * 48000 */
+
+    /* Codec MCLK'ını ayarla */
+    int ret = snd_soc_dai_set_sysclk(codec_dai, 0, mclk, SND_SOC_CLOCK_IN);
+    if (ret)
+        return ret;
+
+    /* CPU DAI formatı: I2S, codec is master */
+    ret = snd_soc_dai_set_fmt(cpu_dai,
+              SND_SOC_DAIFMT_I2S         |
+              SND_SOC_DAIFMT_NB_NF       |
+              SND_SOC_DAIFMT_CBP_CFP);   /* codec BCLK+FS üretiyor */
+    if (ret)
+        return ret;
+
+    return snd_soc_dai_set_fmt(codec_dai,
+              SND_SOC_DAIFMT_I2S         |
+              SND_SOC_DAIFMT_NB_NF       |
+              SND_SOC_DAIFMT_CBP_CFP);
+}
+
+static const struct snd_soc_ops myboard_ops = {
+    .hw_params = myboard_hw_params,
+};
+
+SND_SOC_DAILINK_DEFS(hifi,
+    DAILINK_COMP_ARRAY(COMP_CPU("myplat-i2s")),
+    DAILINK_COMP_ARRAY(COMP_CODEC("mycodec.1-001a", "mycodec-hifi")),
+    DAILINK_COMP_ARRAY(COMP_PLATFORM("myplat-i2s")));
+
+static struct snd_soc_dai_link myboard_dai_links[] = {
+    {
+        .name         = "MyBoard HiFi",
+        .stream_name  = "HiFi",
+        .ops          = &amp;myboard_ops,
+        SND_SOC_DAILINK_REG(hifi),
+    },
+};
+
+static struct snd_soc_card myboard_card = {
+    .name      = "MyBoard",
+    .owner     = THIS_MODULE,
+    .dai_link  = myboard_dai_links,
+    .num_links = ARRAY_SIZE(myboard_dai_links),
+};
+
+static int myboard_probe(struct platform_device *pdev)
+{
+    myboard_card.dev = &amp;pdev-&gt;dev;
+    return devm_snd_soc_register_card(&amp;pdev-&gt;dev, &amp;myboard_card);
+}
+
+static const struct of_device_id myboard_of_match[] = {
+    { .compatible = "myvendor,myboard-audio" },
+    {}
+};
+
+static struct platform_driver myboard_driver = {
+    .driver = { .name = "myboard-audio", .of_match_table = myboard_of_match },
+    .probe  = myboard_probe,
+};
+module_platform_driver(myboard_driver);</code></pre>
+
+  <h3>DAIFMT sabitleri</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Sabit</th><th>Anlamı</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>SND_SOC_DAIFMT_I2S</td><td>Standart I2S — 1 BCLK gecikmeli, simetrik</td></tr>
+        <tr><td>SND_SOC_DAIFMT_LEFT_J</td><td>Left Justified — gecikmesiz, MSB önce</td></tr>
+        <tr><td>SND_SOC_DAIFMT_DSP_A</td><td>PCM/TDM — tek LRCLK darbesi, A modu</td></tr>
+        <tr><td>SND_SOC_DAIFMT_CBP_CFP</td><td>Codec = BCLK üretici &amp; FS üretici (master)</td></tr>
+        <tr><td>SND_SOC_DAIFMT_CBC_CFC</td><td>CPU = BCLK üretici &amp; FS üretici (CPU master)</td></tr>
+        <tr><td>SND_SOC_DAIFMT_NB_NF</td><td>Normal BCLK polarity, Normal Frame polarity</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> DAPM — Dynamic Audio Power Management</h2>
+  <p class="section-lead">DAPM, ses sinyali akışını bir yönlü çizge (directed graph) olarak modelleyerek yalnızca aktif yollar üzerindeki bileşenlere güç uygular; güç durumu değişiklikleri tamamen otomatiktir.</p>
+
+  <h3>DAPM çizge modeli</h3>
+  <div class="flow">
+    <pre>
+[Mikrofon] --&gt; [MIC PGA] --&gt; [ADC] --&gt; [AIF TX] --&gt; CPU Capture
+CPU Playback --&gt; [AIF RX] --&gt; [DAC] --&gt; [HP Mixer] --&gt; [HP PGA] --&gt; [Kulaklık]
+                                     +--&gt; [SPK Mixer] --&gt; [SPK PGA] --&gt; [Hoparlör]
+    </pre>
+  </div>
+
+  <h3>Widget türleri</h3>
+  <div class="params">
+    <div class="param"><span class="name">SND_SOC_DAPM_INPUT / OUTPUT</span><span class="desc">Fiziksel pin — mikrofon, hoparlör, hat girişi/çıkışı</span></div>
+    <div class="param"><span class="name">SND_SOC_DAPM_PGA</span><span class="desc">Programmable Gain Amplifier — tek girişli yükselteç</span></div>
+    <div class="param"><span class="name">SND_SOC_DAPM_MIXER</span><span class="desc">Çok girişli karıştırıcı — her giriş için bir kontrol biti</span></div>
+    <div class="param"><span class="name">SND_SOC_DAPM_MUX</span><span class="desc">Çoktan-bire seçici — enum kontrol</span></div>
+    <div class="param"><span class="name">SND_SOC_DAPM_ADC / DAC</span><span class="desc">Analog-dijital / Dijital-analog dönüştürücü bloğu</span></div>
+    <div class="param"><span class="name">SND_SOC_DAPM_AIF_IN / AIF_OUT</span><span class="desc">Dijital ses arayüzü giriş/çıkışı — CPU ile codec arasındaki köprü</span></div>
+    <div class="param"><span class="name">SND_SOC_DAPM_SUPPLY</span><span class="desc">Güç kaynağı — aktif yol varsa otomatik enable, yoksa disable</span></div>
+    <div class="param"><span class="name">SND_SOC_DAPM_REGULATOR_SUPPLY</span><span class="desc">Regülatör beslemesi — DAPM tarafından açılıp kapatılır</span></div>
+  </div>
+
+  <h3>Widget ve route tanımı</h3>
+  <pre><code>/* Codec sürücüsü içinde */
+static const struct snd_soc_dapm_widget mycodec_dapm_widgets[] = {
+    /* Fiziksel pinler */
+    SND_SOC_DAPM_INPUT("MICIN"),
+    SND_SOC_DAPM_OUTPUT("HPOUT"),
+    SND_SOC_DAPM_OUTPUT("SPKOUT"),
+
+    /* ADC / DAC blokları */
+    SND_SOC_DAPM_ADC("ADC", "Capture",  MYCODEC_REG_PWR, 3, 0),
+    SND_SOC_DAPM_DAC("DAC", "Playback", MYCODEC_REG_PWR, 2, 0),
+
+    /* Yükselteçler */
+    SND_SOC_DAPM_PGA("HP PGA",  MYCODEC_REG_OUT, 7, 0, NULL, 0),
+    SND_SOC_DAPM_PGA("MIC PGA", MYCODEC_REG_IN,  7, 0, NULL, 0),
+
+    /* Mixer — birden fazla giriş */
+    SND_SOC_DAPM_MIXER("HP Mixer", SND_SOC_NOPM, 0, 0,
+                        hp_mixer_controls,
+                        ARRAY_SIZE(hp_mixer_controls)),
+
+    /* Dijital ses arayüzü */
+    SND_SOC_DAPM_AIF_IN("AIF RX",  "Playback", 0, SND_SOC_NOPM, 0, 0),
+    SND_SOC_DAPM_AIF_OUT("AIF TX", "Capture",  0, SND_SOC_NOPM, 0, 0),
+};
+
+/* Route tablosu: { "Hedef widget", "Hedef kontrol (NULL=direkt)", "Kaynak widget" } */
+static const struct snd_soc_dapm_route mycodec_dapm_routes[] = {
+    /* Capture yolu */
+    { "MIC PGA",  NULL,    "MICIN"   },
+    { "ADC",      NULL,    "MIC PGA" },
+    { "AIF TX",   NULL,    "ADC"     },
+
+    /* Playback yolu */
+    { "AIF RX",   NULL,    "DAC"     },  /* DAI &lt;-&gt; DAC */
+    { "DAC",      NULL,    "AIF RX"  },
+    { "HP Mixer", "DAC Switch", "DAC" },
+    { "HP PGA",   NULL,    "HP Mixer"},
+    { "HPOUT",    NULL,    "HP PGA"  },
+};</code></pre>
+
+  <h3>DAPM tetikleme mekanizması</h3>
+  <p>Uygulama <code>snd_pcm_start()</code> çağırdığında ASoC çekirdeği aktif akış yollarını hesaplar, yol üzerindeki her widget'ın güç bitini sırayla yazar. Uygulama durdurduğunda aynı işlem ters sırayla gerçekleşir. Geliştiricinin güç yönetimi kodu yazmasına gerek yoktur.</p>
+
+  <pre><code>/* Manuel DAPM olayı — nadir durumlarda */
+snd_soc_dapm_force_enable_pin(dapm, "HP PGA");
+snd_soc_dapm_sync(dapm);
+
+/* Pin durumu sorgula */
+int active = snd_soc_dapm_get_pin_status(dapm, "HPOUT");</code></pre>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> Kontroller — kcontrol ve mixer</h2>
+  <p class="section-lead">ALSA kontrolleri, kullanıcı alanındaki <code>amixer</code> ve ses sunucularının ses düzeyi, EQ, route seçimi gibi parametreleri okumasını/yazmasını sağlar; ASoC'ta <code>snd_kcontrol_new</code> makrolarıyla tanımlanır.</p>
+
+  <h3>Hazır kontrol makroları</h3>
+  <pre><code>/* SOC_SINGLE: tek kayıt, tek bit alanı */
+SOC_SINGLE("Headphone Volume",
+           MYCODEC_REG_VOL,  /* kayıt adresi */
+           0,                 /* shift */
+           63,                /* max değer */
+           0)                 /* invert */
+
+/* SOC_DOUBLE_R: sol/sağ kanal için ayrı kayıtlar */
+SOC_DOUBLE_R("PCM Playback Volume",
+             MYCODEC_REG_DACL, MYCODEC_REG_DACR,
+             0, 255, 0)
+
+/* SOC_ENUM_SINGLE: kayıt içinde enum seçimi */
+static const char * const mycodec_deemph_text[] = {
+    "None", "32kHz", "44.1kHz", "48kHz"
+};
+static SOC_ENUM_SINGLE_DECL(mycodec_deemph_enum,
+                             MYCODEC_REG_CTRL, 1,
+                             mycodec_deemph_text);
+SOC_ENUM("De-Emphasis", mycodec_deemph_enum)</code></pre>
+
+  <h3>Özel get/put callback'li kontrol</h3>
+  <pre><code>static int mycodec_vol_get(struct snd_kcontrol *kcontrol,
+                            struct snd_ctl_elem_value *ucontrol)
+{
+    struct snd_soc_component *component =
+        snd_soc_kcontrol_component(kcontrol);
+    unsigned int val;
+    regmap_read(component-&gt;regmap, MYCODEC_REG_VOL, &amp;val);
+    ucontrol-&gt;value.integer.value[0] = val &amp; 0x3F;
+    return 0;
+}
+
+static int mycodec_vol_put(struct snd_kcontrol *kcontrol,
+                            struct snd_ctl_elem_value *ucontrol)
+{
+    struct snd_soc_component *component =
+        snd_soc_kcontrol_component(kcontrol);
+    long vol = ucontrol-&gt;value.integer.value[0];
+    regmap_write(component-&gt;regmap, MYCODEC_REG_VOL, (unsigned int)vol);
+    return 0;
+}
+
+static const struct snd_kcontrol_new mycodec_controls[] = {
+    SOC_SINGLE_EXT("Custom Volume", 0, 0, 63, 0,
+                   mycodec_vol_get, mycodec_vol_put),
+};</code></pre>
+
+  <h3>DAPM içi mixer kontrol örneği</h3>
+  <pre><code>static const struct snd_kcontrol_new hp_mixer_controls[] = {
+    SOC_DAPM_SINGLE("DAC Switch",    MYCODEC_REG_HPMIX, 0, 1, 0),
+    SOC_DAPM_SINGLE("Line-In Switch",MYCODEC_REG_HPMIX, 1, 1, 0),
+};</code></pre>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> Device Tree ASoC binding</h2>
+  <p class="section-lead">Device Tree, codec ve platform düğümlerini tanımlar; <code>simple-audio-card</code> veya <code>audio-graph-card</code> ile machine sürücüsü yazmadan ses kartı oluşturulabilir.</p>
+
+  <h3>simple-audio-card</h3>
+  <p>Tek bir DAI link'e sahip basit boardlar için en uygun yaklaşım. Machine sürücüsü yazmaya gerek yoktur; kernel genelindeki <code>simple-audio-card</code> sürücüsü DT'yi okuyarak kartı oluşturur.</p>
+
+  <pre><code>/* board.dts */
+/ {
+    sound {
+        compatible = "simple-audio-card";
+        simple-audio-card,name = "MyBoard-Audio";
+        simple-audio-card,format = "i2s";
+        simple-audio-card,mclk-fs = &lt;256&gt;;
+
+        simple-audio-card,cpu {
+            sound-dai = &lt;&amp;sai1&gt;;        /* platform DAI */
+        };
+
+        simple-audio-card,codec {
+            sound-dai = &lt;&amp;wm8960&gt;;      /* codec DAI */
+            clocks    = &lt;&amp;mclk&gt;;
+        };
+    };
+
+    /* I2C üzerindeki codec */
+    &amp;i2c1 {
+        wm8960: audio-codec@1a {
+            compatible   = "wlf,wm8960";
+            reg          = &lt;0x1a&gt;;
+            #sound-dai-cells = &lt;0&gt;;
+            clocks       = &lt;&amp;mclk&gt;;
+            clock-names  = "mclk";
+            wlf,shared-lrclk;
+        };
+    };
+
+    /* SoC SAI (I2S) bloku */
+    &amp;sai1 {
+        status = "okay";
+        #sound-dai-cells = &lt;0&gt;;
+        pinctrl-names = "default";
+        pinctrl-0 = &lt;&amp;pinctrl_sai1&gt;;
+    };
+};</code></pre>
+
+  <h3>audio-graph-card</h3>
+  <p>Birden fazla codec veya karmaşık routing söz konusu olduğunda <code>audio-graph-card</code> tercih edilir. Bağlantılar <code>port</code> / <code>endpoint</code> düğümleriyle graf olarak tanımlanır:</p>
+
+  <pre><code>/ {
+    sound {
+        compatible = "audio-graph-card";
+        label = "MyBoard-Multi";
+        dais = &lt;&amp;sai1_port&gt;;   /* CPU tarafı portları */
+    };
+
+    &amp;sai1 {
+        #sound-dai-cells = &lt;0&gt;;
+        sai1_port: port {
+            sai1_endpoint: endpoint {
+                remote-endpoint = &lt;&amp;codec_endpoint&gt;;
+                dai-format = "i2s";
+                bitclock-master;
+                frame-master;
+            };
+        };
+    };
+
+    &amp;i2c1 {
+        es8316: audio-codec@11 {
+            compatible = "everest,es8316";
+            reg = &lt;0x11&gt;;
+            #sound-dai-cells = &lt;0&gt;;
+            port {
+                codec_endpoint: endpoint {
+                    remote-endpoint = &lt;&amp;sai1_endpoint&gt;;
+                };
+            };
+        };
+    };
+};</code></pre>
+
+  <h3>sound-dai-cells</h3>
+  <div class="params">
+    <div class="param"><span class="name">#sound-dai-cells = &lt;0&gt;</span><span class="desc">Codec tek bir DAI sunuyor — phandle'a argüman eklenmez</span></div>
+    <div class="param"><span class="name">#sound-dai-cells = &lt;1&gt;</span><span class="desc">Birden fazla DAI (örn. HDMI + analog) — hangi DAI'nin kullanılacağı sayısal argümanla belirtilir</span></div>
+  </div>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> Gerçek dünya codec örnekleri</h2>
+  <p class="section-lead">WM8960, ES8316 ve TLV320AIC3x, gömülü Linux projelerinde en sık kullanılan codec'lerdir; kaynak kodu ve DT binding'leri incelenerek ASoC yapısı somutlaştırılabilir.</p>
+
+  <h3>WM8960 — Wolfson / Cirrus Logic</h3>
+  <p>Kayıt yolu: <code>sound/soc/codecs/wm8960.c</code></p>
+  <div class="params">
+    <div class="param"><span class="name">Arayüz</span><span class="desc">I2C (7-bit adres 0x1A / 0x1B)</span></div>
+    <div class="param"><span class="name">Özellikler</span><span class="desc">Stereo DAC + stereo ADC, dahili PLL, HP amplifikatör, SPK amplifikatör, AGC</span></div>
+    <div class="param"><span class="name">DT compatible</span><span class="desc">wlf,wm8960</span></div>
+    <div class="param"><span class="name">Özel DT özellikleri</span><span class="desc">wlf,shared-lrclk, wlf,hp-cfg, wlf,gpio-cfg</span></div>
+  </div>
+
+  <pre><code>/* WM8960 DT örneği */
+&amp;i2c1 {
+    wm8960: codec@1a {
+        compatible      = "wlf,wm8960";
+        reg             = &lt;0x1a&gt;;
+        #sound-dai-cells = &lt;0&gt;;
+        clocks          = &lt;&amp;clk_out2&gt;;
+        clock-names     = "mclk";
+        wlf,shared-lrclk;
+        wlf,hp-cfg      = &lt;3 2 3&gt;;
+    };
+};</code></pre>
+
+  <h3>ES8316 — Everest Semi</h3>
+  <p>Kayıt yolu: <code>sound/soc/codecs/es8316.c</code></p>
+  <div class="params">
+    <div class="param"><span class="name">Arayüz</span><span class="desc">I2C (adres 0x10 veya 0x11)</span></div>
+    <div class="param"><span class="name">Özellikler</span><span class="desc">24-bit DAC/ADC, dahili LDO, kulaklık algılama, düşük güç tüketimi; Rockchip SBC'lerde yaygın</span></div>
+    <div class="param"><span class="name">DT compatible</span><span class="desc">everest,es8316</span></div>
+  </div>
+
+  <pre><code>&amp;i2c0 {
+    es8316: codec@11 {
+        compatible       = "everest,es8316";
+        reg              = &lt;0x11&gt;;
+        #sound-dai-cells = &lt;0&gt;;
+        clocks           = &lt;&amp;cru SCLK_I2S_8CH_OUT&gt;;
+        clock-names      = "mclk";
+        pinctrl-names    = "default";
+        pinctrl-0        = &lt;&amp;headphone_det&gt;;
+        hp-det-gpio      = &lt;&amp;gpio0 RK_PB0 GPIO_ACTIVE_LOW&gt;;
+    };
+};</code></pre>
+
+  <h3>TLV320AIC3x — Texas Instruments</h3>
+  <p>Kayıt yolu: <code>sound/soc/codecs/tlv320aic3x.c</code></p>
+  <div class="params">
+    <div class="param"><span class="name">Arayüz</span><span class="desc">I2C (4 adres seçeneği: 0x18–0x1B)</span></div>
+    <div class="param"><span class="name">Özellikler</span><span class="desc">Sayfa tabanlı kayıt haritası (256 sayfa), çok kanallı TDM, MiniDSP, gelişmiş EQ</span></div>
+    <div class="param"><span class="name">DT compatible</span><span class="desc">ti,tlv320aic3x</span></div>
+    <div class="param"><span class="name">Sayfa geçişi</span><span class="desc">Kayıt 0x00 yazarak — regmap sayfalama bunu otomatik yönetir</span></div>
+  </div>
+
+  <pre><code>&amp;i2c2 {
+    aic3x: codec@18 {
+        compatible       = "ti,tlv320aic3x";
+        reg              = &lt;0x18&gt;;
+        #sound-dai-cells = &lt;0&gt;;
+        reset-gpios      = &lt;&amp;gpio3 12 GPIO_ACTIVE_LOW&gt;;
+        ai3x-micbias-vg  = &lt;2&gt;;   /* 2.5V */
+    };
+};</code></pre>
+
+  <h3>Codec seçim kılavuzu</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Codec</th><th>Güç</th><th>Kalite</th><th>Öne çıkan özellik</th><th>Tipik kullanım</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>WM8960</td><td>Orta</td><td>Yüksek</td><td>Dahili SPK amp, AGC</td><td>Raspberry Pi, i.MX tabanlı boardlar</td></tr>
+        <tr><td>ES8316</td><td>Düşük</td><td>Orta-Yüksek</td><td>Düşük güç, HP algılama</td><td>Rockchip SBC, taşınabilir cihaz</td></tr>
+        <tr><td>TLV320AIC3x</td><td>Orta</td><td>Çok yüksek</td><td>MiniDSP, TDM, çok kanallı</td><td>Endüstriyel ses, konferans sistemleri</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Hata ayıklama</h2>
+  <p class="section-lead"><code>/proc/asound/</code>, <code>amixer</code>, <code>aplay</code> ve DAPM grafiği dump araçlarıyla ASoC sorunlarını teşhis et.</p>
+
+  <h3>/proc/asound/ ile ses alt sistemi durumu</h3>
+  <pre><code># Kayıtlı ses kartlarını listele
+cat /proc/asound/cards
+
+# Aktif PCM akışlarını gör
+cat /proc/asound/pcm
+
+# Kart 0'ın tüm kontrol bilgileri
+cat /proc/asound/card0/id
+
+# Codec kayıt defterini dump et (regmap)
+cat /proc/asound/card0/codec#0/regs    # sürücü destekliyorsa</code></pre>
+
+  <h3>amixer ile kontrol düzenleme</h3>
+  <pre><code># Tüm kontrolleri listele
+amixer -c 0 contents
+
+# Belirli kontrolü oku
+amixer -c 0 cget name='Headphone Volume'
+
+# Kulaklık sesini ayarla
+amixer -c 0 cset name='Headphone Volume' 50
+
+# DAPM path kontrolü
+amixer -c 0 cset name='HP Mixer DAC Switch' on</code></pre>
+
+  <h3>aplay / arecord ile ses testi</h3>
+  <pre><code># Cihazları listele
+aplay -l
+arecord -l
+
+# 48 kHz, stereo, 16-bit sinüs sesi çal
+speaker-test -c 2 -r 48000 -t sine -D hw:0,0
+
+# Dosya kaydet (10 saniye)
+arecord -D hw:0,0 -f S16_LE -r 48000 -c 2 -d 10 /tmp/test.wav
+
+# Kaydı çal
+aplay /tmp/test.wav</code></pre>
+
+  <h3>DAPM grafiği dump</h3>
+  <pre><code># DAPM widget listesi ve güç durumu
+cat /sys/kernel/debug/asoc/&lt;card-adı&gt;/dapm_widgets
+
+# Codec bileşeninin tam DAPM grafiği
+cat /sys/kernel/debug/asoc/&lt;card-adı&gt;/&lt;codec-adı&gt;/dapm
+
+# Aktif DAPM yolları (power=1 olanlar)
+grep -A1 "power=1" /sys/kernel/debug/asoc/&lt;card-adı&gt;/dapm_widgets
+
+# dot formatında grafik dışa aktar — graphviz ile görselleştir
+cat /sys/kernel/debug/asoc/dapm/&lt;card-adı&gt;  2&gt;/dev/null | dot -Tpng -o dapm.png</code></pre>
+
+  <h3>debugfs ile platform PCM bilgileri</h3>
+  <pre><code>ls /sys/kernel/debug/asoc/
+# Genellikle: cards  dais  platforms  components
+
+# DAI bağlantılarını gör
+cat /sys/kernel/debug/asoc/dais</code></pre>
+
+  <h3>Sık karşılaşılan hatalar ve çözümleri</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Hata</th><th>Olası neden</th><th>Çözüm</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>-ENODEV</code> kart kayıt</td><td>Codec I2C'de bulunamıyor</td><td><code>i2cdetect -y &lt;bus&gt;</code> ile adres kontrol et</td></tr>
+        <tr><td>Ses yok (kayıt tamam)</td><td>DAPM yolu kapalı</td><td>amixer ile HP Mixer / DAC Switch'i aç</td></tr>
+        <tr><td>XRUN (buffer underrun)</td><td>period_size çok küçük</td><td>period_size artır, CPU yükünü düşür</td></tr>
+        <tr><td>Gürültü / distorsyon</td><td>MCLK / BCLK oran hatası</td><td>set_sysclk frekansını kontrol et, PLL ayarla</td></tr>
+        <tr><td>Capture yok</td><td>MICBIAS etkin değil</td><td>amixer cset ile MICBIAS kontrolünü aç</td></tr>
+        <tr><td><code>-EINVAL</code> hw_params</td><td>Desteklenmeyen format/hız</td><td>codec ve platform DAI stream tanımını karşılaştır</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Çekirdek dinamik hata ayıklama</h3>
+  <pre><code># ASoC modülü için tüm debug mesajlarını etkinleştir
+echo "module snd_soc_core +p" &gt; /sys/kernel/debug/dynamic_debug/control
+echo "module snd_soc_simple_card +p" &gt; /sys/kernel/debug/dynamic_debug/control
+
+# Belirli dosya satırı — DAPM güç değişimlerini izle
+echo "file sound/soc/soc-dapm.c +p" &gt; /sys/kernel/debug/dynamic_debug/control
+
+# dmesg ile takip et
+dmesg -w | grep -i "soc\|dapm\|i2s"</code></pre>
+</section>
+
+</main>

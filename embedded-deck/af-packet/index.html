@@ -1,0 +1,984 @@
+---
+layout: tutorial
+title: "AF_PACKET & TPACKET — Ham Paket Yakalama"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>AF_PACKET</span>
+    <span>2026</span>
+  </div>
+  <h1>AF_PACKET &amp; TPACKET<br><em>Ham Paket Yakalama</em></h1>
+  <p class="subtitle">Linux raw socket ile sıfır kopyalı paket yakalama — TPACKET_V3 ring buffer, donanım zaman damgası ve RT ağ uygulamaları.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">AF_PACKET nedir</a></li>
+    <li><a href="#s1">SOCK_RAW vs SOCK_DGRAM</a></li>
+    <li><a href="#s2">Paket gönderme</a></li>
+    <li><a href="#s3">TPACKET_V1/V2/V3 ring buffer modları</a></li>
+    <li><a href="#s4">TPACKET_V3 kurulumu</a></li>
+    <li><a href="#s5">Zero-copy yakalama döngüsü</a></li>
+    <li><a href="#s6">Hardware timestamping</a></li>
+    <li><a href="#s7">BPF filtre ekleme</a></li>
+    <li><a href="#s8">Performans ve RT kullanım</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> AF_PACKET nedir</h2>
+  <p class="section-lead">AF_PACKET, Linux'ta Ethernet katmanından itibaren ham (raw) paket alıp göndermeye izin veren bir adres ailesidir. IP, TCP veya UDP başlıkları kernel tarafından işlenmez; uygulama tüm çerçeveyi kendisi yönetir.</p>
+
+  <h3>Temel kavram</h3>
+  <p>Normal bir TCP/UDP soketi, kernel ağ yığınını (IP defrag, TCP state machine, checksum) kullanır. AF_PACKET soketi ise NIC sürücüsünden hemen sonra devreye girer — Layer 2 Ethernet çerçevesi uygulamaya olduğu gibi teslim edilir.</p>
+
+  <div class="flow">
+    <pre>NIC donanımı → sürücü RX kuyruğu → AF_PACKET ring buffer → uygulama belleği
+                                 ↕
+                    (normal yol) → IP/TCP yığını → socket recv buffer</pre>
+  </div>
+
+  <h3>Kullanım alanları</h3>
+  <div class="params">
+    <div class="param"><span class="name">tcpdump / Wireshark</span><span class="desc">libpcap, AF_PACKET + BPF filtresi üzerine inşa edilmiştir; her paket yakalamak için ham sokete ihtiyaç duyar</span></div>
+    <div class="param"><span class="name">IDS / IPS</span><span class="desc">Snort, Suricata gibi araçlar yüksek hızlı trafik analizini AF_PACKET TPACKET_V3 ile gerçekleştirir</span></div>
+    <div class="param"><span class="name">Endüstriyel RT ağ</span><span class="desc">PROFINET, EtherCAT gibi protokoller standart TCP/IP yığınını devre dışı bırakarak ham Ethernet kullanır</span></div>
+    <div class="param"><span class="name">PTP / IEEE 1588</span><span class="desc">Hassas zaman senkronizasyonu için donanım zaman damgası (HW timestamping) ile ham paket gereklidir</span></div>
+    <div class="param"><span class="name">Fuzzing &amp; test</span><span class="desc">Ağ protokol testlerinde geçersiz veya özel paketler göndermek için raw socket kullanılır</span></div>
+  </div>
+
+  <h3>Gerekli yetkiler</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># AF_PACKET soketi açmak için CAP_NET_RAW yetkisi gerekir</span>
+<span class="cmt"># Root olarak çalıştır VEYA binary'e capability ver:</span>
+<span class="cmd">sudo</span> setcap cap_net_raw+ep ./my_app
+
+<span class="cmt"># Mevcut capability'leri kontrol et</span>
+<span class="cmd">getcap</span> ./my_app
+<span class="cmt"># ./my_app cap_net_raw=ep</span>
+
+<span class="cmt"># systemd servis olarak çalışıyorsa unit'e ekle:</span>
+<span class="cmt"># AmbientCapabilities=CAP_NET_RAW</span>
+<span class="cmt"># CapabilityBoundingSet=CAP_NET_RAW</span></code></pre>
+  </div>
+
+  <h3>Kernel konfigürasyonu</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># AF_PACKET her modern Linux kernel'de varsayılan açıktır</span>
+<span class="cmt"># Gerekli seçenekler (zaten =y olmalı):</span>
+<span class="cmt"># CONFIG_PACKET=y           — AF_PACKET soket desteği</span>
+<span class="cmt"># CONFIG_PACKET_DIAG=y      — ss/netstat teşhis arayüzü</span>
+<span class="cmt"># CONFIG_BPF=y              — klasik BPF (cBPF) filtre motoru</span>
+
+<span class="cmd">grep</span> CONFIG_PACKET /boot/config-$(uname -r)</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>AF_PACKET = kernel ağ yığınını atlayan Layer 2 ham soket</li>
+      <li>tcpdump, Snort, PROFINET, PTP uygulamalarının temel primitifi</li>
+      <li>CAP_NET_RAW yetkisi gerektirir — root veya setcap ile verilebilir</li>
+      <li>CONFIG_PACKET=y ile kernel desteği standart olarak açık gelir</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> SOCK_RAW vs SOCK_DGRAM</h2>
+  <p class="section-lead">AF_PACKET soketi iki tipte açılabilir: SOCK_RAW tam Ethernet çerçevesini (başlık dahil) sunarken, SOCK_DGRAM yalnızca yük (payload) kısmını döndürür ve Ethernet başlığını kernel soyutlamasına bırakır.</p>
+
+  <h3>socket() çağrısı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;sys/socket.h&gt;
+#include &lt;linux/if_packet.h&gt;
+#include &lt;net/ethernet.h&gt;   /* ETH_P_ALL, ETH_P_IP ... */
+#include &lt;arpa/inet.h&gt;      /* htons() */
+
+/* SOCK_RAW: Ethernet başlığı dahil tüm çerçeve */
+int fd_raw = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+
+/* SOCK_DGRAM: kernel Ethernet başlığını soyar, sadece L3+ gelir */
+int fd_dgram = socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IP));
+
+if (fd_raw &lt; 0) {
+    perror("socket");   /* EPERM: CAP_NET_RAW eksik */
+    return -1;
+}</code></pre>
+  </div>
+
+  <h3>ETH_P_* protokol sabitleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Sabit</th><th>Değer</th><th>Yakalanan trafik</th></tr></thead>
+      <tbody>
+        <tr><td><code>ETH_P_ALL</code></td><td>0x0003</td><td>Tüm Ethernet çerçeveleri (promiscuous gerektirir)</td></tr>
+        <tr><td><code>ETH_P_IP</code></td><td>0x0800</td><td>Yalnızca IPv4 paketleri</td></tr>
+        <tr><td><code>ETH_P_IPV6</code></td><td>0x86DD</td><td>Yalnızca IPv6 paketleri</td></tr>
+        <tr><td><code>ETH_P_ARP</code></td><td>0x0806</td><td>Yalnızca ARP çerçeveleri</td></tr>
+        <tr><td><code>ETH_P_8021Q</code></td><td>0x8100</td><td>VLAN etiketli çerçeveler</td></tr>
+        <tr><td><code>ETH_P_LOOP</code></td><td>0x0060</td><td>Loopback çerçeveleri</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Arayüz bağlama (bind)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;net/if.h&gt;
+#include &lt;string.h&gt;
+
+struct sockaddr_ll addr = {0};
+addr.sll_family   = AF_PACKET;
+addr.sll_protocol = htons(ETH_P_ALL);
+addr.sll_ifindex  = if_nametoindex("eth0");  /* arayüz indeksi */
+
+if (bind(fd_raw, (struct sockaddr *)&amp;addr, sizeof(addr)) &lt; 0) {
+    perror("bind");
+    return -1;
+}
+
+/* Promiscuous mod: tüm MAC adreslerine gelen çerçeveleri al */
+struct packet_mreq mreq = {0};
+mreq.mr_ifindex = addr.sll_ifindex;
+mreq.mr_type    = PACKET_MR_PROMISC;
+setsockopt(fd_raw, SOL_PACKET, PACKET_ADD_MEMBERSHIP,
+           &amp;mreq, sizeof(mreq));</code></pre>
+  </div>
+
+  <h3>SOCK_RAW vs SOCK_DGRAM karşılaştırması</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th>SOCK_RAW</th><th>SOCK_DGRAM</th></tr></thead>
+      <tbody>
+        <tr><td>Ethernet başlığı</td><td>Dahil — 14 bayt (dst+src MAC + ethertype)</td><td>Kernel soyutlar, yoktur</td></tr>
+        <tr><td>recvfrom() sonucu</td><td>Ham Ethernet çerçevesi</td><td>L3 yük (IP başlığından itibaren)</td></tr>
+        <tr><td>sendto() için</td><td>Ethernet başlığını uygulama yazar</td><td>Kernel başlık ekler</td></tr>
+        <tr><td>Kullanım</td><td>tcpdump, TPACKET, özel protokol</td><td>Basit L3 sniffing</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>SOCK_RAW: tüm Ethernet çerçevesi — başlık yönetimi uygulamada</li>
+      <li>SOCK_DGRAM: kernel başlığı soyar, sadece yük gelir</li>
+      <li>ETH_P_ALL ile tüm trafik; spesifik protokol için ETH_P_IP vb.</li>
+      <li>bind() ile belirli arayüze bağla; PACKET_MR_PROMISC ile promiscuous mod aç</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> Paket gönderme</h2>
+  <p class="section-lead">AF_PACKET SOCK_RAW ile ham Ethernet çerçevesi oluşturmak ve sendto() ile göndermek — başlık alanlarının elle doldurulması dahil eksiksiz bir örnek.</p>
+
+  <h3>Ethernet çerçevesi yapısı</h3>
+
+  <div class="flow">
+    <pre>[ 6 B dst MAC ][ 6 B src MAC ][ 2 B EtherType ][ 0–1500 B payload ][ 4 B FCS (NIC ekler) ]</pre>
+  </div>
+
+  <h3>Çerçeve oluşturma ve gönderme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include &lt;sys/socket.h&gt;
+#include &lt;linux/if_packet.h&gt;
+#include &lt;net/ethernet.h&gt;
+#include &lt;net/if.h&gt;
+#include &lt;arpa/inet.h&gt;
+#include &lt;unistd.h&gt;
+
+#define IFACE  "eth0"
+#define BUFLEN 1514   /* max Ethernet frame (eksik FCS) */
+
+int main(void)
+{
+    /* 1) Ham soket aç */
+    int fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (fd &lt; 0) { perror("socket"); return 1; }
+
+    /* 2) Arayüz indeksi al */
+    int ifindex = if_nametoindex(IFACE);
+
+    /* 3) Hedef adresi doldur */
+    struct sockaddr_ll dst = {0};
+    dst.sll_family   = AF_PACKET;
+    dst.sll_ifindex  = ifindex;
+    dst.sll_halen    = ETH_ALEN;
+    /* broadcast */
+    memset(dst.sll_addr, 0xFF, ETH_ALEN);
+
+    /* 4) Ethernet başlığı + yük oluştur */
+    unsigned char frame[BUFLEN];
+    struct ethhdr *eth = (struct ethhdr *)frame;
+
+    /* Hedef MAC: broadcast */
+    memset(eth-&gt;h_dest, 0xFF, ETH_ALEN);
+    /* Kaynak MAC: gerçek uygulamada SIOCGIFHWADDR ile al */
+    unsigned char src_mac[ETH_ALEN] = {0x02,0xAA,0xBB,0xCC,0xDD,0xEE};
+    memcpy(eth-&gt;h_source, src_mac, ETH_ALEN);
+    /* EtherType: 0x88B5 = IEEE 802 test protokolü */
+    eth-&gt;h_proto = htons(0x88B5);
+
+    /* 5) Yük yaz */
+    const char *msg = "Merhaba, AF_PACKET!";
+    size_t msg_len  = strlen(msg);
+    memcpy(frame + sizeof(struct ethhdr), msg, msg_len);
+
+    size_t frame_len = sizeof(struct ethhdr) + msg_len;
+    /* Minimum Ethernet çerçevesi 60 bayt (FCS hariç) */
+    if (frame_len &lt; 60) {
+        memset(frame + frame_len, 0, 60 - frame_len);
+        frame_len = 60;
+    }
+
+    /* 6) Gönder */
+    ssize_t sent = sendto(fd, frame, frame_len, 0,
+                          (struct sockaddr *)&amp;dst, sizeof(dst));
+    if (sent &lt; 0) { perror("sendto"); }
+    else           { printf("Gonderildi: %zd bayt\n", sent); }
+
+    close(fd);
+    return 0;
+}</code></pre>
+  </div>
+
+  <h3>Kaynak MAC adresini SIOCGIFHWADDR ile okuma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;sys/ioctl.h&gt;
+#include &lt;net/if.h&gt;
+
+/* Arayüzün MAC adresini al */
+int get_src_mac(int fd, const char *iface, unsigned char *mac_out)
+{
+    struct ifreq ifr;
+    memset(&amp;ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
+
+    if (ioctl(fd, SIOCGIFHWADDR, &amp;ifr) &lt; 0) {
+        perror("ioctl SIOCGIFHWADDR");
+        return -1;
+    }
+    memcpy(mac_out, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
+    return 0;
+}</code></pre>
+  </div>
+
+  <h3>Gönderim hataları ve MTU</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">EMSGSIZE</span><span class="desc">Frame boyutu arayüz MTU'sunu aşıyor — varsayılan 1500 B payload; jumbo frame için ethtool ile MTU artırılabilir</span></div>
+    <div class="param"><span class="name">ENOBUFS</span><span class="desc">Kernel TX kuyruğu dolu — setsockopt SO_SNDBUF ile tampon büyütün veya gönderim hızını azaltın</span></div>
+    <div class="param"><span class="name">ENETDOWN</span><span class="desc">Arayüz kapalı — ip link set eth0 up ile açın</span></div>
+    <div class="param"><span class="name">ENXIO</span><span class="desc">if_nametoindex() başarısız — arayüz adı yanlış</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>SOCK_RAW ile Ethernet başlığını (14 B) uygulamanın kendisi doldurur</li>
+      <li>Minimum çerçeve boyutu 60 B (FCS hariç) — kısa yükü padding ile doldurun</li>
+      <li>Kaynak MAC: SIOCGIFHWADDR ioctl ile arayüzden okunur</li>
+      <li>Jumbo frame için ip link set eth0 mtu 9000 + SO_SNDBUF büyütme</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> TPACKET_V1/V2/V3 ring buffer modları</h2>
+  <p class="section-lead">TPACKET, AF_PACKET'in mmap tabanlı halka arabellek (ring buffer) uzantısıdır. Kernel ile kullanıcı alanı arasında zero-copy paket aktarımı sağlar ve üç nesil halinde gelişmiştir.</p>
+
+  <h3>Sürüm geçmişi</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Sürüm</th><th>Kernel</th><th>Temel özellik</th><th>Kısıtlama</th></tr></thead>
+      <tbody>
+        <tr><td>TPACKET_V1</td><td>2.4</td><td>İlk mmap ring; gettimeofday() zaman damgası</td><td>32-bit zaman damgası, her paket için ayrı başlık yönetimi</td></tr>
+        <tr><td>TPACKET_V2</td><td>2.6.27</td><td>VLAN bilgisi, ns çözünürlüklü zaman damgası</td><td>Her paket hâlâ ayrı frame, blok döngüsü yok</td></tr>
+        <tr><td>TPACKET_V3</td><td>3.2</td><td>Blok tabanlı ring; birden fazla paket tek blokta, esnek frame boyutu</td><td>TX tarafı sınırlı (V2 önerilir TX için)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Neden TPACKET_V3?</h3>
+  <p>V1 ve V2'de kernel her paket için bir ring frame kullanır ve poll() çağrısı tek paket geldikten sonra döner. V3'te kernel birden fazla paketi tek bloğa toplar (<strong>block coalescing</strong>) ve yalnızca blok dolduğunda veya timeout geçtiğinde bildirim gönderir — bu durum CPU kullanımını önemli ölçüde azaltır.</p>
+
+  <div class="flow">
+    <pre>TPACKET_V2:  [pkt1][pkt2][pkt3][pkt4] ...  her paket ayrı poll() uyandırması
+
+TPACKET_V3:  [BLOK0: pkt1,pkt2,pkt3]  [BLOK1: pkt4,pkt5,...] ...
+             poll() sadece blok bitişinde uyandırılır (veya tp_retire_blk_tov timeout)</pre>
+  </div>
+
+  <h3>Performans karşılaştırması</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Metrik</th><th>TPACKET_V2</th><th>TPACKET_V3</th></tr></thead>
+      <tbody>
+        <tr><td>CPU kullanımı (1 Gbit/s)</td><td>%30–50</td><td>%5–10</td></tr>
+        <tr><td>Paket başına syscall</td><td>Her paket için poll()</td><td>Blok başına tek poll()</td></tr>
+        <tr><td>Frame boyutu</td><td>Sabit (tp_frame_size)</td><td>Esnek (blok içinde değişken)</td></tr>
+        <tr><td>Zaman damgası çözünürlüğü</td><td>Nanosaniye</td><td>Nanosaniye</td></tr>
+        <tr><td>TX ring desteği</td><td>Tam</td><td>Kısmi — RX için tercih edin</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Sürüm seçimi rehberi</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">V3 RX</span><span class="desc">Yüksek hızlı paket yakalama (100 Mbit/s ve üzeri) — IDS, libpcap modern modu, trafik analizi</span></div>
+    <div class="param"><span class="name">V2 TX</span><span class="desc">Ham paket gönderimi için hâlâ V2 kullanın; V3 TX desteği sınırlıdır</span></div>
+    <div class="param"><span class="name">V1</span><span class="desc">Eski kernel uyumluluğu gerekiyorsa; yeni geliştirmelerde kullanmayın</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>TPACKET_V3: blok tabanlı ring, çoklu paket birleştirme, düşük CPU</li>
+      <li>V2: sabit frame, paket başına poll — orta hız veya TX için hâlâ geçerli</li>
+      <li>V1: 2.4 kernel mirası, yeni projede kullanmayın</li>
+      <li>Yüksek hız RX → V3; ham TX → V2</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> TPACKET_V3 kurulumu</h2>
+  <p class="section-lead">TPACKET_V3 ring buffer'ı oluşturmak için tp_block_size, tp_block_nr, tp_frame_size parametrelerinin doğru ayarlanması ve mmap() ile belleğe eşlenmesi gerekir.</p>
+
+  <h3>Ring boyutu parametreleri</h3>
+
+  <div class="params">
+    <div class="param"><span class="name">tp_block_size</span><span class="desc">Her bloğun bayt cinsinden boyutu — sayfa boyutunun katı olmalı (ör. 4096 * 64 = 262144). Büyük blok = daha az poll() uyandırması.</span></div>
+    <div class="param"><span class="name">tp_block_nr</span><span class="desc">Ring'deki toplam blok sayısı. Toplam ring boyutu = tp_block_size * tp_block_nr.</span></div>
+    <div class="param"><span class="name">tp_frame_size</span><span class="desc">V3'te minimum frame boyutu (TPACKET_ALIGNMENT katı). V3'te çerçeveler esnek olduğundan bu daha az kritiktir.</span></div>
+    <div class="param"><span class="name">tp_retire_blk_tov</span><span class="desc">Blok zaman aşımı (ms). Bu süre dolduğunda blok dolmamış olsa bile kullanıcıya teslim edilir. Düşük gecikme için küçük tutun.</span></div>
+    <div class="param"><span class="name">tp_sizeof_priv</span><span class="desc">Blok başlığındaki özel alan boyutu — genellikle 0.</span></div>
+    <div class="param"><span class="name">tp_feature_req_word</span><span class="desc">İsteğe bağlı özellikler — TP_FT_REQ_FILL_RXHASH gibi.</span></div>
+  </div>
+
+  <h3>TPACKET_V3 ring oluşturma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sys/socket.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;linux/if_packet.h&gt;
+#include &lt;net/ethernet.h&gt;
+#include &lt;arpa/inet.h&gt;
+#include &lt;net/if.h&gt;
+#include &lt;poll.h&gt;
+
+#define IFACE           "eth0"
+#define BLOCK_SIZE      (1 &lt;&lt; 22)   /* 4 MiB blok */
+#define BLOCK_NR        64           /* 64 blok = 256 MiB ring */
+#define FRAME_SIZE      2048         /* her paket için minimum alan */
+#define BLOCK_TIMEOUT   10           /* ms — düşük gecikme için */
+
+struct ring {
+    void        *map;       /* mmap başlangıç adresi */
+    size_t       map_size;  /* toplam mmap boyutu */
+    unsigned int block_nr;
+    unsigned int block_size;
+};
+
+int setup_tpacket_v3(const char *iface, struct ring *r)
+{
+    /* 1) Ham soket aç */
+    int fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (fd &lt; 0) { perror("socket"); return -1; }
+
+    /* 2) TPACKET_V3 sürümünü seç */
+    int version = TPACKET_V3;
+    if (setsockopt(fd, SOL_PACKET, PACKET_VERSION,
+                   &amp;version, sizeof(version)) &lt; 0) {
+        perror("setsockopt PACKET_VERSION");
+        return -1;
+    }
+
+    /* 3) Ring parametrelerini ayarla */
+    struct tpacket_req3 req = {0};
+    req.tp_block_size      = BLOCK_SIZE;
+    req.tp_block_nr        = BLOCK_NR;
+    req.tp_frame_size      = FRAME_SIZE;
+    req.tp_frame_nr        = (BLOCK_SIZE / FRAME_SIZE) * BLOCK_NR;
+    req.tp_retire_blk_tov  = BLOCK_TIMEOUT;
+    req.tp_sizeof_priv     = 0;
+    req.tp_feature_req_word = TP_FT_REQ_FILL_RXHASH;
+
+    if (setsockopt(fd, SOL_PACKET, PACKET_RX_RING,
+                   &amp;req, sizeof(req)) &lt; 0) {
+        perror("setsockopt PACKET_RX_RING");
+        return -1;
+    }
+
+    /* 4) mmap: tüm ring'i kullanıcı belleğine eşle */
+    size_t map_size = (size_t)BLOCK_SIZE * BLOCK_NR;
+    void *map = mmap(NULL, map_size,
+                     PROT_READ | PROT_WRITE,
+                     MAP_SHARED | MAP_LOCKED,
+                     fd, 0);
+    if (map == MAP_FAILED) { perror("mmap"); return -1; }
+
+    /* 5) Arayüze bağla */
+    struct sockaddr_ll addr = {0};
+    addr.sll_family   = AF_PACKET;
+    addr.sll_protocol = htons(ETH_P_ALL);
+    addr.sll_ifindex  = if_nametoindex(iface);
+    if (bind(fd, (struct sockaddr *)&amp;addr, sizeof(addr)) &lt; 0) {
+        perror("bind"); return -1;
+    }
+
+    r-&gt;map        = map;
+    r-&gt;map_size   = map_size;
+    r-&gt;block_nr   = BLOCK_NR;
+    r-&gt;block_size = BLOCK_SIZE;
+    return fd;
+}</code></pre>
+  </div>
+
+  <h3>Ring boyutlandırma hesabı</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Örnek: 1 Gbit/s hat, paket başı ortalama 512 B, 100 ms tampon süresi</span>
+<span class="cmt"># Hat kapasitesi: 1e9 / 8 = 125 MB/s</span>
+<span class="cmt"># 100 ms tampon: 125 MB/s * 0.1 = 12.5 MB minimum</span>
+<span class="cmt"># Güvenlik katsayısı x4 = 50 MB → 64 blok x 1 MiB = 64 MiB seç</span>
+
+<span class="cmt"># Gerçek ring kullanımını izle:</span>
+<span class="cmd">cat</span> /proc/net/packet
+<span class="cmt"># refcnt sk  type proto  iface   R  rmem   wmem   user   inode</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>PACKET_VERSION = TPACKET_V3 → PACKET_RX_RING → mmap() → bind() sırası</li>
+      <li>tp_block_size: sayfa boyutu katı; tp_retire_blk_tov: düşük gecikme için küçük tutun</li>
+      <li>Toplam ring = tp_block_size * tp_block_nr; hat hızına göre hesaplayın</li>
+      <li>MAP_LOCKED: belleği swap'tan korur — RT uygulamalarda zorunlu</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> Zero-copy yakalama döngüsü</h2>
+  <p class="section-lead">TPACKET_V3 ring buffer kurulduktan sonra poll() ile blok bildirimlerini beklemek ve blok başlığını (tpacket_block_desc) tarayarak her paketi işlemek gerekir.</p>
+
+  <h3>Blok ve paket başlık yapıları</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code>/* Blok başlığı — her bloğun başında yer alır */
+struct tpacket_block_desc {
+    uint32_t version;
+    uint32_t offset_to_priv;
+    union tpacket_bd_header_u {
+        struct tpacket_hdr_v1 {
+            uint32_t block_status;  /* TP_STATUS_* bayrakları */
+            uint32_t num_pkts;      /* bu bloktaki paket sayısı */
+            uint32_t offset_to_first_pkt; /* ilk paket başlığına ofset */
+            uint32_t blk_len;
+            uint64_t seq_num;
+            struct tpacket_bd_ts ts_first_pkt;  /* ilk paketin zaman damgası */
+            struct tpacket_bd_ts ts_last_pkt;   /* son paketin zaman damgası */
+        } v1;
+    } hdr;
+};
+
+/* V3 paket başlığı */
+struct tpacket3_hdr {
+    uint32_t tp_next_offset;  /* sonraki pakete ofset (bayt) */
+    uint32_t tp_sec;          /* saniye (zaman damgası) */
+    uint32_t tp_nsec;         /* nanosaniye (zaman damgası) */
+    uint32_t tp_snaplen;      /* yakalanan uzunluk */
+    uint32_t tp_len;          /* gerçek paket uzunluğu */
+    uint32_t tp_status;       /* TP_STATUS_* */
+    uint16_t tp_mac;          /* Ethernet başlığına ofset */
+    uint16_t tp_net;          /* ağ katmanına ofset */
+    /* ... VLAN, hash alanları */
+};</code></pre>
+  </div>
+
+  <h3>Ana yakalama döngüsü</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code>typedef void (*pkt_handler_t)(const uint8_t *data, uint32_t len,
+                               uint32_t sec, uint32_t nsec);
+
+void capture_loop(int fd, struct ring *r, pkt_handler_t handler)
+{
+    struct pollfd pfd = { .fd = fd, .events = POLLIN | POLLERR };
+    unsigned int cur_block = 0;
+
+    while (1) {
+        /* Mevcut bloğun durumunu kontrol et */
+        struct tpacket_block_desc *pbd =
+            (struct tpacket_block_desc *)
+            ((uint8_t *)r-&gt;map + (size_t)cur_block * r-&gt;block_size);
+
+        /* Blok hazır değilse poll() ile bekle */
+        while (!(pbd-&gt;hdr.v1.block_status &amp; TP_STATUS_USER)) {
+            int ret = poll(&amp;pfd, 1, -1);
+            if (ret &lt; 0 &amp;&amp; errno != EINTR) { perror("poll"); return; }
+        }
+
+        /* Bloktaki paketleri işle */
+        uint32_t num_pkts = pbd-&gt;hdr.v1.num_pkts;
+        uint8_t  *pkt_ptr = (uint8_t *)pbd
+                          + pbd-&gt;hdr.v1.offset_to_first_pkt;
+
+        for (uint32_t i = 0; i &lt; num_pkts; i++) {
+            struct tpacket3_hdr *hdr = (struct tpacket3_hdr *)pkt_ptr;
+
+            /* Ethernet çerçevesi pointer'ı */
+            const uint8_t *eth = pkt_ptr + hdr-&gt;tp_mac;
+
+            /* İşleyiciye gönder */
+            handler(eth, hdr-&gt;tp_snaplen,
+                    hdr-&gt;tp_sec, hdr-&gt;tp_nsec);
+
+            /* Sonraki pakete geç */
+            if (hdr-&gt;tp_next_offset == 0) break;
+            pkt_ptr += hdr-&gt;tp_next_offset;
+        }
+
+        /* Bloğu kernel'e iade et */
+        pbd-&gt;hdr.v1.block_status = TP_STATUS_KERNEL;
+        /* Bellek bariyeri: compiler/CPU yeniden sıralama önlemi */
+        __sync_synchronize();
+
+        cur_block = (cur_block + 1) % r-&gt;block_nr;
+    }
+}
+
+/* Örnek işleyici */
+void print_pkt(const uint8_t *data, uint32_t len,
+               uint32_t sec, uint32_t nsec)
+{
+    const struct ethhdr *eth = (const struct ethhdr *)data;
+    printf("[%u.%09u] %02x:%02x:%02x:%02x:%02x:%02x -&gt; "
+           "%02x:%02x:%02x:%02x:%02x:%02x len=%u\n",
+           sec, nsec,
+           eth-&gt;h_source[0], eth-&gt;h_source[1], eth-&gt;h_source[2],
+           eth-&gt;h_source[3], eth-&gt;h_source[4], eth-&gt;h_source[5],
+           eth-&gt;h_dest[0],   eth-&gt;h_dest[1],   eth-&gt;h_dest[2],
+           eth-&gt;h_dest[3],   eth-&gt;h_dest[4],   eth-&gt;h_dest[5],
+           len);
+}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">ÖNEMLİ</div>
+    <p>Blok işlendikten sonra <code>block_status = TP_STATUS_KERNEL</code> ile kernel'e iade etmek zorunludur. İade edilmeyen bloklar ring'i doldurur ve kernel paket düşürmeye (<strong>drop</strong>) başlar. <code>__sync_synchronize()</code> veya <code>__atomic_store_n()</code> ile bellek bariyeri koyun; aksi takdirde CPU durum bayrağını yeniden sıralayabilir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>tpacket_block_desc.block_status == TP_STATUS_USER: blok hazır</li>
+      <li>offset_to_first_pkt + tp_next_offset ile paketleri zincir gibi gezin</li>
+      <li>tp_mac → Ethernet başlığı; tp_net → IP başlığı offset'i</li>
+      <li>İşlem sonrası block_status = TP_STATUS_KERNEL + bellek bariyeri zorunlu</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> Hardware timestamping</h2>
+  <p class="section-lead">Yazılım zaman damgası (software timestamp) mikrosaniye düzeyinde hata içerir. Donanım zaman damgası (hardware timestamp) NIC'in kendisinde PHY katmanında alınır ve genellikle &lt;100 ns doğruluk sağlar — PTP/IEEE 1588 senkronizasyonunun temelidir.</p>
+
+  <h3>Timestamp seviyeleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Seviye</th><th>Nerede alınır</th><th>Doğruluk</th><th>Gereksinim</th></tr></thead>
+      <tbody>
+        <tr><td>Software (SW)</td><td>Kernel ağ yığınında, genellikle softirq</td><td>1–100 µs</td><td>Her NIC, ekstra yapılandırma yok</td></tr>
+        <tr><td>Hardware (HW)</td><td>NIC PHY/MAC katmanında, RX/TX anında</td><td>1–100 ns</td><td>HW timestamp destekli NIC + sürücü</td></tr>
+        <tr><td>Crossstamp</td><td>HW + SW eşleştirme (PTP_SYS_OFFSET)</td><td>Alt µs</td><td>Kernel 5.0+, destekli NIC</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>NIC HW timestamp desteğini sorgulama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ethtool ile donanım timestamp yeteneklerini sorgula</span>
+<span class="cmd">ethtool</span> <span class="flag">-T</span> eth0
+
+<span class="cmt"># Örnek çıktı:</span>
+<span class="cmt"># Time stamping parameters for eth0:</span>
+<span class="cmt"># Capabilities:</span>
+<span class="cmt">#   hardware-transmit     (SOF_TIMESTAMPING_TX_HARDWARE)</span>
+<span class="cmt">#   software-transmit     (SOF_TIMESTAMPING_TX_SOFTWARE)</span>
+<span class="cmt">#   hardware-receive      (SOF_TIMESTAMPING_RX_HARDWARE)</span>
+<span class="cmt">#   software-receive      (SOF_TIMESTAMPING_RX_SOFTWARE)</span>
+<span class="cmt">#   hardware-raw-clock    (SOF_TIMESTAMPING_RAW_HARDWARE)</span>
+<span class="cmt"># PTP Hardware Clock: 0    ← /dev/ptp0 mevcut</span>
+<span class="cmt"># Hardware Transmit Timestamp Modes: off one-at-a-time</span>
+<span class="cmt"># Hardware Receive Filter Modes: none all</span></code></pre>
+  </div>
+
+  <h3>SIOCSHWTSTAMP ile HW timestamp etkinleştirme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/net_tstamp.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;net/if.h&gt;
+
+int enable_hw_timestamp(int fd, const char *iface)
+{
+    struct ifreq ifr;
+    struct hwtstamp_config cfg = {0};
+
+    /* Tüm RX paketleri için HW timestamp iste */
+    cfg.tx_type   = HWTSTAMP_TX_OFF;    /* TX timestamp istemiyoruz */
+    cfg.rx_filter = HWTSTAMP_FILTER_ALL; /* tüm RX paketleri */
+
+    memset(&amp;ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
+    ifr.ifr_data = (void *)&amp;cfg;
+
+    if (ioctl(fd, SIOCSHWTSTAMP, &amp;ifr) &lt; 0) {
+        perror("ioctl SIOCSHWTSTAMP");
+        /* HW timestamp desteklenmiyor — SW'ye dön */
+        return -1;
+    }
+    return 0;
+}
+
+/* SO_TIMESTAMPING soket seçeneği — tüm timestamp türlerini iste */
+int req_timestamps(int fd)
+{
+    int flags = SOF_TIMESTAMPING_RX_HARDWARE  /* HW RX stamp */
+              | SOF_TIMESTAMPING_RAW_HARDWARE /* ham HW saat */
+              | SOF_TIMESTAMPING_RX_SOFTWARE  /* SW fallback */
+              | SOF_TIMESTAMPING_SOFTWARE;    /* SW stamp aktif */
+
+    return setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPING,
+                      &amp;flags, sizeof(flags));
+}</code></pre>
+  </div>
+
+  <h3>Timestamp'i recvmsg() ile okuma</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;sys/socket.h&gt;
+#include &lt;time.h&gt;
+
+void recv_with_timestamp(int fd)
+{
+    char buf[2048];
+    char ctrl[512];
+    struct iovec iov  = { buf, sizeof(buf) };
+    struct msghdr msg = {0};
+    msg.msg_iov        = &amp;iov;
+    msg.msg_iovlen     = 1;
+    msg.msg_control    = ctrl;
+    msg.msg_controllen = sizeof(ctrl);
+
+    ssize_t n = recvmsg(fd, &amp;msg, 0);
+    if (n &lt; 0) { perror("recvmsg"); return; }
+
+    /* Kontrol mesajlarını tara */
+    struct cmsghdr *cmsg;
+    for (cmsg = CMSG_FIRSTHDR(&amp;msg); cmsg;
+         cmsg = CMSG_NXTHDR(&amp;msg, cmsg)) {
+
+        if (cmsg-&gt;cmsg_level == SOL_SOCKET &amp;&amp;
+            cmsg-&gt;cmsg_type  == SCM_TIMESTAMPING) {
+
+            /* 3 adet timespec: SW, SW deprecated, HW */
+            struct timespec *ts = (struct timespec *)CMSG_DATA(cmsg);
+            /* ts[0] = software timestamp */
+            /* ts[2] = hardware timestamp (PHC saat) */
+            printf("HW stamp: %ld.%09ld\n",
+                   ts[2].tv_sec, ts[2].tv_nsec);
+        }
+    }
+}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>TPACKET_V3 ile kullanıldığında donanım zaman damgası doğrudan <code>tpacket3_hdr.tp_sec / tp_nsec</code> alanlarına yazılır — ayrı <code>recvmsg()</code> gerektirmez. <code>ethtool -T eth0</code> çıktısında <code>SOF_TIMESTAMPING_RX_HARDWARE</code> yoksa NIC sürücüsü HW stamp desteklemiyor demektir; SW stamp ile devam edin.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>HW timestamp: NIC PHY katmanında, &lt;100 ns doğruluk — PTP için zorunlu</li>
+      <li>SIOCSHWTSTAMP ioctl ile HWTSTAMP_FILTER_ALL → tüm RX paketleri etiketlenir</li>
+      <li>SO_TIMESTAMPING soket seçeneği; recvmsg() SCM_TIMESTAMPING ile üç timespec gelir</li>
+      <li>TPACKET_V3: tp_sec/tp_nsec alanları doğrudan HW stamp taşır</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> BPF filtre ekleme</h2>
+  <p class="section-lead">AF_PACKET soketine klasik BPF (cBPF) filtresi ekleyerek kernel'de erken filtreleme yapılır — kullanıcı alanına yalnızca ilgili paketler çıkar, gereksiz kopyalama önlenir.</p>
+
+  <h3>Klasik BPF (cBPF) mimarisi</h3>
+  <p>cBPF, sanal bir yığıt makinesidir. Her talimat bir opcode + jt (true atla) + jf (false atla) + k (sabit) içerir. Filtre, paketi kabul etmek için sıfır olmayan değer, reddetmek için 0 döner.</p>
+
+  <div class="flow">
+    <pre>paket geldi → kernel BPF sanal makinesi kodu çalıştırır → 0: düşür | &gt;0: kullanıcıya ilet</pre>
+  </div>
+
+  <h3>tcpdump ile BPF kodu üretme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># tcpdump'ın BPF komutlarını yazdırmasını sağla (-d: decode)</span>
+<span class="cmd">tcpdump</span> <span class="flag">-d</span> 'tcp port 80'
+<span class="cmt"># (000) ldh  [12]        — EtherType yükle</span>
+<span class="cmt"># (001) jeq  #0x86dd     — IPv6 mı?</span>
+<span class="cmt"># (002) ldb  [20]        — protocol byte</span>
+<span class="cmt"># ... (devam eder)</span>
+
+<span class="cmt"># -dd: C dizisi formatında yaz</span>
+<span class="cmd">tcpdump</span> <span class="flag">-dd</span> 'udp port 53'
+<span class="cmt"># { 0x28, 0, 0, 0x0000000c },</span>
+<span class="cmt"># { 0x15, 0, 8, 0x00000800 },</span>
+<span class="cmt"># ...</span></code></pre>
+  </div>
+
+  <h3>SO_ATTACH_FILTER ile filtre uygulama</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;linux/filter.h&gt;
+#include &lt;sys/socket.h&gt;
+
+/*
+ * Örnek: yalnızca ARP paketlerini geçiren filtre
+ * tcpdump -dd 'arp' çıktısından alındı
+ * EtherType 0x0806 kontrolü
+ */
+static struct sock_filter arp_filter[] = {
+    /* ldh  [12]: EtherType alanını yükle */
+    { 0x28, 0, 0, 0x0000000c },
+    /* jeq  #0x806: ARP ise kabul (ret 0xffff), değilse düşür (ret 0) */
+    { 0x15, 0, 1, 0x00000806 },
+    /* ret  #0xffff: paketi kabul et (65535 bayt) */
+    { 0x06, 0, 0, 0x0000ffff },
+    /* ret  #0: paketi düşür */
+    { 0x06, 0, 0, 0x00000000 },
+};
+
+int attach_bpf_filter(int fd)
+{
+    struct sock_fprog prog = {
+        .len    = sizeof(arp_filter) / sizeof(arp_filter[0]),
+        .filter = arp_filter,
+    };
+
+    if (setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER,
+                   &amp;prog, sizeof(prog)) &lt; 0) {
+        perror("setsockopt SO_ATTACH_FILTER");
+        return -1;
+    }
+    return 0;
+}
+
+/* Filtreyi kaldır */
+int detach_bpf_filter(int fd)
+{
+    int dummy = 0;
+    return setsockopt(fd, SOL_SOCKET, SO_DETACH_FILTER,
+                      &amp;dummy, sizeof(dummy));
+}</code></pre>
+  </div>
+
+  <h3>TCP port 80 filtresi — tam örnek</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code>/* tcpdump -dd 'tcp and port 80' (IPv4 only) */
+static struct sock_filter tcp80_filter[] = {
+    { 0x28, 0, 0, 0x0000000c }, /* ldh [12]  EtherType    */
+    { 0x15, 0, 6, 0x00000800 }, /* jeq #0x800 IPv4?       */
+    { 0x30, 0, 0, 0x00000017 }, /* ldb [23]  proto        */
+    { 0x15, 0, 4, 0x00000006 }, /* jeq #6    TCP?         */
+    { 0x28, 0, 0, 0x00000014 }, /* ldh [20]  frag offset  */
+    { 0x45, 2, 0, 0x00001fff }, /* jset      fragment?    */
+    { 0xb1, 0, 0, 0x0000000e }, /* ldxb 4*([14]&amp;0xf)  IHL */
+    { 0x48, 0, 0, 0x0000000e }, /* ldh [x+14] src port    */
+    { 0x15, 2, 0, 0x00000050 }, /* jeq #80                */
+    { 0x48, 0, 0, 0x00000010 }, /* ldh [x+16] dst port    */
+    { 0x15, 0, 1, 0x00000050 }, /* jeq #80                */
+    { 0x06, 0, 0, 0x00040000 }, /* ret #262144 KABUL      */
+    { 0x06, 0, 0, 0x00000000 }, /* ret #0      DÜŞÜR      */
+};</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>cBPF filtreleri TPACKET ile birlikte kullanılabilir ancak ring buffer oluşturulmadan <strong>önce</strong> uygulanmalıdır. Ring kurulduktan sonra eklenen filtreler ring'e giren paketleri etkilemez; sıra önemlidir: socket() → SO_ATTACH_FILTER → PACKET_VERSION → PACKET_RX_RING → mmap() → bind().</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>cBPF: kernel içinde çalışan sanal makine — kullanıcı alanına kopyalamadan filtreler</li>
+      <li>tcpdump -dd ile herhangi bir BPF ifadesi için C dizisi üretilebilir</li>
+      <li>SO_ATTACH_FILTER ile soket'e filtre bağla; SO_DETACH_FILTER ile kaldır</li>
+      <li>TPACKET kullanımında filtre ring buffer'dan önce eklenmelidir</li>
+    </ul>
+  </div>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Performans ve RT kullanım</h2>
+  <p class="section-lead">Yüksek hızlı paket yakalama veya gerçek zamanlı (RT) ağ uygulamaları için CPU affinite ayarı, SCHED_FIFO zamanlayıcı politikası ve busy-polling teknikleri kritik öneme sahiptir.</p>
+
+  <h3>CPU affinite</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code>#define _GNU_SOURCE
+#include &lt;sched.h&gt;
+#include &lt;pthread.h&gt;
+
+/* Mevcut thread'i belirli CPU'ya sabitle */
+int pin_to_cpu(int cpu)
+{
+    cpu_set_t cpuset;
+    CPU_ZERO(&amp;cpuset);
+    CPU_SET(cpu, &amp;cpuset);
+    return sched_setaffinity(0, sizeof(cpuset), &amp;cpuset);
+}
+
+/* SCHED_FIFO: preemption olmayan RT zamanlayıcı */
+int set_rt_priority(int prio)  /* prio: 1–99 */
+{
+    struct sched_param sp = { .sched_priority = prio };
+    return sched_setscheduler(0, SCHED_FIFO, &amp;sp);
+}
+
+/* mlockall: tüm belleği RAM'de kilitle, page fault önle */
+#include &lt;sys/mman.h&gt;
+void lock_memory(void)
+{
+    mlockall(MCL_CURRENT | MCL_FUTURE);
+}</code></pre>
+  </div>
+
+  <h3>IRQ affinite — NIC kesmesini izole etme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># NIC IRQ numaralarını bul</span>
+<span class="cmd">grep</span> eth0 /proc/interrupts
+<span class="cmt"># 42:  0  0  0  1234  PCI-MSI eth0-TxRx-0</span>
+<span class="cmt"># 43:  0  0  0   567  PCI-MSI eth0-TxRx-1</span>
+
+<span class="cmt"># IRQ 42'yi CPU 2'ye sabitle</span>
+<span class="cmd">echo</span> 4 &gt; /proc/irq/42/smp_affinity   <span class="cmt"># bitmask: CPU 2 = bit 2 = 4</span>
+
+<span class="cmt"># irqbalance'ı devre dışı bırak (aksi takdirde değişikliği geri alır)</span>
+<span class="cmd">systemctl</span> stop irqbalance
+<span class="cmd">systemctl</span> disable irqbalance
+
+<span class="cmt"># isolcpus ile CPU'yu kernel zamanlayıcıdan çıkar (kernel cmdline)</span>
+<span class="cmt"># /etc/default/grub: GRUB_CMDLINE_LINUX="isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3"</span></code></pre>
+  </div>
+
+  <h3>Busy-polling (SO_BUSY_POLL)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>c</span><span class="dot">●</span></div>
+    <pre><code>/* Busy-poll süresi: poll() timeout yerine aktif döngü (µs) */
+int busy_poll_us = 50;  /* 50 µs busy-poll, sonra sleep */
+setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL,
+           &amp;busy_poll_us, sizeof(busy_poll_us));
+
+/* Sistem geneli ayar (root gerekir) */
+/* sysctl net.core.busy_poll=50    */
+/* sysctl net.core.busy_read=50    */</code></pre>
+  </div>
+
+  <h3>Paket düşme (drop) izleme</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># AF_PACKET istatistikleri (düşen paketler dahil)</span>
+<span class="cmd">ss</span> <span class="flag">-p</span> <span class="flag">--packet</span>
+<span class="cmt"># veya getsockopt ile programatik:</span>
+
+<span class="cmt"># NIC RX düşme istatistikleri</span>
+<span class="cmd">ethtool</span> <span class="flag">-S</span> eth0 <span class="flag">|</span> <span class="cmd">grep</span> <span class="flag">-i</span> drop
+<span class="cmd">ethtool</span> <span class="flag">-S</span> eth0 <span class="flag">|</span> <span class="cmd">grep</span> <span class="flag">-i</span> miss
+
+<span class="cmt"># Kernel ağ istatistikleri</span>
+<span class="cmd">cat</span> /proc/net/packet  <span class="cmt"># drops sütunu</span>
+<span class="cmd">netstat</span> <span class="flag">-s</span> <span class="flag">|</span> <span class="cmd">grep</span> <span class="flag">-i</span> overflow</code></pre>
+  </div>
+
+  <h3>RT uygulama için tam kurulum özeti</h3>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Adım</th><th>Komut / Ayar</th><th>Etki</th></tr></thead>
+      <tbody>
+        <tr><td>1. Kernel</td><td>CONFIG_PREEMPT_RT veya PREEMPT_FULL</td><td>Kernel preemption gecikmeyi azaltır</td></tr>
+        <tr><td>2. isolcpus</td><td>isolcpus=2,3 nohz_full=2,3</td><td>CPU'yu kernel zamanlayıcıdan izole eder</td></tr>
+        <tr><td>3. IRQ affinity</td><td>/proc/irq/N/smp_affinity</td><td>NIC kesmesini izole CPU'ya yönlendir</td></tr>
+        <tr><td>4. SCHED_FIFO</td><td>sched_setscheduler(SCHED_FIFO, 90)</td><td>Preemption olmayan RT çalışma</td></tr>
+        <tr><td>5. mlockall</td><td>MCL_CURRENT | MCL_FUTURE</td><td>Page fault latency ortadan kalkar</td></tr>
+        <tr><td>6. TPACKET_V3</td><td>tp_retire_blk_tov=1 ms</td><td>Düşük timeout = düşük gecikme</td></tr>
+        <tr><td>7. SO_BUSY_POLL</td><td>SO_BUSY_POLL=50 µs</td><td>Poll latency azalır, CPU artar</td></tr>
+        <tr><td>8. BPF filtre</td><td>SO_ATTACH_FILTER</td><td>Gereksiz paket kopyası önlenir</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>sched_setaffinity + isolcpus: yakalama thread'ini izole CPU'da tut</li>
+      <li>SCHED_FIFO prio 90 + mlockall: RT gecikmeyi minimize eder</li>
+      <li>IRQ affinity: NIC kesmesini yakalama CPU'suyla hizala</li>
+      <li>SO_BUSY_POLL: sub-millisecond gecikme için aktif polling — güç tüketimi artar</li>
+    </ul>
+  </div>
+</section>
+
+</main>

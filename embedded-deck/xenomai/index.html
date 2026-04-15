@@ -1,0 +1,983 @@
+---
+layout: tutorial
+title: "Xenomai — Dual-Kernel Hard Gerçek Zamanlı Linux"
+back_url: "../index.html"
+back_label: "Tüm eğitimler"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>GÖMÜLÜ LİNUX</span>
+    <span>XENOMAI</span>
+    <span>2026</span>
+  </div>
+  <h1>Xenomai<br><em>Dual-Kernel Hard Gerçek Zamanlı Linux</em></h1>
+  <p class="subtitle">Linux çekirdeğinin yanında Cobalt RTOS çalıştırarak mikrosaniye altı gecikme garantisi — PREEMPT-RT'nin yetmediği yerde Xenomai.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Xenomai neden var</a></li>
+    <li><a href="#s1">Xenomai mimarisi</a></li>
+    <li><a href="#s2">Xenomai 3 kurulumu</a></li>
+    <li><a href="#s3">POSIX skin</a></li>
+    <li><a href="#s4">Alchemy API</a></li>
+    <li><a href="#s5">Latency testi</a></li>
+    <li><a href="#s6">RTDM sürücü modeli</a></li>
+    <li><a href="#s7">Xenomai + CAN, SPI, UART</a></li>
+    <li><a href="#s8">Hata ayıklama</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">00</span> Xenomai neden var</h2>
+  <p class="section-lead">Genel amaçlı Linux çekirdeği, en iyi PREEMPT-RT yamasıyla bile belirli gerçek zamanlı görevler için yeterli gecikme garantisi veremez.</p>
+
+  <h3>PREEMPT-RT'nin sınırları</h3>
+  <p>PREEMPT-RT yaması Linux'u "soft real-time" düzeye taşır: büyük çoğunlukla 50–200 µs jitter elde edilir, ancak şu nedenlerle deterministik alt sınır garanti edilemez:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">IRQ thread latency</span><span class="desc">Donanım kesmeleri threaded IRQ olarak işlenir; yüksek yük altında Linux zamanlayıcısının öncelik kuyruğundan geçmesi gecikmeye yol açar</span></div>
+    <div class="param"><span class="name">spinlock → mutex dönüşümü</span><span class="desc">PREEMPT-RT'nin spinlock'ları preemption noktasına dönüşmesi bazı sürücü yollarında beklenmedik yoksunluk (starvation) üretir</span></div>
+    <div class="param"><span class="name">Linux memory subsystem</span><span class="desc">mlockall() ile sayfalar kilitlense bile page fault, TLB shootdown ve zone reclaim gecikmesi kaçınılamaz</span></div>
+    <div class="param"><span class="name">SMI (System Management Interrupt)</span><span class="desc">x86 platformlarında firmware kaynaklı SMI, tüm çekirdekleri durdurur; Linux bunun farkında bile değildir</span></div>
+  </div>
+
+  <h3>Hard RT gereksinimleri</h3>
+  <p>Bazı endüstriyel ve güvenlik kritik uygulamalar deterministik worst-case execution time (WCET) ister:</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Uygulama</th><th>Tipik deadline</th><th>Kabul edilebilir jitter</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>EtherCAT master (servo kontrol)</td><td>1 ms</td><td>&lt; 10 µs</td></tr>
+        <tr><td>Dijital osiloskopin örnekleme loop'u</td><td>100 µs</td><td>&lt; 1 µs</td></tr>
+        <tr><td>Motor akım kontrolü (FOC)</td><td>50 µs</td><td>&lt; 5 µs</td></tr>
+        <tr><td>Ses işleme (96 kHz, 4 kanal)</td><td>~10 µs</td><td>&lt; 2 µs</td></tr>
+        <tr><td>Güç elektroniği PWM zamanlaması</td><td>20 µs</td><td>&lt; 500 ns</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Dual-kernel yaklaşım</h3>
+  <p>Xenomai'nin çözümü, Linux'u küçük bir gerçek zamanlı mikro-çekirdeğin (Cobalt) altında "idle task" olarak çalıştırmaktır. Donanım kesmeleri önce Cobalt'a gider; Cobalt RT görevini işledikten sonra Linux'a iletir.</p>
+
+  <div class="flow">
+    <pre>
+Donanım IRQ
+    │
+    ▼
+ Cobalt (Xenomai mikro-çekirdek)
+    │  RT görevleri burada çalışır — deterministic
+    │  Linux'a iletilmemiş IRQ'lar yok sayılır
+    ▼
+ Linux (co-kernel — en yüksek öncelikli idle task)
+    │  Normal süreçler, sürücüler, ağ, dosya sistemi
+    ▼
+ Donanım (I-pipe / Dovetail interrupt pipeline)
+    </pre>
+  </div>
+
+  <h3>PREEMPT-RT vs Xenomai karşılaştırması</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Kriter</th><th>PREEMPT-RT</th><th>Xenomai (Cobalt)</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Minimum latency</td><td>~10–30 µs</td><td>&lt; 1 µs (ideal)</td></tr>
+        <tr><td>Worst-case jitter</td><td>100–500 µs yük altında</td><td>2–10 µs tipik</td></tr>
+        <tr><td>POSIX uyumu</td><td>Tam POSIX</td><td>POSIX skin (kısmi)</td></tr>
+        <tr><td>Sürücü uyumu</td><td>Tüm Linux sürücüleri</td><td>RTDM dışı sürücüler "mode switch" üretir</td></tr>
+        <tr><td>Öğrenme eğrisi</td><td>Düşük — standart Linux geliştirme</td><td>Yüksek — dual-kernel kavramları</td></tr>
+        <tr><td>Kernel yaması</td><td>Standart, upstream'e giriyor</td><td>Dovetail yaması gerekir</td></tr>
+        <tr><td>Kullanım alanı</td><td>Genel soft-RT, IIoT</td><td>Hard-RT, servo, güç elektroniği</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> Xenomai mimarisi</h2>
+  <p class="section-lead">Xenomai 3'ün mimarisi iki katmandan oluşur: çekirdek tarafında Dovetail interrupt pipeline ve Cobalt mikro-çekirdek; kullanıcı tarafında libcobalt ve çeşitli API skin'ler.</p>
+
+  <h3>I-pipe'tan Dovetail'e</h3>
+  <p>Xenomai 2, Linux çekirdeğini "<strong>I-pipe</strong>" (interrupt pipeline) yamasıyla değiştiriyordu. Xenomai 3.x, Linux 5.4+ ile birlikte daha temiz ve upstream dostu olan <strong>Dovetail</strong> arayüzüne geçti. Dovetail, Linux'un IRQ akışına iki ayrı "stage" (sahne) ekler:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">OOB stage (Out-Of-Band)</span><span class="desc">Xenomai/Cobalt'ın IRQ'ları işlediği düşük gecikme kanalı; Linux IRQ alt sistemi bu aşamada devre dışı</span></div>
+    <div class="param"><span class="name">In-band stage</span><span class="desc">Normal Linux IRQ işleme yolu; OOB stage tamamlandıktan sonra devreye girer</span></div>
+  </div>
+
+  <div class="flow">
+    <pre>
+Donanım IRQ gelir
+       │
+  ┌────▼────────────────────────┐
+  │   Dovetail IRQ pipeline     │
+  │  ┌─────────────────────┐    │
+  │  │  OOB stage (Cobalt) │◄── RT görevleri, RT timer
+  │  └──────────┬──────────┘    │
+  │             │ irq_exit_oob()│
+  │  ┌──────────▼──────────┐    │
+  │  │  In-band (Linux)    │◄── normal sürücüler, syscall
+  │  └─────────────────────┘    │
+  └─────────────────────────────┘
+    </pre>
+  </div>
+
+  <h3>Cobalt çekirdeği</h3>
+  <p>Cobalt, Linux çekirdeği modülü olarak yüklenen küçük bir RTOS'tur. Temel bileşenleri:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">xntimer</span><span class="desc">Donanım timer'ını doğrudan programlayan, Linux'un yüksek çözünürlüklü timer alt sisteminden bağımsız RT zamanlayıcı</span></div>
+    <div class="param"><span class="name">xnthread</span><span class="desc">RT görevlerinin çekirdek temsili; Linux task_struct ile eşleşik yaşar (dual-personality thread)</span></div>
+    <div class="param"><span class="name">xnsched</span><span class="desc">Cobalt'ın FIFO/RR/sporadic zamanlayıcısı; Linux CFS'ten tamamen bağımsız</span></div>
+    <div class="param"><span class="name">xnsynch</span><span class="desc">RT mutex, semafor, event bayrakları — priority inheritance dahil</span></div>
+    <div class="param"><span class="name">RTDM</span><span class="desc">Real-Time Driver Model — RT görevlerinden çağrılabilen sürücü arayüzü</span></div>
+  </div>
+
+  <h3>Kullanıcı alanı: libcobalt ve skin'ler</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Bileşen</span></th><th>Açıklama</th><th>Başlık</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>libcobalt</td><td>Cobalt syscall wrapper; glibc'nin üstüne biner</td><td>dahili</td></tr>
+        <tr><td>POSIX skin</td><td>pthread, mq_*, sem_* — mevcut kodu port etmek kolay</td><td>pthread.h (cobalt)</td></tr>
+        <tr><td>Alchemy API</td><td>VxWorks/pSOS'a benzer RT_TASK, RT_MUTEX, RT_SEM API'si</td><td>alchemy/*.h</td></tr>
+        <tr><td>VXWORKS skin</td><td>VxWorks uyumu (taskSpawn, semTake vb.)</td><td>vxworks/*.h</td></tr>
+        <tr><td>pSOS skin</td><td>pSOS+ uyumu (t_start, sm_p vb.)</td><td>psos/*.h</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Mode switch (alan geçişi)</h3>
+  <p>Bir RT görevinin Linux syscall'u çağırması (örn. <code>printf</code>, <code>open</code>, <code>malloc</code>) "mode switch" tetikler: görev OOB stage'den in-band'e geçer ve RT güvencesi kaybolur. Bu durum <code>/proc/xenomai/stat</code>'ta MSW sütununda sayılır.</p>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> Xenomai 3 kurulumu</h2>
+  <p class="section-lead">Xenomai kurulumu üç aşamadan oluşur: Linux çekirdeğine Dovetail yaması uygulamak, yamayı içeren çekirdeği derlemek ve Xenomai kullanıcı alanı kitaplıklarını derlemek.</p>
+
+  <h3>Gereksinimler</h3>
+  <div class="params">
+    <div class="param"><span class="name">Kernel</span><span class="desc">Linux 5.10 veya 6.1 LTS önerilir; Dovetail yaması bu sürümlere düzenli bakım alır</span></div>
+    <div class="param"><span class="name">Xenomai sürümü</span><span class="desc">Xenomai 3.2.x (kararlı), kaynak: https://xenomai.org/downloads/xenomai/stable/</span></div>
+    <div class="param"><span class="name">Araçlar</span><span class="desc">gcc, make, flex, bison, libelf-dev, libssl-dev, autoconf, libtool</span></div>
+  </div>
+
+  <h3>Dovetail yamasını uygulama</h3>
+<pre><code># 1. Kaynak indirme
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.80.tar.xz
+wget https://xenomai.org/downloads/xenomai/stable/xenomai-3.2.3.tar.bz2
+
+tar xf linux-6.1.80.tar.xz
+tar xf xenomai-3.2.3.tar.bz2
+
+# 2. Dovetail yamasını uygula
+cd xenomai-3.2.3
+scripts/prepare-kernel.sh \
+    --linux=../linux-6.1.80 \
+    --arch=arm64 \
+    --dovetail=dovetail-6.1-arm64.patch
+
+# 3. Kernel konfigürasyonu
+cd ../linux-6.1.80
+make ARCH=arm64 defconfig
+
+# Xenomai için zorunlu seçenekler
+# CONFIG_XENOMAI=y
+# CONFIG_DOVETAIL=y
+# CONFIG_IPIPE_LEGACY=n  (Dovetail kullanıyoruz)
+# CONFIG_HZ_1000=y       (daha yüksek timer çözünürlüğü)
+# CONFIG_NO_HZ_FULL=n    (RT ile uyumsuz)
+# CONFIG_CPU_FREQ=n      (frekans ölçekleme RT gecikme üretir)
+# CONFIG_CPU_IDLE=n      (C-state gecikmesi engellenir)
+
+make ARCH=arm64 menuconfig</code></pre>
+
+  <h3>Çekirdek derleme</h3>
+<pre><code>make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+     -j$(nproc) Image modules dtbs
+
+make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+     INSTALL_MOD_PATH=../rootfs modules_install
+
+# Çekirdek imajını kopyala
+cp arch/arm64/boot/Image ../rootfs/boot/Image-xenomai
+cp arch/arm64/boot/dts/*/my-board.dtb ../rootfs/boot/</code></pre>
+
+  <h3>Xenomai kullanıcı alanı derleme</h3>
+<pre><code>cd xenomai-3.2.3
+
+./configure \
+    --host=aarch64-linux-gnu \
+    --with-core=cobalt \
+    --enable-smp \
+    --disable-lores-clock \
+    CFLAGS="-O2 -march=armv8-a" \
+    LDFLAGS="-Wl,-rpath,/usr/xenomai/lib"
+
+make -j$(nproc)
+make DESTDIR=../rootfs install
+
+# Kurulan dosyalar:
+# /usr/xenomai/lib/libcobalt.so  — RT syscall wrapper
+# /usr/xenomai/lib/libalchemy.so — Alchemy API
+# /usr/xenomai/bin/xeno-latency  — latency test aracı
+# /usr/xenomai/bin/xeno-config   — derleme bayrakları</code></pre>
+
+  <h3>Uygulama derleme</h3>
+<pre><code># xeno-config ile bayrakları al
+CFLAGS=$(xeno-config --skin=posix --cflags)
+LDFLAGS=$(xeno-config --skin=posix --ldflags)
+
+aarch64-linux-gnu-gcc $CFLAGS -o rt_task my_rt_task.c $LDFLAGS
+
+# Alternatif: Alchemy skin
+CFLAGS=$(xeno-config --skin=alchemy --cflags)
+LDFLAGS=$(xeno-config --skin=alchemy --ldflags)
+aarch64-linux-gnu-gcc $CFLAGS -o alchemy_task alchemy_task.c $LDFLAGS</code></pre>
+
+  <h3>Çalışma zamanı gereksinimleri</h3>
+<pre><code># RT görevleri için önerilen sistem ayarları (/etc/sysctl.conf)
+kernel.sched_rt_runtime_us = -1   # RT bandwidth sınırı kaldır
+
+# Kullanıcı limitleri (/etc/security/limits.conf)
+@realtime  -  rtprio   99
+@realtime  -  memlock  unlimited
+
+# Modüller
+modprobe xenomai
+modprobe xeno_cobalt</code></pre>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> POSIX skin</h2>
+  <p class="section-lead">Xenomai'nin POSIX skin'i, mevcut POSIX çok iş parçacıklı kodu Cobalt üzerine minimal değişiklikle taşımak için en uygun yoldur.</p>
+
+  <h3>RT thread oluşturma</h3>
+<pre><code>#include &lt;stdio.h&gt;
+#include &lt;pthread.h&gt;
+#include &lt;sched.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;xenomai/init.h&gt;
+
+#define TASK_PERIOD_NS  1000000LL   /* 1 ms */
+#define STACK_SIZE      65536
+
+static void *rt_loop(void *arg)
+{
+    struct timespec next;
+    int overruns = 0;
+
+    /* Cobalt POSIX: clock_gettime ile zamanı al */
+    clock_gettime(CLOCK_MONOTONIC, &amp;next);
+
+    for (;;) {
+        /* Periyodik bekleme */
+        next.tv_nsec += TASK_PERIOD_NS;
+        if (next.tv_nsec &gt;= 1000000000LL) {
+            next.tv_nsec -= 1000000000LL;
+            next.tv_sec++;
+        }
+
+        int ret = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &amp;next, NULL);
+        if (ret == EINTR) {
+            overruns++;
+            continue;
+        }
+
+        /* --- Gerçek zamanlı görev gövdesi --- */
+        do_control_loop();
+    }
+    return NULL;
+}
+
+int main(int argc, char *argv[])
+{
+    pthread_t thread;
+    pthread_attr_t attr;
+    struct sched_param param;
+
+    /* Xenomai başlatma */
+    xenomai_init(&amp;argc, &amp;argv);
+
+    /* Tüm belleği kilitle — sayfa hatasını önle */
+    mlockall(MCL_CURRENT | MCL_FUTURE);
+
+    pthread_attr_init(&amp;attr);
+    pthread_attr_setstacksize(&amp;attr, STACK_SIZE);
+    pthread_attr_setinheritsched(&amp;attr, PTHREAD_EXPLICIT_SCHED);
+    pthread_attr_setschedpolicy(&amp;attr, SCHED_FIFO);
+
+    param.sched_priority = 80;
+    pthread_attr_setschedparam(&amp;attr, &amp;param);
+
+    pthread_create(&amp;thread, &amp;attr, rt_loop, NULL);
+    pthread_join(thread, NULL);
+    return 0;
+}</code></pre>
+
+  <h3>Priority Inheritance Protocol (PIP)</h3>
+  <p>Xenomai POSIX skin'de mutex oluşturulurken protokol açıkça belirtilmelidir; aksi hâlde öncelik terslemesi (priority inversion) oluşabilir.</p>
+<pre><code>#include &lt;pthread.h&gt;
+
+pthread_mutex_t rt_mutex;
+pthread_mutexattr_t mattr;
+
+void setup_rt_mutex(void)
+{
+    pthread_mutexattr_init(&amp;mattr);
+
+    /* Priority Inheritance protokolü */
+    pthread_mutexattr_setprotocol(&amp;mattr, PTHREAD_PRIO_INHERIT);
+
+    /* Robust mutex — sahip thread ölürse kurtarılabilir */
+    pthread_mutexattr_setrobust(&amp;mattr, PTHREAD_MUTEX_ROBUST);
+
+    /* Priority Protect (ceiling) alternatif:
+     * pthread_mutexattr_setprotocol(&amp;mattr, PTHREAD_PRIO_PROTECT);
+     * pthread_mutexattr_setprioceiling(&amp;mattr, 90);
+     */
+
+    pthread_mutex_init(&amp;rt_mutex, &amp;mattr);
+    pthread_mutexattr_destroy(&amp;mattr);
+}</code></pre>
+
+  <h3>RT mesaj kuyruğu</h3>
+<pre><code>#include &lt;mqueue.h&gt;
+
+mqd_t create_rt_mqueue(const char *name)
+{
+    struct mq_attr attr = {
+        .mq_flags   = 0,
+        .mq_maxmsg  = 16,
+        .mq_msgsize = 64,
+        .mq_curmsgs = 0,
+    };
+
+    /* Cobalt POSIX mq: /cobalt/mqueue ad alanında */
+    mqd_t mq = mq_open(name, O_CREAT | O_RDWR, 0666, &amp;attr);
+    if (mq == (mqd_t)-1) {
+        perror("mq_open");
+        return (mqd_t)-1;
+    }
+    return mq;
+}</code></pre>
+
+  <h3>Mode switch kaçınma kuralları</h3>
+  <div class="params">
+    <div class="param"><span class="name">printf / fprintf</span><span class="desc">Linux stdio kullanır — mode switch. Bunun yerine Xenomai'nin rt_printf() veya serbest çalışmada log buffer kullanın</span></div>
+    <div class="param"><span class="name">malloc / free</span><span class="desc">glibc heap — mode switch. RT thread başlamadan önce tüm belleği tahsis et, mlockall() ile kilitle</span></div>
+    <div class="param"><span class="name">open / read / write</span><span class="desc">Linux VFS — mode switch. RT'de dosya I/O gerekiyorsa RTDM sürücüsü veya paylaşımlı bellek kullan</span></div>
+    <div class="param"><span class="name">sem_open</span><span class="desc">Cobalt sem_open POSIX named semafor sağlar — mode switch yok. Linux semaphore.h ile karıştırma</span></div>
+  </div>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> Alchemy API</h2>
+  <p class="section-lead">Alchemy API, VxWorks ve pSOS'tan alışkın geliştiriciler için daha sezgisel bir RT programlama modeli sunar; RT_TASK, RT_MUTEX, RT_SEM, RT_QUEUE gibi nesne türleri içerir.</p>
+
+  <h3>RT_TASK oluşturma ve periyodik çalıştırma</h3>
+<pre><code>#include &lt;alchemy/task.h&gt;
+#include &lt;alchemy/timer.h&gt;
+
+RT_TASK control_task;
+
+void control_loop(void *arg)
+{
+    RTIME period = 1000000;  /* 1 ms, nanosaniye cinsinden */
+
+    /* Periyodik göreve dönüştür */
+    rt_task_set_periodic(NULL, TM_NOW, period);
+
+    for (;;) {
+        rt_task_wait_period(NULL);
+
+        /* --- Kontrol algoritması --- */
+        read_encoder();
+        compute_pid();
+        write_pwm();
+    }
+}
+
+int main(void)
+{
+    /* RT_TASK oluştur: isim, yığın boyutu, öncelik, mod */
+    rt_task_create(&amp;control_task, "control", 0, 80, T_JOINABLE);
+
+    /* Görevi başlat */
+    rt_task_start(&amp;control_task, control_loop, NULL);
+
+    /* Ana thread Cobalt değil; rt_task_join ile bekle */
+    rt_task_join(&amp;control_task);
+    return 0;
+}</code></pre>
+
+  <h3>RT_MUTEX</h3>
+<pre><code>#include &lt;alchemy/mutex.h&gt;
+
+RT_MUTEX shared_mutex;
+
+void init_resources(void)
+{
+    /* Mutex oluştur — priority inheritance otomatik */
+    rt_mutex_create(&amp;shared_mutex, "shared_mtx");
+}
+
+void producer_task(void *arg)
+{
+    for (;;) {
+        rt_mutex_acquire(&amp;shared_mutex, TM_INFINITE);
+
+        update_shared_buffer();
+
+        rt_mutex_release(&amp;shared_mutex);
+
+        rt_task_sleep(500000);  /* 500 µs */
+    }
+}
+
+void cleanup(void)
+{
+    rt_mutex_delete(&amp;shared_mutex);
+}</code></pre>
+
+  <h3>RT_SEM ve RT_QUEUE</h3>
+<pre><code>#include &lt;alchemy/sem.h&gt;
+#include &lt;alchemy/queue.h&gt;
+
+RT_SEM irq_sem;
+RT_QUEUE data_queue;
+
+/* Interrupt handler tarafından sinyal gönderilir */
+void irq_handler_rt(void)
+{
+    rt_sem_v(&amp;irq_sem);  /* semafor arttır */
+}
+
+void processing_task(void *arg)
+{
+    struct data_packet pkt;
+    ssize_t sz;
+
+    for (;;) {
+        /* IRQ gelene kadar bekle */
+        rt_sem_p(&amp;irq_sem, TM_INFINITE);
+
+        /* Kuyruğa veri gönder (non-blocking) */
+        sz = rt_queue_write(&amp;data_queue, &amp;pkt, sizeof(pkt), Q_NORMAL);
+        if (sz &lt; 0)
+            rt_printf("Queue full: %d\n", (int)sz);
+    }
+}
+
+void init_ipc(void)
+{
+    rt_sem_create(&amp;irq_sem, "irq_sem", 0, S_PRIO);
+    /* 16 mesaj, her biri 128 byte */
+    rt_queue_create(&amp;data_queue, "data_q", 16 * 128, 16, Q_PRIO);
+}</code></pre>
+
+  <h3>RT_EVENT — olay bayrakları</h3>
+<pre><code>#include &lt;alchemy/event.h&gt;
+
+RT_EVENT sys_events;
+
+#define EVT_ENCODER_READY  0x01
+#define EVT_ADC_READY      0x02
+#define EVT_FAULT          0x80
+
+void sensor_task(void *arg)
+{
+    for (;;) {
+        read_encoder_hw();
+        rt_event_signal(&amp;sys_events, EVT_ENCODER_READY);
+        rt_task_sleep(1000000);
+    }
+}
+
+void fusion_task(void *arg)
+{
+    unsigned int flags;
+
+    for (;;) {
+        /* Her iki olay da gelene kadar bekle */
+        rt_event_wait(&amp;sys_events,
+                      EVT_ENCODER_READY | EVT_ADC_READY,
+                      &amp;flags,
+                      EV_ALL,       /* AND koşulu */
+                      TM_INFINITE);
+
+        compute_sensor_fusion();
+    }
+}</code></pre>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> Latency testi</h2>
+  <p class="section-lead">Xenomai kurulumunun doğrulanması için yerleşik <code>xeno-latency</code> aracı kullanılır; SMP sistemlerde her CPU çekirdeği ayrı ayrı test edilmelidir.</p>
+
+  <h3>xeno-latency kullanımı</h3>
+<pre><code># Temel latency testi — 1000 µs periyot, 10000 örnek
+xeno-latency -p 1000 -l 10000
+
+# SMP: tüm CPU'ları test et (-s: SMP modu)
+xeno-latency -s -p 1000 -l 50000
+
+# Histogram çıktısı (her 1 µs'lik aralık için sayı)
+xeno-latency -H 100 -p 1000 -l 100000 &gt; latency_hist.txt
+
+# Yük altında test: başka terminalde stress çalıştır
+stress-ng --cpu 0 --io 4 --vm 2 --vm-bytes 256M &amp;
+xeno-latency -p 500 -l 100000</code></pre>
+
+  <h3>Örnek çıktı ve yorum</h3>
+<pre><code>== Sampling period: 1000 us
+== Test mode: periodic user-mode task
+== All results in microseconds
+
+warming up...
+RTT|  00:00:01  (periodic user-mode task, 1000 us period, priority 99)
+RTH|----lat min|----lat avg|----lat max|-overrun|---msw|---lat best|--lat worst
+RTD|      0.499|      0.612|      1.847|       0|     0|      0.499|      1.847
+RTD|      0.501|      0.618|      2.103|       0|     0|      0.499|      2.103
+RTD|      0.498|      0.609|      1.956|       0|     0|      0.498|      2.103
+...
+---|-----------|-----------|-----------|--------|------|-----------|----------
+RTS|      0.498|      0.614|      3.201|       0|     0|      0.498|      3.201</code></pre>
+
+  <div class="params">
+    <div class="param"><span class="name">lat min/avg/max</span><span class="desc">Minimum, ortalama ve maksimum gecikme (µs) — max değeri WCET için kritik</span></div>
+    <div class="param"><span class="name">overrun</span><span class="desc">Periyot aşımı sayısı — sıfır olmalı; artıyorsa CPU yükü veya konfigürasyon hatası var</span></div>
+    <div class="param"><span class="name">msw</span><span class="desc">Mode switch sayısı — sıfır olmalı; artıyorsa test programı Linux syscall çağırıyor</span></div>
+  </div>
+
+  <h3>PREEMPT-RT ile karşılaştırmalı ölçüm</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Ortam</th><th>lat min</th><th>lat avg</th><th>lat max (yük altında)</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Vanilla Linux 6.1</td><td>5 µs</td><td>25 µs</td><td>800 µs+</td></tr>
+        <tr><td>PREEMPT-RT Linux 6.1</td><td>3 µs</td><td>12 µs</td><td>120 µs</td></tr>
+        <tr><td>Xenomai 3.2 (Cobalt)</td><td>0.5 µs</td><td>0.8 µs</td><td>5 µs</td></tr>
+        <tr><td>Xenomai 3.2 + CPU izolasyon</td><td>0.3 µs</td><td>0.5 µs</td><td>2 µs</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>CPU izolasyonu ile latency iyileştirme</h3>
+<pre><code># Kernel komut satırına ekle (grub veya device tree bootargs)
+isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3
+
+# RT görevi için izole CPU'yu belirle
+cpu_set_t cpuset;
+CPU_ZERO(&amp;cpuset);
+CPU_SET(2, &amp;cpuset);
+sched_setaffinity(0, sizeof(cpuset), &amp;cpuset);
+
+# İzole CPU'da IRQ affinity ayarı
+echo 3 &gt; /proc/irq/&lt;irq_num&gt;/smp_affinity_list</code></pre>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> RTDM sürücü modeli</h2>
+  <p class="section-lead">RTDM (Real-Time Driver Model), RT görevlerinden çağrılabilen çekirdek sürücüsü yazmanın standart Xenomai yoludur; mode switch olmadan donanım erişimi sağlar.</p>
+
+  <h3>RTDM sürücü çatısı</h3>
+<pre><code>#include &lt;rtdm/driver.h&gt;
+
+struct my_rtdm_priv {
+    rtdm_irq_t     irq_handle;
+    rtdm_lock_t    lock;
+    unsigned int   tx_count;
+    unsigned int   rx_count;
+};
+
+/* Dosya işlemleri */
+static int my_open(struct rtdm_fd *fd, int oflags)
+{
+    struct my_rtdm_priv *ctx = rtdm_fd_to_private(fd);
+    rtdm_lock_init(&amp;ctx-&gt;lock);
+    ctx-&gt;tx_count = 0;
+    ctx-&gt;rx_count = 0;
+    return 0;
+}
+
+static void my_close(struct rtdm_fd *fd)
+{
+    /* kaynakları serbest bırak */
+}
+
+static ssize_t my_read_rt(struct rtdm_fd *fd,
+                           void __user *buf, size_t size)
+{
+    struct my_rtdm_priv *ctx = rtdm_fd_to_private(fd);
+    rtdm_lockctx_t lock_ctx;
+    char kbuf[64];
+    ssize_t ret;
+
+    rtdm_lock_get_irqsave(&amp;ctx-&gt;lock, lock_ctx);
+    ret = read_hw_register(kbuf, size);
+    ctx-&gt;rx_count += ret;
+    rtdm_lock_put_irqrestore(&amp;ctx-&gt;lock, lock_ctx);
+
+    return rtdm_safe_copy_to_user(fd, buf, kbuf, ret);
+}
+
+static ssize_t my_write_rt(struct rtdm_fd *fd,
+                            const void __user *buf, size_t size)
+{
+    struct my_rtdm_priv *ctx = rtdm_fd_to_private(fd);
+    char kbuf[64];
+
+    if (rtdm_safe_copy_from_user(fd, kbuf, buf, size))
+        return -EFAULT;
+
+    write_hw_register(kbuf, size);
+    ctx-&gt;tx_count += size;
+    return size;
+}
+
+/* IOCTL — RT bağlamından çağrılabilir */
+static int my_ioctl_rt(struct rtdm_fd *fd,
+                        unsigned int request, void __user *arg)
+{
+    switch (request) {
+    case MY_IOC_RESET:
+        reset_hw();
+        return 0;
+    default:
+        return -ENOTTY;
+    }
+}
+
+static struct rtdm_fd_ops my_fd_ops = {
+    .open      = my_open,
+    .close     = my_close,
+    .read_rt   = my_read_rt,
+    .write_rt  = my_write_rt,
+    .ioctl_rt  = my_ioctl_rt,
+};
+
+static struct rtdm_driver my_driver = {
+    .profile_info = RTDM_PROFILE_INFO(my_drv,
+                        RTDM_CLASS_SERIAL, 0, 1),
+    .device_flags  = RTDM_NAMED_DEVICE,
+    .device_count  = 1,
+    .context_size  = sizeof(struct my_rtdm_priv),
+    .ops           = &amp;my_fd_ops,
+};
+
+static struct rtdm_device my_device = {
+    .driver = &amp;my_driver,
+    .label  = "my_rtdm%d",
+};
+
+static int __init my_rtdm_init(void)
+{
+    return rtdm_dev_register(&amp;my_device);
+}
+
+static void __exit my_rtdm_exit(void)
+{
+    rtdm_dev_unregister(&amp;my_device);
+}
+
+module_init(my_rtdm_init);
+module_exit(my_rtdm_exit);
+MODULE_LICENSE("GPL");</code></pre>
+
+  <h3>RTDM IRQ yönetimi</h3>
+<pre><code>/* RT IRQ handler — OOB stage'de çalışır */
+static int my_irq_handler(rtdm_irq_t *irq)
+{
+    struct my_rtdm_priv *ctx = rtdm_irq_get_arg(irq, struct my_rtdm_priv);
+
+    /* Donanım kesme bayrağını temizle */
+    clear_hw_irq();
+
+    /* RT event sinyal gönder */
+    rtdm_event_signal(&amp;ctx-&gt;data_ready);
+
+    return RTDM_IRQ_HANDLED;
+}
+
+/* IRQ'yu kaydet */
+ret = rtdm_irq_request(&amp;ctx-&gt;irq_handle,
+                        platform_get_irq(pdev, 0),
+                        my_irq_handler,
+                        RTDM_IRQTYPE_EDGE,
+                        "my_rtdm",
+                        ctx);</code></pre>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> Xenomai + CAN, SPI, UART</h2>
+  <p class="section-lead">Xenomai, endüstriyel haberleşme protokolleri için özel RTDM sürücüler içerir; RTnet (Ethernet), XDDP (RT↔Linux köprü soket) ve platforma özgü CAN/SPI/UART sürücüleri bunların başında gelir.</p>
+
+  <h3>XDDP: RT görev ↔ Linux süreci köprüsü</h3>
+<pre><code>/* ---- Xenomai (RT) tarafı ---- */
+#include &lt;rtdm/ipc.h&gt;
+
+int rt_to_linux_bridge(void)
+{
+    struct sockaddr_ipc saddr;
+    int sock, ret;
+    char msg[] = "sensor_data";
+
+    sock = socket(AF_RTIPC, SOCK_DGRAM, IPCPROTO_XDDP);
+
+    /* RT tarafı: port 0'a bağlan */
+    saddr.sipc_family = AF_RTIPC;
+    saddr.sipc_port   = 0;
+    bind(sock, (struct sockaddr *)&amp;saddr, sizeof(saddr));
+
+    /* Linux tarafına gönder (/dev/rtp0 üzerinden okunabilir) */
+    sendto(sock, msg, sizeof(msg), 0, NULL, 0);
+
+    close(sock);
+    return 0;
+}
+
+/* ---- Linux (non-RT) tarafı ---- */
+int linux_reader(void)
+{
+    int fd;
+    char buf[64];
+
+    fd = open("/dev/rtp0", O_RDONLY);
+    read(fd, buf, sizeof(buf));   /* RT'den gelen veri */
+    printf("Received: %s\n", buf);
+    close(fd);
+    return 0;
+}</code></pre>
+
+  <h3>RT CAN sürücüsü (RTnet)</h3>
+<pre><code>/* RTnet CAN socket — RT bağlamından kullanılabilir */
+#include &lt;rtdm/can.h&gt;
+
+int rt_can_init(int ifindex)
+{
+    struct sockaddr_can addr;
+    int sock;
+
+    sock = rt_dev_socket(PF_CAN, SOCK_RAW, CAN_RAW);
+    if (sock &lt; 0) return sock;
+
+    addr.can_family  = AF_CAN;
+    addr.can_ifindex = ifindex;
+
+    rt_dev_bind(sock, (struct sockaddr *)&amp;addr, sizeof(addr));
+
+    /* CAN frame gönder */
+    struct can_frame frame = {
+        .can_id  = 0x123,
+        .can_dlc = 4,
+        .data    = {0xDE, 0xAD, 0xBE, 0xEF},
+    };
+    rt_dev_send(sock, &amp;frame, sizeof(frame), 0);
+
+    rt_dev_close(sock);
+    return 0;
+}</code></pre>
+
+  <h3>RT SPI transferi</h3>
+<pre><code>/* Xenomai SPI RTDM sürücüsü ile RT transferi */
+#include &lt;rtdm/spi.h&gt;
+
+int rt_spi_transfer(int fd)
+{
+    struct rtdm_spi_config cfg = {
+        .speed_hz      = 10000000,   /* 10 MHz */
+        .bits_per_word = 8,
+        .mode          = SPI_MODE_0,
+    };
+
+    rtdm_ioctl(fd, SPI_RTIOC_SET_CONFIG, &amp;cfg);
+
+    uint8_t tx[] = {0x01, 0x02, 0x03, 0x04};
+    uint8_t rx[4] = {0};
+
+    struct rtdm_spi_iobufs bufs = {
+        .io_len    = sizeof(tx),
+        .i_offset  = 0,
+        .o_offset  = sizeof(tx),
+        .map_len   = sizeof(tx) * 2,
+    };
+
+    /* DMA eşlemeli çift tamponlu transfer */
+    rtdm_ioctl(fd, SPI_RTIOC_SET_IOBUFS, &amp;bufs);
+    memcpy(bufs.tx_buf, tx, sizeof(tx));
+
+    rtdm_write(fd, NULL, 0);  /* transferi başlat */
+    memcpy(rx, bufs.rx_buf, sizeof(rx));
+
+    return 0;
+}</code></pre>
+
+  <h3>Endüstriyel kontrol döngüsü örneği</h3>
+<pre><code>/* EtherCAT + Xenomai motor kontrol döngüsü (1 ms periyot) */
+void ethercat_control_loop(void *arg)
+{
+    rt_task_set_periodic(NULL, TM_NOW, 1000000); /* 1 ms */
+
+    for (;;) {
+        rt_task_wait_period(NULL);
+
+        /* 1. EtherCAT frame al (RTnet RTDM socket) */
+        receive_ethercat_frame();
+
+        /* 2. Encoder konumunu oku */
+        int32_t pos = read_encoder_rtdm();
+
+        /* 3. PID hesapla */
+        int32_t torque = pid_compute(target_pos, pos);
+
+        /* 4. Akım referansı yaz (SPI RTDM) */
+        write_current_ref_spi(torque);
+
+        /* 5. EtherCAT yanıt gönder */
+        send_ethercat_response(pos, torque);
+    }
+}</code></pre>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Hata ayıklama</h2>
+  <p class="section-lead">Xenomai, RT görevlerinin durumunu ve performansını izlemek için /proc dosya sistemi, xeno-config aracı ve GDB entegrasyonu sunar.</p>
+
+  <h3>/proc/xenomai arayüzü</h3>
+<pre><code># Cobalt çekirdek versiyonu ve yapılandırma
+cat /proc/xenomai/version
+# Çıktı: Xenomai/cobalt v3.2.3
+
+# Çalışan RT görevleri
+cat /proc/xenomai/sched/threads
+# PID  CPU  PRI  PERIOD  TIMEOUT  STAT  NAME
+# 142    0   80  1000us       --   RUN  control
+# 143    1   70  2000us       --  WAIT  sensor
+
+# Gecikme istatistikleri (her görev için min/avg/max)
+cat /proc/xenomai/sched/stat
+
+# Mode switch sayaçları — sıfır olmalı
+cat /proc/xenomai/stat | grep MSW
+
+# Timer istatistikleri
+cat /proc/xenomai/timer</code></pre>
+
+  <h3>xeno-config ile derleme bilgisi</h3>
+<pre><code># Kurulu Xenomai yapılandırması
+xeno-config --version
+xeno-config --prefix
+xeno-config --skin=alchemy --cflags
+xeno-config --skin=alchemy --ldflags
+
+# SMP desteği var mı?
+xeno-config --smp
+
+# Desteklenen skin'ler
+xeno-config --skins</code></pre>
+
+  <h3>Mode switch uyarıları</h3>
+<pre><code>/* Geliştirme ortamında MSW yakalamak için sinyal işleyici */
+#include &lt;signal.h&gt;
+#include &lt;xenomai/signal.h&gt;
+
+void msw_handler(int sig, siginfo_t *si, void *ctx)
+{
+    /* Bu handler Linux bağlamında çalışır */
+    fprintf(stderr, "MODE SWITCH in PID %d! Check for Linux syscalls.\n",
+            getpid());
+    /* Stack trace için */
+    // backtrace_symbols_fd(...)
+}
+
+void setup_msw_warn(void)
+{
+    struct sigaction sa = {
+        .sa_sigaction = msw_handler,
+        .sa_flags     = SA_SIGINFO,
+    };
+    sigaction(SIGDEBUG, &amp;sa, NULL);
+
+    /* MSW uyarısını etkinleştir */
+    pthread_setmode_np(0, PTHREAD_WARNSW, NULL);
+}</code></pre>
+
+  <h3>GDB ile Xenomai RT görevi hata ayıklama</h3>
+<pre><code># 1. Sembolle derle
+aarch64-linux-gnu-gcc -g -O0 $CFLAGS -o rt_app_debug rt_app.c $LDFLAGS
+
+# 2. Hedef üzerinde gdbserver başlat
+gdbserver :1234 ./rt_app_debug
+
+# 3. Çapraz GDB ile bağlan
+aarch64-linux-gnu-gdb ./rt_app_debug
+(gdb) target remote 192.168.1.100:1234
+(gdb) set sysroot /path/to/rootfs
+(gdb) break control_loop
+(gdb) continue
+
+# Not: GDB'nin breakpoint'i RT görevini durduracağı için
+# zaman kısıtlamaları geçersiz olur — yalnızca mantık
+# hatası ayıklamak için kullan, zamanlama analizi için değil</code></pre>
+
+  <h3>Yaygın sorunlar ve çözümleri</h3>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Belirti</th><th>Olası neden</th><th>Çözüm</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>MSW &gt; 0</td><td>RT threadden Linux syscall</td><td>printf, malloc, open kaldır; XDDP kullan</td></tr>
+        <tr><td>overrun artıyor</td><td>CPU yükü, yanlış öncelik</td><td>isolcpus, öncelik artır, periyot uzat</td></tr>
+        <tr><td>lat max spike</td><td>SMI, CPU frekans geçişi</td><td>CPU_FREQ=n, SMI sayacını izle (rdmsr)</td></tr>
+        <tr><td>SIGXCPU alındı</td><td>RT görev CPU quotasını aştı</td><td>sched_rt_runtime_us = -1 yap</td></tr>
+        <tr><td>cobalt modülü yüklenmiyor</td><td>Dovetail yaması eksik/uyumsuz</td><td>kernel config'i kontrol et, yama sürümünü eşleştir</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Performans izleme betiği</h3>
+<pre><code>#!/bin/sh
+# Xenomai RT sistem sağlık kontrolü
+
+echo "=== Xenomai Versiyon ==="
+cat /proc/xenomai/version
+
+echo "=== Aktif RT Görevler ==="
+cat /proc/xenomai/sched/threads
+
+echo "=== Mode Switch Sayaçları ==="
+cat /proc/xenomai/stat | awk 'NR==1 || $6 &gt; 0'
+
+echo "=== Timer Çözünürlüğü ==="
+cat /proc/xenomai/timer | grep resolution
+
+echo "=== CPU Izolasyon ==="
+cat /sys/devices/system/cpu/isolated
+
+echo "=== IRQ Affinities ==="
+for irq in $(ls /proc/irq/); do
+    aff=$(cat /proc/irq/$irq/smp_affinity_list 2&gt;/dev/null)
+    echo "IRQ $irq: $aff"
+done</code></pre>
+</section>
+
+</main>
