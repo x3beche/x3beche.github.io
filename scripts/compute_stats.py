@@ -24,7 +24,7 @@ from html.parser import HTMLParser
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DECKS = ["embedded-deck", "ai-deck", "project-deck"]
+DECKS = ["embedded-deck", "ai-deck", "rust-deck", "project-deck"]
 
 # Katalog sayfaları (kart gridi) — bölüm/kelime sayımından dışlanır
 CATALOG_PAGES = {"index.html"}

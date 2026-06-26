@@ -1,0 +1,577 @@
+---
+layout: tutorial
+title: "Rust Temel Kavramlar — Ownership & Borrowing"
+back_url: "../index.html"
+back_label: "Tüm Rust rehberleri"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>BELLEK</span>
+    <span>OWNERSHIP</span>
+    <span>2026</span>
+  </div>
+  <h1>Ownership &amp; Borrowing<br><em>Borrow checker'ı anlamak</em></h1>
+  <p class="subtitle">Rust'ın bellek güvenliğinin kalbi: sahiplik, move semantiği, ödünç alma ve derleme-zamanı borrow checker — C++ unique_ptr ve RAII ile karşılaştırmalı.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Neden ownership?</a></li>
+    <li><a href="#s1">Ownership kuralları</a></li>
+    <li><a href="#s2">Move semantiği</a></li>
+    <li><a href="#s3">Copy vs Clone</a></li>
+    <li><a href="#s4">Sahipliği fonksiyonlarla taşımak</a></li>
+    <li><a href="#s5">Borrowing — &amp;T</a></li>
+    <li><a href="#s6">&amp;mut T — değiştirilebilir ödünç</a></li>
+    <li><a href="#s7">Borrow checker kuralları</a></li>
+    <li><a href="#s8">Slice'lar — &amp;[T] ve &amp;str</a></li>
+    <li><a href="#s9">Drop, RAII ve sık hatalar</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ── s0 ──────────────────────────────────────────────────── -->
+<section id="s0">
+  <h2><span class="num">00</span> Neden ownership?</h2>
+  <p class="section-lead">C bellek hatalarını çalışma zamanına bırakır, GC ise runtime maliyet ekler — Rust üçüncü yolu seçer: derleme-zamanı sahiplik.</p>
+
+  <p>Bir C/C++ programcısı olarak bellek hatalarının taksonomisini ezbere biliyorsundur: <strong>use-after-free</strong> (serbest bırakılmış belleğe erişim), <strong>double-free</strong> (aynı bloğu iki kez serbest bırakma), <strong>memory leak</strong> (hiç bırakmama) ve <strong>dangling pointer</strong> (ömrü bitmiş nesneye işaret eden pointer). Bu hataların ortak özelliği: derleyici sessizdir, sorun çalışma zamanında — çoğu zaman üretimde — patlar. Valgrind, ASan ve code review bunları azaltır ama matematiksel bir garanti vermez.</p>
+
+  <p>Geleneksel olarak iki çözüm vardı. Birincisi <em>manuel yönetim</em> (C/C++): hızlı ve deterministik, ama güvenliği programcının disiplinine bırakır. İkincisi <em>garbage collection</em> (Java, Go, C#): güvenli, ama runtime'da tarama döngüleri, durdur-dünya (stop-the-world) duraklamaları ve öngörülemez gecikme getirir — gömülü ve gerçek-zamanlı sistemlerde kabul edilemez.</p>
+
+  <p>Rust üçüncü yolu seçer: belleği <strong>derleme zamanında</strong> bir sahiplik (ownership) modeliyle yönetir. Çalışma zamanında GC yoktur, ekstra metadata yoktur; kontroller derleyicide yapılır ve geçen kod sıfır-maliyet (zero-cost) çalışır. Aşağıdaki C örneği klasik bir use-after-free içerir — Rust'ta karşılığı derlenmez bile.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>danger.c</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="cmt">// C: derleyici hiçbir şikayet etmez, runtime'da UB.</span>
+<span class="field">char</span> *p = malloc(16);
+strcpy(p, "merhaba");
+free(p);
+printf("%s\n", p);   <span class="cmt">// use-after-free — patlayabilir, patlamayabilir</span>{% endraw %}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> s = <span class="field">String</span>::from(<span class="str">"merhaba"</span>);
+    drop(s);             <span class="cmt">// belleği elle bıraktık (genelde gerek yok)</span>
+    println!(<span class="str">"{s}"</span>);     <span class="cmt">// HATA: borrow of moved value: `s`</span>
+}
+<span class="cmt">// error[E0382]: derleyici durdurur; runtime UB asla oluşmaz.</span>{% endraw %}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Rust'ın garantisi tek bir cümleyle: <strong>güvenli (safe) kodda veri yarışı, dangling pointer ve use-after-free derleme zamanında imkânsızdır.</strong> Bu garantilerden çıkmak istersen <code>unsafe</code> blok kullanırsın — ama bu açık ve aranabilir bir karardır.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>C bellek hataları (use-after-free, double-free, leak, dangling) derleme zamanında yakalanmaz.</li>
+      <li>GC güvenlik sağlar ama runtime tarama ve öngörülemez duraklama maliyeti getirir.</li>
+      <li>Rust üçüncü yol: sahiplik modeli ile derleme-zamanı, sıfır-maliyet bellek güvenliği.</li>
+      <li>Tüm bu garantiler "safe" kod içindir; bilinçli olarak <code>unsafe</code> ile devre dışı bırakılabilir.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s1 ──────────────────────────────────────────────────── -->
+<section id="s1">
+  <h2><span class="num">01</span> Ownership kuralları</h2>
+  <p class="section-lead">Tüm modelin üç kurala indiği nokta — bunları içselleştirince borrow checker artık düşman değil refleks olur.</p>
+
+  <p>Rust'ın bütün bellek modeli üç basit aksiyoma dayanır:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Kural 1</span><span class="desc">Her değerin (value) bir <strong>sahibi</strong> (owner) vardır — sahibi tutan değişkendir.</span></div>
+    <div class="param"><span class="name">Kural 2</span><span class="desc">Bir değerin aynı anda <strong>yalnızca tek</strong> sahibi olabilir.</span></div>
+    <div class="param"><span class="name">Kural 3</span><span class="desc">Sahip scope'tan çıktığında değer otomatik olarak <strong>drop</strong> edilir (kaynak bırakılır).</span></div>
+  </div>
+
+  <p>Üçüncü kural bir C++ programcısına RAII gibi gelmeli — çünkü tam olarak öyle. Fark şu: C++'ta RAII bir kütüphane deseni ve programcı disiplinidir; Rust'ta dilin değişmez kuralıdır ve sahiplik takibi derleyici tarafından zorlanır.</p>
+
+  <h3>Stack vs heap: nerede yaşar?</h3>
+  <p>Sabit boyutlu ve <code>Copy</code> olan değerler (i32, bool, char) stack'te yaşar; ucuz kopyalanır. <code>String</code> ise üç alandan oluşan bir <em>fat değer</em>dir: stack'te bir başlık (heap'e pointer + uzunluk + kapasite), asıl bayt verisi heap'te. Sahip scope'tan çıkınca heap belleği <code>String</code>'in <code>Drop</code> implementasyonu tarafından serbest bırakılır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> n = 42;                       <span class="cmt">// stack: i32, Copy</span>
+    {
+        <span class="keyword">let</span> s = <span class="field">String</span>::from(<span class="str">"selam"</span>); <span class="cmt">// başlık stack'te, "selam" heap'te</span>
+        println!(<span class="str">"{s} / {n}"</span>);
+    } <span class="cmt">// s burada scope'tan çıktı -> String::drop çağrıldı, heap free</span>
+
+    println!(<span class="str">"{n}"</span>); <span class="cmt">// n hâlâ geçerli; s artık yok</span>
+}{% endraw %}</code></pre>
+  </div>
+
+  <div class="flow"><pre>let s = String::from(...)  →  scope sonu  →  drop(s)  →  heap free</pre></div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>C++'ta <code>delete</code> unutmak leak, iki kez çağırmak double-free üretir. Rust'ta drop'u <em>derleyici yerleştirir</em>; ne unutabilirsin ne de elle iki kez çağırabilirsin — sahiplik kuralları double-drop'u baştan engeller.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Üç kural: tek sahip vardır, aynı anda tek sahip olur, sahip scope'tan çıkınca değer drop edilir.</li>
+      <li>Kural 3 = derleyicinin zorladığı, garantili RAII.</li>
+      <li><code>String</code> stack başlığı (ptr/len/cap) + heap verisi olan fat bir değerdir.</li>
+      <li>Drop çağrısını derleyici otomatik yerleştirir; leak veya double-free elle yapılamaz.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s2 ──────────────────────────────────────────────────── -->
+<section id="s2">
+  <h2><span class="num">02</span> Move semantiği</h2>
+  <p class="section-lead">Rust'ta varsayılan atama <strong>move</strong>'dur, kopya değil — ve move sonrası kaynak değişken kullanılamaz hale gelir.</p>
+
+  <p>C++'ta <code>auto b = a;</code> varsayılan olarak <em>kopyalar</em> (copy constructor); taşımak istersen açıkça <code>std::move(a)</code> yazarsın. Rust tam tersini yapar: non-<code>Copy</code> tipler için varsayılan atama <strong>move</strong>'dur. Move sırasında stack başlığı bit-bit yeni değişkene aktarılır ve eski değişken <em>geçersizleştirilir</em>. Heap verisi kopyalanmaz — yalnızca tek geçerli sahip vardır (Kural 2).</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> a = <span class="field">String</span>::from(<span class="str">"veri"</span>);
+    <span class="keyword">let</span> b = a;            <span class="cmt">// MOVE: başlık a'dan b'ye taşındı, a artık geçersiz</span>
+
+    println!(<span class="str">"{b}"</span>);     <span class="cmt">// OK</span>
+    println!(<span class="str">"{a}"</span>);     <span class="cmt">// HATA[E0382]: borrow of moved value: `a`</span>
+}{% endraw %}</code></pre>
+  </div>
+
+  <p>Bu neden hatadır? Çünkü ikisi de geçerli kalsaydı, ikisi de aynı heap bloğunu işaret eder, ikisi de scope sonunda drop çalıştırır — klasik <strong>double-free</strong>. Rust kaynağı move ile geçersizleştirerek bu durumu kökünden imkânsız kılar. C++'ın "moved-from" nesnesi geçerli-ama-belirsiz durumdadır; Rust'ta moved-from değer derleyici tarafından <em>kullanılamaz</em> ilan edilir.</p>
+
+  <h3>Fonksiyona move</h3>
+  <p>Bir değeri fonksiyona değer olarak (by value) geçirmek de move'dur. Çağrıdan sonra kaynak değişken artık senin değildir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">fn</span> yut(s: <span class="field">String</span>) {
+    println!(<span class="str">"yutuldu: {s}"</span>);
+} <span class="cmt">// s burada drop edilir</span>
+
+<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> t = <span class="field">String</span>::from(<span class="str">"merhaba"</span>);
+    yut(t);              <span class="cmt">// t fonksiyona MOVE edildi</span>
+    <span class="cmt">// println!("{t}");  // HATA: t artık geçersiz</span>
+}{% endraw %}</code></pre>
+  </div>
+
+  <div class="file-table"><table>
+    <thead><tr><th>Dil</th><th><code>b = a</code> varsayılanı</th><th>Taşımak için</th></tr></thead>
+    <tbody>
+      <tr><td>C++</td><td>copy (kopya kurucu)</td><td><code>std::move(a)</code></td></tr>
+      <tr><td>Rust</td><td>move (kaynak geçersizleşir)</td><td>zaten varsayılan</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Non-<code>Copy</code> tiplerde atama ve fonksiyon argümanı varsayılan olarak move'dur.</li>
+      <li>Move sonrası kaynak değişken derleyicide geçersizdir — kullanımı E0382 hatası verir.</li>
+      <li>Move heap verisini kopyalamaz; yalnızca stack başlığını taşır (ucuz).</li>
+      <li>Tek-sahip kuralı double-free'yi tasarımdan eler; C++'ın "moved-from" belirsizliği yoktur.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s3 ──────────────────────────────────────────────────── -->
+<section id="s3">
+  <h2><span class="num">03</span> Copy vs Clone</h2>
+  <p class="section-lead">Bazı tipler move yerine sessizce kopyalanır (<code>Copy</code>); derin kopya istiyorsan açıkça <code>.clone()</code> dersin.</p>
+
+  <p>Her tip move semantiğine uymaz. Sabit boyutlu, tamamen stack'te yaşayan ve "bitlerini kopyalamak yeterli" olan tipler <code>Copy</code> trait'ini implement eder: <code>i32</code>, <code>u64</code>, <code>bool</code>, <code>char</code>, <code>f64</code>, ve yalnızca Copy alanlardan oluşan tuple/struct'lar. Bunlarda <code>let b = a;</code> kaynağı geçersizleştirmez — çünkü ucuz bir bit kopyası yapılır ve iki bağımsız değer ortaya çıkar, double-free riski yoktur.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> x = 5;
+    <span class="keyword">let</span> y = x;        <span class="cmt">// COPY: i32 Copy'dir, x hâlâ geçerli</span>
+    println!(<span class="str">"{x} {y}"</span>);  <span class="cmt">// OK -> 5 5</span>
+}{% endraw %}</code></pre>
+  </div>
+
+  <h3>Clone: açık ve potansiyel pahalı</h3>
+  <p><code>String</code>, <code>Vec&lt;T&gt;</code>, <code>HashMap</code> gibi heap sahibi tipler <code>Copy</code> değildir; çünkü ucuz bit kopyası iki sahip yaratır. Gerçek bir derin kopya istiyorsan <code>.clone()</code> çağırırsın — bu, heap verisini yeni bir blok olarak çoğaltır. Çağrı <em>açıktır</em>: kodda <code>.clone()</code> görmek "burada heap tahsisi/kopyası var" demektir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> a = <span class="field">String</span>::from(<span class="str">"veri"</span>);
+    <span class="keyword">let</span> b = a.clone();   <span class="cmt">// DERİN kopya: yeni heap bloğu, ayrı veri</span>
+
+    println!(<span class="str">"{a} | {b}"</span>);  <span class="cmt">// her ikisi de geçerli -> veri | veri</span>
+}{% endraw %}</code></pre>
+  </div>
+
+  <div class="file-table"><table>
+    <thead><tr><th>Özellik</th><th><code>Copy</code></th><th><code>Clone</code></th></tr></thead>
+    <tbody>
+      <tr><td>Tetikleme</td><td>örtük (atama anında)</td><td>açık (<code>.clone()</code>)</td></tr>
+      <tr><td>Maliyet</td><td>ucuz bit kopyası</td><td>keyfi (heap, derin)</td></tr>
+      <tr><td>Tipik tipler</td><td>i32, bool, char, &amp;T</td><td>String, Vec, HashMap</td></tr>
+      <tr><td>İlişki</td><td>Copy ⊂ Clone (Copy ise Clone de olmalı)</td><td>tek başına olabilir</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>Borrow checker hatasından kurtulmak için refleks olarak <code>.clone()</code> serpiştirmek yaygın bir acemi tuzağıdır. Her clone bir tahsis/kopya maliyetidir. Doğru çözüm çoğu zaman <strong>borrow</strong> etmektir (sonraki bölümler) — clone'u gerçekten ayrı bir kopya gerektiğinde sakla.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>Copy</code> tipler (sabit boyut, stack) atamada örtük kopyalanır; kaynak geçerli kalır.</li>
+      <li>Heap sahibi tipler Copy değildir; derin kopya için açık <code>.clone()</code> gerekir.</li>
+      <li><code>.clone()</code> kodda görünür bir maliyet işaretidir.</li>
+      <li>Hatayı clone ile susturmak yerine genelde borrow etmek doğru çözümdür.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s4 ──────────────────────────────────────────────────── -->
+<section id="s4">
+  <h2><span class="num">04</span> Sahipliği fonksiyonlarla taşımak</h2>
+  <p class="section-lead">Sadece move ile çalışmak değeri fonksiyonlara "ver-geri al" döngüsüne sokar — bu hantallık borrowing'in doğuş sebebidir.</p>
+
+  <p>Move semantiği tutarlıdır ama saf haliyle kullanışsızdır. Bir <code>String</code>'i bir fonksiyona verip sonra ana fonksiyonda kullanmaya devam etmek istersen, fonksiyonun onu <em>geri döndürmesi</em> gerekir. Tek bir veri için bu katlanılabilir; ama hem değeri kullanıp hem de bir sonuç döndürmek istediğinde tuple iadelerine boğulursun.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="cmt">// Borrowing yokken: sahipliği al, geri döndür — hantal.</span>
+<span class="keyword">fn</span> uzunluk(s: <span class="field">String</span>) -&gt; (<span class="field">String</span>, usize) {
+    <span class="keyword">let</span> n = s.len();
+    (s, n)              <span class="cmt">// sahipliği çağırana geri verebilmek için s'i iade et</span>
+}
+
+<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> s = <span class="field">String</span>::from(<span class="str">"merhaba"</span>);
+    <span class="keyword">let</span> (s, n) = uzunluk(s); <span class="cmt">// move ettik, geri aldık... yorucu</span>
+    println!(<span class="str">"'{s}' uzunluğu {n}"</span>);
+}{% endraw %}</code></pre>
+  </div>
+
+  <p>Buradaki hantallık tesadüf değil — Rust seni doğal olarak doğru araca itiyor. İhtiyacın olan şey değeri <em>sahiplenmeden</em>, sadece geçici olarak okumak/değiştirmek. Bu da <strong>borrowing</strong> (ödünç alma): sahibi değiştirmeden bir referans (reference) ödünç vermek.</p>
+
+  <div class="flow"><pre>move-and-return (hantal)  →  borrow &amp;T / &amp;mut T (zarif)</pre></div>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="cmt">// Borrowing ile: sahiplik s'te kalır, sadece referans veririz.</span>
+<span class="keyword">fn</span> uzunluk(s: &amp;<span class="field">String</span>) -&gt; usize {
+    s.len()             <span class="cmt">// okuruz ama sahiplenmeyiz</span>
+}
+
+<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> s = <span class="field">String</span>::from(<span class="str">"merhaba"</span>);
+    <span class="keyword">let</span> n = uzunluk(&amp;s);  <span class="cmt">// & ile ödünç verdik</span>
+    println!(<span class="str">"'{s}' uzunluğu {n}"</span>); <span class="cmt">// s hâlâ bizim</span>
+}{% endraw %}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Değeri by-value geçirmek sahipliği fonksiyona taşır (move).</li>
+      <li>Sonra kullanmaya devam için değeri geri döndürmek gerekir — sadece move ile kod hantallaşır.</li>
+      <li>Çözüm borrowing: sahibi taşımadan geçici referans vermek.</li>
+      <li><code>&amp;s</code> ile ödünç verince sahiplik kaynakta kalır, çağrı sonrası değer hâlâ kullanılabilir.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s5 ──────────────────────────────────────────────────── -->
+<section id="s5">
+  <h2><span class="num">05</span> Borrowing — &amp;T</h2>
+  <p class="section-lead">Paylaşımlı referans <code>&amp;T</code>: veriyi sahiplenmeden okumana izin verir, aynı anda istediğin kadar olabilir.</p>
+
+  <p><code>&amp;T</code> bir <em>paylaşımlı</em> (shared), <em>değiştirilemez</em> (immutable) referanstır. C'deki <code>const T*</code> ile kavramsal olarak benzer ama kritik bir farkla: Rust'ta referansın işaret ettiği değerin <code>&amp;T</code> yaşadığı sürece geçerli kalacağı (dangling olmayacağı) derleyici tarafından <em>garanti edilir</em>. Bir referans, ödünç verenden daha uzun yaşayamaz.</p>
+
+  <p>Aynı veriye aynı anda istediğin kadar <code>&amp;T</code> alabilirsin — okuyucular birbirini rahatsız etmez. Hiçbiri veriyi değiştiremediği için bu güvenlidir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> s = <span class="field">String</span>::from(<span class="str">"merhaba"</span>);
+
+    <span class="keyword">let</span> r1 = &amp;s;      <span class="cmt">// paylaşımlı borrow</span>
+    <span class="keyword">let</span> r2 = &amp;s;      <span class="cmt">// ikinci paylaşımlı borrow — sorun yok</span>
+
+    println!(<span class="str">"{r1} ve {r2} ve {s}"</span>); <span class="cmt">// üçü de okuyabilir</span>
+}{% endraw %}</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>Paylaşımlı referans <em>salt okunur bir görünümdür</em>: <code>r1.push_str(...)</code> derlenmez. Değiştirmek için <code>&amp;mut</code> gerekir (sonraki bölüm). C'de <code>const</code>'ı cast'le delebilirsin; Rust'ta <code>&amp;T</code> üzerinden mutasyon hiçbir cast ile mümkün değildir (interior mutability hariç — ileri konu).</p>
+  </div>
+
+  <p>Referansları dereference etmek için <code>*</code> kullanılır, ama method çağrıları ve çoğu operatör otomatik dereference (auto-deref) yaptığı için çoğu zaman <code>*</code> yazmazsın:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">fn</span> topla(v: &amp;<span class="field">Vec</span>&lt;i32&gt;) -&gt; i32 {
+    <span class="keyword">let</span> <span class="keyword">mut</span> acc = 0;
+    <span class="keyword">for</span> x <span class="keyword">in</span> v {       <span class="cmt">// &amp;Vec üzerinde iter; x: &amp;i32</span>
+        acc += *x;       <span class="cmt">// *x ile i32 değerine eriş</span>
+    }
+    acc
+}{% endraw %}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>&amp;T</code> paylaşımlı, salt-okunur referanstır; <code>const T*</code>'a benzer ama güvenli.</li>
+      <li>Aynı veriye aynı anda sınırsız sayıda <code>&amp;T</code> alınabilir.</li>
+      <li>Referans, ödünç verdiği değerden daha uzun yaşayamaz — dangling derleme zamanında engellenir.</li>
+      <li><code>&amp;T</code> üzerinden mutasyon yoktur; auto-deref sayesinde <code>*</code> çoğu zaman gerekmez.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s6 ──────────────────────────────────────────────────── -->
+<section id="s6">
+  <h2><span class="num">06</span> &amp;mut T — değiştirilebilir ödünç</h2>
+  <p class="section-lead">Değiştirilebilir referans <code>&amp;mut T</code> veriyi değiştirmene izin verir — ama aynı anda <strong>tek</strong> tane olabilir.</p>
+
+  <p><code>&amp;mut T</code> ile ödünç aldığın veriyi değiştirebilirsin. Kritik kısıt şudur: bir değer için aynı anda <strong>yalnızca bir</strong> <code>&amp;mut</code> var olabilir ve bir <code>&amp;mut</code> aktifken aynı veriye başka <em>hiçbir</em> referans (ne <code>&amp;</code> ne <code>&amp;mut</code>) olamaz. Üstelik veriyi <code>&amp;mut</code> ile ödünç verebilmek için değişkenin de <code>mut</code> olması gerekir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">fn</span> ekle(s: &amp;<span class="keyword">mut</span> <span class="field">String</span>) {
+    s.push_str(<span class="str">" dünya"</span>);   <span class="cmt">// &amp;mut üzerinden mutasyon serbest</span>
+}
+
+<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> <span class="keyword">mut</span> s = <span class="field">String</span>::from(<span class="str">"merhaba"</span>); <span class="cmt">// mut: değişebilir</span>
+    ekle(&amp;<span class="keyword">mut</span> s);
+    println!(<span class="str">"{s}"</span>);     <span class="cmt">// -> merhaba dünya</span>
+}{% endraw %}</code></pre>
+  </div>
+
+  <h3>Tek &amp;mut kuralı neden var?</h3>
+  <p>Cevap: <strong>veri yarışını (data race) derleme zamanında imkânsız kılmak.</strong> Bir veri yarışı, en az iki erişim aynı belleğe ulaşırken en az biri yazma yapıyor ve erişimler senkronize değilse oluşur. Eğer aynı anda hem bir yazıcı (<code>&amp;mut</code>) hem de başka bir okuyucu/yazıcı olsaydı, klasik data race elimizde olurdu. Rust bunu tip sisteminde yasaklar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> <span class="keyword">mut</span> s = <span class="field">String</span>::from(<span class="str">"x"</span>);
+
+    <span class="keyword">let</span> r1 = &amp;<span class="keyword">mut</span> s;
+    <span class="keyword">let</span> r2 = &amp;<span class="keyword">mut</span> s;   <span class="cmt">// HATA[E0499]: ikinci &amp;mut, aynı anda olamaz</span>
+
+    println!(<span class="str">"{r1} {r2}"</span>);
+}{% endraw %}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Aynı garanti tek iş parçacığında bile geçerlidir; çünkü mutable aliasing iterator invalidation gibi tek-thread hatalarına da yol açar (örn. bir <code>Vec</code>'i üzerinde iter ederken değiştirmek). C++'ta bu UB; Rust'ta derlenmeyen koddur.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>&amp;mut T</code> veriyi değiştirmeye izin verir; değişken de <code>mut</code> olmalıdır.</li>
+      <li>Aynı anda yalnızca bir <code>&amp;mut</code> olabilir ve o aktifken başka referans olamaz.</li>
+      <li>Bu kuralın amacı veri yarışını ve mutable aliasing'i derleme zamanında elemektir.</li>
+      <li>Tek-thread iterator invalidation gibi hatalar da aynı kural sayesinde imkânsızdır.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s7 ──────────────────────────────────────────────────── -->
+<section id="s7">
+  <h2><span class="num">07</span> Borrow checker kuralları</h2>
+  <p class="section-lead">Tüm borrow sistemi tek ilkeye iner: <strong>aliasing XOR mutation</strong> — ya çok okuyucu, ya tek yazıcı; ikisi birden asla.</p>
+
+  <p>Önceki iki bölümün özeti tek bir invariant'tır. Herhangi bir an için, bir veriye ya:</p>
+
+  <div class="flow"><pre>çok sayıda &amp;T (okuyucu)   XOR   tam bir tane &amp;mut T (yazıcı)</pre></div>
+
+  <p>Aynı anda hem paylaşımlı okuyucular hem de bir yazıcı olamaz. Bu "aliasing XOR mutability" ilkesi, hem veri yarışlarını hem de bellek bozulmasını (memory corruption) statik olarak engelleyen tek kuraldır. Borrow checker dediğimiz derleyici aşaması tam olarak bunu kontrol eder.</p>
+
+  <h3>NLL: referanslar son kullanımda biter</h3>
+  <p>Erken Rust'ta bir referans, içinde tanımlandığı blok bitene kadar "canlı" sayılırdı. Bugün <strong>Non-Lexical Lifetimes (NLL)</strong> sayesinde bir borrow, <em>son kullanıldığı satırda</em> sona erer — kapanış parantezinde değil. Bu sayede aşağıdaki kod derlenir:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> <span class="keyword">mut</span> s = <span class="field">String</span>::from(<span class="str">"x"</span>);
+
+    <span class="keyword">let</span> r = &amp;s;          <span class="cmt">// paylaşımlı borrow başlar</span>
+    println!(<span class="str">"{r}"</span>);     <span class="cmt">// r'nin SON kullanımı -> borrow burada biter (NLL)</span>
+
+    <span class="keyword">let</span> m = &amp;<span class="keyword">mut</span> s;      <span class="cmt">// OK: artık aktif paylaşımlı borrow yok</span>
+    m.push_str(<span class="str">"y"</span>);
+    println!(<span class="str">"{m}"</span>);
+}{% endraw %}</code></pre>
+  </div>
+
+  <h3>Tipik hata ve düzeltmesi</h3>
+  <p>En sık görülen ihlal: bir okuyucu hâlâ canlıyken yazmaya kalkmak. Aşağıda hata ve iki düzeltme yolu:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> <span class="keyword">mut</span> v = vec![1, 2, 3];
+
+    <span class="keyword">let</span> ilk = &amp;v[0];     <span class="cmt">// paylaşımlı borrow, ilk hâlâ canlı</span>
+    v.push(4);           <span class="cmt">// HATA[E0502]: v'yi &amp;mut almaya çalışır; ilk borrow aktif</span>
+    println!(<span class="str">"{ilk}"</span>);   <span class="cmt">// ilk'in kullanımı borrow'u canlı tutuyor</span>
+}
+
+<span class="cmt">// DÜZELTME: ilk'i push'tan ÖNCE kullanıp bitir (NLL),</span>
+<span class="cmt">// ya da değeri kopyala: let ilk = v[0]; (i32 Copy).</span>{% endraw %}</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p><code>v.push(4)</code>'ün tehlikesi teorik değil: <code>Vec</code> büyürken heap'i yeniden tahsis edip taşıyabilir; o anda <code>ilk</code> dangling pointer olurdu. İşte borrow checker'ın engellediği tam C/C++ hatası — iterator/pointer invalidation.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Tek invariant: aliasing XOR mutation — ya çok <code>&amp;T</code>, ya tek <code>&amp;mut T</code>.</li>
+      <li>NLL ile bir borrow son kullanımında biter, blok sonunda değil — kod daha esnek.</li>
+      <li>En sık hata: canlı bir <code>&amp;T</code> varken <code>&amp;mut</code> almak (E0502).</li>
+      <li>Bu kural iterator/pointer invalidation gibi gerçek C/C++ hatalarını statik olarak engeller.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s8 ──────────────────────────────────────────────────── -->
+<section id="s8">
+  <h2><span class="num">08</span> Slice'lar — &amp;[T] ve &amp;str</h2>
+  <p class="section-lead">Slice, sahiplik almadan bir koleksiyonun bitişik bir parçasına açılan ödünç pencere — ptr + uzunluktan ibaret.</p>
+
+  <p>Bir <em>slice</em> (dilim), bir koleksiyonun bitişik (contiguous) bir aralığına ödünç verilmiş görünümdür. Sahiplik almaz; içinde sadece bir pointer ve bir uzunluk taşır (fat pointer). C'deki "pointer + length" idiomunun tip-güvenli, sınır-takipli halidir. İki temel slice tipi vardır:</p>
+
+  <div class="params">
+    <div class="param"><span class="name">&amp;str</span><span class="desc">String veya string literal üzerine UTF-8 dilim görünümü.</span></div>
+    <div class="param"><span class="name">&amp;[T]</span><span class="desc">Vec&lt;T&gt; veya dizi üzerine eleman dilimi görünümü.</span></div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> s = <span class="field">String</span>::from(<span class="str">"merhaba dünya"</span>);
+    <span class="keyword">let</span> ilk: &amp;str = &amp;s[0..7];   <span class="cmt">// "merhaba" — sahiplik yok, ödünç</span>
+
+    <span class="keyword">let</span> v = vec![10, 20, 30, 40];
+    <span class="keyword">let</span> orta: &amp;[i32] = &amp;v[1..3]; <span class="cmt">// [20, 30]</span>
+
+    println!(<span class="str">"{ilk} / {orta:?}"</span>);
+}{% endraw %}</code></pre>
+  </div>
+
+  <h3>Parametre tipi: neden <code>&amp;str</code> ve <code>&amp;[T]</code>?</h3>
+  <p>Bir fonksiyon parametresinde <code>&amp;String</code> yerine <code>&amp;str</code>, <code>&amp;Vec&lt;T&gt;</code> yerine <code>&amp;[T]</code> almak en iyi pratiktir. Sebep: slice daha geneldir. <code>&amp;str</code> alan bir fonksiyon hem <code>String</code> (deref ile) hem string literal hem alt-dilim kabul eder; tek bir imza her kaynağa uyar.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="cmt">// İYİ: &amp;str daha esnek — String, literal, dilim hepsi geçer.</span>
+<span class="keyword">fn</span> ilk_kelime(s: &amp;str) -&gt; &amp;str {
+    <span class="keyword">match</span> s.find(<span class="str">' '</span>) {
+        <span class="field">Some</span>(i) =&gt; &amp;s[..i],
+        <span class="field">None</span>    =&gt; s,
+    }
+}
+
+<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> sahip = <span class="field">String</span>::from(<span class="str">"merhaba dünya"</span>);
+    println!(<span class="str">"{}"</span>, ilk_kelime(&amp;sahip));     <span class="cmt">// String -> &amp;str (deref coercion)</span>
+    println!(<span class="str">"{}"</span>, ilk_kelime(<span class="str">"selam ck"</span>));  <span class="cmt">// literal zaten &amp;str</span>
+}{% endraw %}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p><code>ilk_kelime</code>'nin dönüşü girdiyi ödünç alır; derleyici lifetime ilişkisini otomatik çıkarır. Bu yüzden döndürülen <code>&amp;str</code>, kaynak <code>String</code> hayatta olduğu sürece geçerlidir — kaynağı drop edersen slice'ı kullanmak derlenmez. Dangling slice imkânsızdır.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Slice = sahiplik almayan, ptr+len taşıyan ödünç görünüm; sınır-takipli C "ptr+length".</li>
+      <li><code>&amp;str</code> String/literal üzerine, <code>&amp;[T]</code> Vec/dizi üzerine dilimdir.</li>
+      <li>Parametrede <code>&amp;str</code>/<code>&amp;[T]</code> tercih et — deref coercion sayesinde daha çok kaynağa uyar.</li>
+      <li>Slice kaynağına bağlı yaşar; kaynak ölünce slice kullanımı derlenmez (dangling yok).</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s9 ──────────────────────────────────────────────────── -->
+<section id="s9">
+  <h2><span class="num">09</span> Drop, RAII ve sık hatalar</h2>
+  <p class="section-lead">Drop trait'i Rust'ın RAII'sidir — C++ destructor'ının birebir karşılığı, ama move sayesinde double-drop garantili imkânsız.</p>
+
+  <p>Bir tip scope'tan çıkarken kaynak bırakması gerekiyorsa <code>Drop</code> trait'ini implement eder. Bu, C++ destructor'ının doğrudan karşılığıdır: dosya kapatma, soket bırakma, kilit çözme gibi temizlikler burada yapılır. <code>String</code>, <code>Vec</code>, <code>File</code>, <code>MutexGuard</code> hepsinin bir <code>Drop</code>'u vardır ve derleyici çağrıyı scope sonuna otomatik yerleştirir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">struct</span> <span class="field">Kaynak</span> {
+    ad: <span class="field">String</span>,
+}
+
+<span class="keyword">impl</span> <span class="field">Drop</span> <span class="keyword">for</span> <span class="field">Kaynak</span> {
+    <span class="keyword">fn</span> drop(&amp;<span class="keyword">mut</span> self) {       <span class="cmt">// C++ ~Kaynak() gibi</span>
+        println!(<span class="str">"bırakılıyor: {}"</span>, self.ad);
+    }
+}
+
+<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> _a = <span class="field">Kaynak</span> { ad: <span class="field">String</span>::from(<span class="str">"A"</span>) };
+    {
+        <span class="keyword">let</span> _b = <span class="field">Kaynak</span> { ad: <span class="field">String</span>::from(<span class="str">"B"</span>) };
+    } <span class="cmt">// -> "bırakılıyor: B"  (ters sırada, B önce)</span>
+} <span class="cmt">// -> "bırakılıyor: A"</span>{% endraw %}</code></pre>
+  </div>
+
+  <p>C++'ta <code>unique_ptr</code> taşındığında kaynak nesne null'a set edilir ki yıkıcı iki kez free yapmasın. Rust'ta bu davranış dile gömülüdür: bir değer move edildiğinde derleyici eski sahibin drop'unu <em>çalıştırmaz</em>; yalnızca son geçerli sahip drop edilir. Böylece <strong>double-drop tasarımdan imkânsızdır</strong> — programcı disiplinine değil, sahiplik kurallarına dayanır.</p>
+
+  <div class="file-table"><table>
+    <thead><tr><th>Kavram</th><th>C++</th><th>Rust</th></tr></thead>
+    <tbody>
+      <tr><td>Otomatik temizlik</td><td>destructor (<code>~T()</code>)</td><td><code>Drop::drop</code></td></tr>
+      <tr><td>Akıllı pointer</td><td><code>unique_ptr&lt;T&gt;</code></td><td><code>Box&lt;T&gt;</code></td></tr>
+      <tr><td>Move sonrası double-free</td><td>elle null'lamaya bağlı</td><td>dilce imkânsız</td></tr>
+      <tr><td>Erken bırakma</td><td>scope/blok hilesi</td><td><code>drop(x)</code> fonksiyonu</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>En sık 3 borrow checker hatası — oku ve çöz</h3>
+  <div class="params">
+    <div class="param"><span class="name">E0382</span><span class="desc">"borrow of moved value" — değeri move ettin, sonra kullandın. Çözüm: <code>.clone()</code> ya da baştan borrow (<code>&amp;</code>) ver.</span></div>
+    <div class="param"><span class="name">E0499</span><span class="desc">"cannot borrow as mutable more than once" — iki aktif <code>&amp;mut</code>. Çözüm: borrow'ları zamanda ayır (NLL), kapsamı daralt.</span></div>
+    <div class="param"><span class="name">E0502</span><span class="desc">"cannot borrow as mutable ... already borrowed as immutable" — okuyucu canlıyken yazmaya çalıştın. Çözüm: okuyucuyu önce bitir veya değeri kopyala.</span></div>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Rust derleyici hata mesajları olağanüstü açıklayıcıdır: hatanın yerini, borrow'un nerede başlayıp nerede çakıştığını ve çoğu zaman somut bir düzeltme önerisini gösterir. Hata kodunu (<code>E0502</code> gibi) <code>rustc --explain E0502</code> ile detaylı okuyabilirsin.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>Drop</code> = Rust'ın RAII'si; derleyici drop çağrısını scope sonuna ters sırayla yerleştirir.</li>
+      <li>Move edilen değerin eski sahibi drop edilmez; double-free/double-drop dilce imkânsızdır.</li>
+      <li><code>Box&lt;T&gt;</code> ≈ <code>unique_ptr</code>, erken bırakma için <code>drop(x)</code> kullanılır.</li>
+      <li>En sık hatalar E0382/E0499/E0502; mesajlar açıklayıcıdır, <code>rustc --explain</code> ile derinleşir.</li>
+    </ul>
+  </div>
+</section>
+
+</main>
