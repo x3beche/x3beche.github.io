@@ -1,0 +1,607 @@
+---
+layout: tutorial
+title: "Rust Async & Tokio"
+back_url: "../index.html"
+back_label: "Tüm Rust rehberleri"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>ASYNC</span>
+    <span>TOKIO</span>
+    <span>2026</span>
+  </div>
+  <h1>Async &amp; Tokio<br><em>Future, await ve executor</em></h1>
+  <p class="subtitle">async/await, Future trait, tokio runtime ve async vs thread; binlerce eşzamanlı I/O görevi — C epoll/callback ve thread-per-connection ile karşılaştırmalı.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">İçindekiler</div>
+  <ol>
+    <li><a href="#s0">Callback cehenneminden async/await'e</a></li>
+    <li><a href="#s1">async fn ve .await</a></li>
+    <li><a href="#s2">Future bir durum makinesidir</a></li>
+    <li><a href="#s3">Runtime/executor gereksinimi</a></li>
+    <li><a href="#s4">#[tokio::main] ve task spawn</a></li>
+    <li><a href="#s5">Async I/O</a></li>
+    <li><a href="#s6">Send across await ve tuzaklar</a></li>
+    <li><a href="#s7">Eşzamanlı görev birleştirme</a></li>
+    <li><a href="#s8">Async vs thread</a></li>
+    <li><a href="#s9">Gerçek örnek</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ── s0 ──────────────────────────────────────────────────── -->
+<section id="s0">
+  <h2><span class="num">00</span> Callback cehenneminden async/await'e</h2>
+  <p class="section-lead">Thread-per-connection ölçeklenmez; el yazımı epoll state machine'leri okunmaz. Rust async, senkron görünümlü kodu eşzamanlı I/O'ya derler.</p>
+
+  <p>10.000 eşzamanlı bağlantı tutman gerekiyor. C/C++ dünyasında elindeki iki klasik seçeneği biliyorsun. Birincisi <strong>thread-per-connection</strong>: her bağlantıya bir <code>pthread</code>. Temiz görünür, bloklayıcı <code>read()</code>/<code>write()</code> yazarsın, ama her thread 1–8 MB stack ister; 10K thread = onlarca GB sanal bellek artı çekirdeğin scheduler'ında bağlam değişimi (context switch) fırtınası. İkincisi <strong>epoll + event loop</strong>: tek thread, on binlerce fd, ama bedeli kodu elinle bir <em>state machine</em>'e bölmen. Her bloklamayan çağrı <code>EAGAIN</code> dönebilir; yarım kalan işi bir struct'a saklar, <code>epoll_wait</code> dönünce kaldığın yerden devam edersin. Mantık callback'lere ve durum enum'larına dağılır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>echo_epoll.c</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="cmt">// C: epoll ile niyet basit — "oku, sonra yaz" — ama kod parçalanmış</span>
+<span class="keyword">struct</span> conn { <span class="keyword">int</span> fd; <span class="keyword">enum</span> { READING, WRITING } st; <span class="keyword">char</span> buf[4096]; size_t n; };
+
+<span class="keyword">for</span> (;;) {
+    <span class="keyword">int</span> r = epoll_wait(ep, evs, MAX, -1);
+    <span class="keyword">for</span> (<span class="keyword">int</span> i = 0; i &lt; r; i++) {
+        <span class="keyword">struct</span> conn *c = evs[i].data.ptr;
+        <span class="keyword">if</span> (c-&gt;st == READING) { <span class="cmt">/* read(); EAGAIN olabilir, durumu sakla */</span> }
+        <span class="keyword">else</span>               { <span class="cmt">/* write(); yarım yazıldıysa tekrar bekle */</span> }
+        <span class="cmt">// "oku sonra yaz" basit niyeti 3 dala, 1 enum'a, 1 struct'a dağıldı</span>
+    }
+}{% endraw %}</code></pre>
+  </div>
+
+  <p>Rust'ın async/await modeli üçüncü bir yolu sunar: kodu <strong>senkron görünümlü</strong> yazarsın — yukarıdan aşağı, dallanmasız — ama derleyici onu otomatik olarak bir state machine'e çevirir. Tek thread'de binlerce görev (task) yürür, hiçbir görev I/O beklerken thread'i bloklamaz. Yani epoll'ün ölçeklenmesini, thread kodunun okunabilirliğiyle birlikte alırsın.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="cmt">// Rust: aynı niyet, düz akış — derleyici state machine'i kendi üretir</span>
+<span class="keyword">async</span> <span class="keyword">fn</span> echo(<span class="keyword">mut</span> sock: <span class="field">TcpStream</span>) -&gt; <span class="field">io</span>::<span class="field">Result</span>&lt;()&gt; {
+    <span class="keyword">let</span> <span class="keyword">mut</span> buf = [0u8; 4096];
+    <span class="keyword">let</span> n = sock.read(&amp;<span class="keyword">mut</span> buf).<span class="keyword">await</span>?;   <span class="cmt">// burada "bekler" ama thread'i bloklamaz</span>
+    sock.write_all(&amp;buf[..n]).<span class="keyword">await</span>?;   <span class="cmt">// yarım yazma yönetimi await'in içinde</span>
+    <span class="field">Ok</span>(())
+}{% endraw %}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Buradaki <code>.await</code>, C'deki bloklayıcı <code>read()</code> gibi <em>görünür</em> ama davranışı <code>EAGAIN</code> + <code>epoll_wait</code> döngüsünün otomatikleştirilmiş halidir. Görev veri beklerken askıya alınır, thread başka göreve geçer — tıpkı senin elinle yazacağın event loop gibi, ama derleyici yazar.</p>
+  </div>
+
+  <div class="flow">
+    <pre>thread-per-conn:  okunaklı kod  +  kötü ölçeklenme
+epoll state machine: iyi ölçeklenme  +  okunmaz kod
+async/await:      okunaklı kod  +  iyi ölçeklenme</pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Thread-per-connection okunaklıdır ama stack + context switch maliyetiyle ölçeklenmez.</li>
+      <li>epoll event loop ölçeklenir ama mantığı elle state machine'e bölmeyi gerektirir.</li>
+      <li>async/await senkron görünümlü kodu derleyici aracılığıyla bir state machine'e çevirir.</li>
+      <li>Sonuç: epoll'ün ölçeklenmesi + thread kodunun okunabilirliği.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s1 ──────────────────────────────────────────────────── -->
+<section id="s1">
+  <h2><span class="num">01</span> async fn ve .await</h2>
+  <p class="section-lead">Bir <code>async fn</code> gövdesini çalıştırmaz; bir <code>Future</code> döndürür. Future lazy'dir — await/poll edilene dek hiçbir şey olmaz.</p>
+
+  <p>İlk sürpriz: <code>async fn fetch()</code> çağırmak fonksiyonun gövdesini <strong>çalıştırmaz</strong>. Sana sadece bir <code>Future</code> nesnesi verir — "ileride bu işi yapacak tarif". Bu, C++ <code>std::async</code> ya da JavaScript <code>Promise</code>'inden <strong>kritik</strong> farktır: orada işi tetiklersin, geri planda koşmaya başlar. Rust'ta Future <em>lazy</em>'dir; onu birisi <code>.await</code> edip ilerletene dek tek bir CPU çevrimi harcanmaz.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">async</span> <span class="keyword">fn</span> fetch(url: &amp;<span class="keyword">str</span>) -&gt; <span class="field">String</span> {
+    <span class="cmt">// ... ağ işi ...</span>
+    <span class="keyword">let</span> body = format!(<span class="str">"{url} cevabı"</span>);
+    body
+}
+
+<span class="keyword">async</span> <span class="keyword">fn</span> run() {
+    <span class="keyword">let</span> fut = fetch(<span class="str">"https://a.dev"</span>);  <span class="cmt">// HİÇBİR ŞEY çalışmadı — sadece Future kuruldu</span>
+    <span class="cmt">// burada fetch'in gövdesi henüz hiç yürütülmedi</span>
+    <span class="keyword">let</span> body = fut.<span class="keyword">await</span>;             <span class="cmt">// İŞTE ŞİMDİ gövde koşar, bitene dek ilerletilir</span>
+    println!(<span class="str">"{body}"</span>);
+}{% endraw %}</code></pre>
+  </div>
+
+  <p><code>.await</code> iki şey yapar. Birincisi: Future'ı ilerletmeyi dener. Future hazırsa (örn. soket okunabilir) sonucu hemen verir. İkincisi: Future hazır değilse (veri yok), bulunduğun async fonksiyonu o noktadan <strong>askıya alır</strong> ve kontrolü çağırana — yani executor'a — geri verir. Executor başka görevleri yürütür; veri geldiğinde senin görevin kaldığı <code>.await</code> noktasından devam eder. Bu, C'de elinle yazdığın "EAGAIN gördüm, durumu sakla, epoll_wait'e dön" mantığının dil seviyesindeki karşılığıdır.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">async fn</span><span class="desc">Gövdeyi çalıştırmaz; <code>impl Future&lt;Output = T&gt;</code> döndüren bir tarif üretir.</span></div>
+    <div class="param"><span class="name">.await</span><span class="desc">Future'ı ilerletir; hazır değilse çağıran async fonksiyonu askıya alıp kontrolü executor'a verir.</span></div>
+    <div class="param"><span class="name">lazy</span><span class="desc">Await/poll edilene dek Future içindeki kod hiç koşmaz — Promise/std::async'in tersine.</span></div>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>Future'ı oluşturup <code>.await</code> etmeyi unutursan kodun <em>hiç çalışmaz</em>. Derleyici "unused <code>Future</code> that must be used" uyarısı verir. JavaScript'te "fire and forget" alışkanlığın varsa burada işe yaramaz: <code>.await</code> yoksa iş de yok.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>async fn</code> çağrısı gövdeyi çalıştırmaz; bir <code>Future</code> döndürür.</li>
+      <li>Future lazy'dir — <code>.await</code> veya poll edilene dek tek satır kod koşmaz.</li>
+      <li><code>.await</code> Future'ı ilerletir; hazır değilse görevi askıya alıp kontrolü executor'a verir.</li>
+      <li>Bu, C++ <code>std::async</code> / JS <code>Promise</code>'inin eager (anında başlayan) modelinden temel bir farktır.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s2 ──────────────────────────────────────────────────── -->
+<section id="s2">
+  <h2><span class="num">02</span> Future bir durum makinesidir</h2>
+  <p class="section-lead">Future trait'i tek bir metoda dayanır: <code>poll()</code>. Derleyici her <code>async fn</code>'i, <code>.await</code> noktalarını duraklar yapan bir state machine'e çevirir.</p>
+
+  <p>Future, sihir değil — basit bir trait. Çekirdeği tek metot: <code>poll</code>. Executor bir görevi ilerletmek için <code>poll</code> çağırır; görev <code>Poll::Ready(t)</code> (bittim, sonuç bu) ya da <code>Poll::Pending</code> (henüz değil, beni sonra tekrar çağır) döner. Bu, epoll'ün "fd hazır mı?" sorusunun tip sistemindeki halidir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>future.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">pub</span> <span class="keyword">trait</span> <span class="field">Future</span> {
+    <span class="keyword">type</span> <span class="field">Output</span>;
+    <span class="cmt">// Pending dönerse: ilerleme yok; Waker tetiklenince tekrar poll edilecek</span>
+    <span class="keyword">fn</span> poll(self: <span class="field">Pin</span>&lt;&amp;<span class="keyword">mut</span> <span class="field">Self</span>&gt;, cx: &amp;<span class="keyword">mut</span> <span class="field">Context</span>) -&gt; <span class="field">Poll</span>&lt;<span class="field">Self</span>::<span class="field">Output</span>&gt;;
+}
+
+<span class="keyword">enum</span> <span class="field">Poll</span>&lt;T&gt; { <span class="field">Ready</span>(T), <span class="field">Pending</span> }{% endraw %}</code></pre>
+  </div>
+
+  <p>Asıl güzellik: sen <code>poll</code> yazmazsın. Derleyici, içinde <em>n</em> tane <code>.await</code> olan bir <code>async fn</code>'i, <em>n+1</em> durumlu bir enum'a — gerçek bir state machine'e — derler. Her <code>.await</code> bir <strong>durak noktası</strong>dır: makine o durumda durur, kontrolü bırakır, tekrar poll edildiğinde o durumdan devam eder. Yerel değişkenlerin (<code>.await</code> sonrası hâlâ kullanılanlar) bu enum'ın varyantlarında saklanır — yani C'de elinle <code>struct conn</code>'a koyduğun "kaldığım yer" alanlarını derleyici otomatik üretir.</p>
+
+  <div class="flow">
+    <pre>async fn:  oku().await  →  işle()  →  yaz().await  →  bitti
+state machine: [S0: oku bekliyor] → [S1: yaz bekliyor] → [S2: Ready]</pre>
+  </div>
+
+  <p>Peki <code>Pin&lt;&amp;mut Self&gt;</code> neden var? State machine, kendi içindeki bir veriye referans tutabilir (örn. okuma buffer'ına işaret eden bir slice). Böyle bir yapı <strong>self-referential</strong>'dir: bellekte taşınırsa (move) içindeki o referans bozulur — klasik dangling. <code>Pin</code>, "bu Future poll edilirken bellekte yer değiştiremez" garantisini tip seviyesinde verir. Çoğu zaman <code>Pin</code>'i hiç elle tutmazsın; <code>tokio::pin!</code> ya da heap'e koyan <code>Box::pin</code> halleder. Bilmen gereken tek şey: var olma sebebi self-referential state machine'lerin güvenliğidir.</p>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Future'ın bedeli sıfıra yakındır: heap allocation yok (top-level görev hariç), her görev için ayrı stack yok. Bir async görev, durumunu tutan <em>tek bir</em> derleyici-üretimi struct'tan ibarettir. 10K görev = 10K küçük struct, 10K thread stack'i değil. Ölçeklenme farkının kaynağı budur.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>Future</code> = tek metotlu trait; <code>poll</code> ya <code>Poll::Ready(t)</code> ya <code>Poll::Pending</code> döner.</li>
+      <li>Derleyici her <code>async fn</code>'i, her <code>.await</code>'ün durak olduğu bir state machine enum'una çevirir.</li>
+      <li><code>.await</code> sonrası yaşayan yerel değişkenler bu enum'ın varyantlarında saklanır.</li>
+      <li><code>Pin</code>, self-referential Future'ların poll sırasında move edilmemesini garanti eder.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s3 ──────────────────────────────────────────────────── -->
+<section id="s3">
+  <h2><span class="num">03</span> Runtime/executor gereksinimi</h2>
+  <p class="section-lead">Future kendiliğinden ilerlemez; onu poll eden bir <em>executor</em> gerekir. std bir runtime içermez — Rust async, runtime'ı kasten dile gömmez.</p>
+
+  <p>Future tanımladın, ama onu kim poll edecek? <code>poll</code>'u tekrar tekrar çağıran, <code>Pending</code> dönenleri uyku noktalarına bağlayan (epoll/kqueue/IOCP üzerinden) ve hazır olunca yeniden poll eden bileşene <strong>executor</strong> (daha geniş paketiyle <strong>runtime</strong>) denir. Burada Go ve Node.js'ten kritik bir tasarım farkı var: <strong>std bir runtime içermez</strong>. Standart kütüphane sadece <code>Future</code>, <code>Poll</code>, <code>Waker</code> arabirimlerini tanımlar; gerçek event loop'u sana bırakır.</p>
+
+  <p>Neden? Çünkü Rust gömülü sistemden sunucuya kadar her yerde koşar. Tek bir zorunlu scheduler dayatmak, no_std bir mikrodenetleyiciyle yüksek-throughput bir ağ sunucusunu aynı kalıba sokmak olurdu. Rust bunun yerine arabirimi standartlaştırır, politikayı (iş çalma, thread sayısı, I/O backend) ekosisteme bırakır. Pratikte baskın seçim <strong>tokio</strong>'dur.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Katman</th><th>Sağlayan</th><th>İçerik</th></tr></thead>
+      <tbody>
+        <tr><td>Arabirim</td><td>std</td><td><code>Future</code>, <code>Poll</code>, <code>Context</code>, <code>Waker</code></td></tr>
+        <tr><td>Söz dizimi</td><td>derleyici</td><td><code>async</code>/<code>.await</code> → state machine</td></tr>
+        <tr><td>Executor / runtime</td><td>tokio (vb.)</td><td>scheduler, epoll/IOCP, timer, async I/O tipleri</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>tokio'yu projeye ekle. <code>features = ["full"]</code> öğrenirken pratiktir; üretimde sadece kullandığın özellikleri (<code>"rt-multi-thread"</code>, <code>"net"</code>, <code>"io-util"</code>, <code>"macros"</code>, <code>"time"</code>) açarak derleme süresini ve ikili boyutunu kısarsın.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>Cargo.toml</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="field">[dependencies]</span>
+<span class="cmt"># öğrenirken: tüm özellikler açık</span>
+tokio = { version = <span class="str">"1"</span>, features = [<span class="str">"full"</span>] }
+
+<span class="cmt"># üretimde: yalnızca gerekenler</span>
+<span class="cmt"># tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros"] }</span>{% endraw %}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Birden çok runtime vardır (<code>async-std</code>, <code>smol</code>, gömülü için <code>embassy</code>). Future trait ortak olduğundan tip seviyesinde uyumludurlar; ama I/O tipleri (örn. tokio'nun <code>TcpStream</code>'i) kendi runtime'ına bağlıdır. Pratik kural: <strong>tek bir runtime seç ve ekosisteminde kal</strong>. tokio en geniş kütüphane desteğine sahiptir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Future'ı executor poll eder; runtime = scheduler + I/O backend + timer'lar.</li>
+      <li>std bilinçli olarak runtime içermez — sadece Future/Poll/Waker arabirimlerini tanımlar.</li>
+      <li>Politika ekosisteme bırakıldı: gömülüden sunucuya tek scheduler dayatılmaz.</li>
+      <li>Baskın seçim tokio; <code>features = ["full"]</code> öğrenmek için, daraltılmış set üretim için.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s4 ──────────────────────────────────────────────────── -->
+<section id="s4">
+  <h2><span class="num">04</span> #[tokio::main] ve task spawn</h2>
+  <p class="section-lead"><code>#[tokio::main]</code> runtime'ı kurar; <code>tokio::spawn</code> bir görevi scheduler'a verir. Task = yeşil iş parçacığı, OS thread'i değil.</p>
+
+  <p><code>main</code> async olamaz — programın giriş noktası bir Future'ı bekleyecek executor'a ihtiyaç duyar. <code>#[tokio::main]</code> makrosu bu plaka kodu yazar: bir runtime oluşturur, <code>main</code>'in döndürdüğü Future'ı <code>block_on</code> ile çalıştırır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="cmt">// Makro bunu üretir: Runtime::new().block_on(async { ... })</span>
+<span class="cmt">#[tokio::main]</span>
+<span class="keyword">async</span> <span class="keyword">fn</span> main() {
+    println!(<span class="str">"runtime hazır, main bir Future olarak koşuyor"</span>);
+}{% endraw %}</code></pre>
+  </div>
+
+  <p>Eşzamanlılık için görev (<strong>task</strong>) açarsın. <code>tokio::spawn</code> bir Future'ı scheduler'a teslim eder ve <strong>hemen</strong> bir <code>JoinHandle&lt;T&gt;</code> döner — görev arka planda bağımsız ilerler (burada Future'ın lazy kuralı bozulmaz: spawn, ilerletme görevini executor'a devrettiği için iş başlar). <code>JoinHandle</code>, C'deki <code>pthread_join</code>'in async eşdeğeridir: <code>.await</code> edersen görevin sonucunu beklersin.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="cmt">#[tokio::main]</span>
+<span class="keyword">async</span> <span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> handle: <span class="field">JoinHandle</span>&lt;u64&gt; = tokio::spawn(<span class="keyword">async</span> {
+        <span class="cmt">// bağımsız bir görev — kendi state machine'i</span>
+        (1..=100).sum()
+    });
+
+    <span class="cmt">// main bu sırada başka iş yapabilir...</span>
+    <span class="keyword">let</span> toplam = handle.<span class="keyword">await</span>.unwrap();  <span class="cmt">// JoinHandle .await = görevin sonucu</span>
+    println!(<span class="str">"toplam = {toplam}"</span>);
+}{% endraw %}</code></pre>
+  </div>
+
+  <p>Kritik zihinsel model: task bir OS thread'i <strong>değildir</strong>. Çoğu zaman "yeşil iş parçacığı" (green thread) denir — runtime tarafından zamanlanan, kullanıcı uzayında yaşayan hafif bir yürütme birimi. Varsayılan multi-thread scheduler bir <strong>thread havuzu</strong> (genelde çekirdek sayısı kadar) tutar ve binlerce task'ı bu birkaç thread üzerinde <em>iş çalma</em> (work-stealing) ile çoğullar (multiplex). Bir task <code>.await</code>'te askıya alındığında, çalıştığı thread başka bir hazır task'a geçer. 10K task açmak 10K thread değil, 10K küçük state machine demektir.</p>
+
+  <div class="flow">
+    <pre>10.000 task  →  work-stealing scheduler  →  N OS thread (N ≈ çekirdek sayısı)</pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>Multi-thread runtime'da bir task herhangi bir thread'de — ve <code>.await</code> sonrası <em>başka</em> bir thread'de — koşabilir. Bu yüzden task'lar arası paylaşılan durum thread-safe olmalı (bkz. s6: Send). Bu, tek thread'li Node.js event loop'undan önemli bir ayrımdır.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>#[tokio::main]</code> runtime'ı kurar ve <code>main</code> Future'ını <code>block_on</code> ile çalıştırır.</li>
+      <li><code>tokio::spawn</code> bir Future'ı scheduler'a verir, anında <code>JoinHandle&lt;T&gt;</code> döner.</li>
+      <li><code>JoinHandle</code>'ı <code>.await</code> etmek görevin sonucunu beklemektir (async <code>pthread_join</code>).</li>
+      <li>Task = yeşil iş parçacığı; binlerce task work-stealing ile birkaç OS thread'e çoğullanır.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s5 ──────────────────────────────────────────────────── -->
+<section id="s5">
+  <h2><span class="num">05</span> Async I/O</h2>
+  <p class="section-lead">tokio'nun <code>TcpListener</code>/<code>TcpStream</code>'i async <code>accept</code>/<code>read</code>/<code>write</code> sunar. Tek thread'de binlerce görev = concurrency; çok çekirdekte aynı anda yürütme = parallelism.</p>
+
+  <p>tokio, std'nin bloklayıcı ağ tiplerinin async ikizlerini sağlar. İmzalar tanıdık ama metotlar Future döndürür; <code>.await</code> ile beklersin. Aşağıda klasik accept döngüsü: her bağlantıyı ayrı bir task'a verir, döngü hemen yeni <code>accept</code>'e döner — yani sunucu bir bağlantıyı işlerken diğerlerini kabul etmeyi bekletmez.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">use</span> tokio::net::<span class="field">TcpListener</span>;
+<span class="keyword">use</span> tokio::io::{<span class="field">AsyncReadExt</span>, <span class="field">AsyncWriteExt</span>};
+
+<span class="cmt">#[tokio::main]</span>
+<span class="keyword">async</span> <span class="keyword">fn</span> main() -&gt; <span class="field">io</span>::<span class="field">Result</span>&lt;()&gt; {
+    <span class="keyword">let</span> listener = <span class="field">TcpListener</span>::bind(<span class="str">"0.0.0.0:8080"</span>).<span class="keyword">await</span>?;
+    <span class="keyword">loop</span> {
+        <span class="keyword">let</span> (<span class="keyword">mut</span> sock, _) = listener.accept().<span class="keyword">await</span>?;  <span class="cmt">// async accept</span>
+        tokio::spawn(<span class="keyword">async</span> <span class="keyword">move</span> {                       <span class="cmt">// her bağlantı kendi task'ı</span>
+            <span class="keyword">let</span> <span class="keyword">mut</span> buf = [0u8; 1024];
+            <span class="keyword">while</span> <span class="keyword">let</span> <span class="field">Ok</span>(n) = sock.read(&amp;<span class="keyword">mut</span> buf).<span class="keyword">await</span> {
+                <span class="keyword">if</span> n == 0 { <span class="keyword">break</span>; }              <span class="cmt">// karşı taraf kapattı</span>
+                <span class="keyword">if</span> sock.write_all(&amp;buf[..n]).<span class="keyword">await</span>.is_err() { <span class="keyword">break</span>; }
+            }
+        });
+    }
+}{% endraw %}</code></pre>
+  </div>
+
+  <p>Burada <strong>concurrency</strong> ile <strong>parallelism</strong> ayrımı netleşir; C/C++'ta sık karıştırılır. <em>Concurrency</em>: birden çok görevin <em>ilerleme hâlinde</em> olması — biri I/O beklerken diğerine geçilmesi. Bu, tek bir thread'de bile mümkündür; epoll'ün yaptığı tam olarak budur. <em>Parallelism</em>: birden çok görevin <em>aynı anda farklı CPU çekirdeklerinde</em> yürümesi; donanım paralelliği gerektirir.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th></th><th>Concurrency</th><th>Parallelism</th></tr></thead>
+      <tbody>
+        <tr><td>Tanım</td><td>çok görev "ilerleme hâlinde"</td><td>çok görev "aynı anda yürümede"</td></tr>
+        <tr><td>Tek çekirdek</td><td>mümkün (görev çoğullama)</td><td>imkânsız</td></tr>
+        <tr><td>Donanım</td><td>tek thread yeter</td><td>çok çekirdek şart</td></tr>
+        <tr><td>async ile</td><td>her zaman elde edersin</td><td>multi-thread runtime ile</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>tokio'nun varsayılan multi-thread runtime'ı ikisini birleştirir: tek thread'de bile binlerce bağlantıyı I/O üzerinde çoğullar (concurrency) ve birden çok çekirdekte task'ları gerçekten paralel koşturur (parallelism). 10K bağlantı için 10K thread açmak yerine, birkaç thread üzerinde 10K task çoğullanır.</p>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p><code>read</code>/<code>write</code> metotları <code>AsyncReadExt</code>/<code>AsyncWriteExt</code> trait'lerinden gelir — kullanmak için onları <code>use</code> etmen şart, yoksa "no method named read" hatası alırsın. Bu, Rust'ın "trait metotları görünür olmalı" kuralının klasik bir tezahürüdür.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>tokio, std ağ tiplerinin async ikizlerini sunar; metotlar Future döndürür, <code>.await</code> ile beklenir.</li>
+      <li>Her bağlantıyı <code>spawn</code> edip accept döngüsünü bekletmemek temel desendir.</li>
+      <li>Concurrency = çok görev ilerleme hâlinde (tek thread'de bile); parallelism = aynı anda çok çekirdekte.</li>
+      <li>Multi-thread runtime ikisini birleştirir: I/O çoğullama + çekirdekler arası gerçek paralellik.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s6 ──────────────────────────────────────────────────── -->
+<section id="s6">
+  <h2><span class="num">06</span> Send across await ve tuzaklar</h2>
+  <p class="section-lead">Bir <code>.await</code>'i geçen her değişken state machine'de saklanır; multi-thread'de bu değerlerin <code>Send</code> olması gerekir. <code>Rc</code>/<code>RefCell</code> guard'ı await üzerinden taşımak derleme hatasıdır.</p>
+
+  <p>s2'den hatırla: <code>.await</code> noktasından sonra hâlâ kullanılan yerel değişkenler, derleyicinin ürettiği state machine struct'ında <strong>yaşar</strong>. Multi-thread runtime'da bir task, bir <code>.await</code>'te askıya alınıp <em>başka</em> bir thread'de devam edebilir. Yani state machine'in tamamı thread'ler arasında taşınabilmeli — bu da içindeki tüm "await'i geçen" verilerin <code>Send</code> olmasını gerektirir.</p>
+
+  <p>Klasik tuzak: thread-safe <strong>olmayan</strong> bir tipi (<code>Rc</code>, ya da <code>RefCell</code>'in <code>Ref</code>/<code>RefMut</code> guard'ı) bir <code>.await</code>'in iki yanında canlı tutmak. Bu tipler kasıtla <code>!Send</code>'dir; derleyici task'ı başka thread'e taşıyamaz ve <code>tokio::spawn</code> reddeder.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">use</span> std::rc::<span class="field">Rc</span>;
+
+<span class="cmt">// HATA: Rc !Send; await üzerinden canlı kaldığı için task Send değil</span>
+tokio::spawn(<span class="keyword">async</span> {
+    <span class="keyword">let</span> data = <span class="field">Rc</span>::new(42);
+    yield_now().<span class="keyword">await</span>;          <span class="cmt">// burada askıya alınır; `data` hâlâ canlı</span>
+    println!(<span class="str">"{}"</span>, data);       <span class="cmt">// await'in diğer yanında kullanılıyor</span>
+});
+<span class="cmt">// error: future cannot be sent between threads safely  →  `Rc&lt;i32&gt;` is not `Send`</span>{% endraw %}</code></pre>
+  </div>
+
+  <p>İki çözüm var. Birincisi: thread-safe karşılığı kullan — <code>Rc</code> yerine <code>Arc</code>, <code>RefCell</code> yerine <code>tokio::sync::Mutex</code> (kilidi await üzerinden tutmak gerekiyorsa) ya da <code>std::sync::Mutex</code> (kilit kısa ve await'siz tutuluyorsa). İkincisi: <code>!Send</code> değeri <code>.await</code>'ten <em>önce</em> bir kapsamda kapat (drop et), böylece state machine'e hiç sızmaz.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">use</span> std::sync::<span class="field">Arc</span>;
+
+<span class="cmt">// Çözüm 1: Send olan Arc</span>
+tokio::spawn(<span class="keyword">async</span> {
+    <span class="keyword">let</span> data = <span class="field">Arc</span>::new(42);    <span class="cmt">// Arc Send'dir</span>
+    yield_now().<span class="keyword">await</span>;
+    println!(<span class="str">"{}"</span>, data);        <span class="cmt">// sorun yok</span>
+});
+
+<span class="cmt">// Çözüm 2: !Send değeri await'ten önce drop et (kapsam içinde tut)</span>
+tokio::spawn(<span class="keyword">async</span> {
+    {
+        <span class="keyword">let</span> tmp = <span class="field">Rc</span>::new(1);     <span class="cmt">// Rc burada kullanılır...</span>
+        do_sync(&amp;tmp);
+    }                            <span class="cmt">// ...ve burada drop edilir — await'i geçmez</span>
+    yield_now().<span class="keyword">await</span>;            <span class="cmt">// artık state machine'de !Send bir şey yok</span>
+});{% endraw %}</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p><code>std::sync::MutexGuard</code> <code>!Send</code>'dir; kilidi <code>.await</code> üzerinden tutarsan task <code>Send</code> olmaktan çıkar. Kuralı şöyle düşün: <strong>kilidi await'ten önce bırak</strong>, ya da <em>async-aware</em> <code>tokio::sync::Mutex</code> kullan (onun guard'ı await üzerinden taşınabilir). Bu hata, C'de mutex tutarken bloklayıcı çağrı yapıp deadlock'a benzer ama burada <em>derleme zamanında</em> yakalanır.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>.await</code>'i geçen yerel değişkenler state machine'de saklanır.</li>
+      <li>Multi-thread runtime task'ı thread'ler arası taşıyabilir → await'i geçen değerler <code>Send</code> olmalı.</li>
+      <li><code>Rc</code>, <code>RefCell</code> guard, <code>std::sync::MutexGuard</code> <code>!Send</code>'dir; await üzerinden taşımak derleme hatasıdır.</li>
+      <li>Çözüm: <code>Arc</code>/<code>tokio::sync::Mutex</code> kullan ya da <code>!Send</code> değeri await'ten önce drop et.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s7 ──────────────────────────────────────────────────── -->
+<section id="s7">
+  <h2><span class="num">07</span> Eşzamanlı görev birleştirme</h2>
+  <p class="section-lead"><code>join!</code> hepsini bekler, <code>select!</code> ilk biteni alır, <code>timeout</code> süre koyar. Sıralı <code>.await</code> ile eşzamanlı çalıştırma arasındaki performans farkı kritiktir.</p>
+
+  <p>En sık yapılan performans hatası: bağımsız işleri <strong>sıralı</strong> <code>.await</code> etmek. Üç HTTP isteğini art arda await edersen toplam süre = sürelerin toplamı; oysa hepsi bağımsızsa aynı anda ilerlemeleri ve toplam sürenin <em>en yavaşı</em> kadar olması gerekir. <code>tokio::join!</code> tam bunu yapar: birden çok Future'ı aynı görevde eşzamanlı ilerletir, hepsi bitince sonuçları tuple olarak verir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="cmt">// YANLIŞ: sıralı — toplam ≈ a + b + c</span>
+<span class="keyword">let</span> ra = fetch(<span class="str">"a"</span>).<span class="keyword">await</span>;
+<span class="keyword">let</span> rb = fetch(<span class="str">"b"</span>).<span class="keyword">await</span>;
+<span class="keyword">let</span> rc = fetch(<span class="str">"c"</span>).<span class="keyword">await</span>;
+
+<span class="cmt">// DOĞRU: eşzamanlı — toplam ≈ max(a, b, c)</span>
+<span class="keyword">let</span> (ra, rb, rc) = tokio::join!(fetch(<span class="str">"a"</span>), fetch(<span class="str">"b"</span>), fetch(<span class="str">"c"</span>));
+
+<span class="cmt">// Herhangi biri hata dönebiliyorsa: ilk Err'de kısa devre yapar</span>
+<span class="keyword">let</span> (ra, rb) = tokio::try_join!(get(<span class="str">"a"</span>), get(<span class="str">"b"</span>))?;{% endraw %}</code></pre>
+  </div>
+
+  <p><code>select!</code> farklı bir desen: birden çok Future'ı eşzamanlı bekler ama <strong>ilk biten</strong> kazanır; geri kalanlar iptal edilir (drop edilir). C'de <code>select()</code>/<code>poll()</code>'un "hangi fd önce hazır" sorusunun async hâlidir. Tipik kullanım: bir işi bir iptal sinyaline ya da zaman aşımına karşı yarıştırmak.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">use</span> tokio::time::{sleep, timeout, <span class="field">Duration</span>};
+
+<span class="cmt">// select!: ilk biteni al, diğerini iptal et</span>
+tokio::select! {
+    res = fetch(<span class="str">"hizli"</span>)   =&gt; println!(<span class="str">"önce fetch bitti: {res}"</span>),
+    _   = sleep(<span class="field">Duration</span>::from_secs(2)) =&gt; println!(<span class="str">"2 sn doldu, vazgeç"</span>),
+}
+
+<span class="cmt">// timeout: Future'ı süreyle sınırla — aşarsa Err(Elapsed)</span>
+<span class="keyword">match</span> timeout(<span class="field">Duration</span>::from_secs(3), fetch(<span class="str">"a"</span>)).<span class="keyword">await</span> {
+    <span class="field">Ok</span>(body) =&gt; println!(<span class="str">"geldi: {body}"</span>),
+    <span class="field">Err</span>(_)   =&gt; println!(<span class="str">"zaman aşımı"</span>),
+}{% endraw %}</code></pre>
+  </div>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Birleştirici</th><th>Davranış</th><th>Tipik kullanım</th></tr></thead>
+      <tbody>
+        <tr><td><code>join!</code></td><td>hepsini bekle, tüm sonuçları topla</td><td>bağımsız işleri paralel toplama</td></tr>
+        <tr><td><code>try_join!</code></td><td>hepsini bekle, ilk <code>Err</code>'de kısa devre</td><td>biri başarısızsa hepsini iptal</td></tr>
+        <tr><td><code>select!</code></td><td>ilk biteni al, kalanı iptal et</td><td>yarış / iptal / zaman aşımı</td></tr>
+        <tr><td><code>timeout</code></td><td>Future'a süre sınırı koy</td><td>askıda kalan I/O'yu kesme</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p><code>select!</code> kazanmayan kolu <strong>iptal eder</strong> — yani o Future bir <code>.await</code> noktasında yarıda kesilir (<em>cancellation</em>). Yarıda kesilen iş yan etki bırakmışsa (yarım yazılan dosya, tutulan kilit) tutarsızlık doğabilir. Kolların <em>cancel-safe</em> olduğundan emin ol; tokio dokümanı her metot için bunu belirtir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Bağımsız işleri sıralı <code>.await</code> etmek süreleri toplar; <code>join!</code> onları eşzamanlı ilerletir (≈ en yavaş).</li>
+      <li><code>try_join!</code> ilk <code>Err</code>'de kısa devre yapar; <code>select!</code> ilk biteni alıp kalanı iptal eder.</li>
+      <li><code>tokio::time::timeout</code> bir Future'a süre sınırı koyar, aşarsa <code>Err</code> döner.</li>
+      <li><code>select!</code> iptali (cancellation) yan etkili işlerde tutarsızlık yaratabilir — cancel-safe ol.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s8 ──────────────────────────────────────────────────── -->
+<section id="s8">
+  <h2><span class="num">08</span> Async vs thread</h2>
+  <p class="section-lead">I/O-bound iş → async; CPU-bound iş → thread/rayon. Bloklayıcı bir çağrı runtime thread'ini kilitler; çözüm <code>spawn_blocking</code>.</p>
+
+  <p>async her şeyin çözümü değildir. Doğru ayrım iş yükünün doğasındadır. <strong>I/O-bound</strong> iş (ağ, disk, bekleme) çoğunlukla <em>beklemekle</em> geçer; CPU boştadır. Burada async ideal: bekleyen görev thread'i serbest bırakır, binlercesi birkaç thread'e sığar. <strong>CPU-bound</strong> iş (şifreleme, sıkıştırma, sayısal hesap) çekirdeği doyurur; askıya alacak bir "bekleme" noktası yoktur. Burada async hiçbir şey kazandırmaz — gerçek paralellik için OS thread'leri ya da <code>rayon</code> gibi bir veri-paralel kütüphane gerekir.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>İş türü</th><th>Örnek</th><th>Doğru araç</th><th>Neden</th></tr></thead>
+      <tbody>
+        <tr><td>I/O-bound</td><td>ağ, disk, DB sorgusu</td><td>async / tokio</td><td>bekleme thread'i bloklamaz, çok görev çoğullanır</td></tr>
+        <tr><td>CPU-bound</td><td>hash, sıkıştırma, render</td><td>thread / rayon</td><td>gerçek paralellik şart; askıya alınacak nokta yok</td></tr>
+        <tr><td>Karışık</td><td>I/O + ağır hesap</td><td>async + <code>spawn_blocking</code></td><td>hesabı ayrı havuza taşı, runtime'ı boş tut</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>En tehlikeli tuzak: async bir görevin içinde <strong>bloklayıcı</strong> bir çağrı yapmak — uzun süren senkron hesap, <code>std::thread::sleep</code>, ya da bloklayan bir C kütüphane çağrısı. async görev yürüten bir runtime thread'i, <code>.await</code>'e gelene dek <em>kooperatif</em> çalışır; bloklayıcı çağrı o thread'i ele geçirir, üzerindeki <em>tüm diğer</em> task'lar aç kalır. Bu, tek thread'li event loop'u kilitlemenin tokio karşılığıdır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="cmt">// YANLIŞ: bloklayıcı hesap runtime thread'ini ele geçirir</span>
+tokio::spawn(<span class="keyword">async</span> {
+    <span class="keyword">let</span> h = expensive_hash(&amp;data);  <span class="cmt">// 500 ms CPU — bu thread'deki diğer task'lar donar</span>
+    use_it(h);
+});
+
+<span class="cmt">// DOĞRU: bloklayıcı işi ayrı thread havuzuna taşı</span>
+tokio::spawn(<span class="keyword">async</span> {
+    <span class="keyword">let</span> h = tokio::task::spawn_blocking(<span class="keyword">move</span> || {
+        expensive_hash(&amp;data)        <span class="cmt">// ayrı blocking-pool thread'inde koşar</span>
+    }).<span class="keyword">await</span>.unwrap();
+    use_it(h);                       <span class="cmt">// runtime thread'i boş kaldı, diğer task'lar akmaya devam etti</span>
+});{% endraw %}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p><code>spawn_blocking</code> tokio'nun ayrı bir <em>blocking thread pool</em>'unda iş koşturur ve sonucu <code>.await</code> edilebilir bir <code>JoinHandle</code> ile geri verir. Ağır CPU işi için <code>rayon</code> ile birleştirebilir, async dünyaya köprüyü <code>spawn_blocking</code> (veya bir oneshot kanal) ile kurabilirsin. Uyku için her zaman <code>tokio::time::sleep</code> kullan — <code>std::thread::sleep</code> değil.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>I/O-bound iş async'e, CPU-bound iş thread/rayon'a aittir; doğru ayrım iş yükünün doğasıdır.</li>
+      <li>async görev içinde bloklayıcı çağrı, runtime thread'ini ele geçirip diğer tüm task'ları aç bırakır.</li>
+      <li><code>spawn_blocking</code> bloklayıcı/ağır işi ayrı bir thread havuzuna taşır, runtime'ı serbest tutar.</li>
+      <li>Uyku için <code>tokio::time::sleep</code> kullan; <code>std::thread::sleep</code> thread'i bloklar.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s9 ──────────────────────────────────────────────────── -->
+<section id="s9">
+  <h2><span class="num">09</span> Gerçek örnek</h2>
+  <p class="section-lead">Öğrendiğimiz her şeyi tek dosyada birleştiren, çalışan bir async TCP echo sunucusu — her bağlantı kendi task'ında, eşzamanlı binlerce istemciye dayanıklı.</p>
+
+  <p>Aşağıdaki sunucu bu rehberin tamamını özetler: <code>#[tokio::main]</code> ile runtime, async <code>accept</code> döngüsü, bağlantı başına <code>spawn</code>, <code>AsyncReadExt</code>/<code>AsyncWriteExt</code> ile async I/O ve <code>timeout</code> ile boşta kalan bağlantıyı kesme. Tek thread'li bir C epoll sunucusunun yaptığı işi, düz okunan kodla yapar — ama varsayılan multi-thread runtime sayesinde çekirdekler arasında da ölçeklenir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">use</span> tokio::net::<span class="field">TcpListener</span>;
+<span class="keyword">use</span> tokio::io::{<span class="field">AsyncReadExt</span>, <span class="field">AsyncWriteExt</span>};
+<span class="keyword">use</span> tokio::time::{timeout, <span class="field">Duration</span>};
+
+<span class="cmt">#[tokio::main]</span>
+<span class="keyword">async</span> <span class="keyword">fn</span> main() -&gt; <span class="field">std</span>::<span class="field">io</span>::<span class="field">Result</span>&lt;()&gt; {
+    <span class="keyword">let</span> listener = <span class="field">TcpListener</span>::bind(<span class="str">"127.0.0.1:8080"</span>).<span class="keyword">await</span>?;
+    println!(<span class="str">"echo sunucu :8080 dinlemede"</span>);
+
+    <span class="keyword">loop</span> {
+        <span class="keyword">let</span> (sock, peer) = listener.accept().<span class="keyword">await</span>?;   <span class="cmt">// async accept — bloklamaz</span>
+        <span class="cmt">// her bağlantı bağımsız bir task; accept döngüsü beklemez</span>
+        tokio::spawn(<span class="keyword">async</span> <span class="keyword">move</span> {
+            <span class="keyword">if</span> <span class="keyword">let</span> <span class="field">Err</span>(e) = handle(sock).<span class="keyword">await</span> {
+                eprintln!(<span class="str">"{peer} hata: {e}"</span>);
+            }
+        });
+    }
+}
+
+<span class="keyword">async</span> <span class="keyword">fn</span> handle(<span class="keyword">mut</span> sock: tokio::net::<span class="field">TcpStream</span>) -&gt; <span class="field">std</span>::<span class="field">io</span>::<span class="field">Result</span>&lt;()&gt; {
+    <span class="keyword">let</span> <span class="keyword">mut</span> buf = [0u8; 1024];
+    <span class="keyword">loop</span> {
+        <span class="cmt">// 30 sn veri gelmezse bağlantıyı kes (askıda kalan istemciyi temizle)</span>
+        <span class="keyword">let</span> n = <span class="keyword">match</span> timeout(<span class="field">Duration</span>::from_secs(30), sock.read(&amp;<span class="keyword">mut</span> buf)).<span class="keyword">await</span> {
+            <span class="field">Ok</span>(<span class="field">Ok</span>(0))  =&gt; <span class="keyword">return</span> <span class="field">Ok</span>(()),   <span class="cmt">// 0 bayt = karşı taraf kapattı</span>
+            <span class="field">Ok</span>(<span class="field">Ok</span>(n))  =&gt; n,
+            <span class="field">Ok</span>(<span class="field">Err</span>(e)) =&gt; <span class="keyword">return</span> <span class="field">Err</span>(e),     <span class="cmt">// soket hatası</span>
+            <span class="field">Err</span>(_)      =&gt; <span class="keyword">return</span> <span class="field">Ok</span>(()),   <span class="cmt">// timeout: sessizce kapat</span>
+        };
+        sock.write_all(&amp;buf[..n]).<span class="keyword">await</span>?;       <span class="cmt">// geleni aynen geri yaz</span>
+    }
+}{% endraw %}</code></pre>
+  </div>
+
+  <p>Test etmek için ayrı bir terminalde <code>nc 127.0.0.1 8080</code> ile bağlan, bir şey yaz — aynen geri gelir. Aynı anda onlarca <code>nc</code> oturumu açabilirsin; her biri kendi task'ında yürür, hiçbiri diğerini bekletmez. Bunu bir C epoll sunucusuyla kıyasla: orada bu mantık (accept, durum izleme, kısmi okuma/yazma, zaman aşımı) onlarca satır el yazımı state machine olurdu; burada düz, sıralı okunan async kod.</p>
+
+  <p>İstemci tarafında da eşzamanlılığın gücünü <code>join!</code> ile görelim — bağımsız işleri tek thread'de, tek görevde paralel yürüten son bir örnek:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="cmt">// Üç bağımsız işi eşzamanlı yürüt — toplam ≈ en yavaşı, toplamı değil</span>
+<span class="cmt">#[tokio::main]</span>
+<span class="keyword">async</span> <span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> (a, b, c) = tokio::join!(
+        fetch(<span class="str">"https://x.dev/1"</span>),
+        fetch(<span class="str">"https://x.dev/2"</span>),
+        fetch(<span class="str">"https://x.dev/3"</span>),
+    );
+    println!(<span class="str">"{a} {b} {c}"</span>);
+}{% endraw %}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Buradan ileri yol: kanal tabanlı görevler arası iletişim için <code>tokio::sync::mpsc</code>; paylaşılan durum için <code>Arc&lt;Mutex&lt;T&gt;&gt;</code>; HTTP için <code>reqwest</code> (istemci) ve <code>axum</code>/<code>hyper</code> (sunucu); akışlar için <code>Stream</code> trait'i. Hepsi aynı Future/tokio temeline oturur — bu rehberdeki zihinsel model değişmeden ölçeklenir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Tam echo sunucusu: <code>#[tokio::main]</code> + async accept döngüsü + bağlantı başına <code>spawn</code>.</li>
+      <li><code>timeout</code> ile askıda kalan bağlantıyı kesmek üretim kalitesinde dayanıklılık sağlar.</li>
+      <li>C epoll state machine'inin onlarca satırı, düz okunan birkaç satır async koda iner.</li>
+      <li>İstemci tarafında <code>join!</code> bağımsız işleri eşzamanlı yürütür; ileri adım kanallar, <code>reqwest</code>, <code>axum</code>.</li>
+    </ul>
+  </div>
+</section>
+
+</main>

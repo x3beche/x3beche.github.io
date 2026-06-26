@@ -1,0 +1,692 @@
+---
+layout: tutorial
+title: "Rust unsafe & FFI"
+back_url: "../index.html"
+back_label: "Tüm Rust rehberleri"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>İLERİ</span>
+    <span>UNSAFE</span>
+    <span>2026</span>
+  </div>
+  <h1>unsafe &amp; FFI<br><em>Raw pointer, C çağırma, bindgen</em></h1>
+  <p class="subtitle">unsafe blokların beş süper gücü, raw pointer'lar, extern "C" ile C kütüphanesi çağırma ve bindgen; güvenli soyutlama kabuğu — C ABI ile birebir.</p>
+</header>
+
+<nav class="toc"><div class="toc-label">İçindekiler</div><ol><li><a href="#s0">unsafe ne DEĞİLDİR</a></li><li><a href="#s1">unsafe'in beş gücü</a></li><li><a href="#s2">Raw pointer'lar</a></li><li><a href="#s3">C fonksiyonu çağırma (extern C)</a></li><li><a href="#s4">Rust'tan C'ye veri geçirme</a></li><li><a href="#s5">C'den Rust çağırma</a></li><li><a href="#s6">bindgen</a></li><li><a href="#s7">Güvenli sarmalama (safe wrapper)</a></li><li><a href="#s8">UB tuzakları ve doğrulama</a></li><li><a href="#s9">Gerçek örnek</a></li></ol></nav>
+
+<main>
+
+<!-- ── s0 ──────────────────────────────────────────────────── -->
+<section id="s0">
+  <h2><span class="num">00</span> unsafe ne DEĞİLDİR</h2>
+  <p class="section-lead">C/C++ dünyasından gelirken <code>unsafe</code> kelimesi yanıltıcıdır. "unsafe yazınca derleyici susar, ben de C gibi rahatça pointer çevirmeye başlarım" beklentisi baştan sona yanlıştır. unsafe bir kapıyı kapatmaz, sadece beş tane fazladan kapı açar.</p>
+
+  <p>En yaygın yanlış inanış şu: <strong>unsafe, borrow checker'ı kapatır.</strong> Kapatmaz. Bir <code>unsafe</code> bloğunun içinde de ownership, move semantiği, lifetime kontrolü ve <code>&amp;mut</code> tekliği kuralları aynen geçerlidir. Normal bir referansı (<code>&amp;T</code>, <code>&amp;mut T</code>) yanlış kullanırsan derleyici unsafe bloğun içinde de seni durdurur. unsafe yalnızca derleyicinin <em>doğrulayamadığı</em> beş işlemi yapmana izin verir; geri kalan her şey hâlâ tam denetim altındadır.</p>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p><code>unsafe</code>, "bu kod tehlikeli" demek değildir. Anlamı şudur: "Derleyici bu noktada bellek güvenliğini <em>kanıtlayamıyor</em>; kanıtı ben üstleniyorum." Sorumluluk derleyiciden programcıya geçer — tıpkı C'deki her satırın varsayılan durumu gibi. Fark, Rust'ta bunun yalnızca işaretli ve denetlenebilir adacıklarda geçerli olmasıdır.</p>
+  </div>
+
+  <p>C'de programın <em>tamamı</em> bir unsafe bloğudur; güvenlik kanıtı tümüyle senin kafandadır. Rust'ta felsefe terstir: <strong>varsayılan güvenli, çekirdek unsafe.</strong> Tehlikeli işlemi mümkün olan en küçük bloğa hapsedersin, etrafına invariant'ları koruyan güvenli bir API geçirirsin. Kullanıcılar bu güvenli kabuğu çağırır, asla unsafe'i görmez.</p>
+
+  <div class="flow">
+    <pre>C:    tüm program unsafe (kanıt = programcının kafası)
+Rust: güvenli kabuk → küçük unsafe çekirdek → kabuk invariant'ı korur</pre>
+  </div>
+
+  <p>Bu yüzden iyi yazılmış Rust kodunda unsafe satır sayısı toplam kodun küçük bir yüzdesidir. <code>std</code> kütüphanesinin kendisi içeride bolca unsafe kullanır (<code>Vec</code>, <code>String</code>, <code>Mutex</code> hepsi unsafe çekirdeklidir) ama sana sunduğu yüzey %100 güvenlidir. Senin hedefin de aynısıdır: unsafe'i yutup dışarıya güvenli vermek.</p>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Bir <code>unsafe</code> bloğu yazdığında, o bloğun gerektirdiği tüm önkoşulları (pointer geçerli, hizalı, aliasing yok, vb.) <em>elle</em> sağladığını taahhüt etmiş olursun. Bunu bir yorum satırıyla belgelemek (<code>// SAFETY: ...</code>) topluluğun değişmez geleneğidir; clippy bunu zorlayabilir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>unsafe borrow checker'ı kapatmaz; ownership/lifetime/&amp;mut kuralları aynen geçerlidir.</li>
+      <li>unsafe yalnızca derleyicinin doğrulayamadığı beş ek işlemi açar; sorumluluk programcıya geçer.</li>
+      <li>Felsefe: güvenli kabuk + en küçük unsafe çekirdek (std'nin kendi modeli).</li>
+      <li>Her unsafe blok bir <code>// SAFETY:</code> gerekçesiyle belgelenir.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s1 ──────────────────────────────────────────────────── -->
+<section id="s1">
+  <h2><span class="num">01</span> unsafe'in beş gücü</h2>
+  <p class="section-lead"><code>unsafe</code> anahtar kelimesinin açtığı kapı sayısı tam olarak beştir — ne bir eksik, ne bir fazla. Bunları bilmek "unsafe içinde neye dikkat edeceğimi" tam olarak çerçeveler.</p>
+
+  <p>Güvenli Rust'ta yasak olup yalnızca bir <code>unsafe</code> bağlamında izin verilen işlemler şunlardır:</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>#</th><th>Güç</th><th>Neden derleyici doğrulayamaz</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>Raw pointer deref (<code>*p</code>)</td><td>Pointer'ın geçerli, hizalı ve canlı belleğe baktığını derleyici bilemez.</td></tr>
+        <tr><td>2</td><td>unsafe fn / unsafe blok çağırma</td><td>Çağrılan fonksiyonun önkoşullarını çağıran sağlamalı.</td></tr>
+        <tr><td>3</td><td><code>static mut</code> erişimi</td><td>Global değişken paylaşımlı + değiştirilebilir → veri yarışı riski.</td></tr>
+        <tr><td>4</td><td>union alanı okuma</td><td>Hangi alanın "aktif" olduğunu tür sistemi takip etmez (etiketsiz).</td></tr>
+        <tr><td>5</td><td>unsafe trait implement</td><td><code>Send</code>/<code>Sync</code> gibi trait'lerin garantisini programcı üstlenir.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>FFI'da pratikte sürekli ilk iki gücü kullanırsın: yabancı (extern) fonksiyon çağırmak <em>her zaman</em> 2. güçtür (extern fonksiyon imzaları derleyici için unsafe'tir), C'den gelen pointer'ı okumak da 1. güçtür. Diğer üçü daha nadirdir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="cmt">// 1) raw pointer deref</span>
+<span class="keyword">let</span> x = 42;
+<span class="keyword">let</span> p = &amp;x <span class="keyword">as</span> *<span class="keyword">const</span> <span class="field">i32</span>;
+<span class="keyword">let</span> v = <span class="keyword">unsafe</span> { *p };           <span class="cmt">// deref → unsafe gerekir</span>
+
+<span class="cmt">// 3) static mut erişimi (önerilmez; örnek için)</span>
+<span class="keyword">static</span> <span class="keyword">mut</span> SAYAC: <span class="field">u32</span> = 0;
+<span class="keyword">unsafe</span> { SAYAC += 1; }            <span class="cmt">// yazma da okuma da unsafe</span>
+
+<span class="cmt">// 4) union alanı okuma</span>
+<span class="keyword">union</span> <span class="field">Reg</span> { word: <span class="field">u32</span>, bytes: [<span class="field">u8</span>; 4] }
+<span class="keyword">let</span> r = <span class="field">Reg</span> { word: 0xDEADBEEF };
+<span class="keyword">let</span> b0 = <span class="keyword">unsafe</span> { r.bytes[0] };   <span class="cmt">// hangi alan aktif? sen bilirsin</span>{% endraw %}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Dikkat: bu beşinin <em>içinde</em> "integer'ı pointer'a çevirmek", "bir tipi başka bir tipe bit-bit dökmek (<code>transmute</code>)" gibi işlemler doğrudan birer "güç" değildir — bunlar 1. gücün (deref) ya da güvenli fonksiyonların önkoşullarını ihlal etme potansiyeli taşıyan ham yetenekler olarak unsafe gerektirir. Liste, dilin tanımladığı çekirdek beş izindir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>unsafe tam olarak beş ek güç açar: raw deref, unsafe çağrı, <code>static mut</code>, union okuma, unsafe trait impl.</li>
+      <li>Her gücün ortak noktası: derleyicinin doğrulayamadığı bir invariant'ı programcı üstlenir.</li>
+      <li>FFI'da neredeyse her zaman 1. (deref) ve 2. (extern çağrı) güçler devrededir.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s2 ──────────────────────────────────────────────────── -->
+<section id="s2">
+  <h2><span class="num">02</span> Raw pointer'lar</h2>
+  <p class="section-lead">Rust'ın raw pointer'ları (<code>*const T</code>, <code>*mut T</code>) C pointer'larının birebir karşılığıdır: aliasing garantisi yok, lifetime yok, null olabilir. Referansların (<code>&amp;T</code>, <code>&amp;mut T</code>) tüm güvenlik garantilerini bilerek kaybedersin.</p>
+
+  <p>Sözdizimi C'ye yakındır ama <code>*const</code> / <code>*mut</code> tek bir token gibi okunur: "T'ye bir const pointer". Bir referanstan raw pointer üretmek <strong>güvenlidir</strong> — tehlikeli olan onu <em>deref</em> etmektir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">let</span> <span class="keyword">mut</span> n = 10;
+
+<span class="cmt">// referanstan raw pointer üretmek: GÜVENLİ</span>
+<span class="keyword">let</span> p: *<span class="keyword">const</span> <span class="field">i32</span> = &amp;n;
+<span class="keyword">let</span> pm: *<span class="keyword">mut</span> <span class="field">i32</span> = &amp;<span class="keyword">mut</span> n;
+
+<span class="cmt">// deref etmek: UNSAFE — geçerliliğin kanıtı sende</span>
+<span class="keyword">unsafe</span> {
+    println!(<span class="str">"{}"</span>, *p);   <span class="cmt">// 10</span>
+    *pm = 20;             <span class="cmt">// n artık 20</span>
+}{% endraw %}</code></pre>
+  </div>
+
+  <p>Raw pointer ile referans arasındaki kavramsal fark, C'den gelen biri için kritik. Referans bir <em>sözleşmedir</em>; raw pointer yalnızca bir adrestir:</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Özellik</th><th><code>&amp;T</code> / <code>&amp;mut T</code></th><th><code>*const T</code> / <code>*mut T</code></th></tr></thead>
+      <tbody>
+        <tr><td>Null olabilir mi?</td><td>Asla</td><td>Evet</td></tr>
+        <tr><td>Geçerli belleğe bakma garantisi</td><td>Var (borrow checker)</td><td>Yok</td></tr>
+        <tr><td>Aliasing kuralı</td><td>Zorunlu (XOR mutation)</td><td>Yok — C gibi serbest</td></tr>
+        <tr><td>Lifetime takibi</td><td>Var</td><td>Yok</td></tr>
+        <tr><td>Deref güvenli mi?</td><td>Evet</td><td>Hayır (unsafe)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Raw pointer deref ederken sırtladığın kurallar tam olarak C'dekilerle aynıdır: pointer <strong>null olmamalı</strong>, <strong>dangling olmamalı</strong> (gösterdiği veri hâlâ canlı), <strong>hizalı olmalı</strong> (<code>T</code>'nin alignment'ı), ve eğer <code>&amp;mut</code> türetiyorsan o an başka aktif erişim olmamalı (<strong>aliasing</strong> ihlali UB'dir).</p>
+
+  <div class="params">
+    <div class="param"><span class="name">null</span><span class="desc">Deref'ten önce kontrol et; <code>p.is_null()</code> ya da <code>NonNull&lt;T&gt;</code> kullan.</span></div>
+    <div class="param"><span class="name">dangling</span><span class="desc">Gösterilen veri serbest bırakıldıysa/scope dışına çıktıysa deref UB.</span></div>
+    <div class="param"><span class="name">aliasing</span><span class="desc">Aynı bellek için <code>&amp;mut</code> + başka erişim aynı anda → UB.</span></div>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>Bir raw pointer'dan <code>&amp;T</code> ya da <code>&amp;mut T</code> ürettiğin an, o referansın yaşam süresince tüm Rust aliasing kuralları geçerli olmak <em>zorundadır</em>. C'de iki <code>int*</code>'in aynı yere bakması sorun değildir; ama bir <code>&amp;mut i32</code> türettiysen, o referans yaşarken aynı belleğe başka hiçbir erişim olamaz — aksi halde derleyici görünmese bile UB'dir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>*const T</code> / <code>*mut T</code> = C pointer'ı: null'lanabilir, lifetime'sız, aliasing garantisiz.</li>
+      <li>Referanstan raw pointer üretmek güvenli; deref etmek unsafe.</li>
+      <li>Deref kuralları C ile aynı: null değil, dangling değil, hizalı; <code>&amp;mut</code> tekliği korunmalı.</li>
+      <li>Raw pointer'dan referans türetince Rust'ın tüm aliasing kuralları yeniden devreye girer.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s3 ──────────────────────────────────────────────────── -->
+<section id="s3">
+  <h2><span class="num">03</span> C fonksiyonu çağırma (extern C)</h2>
+  <p class="section-lead">Bir C fonksiyonunu çağırmak için iki şey gerekir: imzasını <code>extern "C"</code> bloğunda bildirmek (C header'ındaki prototip gibi) ve linker'a sembolü nereden bulacağını söylemek. Çağrının kendisi her zaman unsafe'tir.</p>
+
+  <p><code>extern "C"</code> burada <strong>ABI</strong> seçimidir: argümanların register/stack düzeni, isim mangling kuralları C kuralıyla aynı olsun demek. Rust'ın varsayılan ABI'si (<code>"Rust"</code>) stabil değildir; C ile konuşacaksan mutlaka <code>"C"</code> dersin. <code>libc</code> gibi standart kütüphane fonksiyonları zaten link edilidir; harici kütüphaneler için <code>#[link]</code> kullanırsın.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">use</span> std::os::raw::c_int;
+
+<span class="cmt">// libc'deki int abs(int) prototipinin Rust karşılığı</span>
+<span class="keyword">unsafe</span> <span class="keyword">extern</span> <span class="str">"C"</span> {
+    <span class="keyword">fn</span> abs(input: <span class="field">c_int</span>) -&gt; <span class="field">c_int</span>;
+}
+
+<span class="keyword">fn</span> main() {
+    <span class="cmt">// çağrı unsafe: imzanın C tarafıyla eşleştiğini sen garanti edersin</span>
+    <span class="keyword">let</span> r = <span class="keyword">unsafe</span> { abs(-7) };
+    println!(<span class="str">"abs(-7) = {}"</span>, r);   <span class="cmt">// 7</span>
+}{% endraw %}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Rust 2024 sürümünde <code>extern "C"</code> blokları <code>unsafe extern "C"</code> olarak yazılır — blok başlığındaki <code>unsafe</code>, "bu bildirimlerin doğruluğunu ben üstleniyorum" anlamına gelir. Eski sürümlerde sadece <code>extern "C" { ... }</code> yazılırdı. Her iki durumda da <em>çağrı yeri</em> ayrıca bir <code>unsafe</code> blok ister.</p>
+  </div>
+
+  <p>Harici bir kütüphaneyi (örneğin <code>libfoo</code>) link etmek için fonksiyon imzasının üstüne <code>#[link]</code> koyarsın; bu, linker'a <code>-lfoo</code> demekle eşdeğerdir:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="cmt">// size_t strlen(const char *s); — libc, genelde otomatik linkli</span>
+<span class="keyword">use</span> std::os::raw::{c_char, c_ulong};
+
+<span class="keyword">unsafe</span> <span class="keyword">extern</span> <span class="str">"C"</span> {
+    <span class="keyword">fn</span> strlen(s: *<span class="keyword">const</span> <span class="field">c_char</span>) -&gt; <span class="field">c_ulong</span>;
+}
+
+<span class="cmt">// Harici kütüphane için:</span>
+<span class="cmt">// #[link(name = "foo")]              → -lfoo</span>
+<span class="cmt">// #[link(name = "foo", kind = "static")]  → statik link</span>{% endraw %}</code></pre>
+  </div>
+
+  <p>İlkel tipleri C ABI ile eşleştirirken <code>std::os::raw</code> (veya <code>libc</code> crate'i) içindeki takma adları kullan: <code>c_int</code>, <code>c_char</code>, <code>c_long</code>, <code>c_void</code>... Bunlar platforma göre doğru genişliğe çözülür, C'deki <code>int</code>/<code>char</code> ile birebir uyumludur. Asla <code>i32</code> ile <code>c_int</code>'i aynı kabul edip kestirme yapma — çoğu platformda eşittirler ama garanti değildir.</p>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>extern "C"</code> ABI seçimidir: register/stack düzeni ve mangling C kuralıyla aynı.</li>
+      <li>extern fonksiyon = C header'daki prototip; çağrı her zaman bir <code>unsafe</code> blok ister.</li>
+      <li><code>#[link(name = "...")]</code> = linker'a <code>-l...</code> demek; libc genelde otomatik linklidir.</li>
+      <li>İlkel tipler için <code>std::os::raw</code> / <code>libc</code> takma adları (<code>c_int</code>, <code>c_char</code>) kullanılır.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s4 ──────────────────────────────────────────────────── -->
+<section id="s4">
+  <h2><span class="num">04</span> Rust'tan C'ye veri geçirme</h2>
+  <p class="section-lead">Bellek düzeni (memory layout) FFI'nın kalbidir. Rust'ın varsayılan struct düzeni belirsizdir — alanları yeniden sıralayabilir. C'ye geçen her tip <code>#[repr(C)]</code> ile işaretlenmeli ki düzen C ABI ile bire bir eşleşsin.</p>
+
+  <p><code>#[repr(C)]</code> derleyiciye "bu struct'ı C derleyicisinin yapacağı gibi diz: alan sırası bozulmasın, padding C kuralıyla aynı olsun" der. Bu olmadan struct'ı pointer ile C'ye geçirmek doğrudan UB'dir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="cmt">// C tarafı: struct Point { int x; int y; };</span>
+<span class="attr">#[repr(C)]</span>
+<span class="keyword">struct</span> <span class="field">Point</span> {
+    x: <span class="field">c_int</span>,
+    y: <span class="field">c_int</span>,
+}
+
+<span class="keyword">unsafe</span> <span class="keyword">extern</span> <span class="str">"C"</span> {
+    <span class="cmt">// void translate(struct Point *p, int dx, int dy);</span>
+    <span class="keyword">fn</span> translate(p: *<span class="keyword">mut</span> <span class="field">Point</span>, dx: <span class="field">c_int</span>, dy: <span class="field">c_int</span>);
+}
+
+<span class="keyword">let</span> <span class="keyword">mut</span> pt = <span class="field">Point</span> { x: 1, y: 2 };
+<span class="keyword">unsafe</span> { translate(&amp;<span class="keyword">mut</span> pt, 10, 20); }   <span class="cmt">// &amp;mut → *mut otomatik</span>{% endraw %}</code></pre>
+  </div>
+
+  <p><strong>String geçirmek</strong> C'nin en sevdiği tuzaktır: C string'leri NUL ile biter, Rust <code>String</code>/<code>str</code>'leri ise uzunluk taşır ve NUL içerebilir. Köprü <code>CString</code> (sahipli, NUL-sonlu) ve <code>CStr</code> (ödünç alınmış, NUL-sonlu görünüm) tipleridir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">use</span> std::ffi::{CString, CStr};
+<span class="keyword">use</span> std::os::raw::c_char;
+
+<span class="keyword">unsafe</span> <span class="keyword">extern</span> <span class="str">"C"</span> {
+    <span class="keyword">fn</span> puts(s: *<span class="keyword">const</span> <span class="field">c_char</span>) -&gt; <span class="field">c_int</span>;
+}
+
+<span class="cmt">// Rust String → C char*  (NUL ekler, içte NUL varsa hata döner)</span>
+<span class="keyword">let</span> s = <span class="field">CString</span>::new(<span class="str">"merhaba C"</span>).unwrap();
+<span class="keyword">unsafe</span> { puts(s.as_ptr()); }
+<span class="cmt">// DİKKAT: s burada hâlâ canlı olmalı; as_ptr ödünç pointer verir</span>{% endraw %}</code></pre>
+  </div>
+
+  <p><strong>Dilim (slice)</strong> geçirmek için C'nin klasik "pointer + uzunluk" kalıbını kullanırsın. Rust dilimi (<code>&amp;[T]</code>) zaten pointer+uzunluk çiftidir; ikisini ayrı argüman olarak verirsin:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">unsafe</span> <span class="keyword">extern</span> <span class="str">"C"</span> {
+    <span class="cmt">// long sum(const int *data, size_t len);</span>
+    <span class="keyword">fn</span> sum(data: *<span class="keyword">const</span> <span class="field">c_int</span>, len: <span class="field">usize</span>) -&gt; <span class="field">c_long</span>;
+}
+
+<span class="keyword">let</span> v: <span class="field">Vec</span>&lt;<span class="field">c_int</span>&gt; = vec![1, 2, 3, 4];
+<span class="keyword">let</span> total = <span class="keyword">unsafe</span> { sum(v.as_ptr(), v.len()) };{% endraw %}</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>Bellek sahipliği (ownership) FFI'nın en sık çökme noktasıdır. Kural: <strong>kim ayırdıysa o serbest bırakır.</strong> Rust'ta <code>CString::into_raw()</code> ile pointer verip sahipliği C'ye devredersen, o belleği geri alıp <code>CString::from_raw()</code> ile <em>Rust'ta</em> drop etmen gerekir — C'nin <code>free()</code>'siyle değil. Tersine C'nin <code>malloc</code>'ladığı belleği asla Rust'ın allocator'ıyla serbest bırakma. Karışık allocator = anında UB.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>#[repr(C)]</code> struct düzenini C ABI ile sabitler; FFI'ya geçen her tip için zorunlu.</li>
+      <li>String köprüsü <code>CString</code> (sahipli, NUL-sonlu) ve <code>CStr</code> (ödünç); <code>as_ptr()</code> pointer'ı canlı kalmalı.</li>
+      <li>Dilim "pointer + uzunluk" çifti olarak geçer: <code>v.as_ptr()</code> + <code>v.len()</code>.</li>
+      <li>Sahiplik kuralı: kim ayırdıysa o free eder; allocator karıştırma UB'dir.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s5 ──────────────────────────────────────────────────── -->
+<section id="s5">
+  <h2><span class="num">05</span> C'den Rust çağırma</h2>
+  <p class="section-lead">Yön tersine döndüğünde Rust fonksiyonunu C'nin görebileceği bir sembol haline getirirsin: <code>#[no_mangle] pub extern "C" fn</code>. Bu, C dünyasına açtığın bir prototiptir.</p>
+
+  <p><code>#[no_mangle]</code> isim mangling'i kapatır — sembol adı tam olarak fonksiyon adın olur, C linker'ı onu bulabilir. <code>extern "C"</code> ABI'yi C'ye sabitler. İkisi birlikte, C kaynağından <code>extern</code> ile çağrılabilen bir fonksiyon üretir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>lib.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">use</span> std::os::raw::c_int;
+
+<span class="cmt">// C tarafı bunu çağırır: extern int rust_kare(int);</span>
+<span class="attr">#[no_mangle]</span>
+<span class="keyword">pub</span> <span class="keyword">extern</span> <span class="str">"C"</span> <span class="keyword">fn</span> rust_kare(x: <span class="field">c_int</span>) -&gt; <span class="field">c_int</span> {
+    x * x
+}{% endraw %}</code></pre>
+  </div>
+
+  <p>En sık kullanım <strong>callback</strong>'tir: C kütüphanesine bir Rust fonksiyon pointer'ı verirsin (örneğin <code>qsort</code>'un karşılaştırıcısı). Rust tarafında fonksiyon pointer tipi <code>extern "C" fn(...) -&gt; ...</code> şeklinde yazılır:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">use</span> std::os::raw::{c_int, c_void};
+
+<span class="keyword">unsafe</span> <span class="keyword">extern</span> <span class="str">"C"</span> {
+    <span class="keyword">fn</span> qsort(
+        base: *<span class="keyword">mut</span> <span class="field">c_void</span>, n: <span class="field">usize</span>, sz: <span class="field">usize</span>,
+        cmp: <span class="keyword">extern</span> <span class="str">"C"</span> <span class="keyword">fn</span>(*<span class="keyword">const</span> <span class="field">c_void</span>, *<span class="keyword">const</span> <span class="field">c_void</span>) -&gt; <span class="field">c_int</span>,
+    );
+}
+
+<span class="cmt">// C'nin çağıracağı karşılaştırıcı — extern "C" olmalı</span>
+<span class="keyword">extern</span> <span class="str">"C"</span> <span class="keyword">fn</span> cmp_i32(a: *<span class="keyword">const</span> <span class="field">c_void</span>, b: *<span class="keyword">const</span> <span class="field">c_void</span>) -&gt; <span class="field">c_int</span> {
+    <span class="keyword">let</span> (a, b) = <span class="keyword">unsafe</span> { (*(a <span class="keyword">as</span> *<span class="keyword">const</span> <span class="field">c_int</span>), *(b <span class="keyword">as</span> *<span class="keyword">const</span> <span class="field">c_int</span>)) };
+    (a - b) <span class="keyword">as</span> <span class="field">c_int</span>
+}{% endraw %}</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>Bir Rust panic'inin FFI sınırını geçmesi <strong>tanımsız davranıştır</strong>. Stack unwinding C frame'lerinin üzerinden geçemez. C'den çağrılan her <code>extern "C"</code> Rust fonksiyonunda panic ihtimali varsa, <code>std::panic::catch_unwind</code> ile sınırı içeride kapatmalısın; aksi halde program çöker ya da daha kötüsü UB üretir.</p>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>lib.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">use</span> std::panic::catch_unwind;
+<span class="keyword">use</span> std::os::raw::c_int;
+
+<span class="attr">#[no_mangle]</span>
+<span class="keyword">pub</span> <span class="keyword">extern</span> <span class="str">"C"</span> <span class="keyword">fn</span> islem(x: <span class="field">c_int</span>) -&gt; <span class="field">c_int</span> {
+    <span class="cmt">// panic'i FFI sınırını geçmeden yakala</span>
+    <span class="keyword">let</span> r = catch_unwind(|| {
+        <span class="keyword">if</span> x &lt; 0 { panic!(<span class="str">"negatif!"</span>); }
+        x * 2
+    });
+    r.unwrap_or(-1)   <span class="cmt">// panic olursa C'ye hata kodu dön</span>
+}{% endraw %}</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li><code>#[no_mangle] pub extern "C" fn</code> = C'den çağrılabilir sembol; mangling kapalı, ABI C.</li>
+      <li>Callback için fonksiyon pointer tipi <code>extern "C" fn(...) -&gt; ...</code> olarak yazılır.</li>
+      <li>Panic FFI sınırını geçemez; <code>catch_unwind</code> ile sınırın Rust tarafında kapatılır.</li>
+      <li>C'ye dönüşte panic yerine hata kodu döndürmek doğru kalıptır.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s6 ──────────────────────────────────────────────────── -->
+<section id="s6">
+  <h2><span class="num">06</span> bindgen</h2>
+  <p class="section-lead">Büyük bir C header'ını elle Rust'a çevirmek hem sıkıcı hem hataya açıktır. <code>bindgen</code>, bir <code>.h</code> dosyasını okuyup ondan otomatik <code>extern "C"</code> bildirimleri, <code>#[repr(C)]</code> struct'lar ve sabitler üretir.</p>
+
+  <p>Tipik kullanım build-time'dadır: <code>build.rs</code> betiği derlemeden önce çalışır, bindgen'i çağırır, üretilen Rust kodunu <code>OUT_DIR</code>'a yazar, sen de <code>include!</code> ile dahil edersin. C derleyicisinin başlığı nasıl gördüğünü (clang üzerinden) aynen yansıtır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>Cargo.toml</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}[package]
+name = <span class="str">"foo-sys"</span>
+version = <span class="str">"0.1.0"</span>
+edition = <span class="str">"2021"</span>
+
+[build-dependencies]
+bindgen = <span class="str">"0.69"</span>{% endraw %}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>build.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">use</span> std::path::PathBuf;
+<span class="keyword">use</span> std::env;
+
+<span class="keyword">fn</span> main() {
+    <span class="cmt">// C kütüphanesini linkle</span>
+    println!(<span class="str">"cargo:rustc-link-lib=foo"</span>);
+    <span class="cmt">// header değişince yeniden üret</span>
+    println!(<span class="str">"cargo:rerun-if-changed=wrapper.h"</span>);
+
+    <span class="keyword">let</span> bindings = bindgen::Builder::default()
+        .header(<span class="str">"wrapper.h"</span>)       <span class="cmt">// #include &lt;foo.h&gt; içeren başlık</span>
+        .generate()
+        .expect(<span class="str">"binding üretilemedi"</span>);
+
+    <span class="keyword">let</span> out = PathBuf::from(env::var(<span class="str">"OUT_DIR"</span>).unwrap());
+    bindings.write_to_file(out.join(<span class="str">"bindings.rs"</span>)).unwrap();
+}{% endraw %}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>lib.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="cmt">// üretilen ham binding'leri dahil et</span>
+<span class="attr">#![allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]</span>
+include!(concat!(env!(<span class="str">"OUT_DIR"</span>), <span class="str">"/bindings.rs"</span>));{% endraw %}</code></pre>
+  </div>
+
+  <p>Ekosistemde güçlü bir konvansiyon var: ham, otomatik üretilmiş binding'ler <strong><code>-sys</code> crate</strong>'inde durur (örn. <code>libgit2-sys</code>, <code>openssl-sys</code>). Üzerine güvenli, deyimsel API koyan crate ise <code>-sys</code> son ekini taşımaz (<code>git2</code>, <code>openssl</code>). Bu ayrım sayesinde aynı C kütüphanesine birden çok yüksek seviye sarmalayıcı geçirilebilir.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Yaklaşım</th><th>Ne zaman</th></tr></thead>
+      <tbody>
+        <tr><td>Elle <code>extern "C"</code></td><td>Birkaç fonksiyon; basit, stabil imzalar; bağımlılık istemiyorsun.</td></tr>
+        <tr><td>bindgen</td><td>Büyük/değişken header; bolca struct/enum/sabit; başlık üst sürümlerini takip.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>bindgen "ham" binding üretir — pointer'lar, <code>c_void</code>, NUL-sonlu char dizileri. Bu binding doğrudan kullanılabilir ama hâlâ %100 unsafe yüzeydir. Asıl iş bir sonraki bölümdeki güvenli sarmalamadır; bindgen yalnızca sıkıcı çeviri kısmını otomatikleştirir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>bindgen, C header'ından otomatik <code>extern "C"</code> + <code>#[repr(C)]</code> binding üretir (clang tabanlı).</li>
+      <li>Tipik akış: <code>build.rs</code> → bindgen → <code>OUT_DIR/bindings.rs</code> → <code>include!</code>.</li>
+      <li>Konvansiyon: ham binding <code>foo-sys</code>'te, güvenli API <code>foo</code> crate'inde durur.</li>
+      <li>Az fonksiyon → elle; büyük/değişken header → bindgen.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s7 ──────────────────────────────────────────────────── -->
+<section id="s7">
+  <h2><span class="num">07</span> Güvenli sarmalama (safe wrapper)</h2>
+  <p class="section-lead">FFI işinin asıl değeri burada: ham, unsafe binding'i küçük bir modüle hapsedip dışarıya güvenli, deyimsel ve kaynak-sızdırmayan bir API sunmak. Bu, s0'daki "güvenli kabuk, unsafe çekirdek" felsefesinin somut hali.</p>
+
+  <p>Klasik desen <strong>newtype + RAII</strong>'dir: C kaynağını tutan opak pointer'ı bir Rust struct'ı içine sarar, <code>Drop</code> ile otomatik temizlik bağlarsın. Kullanıcı C'nin <code>foo_free()</code>'sini hiç görmez; struct scope'tan çıkınca kaynak kendiliğinden serbest kalır — tıpkı C++ destructor'ı gibi, ama derleyici garantisiyle.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — kütüphane</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="cmt">// Tampon: foo_open ayırır, foo_close serbest bırakır</span>
+<span class="keyword">typedef</span> <span class="keyword">struct</span> Foo Foo;
+Foo  *foo_open(<span class="keyword">const</span> <span class="keyword">char</span> *ad);
+<span class="keyword">int</span>   foo_oku(Foo *f);
+<span class="keyword">void</span>  foo_close(Foo *f);{% endraw %}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>lib.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">use</span> std::ffi::CString;
+<span class="keyword">use</span> std::os::raw::{c_char, c_int};
+<span class="keyword">use</span> std::ptr::NonNull;
+
+<span class="cmt">// ── ham, unsafe binding (bu modülde kalır) ──</span>
+<span class="keyword">enum</span> <span class="field">FooRaw</span> {}   <span class="cmt">// opak C tipi (alanı yok)</span>
+<span class="keyword">unsafe</span> <span class="keyword">extern</span> <span class="str">"C"</span> {
+    <span class="keyword">fn</span> foo_open(ad: *<span class="keyword">const</span> <span class="field">c_char</span>) -&gt; *<span class="keyword">mut</span> <span class="field">FooRaw</span>;
+    <span class="keyword">fn</span> foo_oku(f: *<span class="keyword">mut</span> <span class="field">FooRaw</span>) -&gt; <span class="field">c_int</span>;
+    <span class="keyword">fn</span> foo_close(f: *<span class="keyword">mut</span> <span class="field">FooRaw</span>);
+}
+
+<span class="cmt">// ── güvenli kabuk: newtype + RAII ──</span>
+<span class="keyword">pub</span> <span class="keyword">struct</span> <span class="field">Foo</span> {
+    raw: NonNull&lt;<span class="field">FooRaw</span>&gt;,   <span class="cmt">// asla null değil — invariant</span>
+}
+
+<span class="keyword">impl</span> <span class="field">Foo</span> {
+    <span class="keyword">pub</span> <span class="keyword">fn</span> open(ad: &amp;<span class="field">str</span>) -&gt; <span class="field">Option</span>&lt;<span class="field">Foo</span>&gt; {
+        <span class="keyword">let</span> c = CString::new(ad).ok()?;
+        <span class="cmt">// SAFETY: c canlı; foo_open ya geçerli pointer ya null döner</span>
+        <span class="keyword">let</span> p = <span class="keyword">unsafe</span> { foo_open(c.as_ptr()) };
+        NonNull::new(p).map(|raw| <span class="field">Foo</span> { raw })
+    }
+
+    <span class="keyword">pub</span> <span class="keyword">fn</span> oku(&amp;<span class="keyword">mut</span> self) -&gt; <span class="field">i32</span> {
+        <span class="cmt">// SAFETY: raw invariant gereği geçerli</span>
+        <span class="keyword">unsafe</span> { foo_oku(self.raw.as_ptr()) }
+    }
+}
+
+<span class="keyword">impl</span> <span class="field">Drop</span> <span class="keyword">for</span> <span class="field">Foo</span> {
+    <span class="keyword">fn</span> drop(&amp;<span class="keyword">mut</span> self) {
+        <span class="cmt">// SAFETY: raw bir kez, burada serbest bırakılır</span>
+        <span class="keyword">unsafe</span> { foo_close(self.raw.as_ptr()); }
+    }
+}{% endraw %}</code></pre>
+  </div>
+
+  <p>Bu kabuğun kullanıcısı tek bir <code>unsafe</code> görmez:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">let</span> <span class="keyword">mut</span> f = <span class="field">Foo</span>::open(<span class="str">"veri.bin"</span>).expect(<span class="str">"açılamadı"</span>);
+println!(<span class="str">"{}"</span>, f.oku());
+<span class="cmt">// f scope'tan çıkınca Drop → foo_close otomatik; sızıntı yok</span>{% endraw %}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOT</div>
+    <p>Güvenli wrapper'ın iki sorumluluğu vardır: (1) C'nin invariant'larını koru (pointer null değil, çift-free yok, kullanım-sonrası-serbest yok), (2) Rust kullanıcısına bunu yapamayacağı bir API sun. Eğer kullanıcı senin "güvenli" fonksiyonlarını <em>herhangi bir</em> sırada çağırarak UB tetikleyebiliyorsa, o API güvenli değildir — o zaman fonksiyonu <code>unsafe</code> işaretlemen gerekir.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Ham binding tek bir modülde hapsedilir; dışarıya yalnızca güvenli API sunulur.</li>
+      <li>Newtype + <code>NonNull&lt;T&gt;</code> + <code>Drop</code> = otomatik RAII; C kaynağı kendiliğinden serbest kalır.</li>
+      <li>Her <code>unsafe</code> blok bir <code>// SAFETY:</code> gerekçesiyle hangi invariant'a dayandığını belgeler.</li>
+      <li>API ancak her çağrı sırasında UB imkânsızsa "güvenli"dir; değilse <code>unsafe fn</code> olmalı.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s8 ──────────────────────────────────────────────────── -->
+<section id="s8">
+  <h2><span class="num">08</span> UB tuzakları ve doğrulama</h2>
+  <p class="section-lead">unsafe'in bedeli, derleyicinin artık tutamadığı invariant'ları senin tutmandır. FFI'da en sık karşılaşılan UB sınıflarını tanı, sonra Miri ve ASan gibi araçlarla bunları çalışma anında yakala.</p>
+
+  <p>C/C++'tan tanıdık olanların yanında Rust'a özgü olanlar da var. Tehlikeli olanların özeti:</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>UB sınıfı</th><th>Ne zaman olur</th></tr></thead>
+      <tbody>
+        <tr><td>Hizalama (alignment)</td><td>Hizasız adresten <code>T</code> okuma; <code>read_unaligned</code> kullan.</td></tr>
+        <tr><td>Dangling / use-after-free</td><td>Serbest bırakılmış ya da scope'tan çıkmış belleğe deref.</td></tr>
+        <tr><td>Null deref</td><td>Null pointer'ı deref; <code>NonNull</code> / <code>is_null()</code> ile koru.</td></tr>
+        <tr><td>Aliasing ihlali</td><td>Bir <code>&amp;mut T</code> yaşarken aynı belleğe başka erişim.</td></tr>
+        <tr><td>Geçersiz değer</td><td><code>bool</code>=2, geçersiz enum diskriminantı, geçersiz <code>char</code>.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Son satır C'lilere yabancıdır: Rust'ta her tipin <strong>geçerli bit kalıpları</strong> kümesi vardır. Bir <code>bool</code> yalnızca 0 veya 1 olabilir; C'den gelen bir <code>uint8_t</code> 2 ise ve onu <code>bool</code> olarak yorumlarsan, hiçbir satır yazmadan UB üretmiş olursun. Geçersiz bir enum diskriminantı ya da <code>0x110000</code> üstü bir <code>char</code> de aynı şekilde anında UB'dir.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="cmt">// HATALI: hizasız okuma UB</span>
+<span class="keyword">let</span> buf: [<span class="field">u8</span>; 8] = [0; 8];
+<span class="keyword">let</span> p = buf.as_ptr().wrapping_add(1) <span class="keyword">as</span> *<span class="keyword">const</span> <span class="field">u32</span>;
+<span class="cmt">// let x = unsafe { *p };          // UB: 1 adresi u32 için hizasız</span>
+<span class="keyword">let</span> x = <span class="keyword">unsafe</span> { p.read_unaligned() };   <span class="cmt">// DOĞRU</span>{% endraw %}</code></pre>
+  </div>
+
+  <p>Bu UB'lerin çoğu derleyicinin göremediği yerlerdir — kod çalışır, hatta testler geçer, sonra optimizasyon sürümünde ya da başka platformda patlar. Çözüm: <strong>Miri</strong>. Miri, Rust'ı bir yorumlayıcıda çalıştırıp her bellek erişiminde UB'yi yakalar (hizalama, aliasing, use-after-free dahil). Saf-Rust unsafe kodu için altın standarttır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="cmt"># Miri'yi kur ve testleri yorumlayıcıda çalıştır</span>
+<span class="cmd">rustup</span> +nightly component add miri
+<span class="cmd">cargo</span> +nightly miri test
+<span class="cmd">cargo</span> +nightly miri run{% endraw %}</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DİKKAT</div>
+    <p>Miri, gerçek C kodunu (extern fonksiyon gövdelerini) çalıştıramaz — yalnızca Rust tarafını yorumlar. Saf FFI çağrılarında C'ye geçen kısmı Miri göremez. Orada devreye <strong>AddressSanitizer (ASan)</strong> girer: <code>RUSTFLAGS="-Zsanitizer=address" cargo +nightly run</code> ile hem Rust hem C tarafını çalışma anında denetlersin (heap-overflow, use-after-free, vb.) — C'deki <code>-fsanitize=address</code> ile aynı mantık.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>FFI UB'leri: hizalama, dangling/UAF, null deref, aliasing ihlali, geçersiz bit kalıbı.</li>
+      <li>Rust'a özgü: her tipin geçerli değer kümesi var (<code>bool</code>∈{0,1}, geçerli enum/char).</li>
+      <li>Hizasız okuma için <code>read_unaligned</code>; null için <code>NonNull</code>/<code>is_null()</code>.</li>
+      <li>Doğrulama: saf-Rust UB için Miri (<code>cargo +nightly miri test</code>), C tarafı dahil için ASan.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── s9 ──────────────────────────────────────────────────── -->
+<section id="s9">
+  <h2><span class="num">09</span> Gerçek örnek</h2>
+  <p class="section-lead">Tüm parçaları birleştirelim: küçük bir C kütüphanesi (sahipli bir sayaç nesnesi), build.rs ile derlenip linklensin, üzerine RAII tabanlı güvenli bir Rust API otursun. Bu, gerçek bir <code>-sys</code> + güvenli crate ikilisinin minyatürüdür.</p>
+
+  <p>C tarafı: bir sayaç nesnesini malloc'layan, artıran, değerini okuyan ve serbest bırakan klasik opak-handle API'si.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — kütüphane</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="cmt">// counter.c — derlenip statik kütüphane olur</span>
+<span class="cmt">#include &lt;stdlib.h&gt;</span>
+
+<span class="keyword">struct</span> Counter { <span class="keyword">int</span> deger; };
+
+<span class="keyword">struct</span> Counter *counter_new(<span class="keyword">int</span> baslangic) {
+    <span class="keyword">struct</span> Counter *c = malloc(<span class="keyword">sizeof</span> *c);
+    <span class="keyword">if</span> (c) c->deger = baslangic;
+    <span class="keyword">return</span> c;                         <span class="cmt">// sahiplik çağırana geçer</span>
+}
+<span class="keyword">void</span> counter_add(<span class="keyword">struct</span> Counter *c, <span class="keyword">int</span> d) { c->deger += d; }
+<span class="keyword">int</span>  counter_get(<span class="keyword">const</span> <span class="keyword">struct</span> Counter *c) { <span class="keyword">return</span> c->deger; }
+<span class="keyword">void</span> counter_free(<span class="keyword">struct</span> Counter *c) { free(c); }{% endraw %}</code></pre>
+  </div>
+
+  <p>build.rs, <code>cc</code> crate'iyle C kaynağını derler ve linkler — make/cmake yazmaya gerek yok:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>build.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="cmt">// Cargo.toml → [build-dependencies] cc = "1"</span>
+<span class="keyword">fn</span> main() {
+    cc::Build::new()
+        .file(<span class="str">"src/counter.c"</span>)
+        .compile(<span class="str">"counter"</span>);   <span class="cmt">// libcounter.a üretir + linkler</span>
+    println!(<span class="str">"cargo:rerun-if-changed=src/counter.c"</span>);
+}{% endraw %}</code></pre>
+  </div>
+
+  <p>Rust tarafı: ham <code>extern "C"</code> bildirimleri + üzerine RAII'li güvenli <code>Counter</code> tipi. Sahiplik açıkça yönetilir: <code>counter_new</code> sahipliği verir, <code>Drop</code> içinde <code>counter_free</code> geri alır.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>lib.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">use</span> std::os::raw::c_int;
+<span class="keyword">use</span> std::ptr::NonNull;
+
+<span class="cmt">// ── ham binding ──</span>
+<span class="keyword">enum</span> <span class="field">CounterRaw</span> {}
+<span class="keyword">unsafe</span> <span class="keyword">extern</span> <span class="str">"C"</span> {
+    <span class="keyword">fn</span> counter_new(baslangic: <span class="field">c_int</span>) -&gt; *<span class="keyword">mut</span> <span class="field">CounterRaw</span>;
+    <span class="keyword">fn</span> counter_add(c: *<span class="keyword">mut</span> <span class="field">CounterRaw</span>, d: <span class="field">c_int</span>);
+    <span class="keyword">fn</span> counter_get(c: *<span class="keyword">const</span> <span class="field">CounterRaw</span>) -&gt; <span class="field">c_int</span>;
+    <span class="keyword">fn</span> counter_free(c: *<span class="keyword">mut</span> <span class="field">CounterRaw</span>);
+}
+
+<span class="cmt">// ── güvenli kabuk ──</span>
+<span class="keyword">pub</span> <span class="keyword">struct</span> <span class="field">Counter</span> { raw: NonNull&lt;<span class="field">CounterRaw</span>&gt; }
+
+<span class="keyword">impl</span> <span class="field">Counter</span> {
+    <span class="keyword">pub</span> <span class="keyword">fn</span> new(baslangic: <span class="field">i32</span>) -&gt; <span class="field">Option</span>&lt;<span class="field">Counter</span>&gt; {
+        <span class="cmt">// SAFETY: counter_new ya geçerli ya null döner; NonNull filtreler</span>
+        <span class="keyword">let</span> p = <span class="keyword">unsafe</span> { counter_new(baslangic) };
+        NonNull::new(p).map(|raw| <span class="field">Counter</span> { raw })
+    }
+    <span class="keyword">pub</span> <span class="keyword">fn</span> add(&amp;<span class="keyword">mut</span> self, d: <span class="field">i32</span>) {
+        <span class="cmt">// SAFETY: raw invariant gereği geçerli; &amp;mut tekliği aliasing'i kapatır</span>
+        <span class="keyword">unsafe</span> { counter_add(self.raw.as_ptr(), d); }
+    }
+    <span class="keyword">pub</span> <span class="keyword">fn</span> get(&amp;self) -&gt; <span class="field">i32</span> {
+        <span class="cmt">// SAFETY: raw geçerli; salt okuma</span>
+        <span class="keyword">unsafe</span> { counter_get(self.raw.as_ptr()) }
+    }
+}
+
+<span class="keyword">impl</span> <span class="field">Drop</span> <span class="keyword">for</span> <span class="field">Counter</span> {
+    <span class="keyword">fn</span> drop(&amp;<span class="keyword">mut</span> self) {
+        <span class="cmt">// SAFETY: tek sahip, tam bir kez free — çift-free yok</span>
+        <span class="keyword">unsafe</span> { counter_free(self.raw.as_ptr()); }
+    }
+}{% endraw %}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.rs</span><span class="dot">●</span></div>
+    <pre><code>{% raw %}<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> <span class="keyword">mut</span> c = <span class="field">Counter</span>::new(10).expect(<span class="str">"ayrılamadı"</span>);
+    c.add(5);
+    c.add(-2);
+    println!(<span class="str">"deger = {}"</span>, c.get());   <span class="cmt">// deger = 13</span>
+}   <span class="cmt">// c drop → counter_free otomatik; sızıntı yok, çift-free yok</span>{% endraw %}</code></pre>
+  </div>
+
+  <div class="flow">
+    <pre>counter.c → cc (build.rs) → libcounter.a → extern "C" ham binding → güvenli Counter (RAII) → main</pre>
+  </div>
+
+  <p>Kapanış: FFI köprüsü iki yönlüdür ama disiplin tek yönlüdür — <strong>her zaman güvenli kabuğa doğru.</strong> C tarafının her belirsizliğini (null, sahiplik, ABI, hizalama, panic sınırı) en küçük unsafe çekirdekte karşılar, dışarıya derleyicinin koruduğu bir yüzey verirsin. Miri ve ASan ile çekirdeği doğrular, <code>// SAFETY:</code> ile gerekçeni belgelersin. Böylece C'nin gücünü Rust'ın garantileriyle birleştirmiş olursun.</p>
+
+  <div class="summary">
+    <h4>Bu bölümde</h4>
+    <ul>
+      <li>Tam zincir: <code>counter.c</code> → <code>cc</code>/<code>build.rs</code> → statik lib → ham <code>extern "C"</code> → RAII'li güvenli <code>Counter</code>.</li>
+      <li>Sahiplik açık: C <code>new</code> ile verir, Rust <code>Drop</code> ile tam bir kez geri alır (çift-free yok).</li>
+      <li>Her <code>unsafe</code> bir <code>// SAFETY:</code> gerekçesine dayanır; kullanıcı yüzeyi %100 güvenli.</li>
+      <li>Disiplin: tüm C belirsizliğini en küçük çekirdekte karşıla, Miri/ASan ile doğrula.</li>
+    </ul>
+  </div>
+</section>
+
+</main>

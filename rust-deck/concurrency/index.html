@@ -1,0 +1,486 @@
+---
+layout: tutorial
+title: "Rust Eşzamanlılık — Thread, Send/Sync, Channel"
+back_url: "../index.html"
+back_label: "Tüm Rust rehberleri"
+---
+<header class="header">
+  <div class="meta">
+    <span>TEKNİK REHBER</span>
+    <span>EŞZAMANLILIK</span>
+    <span>THREAD</span>
+    <span>2026</span>
+  </div>
+  <h1>Eşzamanlılık<br><em>Korkusuz paralellik</em></h1>
+  <p class="subtitle">Thread'ler, channel'lar, Mutex/Arc ve Send/Sync trait'leri; derleme zamanında veri yarışı (data race) güvenliği — C pthread ve manuel kilitlemeyle karşılaştırmalı.</p>
+</header>
+
+<nav class="toc"><div class="toc-label">İçindekiler</div><ol>
+  <li><a href="#s0">Korkusuz eşzamanlılık</a></li>
+  <li><a href="#s1">thread::spawn ve join</a></li>
+  <li><a href="#s2">Thread'lerde borrow checker</a></li>
+  <li><a href="#s3">Channel (mpsc)</a></li>
+  <li><a href="#s4">Mutex&lt;T&gt;</a></li>
+  <li><a href="#s5">Arc&lt;Mutex&lt;T&gt;&gt;</a></li>
+  <li><a href="#s6">Send ve Sync</a></li>
+  <li><a href="#s7">RwLock ve atomics</a></li>
+  <li><a href="#s8">Scoped threads</a></li>
+  <li><a href="#s9">Gerçek örnek</a></li>
+</ol></nav>
+
+<main>
+<section id="s0">
+  <h2><span class="num">00</span> Korkusuz eşzamanlılık</h2>
+  <p class="section-lead">C'de paylaşımlı belleğe iki thread'in kilitsiz dokunması bir <strong>data race</strong>'tir ve standart bunu tanımsız davranış (UB) ilan eder — derleyici uyarmaz, sanitizer çoğu zaman yakalamaz, hata üretimde rastgele patlar. Rust'ta aynı kod <em>derlenmez</em>. Veri yarışı bir runtime sorunu değil, bir tip hatasıdır.</p>
+
+  <p>pthreads ile çalışırken bildiğiniz disiplin şudur: hangi mutex'in hangi veriyi koruduğunu kafanızda tutarsınız, her erişimden önce kilitlersiniz, kilit sırasına dikkat edip deadlock'tan kaçınırsınız. Bu sözleşmenin tamamı belgelenmemiş, derleyici tarafından <em>denetlenmeyen</em> bir konvansiyondur. Tek bir unutulmuş <code>pthread_mutex_lock</code> sessizce UB üretir.</p>
+
+  <p>Rust aynı garantileri sahip olduğu ownership sisteminden bedavaya çıkarır. Bir değere aynı anda ya bir tane <code>&amp;mut</code> (yazıcı) ya da çok sayıda <code>&amp;</code> (okuyucu) erişebilir — bu kural tek thread'de aliasing hatalarını önler; çoklu thread'de ise <strong>data race'in tanımının kendisini</strong> ortadan kaldırır, çünkü data race = "en az biri yazan, eşzamanlı, senkronizasyonsuz iki erişim".</p>
+
+  <div class="flow"><pre>C/pthread sözleşmesi          Rust'ta zorunlu kıldıran
+─────────────────             ─────────────────
+"kilitlemeyi unutma"     →     Mutex erişimi lock() ister
+"kilit + veri eşleşsin"  →     veri Mutex'in İÇİNDE
+"bu tip thread-safe mi?" →     Send / Sync trait'leri
+"dangling thread yok"    →     'static + JoinHandle</pre></div>
+
+  <h3>İki dik mekanizma</h3>
+  <p>Rust eşzamanlılığı iki bağımsız ekseni denetler. Birincisi <strong>borrow checker</strong>: bir veriye kaç referansın hangi türden eriştiğini izler. İkincisi <strong>Send/Sync</strong> auto trait'leri: bir tipin thread sınırlarını geçip geçemeyeceğini tip düzeyinde işaretler. <code>std::thread::spawn</code>, kapatma (closure) içine taşınan her şeyin <code>Send + 'static</code> olmasını isteyen tek bir imzayla bütün modeli devreye sokar.</p>
+
+  <div class="callout"><div class="label">NOT</div><p>"Korkusuz eşzamanlılık" (fearless concurrency) pazarlama değil, ölçülebilir bir iddia: yanlış senkronizasyon kategorisindeki hataların büyük kısmı derleme aşamasında durur. Geriye kalan asıl risk <strong>deadlock</strong>'tur — Rust onu engellemez, çünkü deadlock bir bellek güvenliği ihlali değildir.</p></div>
+
+  <div class="summary"><h4>Bu bölümde</h4><ul>
+    <li>C'de data race UB'dir ve sessizdir; Rust'ta aynı kod derlenmez</li>
+    <li>Borrow checker'ın aliasing kuralı doğrudan data race'i tanımsız kılar</li>
+    <li>İki dik eksen: ownership/borrow ve Send/Sync auto trait'leri</li>
+    <li>Deadlock derlemeyle engellenmez — o bir mantık hatasıdır, bellek hatası değil</li>
+  </ul></div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">01</span> thread::spawn ve join</h2>
+  <p class="section-lead"><code>thread::spawn</code>, <code>pthread_create</code>'in yerini tutar ama imzası taban tabana farklı: void* alıp void* döndüren bir C fonksiyonu yerine, doğrudan tipli bir closure alır ve geriye <code>JoinHandle&lt;T&gt;</code> verir — pthread'in <code>void**</code> retval kanalını tip güvenli hale getirir.</p>
+
+  <p>Closure'a dışarıdan veri taşımak için <code>move</code> anahtar kelimesi kullanılır: bu, yakalanan değerlerin sahipliğini yeni thread'e geçirir. C'de argümanı <code>void*</code> olarak paketleyip thread'in ömrü boyunca o belleğin yaşadığından elle emin olmanız gerekirdi; Rust'ta <code>move</code> sahipliği devrettiği için derleyici bunu garanti eder.</p>
+
+  <div class="code-block"><div class="code-header"><span>main.rs</span><span class="dot">●</span></div><pre><code>{% raw %}<span class="keyword">use</span> std::thread;
+
+<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> mesaj = <span class="field">String</span>::from(<span class="str">"merhaba"</span>);
+
+    <span class="cmt">// move: `mesaj`in sahipliği thread'e geçer (pthread'de void* arg)</span>
+    <span class="keyword">let</span> tutamac = thread::spawn(<span class="keyword">move</span> || {
+        println!(<span class="str">"alt thread: {}"</span>, mesaj);
+        mesaj.len() <span class="cmt">// dönüş değeri JoinHandle&lt;usize&gt; ile taşınır</span>
+    });
+
+    <span class="cmt">// join() == pthread_join; retval tip güvenli gelir</span>
+    <span class="keyword">let</span> uzunluk = tutamac.join().unwrap();
+    println!(<span class="str">"thread {} bayt yazdı"</span>, uzunluk);
+}{% endraw %}</code></pre></div>
+
+  <div class="params">
+    <div class="param"><span class="name">spawn(f)</span><span class="desc"><code>FnOnce + Send + 'static</code> bir closure alır, <code>JoinHandle&lt;T&gt;</code> döndürür.</span></div>
+    <div class="param"><span class="name">JoinHandle&lt;T&gt;</span><span class="desc">Thread'in tutamacı; <code>T</code> closure'ın dönüş tipidir.</span></div>
+    <div class="param"><span class="name">.join()</span><span class="desc">Thread'i bekler, <code>Result&lt;T, Box&lt;dyn Any&gt;&gt;</code> verir; <code>Err</code> = panic.</span></div>
+  </div>
+
+  <div class="callout warn"><div class="label">DİKKAT</div><p><code>JoinHandle</code> üzerinde <code>join()</code> çağırmazsanız thread <strong>detach</strong> edilmiş olur — <code>main</code> biterse process'le birlikte aniden ölür. C'deki gibi "sessizce arkada koşmaya devam etmez"; bekleneni açıkça join etmelisiniz.</p></div>
+
+  <p>Thread'in panik atması process'i çökertmez: panic o thread'le sınırlı kalır ve <code>join()</code> bir <code>Err</code> olarak geri döner. Bu, pthread'de bir thread'in segfault ile tüm process'i indirmesinden temelde farklıdır.</p>
+
+  <div class="summary"><h4>Bu bölümde</h4><ul>
+    <li><code>spawn</code> tipli closure alır; <code>void*</code> paketleme yok</li>
+    <li><code>move</code> yakalanan verinin sahipliğini thread'e devreder</li>
+    <li><code>JoinHandle&lt;T&gt;</code> dönüş değerini tip güvenli taşır; <code>join()</code> bekler</li>
+    <li>Join edilmeyen thread detach olur; panik o thread'le sınırlı kalır</li>
+  </ul></div>
+</section>
+
+<section id="s2">
+  <h2><span class="num">02</span> Thread'lerde borrow checker</h2>
+  <p class="section-lead">C'de yığın (stack) üzerindeki bir değişkenin adresini bir thread'e verip ana fonksiyonun erken dönmesi — klasik dangling pointer. Rust bu senaryoyu <code>spawn</code>'ın <code>'static</code> bound'u ile derleme zamanında reddeder: spawn edilen closure, oluşturan stack frame'den uzun yaşayabilmek zorundadır.</p>
+
+  <p><code>spawn</code> imzası, taşınan closure'ın <code>'static</code> ömre sahip olmasını ister. Bunun anlamı: closure ödünç alınmış (borrowed) hiçbir referansa <em>bağımlı olamaz</em>; ya sahiplenmiş veri taşır ya da gerçekten <code>'static</code> olan (örn. statik) bir şeye dokunur. Çıplak bir <code>&amp;veri</code> yakalamak derlenmez.</p>
+
+  <div class="code-block"><div class="code-header"><span>main.rs</span><span class="dot">●</span></div><pre><code>{% raw %}<span class="keyword">use</span> std::thread;
+
+<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> dizi = vec![1, 2, 3];
+
+    <span class="cmt">// HATA: closure `&amp;dizi` ödünç alır, ama thread `dizi`den</span>
+    <span class="cmt">// uzun yaşayabilir → derlenmez (E0373/'static ihlali)</span>
+    <span class="keyword">let</span> h = thread::spawn(|| {
+        println!(<span class="str">"{:?}"</span>, dizi); <span class="cmt">// borrow</span>
+    });
+
+    h.join().unwrap();
+}{% endraw %}</code></pre></div>
+
+  <p>Derleyicinin önerdiği çözüm tektir: <code>move</code> ile sahipliği taşıyın. Tek bir thread veriyi tüketecekse bu yeterli. Birden fazla thread <em>aynı</em> veriye erişecekse, sahipliği paylaşmak gerekir — bu da Bölüm 05'teki <code>Arc</code>'ın varlık sebebidir.</p>
+
+  <div class="code-block"><div class="code-header"><span>main.rs</span><span class="dot">●</span></div><pre><code>{% raw %}<span class="keyword">use</span> std::thread;
+
+<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> dizi = vec![1, 2, 3];
+
+    <span class="cmt">// move: `dizi`nin sahipliği thread'e geçer; artık borrow yok</span>
+    <span class="keyword">let</span> h = thread::spawn(<span class="keyword">move</span> || {
+        println!(<span class="str">"{:?}"</span>, dizi);
+    });
+    <span class="cmt">// burada `dizi` artık kullanılamaz — sahiplik gitti</span>
+
+    h.join().unwrap();
+}{% endraw %}</code></pre></div>
+
+  <div class="callout"><div class="label">NOT</div><p><code>'static</code> burada "programın tüm ömrü kadar yaşar" demek <em>değildir</em>; "ömrü ödünç alınmış bir referansa bağlı değildir" demektir. Sahiplenilmiş bir <code>String</code> ya da <code>Vec</code> mükemmel biçimde <code>'static</code>'tir, çünkü içsel hiçbir borrow taşımaz.</p></div>
+
+  <div class="summary"><h4>Bu bölümde</h4><ul>
+    <li><code>spawn</code> closure'ın <code>'static</code> olmasını ister; çıplak referans yakalanamaz</li>
+    <li>Tek thread tüketecekse <code>move</code> ile sahipliği taşımak yeterli</li>
+    <li>Çok thread aynı veriye erişecekse paylaşımlı sahiplik (<code>Arc</code>) gerekir</li>
+    <li><code>'static</code> = "borrow'a bağlı değil", "sonsuza dek yaşar" değil</li>
+  </ul></div>
+</section>
+
+<section id="s3">
+  <h2><span class="num">03</span> Channel (mpsc)</h2>
+  <p class="section-lead">Paylaşımlı belleği kilitle korumanın alternatifi mesajlaşmadır: "belleği paylaşarak iletişme; ileterek belleği paylaş." <code>std::sync::mpsc</code>, Go'nun kanallarına benzer ama tek farkla — Rust kanalında geçen değerin <strong>sahipliği</strong> alıcıya transfer olur, kopya değil paylaşım değil, taşıma.</p>
+
+  <p><code>mpsc</code> = multiple producer, single consumer. <code>channel()</code> bir <code>(Sender&lt;T&gt;, Receiver&lt;T&gt;)</code> çifti üretir. Gönderen tarafta <code>send</code>, alan tarafta <code>recv</code> (bloklayan) ya da <code>for v in rx</code> (kanal kapanana dek iterasyon) kullanılır.</p>
+
+  <div class="code-block"><div class="code-header"><span>main.rs</span><span class="dot">●</span></div><pre><code>{% raw %}<span class="keyword">use</span> std::sync::mpsc;
+<span class="keyword">use</span> std::thread;
+
+<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> (tx, rx) = mpsc::channel::&lt;<span class="field">String</span>&gt;();
+
+    thread::spawn(<span class="keyword">move</span> || {
+        <span class="keyword">let</span> s = <span class="field">String</span>::from(<span class="str">"iş sonucu"</span>);
+        tx.send(s).unwrap(); <span class="cmt">// `s`in SAHİPLİĞİ kanala geçti</span>
+        <span class="cmt">// `s` burada artık kullanılamaz — use-after-send imkânsız</span>
+    });
+
+    <span class="cmt">// recv() bloklar; kanal kapanırsa Err döner</span>
+    <span class="keyword">let</span> alinan = rx.recv().unwrap();
+    println!(<span class="str">"ana thread aldı: {}"</span>, alinan);
+}{% endraw %}</code></pre></div>
+
+  <p>Sahipliğin transferi, C'de paylaşımlı kuyruklarda görülen en sinsi hatayı kökten yok eder: bir thread bir nesneyi kuyruğa koyup <em>aynı pointer'ı kullanmaya devam etmesi</em>. Rust'ta <code>send</code>'den sonra değer artık gönderende yoktur; data race veya use-after-free yazmak mümkün değildir.</p>
+
+  <h3>Çoklu üretici</h3>
+  <p><code>Sender</code> klonlanabilir; her klon aynı tek alıcıya yazar. C'de tek bir kuyruğu N thread'in beslemesi için kuyruğun etrafına manuel mutex sararsınız — burada <code>clone()</code> yeterli, senkronizasyon kanalın içindedir.</p>
+
+  <div class="code-block"><div class="code-header"><span>main.rs</span><span class="dot">●</span></div><pre><code>{% raw %}<span class="keyword">use</span> std::sync::mpsc;
+<span class="keyword">use</span> std::thread;
+
+<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> (tx, rx) = mpsc::channel();
+
+    <span class="keyword">for</span> id <span class="keyword">in</span> 0..3 {
+        <span class="keyword">let</span> tx = tx.clone(); <span class="cmt">// her üretici kendi Sender'ı</span>
+        thread::spawn(<span class="keyword">move</span> || {
+            tx.send(format!(<span class="str">"worker {id}"</span>)).unwrap();
+        });
+    }
+    drop(tx); <span class="cmt">// orijinali bırak; yoksa kanal hiç kapanmaz</span>
+
+    <span class="cmt">// kanal kapanana (tüm Sender düşene) dek iterasyon</span>
+    <span class="keyword">for</span> m <span class="keyword">in</span> rx {
+        println!(<span class="str">"alındı: {}"</span>, m);
+    }
+}{% endraw %}</code></pre></div>
+
+  <div class="callout warn"><div class="label">DİKKAT</div><p>Klonladıktan sonra orijinal <code>tx</code>'i <code>drop</code> etmeyi unutursanız, <code>for m in rx</code> döngüsü <strong>asla bitmez</strong>: kanal yalnızca <em>tüm</em> Sender'lar düştüğünde kapanır. Bu, Go'da <code>close(ch)</code>'i unutmaya denk bir tuzaktır.</p></div>
+
+  <div class="summary"><h4>Bu bölümde</h4><ul>
+    <li>Kanal = sahiplik transferiyle mesajlaşma; kopya/paylaşım değil taşıma</li>
+    <li><code>send</code> sonrası değer gönderende kalmaz → use-after-send imkânsız</li>
+    <li><code>Sender</code> klonlanarak çoklu üretici (mpsc) kurulur</li>
+    <li>Kanal tüm Sender'lar düşünce kapanır; orijinali drop etmeyi unutma</li>
+  </ul></div>
+</section>
+
+<section id="s4">
+  <h2><span class="num">04</span> Mutex&lt;T&gt;</h2>
+  <p class="section-lead">C'de mutex ile koruduğu veri iki ayrı değişkendir; aralarındaki bağ yalnızca programcının zihnindedir. Rust'ta <code>Mutex&lt;T&gt;</code> veriyi <strong>içine alır</strong> — korunan değere ancak kilidi alarak ulaşabilirsiniz, dolayısıyla "kilitlemeyi unutmak" tip düzeyinde imkânsızlaşır.</p>
+
+  <p><code>lock()</code> çağrısı bir <code>MutexGuard&lt;T&gt;</code> döndürür. Bu guard, <code>&amp;mut T</code> gibi davranan bir akıllı işaretçidir (Deref + DerefMut); kapsam dışına çıktığında <code>Drop</code> ile kilidi otomatik bırakır. <code>pthread_mutex_unlock</code>'u elle çağırmazsınız — RAII bunu garantiler, erken <code>return</code> ya da panic'te bile.</p>
+
+  <div class="code-block"><div class="code-header"><span>main.rs</span><span class="dot">●</span></div><pre><code>{% raw %}<span class="keyword">use</span> std::sync::<span class="field">Mutex</span>;
+
+<span class="keyword">fn</span> main() {
+    <span class="cmt">// Veri kilidin İÇİNDE — ayrı "kilit + veri" hatası yok</span>
+    <span class="keyword">let</span> sayac = <span class="field">Mutex</span>::new(0);
+
+    {
+        <span class="cmt">// lock() == pthread_mutex_lock; guard kilidi temsil eder</span>
+        <span class="keyword">let</span> mut g = sayac.lock().unwrap();
+        *g += 1; <span class="cmt">// MutexGuard, &amp;mut T gibi davranır</span>
+    } <span class="cmt">// g burada drop olur → kilit otomatik bırakılır (unlock)</span>
+
+    println!(<span class="str">"sayac = {}"</span>, *sayac.lock().unwrap());
+}{% endraw %}</code></pre></div>
+
+  <h3>Poisoning</h3>
+  <p>Bir thread kilidi tutarken panik atarsa, <code>Mutex</code> <strong>poisoned</strong> (zehirli) duruma geçer: korunan veri yarım kalmış olabilir. Sonraki <code>lock()</code> çağrıları bunu bir <code>Err</code> ile bildirir; bu yüzden dönüş tipi <code>Result</code>'tır. Sıkça görülen <code>.unwrap()</code> "zehirlenmişse panikle çök" anlamına gelir; gerçek kodda <code>into_inner()</code> ile veriye yine de erişmeyi seçebilirsiniz.</p>
+
+  <div class="callout"><div class="label">NOT</div><p>Poisoning C'de yoktur; bir thread kilit altında çökerse C'de mutex bozuk-tutarlı veriyle "açık" kalır ve diğer thread'ler farkında olmadan o veriyi okur. Rust en azından bu durumu <code>Err</code> olarak görünür kılar.</p></div>
+
+  <div class="callout warn"><div class="label">DİKKAT</div><p>Guard'ı bir değişkene bağlayıp kapsam içinde tutarsanız kilit beklediğinizden uzun süre elde kalır. Kilidin yaşam süresini daraltmak için <code>{ ... }</code> bloğu ya da bilinçli bir <code>drop(g)</code> kullanın — aksi halde gizli darboğaz ve deadlock riski.</p></div>
+
+  <div class="summary"><h4>Bu bölümde</h4><ul>
+    <li><code>Mutex&lt;T&gt;</code> veriyi içine alır; kilitsiz erişim tipçe imkânsız</li>
+    <li><code>lock()</code> bir <code>MutexGuard</code> verir; drop'ta otomatik unlock (RAII)</li>
+    <li>Panik altında poisoning kilidi zehirler; <code>lock()</code> bu yüzden <code>Result</code></li>
+    <li>Guard ömrünü blok/<code>drop</code> ile daralt — uzun tutarsa darboğaz</li>
+  </ul></div>
+</section>
+
+<section id="s5">
+  <h2><span class="num">05</span> Arc&lt;Mutex&lt;T&gt;&gt;</h2>
+  <p class="section-lead">Tek bir <code>Mutex</code>'i N thread paylaşmak için ona N tane sahip lazım — ama Rust'ta bir değerin tek bir sahibi olur. Çözüm <code>Arc</code> (atomically reference counted): paylaşımlı sahiplik. Thread'ler arası değiştirilebilir paylaşımlı durumun kanonik kalıbı <code>Arc&lt;Mutex&lt;T&gt;&gt;</code>'tir.</p>
+
+  <p>Roller nettir: <code>Arc</code> "bu veriye birden çok sahip var" der ve sayım sıfırlanınca veriyi serbest bırakır; <code>Mutex</code> ise "aynı anda yalnız biri yazsın" der. Birlikte: çok sahipli + güvenli değiştirilebilir. Klasik örnek, on thread'in tek bir sayacı artırması.</p>
+
+  <div class="code-block"><div class="code-header"><span>main.rs</span><span class="dot">●</span></div><pre><code>{% raw %}<span class="keyword">use</span> std::sync::{<span class="field">Arc</span>, <span class="field">Mutex</span>};
+<span class="keyword">use</span> std::thread;
+
+<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> sayac = <span class="field">Arc</span>::new(<span class="field">Mutex</span>::new(0));
+    <span class="keyword">let</span> mut tutamaclar = vec![];
+
+    <span class="keyword">for</span> _ <span class="keyword">in</span> 0..10 {
+        <span class="keyword">let</span> sayac = <span class="field">Arc</span>::clone(&amp;sayac); <span class="cmt">// refcount++; veri kopyalanmaz</span>
+        tutamaclar.push(thread::spawn(<span class="keyword">move</span> || {
+            <span class="keyword">let</span> mut n = sayac.lock().unwrap();
+            *n += 1; <span class="cmt">// kilit altında güvenli artış</span>
+        }));
+    }
+
+    <span class="keyword">for</span> h <span class="keyword">in</span> tutamaclar { h.join().unwrap(); }
+    println!(<span class="str">"toplam = {}"</span>, *sayac.lock().unwrap()); <span class="cmt">// 10</span>
+}{% endraw %}</code></pre></div>
+
+  <div class="params">
+    <div class="param"><span class="name">Arc::new(x)</span><span class="desc">Heap'te paylaşımlı sahiplik; atomik refcount başlatır.</span></div>
+    <div class="param"><span class="name">Arc::clone(&amp;a)</span><span class="desc">Sayacı artırır, veriyi <em>kopyalamaz</em>; ucuz bir pointer paylaşımı.</span></div>
+    <div class="param"><span class="name">Mutex::new(x)</span><span class="desc">Korunan veriyi sarmalar; <code>lock()</code> ile erişilir.</span></div>
+  </div>
+
+  <h3>Neden Rc değil Arc</h3>
+  <p><code>Rc</code> de paylaşımlı sahiplik verir ama refcount'u <em>atomik değildir</em> — tek thread için tasarlanmıştır, daha hızlıdır. İki thread aynı <code>Rc</code>'yi klonlasa sayaçta data race olurdu. İşte bu yüzden <code>Rc</code> <strong>!Send</strong>'dir: derleyici onu bir thread'e taşımanıza izin vermez. <code>Arc</code> atomik sayaç kullanır, dolayısıyla <code>Send + Sync</code>'tir. Yani "yanlış sayaç" seçimi derleme hatasıdır, runtime sürprizi değil.</p>
+
+  <div class="callout"><div class="label">NOT</div><p>Atomik sayaç ucuz değildir; tek thread'de <code>Rc</code> daima tercih edilir. <code>Arc</code>'ı yalnızca veri gerçekten thread sınırını geçecekse kullanın — derleyici zaten <code>Rc</code> yetersizse uyaracaktır.</p></div>
+
+  <div class="summary"><h4>Bu bölümde</h4><ul>
+    <li><code>Arc</code> = paylaşımlı sahiplik; <code>Mutex</code> = güvenli değiştirme</li>
+    <li><code>Arc::clone</code> sayacı artırır, veriyi kopyalamaz (ucuz)</li>
+    <li><code>Rc</code> atomik olmayan sayaç yüzünden <code>!Send</code>'dir; thread'e geçemez</li>
+    <li><code>Arc&lt;Mutex&lt;T&gt;&gt;</code> paylaşımlı değiştirilebilir durumun kanonik kalıbı</li>
+  </ul></div>
+</section>
+
+<section id="s6">
+  <h2><span class="num">06</span> Send ve Sync</h2>
+  <p class="section-lead">Bir tipin thread'lerle nasıl etkileşebileceğini iki <strong>auto trait</strong> kodlar. <code>Send</code>: tip bir başka thread'e <em>taşınabilir</em>. <code>Sync</code>: <code>&amp;T</code> thread'ler arası <em>paylaşılabilir</em> (eşdeğer olarak: <code>&amp;T</code> Send'dir). C'de "bu struct thread-safe mi?" sorusunun yanıtı belgelemededir; Rust'ta tip sisteminin içindedir.</p>
+
+  <p>Bu trait'ler "auto"dur: bileşenlerinin hepsi Send/Sync ise tip otomatik olarak Send/Sync sayılır. Hiçbir şey elle implemente etmezsiniz; derleyici tip ağacını gezerek türetir. Bir tipi <em>kasıtlı</em> olarak unsafe yollarla işaretlemediğiniz sürece kurallar mekaniktir.</p>
+
+  <div class="file-table"><table>
+    <thead><tr><th>Tip</th><th>Send</th><th>Sync</th><th>Neden</th></tr></thead>
+    <tbody>
+      <tr><td><code>Arc&lt;T&gt;</code></td><td>evet*</td><td>evet*</td><td>atomik refcount (T: Send+Sync ise)</td></tr>
+      <tr><td><code>Rc&lt;T&gt;</code></td><td>hayır</td><td>hayır</td><td>atomik olmayan sayaç → data race</td></tr>
+      <tr><td><code>Mutex&lt;T&gt;</code></td><td>evet*</td><td>evet*</td><td>kilit erişimi serileştirir</td></tr>
+      <tr><td><code>Cell/RefCell</code></td><td>evet</td><td>hayır</td><td>runtime borrow paylaşımda yarışır</td></tr>
+      <tr><td>çıplak işaretçi <code>*mut T</code></td><td>hayır</td><td>hayır</td><td>güvenlik garantisi yok</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>Anahtar nokta: <code>thread::spawn</code>'ın bound'u <code>F: Send + 'static</code>'tir. Yani bir thread'e <code>Send</code> olmayan bir şey taşımaya kalkarsanız hata <em>kullanım yerinde</em>, açık bir mesajla çıkar. <code>Rc</code> örneğindeki "neden derlenmedi?" sorusunun tek cümlelik yanıtı: <code>Rc</code> <code>!Send</code>'dir.</p>
+
+  <div class="code-block"><div class="code-header"><span>main.rs</span><span class="dot">●</span></div><pre><code>{% raw %}<span class="keyword">use</span> std::rc::<span class="field">Rc</span>;
+<span class="keyword">use</span> std::thread;
+
+<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> r = <span class="field">Rc</span>::new(5);
+
+    <span class="cmt">// HATA: `Rc&lt;i32&gt;` Send değil → thread'e taşınamaz</span>
+    <span class="cmt">// error[E0277]: `Rc&lt;i32&gt;` cannot be sent between threads safely</span>
+    thread::spawn(<span class="keyword">move</span> || {
+        println!(<span class="str">"{}"</span>, r);
+    });
+}{% endraw %}</code></pre></div>
+
+  <div class="callout"><div class="label">NOT</div><p><code>Send</code> ve <code>Sync</code> ortogonaldir. <code>MutexGuard</code> ilginç bir örnektir: <code>Sync</code>'tir (referansı paylaşılabilir) ama bazı platformlarda <code>!Send</code>'dir — yani guard'ı kilitleyen thread bırakmalıdır. Çoğu tipte ikisi birlikte gelir; ayrımı yalnızca bu tür sınır durumlarda hissedersiniz.</p></div>
+
+  <div class="summary"><h4>Bu bölümde</h4><ul>
+    <li><code>Send</code> = thread'e taşınabilir; <code>Sync</code> = <code>&amp;T</code> paylaşılabilir</li>
+    <li>Auto trait: bileşenler uygunsa derleyici otomatik türetir</li>
+    <li><code>Rc</code> <code>!Send</code> (atomik olmayan sayaç); <code>Arc</code> <code>Send + Sync</code></li>
+    <li><code>spawn</code>'ın <code>Send + 'static</code> bound'u kuralı kullanım yerinde zorlar</li>
+  </ul></div>
+</section>
+
+<section id="s7">
+  <h2><span class="num">07</span> RwLock ve atomics</h2>
+  <p class="section-lead">Tek bir <code>Mutex</code> okuyucuları da serileştirir; oysa çoğu okuyucu / az yazıcı yükünde bu israftır. <code>RwLock&lt;T&gt;</code> tam olarak <code>pthread_rwlock_t</code>'nin karşılığıdır: aynı anda <em>çok okuyucu</em> ya da <em>tek yazıcı</em>. Daha da hafifi gerekiyorsa, tek skaler değerler için <strong>atomics</strong> kilidi tamamen ortadan kaldırır.</p>
+
+  <p><code>RwLock</code> iki ayrı kilitleme verir: <code>read()</code> paylaşımlı bir guard (<code>&amp;T</code>), <code>write()</code> dışlayıcı bir guard (<code>&amp;mut T</code>) döndürür. Borrow checker'ın "çok okuyucu veya tek yazıcı" kuralının çalışma zamanına taşınmış halidir.</p>
+
+  <div class="code-block"><div class="code-header"><span>main.rs</span><span class="dot">●</span></div><pre><code>{% raw %}<span class="keyword">use</span> std::sync::<span class="field">RwLock</span>;
+
+<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> ayar = <span class="field">RwLock</span>::new(vec![1, 2, 3]);
+
+    {
+        <span class="keyword">let</span> r1 = ayar.read().unwrap(); <span class="cmt">// paylaşımlı; eşzamanlı r2 olabilir</span>
+        <span class="keyword">let</span> r2 = ayar.read().unwrap();
+        println!(<span class="str">"{} {}"</span>, r1.len(), r2.len());
+    } <span class="cmt">// okuyucular drop olur</span>
+
+    {
+        <span class="keyword">let</span> mut w = ayar.write().unwrap(); <span class="cmt">// dışlayıcı</span>
+        w.push(4);
+    }
+}{% endraw %}</code></pre></div>
+
+  <h3>Atomics</h3>
+  <p>Korunan veri tek bir tamsayı ya da bayrak ise kilit aşırıdır. <code>AtomicUsize</code>, <code>AtomicBool</code> gibi tipler donanım atomik komutlarıyla çalışır — kilitsiz (lock-free). C11 <code>&lt;stdatomic.h&gt;</code> ya da GCC <code>__atomic</code> builtin'lerini biliyorsanız model birebir aynıdır; <code>Ordering</code> da C++/C bellek sıralamasının (memory order) aynısıdır.</p>
+
+  <div class="code-block"><div class="code-header"><span>main.rs</span><span class="dot">●</span></div><pre><code>{% raw %}<span class="keyword">use</span> std::sync::atomic::{<span class="field">AtomicUsize</span>, <span class="field">Ordering</span>};
+<span class="keyword">use</span> std::sync::<span class="field">Arc</span>;
+<span class="keyword">use</span> std::thread;
+
+<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> sayac = <span class="field">Arc</span>::new(<span class="field">AtomicUsize</span>::new(0));
+    <span class="keyword">let</span> mut hs = vec![];
+
+    <span class="keyword">for</span> _ <span class="keyword">in</span> 0..10 {
+        <span class="keyword">let</span> c = <span class="field">Arc</span>::clone(&amp;sayac);
+        hs.push(thread::spawn(<span class="keyword">move</span> || {
+            <span class="cmt">// kilitsiz artış; basit sayaç için Relaxed yeter</span>
+            c.fetch_add(1, <span class="field">Ordering</span>::<span class="field">Relaxed</span>);
+        }));
+    }
+    <span class="keyword">for</span> h <span class="keyword">in</span> hs { h.join().unwrap(); }
+    println!(<span class="str">"{}"</span>, sayac.load(<span class="field">Ordering</span>::<span class="field">Relaxed</span>)); <span class="cmt">// 10</span>
+}{% endraw %}</code></pre></div>
+
+  <div class="callout warn"><div class="label">DİKKAT</div><p><code>Ordering</code> seçimi ciddidir. <code>Relaxed</code> yalnızca atomikliği garanti eder, başka veriyle <em>sıralama</em> kurmaz — bağımsız bir sayaç için doğru ama bir bayrakla başka belleği "yayınlıyorsanız" <code>Release</code>/<code>Acquire</code> gerekir. Şüphedeyseniz <code>SeqCst</code> kullanın; C/C++'taki kurallarla aynıdır.</p></div>
+
+  <div class="summary"><h4>Bu bölümde</h4><ul>
+    <li><code>RwLock</code> = çok okuyucu / tek yazıcı; <code>pthread_rwlock</code> karşılığı</li>
+    <li><code>read()</code> paylaşımlı, <code>write()</code> dışlayıcı guard verir</li>
+    <li>Tek skaler için <code>Atomic*</code> kilitsizdir; C11/C++ atomic modeliyle aynı</li>
+    <li><code>Ordering</code> C/C++ memory order'ıyla birebir; şüphede <code>SeqCst</code></li>
+  </ul></div>
+</section>
+
+<section id="s8">
+  <h2><span class="num">08</span> Scoped threads</h2>
+  <p class="section-lead"><code>spawn</code>'ın <code>'static</code> bound'u, sadece kısa süre çalışıp ana fonksiyonun yerel verisini ödünç almak isteyen thread'ler için fazla katıdır. <code>std::thread::scope</code> (Rust 1.63+) tam bu boşluğu doldurur: scope bitmeden tüm child thread'lerin join'ini garanti ettiği için, ödünç alınan veriye <code>Arc</code>'sız, klonsuz erişebilirsiniz.</p>
+
+  <p>Mekanizma şu: <code>scope</code> kapanmadan önce içinde açılan her thread'i otomatik join eder. Derleyici bunu bildiği için, child thread'lerin yerel bir <code>&amp;data</code>'yı yakalamasına izin verir — çünkü o veri, thread'ler bitmeden asla yok olamaz. <code>'static</code> şartı bu kapsamda gevşer.</p>
+
+  <div class="code-block"><div class="code-header"><span>main.rs</span><span class="dot">●</span></div><pre><code>{% raw %}<span class="keyword">use</span> std::thread;
+
+<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> dizi = vec![1, 2, 3, 4, 5, 6];
+
+    thread::scope(|s| {
+        <span class="cmt">// her iki thread `dizi`yi PAYLAŞIMLI ödünç alır — Arc yok</span>
+        s.spawn(|| {
+            <span class="keyword">let</span> toplam: i32 = dizi[..3].iter().sum();
+            println!(<span class="str">"ilk yarı: {toplam}"</span>);
+        });
+        s.spawn(|| {
+            <span class="keyword">let</span> toplam: i32 = dizi[3..].iter().sum();
+            println!(<span class="str">"ikinci yarı: {toplam}"</span>);
+        });
+    }); <span class="cmt">// scope kapanır → her iki thread otomatik join edilir</span>
+
+    <span class="cmt">// `dizi` hâlâ geçerli; sahipliği hiç taşınmadı</span>
+    println!(<span class="str">"toplam eleman: {}"</span>, dizi.len());
+}{% endraw %}</code></pre></div>
+
+  <div class="callout"><div class="label">NOT</div><p>Scope içinde de <code>&amp;mut</code> kuralları geçerli: aynı veriyi iki thread paylaşımlı (<code>&amp;</code>) okuyabilir, ama ikisi birden değiştiremez. Eşzamanlı yazma gerekiyorsa scope içinde bile <code>Mutex</code> ya da disjoint (örtüşmeyen) dilimler kullanmanız gerekir.</p></div>
+
+  <p>Ne zaman pratik? Veriyi yaşatan stack frame thread'lerden uzun yaşayacaksa ve iş kısa süreliyse scoped threads en temiz seçimdir: <code>Arc</code>/klon gürültüsü ve atomik refcount maliyeti olmadan paralellik. Uzun ömürlü, ana fonksiyondan bağımsız çalışan thread'ler için ise hâlâ klasik <code>spawn</code> + <code>Arc</code> gerekir.</p>
+
+  <div class="summary"><h4>Bu bölümde</h4><ul>
+    <li><code>thread::scope</code> child thread'leri scope sonunda otomatik join eder</li>
+    <li>Bu garanti sayesinde yerel veri <code>Arc</code>'sız ödünç verilebilir</li>
+    <li>Paylaşımlı borrow serbest; eşzamanlı yazma için yine <code>Mutex</code>/disjoint</li>
+    <li>Kısa ömürlü, yerel veriye dokunan işler için en temiz kalıp</li>
+  </ul></div>
+</section>
+
+<section id="s9">
+  <h2><span class="num">09</span> Gerçek örnek</h2>
+  <p class="section-lead">Şimdi parçaları birleştirelim: sabit sayıda <strong>worker</strong> thread'in bir kanaldan iş çekip, sonucu paylaşımlı bir <code>Arc&lt;Mutex&lt;T&gt;&gt;</code>'te biriktirdiği klasik bir desen. Bu, C'de "thread pool + iş kuyruğu + sonuç mutex'i" üçlüsünün doğrudan ama güvenli karşılığıdır.</p>
+
+  <p>İşler bir <code>mpsc</code> kanalına gönderilir; N worker aynı <code>Receiver</code>'ı paylaşamayacağı için (mpsc tek tüketicilidir) <code>Receiver</code>'ı <code>Arc&lt;Mutex&lt;...&gt;&gt;</code> ile sararız — her worker kilitleyip bir iş alır. Sonuçlar paylaşımlı bir toplam mutex'inde birikir.</p>
+
+  <div class="code-block"><div class="code-header"><span>main.rs</span><span class="dot">●</span></div><pre><code>{% raw %}<span class="keyword">use</span> std::sync::{<span class="field">Arc</span>, <span class="field">Mutex</span>, mpsc};
+<span class="keyword">use</span> std::thread;
+
+<span class="keyword">fn</span> main() {
+    <span class="keyword">let</span> (tx, rx) = mpsc::channel::&lt;u64&gt;();
+    <span class="cmt">// rx paylaşımlı: çok worker tek kuyruktan çeker</span>
+    <span class="keyword">let</span> rx = <span class="field">Arc</span>::new(<span class="field">Mutex</span>::new(rx));
+    <span class="keyword">let</span> toplam = <span class="field">Arc</span>::new(<span class="field">Mutex</span>::new(0u64));
+
+    <span class="keyword">let</span> mut workerlar = vec![];
+    <span class="keyword">for</span> _ <span class="keyword">in</span> 0..4 {
+        <span class="keyword">let</span> rx = <span class="field">Arc</span>::clone(&amp;rx);
+        <span class="keyword">let</span> toplam = <span class="field">Arc</span>::clone(&amp;toplam);
+        workerlar.push(thread::spawn(<span class="keyword">move</span> || {
+            <span class="keyword">loop</span> {
+                <span class="cmt">// kilidi kısa tut: yalnız bir iş çek, sonra bırak</span>
+                <span class="keyword">let</span> is = rx.lock().unwrap().recv();
+                <span class="keyword">match</span> is {
+                    <span class="field">Ok</span>(n) =&gt; {
+                        <span class="keyword">let</span> kare = n * n;       <span class="cmt">// kilit DIŞINDA hesapla</span>
+                        *toplam.lock().unwrap() += kare;
+                    }
+                    <span class="field">Err</span>(_) =&gt; <span class="keyword">break</span>, <span class="cmt">// kanal kapandı → çık</span>
+                }
+            }
+        }));
+    }
+
+    <span class="keyword">for</span> i <span class="keyword">in</span> 1..=100u64 { tx.send(i).unwrap(); }
+    drop(tx); <span class="cmt">// tüm işler gönderildi; kanalı kapat</span>
+
+    <span class="keyword">for</span> w <span class="keyword">in</span> workerlar { w.join().unwrap(); }
+    println!(<span class="str">"kareler toplamı = {}"</span>, *toplam.lock().unwrap()); <span class="cmt">// 338350</span>
+}{% endraw %}</code></pre></div>
+
+  <p>Dikkat edilen iki nokta üretim kodunda kritiktir: ağır hesaplama (<code>n * n</code> burada simgesel) kilit <em>dışında</em> yapılır, böylece worker'lar darboğaza girmez; ve kanal <code>drop(tx)</code> ile kapatıldığı için <code>recv()</code> bir <code>Err</code> döner ve döngü temiz biter. C'de bu "kapanış sinyali" için ayrı bir bayrak + condition variable kurardınız.</p>
+
+  <h3>Kapanış: rayon</h3>
+  <p>Yukarıdaki desen <em>heterojen</em> iş kuyrukları için doğru araçtır. Ama yaptığınız tek şey bir koleksiyonu paralel işlemekse (data parallelism), elle thread pool kurmak gereksizdir. <code>rayon</code> crate'i bunu tek satıra indirir: <code>iter()</code> yerine <code>par_iter()</code> yazarsınız, kütüphane work-stealing scheduler ile çekirdeklere böler.</p>
+
+  <div class="code-block"><div class="code-header"><span>main.rs</span><span class="dot">●</span></div><pre><code>{% raw %}<span class="keyword">use</span> rayon::prelude::*;
+
+<span class="keyword">fn</span> main() {
+    <span class="cmt">// aynı toplam, sıfır manuel senkronizasyon</span>
+    <span class="keyword">let</span> toplam: u64 = (1..=100u64)
+        .into_par_iter()      <span class="cmt">// paralel iterator</span>
+        .map(|n| n * n)
+        .sum();
+    println!(<span class="str">"kareler toplamı = {toplam}"</span>); <span class="cmt">// 338350</span>
+}{% endraw %}</code></pre></div>
+
+  <div class="callout"><div class="label">NOT</div><p>rayon güvenliğini yine <code>Send</code>/<code>Sync</code>'ten alır: <code>par_iter</code>, closure'ınızın <code>Send</code> olmasını ister, yani aynı derleme zamanı veri-yarışı garantisi geçerlidir. Pratik kural: <strong>düzenli data parallelism → rayon</strong>; <strong>özel iş akışı / heterojen görevler → elle channel + Arc&lt;Mutex&gt;</strong>.</p></div>
+
+  <div class="summary"><h4>Bu bölümde</h4><ul>
+    <li>Worker pool: <code>Arc&lt;Mutex&lt;Receiver&gt;&gt;</code> ile çok worker tek kuyruktan çeker</li>
+    <li>Ağır işi kilit dışında yap; kilidi sadece veri paylaşımı için kısa tut</li>
+    <li><code>drop(tx)</code> kanalı kapatır → worker'lar <code>Err</code> görüp temiz biter</li>
+    <li>Düz data parallelism için <code>rayon</code> <code>par_iter</code> elle pool kurmaya yeğdir</li>
+  </ul></div>
+</section>
+</main>
