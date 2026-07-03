@@ -53,8 +53,10 @@ def discover_decks():
 
 
 def short_name(deck):
-    """embedded-deck → embedded ; ai-deck → ai (MCP prefix'i)."""
-    return re.sub(r'-deck$', '', deck) or deck
+    """embedded-deck → embedded ; cli-tools-deck → cli_tools (MCP prefix'i).
+    Tire → alt çizgi: MCP tool adları için güvenli (cli_tools_search)."""
+    base = re.sub(r'-deck$', '', deck) or deck
+    return base.replace('-', '_')
 
 
 # ──────────────────────────────────────────────────────────────
