@@ -1,0 +1,554 @@
+---
+layout: tutorial
+title: "ARM Semihosting — printf via the Debugger"
+back_url: "../index.html"
+back_label: "All guides"
+---
+<header class="header">
+  <div class="meta">
+    <span>TECHNICAL GUIDE</span><span>STM32 DEBUG</span><span>SEMIHOSTING</span><span>2026</span>
+  </div>
+  <h1>ARM Semihosting<br><em>printf via the Debugger</em></h1>
+  <p class="subtitle">Get stdout on an STM32L4R5 with zero UART wiring — BKPT-based host syscalls, newlib rdimon, and OpenOCD, from first build to first character.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">Contents</div>
+  <ol>
+    <li><a href="#s0">What semihosting is &amp; why use it</a></li>
+    <li><a href="#s1">The BKPT syscall mechanism</a></li>
+    <li><a href="#s2">Operation numbers &amp; trap encodings</a></li>
+    <li><a href="#s3">Toolchain wiring: newlib rdimon</a></li>
+    <li><a href="#s4">Enabling in OpenOCD / GDB</a></li>
+    <li><a href="#s5">Full build + run example</a></li>
+    <li><a href="#s6">Register-level: direct BKPT, no library</a></li>
+    <li><a href="#s7">Pros, cons &amp; when to use</a></li>
+    <li><a href="#s8">Gotchas / common mistakes</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">01</span> What semihosting is &amp; why use it</h2>
+  <p class="section-lead">Semihosting is an ARM mechanism that lets code running on the target (your STM32L4R5) ask the <em>host</em> PC — through the debugger — to perform I/O on its behalf. <code>printf</code>, <code>fopen</code>, <code>scanf</code> and friends run on the chip, but the actual reading and writing happen on your workstation.</p>
+
+  <p>The target has no display, no filesystem, and — during early bring-up — often no working UART yet. Semihosting borrows the host's. When the target executes a special trap instruction, the debug agent (OpenOCD, pyOCD, J-Link, etc.) halts the core, inspects the requested operation, executes it on the host, writes the result back into target memory/registers, and resumes the core. The application never knows the difference: to it, <code>stdout</code> is just a file handle.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Target</span><span class="desc">STM32L4R5 (Cortex-M4F). Runs newlib + the semihosting stubs; issues <code>BKPT&nbsp;0xAB</code> traps.</span></div>
+    <div class="param"><span class="name">Debug agent</span><span class="desc">OpenOCD/GDB over SWD via the on-board ST-LINK. Catches the trap, does the host I/O.</span></div>
+    <div class="param"><span class="name">Host</span><span class="desc">Your PC. The string appears in the OpenOCD console (or GDB console).</span></div>
+  </div>
+
+  <p>The single biggest reason to reach for it: <strong>it needs no peripheral</strong>. No USART, no pins, no clocks, no DMA, no level shifter, no USB-serial cable. If SWD works — which it must, or you could not flash the part — semihosting works. That makes it the fastest possible way to get a <code>printf</code> out of a board on day one.</p>
+
+  <div class="callout">
+    <div class="label">NO PINS INVOLVED</div>
+    <p>A normal UART <code>printf</code> on a Nucleo-L4R5ZI would tie up USART2 on <code>PA2</code>/<code>PA3</code> (AF7), plus a clock enable and a baud-rate calc. Semihosting uses <em>none</em> of that — the debug port you already have <em>is</em> the transport. That is exactly why it shines before your board bring-up code exists.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Use it for</h4>
+    <ul>
+      <li>Day-one bring-up: is my clock tree alive? did <code>main()</code> even reach line 1?</li>
+      <li>Boards with no free UART, or where the UART is the thing you are debugging.</li>
+      <li>Quick host file access from the target (read a test vector, dump a log to a file).</li>
+    </ul>
+    <h4>Do <em>not</em> ship it</h4>
+    <ul>
+      <li>It halts the core on every call (see §08) — never leave it in a real-time or production build.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">02</span> The BKPT syscall mechanism</h2>
+  <p class="section-lead">Semihosting is a software-interrupt calling convention. On a Cortex-M the trap is the breakpoint instruction <code>BKPT&nbsp;0xAB</code> (encoding <code>0xBEAB</code>). The immediate <code>0xAB</code> is what tells the debugger "this halt is a semihosting request, not a user breakpoint."</p>
+
+  <p>The convention is deliberately tiny:</p>
+  <ol>
+    <li>Load the <strong>operation number</strong> into <code>r0</code>.</li>
+    <li>Load a <strong>pointer to the parameter block</strong> (or, for one-argument calls, the value itself) into <code>r1</code>.</li>
+    <li>Execute the trap. The core halts; the debugger reads <code>r0</code>/<code>r1</code>, walks the parameter block in target RAM, and does the work.</li>
+    <li>The debugger writes the return value back into <code>r0</code> and resumes the core past the <code>BKPT</code>.</li>
+  </ol>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — the entire calling convention</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* A generic semihosting call for Cortex-M.
+ * r0 = operation number, r1 = pointer to arg block.
+ * Returns the debugger's result value (also in r0). */</span>
+static inline int semihost(int op, void *arg_block)
+{
+    register int   r0 asm("r0") = op;          <span class="cmt">// operation -> r0</span>
+    register void *r1 asm("r1") = arg_block;    <span class="cmt">// arg pointer -> r1</span>
+    asm volatile(
+        "bkpt #0xAB"        <span class="cmt">// the semihosting trap (0xBEAB)</span>
+        : "+r"(r0)          <span class="cmt">// r0 is read AND written (return value)</span>
+        : "r"(r1)           <span class="cmt">// r1 is an input</span>
+        : "memory");        <span class="cmt">// debugger may touch our RAM</span>
+    return r0;
+}</code></pre>
+  </div>
+
+  <p>Every semihosting service — <code>SYS_WRITE0</code>, <code>SYS_OPEN</code>, <code>SYS_READC</code> — is just this one instruction with a different <code>r0</code> and a different parameter block layout. newlib's <code>librdimon</code> wraps exactly this behind <code>_write</code>, <code>_read</code>, <code>_open</code>, so that <code>printf</code> ends up here without you writing a line of assembly.</p>
+
+  <div class="callout warn">
+    <div class="label">THE FATAL CATCH</div>
+    <p>On Cortex-M, <code>BKPT</code> with <strong>no debugger attached</strong> escalates to a <strong>HardFault</strong> (the debug event is unhandled). A binary linked with semihosting therefore <em>hangs or faults on its own</em> when you power the board from a wall adapter with no probe running. This single fact drives most of the gotchas in §09.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">03</span> Operation numbers &amp; trap encodings</h2>
+  <p class="section-lead">The full operation set is defined in the ARM "Semihosting for AArch32 and AArch64" specification (ARM-software/abi-aa). Below are the ones you actually hit; the two that matter for a first <code>printf</code> are <code>SYS_WRITE0</code> (0x04) and <code>SYS_WRITE</code> (0x05).</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>op (r0)</th><th>Name</th><th>r1 parameter block</th><th>Returns (r0)</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>0x01</td><td>SYS_OPEN</td><td>[ name_ptr, mode, name_len ]</td><td>host file handle, or −1</td></tr>
+        <tr><td>0x02</td><td>SYS_CLOSE</td><td>[ handle ]</td><td>0 on success</td></tr>
+        <tr><td>0x03</td><td>SYS_WRITEC</td><td>pointer to <em>one</em> char</td><td>void</td></tr>
+        <tr><td>0x04</td><td>SYS_WRITE0</td><td>pointer to a <em>NUL-terminated</em> string</td><td>void</td></tr>
+        <tr><td>0x05</td><td>SYS_WRITE</td><td>[ handle, data_ptr, len ]</td><td>bytes <em>not</em> written (0 = ok)</td></tr>
+        <tr><td>0x06</td><td>SYS_READ</td><td>[ handle, buf_ptr, len ]</td><td>bytes <em>not</em> read</td></tr>
+        <tr><td>0x07</td><td>SYS_READC</td><td>none</td><td>one char read from console</td></tr>
+        <tr><td>0x09</td><td>SYS_ISTTY</td><td>[ handle ]</td><td>1 if interactive tty</td></tr>
+        <tr><td>0x0A</td><td>SYS_SEEK</td><td>[ handle, abs_pos ]</td><td>0 on success</td></tr>
+        <tr><td>0x0C</td><td>SYS_FLEN</td><td>[ handle ]</td><td>file length, or −1</td></tr>
+        <tr><td>0x13</td><td>SYS_ERRNO</td><td>none</td><td>host errno of last call</td></tr>
+        <tr><td>0x15</td><td>SYS_GET_CMDLINE</td><td>[ buf_ptr, len ]</td><td>command line into buf</td></tr>
+        <tr><td>0x16</td><td>SYS_HEAPINFO</td><td>pointer to 4-word block (filled in)</td><td>heap/stack limits</td></tr>
+        <tr><td>0x18</td><td>SYS_EXIT</td><td>reason code (0x20026 = ApplicationExit)</td><td>does not return</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>To open the host console explicitly you <code>SYS_OPEN</code> the special filename <code>":tt"</code> — mode <code>0</code> gives stdin, mode <code>4</code> gives stdout, mode <code>8</code> gives stderr. This is exactly what newlib's <code>initialise_monitor_handles()</code> does under the hood to wire up handles 0/1/2.</p>
+
+  <h3>Trap instruction per ISA</h3>
+  <p>The immediate is the same idea everywhere, but the <em>instruction</em> differs by architecture. On the STM32L4R5 (M-profile) it is always the <code>BKPT</code> row.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>ISA</th><th>Instruction</th><th>Encoding</th><th>Applies to</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>A32 (ARM)</td><td>SVC #0x123456</td><td>0xEF123456</td><td>Cortex-A/R in ARM state</td></tr>
+        <tr><td>T32 (Thumb)</td><td>SVC #0xAB</td><td>0xDFAB</td><td>Cortex-A/R in Thumb state</td></tr>
+        <tr><td><strong>M-profile T32</strong></td><td><strong>BKPT #0xAB</strong></td><td><strong>0xBEAB</strong></td><td><strong>Cortex-M0/M3/M4/M7 → STM32L4R5</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">WHY BKPT, NOT SVC, ON CORTEX-M</div>
+    <p>Cortex-M reserves <code>SVC</code> for the RTOS/OS supervisor call and routes it through the normal exception vector — the debugger never sees it. <code>BKPT</code> instead generates a <em>debug</em> event that the halting debug logic catches directly. That is why M-profile semihosting uses <code>BKPT 0xAB</code> and A/R-profile uses <code>SVC</code>.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">04</span> Toolchain wiring: newlib rdimon</h2>
+  <p class="section-lead">You rarely write the <code>BKPT</code> yourself. The GNU Arm Embedded toolchain ships <code>librdimon</code> (the "remote debug monitor" flavour of libgloss) whose syscall stubs — <code>_write</code>, <code>_read</code>, <code>_open</code>, <code>_close</code>, <code>_lseek</code>, <code>_sbrk</code>, <code>_exit</code> — are implemented on top of semihosting. Point the linker at it with <code>--specs=rdimon.specs</code> and <code>printf</code> just works.</p>
+
+  <h3>The three specs files you will meet</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Spec</th><th>Library</th><th>What the syscalls do</th><th>When</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>--specs=nosys.specs</code></td><td>libnosys</td><td>Stubs return −1 / do nothing. <code>printf</code> goes nowhere.</td><td>No I/O; link cleanly with no host.</td></tr>
+        <tr><td><code>--specs=rdimon.specs</code></td><td>librdimon</td><td>Syscalls become <strong>semihosting</strong> <code>BKPT</code> traps → host.</td><td><strong>Semihosting (this guide).</strong></td></tr>
+        <tr><td><code>--specs=nano.specs</code></td><td>newlib-nano</td><td>Size-optimised libc; <em>orthogonal</em> to where I/O goes.</td><td>Shrink code; combine carefully (see §09).</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Link flags</h3>
+  <p>Add the rdimon spec, then link the C library and the rdimon stubs. Wrapping them in a link group resolves the circular references between <code>libc</code> and <code>librdimon</code>:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>make — link flags for STM32L4R5 (Cortex-M4F)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># --- CPU / FPU: STM32L4R5 is Cortex-M4 with single-precision FPU ---</span>
+CPU     = -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard
+
+<span class="cmt"># --- Compile ---</span>
+CFLAGS  = $(CPU) -Og -g3 -Wall -ffunction-sections -fdata-sections
+
+<span class="cmt"># --- Link: rdimon.specs routes newlib syscalls to semihosting ---</span>
+LDFLAGS = $(CPU) --specs=rdimon.specs -Wl,--gc-sections \
+          -T STM32L4R5ZI_FLASH.ld \
+          -Wl,--start-group -lc -lrdimon -Wl,--end-group \
+          -Wl,-Map=firmware.map</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">DO NOT SILENTLY MIX SPECS</div>
+    <p><code>--specs=rdimon.specs</code> already selects a startup and libc set. Naively adding <code>--specs=nano.specs</code> as well is a documented way to make <code>printf</code> hang. If you need newlib-nano <em>and</em> semihosting, use <code>--specs=nano.specs --specs=rdimon.specs</code> in that order and test it; when in doubt, use <code>rdimon.specs</code> alone.</p>
+  </div>
+
+  <h3>initialise_monitor_handles()</h3>
+  <p>Before any <code>printf</code>, the rdimon runtime must open the console (<code>:tt</code>) and set up handles 0/1/2. The function that does this is <code>initialise_monitor_handles()</code>. It is provided by <code>librdimon</code>; you declare it <code>extern</code> and call it once, first thing in <code>main()</code>:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — the mandatory init call</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;stdio.h&gt;
+
+<span class="cmt">/* Provided by librdimon. No header ships it, so declare it. */</span>
+extern void initialise_monitor_handles(void);
+
+int main(void)
+{
+    initialise_monitor_handles();   <span class="cmt">// MUST run before the first printf</span>
+
+    printf("STM32L4R5 alive, HCLK bring-up OK\n");
+    for (int i = 0; i &lt; 3; i++)
+        printf("tick %d\n", i);
+
+    while (1) { }
+}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">ORDER MATTERS</div>
+    <p><code>initialise_monitor_handles()</code> itself issues semihosting <code>SYS_OPEN</code> traps. Semihosting must <em>already be enabled on the debug agent</em> (next section) before this call runs, or the very first <code>BKPT</code> HardFaults on "an unexpected debug event." Enable in the debugger, <em>then</em> let the core reach <code>main()</code>.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">05</span> Enabling in OpenOCD / GDB</h2>
+  <p class="section-lead">The target's traps do nothing until the debug agent is told to service them. In OpenOCD the command is <code>arm semihosting enable</code>; from GDB you issue it as a <code>monitor</code> command. The Nucleo-L4R5ZI's on-board ST-LINK is the SWD probe.</p>
+
+  <h3>Start the OpenOCD server</h3>
+  <div class="code-block">
+    <div class="code-header"><span>sh — launch OpenOCD for the L4R5</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Option A: generic ST-LINK interface + STM32L4 target</span>
+<span class="cmd">openocd</span> <span class="flag">-f</span> interface/stlink.cfg <span class="flag">-f</span> target/stm32l4x.cfg
+
+<span class="cmt"># Option B: the ready-made Nucleo-L4 board file (does both)</span>
+<span class="cmd">openocd</span> <span class="flag">-f</span> board/st_nucleo_l4.cfg
+
+<span class="cmt"># OpenOCD now listens: GDB on :3333, telnet on :4444</span></code></pre>
+  </div>
+
+  <h3>Drive it from GDB</h3>
+  <p>Connect, halt, <strong>enable semihosting</strong>, flash, and run. The critical line is <code>monitor arm semihosting enable</code> — issued <em>before</em> <code>continue</code> so it is active by the time <code>initialise_monitor_handles()</code> runs.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>gdb — run.gdb</span><span class="dot">●</span></div>
+    <pre><code>target extended-remote localhost:3333
+monitor reset halt
+monitor arm semihosting enable
+load
+continue
+<span class="cmt"># printf output now streams to the OpenOCD console window.</span></code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>sh — one-shot invocation</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">arm-none-eabi-gdb</span> firmware.elf <span class="flag">-x</span> run.gdb
+
+<span class="cmt"># or fully inline:</span>
+<span class="cmd">arm-none-eabi-gdb</span> firmware.elf \
+  <span class="flag">-ex</span> <span class="str">"target extended-remote localhost:3333"</span> \
+  <span class="flag">-ex</span> <span class="str">"monitor reset halt"</span> \
+  <span class="flag">-ex</span> <span class="str">"monitor arm semihosting enable"</span> \
+  <span class="flag">-ex</span> <span class="str">"load"</span> \
+  <span class="flag">-ex</span> <span class="str">"continue"</span></code></pre>
+  </div>
+
+  <h3>Where the output appears &amp; useful OpenOCD sub-commands</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Command (OpenOCD / <code>monitor …</code>)</th><th>Effect</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>arm semihosting enable</code></td><td>Service <code>BKPT&nbsp;0xAB</code>; output goes to the OpenOCD console.</td></tr>
+        <tr><td><code>arm semihosting disable</code></td><td>Stop servicing — traps will then HardFault the target.</td></tr>
+        <tr><td><code>arm semihosting_fileio enable</code></td><td>Route file I/O through GDB's own fileio channel instead of OpenOCD.</td></tr>
+        <tr><td><code>arm semihosting_redirect tcp &lt;port&gt; all</code></td><td>Redirect semihosting I/O to a TCP socket (newer OpenOCD) — read it with <code>nc localhost &lt;port&gt;</code>.</td></tr>
+        <tr><td><code>arm semihosting_resexit enable</code></td><td>Treat <code>SYS_EXIT</code> as "leave the debug session" rather than just halting.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">ST-LINK GDB SERVER CANNOT DO THIS</div>
+    <p>ST's own <code>ST-LINK_gdbserver</code> (used by default in STM32CubeIDE) does <strong>not</strong> implement semihosting. Use <strong>OpenOCD</strong> as the GDB server for semihosting, or switch CubeIDE's debug configuration from "ST-LINK (ST-LINK GDB server)" to "ST-LINK (OpenOCD)" and add the <code>monitor arm semihosting enable</code> line under the <em>Startup</em> tab. J-Link and pyOCD also support it.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">06</span> Full build + run example</h2>
+  <p class="section-lead">A complete, copy-pasteable flow: source, Makefile, GDB script, and the exact commands. This assumes the standard STM32CubeMX-generated <code>startup_stm32l4r5xx.s</code> and <code>STM32L4R5ZI_FLASH.ld</code> are present (they provide the vector table, <code>Reset_Handler</code>, and clock init). We change only the <em>link flags</em> and add the two semihosting lines.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — main.c</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdint.h&gt;
+
+<span class="cmt">/* Supplied by librdimon (via --specs=rdimon.specs). */</span>
+extern void initialise_monitor_handles(void);
+
+int main(void)
+{
+    <span class="cmt">/* SystemInit() / clock config from CubeMX has already run
+       out of the reset handler before main(). */</span>
+    initialise_monitor_handles();
+
+    printf("=== STM32L4R5 semihosting bring-up ===\n");
+    printf("SCB CPUID @ 0xE000ED00 = 0x%08lX\n",
+           *(volatile uint32_t *)0xE000ED00);   <span class="cmt">// should read 0x410FC241 (Cortex-M4 r0p1)</span>
+
+    for (uint32_t i = 0; i &lt; 5; i++) {
+        printf("loop %lu\n", i);
+        for (volatile uint32_t d = 0; d &lt; 200000; d++) { }  <span class="cmt">// crude delay</span>
+    }
+
+    printf("done.\n");
+    while (1) { }
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>make — Makefile</span><span class="dot">●</span></div>
+    <pre><code>PREFIX  = arm-none-eabi-
+CC      = $(PREFIX)gcc
+OBJCOPY = $(PREFIX)objcopy
+
+CPU     = -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard
+CFLAGS  = $(CPU) -Og -g3 -Wall -ffunction-sections -fdata-sections \
+          -DSTM32L4R5xx
+LDFLAGS = $(CPU) --specs=rdimon.specs -Wl,--gc-sections \
+          -T STM32L4R5ZI_FLASH.ld \
+          -Wl,--start-group -lc -lrdimon -Wl,--end-group \
+          -Wl,-Map=firmware.map
+
+SRCS    = main.c system_stm32l4xx.c startup_stm32l4r5xx.s
+OBJS    = $(addsuffix .o,$(basename $(SRCS)))
+
+all: firmware.elf firmware.bin
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $&lt; -o $@
+%.o: %.s
+	$(CC) $(CFLAGS) -c $&lt; -o $@
+
+firmware.elf: $(OBJS)
+	$(CC) $(OBJS) $(LDFLAGS) -o $@
+	$(PREFIX)size $@
+
+firmware.bin: firmware.elf
+	$(OBJCOPY) -O binary $&lt; $@
+
+clean:
+	rm -f $(OBJS) firmware.elf firmware.bin firmware.map</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>sh — build, then flash + run in two terminals</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1) Build</span>
+<span class="cmd">make</span>
+
+<span class="cmt"># 2) Terminal A — start the GDB server (leave it running)</span>
+<span class="cmd">openocd</span> <span class="flag">-f</span> interface/stlink.cfg <span class="flag">-f</span> target/stm32l4x.cfg
+
+<span class="cmt"># 3) Terminal B — connect, enable semihosting, flash, run</span>
+<span class="cmd">arm-none-eabi-gdb</span> firmware.elf <span class="flag">-x</span> run.gdb</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>text — expected output in Terminal A (OpenOCD)</span><span class="dot">●</span></div>
+    <pre><code>Info : halted: PC: 0x08000abc
+Info : semihosting is enabled
+=== STM32L4R5 semihosting bring-up ===
+SCB CPUID @ 0xE000ED00 = 0x410FC241
+loop 0
+loop 1
+loop 2
+loop 3
+loop 4
+done.</code></pre>
+  </div>
+
+  <p>The <code>0x410FC241</code> read confirms this is a Cortex-M4 (r0p1) core — a handy sanity check that both the read and the semihosting print path work.</p>
+</section>
+
+<!-- ═══════════════════ 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">07</span> Register-level: direct BKPT, no library</h2>
+  <p class="section-lead">You do not <em>need</em> newlib rdimon at all. Because the whole protocol is one instruction (§02), you can retarget <code>printf</code> with a handful of lines and keep <code>--specs=nano.specs</code> (or even <code>nosys.specs</code>) for a tiny binary. This is the LL/register-level path: it works with any startup, no <code>librdimon</code>, no <code>initialise_monitor_handles()</code>.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — semihost.c (self-contained retarget)</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;stdint.h&gt;
+#include &lt;sys/stat.h&gt;
+
+<span class="cmt">/* Operation numbers from the ARM semihosting spec. */</span>
+#define SYS_WRITE0  0x04
+#define SYS_WRITE   0x05
+#define SYS_READC   0x07
+
+<span class="cmt">/* The one-instruction primitive: r0=op, r1=args, ret in r0. */</span>
+static inline int semihost(int op, void *args)
+{
+    register int   r0 asm("r0") = op;
+    register void *r1 asm("r1") = args;
+    asm volatile("bkpt #0xAB"
+                 : "+r"(r0) : "r"(r1) : "memory");
+    return r0;
+}
+
+<span class="cmt">/* SYS_WRITE param block: { handle, data ptr, length }.
+   Returns the number of bytes NOT written (0 == success). */</span>
+static int sh_write(int handle, const char *buf, int len)
+{
+    volatile uint32_t block[3] = { (uint32_t)handle,
+                                   (uint32_t)buf,
+                                   (uint32_t)len };
+    return semihost(SYS_WRITE, (void *)block);
+}
+
+<span class="cmt">/* newlib calls _write() for every printf/putchar/fwrite(stdout).
+   Handle 1 == stdout by convention. */</span>
+int _write(int fd, const char *buf, int len)
+{
+    (void)fd;                       <span class="cmt">// treat all fds as the console</span>
+    int not_written = sh_write(1, buf, len);
+    return len - not_written;       <span class="cmt">// bytes actually written</span>
+}
+
+<span class="cmt">/* Minimal stubs so the linker is happy with --specs=nano.specs. */</span>
+int _read(int fd, char *buf, int len)     { (void)fd;(void)buf;(void)len; return 0; }
+int _close(int fd)                        { (void)fd; return -1; }
+int _lseek(int fd, int off, int dir)      { (void)fd;(void)off;(void)dir; return 0; }
+int _fstat(int fd, struct stat *st)       { (void)fd; st-&gt;st_mode = S_IFCHR; return 0; }
+int _isatty(int fd)                       { (void)fd; return 1; }</code></pre>
+  </div>
+
+  <p>Link this with <code>--specs=nano.specs</code> (not rdimon) and <code>printf("hi\n")</code> reaches the host through <code>_write → sh_write → BKPT 0xAB</code>. For the very cheapest "did I get here?" probe you can skip <code>printf</code> entirely and fire <code>SYS_WRITE0</code> directly:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — zero-dependency one-liner</span><span class="dot">●</span></div>
+    <pre><code>static inline void sh_puts(const char *s)
+{
+    semihost(SYS_WRITE0, (void *)s);   <span class="cmt">// r1 -> NUL-terminated string</span>
+}
+
+<span class="cmt">// ...anywhere in your code, even before clocks are configured:</span>
+sh_puts("reached HAL_Init\n");</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">SAME ENABLE STEP</div>
+    <p>The direct approach still requires <code>monitor arm semihosting enable</code> on the debug agent and a probe attached — the <code>BKPT</code> is identical hardware behaviour. The only thing you saved is the <code>librdimon</code> code size and the <code>initialise_monitor_handles()</code> dance.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">08</span> Pros, cons &amp; when to use</h2>
+  <p class="section-lead">Semihosting trades speed and independence for zero setup. Understanding the cost tells you where it belongs (bring-up) and where it does not (anything timed or unattended).</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Property</th><th>Semihosting</th><th>UART printf</th><th>SWO / ITM (printf via SWV)</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Extra pins</td><td><strong>None</strong> (reuses SWD)</td><td>2 (TX/RX)</td><td>1 (SWO/PB3)</td></tr>
+        <tr><td>Peripheral setup</td><td>None</td><td>USART + clock + baud</td><td>ITM + TPIU + trace clock</td></tr>
+        <tr><td>Halts the core?</td><td><strong>Yes, every call</strong></td><td>No</td><td>No</td></tr>
+        <tr><td>Throughput</td><td>Very slow (μs–ms/call)</td><td>Baud-limited</td><td>Fast (MHz)</td></tr>
+        <tr><td>Runs with no probe?</td><td><strong>No — HardFaults</strong></td><td>Yes</td><td>Runs, output lost</td></tr>
+        <tr><td>Host file access</td><td>Yes (open/read/write)</td><td>No</td><td>No</td></tr>
+        <tr><td>Best for</td><td>Day-one bring-up, host files</td><td>Field logging, production</td><td>High-rate live tracing</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Why it is slow — and why "slow" is the point</h3>
+  <p>Every <code>printf</code> forces a full round trip: the core executes <code>BKPT</code> and <strong>stops</strong>; the debug probe notices the halt, reads registers over SWD, walks the parameter block out of target RAM, does the host I/O, writes the result back, and single-steps the core past the breakpoint. That is tens of microseconds to milliseconds <em>per call</em>, during which your firmware is frozen. Interrupts do not run, timers drift, communication peripherals overflow.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Great</span><span class="desc">"Does <code>main()</code> run? Is my PLL locked? What is the value of this register?" — correctness questions where stopping the core is irrelevant.</span></div>
+    <div class="param"><span class="name">Terrible</span><span class="desc">Motor control loops, USB/Ethernet stacks, ISR-heavy code, or any log left in a shipping build. The halts corrupt exactly the timing you are trying to observe.</span></div>
+  </div>
+
+  <p>The rule of thumb: <strong>semihosting is a bring-up and lab tool.</strong> Once the board talks, graduate your logging to a non-halting transport (ITM/SWO or a real UART) and strip the rdimon link flags out of release builds.</p>
+</section>
+
+<!-- ═══════════════════ 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">09</span> Gotchas / common mistakes</h2>
+  <p class="section-lead">Almost every "semihosting doesn't print / my board hangs" report is one of the following.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Board HardFaults the instant it hits <code>printf</code>, or hangs when powered from USB/wall with no probe.</td><td><code>BKPT 0xAB</code> with no debugger = unhandled debug event = HardFault on Cortex-M.</td><td>Never ship rdimon builds. For standalone runs relink with <code>nosys.specs</code>, or guard traps behind a "debugger attached" check (<code>CoreDebug-&gt;DHCSR &amp; C_DEBUGEN</code>).</td></tr>
+        <tr><td>Nothing prints; no fault.</td><td>Forgot <code>monitor arm semihosting enable</code>, or used the ST-LINK GDB server (no support).</td><td>Enable semihosting <em>before</em> <code>continue</code>; use OpenOCD/J-Link/pyOCD, not ST-LINK_gdbserver.</td></tr>
+        <tr><td>First trap faults inside <code>initialise_monitor_handles()</code>.</td><td>Semihosting enabled <em>after</em> the core already reached that call.</td><td>Order: reset halt → enable semihosting → then run to <code>main()</code>.</td></tr>
+        <tr><td>Output only appears in bursts / at exit.</td><td><code>stdout</code> is block-buffered by newlib.</td><td>End lines with <code>\n</code> and/or call <code>setvbuf(stdout, NULL, _IONBF, 0)</code>, or <code>fflush(stdout)</code>.</td></tr>
+        <tr><td>Link error: undefined reference to <code>initialise_monitor_handles</code> / <code>_write</code>.</td><td><code>-lrdimon</code> missing, or <code>--specs=rdimon.specs</code> not passed.</td><td>Use the group form: <code>--specs=rdimon.specs -Wl,--start-group -lc -lrdimon -Wl,--end-group</code>.</td></tr>
+        <tr><td><code>printf</code> hangs forever after adding <code>nano.specs</code>.</td><td>Conflicting <code>nano.specs</code> + <code>rdimon.specs</code> combination.</td><td>Use <code>rdimon.specs</code> alone, or the direct-BKPT retarget in §07 with <code>nano.specs</code>.</td></tr>
+        <tr><td>Firmware is fine under debugger but "randomly" freezes in the field.</td><td>A stray semihosting <code>printf</code> left in a production build; runs fine only while a probe is attached.</td><td>Grep the release map for <code>librdimon</code> / <code>semihost</code> symbols; remove the spec from release configs.</td></tr>
+        <tr><td>Everything works but the loop is unbearably slow.</td><td>Expected: each call halts the core (§08).</td><td>Move to ITM/SWO or UART for anything high-rate; keep semihosting for bring-up only.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — guard so standalone runs don't fault</span><span class="dot">●</span></div>
+    <pre><code>#include &lt;stdint.h&gt;
+
+<span class="cmt">/* DHCSR bit0 (C_DEBUGEN) is set only when a debugger has enabled
+   halting-debug. Check it before issuing any semihosting trap so the
+   same image can run both under the probe and standalone. */</span>
+static inline int debugger_attached(void)
+{
+    return (*(volatile uint32_t *)0xE000EDF0) &amp; 0x1u;   <span class="cmt">// CoreDebug-&gt;DHCSR &amp; C_DEBUGEN</span>
+}
+
+void log_msg(const char *s)
+{
+    if (debugger_attached())
+        sh_puts(s);        <span class="cmt">// safe: a probe is servicing traps</span>
+    <span class="cmt">// else: silently skip — no BKPT, no HardFault</span>
+}</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">THE ONE RULE</div>
+    <p>A semihosting build is <strong>not self-contained</strong>. It only runs correctly while a debugger with semihosting enabled is attached. Treat it as a lab instrument: enable it for bring-up, guard or remove it everywhere else.</p>
+  </div>
+
+  <div class="summary">
+    <h4>Checklist to get the first character</h4>
+    <ul>
+      <li>Compile <code>-mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard</code>.</li>
+      <li>Link <code>--specs=rdimon.specs</code> + <code>-lc -lrdimon</code> (in a link group).</li>
+      <li>Call <code>initialise_monitor_handles()</code> first thing in <code>main()</code>.</li>
+      <li>OpenOCD server up; GDB: <code>reset halt</code> → <code>monitor arm semihosting enable</code> → <code>load</code> → <code>continue</code>.</li>
+      <li>Print with a trailing <code>\n</code>; watch the OpenOCD console.</li>
+    </ul>
+  </div>
+</section>
+
+</main>

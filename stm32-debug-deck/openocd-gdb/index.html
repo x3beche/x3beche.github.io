@@ -1,0 +1,608 @@
+---
+layout: tutorial
+title: "OpenOCD + GDB — Flash & Debug STM32 from the CLI"
+back_url: "../index.html"
+back_label: "All guides"
+---
+<header class="header">
+  <div class="meta">
+    <span>TECHNICAL GUIDE</span><span>STM32 DEBUG</span><span>OPENOCD</span><span>2026</span>
+  </div>
+  <h1>OpenOCD + GDB<br><em>Flash &amp; Debug STM32 from the CLI</em></h1>
+  <p class="subtitle">Program and step-debug an STM32L4R5 over SWD with nothing but <code class="inline">openocd</code>, <code class="inline">arm-none-eabi-gdb</code>, and an ST-Link — no IDE required.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">Contents</div>
+  <ol>
+    <li><a href="#s0">The debug chain — why OpenOCD + GDB</a></li>
+    <li><a href="#s1">Install, invoke &amp; the port model</a></li>
+    <li><a href="#s2">The STM32L4R5 target — memory, flash &amp; SWD pins</a></li>
+    <li><a href="#s3">A complete flashable firmware</a></li>
+    <li><a href="#s4">Flashing from the CLI</a></li>
+    <li><a href="#s5">The GDB debug session</a></li>
+    <li><a href="#s6">Full flash-and-debug workflow</a></li>
+    <li><a href="#s7">Gotchas, common mistakes &amp; quick reference</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════ SECTION 01 ═══════════════ -->
+<section id="s0">
+  <h2><span class="num">01</span> The debug chain — why OpenOCD + GDB</h2>
+  <p class="section-lead">OpenOCD is a translator: it turns the Arm SWD/JTAG wire protocol that an ST-Link speaks into a plain TCP <strong>GDB remote server</strong>, so any <code class="inline">arm-none-eabi-gdb</code> can flash and single-step your STM32 — from a terminal, a Makefile, or CI.</p>
+
+  <p>The STM32L4R5 (Arm Cortex-M4F, RM0432, DS12023) exposes a 2-pin <strong>SWD</strong> debug port. You cannot talk to that port directly from a PC; you need a debug probe (an <strong>ST-Link/V2 or V3</strong>, which is soldered onto every Nucleo/Discovery board) plus host software that drives the probe. That host software is OpenOCD.</p>
+
+  <div class="flow">
+    <pre>
+   Host (your PC)                                  Debug probe            Target MCU
+ ┌───────────────────┐   TCP :3333 (GDB remote)  ┌───────────┐  SWD    ┌──────────────┐
+ │ arm-none-eabi-gdb │◄─────────────────────────►│  OpenOCD  │◄──USB──►│  ST-Link  │◄─┤ STM32L4R5    │
+ │  (ELF + symbols)  │   TCP :4444 (telnet CLI)  │  (server) │         │  V2 / V3  │  │ Cortex-M4F   │
+ └───────────────────┘   TCP :6666 (Tcl RPC)     └───────────┘         └───────────┘  └──────────────┘
+     "the client"                                 "the adapter"   SWDIO=PA13 / SWCLK=PA14</pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">OpenOCD</span><span class="desc">Daemon. Opens the USB probe, drives SWD, exposes a GDB server (3333), a telnet command shell (4444) and a Tcl RPC port (6666). Owns the flash-programming algorithms.</span></div>
+    <div class="param"><span class="name">arm-none-eabi-gdb</span><span class="desc">The debugger front-end. Holds your ELF and its symbols, connects to OpenOCD over TCP, sets breakpoints, and reads/writes registers and memory.</span></div>
+    <div class="param"><span class="name">ST-Link</span><span class="desc">The probe. On a Nucleo/Discovery it is the second chip; a stand-alone dongle for custom boards. Speaks USB on one side, SWD on the other.</span></div>
+    <div class="param"><span class="name">SWD</span><span class="desc">Serial Wire Debug — 2 wires (SWDIO + SWCLK) + NRST + GND. The on-chip debug access port (DAP) reaches the Cortex-M4 core and the whole memory bus.</span></div>
+  </div>
+
+  <div class="callout">
+    <div class="label">KEY IDEA</div>
+    <p>OpenOCD and GDB are two separate processes that talk over a socket. You run OpenOCD once and leave it running; GDB attaches and detaches freely. Because the interface is just TCP port <strong>3333</strong>, the exact same setup drives VS Code (cortex-debug), Eclipse, or a headless CI runner.</p>
+  </div>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>OpenOCD service</th><th>Default port</th><th>Used for</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>GDB remote</td><td><strong>3333</strong></td><td><code>target extended-remote :3333</code> from arm-none-eabi-gdb</td></tr>
+        <tr><td>Telnet monitor</td><td><strong>4444</strong></td><td>Interactive OpenOCD command shell (<code>reset halt</code>, <code>flash …</code>)</td></tr>
+        <tr><td>Tcl RPC</td><td><strong>6666</strong></td><td>Scripting / automation (binary command protocol)</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════ SECTION 02 ═══════════════ -->
+<section id="s1">
+  <h2><span class="num">02</span> Install, invoke &amp; the port model</h2>
+  <p class="section-lead">OpenOCD is configured by <em>layering config files</em>: first the <strong>interface</strong> (which probe), then the <strong>target</strong> (which chip). The two-file invocation <code class="inline">-f interface/stlink.cfg -f target/stm32l4x.cfg</code> is the canonical STM32 command line.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — install the toolchain + OpenOCD</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Debian / Ubuntu (distro build; fine for STM32L4)</span>
+<span class="cmd">sudo</span> apt install openocd gdb-multiarch gcc-arm-none-eabi
+
+<span class="cmt"># macOS</span>
+<span class="cmd">brew</span> install open-ocd arm-none-eabi-gdb arm-none-eabi-gcc
+
+<span class="cmt"># verify — need OpenOCD 0.11+ for ST-Link V3 and modern L4+ flash</span>
+<span class="cmd">openocd</span> <span class="flag">--version</span>
+<span class="cmd">arm-none-eabi-gdb</span> <span class="flag">--version</span></code></pre>
+  </div>
+
+  <p><strong>Config-file layering.</strong> OpenOCD ships hundreds of <code class="inline">.cfg</code> scripts under its data dir (<code class="inline">/usr/share/openocd/scripts</code>). <code class="inline">-f</code> means "find &amp; source this file". Order matters: the interface must be declared before the target, because the target script calls <code class="inline">transport select</code> against the already-selected adapter.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — the canonical STM32 invocation</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># interface first (the probe), then target (the chip)</span>
+<span class="cmd">openocd</span> <span class="flag">-f</span> interface/stlink.cfg <span class="flag">-f</span> target/stm32l4x.cfg
+
+<span class="cmt"># stm32l4x.cfg covers the WHOLE L4 / L4+ family incl. the STM32L4R5.</span>
+<span class="cmt"># The flash driver auto-probes size + bank layout over SWD.</span>
+<span class="cmt">#</span>
+<span class="cmt"># Expected startup log:</span>
+<span class="cmt">#  Info : STLINK V3J13M4 (API v3) VID:PID 0483:374E</span>
+<span class="cmt">#  Info : Target voltage: 3.285000</span>
+<span class="cmt">#  Info : stm32l4x.cpu: Cortex-M4 r0p1 processor detected</span>
+<span class="cmt">#  Info : starting gdb server for stm32l4x.cpu on 3333</span>
+<span class="cmt">#  Info : Listening on port 3333 for gdb connections</span>
+<span class="cmt"># Leave this running — it is now your GDB server. Ctrl-C to stop.</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NOTE — interface/stlink.cfg</div>
+    <p>Since OpenOCD 0.11 the ST-Link script simply runs <code>adapter driver stlink</code> and defaults the transport to <code>hla_swd</code> (ST-Link's high-level adapter layer). Both ST-Link/V2 and V3 are auto-detected by USB VID:PID (<code>0483:3748</code> / <code>0483:374E/374F</code>). The older <code>interface stlink</code> command still works but prints a deprecation warning; prefer <code>adapter driver stlink</code> in hand-written configs.</p>
+  </div>
+
+  <h3>Changing / binding the ports</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — override the default ports</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># -c runs an OpenOCD command; use it to set ports before init</span>
+<span class="cmd">openocd</span> <span class="flag">-f</span> interface/stlink.cfg <span class="flag">-f</span> target/stm32l4x.cfg \
+    <span class="flag">-c</span> <span class="str">"gdb_port 3333"</span> \
+    <span class="flag">-c</span> <span class="str">"telnet_port 4444"</span> \
+    <span class="flag">-c</span> <span class="str">"tcl_port 6666"</span>
+
+<span class="cmt"># expose the gdb server to other machines (default binds to localhost only)</span>
+    <span class="flag">-c</span> <span class="str">"bindto 0.0.0.0"</span>
+
+<span class="cmt"># headless flashing only — no gdb server, no telnet</span>
+    <span class="flag">-c</span> <span class="str">"gdb_port disabled"</span> <span class="flag">-c</span> <span class="str">"telnet_port disabled"</span></code></pre>
+  </div>
+
+  <h3>USB permissions (Linux)</h3>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — udev rules so the ST-Link works without root</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Symptom without this: "Error: libusb_open() failed ... LIBUSB_ERROR_ACCESS"</span>
+<span class="cmd">sudo</span> cp /usr/share/openocd/contrib/60-openocd.rules /etc/udev/rules.d/
+<span class="cmd">sudo</span> udevadm control <span class="flag">--reload-rules</span> &amp;&amp; <span class="cmd">sudo</span> udevadm trigger
+
+<span class="cmt"># add yourself to plugdev, then LOG OUT / IN (or replug the board)</span>
+<span class="cmd">sudo</span> usermod <span class="flag">-aG</span> plugdev $USER</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════ SECTION 03 ═══════════════ -->
+<section id="s2">
+  <h2><span class="num">03</span> The STM32L4R5 target — memory, flash &amp; SWD pins</h2>
+  <p class="section-lead">To flash and debug correctly you need three facts about the STM32L4R5: its <strong>memory map</strong> (where flash and RAM live), its <strong>flash bank layout</strong> (single vs dual bank via the DBANK option byte), and its <strong>SWD pins</strong> (which you must not repurpose as GPIO).</p>
+
+  <h3>Memory map (RM0432 / DS12023)</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Region</th><th>Base address</th><th>Size</th><th>Notes</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Main flash</td><td><code>0x0800 0000</code></td><td>2 MB</td><td>Code + const. Reset vector fetched here (after boot remap).</td></tr>
+        <tr><td>System memory</td><td><code>0x1FFF 0000</code></td><td>~28 KB</td><td>ST factory ROM bootloader (DFU/UART).</td></tr>
+        <tr><td>OTP</td><td><code>0x1FFF 7000</code></td><td>512 B</td><td>One-time-programmable.</td></tr>
+        <tr><td>Option bytes</td><td><code>0x1FFF 7800</code></td><td>—</td><td>RDP, DBANK, BOR level, watchdog, WRP.</td></tr>
+        <tr><td>SRAM1</td><td><code>0x2000 0000</code></td><td>192 KB</td><td>Start of the 640 KB contiguous SRAM.</td></tr>
+        <tr><td>SRAM2</td><td><code>0x2003 0000</code></td><td>64 KB</td><td>Contiguous after SRAM1; also aliased at <code>0x1000 0000</code>.</td></tr>
+        <tr><td>SRAM3</td><td><code>0x2004 0000</code></td><td>384 KB</td><td>Ends at <code>0x2009 FFFF</code> → top of RAM = <code>0x200A 0000</code>.</td></tr>
+        <tr><td>Peripherals</td><td><code>0x4000 0000</code></td><td>—</td><td>APB1/APB2/AHB1/AHB2 register blocks.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Flash bank layout — the DBANK option byte</h3>
+  <p>The 2 MB flash is organised by the <strong>DBANK</strong> option byte (in <code class="inline">FLASH_OPTR</code>, bit 22 on L4+). You rarely change it, but it decides page size — which matters when you erase individual pages. OpenOCD's <code class="inline">stm32l4x</code> driver reads the option byte and the <code class="inline">FLASH_SIZE</code> register and configures the banks automatically.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>DBANK</th><th>Layout</th><th>Page (erase) size</th><th>Read width</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>0</code></td><td>Single bank — 2 MB contiguous, 256 pages</td><td>8 KB</td><td>128-bit</td></tr>
+        <tr><td><code>1</code></td><td>Dual bank — 2 × 1 MB (bank 1 @ <code>0x0800 0000</code>, bank 2 @ <code>0x0810 0000</code>)</td><td>4 KB</td><td>64-bit</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">TIP — let OpenOCD auto-probe</div>
+    <p>The stock <code>target/stm32l4x.cfg</code> declares the flash bank with size <code>0</code> (<code>flash bank $_FLASHNAME stm32l4x 0x08000000 0 0 0 $_TARGETNAME</code>). Size <code>0</code> means "probe it": on <code>init</code> OpenOCD reads the die's flash size and DBANK and sizes the bank itself. Run <code>monitor flash probe 0</code> to see what it detected. Do <em>not</em> hard-code a bank size for the L4R5.</p>
+  </div>
+
+  <h3>SWD / trace pins — do not reuse these</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Signal</th><th>Pin</th><th>Alternate function</th><th>Role</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>SWDIO</td><td><strong>PA13</strong></td><td>SYS_JTMS-SWDIO (default at reset)</td><td>Bidirectional debug data</td></tr>
+        <tr><td>SWCLK</td><td><strong>PA14</strong></td><td>SYS_JTCK-SWCLK (default at reset)</td><td>Debug clock</td></tr>
+        <tr><td>SWO</td><td>PB3</td><td>SYS_JTDO-SWO / TRACESWO (AF0)</td><td>Single-wire ITM/SWO trace (optional)</td></tr>
+        <tr><td>NRST</td><td>NRST</td><td>—</td><td>Hardware reset (SRST)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>PA13/PA14 boot as SWD. If your firmware reconfigures them as GPIO or alternate function, you lose debug access after that code runs (see <a href="#s7">Gotchas</a>). The Cortex-M4 core also fixes your breakpoint budget: <strong>6 hardware breakpoints (FPB)</strong> and <strong>4 watchpoints (DWT)</strong> — OpenOCD prints exactly this at connect.</p>
+</section>
+
+<!-- ═══════════════ SECTION 04 ═══════════════ -->
+<section id="s3">
+  <h2><span class="num">04</span> A complete flashable firmware</h2>
+  <p class="section-lead">You need something to flash and step through. Here is a full, self-contained, register-level blinky for the <strong>NUCLEO-L4R5ZI</strong> (LD1 green = PC7) — four files, no CMSIS, no HAL — that compiles with <code class="inline">arm-none-eabi-gcc</code> and lands at <code class="inline">0x08000000</code>.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.c — register-level GPIO blink (PC7)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">#include</span> <span class="str">&lt;stdint.h&gt;</span>
+
+<span class="cmt">/* NUCLEO-L4R5ZI: LD1 (green) = PC7 */</span>
+<span class="cmt">#define</span> RCC_AHB2ENR  (*(volatile uint32_t *)0x4002104C)  <span class="cmt">/* GPIO port clocks */</span>
+<span class="cmt">#define</span> GPIOC_MODER  (*(volatile uint32_t *)0x48000800)  <span class="cmt">/* PC pin modes     */</span>
+<span class="cmt">#define</span> GPIOC_BSRR   (*(volatile uint32_t *)0x48000818)  <span class="cmt">/* PC atomic set/rst*/</span>
+<span class="cmt">#define</span> LED          7u
+
+<span class="keyword">static void</span> delay(<span class="keyword">volatile</span> uint32_t n) { <span class="keyword">while</span> (n--) __asm__ <span class="keyword">volatile</span> (<span class="str">"nop"</span>); }
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>)
+{
+    RCC_AHB2ENR |= (1u &lt;&lt; 2);              <span class="cmt">/* GPIOCEN: enable GPIOC clock  */</span>
+    GPIOC_MODER &amp;= ~(3u &lt;&lt; (LED * 2));     <span class="cmt">/* clear the 2 mode bits        */</span>
+    GPIOC_MODER |=  (1u &lt;&lt; (LED * 2));     <span class="cmt">/* 01 = general-purpose output  */</span>
+
+    <span class="keyword">for</span> (;;) {
+        GPIOC_BSRR = (1u &lt;&lt; LED);          <span class="cmt">/* BS7: drive PC7 high → LED on  */</span>
+        delay(400000);
+        GPIOC_BSRR = (1u &lt;&lt; (LED + 16));   <span class="cmt">/* BR7: drive PC7 low  → LED off */</span>
+        delay(400000);
+    }
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>startup.c — minimal vector table + reset handler</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">#include</span> <span class="str">&lt;stdint.h&gt;</span>
+
+<span class="keyword">extern</span> uint32_t _sidata, _sdata, _edata, _sbss, _ebss, _estack;
+<span class="keyword">int</span>  main(<span class="keyword">void</span>);
+
+<span class="keyword">void</span> Reset_Handler(<span class="keyword">void</span>)
+{
+    uint32_t *s = &amp;_sidata, *d = &amp;_sdata;
+    <span class="keyword">while</span> (d &lt; &amp;_edata) *d++ = *s++;         <span class="cmt">/* copy .data flash → RAM */</span>
+    <span class="keyword">for</span> (d = &amp;_sbss; d &lt; &amp;_ebss;) *d++ = 0;    <span class="cmt">/* zero .bss              */</span>
+    main();
+    <span class="keyword">for</span> (;;) { }                             <span class="cmt">/* main() never returns   */</span>
+}
+
+<span class="keyword">void</span> Default_Handler(<span class="keyword">void</span>) { <span class="keyword">for</span> (;;) { } }
+
+<span class="keyword">typedef void</span> (*vector_t)(<span class="keyword">void</span>);
+
+<span class="cmt">/* First 16 core vectors are enough to boot and to debug. */</span>
+__attribute__((section(<span class="str">".isr_vector"</span>), used))
+<span class="keyword">const</span> vector_t g_vectors[] = {
+    (vector_t)(&amp;_estack),   <span class="cmt">/* 0x00 initial MSP  */</span>
+    Reset_Handler,          <span class="cmt">/* 0x04 reset        */</span>
+    Default_Handler,        <span class="cmt">/* NMI               */</span>
+    Default_Handler,        <span class="cmt">/* HardFault         */</span>
+    Default_Handler,        <span class="cmt">/* MemManage         */</span>
+    Default_Handler,        <span class="cmt">/* BusFault          */</span>
+    Default_Handler,        <span class="cmt">/* UsageFault        */</span>
+    0, 0, 0, 0,             <span class="cmt">/* reserved          */</span>
+    Default_Handler,        <span class="cmt">/* SVCall            */</span>
+    Default_Handler,        <span class="cmt">/* DebugMonitor      */</span>
+    0,                      <span class="cmt">/* reserved          */</span>
+    Default_Handler,        <span class="cmt">/* PendSV            */</span>
+    Default_Handler,        <span class="cmt">/* SysTick           */</span>
+};</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>stm32l4r5.ld — linker script (2 MB flash, 640 KB RAM)</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">ENTRY</span>(Reset_Handler)
+
+_estack = 0x200A0000;        <span class="cmt">/* top of 640 KB SRAM (0x20000000 + 640K) */</span>
+
+<span class="keyword">MEMORY</span>
+{
+    FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 2048K
+    RAM   (rwx) : ORIGIN = 0x20000000, LENGTH = 640K
+}
+
+<span class="keyword">SECTIONS</span>
+{
+    .isr_vector : { KEEP(*(.isr_vector)) } &gt; FLASH
+
+    .text : {
+        *(.text*)
+        *(.rodata*)
+    } &gt; FLASH
+
+    _sidata = LOADADDR(.data);
+    .data : {
+        _sdata = .;
+        *(.data*)
+        _edata = .;
+    } &gt; RAM AT &gt; FLASH
+
+    .bss : {
+        _sbss = .;
+        *(.bss*)
+        *(COMMON)
+        _ebss = .;
+    } &gt; RAM
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — build for Cortex-M4F, keep debug symbols</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># STM32L4R5 = Cortex-M4 with single-precision FPU → fpv4-sp-d16 / hard ABI</span>
+<span class="cmt"># -O0 -g3 gives 1:1 line stepping and full macro info for debugging</span>
+<span class="cmd">arm-none-eabi-gcc</span> \
+    <span class="flag">-mcpu=cortex-m4</span> <span class="flag">-mthumb</span> <span class="flag">-mfpu=fpv4-sp-d16</span> <span class="flag">-mfloat-abi=hard</span> \
+    <span class="flag">-O0</span> <span class="flag">-g3</span> <span class="flag">-Wall</span> <span class="flag">-ffreestanding</span> <span class="flag">-nostdlib</span> \
+    <span class="flag">-T</span> stm32l4r5.ld startup.c main.c <span class="flag">-o</span> blink.elf
+
+<span class="cmt"># derive raw + Intel-HEX images from the ELF</span>
+<span class="cmd">arm-none-eabi-objcopy</span> <span class="flag">-O</span> binary blink.elf blink.bin
+<span class="cmd">arm-none-eabi-objcopy</span> <span class="flag">-O</span> ihex   blink.elf blink.hex
+<span class="cmd">arm-none-eabi-size</span> blink.elf
+<span class="cmt">#    text    data     bss     dec     hex filename</span>
+<span class="cmt">#     ~90       0       0      90      5a blink.elf</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════ SECTION 05 ═══════════════ -->
+<section id="s4">
+  <h2><span class="num">05</span> Flashing from the CLI</h2>
+  <p class="section-lead">To only program the chip (no debugging), let OpenOCD do everything in one shot with the <code class="inline">program</code> helper, then exit. This is the command you put in a Makefile <code class="inline">flash:</code> target.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — one-liner flash (the everyday command)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># program &lt;file&gt; [verify] [reset] [exit] [offset]</span>
+<span class="cmt"># ELF/HEX carry their own load address → no offset needed</span>
+<span class="cmd">openocd</span> <span class="flag">-f</span> interface/stlink.cfg <span class="flag">-f</span> target/stm32l4x.cfg \
+    <span class="flag">-c</span> <span class="str">"program blink.elf verify reset exit"</span>
+
+<span class="cmt"># A raw .bin has NO address — you MUST pass the flash base 0x08000000</span>
+<span class="cmd">openocd</span> <span class="flag">-f</span> interface/stlink.cfg <span class="flag">-f</span> target/stm32l4x.cfg \
+    <span class="flag">-c</span> <span class="str">"program blink.bin verify reset exit 0x08000000"</span></code></pre>
+  </div>
+
+  <p>The <code class="inline">program</code> keywords: <code class="inline">verify</code> reads flash back and compares, <code class="inline">reset</code> resets and runs the new image, <code class="inline">exit</code> shuts OpenOCD down when finished. It internally does <code class="inline">init → reset halt → erase → write → verify → reset run → shutdown</code>.</p>
+
+  <h3>The explicit long form (what <code class="inline">program</code> expands to)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — flash write_image, step by step</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">openocd</span> <span class="flag">-f</span> interface/stlink.cfg <span class="flag">-f</span> target/stm32l4x.cfg \
+    <span class="flag">-c</span> <span class="str">"init"</span> \
+    <span class="flag">-c</span> <span class="str">"reset halt"</span> \
+    <span class="flag">-c</span> <span class="str">"flash write_image erase blink.hex"</span> \
+    <span class="flag">-c</span> <span class="str">"verify_image blink.hex"</span> \
+    <span class="flag">-c</span> <span class="str">"reset run"</span> \
+    <span class="flag">-c</span> <span class="str">"shutdown"</span>
+
+<span class="cmt"># flash write_image [erase] [unlock] &lt;file&gt; [offset] [type]</span>
+<span class="cmt">#   erase  → erase the sectors the image covers first (required!)</span>
+<span class="cmt">#   unlock → also clear write protection if set</span></code></pre>
+  </div>
+
+  <h3>Interactive control over telnet (port 4444)</h3>
+  <p>With an OpenOCD server already running (Section 02), open its command shell. Everything here is also reachable from GDB by prefixing with <code class="inline">monitor</code>.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — telnet monitor shell</span><span class="dot">●</span></div>
+    <pre><code><span class="cmd">telnet</span> localhost 4444
+<span class="cmt"># Open On-Chip Debugger</span>
+&gt; reset halt                         <span class="cmt"># stop the core at the reset vector</span>
+&gt; flash probe 0                      <span class="cmt"># report detected flash: size, banks, page size</span>
+&gt; flash write_image erase blink.hex  <span class="cmt"># erase + program</span>
+&gt; verify_image blink.hex             <span class="cmt"># read back &amp; compare</span>
+&gt; mdw 0x08000000 4                   <span class="cmt"># dump 4 words at the vector table</span>
+&gt; reg                                <span class="cmt"># dump core registers (r0..pc, xPSR)</span>
+&gt; reset run                          <span class="cmt"># run the freshly-flashed firmware</span>
+&gt; exit                               <span class="cmt"># close the telnet session (server stays up)</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">RESET FLAVORS</div>
+    <p><code>reset halt</code> = reset then stop at the very first instruction. <code>reset init</code> = reset, then run the target's <code>reset-init</code> hook (clock/PLL setup) and stop — use this before flashing at high speed. <code>reset run</code> = reset and let it run free. From GDB these are <code>monitor reset halt</code>, etc.</p>
+  </div>
+</section>
+
+<!-- ═══════════════ SECTION 06 ═══════════════ -->
+<section id="s5">
+  <h2><span class="num">06</span> The GDB debug session</h2>
+  <p class="section-lead">With OpenOCD running as the server, drive a full flash-and-step session from <code class="inline">arm-none-eabi-gdb</code>. The five load-bearing commands are <code class="inline">target extended-remote :3333</code>, <code class="inline">monitor reset halt</code>, <code class="inline">load</code>, <code class="inline">break</code>, and <code class="inline">continue</code>.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>gdb — an interactive session, start to finish</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Terminal A already runs: openocd -f interface/stlink.cfg -f target/stm32l4x.cfg</span>
+<span class="cmd">arm-none-eabi-gdb</span> <span class="flag">-q</span> blink.elf
+
+<span class="cmt"># connect to OpenOCD's gdb server. Use EXTENDED-remote so you can</span>
+<span class="cmt"># reset / rerun and stay attached after the program "exits".</span>
+(gdb) target extended-remote :3333
+
+(gdb) monitor reset halt          <span class="cmt"># halt CPU before touching flash</span>
+(gdb) load                        <span class="cmt"># write ELF to flash via OpenOCD's memory map</span>
+<span class="cmt">#   Loading section .isr_vector, size 0x40 lma 0x8000000</span>
+<span class="cmt">#   Loading section .text, size 0x5c lma 0x8000040</span>
+<span class="cmt">#   Start address 0x08000041, load size 156</span>
+(gdb) monitor reset halt          <span class="cmt"># reset so PC = the new reset vector</span>
+
+(gdb) break main                  <span class="cmt"># hardware breakpoint (flash) — 6 available</span>
+(gdb) continue                    <span class="cmt"># run to main()</span>
+
+(gdb) info registers              <span class="cmt"># r0..r12, sp, lr, pc, xPSR</span>
+(gdb) next                        <span class="cmt"># step over one source line</span>
+(gdb) step                        <span class="cmt"># step into</span>
+(gdb) stepi                       <span class="cmt"># one machine instruction</span>
+
+(gdb) x/4xw 0x48000800            <span class="cmt"># examine GPIOC MODER..BSRR (4 words, hex)</span>
+(gdb) print/x $pc                 <span class="cmt"># current program counter</span>
+(gdb) watch *(uint32_t *)0x48000818   <span class="cmt"># DWT watchpoint on GPIOC_BSRR</span>
+(gdb) continue                    <span class="cmt"># stops when BSRR is written (LED toggles)</span>
+
+(gdb) monitor reset run           <span class="cmt"># let it run free on the board</span>
+(gdb) detach                      <span class="cmt"># release the target, keep it running</span>
+(gdb) quit</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">WHY <code>load</code> PROGRAMS FLASH</div>
+    <p>OpenOCD advertises a memory map to GDB (<code>gdb_memory_map enable</code>, on by default). When <code>load</code> writes to an address inside a declared flash bank, GDB routes it through OpenOCD's flash driver, which erases the needed pages and programs them — you get real flashing, not just a RAM write. If you linked the program for RAM instead, <code>load</code> would simply drop it into RAM.</p>
+  </div>
+
+  <h3>Non-interactive / scripted GDB</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash + gdb — batch flash-and-break with -ex, or a command file</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># one-shot: connect, flash, break at main, hand you the prompt</span>
+<span class="cmd">arm-none-eabi-gdb</span> <span class="flag">-q</span> blink.elf \
+    <span class="flag">-ex</span> <span class="str">"target extended-remote :3333"</span> \
+    <span class="flag">-ex</span> <span class="str">"monitor reset halt"</span> \
+    <span class="flag">-ex</span> <span class="str">"load"</span> \
+    <span class="flag">-ex</span> <span class="str">"monitor reset halt"</span> \
+    <span class="flag">-ex</span> <span class="str">"break main"</span> \
+    <span class="flag">-ex</span> <span class="str">"continue"</span>
+
+<span class="cmt"># or keep the recipe in a file and run: arm-none-eabi-gdb -x flash.gdb blink.elf</span></code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>flash.gdb — reusable GDB command file</span><span class="dot">●</span></div>
+    <pre><code>target extended-remote :3333
+monitor reset halt
+load
+monitor reset halt
+break main
+continue</code></pre>
+  </div>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>GDB command</th><th>Effect</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>target extended-remote :3333</code></td><td>Attach to OpenOCD's gdb server (allows reset + rerun)</td></tr>
+        <tr><td><code>monitor &lt;cmd&gt;</code></td><td>Send <code>&lt;cmd&gt;</code> straight to OpenOCD (e.g. <code>monitor reset halt</code>)</td></tr>
+        <tr><td><code>load</code></td><td>Program the ELF's loadable sections to flash/RAM</td></tr>
+        <tr><td><code>break / tbreak</code></td><td>Breakpoint / one-shot breakpoint (uses FPB hardware on flash)</td></tr>
+        <tr><td><code>watch / rwatch</code></td><td>Data write / read watchpoint (uses DWT — max 4)</td></tr>
+        <tr><td><code>continue (c)</code></td><td>Resume execution</td></tr>
+        <tr><td><code>next (n) / step (s)</code></td><td>Step over / step into one source line</td></tr>
+        <tr><td><code>stepi (si) / finish</code></td><td>One instruction / run until current function returns</td></tr>
+        <tr><td><code>info registers</code></td><td>Dump core registers</td></tr>
+        <tr><td><code>x/&lt;n&gt;&lt;f&gt;&lt;u&gt; addr</code></td><td>Examine memory, e.g. <code>x/8xw 0x40021000</code> (RCC block)</td></tr>
+        <tr><td><code>backtrace (bt)</code></td><td>Call stack</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════ SECTION 07 ═══════════════ -->
+<section id="s6">
+  <h2><span class="num">07</span> Full flash-and-debug workflow</h2>
+  <p class="section-lead">The daily loop is two terminals: OpenOCD in one (the server, left running), GDB in the other (edit → build → <code class="inline">load</code> → debug, repeat). A project-local <code class="inline">openocd.cfg</code> makes the server a bare <code class="inline">openocd</code>.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — two-terminal workflow</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ── Terminal A: the OpenOCD server (start once, leave running) ──</span>
+<span class="cmd">openocd</span> <span class="flag">-f</span> interface/stlink.cfg <span class="flag">-f</span> target/stm32l4x.cfg
+<span class="cmt"># ... Listening on port 3333 for gdb connections</span>
+
+<span class="cmt"># ── Terminal B: edit → build → reflash → debug, over and over ──</span>
+<span class="cmd">make</span>                                   <span class="cmt"># rebuild blink.elf</span>
+<span class="cmd">arm-none-eabi-gdb</span> <span class="flag">-q</span> blink.elf <span class="flag">-ex</span> <span class="str">"target extended-remote :3333"</span>
+(gdb) monitor reset halt
+(gdb) load                             <span class="cmt"># reflash without restarting the server</span>
+(gdb) monitor reset halt
+(gdb) break main
+(gdb) continue</code></pre>
+  </div>
+
+  <h3>A project-local openocd.cfg</h3>
+  <p>Drop this file next to your firmware. Running <code class="inline">openocd</code> with no arguments auto-loads <code class="inline">./openocd.cfg</code>, so the server command becomes a single word.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>openocd.cfg — project config for NUCLEO-L4R5ZI</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># run simply as: openocd</span>
+<span class="field">source</span> [find interface/stlink.cfg]
+<span class="field">transport</span> select hla_swd            <span class="cmt"># ST-Link high-level SWD (default)</span>
+<span class="field">source</span> [find target/stm32l4x.cfg]
+
+<span class="field">adapter</span> speed 1800                  <span class="cmt"># kHz; conservative for the on-board ST-Link</span>
+<span class="field">reset_config</span> srst_only srst_nogate  <span class="cmt"># use NRST, keep it released between resets</span>
+
+<span class="cmt"># Optional: flash + halt at main automatically when this cfg is sourced.</span>
+<span class="cmt"># init</span>
+<span class="cmt"># reset halt</span>
+<span class="cmt"># program blink.elf verify</span></code></pre>
+  </div>
+
+  <h3>Semihosting — printf() to the GDB console</h3>
+  <div class="code-block">
+    <div class="code-header"><span>gdb — route firmware stdout into GDB, no UART needed</span><span class="dot">●</span></div>
+    <pre><code>(gdb) monitor arm semihosting enable
+<span class="cmt"># Now newlib's write()/printf() in firmware appears in this GDB console.</span>
+<span class="cmt"># Requires linking with a semihosting stub (e.g. --specs=rdimon.specs).</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">OPTIONAL — SWO/ITM trace</div>
+    <p>For non-halting <code>printf</code>-style tracing, the STM32L4R5 streams ITM data out the <strong>SWO pin (PB3)</strong>. Configure OpenOCD's TPIU with the <code>tpiu</code> command object, matching <code>-traceclk</code> to your real HCLK (up to 120 MHz on the L4R5). Firmware writes bytes to <code>ITM-&gt;PORT[0]</code>; OpenOCD decodes them to a file or a TCP port. This needs no CPU halt, unlike breakpoints.</p>
+  </div>
+</section>
+
+<!-- ═══════════════ SECTION 08 ═══════════════ -->
+<section id="s7">
+  <h2><span class="num">08</span> Gotchas, common mistakes &amp; quick reference</h2>
+  <p class="section-lead">The failures below account for the vast majority of "OpenOCD won't connect / won't flash" reports. Most are configuration-order, permission, or reset issues — not hardware faults.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Wrong -f order</span><span class="desc">Always <code>-f interface/…</code> BEFORE <code>-f target/…</code>. The target script selects the transport against an already-declared adapter; reversed order errors with "session transport was not selected".</span></div>
+    <div class="param"><span class="name">Port confusion</span><span class="desc">GDB connects to <strong>3333</strong>, not 4444. <code>target remote localhost:4444</code> attaches to the telnet shell and hangs. Telnet is a human CLI; 3333 is the GDB protocol.</span></div>
+    <div class="param"><span class="name">remote vs extended-remote</span><span class="desc">Plain <code>target remote</code> drops the connection when the program "exits" and forbids <code>run</code>/restart. Use <code>target extended-remote :3333</code> so you can <code>monitor reset</code> and reflash without relaunching GDB.</span></div>
+    <div class="param"><span class="name">load without halt</span><span class="desc">Flashing while the core runs can corrupt the write. Always <code>monitor reset halt</code> before <code>load</code>, and again after (so PC points at the new reset vector).</span></div>
+    <div class="param"><span class="name">LIBUSB_ERROR_ACCESS</span><span class="desc">Missing udev rules → "libusb_open() failed". Install <code>60-openocd.rules</code>, add yourself to <code>plugdev</code>, replug (Section 02). Running as root is a smell, not a fix.</span></div>
+    <div class="param"><span class="name">More than 6 breakpoints</span><span class="desc">Cortex-M4 FPB gives 6 hardware breakpoints on flash and 4 DWT watchpoints. The 7th <code>break</code> on flash fails: "Cannot insert breakpoint / hardware breakpoints used exceeds limit". Delete some or move code to RAM (soft breakpoints).</span></div>
+    <div class="param"><span class="name">.bin with no address</span><span class="desc"><code>program blink.bin …</code> without a trailing <code>0x08000000</code> writes to address 0 and silently mis-flashes. ELF/HEX carry their address; raw BIN never does.</span></div>
+    <div class="param"><span class="name">Killed SWD pins</span><span class="desc">If firmware reconfigures PA13/PA14 (or calls a "disable JTAG/SWD" remap), the next connect fails. Recover with connect-under-reset: hold the core in reset while attaching so your code never runs.</span></div>
+    <div class="param"><span class="name">Read-out protection (RDP)</span><span class="desc">RDP level 1 blocks debug + flash read. Recover by dropping RDP to level 0, which forces a mass erase (see below). At RDP level 2 the debug port is permanently disabled — no recovery.</span></div>
+    <div class="param"><span class="name">Adapter speed too high</span><span class="desc">"Error: init mode failed (unable to connect to the target)" on long wires / noisy boards → lower <code>adapter speed</code> (try 480, then 1000, 1800). The stm32l4x cfg starts at 500 kHz and boosts to 4 MHz only after reset-init.</span></div>
+    <div class="param"><span class="name">Semihosting hang</span><span class="desc">Enabling semihosting in firmware but running with NO debugger attached makes the first <code>printf</code> hit a <code>BKPT</code> and hang the MCU. Only enable it under an active GDB/OpenOCD session.</span></div>
+    <div class="param"><span class="name">Stale ST-Link firmware</span><span class="desc">Very old ST-Link firmware isn't recognized ("unknown adapter"). Update it with ST's <em>STLinkUpgrade</em> tool, then OpenOCD 0.11+ detects V2/V3 fine.</span></div>
+  </div>
+
+  <h3>Recovering a locked / bricked L4R5 (connect under reset)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — force RDP→0 + mass erase to unbrick</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Board runs code that kills SWD, or is RDP level 1 → hold in reset, unlock, wipe.</span>
+<span class="cmd">openocd</span> <span class="flag">-f</span> interface/stlink.cfg <span class="flag">-f</span> target/stm32l4x.cfg \
+    <span class="flag">-c</span> <span class="str">"reset_config connect_assert_srst"</span> \
+    <span class="flag">-c</span> <span class="str">"init"</span> \
+    <span class="flag">-c</span> <span class="str">"reset halt"</span> \
+    <span class="flag">-c</span> <span class="str">"stm32l4x unlock 0"</span> \
+    <span class="flag">-c</span> <span class="str">"stm32l4x mass_erase 0"</span> \
+    <span class="flag">-c</span> <span class="str">"reset run"</span> \
+    <span class="flag">-c</span> <span class="str">"shutdown"</span>
+<span class="cmt"># stm32l4x unlock 0 sets RDP to 0xAA (level 0); the option-byte change</span>
+<span class="cmt"># triggers a full mass erase, clearing whatever bricked the part.</span></code></pre>
+  </div>
+
+  <h3>Quick reference — monitor / OpenOCD commands</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Command (telnet, or <code>monitor …</code> in GDB)</th><th>Effect</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>reset halt</code> / <code>reset init</code> / <code>reset run</code></td><td>Reset + stop / reset + run reset-init hook / reset + run free</td></tr>
+        <tr><td><code>halt</code> / <code>resume</code></td><td>Stop the core / continue the core</td></tr>
+        <tr><td><code>program &lt;file&gt; verify reset exit [addr]</code></td><td>One-shot: erase, program, verify, reset, quit</td></tr>
+        <tr><td><code>flash write_image erase &lt;file&gt; [addr]</code></td><td>Erase covered sectors, then program the image</td></tr>
+        <tr><td><code>flash probe 0</code></td><td>Detect flash size, bank layout, page size</td></tr>
+        <tr><td><code>flash erase_sector 0 0 last</code></td><td>Erase every sector of bank 0</td></tr>
+        <tr><td><code>mdw / mdh / mdb addr [count]</code></td><td>Memory display: word / half / byte</td></tr>
+        <tr><td><code>mww addr value</code></td><td>Memory write word</td></tr>
+        <tr><td><code>reg</code></td><td>Dump core registers</td></tr>
+        <tr><td><code>arm semihosting enable</code></td><td>Route firmware stdout to the GDB console</td></tr>
+        <tr><td><code>stm32l4x unlock 0</code> / <code>stm32l4x mass_erase 0</code></td><td>Clear RDP / wipe all flash (recovery)</td></tr>
+        <tr><td><code>shutdown</code></td><td>Stop the OpenOCD server</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>The whole flow in six lines</h4>
+    <ul>
+      <li>Server: <code>openocd -f interface/stlink.cfg -f target/stm32l4x.cfg</code></li>
+      <li>Flash only: append <code>-c "program blink.elf verify reset exit"</code></li>
+      <li>Debug: <code>arm-none-eabi-gdb -q blink.elf</code></li>
+      <li><code>target extended-remote :3333</code> → <code>monitor reset halt</code> → <code>load</code></li>
+      <li><code>monitor reset halt</code> → <code>break main</code> → <code>continue</code></li>
+      <li>Unbrick: connect-under-reset + <code>stm32l4x unlock 0</code> + <code>stm32l4x mass_erase 0</code></li>
+    </ul>
+  </div>
+</section>
+
+</main>

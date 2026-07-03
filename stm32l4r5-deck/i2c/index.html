@@ -1,0 +1,585 @@
+---
+layout: tutorial
+title: "STM32L4R5 — I2C (TIMINGR, Master TX/RX)"
+back_url: "../index.html"
+back_label: "All guides"
+---
+<header class="header">
+  <div class="meta">
+    <span>TECHNICAL GUIDE</span>
+    <span>STM32L4R5</span>
+    <span>I2C</span>
+    <span>2026</span>
+  </div>
+  <h1>STM32L4R5 I2C<br><em>TIMINGR &amp; master transfers.</em></h1>
+  <p class="subtitle">The STM32L4R5 uses the "I2Cv2" peripheral: no more CCR/TRISE — one TIMINGR register sets the whole bus timing, and CR2 (NBYTES + AUTOEND + START) drives fully hardware-sequenced master reads and writes. Register-level and HAL code for I2C1–I2C4.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">Contents</div>
+  <ol>
+    <li><a href="#s0">I2C peripheral map, clocks &amp; why TIMINGR</a></li>
+    <li><a href="#s1">TIMINGR: fields, formula &amp; example table</a></li>
+    <li><a href="#s2">CR1 / CR2 / ISR / ICR bit reference</a></li>
+    <li><a href="#s3">Pins, GPIO AF setup &amp; register-level init</a></li>
+    <li><a href="#s4">Master write &amp; read (register level)</a></li>
+    <li><a href="#s5">HAL variant</a></li>
+    <li><a href="#s6">DMA with DMAMUX</a></li>
+    <li><a href="#s7">Clock stretching &amp; gotchas</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ SECTION 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">01</span> I2C peripheral map, clocks &amp; why TIMINGR</h2>
+  <p class="section-lead">The STM32L4R5 (Cortex-M4F, RM0432) has four identical I2C blocks: I2C1, I2C2, I2C3, I2C4. All are the same "I2Cv2" IP as the STM32F0/F3/F7/G0/G4/L4 — SMBus/PMBus capable, with an independent kernel clock and a single 32-bit timing register.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Instance</th><th>Base address</th><th>Bus</th><th>Clock enable bit</th><th>Kernel-clock select</th></tr></thead>
+      <tbody>
+        <tr><td>I2C1</td><td>0x4000&nbsp;5400</td><td>APB1</td><td>RCC_APB1ENR1.I2C1EN (bit 21)</td><td>RCC_CCIPR.I2C1SEL[13:12]</td></tr>
+        <tr><td>I2C2</td><td>0x4000&nbsp;5800</td><td>APB1</td><td>RCC_APB1ENR1.I2C2EN (bit 22)</td><td>RCC_CCIPR.I2C2SEL[15:14]</td></tr>
+        <tr><td>I2C3</td><td>0x4000&nbsp;5C00</td><td>APB1</td><td>RCC_APB1ENR1.I2C3EN (bit 23)</td><td>RCC_CCIPR.I2C3SEL[17:16]</td></tr>
+        <tr><td>I2C4</td><td>0x4000&nbsp;8400</td><td>APB1</td><td><strong>RCC_APB1ENR2</strong>.I2C4EN (bit 1)</td><td><strong>RCC_CCIPR2</strong>.I2C4SEL[1:0]</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">I2C4 IS THE ODD ONE</div>
+    <p>I2C4's clock-enable bit lives in <code class="inline">RCC_APB1ENR2</code> (bit 1), not APB1ENR1, and its source mux is in <code class="inline">RCC_CCIPR2</code> (bits 1:0), not CCIPR. Copy-pasting I2C1 init and only changing the instance pointer will leave I2C4 unclocked.</p>
+  </div>
+
+  <h3>Kernel clock selection (I2CCLK)</h3>
+  <p>Each I2C runs from a selectable kernel clock — this is the frequency you feed into the TIMINGR math, and it is <em>independent</em> of the APB prescaler. The 2-bit <code class="inline">I2CxSEL</code> field picks:</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>I2CxSEL</th><th>Source</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>00</td><td>PCLK1 (APB1)</td><td>Reset default. Changes whenever you retune the APB1 prescaler → TIMINGR must be recomputed.</td></tr>
+        <tr><td>01</td><td>SYSCLK</td><td>Up to 120 MHz. Highest resolution, but recompute if SYSCLK changes.</td></tr>
+        <tr><td>10</td><td>HSI16</td><td>Fixed 16 MHz, independent of the PLL/APB tree. Lets you use the RM0432 16 MHz TIMINGR table verbatim and keeps I2C alive in low-power/Stop wake.</td></tr>
+        <tr><td>11</td><td>reserved</td><td>—</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">RECOMMENDATION</div>
+    <p>For a robust first bring-up, select <strong>HSI16</strong> as the I2C kernel clock. It is a rock-solid 16 MHz regardless of your system clock, so the RM0432 example TIMINGR values in the next section apply directly, and the bus keeps working across clock reconfiguration. HSI16 must be enabled (RCC_CR.HSION → wait HSIRDY) before you rely on it.</p>
+  </div>
+
+  <h3>Why TIMINGR (vs. the old CCR/TRISE)</h3>
+  <p>The legacy STM32F1/F4 I2C had CR2 (freq in MHz), CCR (divider) and TRISE. The I2Cv2 in the L4R5 replaces all three with one <code class="inline">TIMINGR</code> that separately programs the prescaler, SCL high/low widths, the SDA data setup/hold delay (SDADEL) and the SCL clock delay (SCLDEL). This makes Standard-mode (100 kHz), Fast-mode (400 kHz) and Fast-mode Plus (1 MHz) exact and lets the hardware guarantee I2C setup/hold timing without software TRISE tricks. There is <strong>no DR/SR1/SR2</strong>: data goes through TXDR/RXDR and status through ISR.</p>
+
+  <div class="flow">
+    <pre>
+        Vdd
+         │   Rp (2.2k–4.7k, external, required)
+         ├──┴──┐
+   SCL ──┤     ├────── to slaves      Open-drain: MCU only pulls LOW,
+   SDA ──┤     ├────── to slaves      the resistor pulls HIGH.
+         └─────┘       GPIO mode = Alternate Function, OTYPE = open-drain.
+    </pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ SECTION 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">02</span> TIMINGR: fields, formula &amp; example table</h2>
+  <p class="section-lead">TIMINGR is a 32-bit register with five fields. tPRESC is the timing unit; everything else counts in units of tPRESC.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Bits</th><th>Field</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td>31:28</td><td>PRESC</td><td>Prescaler. tPRESC = (PRESC + 1) / f<sub>I2CCLK</sub></td></tr>
+        <tr><td>27:24</td><td>—</td><td>reserved (write 0)</td></tr>
+        <tr><td>23:20</td><td>SCLDEL</td><td>Data setup time before SCL rising edge: tSCLDEL = (SCLDEL + 1) × tPRESC</td></tr>
+        <tr><td>19:16</td><td>SDADEL</td><td>Data hold time after SCL falling edge: tSDADEL = SDADEL × tPRESC</td></tr>
+        <tr><td>15:8</td><td>SCLH</td><td>SCL high period: tSCLH = (SCLH + 1) × tPRESC</td></tr>
+        <tr><td>7:0</td><td>SCLL</td><td>SCL low period: tSCLL = (SCLL + 1) × tPRESC</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Ignoring bus rise/fall time, the SCL period is <code class="inline">tSCL ≈ tSCLL + tSCLH</code>, so <code class="inline">f_SCL ≈ f_I2CCLK / ((PRESC+1)·(SCLL+1 + SCLH+1))</code>. SDADEL and SCLDEL do not set the frequency — they guarantee I2C data setup/hold against the slave and the bus RC.</p>
+
+  <h3>RM0432 example values for f<sub>I2CCLK</sub> = 16 MHz</h3>
+  <p>These are the reference-manual timing examples (analog filter enabled, DNF = 0). If you clock I2C from <strong>HSI16</strong>, drop these in unchanged. The rightmost column is the assembled 32-bit value ready for <code class="inline">I2C1-&gt;TIMINGR = ...;</code>.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Mode</th><th>f<sub>SCL</sub></th><th>PRESC</th><th>SCLL</th><th>SCLH</th><th>SDADEL</th><th>SCLDEL</th><th>TIMINGR</th></tr></thead>
+      <tbody>
+        <tr><td>Standard</td><td>10 kHz</td><td>0x3</td><td>0xC7</td><td>0xC3</td><td>0x2</td><td>0x4</td><td><code class="inline">0x3042C3C7</code></td></tr>
+        <tr><td>Standard</td><td>100 kHz</td><td>0x3</td><td>0x13</td><td>0x0F</td><td>0x2</td><td>0x4</td><td><code class="inline">0x30420F13</code></td></tr>
+        <tr><td>Fast</td><td>400 kHz</td><td>0x1</td><td>0x09</td><td>0x03</td><td>0x2</td><td>0x3</td><td><code class="inline">0x10320309</code></td></tr>
+        <tr><td>Fast+</td><td>1000 kHz</td><td>0x0</td><td>0x04</td><td>0x02</td><td>0x0</td><td>0x2</td><td><code class="inline">0x00200204</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — how TIMINGR is assembled</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">// TIMINGR = PRESC[31:28] | SCLDEL[23:20] | SDADEL[19:16] | SCLH[15:8] | SCLL[7:0]</span>
+<span class="cmt">// 100 kHz @ 16 MHz: PRESC=3, SCLDEL=4, SDADEL=2, SCLH=0x0F, SCLL=0x13</span>
+uint32_t timingr = (3u  &lt;&lt; 28)   <span class="cmt">// PRESC  -&gt; tPRESC = 4/16MHz = 250 ns</span>
+                 | (4u  &lt;&lt; 20)   <span class="cmt">// SCLDEL</span>
+                 | (2u  &lt;&lt; 16)   <span class="cmt">// SDADEL</span>
+                 | (0x0Fu &lt;&lt; 8)  <span class="cmt">// SCLH  -&gt; 16*250ns = 4.0 us high</span>
+                 | (0x13u);       <span class="cmt">// SCLL  -&gt; 20*250ns = 5.0 us low  =&gt; ~100 kHz</span>
+<span class="cmt">// timingr == 0x30420F13</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">OTHER KERNEL FREQUENCIES</div>
+    <p>The 16 MHz table only applies when I2CCLK = 16 MHz. For any other kernel clock (e.g. PCLK1 = 80 MHz or SYSCLK = 120 MHz) do not scale these by hand — generate the value with <strong>STM32CubeMX</strong> (Connectivity → I2Cx → "Timing configuration") or the ST I2C timing tool (method described in AN4235). Enter the real I2CCLK and your target speed; it emits the exact TIMINGR accounting for the bus rise/fall time and filter delays.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ SECTION 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">03</span> CR1 / CR2 / ISR / ICR bit reference</h2>
+  <p class="section-lead">CR1 holds the enable + feature bits. CR2 is the "transaction descriptor" — you program the address, direction, length and end mode, then set START. ISR is read-only status; write-1-to-clear flags go to ICR.</p>
+
+  <h3>CR1 — control register 1 (key bits)</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Bit</th><th>Name</th><th>Function</th></tr></thead>
+      <tbody>
+        <tr><td>0</td><td>PE</td><td>Peripheral enable. Clearing PE resets the I2C state machine (soft recovery).</td></tr>
+        <tr><td>7:1</td><td>*IE</td><td>Interrupt enables: TXIE, RXIE, ADDRIE, NACKIE, STOPIE, TCIE, ERRIE.</td></tr>
+        <tr><td>11:8</td><td>DNF[3:0]</td><td>Digital noise filter length (0 = off, N = suppress spikes &lt; N·t<sub>I2CCLK</sub>). Set only while PE=0.</td></tr>
+        <tr><td>12</td><td>ANFOFF</td><td>Analog noise filter OFF (0 = filter ON, ~50–260 ns spike suppression). Set only while PE=0.</td></tr>
+        <tr><td>14</td><td>TXDMAEN</td><td>DMA request enable on transmit (TXIS).</td></tr>
+        <tr><td>15</td><td>RXDMAEN</td><td>DMA request enable on receive (RXNE).</td></tr>
+        <tr><td>17</td><td>NOSTRETCH</td><td>Disable clock stretching — <em>slave mode only</em>. Must stay 0 in master mode.</td></tr>
+        <tr><td>19</td><td>GCEN</td><td>General call (address 0x00) enable.</td></tr>
+        <tr><td>23:20</td><td>SMBus</td><td>SMBHEN / SMBDEN / ALERTEN / PECEN — SMBus host/device, alert, PEC.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>CR2 — control register 2 (the transaction)</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Bit</th><th>Name</th><th>Function</th></tr></thead>
+      <tbody>
+        <tr><td>9:0</td><td>SADD[9:0]</td><td>Slave address. 7-bit mode: put the address in SADD[7:1] (i.e. write <code class="inline">addr7 &lt;&lt; 1</code>). 10-bit mode: full address in SADD[9:0].</td></tr>
+        <tr><td>10</td><td>RD_WRN</td><td>Transfer direction: 0 = master write, 1 = master read.</td></tr>
+        <tr><td>11</td><td>ADD10</td><td>0 = 7-bit addressing, 1 = 10-bit addressing.</td></tr>
+        <tr><td>12</td><td>HEAD10R</td><td>10-bit read: 0 = send full header, 1 = send read header only after a restart.</td></tr>
+        <tr><td>13</td><td>START</td><td>Write 1 to generate START (+ address). Self-clears. This launches the transfer.</td></tr>
+        <tr><td>14</td><td>STOP</td><td>Write 1 to generate STOP (used when AUTOEND = 0 and you end manually).</td></tr>
+        <tr><td>15</td><td>NACK</td><td>Slave mode: send NACK. Ignored in master mode (master NACKs automatically after NBYTES on read).</td></tr>
+        <tr><td>23:16</td><td>NBYTES[7:0]</td><td>Number of bytes to transfer (0–255) before TC/TCR/STOP. See RELOAD for &gt; 255.</td></tr>
+        <tr><td>24</td><td>RELOAD</td><td>1 = NBYTES reloads (chained transfer). TCR is set after each NBYTES; AUTOEND is ignored while RELOAD=1.</td></tr>
+        <tr><td>25</td><td>AUTOEND</td><td>1 = hardware issues STOP automatically after NBYTES. 0 = TC is set instead (needed for repeated-START).</td></tr>
+        <tr><td>26</td><td>PECBYTE</td><td>SMBus: append/check the PEC byte as the last byte.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>ISR (read) &amp; ICR (write-1-to-clear)</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>ISR bit</th><th>Flag</th><th>Meaning / when you poll it</th><th>Clear</th></tr></thead>
+      <tbody>
+        <tr><td>0</td><td>TXE</td><td>TXDR empty (1 = ready). Write 1 to flush TXDR.</td><td>write TXDR</td></tr>
+        <tr><td>1</td><td>TXIS</td><td>Transmit interrupt status — hardware wants the next byte in TXDR.</td><td>write TXDR</td></tr>
+        <tr><td>2</td><td>RXNE</td><td>RXDR not empty — a received byte is ready to read.</td><td>read RXDR</td></tr>
+        <tr><td>4</td><td>NACKF</td><td>NACK received from slave (no ACK on address/data).</td><td>ICR.NACKCF</td></tr>
+        <tr><td>5</td><td>STOPF</td><td>STOP detected on the bus (end of your transfer with AUTOEND).</td><td>ICR.STOPCF</td></tr>
+        <tr><td>6</td><td>TC</td><td>Transfer complete: NBYTES done, RELOAD=0, AUTOEND=0. Bus held — issue restart or STOP.</td><td>START/STOP</td></tr>
+        <tr><td>7</td><td>TCR</td><td>Transfer complete reload: NBYTES done, RELOAD=1. Program next NBYTES to continue.</td><td>write NBYTES</td></tr>
+        <tr><td>8/9/10</td><td>BERR/ARLO/OVR</td><td>Bus error / arbitration lost / overrun-underrun.</td><td>ICR.BERRCF/ARLOCF/OVRCF</td></tr>
+        <tr><td>15</td><td>BUSY</td><td>Bus is busy. Poll for 0 before starting a new transfer.</td><td>hardware</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout danger">
+    <div class="label">MUST CLEAR STOPF / NACKF</div>
+    <p>STOPF and NACKF are sticky. If you leave them set, the next <code class="inline">START</code> behaves unexpectedly or your poll loop exits immediately. Always write <code class="inline">ICR.STOPCF</code> at the end of a transfer and <code class="inline">ICR.NACKCF</code> on a NACK before retrying.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ SECTION 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">04</span> Pins, GPIO AF setup &amp; register-level init</h2>
+  <p class="section-lead">I2C SCL/SDA must be configured as Alternate Function, open-drain, with external pull-ups. On the STM32L4R5 the I2C1/2/3 signals are AF4; I2C4 has several mappings — confirm the exact AF for your package in datasheet DS12023.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Signal</th><th>Pins</th><th>AF</th></tr></thead>
+      <tbody>
+        <tr><td>I2C1_SCL / SDA</td><td>PB6/PB7, PB8/PB9, PG14/PG13</td><td>AF4</td></tr>
+        <tr><td>I2C2_SCL / SDA</td><td>PB10/PB11, PB13/PB14, PF1/PF0</td><td>AF4</td></tr>
+        <tr><td>I2C3_SCL / SDA</td><td>PC0/PC1, PG7/PG8, PA7/PB4</td><td>AF4</td></tr>
+        <tr><td>I2C4_SCL / SDA</td><td>PD12/PD13, PF14/PF15</td><td>AF4</td></tr>
+        <tr><td>I2C4_SCL / SDA (alt)</td><td>PB10/PB11, PB6/PB7, PC0/PC1</td><td>AF3 / AF5 — check DS12023 per package</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">VERIFY THE AF NUMBER</div>
+    <p>I2C1/2/3 are uniformly AF4 across the L4/L4+. I2C4 is newer and shares pins with other peripherals, so its AF differs by pin (AF3, AF4 or AF5). Do not guess — open the "Alternate function" table in DS12023 for your exact device/package and read the AF column for the row of the pin you chose.</p>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — register-level I2C1 init (PB8=SCL, PB9=SDA, 400 kHz, HSI16)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">// STM32L4R5 — CMSIS device header defines RCC, GPIOB, I2C1, and the *_Pos/_Msk macros.</span>
+<span class="cmt">// I2C1_SCL = PB8 (AF4), I2C1_SDA = PB9 (AF4). External 2.2k-4.7k pull-ups required.</span>
+#include "stm32l4r5xx.h"
+
+void i2c1_init_400k(void)
+{
+    <span class="cmt">// 1) Kernel clock = HSI16 (fixed 16 MHz) so the RM0432 16 MHz TIMINGR values apply.</span>
+    RCC-&gt;CR |= RCC_CR_HSION;
+    while (!(RCC-&gt;CR &amp; RCC_CR_HSIRDY)) { }
+    RCC-&gt;CCIPR = (RCC-&gt;CCIPR &amp; ~RCC_CCIPR_I2C1SEL_Msk)
+               | (0x2u &lt;&lt; RCC_CCIPR_I2C1SEL_Pos);   <span class="cmt">// 10 = HSI16</span>
+
+    <span class="cmt">// 2) GPIOB clock, then PB8/PB9 -&gt; AF mode, open-drain, very-high speed, weak pull-up.</span>
+    RCC-&gt;AHB2ENR |= RCC_AHB2ENR_GPIOBEN;
+    (void)RCC-&gt;AHB2ENR;                              <span class="cmt">// dummy read: let the clock settle</span>
+
+    GPIOB-&gt;MODER   = (GPIOB-&gt;MODER  &amp; ~((3u&lt;&lt;(8*2)) | (3u&lt;&lt;(9*2))))
+                   | (2u&lt;&lt;(8*2)) | (2u&lt;&lt;(9*2));       <span class="cmt">// 10 = Alternate Function</span>
+    GPIOB-&gt;OTYPER |= (1u&lt;&lt;8) | (1u&lt;&lt;9);                <span class="cmt">// 1 = open-drain (mandatory for I2C)</span>
+    GPIOB-&gt;OSPEEDR|= (3u&lt;&lt;(8*2)) | (3u&lt;&lt;(9*2));        <span class="cmt">// 11 = very high speed</span>
+    GPIOB-&gt;PUPDR   = (GPIOB-&gt;PUPDR  &amp; ~((3u&lt;&lt;(8*2)) | (3u&lt;&lt;(9*2))))
+                   | (1u&lt;&lt;(8*2)) | (1u&lt;&lt;(9*2));       <span class="cmt">// 01 = pull-up (external Rp still required)</span>
+    GPIOB-&gt;AFR[1]  = (GPIOB-&gt;AFR[1] &amp; ~((0xFu&lt;&lt;((8-8)*4)) | (0xFu&lt;&lt;((9-8)*4))))
+                   | (4u&lt;&lt;((8-8)*4)) | (4u&lt;&lt;((9-8)*4)); <span class="cmt">// AF4, AFR[1]=AFRH for pins 8..15</span>
+
+    <span class="cmt">// 3) Enable the I2C1 peripheral clock.</span>
+    RCC-&gt;APB1ENR1 |= RCC_APB1ENR1_I2C1EN;
+    (void)RCC-&gt;APB1ENR1;
+
+    <span class="cmt">// 4) Program timing and features ONLY while PE = 0.</span>
+    I2C1-&gt;CR1     &amp;= ~I2C_CR1_PE;                    <span class="cmt">// disable to configure / reset FSM</span>
+    I2C1-&gt;TIMINGR = 0x10320309;                      <span class="cmt">// 400 kHz @ 16 MHz kernel (RM0432)</span>
+    I2C1-&gt;CR1     &amp;= ~I2C_CR1_ANFOFF;                <span class="cmt">// analog filter ON (recommended)</span>
+    I2C1-&gt;CR1     &amp;= ~I2C_CR1_NOSTRETCH;             <span class="cmt">// master must allow clock stretching</span>
+    I2C1-&gt;CR1     |=  I2C_CR1_PE;                     <span class="cmt">// enable</span>
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ SECTION 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">05</span> Master write &amp; read (register level)</h2>
+  <p class="section-lead">The I2Cv2 master is almost fully autonomous: load CR2 with address + direction + NBYTES + AUTOEND + START, then just feed TXDR / drain RXDR. Hardware makes the START, address, ACK checks and STOP.</p>
+
+  <div class="flow">
+    <pre>
+  MASTER WRITE (AUTOEND=1, NBYTES=n)                 MASTER READ (AUTOEND=1, NBYTES=n)
+  ─────────────────────────────────                 ────────────────────────────────
+  set CR2: SADD,RD_WRN=0,NBYTES=n,AUTOEND,START      set CR2: SADD,RD_WRN=1,NBYTES=n,AUTOEND,START
+  loop n:  wait TXIS  -&gt; TXDR = byte                 loop n:  wait RXNE  -&gt; byte = RXDR
+  hw sends STOP -&gt; wait STOPF -&gt; clear STOPF          hw NACK+STOP -&gt; wait STOPF -&gt; clear STOPF
+    </pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — master TX / RX / register-read helpers</span><span class="dot">●</span></div>
+    <pre><code>#include "stm32l4r5xx.h"
+#include &lt;stdint.h&gt;
+
+<span class="cmt">// Build the CR2 "transaction descriptor" and fire START in one write.</span>
+static void i2c_cr2_start(I2C_TypeDef *i2c, uint8_t addr7,
+                          uint8_t nbytes, int read, int autoend)
+{
+    uint32_t cr2 = (((uint32_t)addr7 &lt;&lt; 1) &amp; I2C_CR2_SADD)          <span class="cmt">// 7-bit addr in SADD[7:1]</span>
+                 | (((uint32_t)nbytes &lt;&lt; I2C_CR2_NBYTES_Pos) &amp; I2C_CR2_NBYTES)
+                 | (read    ? I2C_CR2_RD_WRN  : 0u)
+                 | (autoend ? I2C_CR2_AUTOEND : 0u)
+                 | I2C_CR2_START;
+    i2c-&gt;CR2 = cr2;   <span class="cmt">// writing whole CR2 also clears ADD10/RELOAD/etc. for a clean master frame</span>
+}
+
+<span class="cmt">// Master WRITE n bytes. Returns 0 on success, -1 on NACK.</span>
+int i2c_write(I2C_TypeDef *i2c, uint8_t addr7, const uint8_t *buf, uint8_t n)
+{
+    while (i2c-&gt;ISR &amp; I2C_ISR_BUSY) { }             <span class="cmt">// wait for a free bus</span>
+    i2c_cr2_start(i2c, addr7, n, 0, 1);            <span class="cmt">// write, AUTOEND</span>
+
+    for (uint8_t i = 0; i &lt; n; i++) {
+        while (!(i2c-&gt;ISR &amp; (I2C_ISR_TXIS | I2C_ISR_NACKF))) { }
+        if (i2c-&gt;ISR &amp; I2C_ISR_NACKF) {            <span class="cmt">// slave did not ACK</span>
+            i2c-&gt;ICR = I2C_ICR_NACKCF;
+            while (!(i2c-&gt;ISR &amp; I2C_ISR_STOPF)) { }
+            i2c-&gt;ICR = I2C_ICR_STOPCF;
+            return -1;
+        }
+        i2c-&gt;TXDR = buf[i];
+    }
+    while (!(i2c-&gt;ISR &amp; I2C_ISR_STOPF)) { }         <span class="cmt">// AUTOEND issued STOP</span>
+    i2c-&gt;ICR = I2C_ICR_STOPCF;
+    return 0;
+}
+
+<span class="cmt">// Master READ n bytes. Returns 0 on success, -1 on address NACK.</span>
+int i2c_read(I2C_TypeDef *i2c, uint8_t addr7, uint8_t *buf, uint8_t n)
+{
+    while (i2c-&gt;ISR &amp; I2C_ISR_BUSY) { }
+    i2c_cr2_start(i2c, addr7, n, 1, 1);            <span class="cmt">// read, AUTOEND</span>
+
+    for (uint8_t i = 0; i &lt; n; i++) {
+        while (!(i2c-&gt;ISR &amp; (I2C_ISR_RXNE | I2C_ISR_NACKF))) { }
+        if (i2c-&gt;ISR &amp; I2C_ISR_NACKF) {
+            i2c-&gt;ICR = I2C_ICR_NACKCF;
+            while (!(i2c-&gt;ISR &amp; I2C_ISR_STOPF)) { }
+            i2c-&gt;ICR = I2C_ICR_STOPCF;
+            return -1;
+        }
+        buf[i] = (uint8_t)i2c-&gt;RXDR;
+    }
+    while (!(i2c-&gt;ISR &amp; I2C_ISR_STOPF)) { }
+    i2c-&gt;ICR = I2C_ICR_STOPCF;
+    return 0;
+}
+
+<span class="cmt">// Write register pointer, then repeated-START and read n bytes (classic sensor read).</span>
+<span class="cmt">// Phase 1 uses AUTOEND=0 so the bus is held (TC) instead of STOP -&gt; a real restart.</span>
+int i2c_read_reg(I2C_TypeDef *i2c, uint8_t addr7, uint8_t reg, uint8_t *buf, uint8_t n)
+{
+    while (i2c-&gt;ISR &amp; I2C_ISR_BUSY) { }
+
+    i2c_cr2_start(i2c, addr7, 1, 0, 0);            <span class="cmt">// write 1 byte, NO AUTOEND</span>
+    while (!(i2c-&gt;ISR &amp; (I2C_ISR_TXIS | I2C_ISR_NACKF))) { }
+    if (i2c-&gt;ISR &amp; I2C_ISR_NACKF) { i2c-&gt;ICR = I2C_ICR_NACKCF; return -1; }
+    i2c-&gt;TXDR = reg;
+    while (!(i2c-&gt;ISR &amp; I2C_ISR_TC)) { }            <span class="cmt">// transfer complete, bus still owned</span>
+
+    i2c_cr2_start(i2c, addr7, n, 1, 1);            <span class="cmt">// repeated START, read, AUTOEND</span>
+    for (uint8_t i = 0; i &lt; n; i++) {
+        while (!(i2c-&gt;ISR &amp; I2C_ISR_RXNE)) { }
+        buf[i] = (uint8_t)i2c-&gt;RXDR;
+    }
+    while (!(i2c-&gt;ISR &amp; I2C_ISR_STOPF)) { }
+    i2c-&gt;ICR = I2C_ICR_STOPCF;
+    return 0;
+}
+
+<span class="cmt">// Example: read 6 bytes of accel data (reg 0x3B) from an MPU-6050 at 7-bit addr 0x68.</span>
+void demo(void)
+{
+    uint8_t accel[6];
+    i2c_read_reg(I2C1, 0x68, 0x3B, accel, 6);
+}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">NBYTES &gt; 255 → USE RELOAD</div>
+    <p>NBYTES is 8-bit. For a longer transfer, set <code class="inline">RELOAD=1</code> with NBYTES=255; when the 255 bytes are done the hardware sets <strong>TCR</strong> (and stretches SCL). Reload NBYTES (and clear RELOAD on the final chunk, set AUTOEND) to continue/finish. While RELOAD=1, AUTOEND is ignored, so the STOP only comes from the last chunk.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ SECTION 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">06</span> HAL variant</h2>
+  <p class="section-lead">The STM32Cube HAL wraps the same registers. The one thing to remember: HAL takes the <strong>8-bit</strong> address (7-bit value shifted left by one), and you still hand it the raw <code class="inline">Timing</code> word — CubeMX computes it for you.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — HAL init + blocking transfers</span><span class="dot">●</span></div>
+    <pre><code>#include "stm32l4xx_hal.h"
+
+I2C_HandleTypeDef hi2c1;
+
+void MX_I2C1_Init(void)
+{
+    hi2c1.Instance             = I2C1;
+    hi2c1.Init.Timing          = 0x10320309;              <span class="cmt">// 400 kHz @ 16 MHz I2CCLK (from CubeMX)</span>
+    hi2c1.Init.OwnAddress1     = 0;
+    hi2c1.Init.AddressingMode  = I2C_ADDRESSINGMODE_7BIT;
+    hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+    hi2c1.Init.OwnAddress2     = 0;
+    hi2c1.Init.OwnAddress2Masks= I2C_OA2_NOMASK;
+    hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+    hi2c1.Init.NoStretchMode   = I2C_NOSTRETCH_DISABLE;    <span class="cmt">// master: keep stretching enabled</span>
+    if (HAL_I2C_Init(&amp;hi2c1) != HAL_OK) { Error_Handler(); }
+
+    HAL_I2CEx_ConfigAnalogFilter(&amp;hi2c1, I2C_ANALOGFILTER_ENABLE);
+    HAL_I2CEx_ConfigDigitalFilter(&amp;hi2c1, 0);
+}
+
+<span class="cmt">// Select HSI16 as the I2C1 kernel clock (matches the 16 MHz Timing value above).</span>
+void I2C1_SelectHSI16(void)
+{
+    RCC_PeriphCLKInitTypeDef p = {0};
+    p.PeriphClockSelection = RCC_PERIPHCLK_I2C1;
+    p.I2c1ClockSelection   = RCC_I2C1CLKSOURCE_HSI;
+    if (HAL_RCCEx_PeriphCLKConfig(&amp;p) != HAL_OK) { Error_Handler(); }
+}
+
+<span class="cmt">// HAL_I2C_MspInit is called by HAL_I2C_Init: enable clocks + configure the AF pins.</span>
+void HAL_I2C_MspInit(I2C_HandleTypeDef *h)
+{
+    if (h-&gt;Instance == I2C1) {
+        __HAL_RCC_GPIOB_CLK_ENABLE();
+        __HAL_RCC_I2C1_CLK_ENABLE();
+        GPIO_InitTypeDef g = {0};
+        g.Pin       = GPIO_PIN_8 | GPIO_PIN_9;            <span class="cmt">// PB8=SCL, PB9=SDA</span>
+        g.Mode      = GPIO_MODE_AF_OD;                    <span class="cmt">// alternate function, open-drain</span>
+        g.Pull      = GPIO_NOPULL;                        <span class="cmt">// external pull-ups on the board</span>
+        g.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+        g.Alternate = GPIO_AF4_I2C1;
+        HAL_GPIO_Init(GPIOB, &amp;g);
+    }
+}
+
+void demo_hal(void)
+{
+    uint8_t cfg[2] = { 0x6B, 0x00 };                      <span class="cmt">// MPU-6050: PWR_MGMT_1 = 0 (wake)</span>
+    uint8_t accel[6];
+    <span class="cmt">// NOTE the &lt;&lt;1 : HAL wants the 8-bit address. 7-bit 0x68 -&gt; 0xD0.</span>
+    HAL_I2C_Master_Transmit(&amp;hi2c1, (0x68 &lt;&lt; 1), cfg, 2, HAL_MAX_DELAY);
+    HAL_I2C_Mem_Read(&amp;hi2c1, (0x68 &lt;&lt; 1), 0x3B,
+                     I2C_MEMADD_SIZE_8BIT, accel, 6, HAL_MAX_DELAY);
+}</code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">HAL_I2C_Master_Transmit / _Receive</span><span class="desc">Blocking single write / read to a device address (with timeout).</span></div>
+    <div class="param"><span class="name">HAL_I2C_Mem_Write / _Mem_Read</span><span class="desc">Register/EEPROM access: sends the memory address then does a repeated-START read (exactly the i2c_read_reg pattern).</span></div>
+    <div class="param"><span class="name">*_IT / *_DMA variants</span><span class="desc">Non-blocking interrupt- or DMA-driven versions; completion via HAL_I2C_MasterTxCpltCallback etc.</span></div>
+    <div class="param"><span class="name">HAL_I2C_IsDeviceReady</span><span class="desc">Probe/ping a device (address-only frame) — handy for bus scans and EEPROM write polling.</span></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ SECTION 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">07</span> DMA with DMAMUX</h2>
+  <p class="section-lead">On the L4R5, DMA1/DMA2 channels are not hard-wired to peripherals — the DMAMUX routes any peripheral request line to any channel. Set CR1.TXDMAEN/RXDMAEN, point a DMA channel at TXDR/RXDR, and tell DMAMUX which I2C request line to listen for.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Peripheral request</th><th>DMAMUX1 request ID</th><th>Peripheral request</th><th>DMAMUX1 request ID</th></tr></thead>
+      <tbody>
+        <tr><td>I2C1_RX</td><td>16</td><td>I2C1_TX</td><td>17</td></tr>
+        <tr><td>I2C2_RX</td><td>18</td><td>I2C2_TX</td><td>19</td></tr>
+        <tr><td>I2C3_RX</td><td>20</td><td>I2C3_TX</td><td>21</td></tr>
+        <tr><td>I2C4_RX</td><td>22</td><td>I2C4_TX</td><td>23</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">DIRECTION</div>
+    <p>For a master <em>write</em> use the <strong>TX</strong> request (memory → TXDR, DMA reads RAM). For a master <em>read</em> use the <strong>RX</strong> request (RXDR → memory, DMA writes RAM). The DMA channel's data direction and the DMAMUX request ID must match.</p>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — register-level DMA TX (I2C1_TX, request 17)</span><span class="dot">●</span></div>
+    <pre><code>#include "stm32l4r5xx.h"
+
+<span class="cmt">// Transmit 'n' bytes from 'buf' to a 7-bit slave using DMA1 Channel 1 + DMAMUX.</span>
+void i2c1_dma_write(uint8_t addr7, const uint8_t *buf, uint8_t n)
+{
+    RCC-&gt;AHB1ENR |= RCC_AHB1ENR_DMA1EN | RCC_AHB1ENR_DMAMUX1EN;
+
+    <span class="cmt">// Route DMAMUX1 channel 0 (drives DMA1_Channel1) to I2C1_TX request line 17.</span>
+    DMAMUX1_Channel0-&gt;CCR = 17u;                    <span class="cmt">// DMAMUX_CxCR.DMAREQ_ID = 17</span>
+
+    DMA1_Channel1-&gt;CCR &amp;= ~DMA_CCR_EN;              <span class="cmt">// disable while configuring</span>
+    DMA1_Channel1-&gt;CPAR  = (uint32_t)&amp;I2C1-&gt;TXDR;   <span class="cmt">// peripheral = TXDR</span>
+    DMA1_Channel1-&gt;CMAR  = (uint32_t)buf;           <span class="cmt">// memory = source buffer</span>
+    DMA1_Channel1-&gt;CNDTR = n;
+    DMA1_Channel1-&gt;CCR   = DMA_CCR_MINC             <span class="cmt">// increment memory</span>
+                         | DMA_CCR_DIR              <span class="cmt">// 1 = read-from-memory (mem -&gt; periph)</span>
+                         | DMA_CCR_EN;              <span class="cmt">// byte-wide (PSIZE=MSIZE=00) is fine for I2C</span>
+
+    I2C1-&gt;CR1 |= I2C_CR1_TXDMAEN;                   <span class="cmt">// TXIS now triggers a DMA request</span>
+
+    <span class="cmt">// Kick the frame exactly like the polled case: addr, NBYTES=n, write, AUTOEND, START.</span>
+    I2C1-&gt;CR2 = (((uint32_t)addr7 &lt;&lt; 1) &amp; I2C_CR2_SADD)
+              | (((uint32_t)n &lt;&lt; I2C_CR2_NBYTES_Pos) &amp; I2C_CR2_NBYTES)
+              | I2C_CR2_AUTOEND | I2C_CR2_START;
+
+    while (!(I2C1-&gt;ISR &amp; I2C_ISR_STOPF)) { }        <span class="cmt">// DMA feeds TXDR; STOP when NBYTES done</span>
+    I2C1-&gt;ICR = I2C_ICR_STOPCF;
+    I2C1-&gt;CR1 &amp;= ~I2C_CR1_TXDMAEN;
+    DMA1_Channel1-&gt;CCR &amp;= ~DMA_CCR_EN;
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>C — HAL DMA equivalent</span><span class="dot">●</span></div>
+    <pre><code>DMA_HandleTypeDef hdma_i2c1_tx;
+
+void I2C1_DMA_Init(void)
+{
+    __HAL_RCC_DMA1_CLK_ENABLE();
+    __HAL_RCC_DMAMUX1_CLK_ENABLE();
+
+    hdma_i2c1_tx.Instance                 = DMA1_Channel1;
+    hdma_i2c1_tx.Init.Request             = DMA_REQUEST_I2C1_TX;   <span class="cmt">// == 17</span>
+    hdma_i2c1_tx.Init.Direction           = DMA_MEMORY_TO_PERIPH;
+    hdma_i2c1_tx.Init.PeriphInc           = DMA_PINC_DISABLE;
+    hdma_i2c1_tx.Init.MemInc              = DMA_MINC_ENABLE;
+    hdma_i2c1_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_i2c1_tx.Init.MemDataAlignment    = DMA_MDATAALIGN_BYTE;
+    hdma_i2c1_tx.Init.Mode                = DMA_NORMAL;
+    hdma_i2c1_tx.Init.Priority            = DMA_PRIORITY_HIGH;
+    HAL_DMA_Init(&amp;hdma_i2c1_tx);
+    __HAL_LINKDMA(&amp;hi2c1, hdmatx, hdma_i2c1_tx);
+
+    HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);   <span class="cmt">// + call HAL_DMA_IRQHandler(&amp;hdma_i2c1_tx) in it</span>
+    HAL_NVIC_EnableIRQ(I2C1_EV_IRQn);         <span class="cmt">// + call HAL_I2C_EV_IRQHandler(&amp;hi2c1)</span>
+}
+
+void demo_dma(void)
+{
+    static uint8_t buf[32];
+    HAL_I2C_Master_Transmit_DMA(&amp;hi2c1, (0x50 &lt;&lt; 1), buf, sizeof buf);
+    <span class="cmt">// completion signalled by HAL_I2C_MasterTxCpltCallback()</span>
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ SECTION 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">08</span> Clock stretching &amp; gotchas</h2>
+  <p class="section-lead">Most "my I2C hangs" bugs on the L4R5 come from a handful of repeatable mistakes. Read this list first.</p>
+
+  <h3>Clock stretching</h3>
+  <p>Clock stretching is a slave holding SCL low to buy time. As a <strong>master</strong>, the L4R5 handles this transparently — it always tolerates a stretched clock and there is nothing to configure. The <code class="inline">NOSTRETCH</code> bit only affects the peripheral when it acts as a <strong>slave</strong>: NOSTRETCH=1 tells the hardware "I will keep up, never stretch" (used by fast SMBus slaves). In master mode NOSTRETCH must stay 0; setting it does nothing useful and the RM requires it clear for masters.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>#</th><th>Mistake</th><th>Symptom</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>Passing the 7-bit address unshifted to HAL</td><td>Always NACK / wrong device</td><td>HAL wants 8-bit: use <code class="inline">addr7 &lt;&lt; 1</code>. Register SADD also needs <code class="inline">addr7 &lt;&lt; 1</code>.</td></tr>
+        <tr><td>2</td><td>Not clearing STOPF/NACKF via ICR</td><td>Second transfer never starts, or exits instantly</td><td>Write ICR.STOPCF / ICR.NACKCF at the end of every transfer.</td></tr>
+        <tr><td>3</td><td>Writing TIMINGR / DNF / ANFOFF while PE=1</td><td>Ignored / undefined timing</td><td>Clear PE, program, then set PE. These fields are write-protected while enabled.</td></tr>
+        <tr><td>4</td><td>TIMINGR computed for the wrong I2CCLK</td><td>SCL runs at the wrong speed (e.g. half)</td><td>TIMINGR depends on the <em>kernel</em> clock (I2CxSEL), not APB. Recompute if PCLK1/SYSCLK/source changes; or pin it to HSI16.</td></tr>
+        <tr><td>5</td><td>No external pull-ups, or push-pull GPIO</td><td>SDA/SCL stuck, BERR, garbage</td><td>Open-drain AF (<code class="inline">GPIO_MODE_AF_OD</code>) + external 2.2k–4.7k to Vdd. Internal pull-ups are far too weak for 400 kHz+.</td></tr>
+        <tr><td>6</td><td>Setting AUTOEND in the write phase of a register read</td><td>STOP instead of repeated-START; sensor returns stale data</td><td>Phase 1: AUTOEND=0, wait <strong>TC</strong> (not STOPF), then a second START.</td></tr>
+        <tr><td>7</td><td>NBYTES &gt; 255 in one shot</td><td>Truncated transfer</td><td>NBYTES is 8-bit; use RELOAD and refill NBYTES on TCR.</td></tr>
+        <tr><td>8</td><td>Reading RXDR before RXNE / writing TXDR before TXIS</td><td>OVR/underrun, corrupt bytes</td><td>Always gate TXDR on TXIS and RXDR on RXNE.</td></tr>
+        <tr><td>9</td><td>Bus locked: a slave holds SDA low</td><td>BUSY never clears</td><td>There is no bus reset register — toggle PE (PE=0 for ≥3 APB cycles, then PE=1), or reconfigure SCL as GPIO and clock out up to 9 manual pulses to free the slave.</td></tr>
+        <tr><td>10</td><td>I2C4 configured like I2C1</td><td>Peripheral dead / no clock</td><td>Enable via RCC_APB1ENR2.I2C4EN (bit 1); select source via RCC_CCIPR2.I2C4SEL; base 0x40008400.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">FILTERS AFFECT TIMING &amp; MINIMUM PULSE</div>
+    <p>The analog filter (ANFOFF=0) suppresses spikes up to ~50–260 ns and the digital filter (DNF=1..15) suppresses spikes shorter than DNF×t<sub>I2CCLK</sub>. Both add latency that the RM0432 example TIMINGR values already assume (analog ON, DNF=0). If you enable a large DNF or turn the analog filter off, regenerate TIMINGR with CubeMX so setup/hold stay in spec — especially at Fast-mode Plus (1 MHz).</p>
+  </div>
+
+  <div class="callout">
+    <div class="label">SANITY CHECKLIST</div>
+    <p>Kernel clock selected &amp; running (HSI16 ready) → GPIO AF4 open-drain + external Rp → I2C clock enabled → TIMINGR set while PE=0 → PE=1 → transfer sets SADD/NBYTES/dir/AUTOEND then START → poll TXIS/RXNE → clear STOPF. If BUSY is stuck at boot, toggle PE to reset the state machine.</p>
+  </div>
+</section>
+
+</main>

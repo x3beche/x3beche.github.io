@@ -1,0 +1,589 @@
+---
+layout: tutorial
+title: "STM32L4R5 — Low-Power Modes & Wakeup"
+back_url: "../index.html"
+back_label: "All guides"
+---
+<header class="header">
+  <div class="meta">
+    <span>TECHNICAL GUIDE</span><span>STM32L4R5</span><span>LOW POWER</span><span>2026</span>
+  </div>
+  <h1>Low-Power Modes<br><em>&amp; Wakeup</em></h1>
+  <p class="subtitle">Run, Sleep, Stop 0/1/2, Standby and Shutdown on the STM32L4R5 (Cortex-M4F, RM0432): the PWR CR1–CR4 / SR / SCR registers, the SLEEPDEEP + WFI/WFE mechanism, RAM retention, wakeup sources and a complete RTC periodic-wakeup example.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">Contents</div>
+  <ol>
+    <li><a href="#s0">Why go low-power: the mode ladder</a></li>
+    <li><a href="#s1">The mechanism: SLEEPDEEP, LPMS, WFI/WFE</a></li>
+    <li><a href="#s2">PWR register map (CR1–CR4, SR1/SR2, SCR)</a></li>
+    <li><a href="#s3">Run, Sleep and Low-power run/sleep</a></li>
+    <li><a href="#s4">Stop 0 / Stop 1 / Stop 2</a></li>
+    <li><a href="#s5">Standby, Shutdown, SRAM2 retention &amp; wakeup pins</a></li>
+    <li><a href="#s6">RTC wakeup timer: periodic wake from Stop 2</a></li>
+    <li><a href="#s7">Wakeup sources &amp; EXTI mapping</a></li>
+    <li><a href="#s8">Gotchas &amp; common mistakes</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ 01 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">01</span> Why go low-power: the mode ladder</h2>
+  <p class="section-lead">The STM32L4R5 is an ultra-low-power Cortex-M4F running up to 120 MHz. Its value is the ability to trade activity for current across a ladder of modes, from full Run down to a few tens of nanoamps in Shutdown. Each rung switches off more clocks, more of the voltage regulator, and eventually most of the RAM — so choosing a mode is really choosing <em>what must survive</em> and <em>what may wake you</em>.</p>
+
+  <h3>The seven states, deepest wins</h3>
+  <div class="params">
+    <div class="param"><span class="name">Run</span><span class="desc">CPU + all clocks live. Main regulator, voltage scaling Range 1 (up to 120 MHz) or Range 2 (up to 26 MHz).</span></div>
+    <div class="param"><span class="name">Low-power run</span><span class="desc">SYSCLK ≤ 2 MHz on the low-power regulator (LPR). CPU still executes; ideal for slow polling loops.</span></div>
+    <div class="param"><span class="name">Sleep / Low-power sleep</span><span class="desc">CPU clock gated (WFI/WFE); every peripheral keeps its clock. Wake on any enabled interrupt in a few cycles.</span></div>
+    <div class="param"><span class="name">Stop 0 / 1 / 2</span><span class="desc">All clocks stopped (HSI16/HSE/PLL off); SRAM and all registers retained. Stop 0 keeps the main regulator (fastest wake), Stop 1/2 use the LPR (lowest current). Wake via EXTI, RTC, LPTIM, LPUART, etc.</span></div>
+    <div class="param"><span class="name">Standby</span><span class="desc">Regulators off, kernel powered down. Only the backup domain (RTC + 32 backup registers) and, optionally, the 64-KB SRAM2 survive. Wakeup = full reset.</span></div>
+    <div class="param"><span class="name">Shutdown</span><span class="desc">Deepest mode. Even the LSI and brown-out reset are off; only LSE + backup registers survive. Wakeup = full reset.</span></div>
+  </div>
+
+  <h3>Typical current &amp; what is retained</h3>
+  <p>Figures below are <em>typical</em> at T<sub>A</sub> = 25 °C, V<sub>DD</sub> = 3.0 V from DS12023; always use the datasheet tables for guaranteed maxima in your temperature range.</p>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Mode</th><th>LPMS</th><th>Regulator</th><th>Typ. I<sub>DD</sub></th><th>Retained</th><th>Wake exit</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Run @ 80 MHz</td><td>—</td><td>Main</td><td>≈ 100 µA/MHz</td><td>everything</td><td>—</td></tr>
+        <tr><td>Sleep</td><td>—</td><td>Main</td><td>≈ 30 µA/MHz</td><td>everything</td><td>resume (few cycles)</td></tr>
+        <tr><td>Low-power run</td><td>—</td><td>LPR</td><td>&lt; 10 µA @ 2 MHz</td><td>everything</td><td>—</td></tr>
+        <tr><td>Stop 0</td><td>000</td><td>Main</td><td>≈ 114 µA</td><td>all SRAM + regs</td><td>resume, MSI ~4 MHz</td></tr>
+        <tr><td>Stop 1</td><td>001</td><td>LPR</td><td>≈ 4.6 µA</td><td>all SRAM + regs</td><td>resume, MSI ~4 MHz</td></tr>
+        <tr><td>Stop 2</td><td>010</td><td>LPR (reduced)</td><td>≈ 1.2 µA</td><td>all SRAM + regs</td><td>resume, MSI ~4 MHz</td></tr>
+        <tr><td>Standby (no RTC)</td><td>011</td><td>off</td><td>≈ 0.12 µA</td><td>backup regs</td><td>RESET</td></tr>
+        <tr><td>Standby + RTC</td><td>011</td><td>off (LPR if RRS)</td><td>≈ 0.42 µA</td><td>backup regs (+SRAM2 if RRS)</td><td>RESET</td></tr>
+        <tr><td>Shutdown (no RTC)</td><td>1xx</td><td>off</td><td>≈ 0.03 µA</td><td>backup regs</td><td>RESET</td></tr>
+        <tr><td>Shutdown + RTC</td><td>1xx</td><td>off</td><td>≈ 0.30 µA</td><td>backup regs</td><td>RESET</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout">
+    <div class="label">KEY RETENTION RULE</div>
+    <p>In every <strong>Stop</strong> mode all of SRAM1 (192 KB), SRAM2 (64 KB), SRAM3 (384 KB) and every peripheral register keep their contents — you resume exactly where you left off. In <strong>Standby</strong> and <strong>Shutdown</strong> the core is reset: only the RTC backup registers (<code>RTC_BKP0R…BKP31R</code>) survive, plus SRAM2 in Standby <em>if</em> you set the <code>RRS</code> bit. Plan your state accordingly.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 02 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">02</span> The mechanism: SLEEPDEEP, LPMS, WFI/WFE</h2>
+  <p class="section-lead">There is exactly one instruction that stops the core — <code>WFI</code> (Wait For Interrupt) or <code>WFE</code> (Wait For Event). Two bits decide what "stop" means: the Cortex-M4 <code>SLEEPDEEP</code> bit in <code>SCB-&gt;SCR</code>, and the <code>LPMS[2:0]</code> field in <code>PWR_CR1</code>.</p>
+
+  <h3>The decision tree</h3>
+  <div class="params">
+    <div class="param"><span class="name">SLEEPDEEP = 0</span><span class="desc">WFI/WFE → <strong>Sleep</strong> (or Low-power sleep if LPR is on). Only the CPU clock stops. LPMS is ignored.</span></div>
+    <div class="param"><span class="name">SLEEPDEEP = 1</span><span class="desc">WFI/WFE → <strong>Deep-sleep</strong>. The PWR block now reads <code>LPMS[2:0]</code> to pick Stop 0/1/2, Standby or Shutdown.</span></div>
+  </div>
+
+  <p>So the universal entry sequence is: pick the mode in <code>LPMS</code>, set/clear <code>SLEEPDEEP</code>, make sure no wakeup flag is already pending, then execute <code>WFI</code>. Bracket the store to <code>SCR</code> with a data-sync barrier so it lands before the core sleeps.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — SCB SCR bits (0xE000ED10)</span><span class="dot">●</span></div>
+    <pre><code>/* Cortex-M4 System Control Register — CMSIS names */
+/* SCB_SCR_SLEEPONEXIT_Msk  (bit 1) : re-sleep on ISR return       */
+/* SCB_SCR_SLEEPDEEP_Msk    (bit 2) : 0 = Sleep, 1 = Stop/Standby   */
+/* SCB_SCR_SEVONPEND_Msk    (bit 4) : pending IRQ generates an event */
+
+static inline void deepsleep(int on)
+{
+    if (on) SCB-&gt;SCR |=  SCB_SCR_SLEEPDEEP_Msk;
+    else    SCB-&gt;SCR &amp;= ~SCB_SCR_SLEEPDEEP_Msk;
+    __DSB();          /* ensure the SCR write completes before WFI */
+}</code></pre>
+  </div>
+
+  <h3>WFI vs WFE</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th></th><th>WFI</th><th>WFE</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Wakes on</td><td>any NVIC-enabled interrupt (and NMI/reset)</td><td>an <em>event</em>: SEV, EXTI event-mode line, or a pending IRQ if <code>SEVONPEND</code>=1</td></tr>
+        <tr><td>Runs the ISR?</td><td>yes — vectoring to the handler is how you resume</td><td>no — execution just continues after <code>WFE</code>; no handler needed</td></tr>
+        <tr><td>Typical use</td><td>Stop/Standby with an EXTI/RTC interrupt configured</td><td>tight polling loops, or waking on an EXTI line in <em>event</em> mode (<code>EXTI_EMR1</code>)</td></tr>
+        <tr><td>Gotcha</td><td>the peripheral IRQ must be enabled in NVIC or you never return</td><td>an already-latched event makes <code>WFE</code> return instantly — issue a dummy <code>SEV; WFE;</code> to clear it first</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Most designs use <code>WFI</code>: enable the wakeup peripheral's EXTI line + NVIC IRQ, then <code>__WFI()</code>. In Stop modes the core is halted but the EXTI controller stays alive on the LSI/LSE/HSI16-on-demand paths, so an EXTI or RTC edge restarts the clocks and vectors the pending interrupt.</p>
+</section>
+
+<!-- ═══════════════════ 03 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">03</span> PWR register map (CR1–CR4, SR1/SR2, SCR)</h2>
+  <p class="section-lead">The power controller lives at <code>0x4000_7000</code> on APB1. Enable its clock with <code>RCC-&gt;APB1ENR1 |= RCC_APB1ENR1_PWREN</code> before touching any of these, and set <code>PWR_CR1.DBP</code> before writing the RTC/backup domain.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Register</th><th>Offset</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td>PWR_CR1</td><td>0x00</td><td>LPMS mode select, voltage scaling (VOS), low-power run (LPR), backup unlock (DBP)</td></tr>
+        <tr><td>PWR_CR2</td><td>0x04</td><td>PVD level, peripheral voltage monitors, independent VDDUSB/VDDIO2 supplies</td></tr>
+        <tr><td>PWR_CR3</td><td>0x08</td><td>Wakeup-pin enables (EWUPn), SRAM2 retention (RRS), pull config apply (APC), internal wakeup (EIWUL)</td></tr>
+        <tr><td>PWR_CR4</td><td>0x0C</td><td>Wakeup-pin polarity (WPn), VBAT charging (VBE/VBRS)</td></tr>
+        <tr><td>PWR_SR1</td><td>0x10</td><td>Wakeup flags (WUFn), Standby flag (SBF), internal wakeup flag (WUFI)</td></tr>
+        <tr><td>PWR_SR2</td><td>0x14</td><td>Regulator/scaling ready flags (VOSF, REGLPF, REGLPS), PVDO, PVMOx</td></tr>
+        <tr><td>PWR_SCR</td><td>0x18</td><td>Clear-wakeup (CWUFn) and clear-Standby (CSBF) — write 1 to clear</td></tr>
+        <tr><td>PWR_PUCRx / PDCRx</td><td>0x20+</td><td>Per-port pull-up / pull-down hold during Standby/Shutdown (needs APC=1)</td></tr>
+        <tr><td>PWR_CR5</td><td>0x80</td><td>R1MODE: Range 1 "boost" (0) enables 120 MHz; normal Range 1 (1) caps ~80 MHz</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>PWR_CR1 — the mode selector</h3>
+  <div class="params">
+    <div class="param"><span class="name">LPMS[2:0] — bits 2:0</span><span class="desc">000 Stop 0 · 001 Stop 1 · 010 Stop 2 · 011 Standby · 1xx Shutdown. Read when SLEEPDEEP=1.</span></div>
+    <div class="param"><span class="name">DBP — bit 8</span><span class="desc">Disable Backup-domain write protection. Must be 1 to write RTC, backup registers, LSE/RTCSEL.</span></div>
+    <div class="param"><span class="name">VOS[1:0] — bits 10:9</span><span class="desc">01 = Range 1 (high perf), 10 = Range 2 (low power, ≤ 26 MHz). Wait <code>SR2.VOSF=0</code> after changing.</span></div>
+    <div class="param"><span class="name">LPR — bit 14</span><span class="desc">Low-power run. Set only after SYSCLK ≤ 2 MHz and VOS = Range 2.</span></div>
+  </div>
+
+  <h3>PWR_CR3 — Standby/Shutdown behaviour &amp; wakeup pins</h3>
+  <div class="params">
+    <div class="param"><span class="name">EWUP1…EWUP5 — bits 0..4</span><span class="desc">Enable wakeup pin WKUP1..WKUP5 for Standby/Shutdown.</span></div>
+    <div class="param"><span class="name">RRS — bit 8</span><span class="desc">SRAM2 Retention in Standby: 1 keeps the 64-KB SRAM2 powered by the LPR. No effect in Shutdown.</span></div>
+    <div class="param"><span class="name">APC — bit 10</span><span class="desc">Apply pull-up/pull-down: activates PWR_PUCRx/PDCRx so GPIOs are held (not floating) in Standby/Shutdown.</span></div>
+    <div class="param"><span class="name">EIWUL — bit 15</span><span class="desc">Enable Internal Wakeup Line (e.g. RTC/IWDG) as a Standby wakeup.</span></div>
+  </div>
+
+  <h3>Status &amp; clear registers</h3>
+  <div class="params">
+    <div class="param"><span class="name">PWR_SR1: WUF1..WUF5 (0..4), SBF (8), WUFI (15)</span><span class="desc">Wakeup-pin flags, Standby flag (set after Standby wake), internal wakeup flag. Read-only.</span></div>
+    <div class="param"><span class="name">PWR_SR2: REGLPS (8), REGLPF (9), VOSF (10)</span><span class="desc">LPR started / LPR in use / voltage-scaling ongoing. Poll these when switching regulator or VOS.</span></div>
+    <div class="param"><span class="name">PWR_SCR: CWUF1..CWUF5 (0..4), CSBF (8)</span><span class="desc">Write 1 to clear the matching SR1 flag. Clearing WUFn should be the LAST step before entering low-power.</span></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ 04 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">04</span> Run, Sleep and Low-power run/sleep</h2>
+  <p class="section-lead">Sleep is the cheapest win: peripherals keep running (a DMA transfer, a UART receive, a timer PWM) while the core idles. Nothing is lost, wake latency is a few cycles. Low-power run/sleep additionally moves the regulator to the LPR for sub-2-MHz duty.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — Sleep on WFI, and sleep-on-exit</span><span class="dot">●</span></div>
+    <pre><code>#include "stm32l4xx.h"
+
+/* Plain Sleep: SLEEPDEEP=0, so WFI only gates the CPU clock.
+   Any NVIC-enabled interrupt wakes and vectors to its handler. */
+static void enter_sleep(void)
+{
+    SCB-&gt;SCR &amp;= ~SCB_SCR_SLEEPDEEP_Msk;   /* Sleep, not Stop */
+    __DSB();
+    __WFI();                              /* halt until an interrupt */
+}
+
+/* Sleep-on-exit: the core automatically re-sleeps every time it
+   returns from an ISR. Perfect for purely event-driven firmware —
+   main() sets it once and the while(1) never actually runs. */
+static void enable_sleep_on_exit(void)
+{
+    SCB-&gt;SCR &amp;= ~SCB_SCR_SLEEPDEEP_Msk;
+    SCB-&gt;SCR |=  SCB_SCR_SLEEPONEXIT_Msk;
+    __DSB();
+    __WFI();                              /* first sleep; ISRs do the rest */
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — Low-power run (register level)</span><span class="dot">●</span></div>
+    <pre><code>/* Low-power run needs: VOS = Range 2, then SYSCLK &lt;= 2 MHz,
+   then set LPR. Order matters. */
+static void enter_low_power_run(void)
+{
+    RCC-&gt;APB1ENR1 |= RCC_APB1ENR1_PWREN;
+
+    /* 1. Voltage scaling Range 2 (VOS = 10) */
+    PWR-&gt;CR1 = (PWR-&gt;CR1 &amp; ~PWR_CR1_VOS_Msk) | (0x2u &lt;&lt; PWR_CR1_VOS_Pos);
+    while (PWR-&gt;SR2 &amp; PWR_SR2_VOSF) { }     /* wait until scaling done */
+
+    /* 2. Drop SYSCLK to <= 2 MHz here (e.g. MSI range 2 MHz) ... */
+
+    /* 3. Enter low-power run */
+    PWR-&gt;CR1 |= PWR_CR1_LPR;
+    while (!(PWR-&gt;SR2 &amp; PWR_SR2_REGLPF)) { } /* LPR now supplying core */
+}
+
+static void exit_low_power_run(void)
+{
+    PWR-&gt;CR1 &amp;= ~PWR_CR1_LPR;
+    while (PWR-&gt;SR2 &amp; PWR_SR2_REGLPF) { }    /* back on main regulator */
+    /* raise SYSCLK and VOS = Range 1 again as needed */
+}</code></pre>
+  </div>
+  <div class="callout warn">
+    <div class="label">SLEEP vs LOW-POWER SLEEP</div>
+    <p>"Low-power sleep" is simply Sleep entered while <code>LPR=1</code>. Because the LPR limits SYSCLK to 2 MHz, Flash is put in power-down and instruction fetch stalls — great for a peripheral waiting on a slow event, but do not expect fast code between wakes. To go back to full speed you must exit LPR (clear <code>LPR</code>, restore VOS Range 1, raise the clock) first.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 05 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">05</span> Stop 0 / Stop 1 / Stop 2</h2>
+  <p class="section-lead">Stop modes are the workhorse of battery designs: HSE, HSI16 and the PLL are switched off, but every byte of SRAM and every register is retained, so <code>WFI</code> returns to the very next instruction. The three variants trade wake speed for current — Stop 0 keeps the main regulator (fastest, ~114 µA), Stop 2 drops to a reduced LPR (~1.2 µA).</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — generic Stop entry (register level)</span><span class="dot">●</span></div>
+    <pre><code>#include "stm32l4xx.h"
+
+/* lpms: 0 = Stop0, 1 = Stop1, 2 = Stop2 */
+static void enter_stop(uint32_t lpms)
+{
+    RCC-&gt;APB1ENR1 |= RCC_APB1ENR1_PWREN;
+
+    /* 1. Select the Stop level in LPMS[2:0] */
+    PWR-&gt;CR1 = (PWR-&gt;CR1 &amp; ~PWR_CR1_LPMS_Msk)
+             | (lpms &amp; PWR_CR1_LPMS_Msk);
+
+    /* 2. SLEEPDEEP = 1 so WFI enters Stop, not Sleep */
+    SCB-&gt;SCR |= SCB_SCR_SLEEPDEEP_Msk;
+
+    /* 3. Barrier, then sleep. Execution resumes HERE on wakeup. */
+    __DSB();
+    __WFI();
+
+    /* 4. Restore SLEEPDEEP so a later plain Sleep behaves */
+    SCB-&gt;SCR &amp;= ~SCB_SCR_SLEEPDEEP_Msk;
+}</code></pre>
+  </div>
+
+  <p>On wakeup the system clock is whatever <code>STOPWUCK</code> in <code>RCC_CFGR</code> selects — MSI (default, ~4 MHz) or HSI16. The PLL and HSE are <em>off</em>. If your app ran at 120 MHz you must rebuild the clock tree, otherwise you silently continue at 4 MHz.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — rebuild the clock after Stop</span><span class="dot">●</span></div>
+    <pre><code>/* After Stop the tree is MSI-only. Re-arm HSE + PLL and switch back.
+   In practice just call your generated SystemClock_Config() again. */
+static void restore_clock_after_stop(void)
+{
+    RCC-&gt;CR |= RCC_CR_HSEON;
+    while (!(RCC-&gt;CR &amp; RCC_CR_HSERDY)) { }
+
+    RCC-&gt;CR |= RCC_CR_PLLON;
+    while (!(RCC-&gt;CR &amp; RCC_CR_PLLRDY)) { }
+
+    RCC-&gt;CFGR = (RCC-&gt;CFGR &amp; ~RCC_CFGR_SW_Msk) | RCC_CFGR_SW_PLL;
+    while ((RCC-&gt;CFGR &amp; RCC_CFGR_SWS_Msk) != RCC_CFGR_SWS_PLL) { }
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — HAL equivalents</span><span class="dot">●</span></div>
+    <pre><code>/* HAL rolls LPMS + SLEEPDEEP + WFI into one call per mode.        */
+/* Stop 0 (main regulator kept):                                  */
+HAL_PWREx_EnterSTOP0Mode(PWR_STOPENTRY_WFI);
+
+/* Stop 1 (LPR):                                                  */
+HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
+
+/* Stop 2 (deepest Stop):                                         */
+HAL_PWREx_EnterSTOP2Mode(PWR_STOPENTRY_WFI);
+
+/* Every one of these returns on wakeup with the clock on MSI,    */
+/* so re-run your clock config immediately:                       */
+SystemClock_Config();</code></pre>
+  </div>
+  <div class="callout">
+    <div class="label">CHOOSING A STOP LEVEL</div>
+    <p><strong>Stop 0</strong> — need &lt; ~5 µs wake and full-speed restart: main regulator stays warm. <strong>Stop 1</strong> — general low-power idle. <strong>Stop 2</strong> — longest idles; a few peripherals (some GPIO/EXTI, LPUART, LPTIM, RTC, comparators, I2C3) can still wake you, but fewer than Stop 1. All three preserve SRAM and context.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 06 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">06</span> Standby, Shutdown, SRAM2 retention &amp; wakeup pins</h2>
+  <p class="section-lead">Below Stop the regulators shut down and the core is powered off. Wakeup is a <strong>reset</strong>: firmware restarts at the reset vector with SRAM1/SRAM3 gone. Only the backup domain survives — plus SRAM2 in Standby if you ask for it. These are the modes for shelf-life and long sleep intervals.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — enter Standby (optional SRAM2 retention)</span><span class="dot">●</span></div>
+    <pre><code>#include "stm32l4xx.h"
+
+/* retain_sram2 != 0 keeps the 64-KB SRAM2 alive across Standby
+   (powered by the LPR) so you can stash state there. */
+static void enter_standby(int retain_sram2)
+{
+    RCC-&gt;APB1ENR1 |= RCC_APB1ENR1_PWREN;
+
+    if (retain_sram2) PWR-&gt;CR3 |=  PWR_CR3_RRS;
+    else              PWR-&gt;CR3 &amp;= ~PWR_CR3_RRS;
+
+    /* LPMS = 011 -> Standby */
+    PWR-&gt;CR1 = (PWR-&gt;CR1 &amp; ~PWR_CR1_LPMS_Msk)
+             | (0x3u &lt;&lt; PWR_CR1_LPMS_Pos);
+
+    /* Clear every stale wakeup flag LAST, per RM0432 */
+    PWR-&gt;SCR = PWR_SCR_CWUF1 | PWR_SCR_CWUF2 | PWR_SCR_CWUF3
+             | PWR_SCR_CWUF4 | PWR_SCR_CWUF5;
+
+    SCB-&gt;SCR |= SCB_SCR_SLEEPDEEP_Msk;
+    __DSB();
+    __WFI();                 /* powers down; wakeup causes a RESET */
+}
+
+/* LPMS = 1xx -> Shutdown (use 100). Deepest; ignores RRS. */
+static void enter_shutdown(void)
+{
+    RCC-&gt;APB1ENR1 |= RCC_APB1ENR1_PWREN;
+    PWR-&gt;CR1 = (PWR-&gt;CR1 &amp; ~PWR_CR1_LPMS_Msk)
+             | (0x4u &lt;&lt; PWR_CR1_LPMS_Pos);
+    PWR-&gt;SCR = PWR_SCR_CWUF1 | PWR_SCR_CWUF2 | PWR_SCR_CWUF3
+             | PWR_SCR_CWUF4 | PWR_SCR_CWUF5;
+    SCB-&gt;SCR |= SCB_SCR_SLEEPDEEP_Msk;
+    __DSB();
+    __WFI();
+}</code></pre>
+  </div>
+
+  <h3>Wakeup pins (Standby/Shutdown)</h3>
+  <p>Five dedicated <code>WKUPn</code> pins can pull the device out of Standby or Shutdown. Each is enabled by <code>EWUPn</code> in <code>PWR_CR3</code> and its edge polarity chosen by <code>WPn</code> in <code>PWR_CR4</code> (0 = rising, 1 = falling). On STM32L4R5 each WKUP line maps to a fixed pad:</p>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Wakeup line</th><th>Pin</th><th>Enable bit (PWR_CR3)</th><th>Polarity bit (PWR_CR4)</th><th>Flag / clear</th></tr></thead>
+      <tbody>
+        <tr><td>WKUP1</td><td>PA0</td><td>EWUP1 (bit 0)</td><td>WP1 (bit 0)</td><td>WUF1 / CWUF1</td></tr>
+        <tr><td>WKUP2</td><td>PC13</td><td>EWUP2 (bit 1)</td><td>WP2 (bit 1)</td><td>WUF2 / CWUF2</td></tr>
+        <tr><td>WKUP3</td><td>PE6</td><td>EWUP3 (bit 2)</td><td>WP3 (bit 2)</td><td>WUF3 / CWUF3</td></tr>
+        <tr><td>WKUP4</td><td>PA2</td><td>EWUP4 (bit 3)</td><td>WP4 (bit 3)</td><td>WUF4 / CWUF4</td></tr>
+        <tr><td>WKUP5</td><td>PC5</td><td>EWUP5 (bit 4)</td><td>WP5 (bit 4)</td><td>WUF5 / CWUF5</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="section-lead" style="font-size:0.9em">Confirm the pad for your exact package against the "Additional functions" table in DS12023 — the mapping above is the standard STM32L4R5 assignment.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — WKUP1 (PA0) rising-edge wakeup + boot detection</span><span class="dot">●</span></div>
+    <pre><code>/* Arm WKUP1 (PA0) as a rising-edge Standby/Shutdown wakeup. The pad
+   itself needs no GPIO clock — the WKUP function is always wired. */
+static void configure_wakeup_pin1(void)
+{
+    PWR-&gt;CR4 &amp;= ~PWR_CR4_WP1;    /* WP1 = 0 -> detect a rising edge */
+    PWR-&gt;SCR  =  PWR_SCR_CWUF1;   /* clear any pending flag first     */
+    PWR-&gt;CR3 |=  PWR_CR3_EWUP1;   /* enable WKUP1                     */
+}
+
+/* At every boot, tell "cold power-on" from "woke from Standby". */
+int main(void)
+{
+    RCC-&gt;APB1ENR1 |= RCC_APB1ENR1_PWREN;
+
+    if (PWR-&gt;SR1 &amp; PWR_SR1_SBF) {         /* came out of Standby/Shutdown */
+        PWR-&gt;SCR = PWR_SCR_CSBF;          /* clear the Standby flag       */
+        /* SRAM2 is valid only if RRS was set; SRAM1/SRAM3 are cleared.
+           Backup registers RTC-&gt;BKP0R..BKP31R are always valid.        */
+    } else {
+        /* genuine cold start: full init */
+    }
+
+    configure_wakeup_pin1();
+    /* ... */
+    for (;;) { }
+}</code></pre>
+  </div>
+  <div class="callout warn">
+    <div class="label">FLOATING PINS DOMINATE THE BUDGET</div>
+    <p>In Standby/Shutdown, GPIOs are Hi-Z by default and a floating input can burn far more than the 0.1 µA core current. Either drive/terminate them externally, or use <code>PWR_PUCRx</code>/<code>PWR_PDCRx</code> with <code>APC=1</code> in <code>PWR_CR3</code> to latch a defined pull-up/pull-down that persists through the low-power mode.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 07 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">07</span> RTC wakeup timer: periodic wake from Stop 2</h2>
+  <p class="section-lead">The RTC wakeup timer is the canonical periodic "heartbeat": a down-counter clocked from the RTC that fires an interrupt every N ticks and pulls the core out of Stop (via EXTI line 20) or out of Standby/Shutdown (via the internal wakeup line). Clocked by the 32.768-kHz LSE it costs about a microamp in Stop 2. This is a complete, self-contained example.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — one-time RTC + LSE bring-up</span><span class="dot">●</span></div>
+    <pre><code>#include "stm32l4xx.h"
+
+/* Enable the LSE and route it to the RTC. Do this once at startup. */
+static void rtc_lse_init(void)
+{
+    RCC-&gt;APB1ENR1 |= RCC_APB1ENR1_PWREN;   /* PWR clock             */
+    PWR-&gt;CR1 |= PWR_CR1_DBP;                /* unlock backup domain  */
+
+    /* Start the 32.768 kHz LSE crystal */
+    RCC-&gt;BDCR |= RCC_BDCR_LSEON;
+    while (!(RCC-&gt;BDCR &amp; RCC_BDCR_LSERDY)) { }
+
+    /* RTCSEL = 01 (LSE) and switch the RTC on */
+    RCC-&gt;BDCR = (RCC-&gt;BDCR &amp; ~RCC_BDCR_RTCSEL_Msk)
+              | (0x1u &lt;&lt; RCC_BDCR_RTCSEL_Pos)
+              | RCC_BDCR_RTCEN;
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — program the wakeup timer + EXTI line 20</span><span class="dot">●</span></div>
+    <pre><code>/* Period = (seconds) using ck_spre = 1 Hz. Valid 1..65536 s.
+   WUCKSEL = 100b selects ck_spre; counter reload = seconds - 1. */
+static void rtc_wakeup_start(uint32_t seconds)
+{
+    /* 1. Unlock RTC write protection */
+    RTC-&gt;WPR = 0xCA;
+    RTC-&gt;WPR = 0x53;
+
+    /* 2. Disable the timer, then wait until it is safe to write WUTR */
+    RTC-&gt;CR &amp;= ~RTC_CR_WUTE;
+    while (!(RTC-&gt;ISR &amp; RTC_ISR_WUTWF)) { }   /* WUTWF = write allowed */
+
+    /* 3. Reload value and clock source */
+    RTC-&gt;WUTR = (seconds - 1u) &amp; 0xFFFFu;
+    RTC-&gt;CR = (RTC-&gt;CR &amp; ~RTC_CR_WUCKSEL_Msk)
+            | (0x4u &lt;&lt; RTC_CR_WUCKSEL_Pos);   /* ck_spre (1 Hz)       */
+
+    /* 4. Enable timer + its interrupt */
+    RTC-&gt;CR |= RTC_CR_WUTE | RTC_CR_WUTIE;
+
+    /* 5. Re-lock the RTC */
+    RTC-&gt;WPR = 0xFF;
+
+    /* 6. RTC wakeup is EXTI line 20 — unmask + rising edge so it can
+          restart the clocks and vector the IRQ out of Stop. */
+    EXTI-&gt;IMR1  |= (1u &lt;&lt; 20);   /* interrupt mask   (IM20)  */
+    EXTI-&gt;RTSR1 |= (1u &lt;&lt; 20);   /* rising trigger   (RT20)  */
+
+    NVIC_SetPriority(RTC_WKUP_IRQn, 2);
+    NVIC_EnableIRQ(RTC_WKUP_IRQn);
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — ISR + Stop 2 main loop</span><span class="dot">●</span></div>
+    <pre><code>volatile uint32_t ticks;
+
+/* WUTF is an rc_w0 flag and is NOT under RTC write protection,
+   so clearing it needs no WPR dance. Also clear EXTI line 20. */
+void RTC_WKUP_IRQHandler(void)
+{
+    if (RTC-&gt;ISR &amp; RTC_ISR_WUTF) {
+        RTC-&gt;ISR &amp;= ~RTC_ISR_WUTF;   /* acknowledge wakeup timer */
+        ticks++;
+    }
+    EXTI-&gt;PR1 = (1u &lt;&lt; 20);           /* clear pending (write 1)  */
+}
+
+int main(void)
+{
+    rtc_lse_init();
+    rtc_wakeup_start(5);              /* wake every 5 seconds */
+
+    for (;;) {
+        /* --- enter Stop 2 --- */
+        PWR-&gt;CR1 = (PWR-&gt;CR1 &amp; ~PWR_CR1_LPMS_Msk)
+                 | (0x2u &lt;&lt; PWR_CR1_LPMS_Pos);
+        SCB-&gt;SCR |= SCB_SCR_SLEEPDEEP_Msk;
+        __DSB();
+        __WFI();                     /* sleeps ~5 s, wakes in ISR */
+        SCB-&gt;SCR &amp;= ~SCB_SCR_SLEEPDEEP_Msk;
+
+        /* Back on MSI ~4 MHz. Do a short task, then loop.
+           Call restore_clock_after_stop() if you need full speed. */
+    }
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — HAL variant of the same wakeup</span><span class="dot">●</span></div>
+    <pre><code>/* Assuming hrtc is initialised by HAL_RTC_Init() with LSE selected. */
+RTC_HandleTypeDef hrtc;
+
+/* 5-second period using ck_spre (1 Hz): counter = 5 - 1.
+   The 4th arg (WakeUpAutoClr) = 0 disables the auto-reload output. */
+HAL_RTCEx_SetWakeUpTimer_IT(&amp;hrtc, 5u - 1u,
+                            RTC_WAKEUPCLOCK_CKSPRE, 0u);
+
+/* HAL enables EXTI line 20 + NVIC for you. Enter Stop 2: */
+HAL_PWREx_EnterSTOP2Mode(PWR_STOPENTRY_WFI);
+SystemClock_Config();                /* rebuild clock after wake */
+
+/* HAL supplies RTC_WKUP_IRQHandler -> HAL_RTCEx_WakeUpTimerIRQHandler.
+   Handle the tick in the weak callback: */
+void HAL_RTCEx_WakeUpTimerEventCallback(RTC_HandleTypeDef *h)
+{
+    (void)h;
+    /* periodic work here */
+}</code></pre>
+  </div>
+  <div class="callout">
+    <div class="label">PICKING THE WAKEUP PERIOD</div>
+    <p>Two clock domains feed <code>WUCKSEL</code>. For 1 s…36 h use <strong>ck_spre</strong> (1 Hz): <code>WUCKSEL=100</code>, period = <code>(WUT+1)</code> seconds; add <code>WUCKSEL=110</code> to tack on 2<sup>16</sup> s. For sub-second/finer resolution use <strong>RTCCLK/2/4/8/16</strong> (<code>WUCKSEL=011..000</code>): with LSE/16 one tick is 16/32768 = 488.28 µs, so <code>WUT = round(T / 488.28µs) - 1</code>. Always wait for <code>WUTWF=1</code> before writing <code>WUTR</code>.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 08 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">08</span> Wakeup sources &amp; EXTI mapping</h2>
+  <p class="section-lead">What can wake you depends on the mode. In Stop, wakeups are asynchronous EXTI edges (the clocks restart on the edge). In Standby/Shutdown only a handful of always-on sources remain, and each one causes a reset.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Source</th><th>Stop 0/1/2</th><th>Standby</th><th>Shutdown</th></tr></thead>
+      <tbody>
+        <tr><td>WKUP1..WKUP5 pins</td><td>via EXTI 0–15 (if mapped)</td><td>yes (EWUPn)</td><td>yes (EWUPn)</td></tr>
+        <tr><td>GPIO EXTI lines 0–15</td><td>yes</td><td>no (use WKUP pins)</td><td>no</td></tr>
+        <tr><td>RTC alarm A/B</td><td>yes (EXTI 18)</td><td>yes</td><td>yes (LSE)</td></tr>
+        <tr><td>RTC wakeup timer</td><td>yes (EXTI 20)</td><td>yes</td><td>yes (LSE)</td></tr>
+        <tr><td>RTC tamper / timestamp</td><td>yes (EXTI 19)</td><td>yes</td><td>yes (LSE)</td></tr>
+        <tr><td>LPTIM1/2, LPUART1, I2C3</td><td>yes</td><td>no</td><td>no</td></tr>
+        <tr><td>Comparators COMP1/2</td><td>yes (EXTI 21/22)</td><td>no</td><td>no</td></tr>
+        <tr><td>IWDG</td><td>reset</td><td>reset</td><td>no (LSI off)</td></tr>
+        <tr><td>NRST pin / BOR</td><td>reset</td><td>reset</td><td>NRST only (BOR off)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Selected EXTI internal lines (RM0432)</h3>
+  <p>EXTI lines 0–15 are the GPIO edge detectors; from 16 up they are internal peripheral wakeup lines. The load-bearing ones for low power:</p>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Line</th><th>Source</th><th>Config register bits</th></tr></thead>
+      <tbody>
+        <tr><td>0–15</td><td>GPIO PXn edge</td><td>IMR1/EMR1, RTSR1/FTSR1, SYSCFG_EXTICR</td></tr>
+        <tr><td>16</td><td>PVD output</td><td>IMR1 bit 16</td></tr>
+        <tr><td>18</td><td>RTC alarms A/B</td><td>IMR1/RTSR1 bit 18</td></tr>
+        <tr><td>19</td><td>RTC tamper / timestamp / LSECSS</td><td>IMR1/RTSR1 bit 19</td></tr>
+        <tr><td>20</td><td>RTC wakeup timer</td><td>IMR1/RTSR1 bit 20</td></tr>
+        <tr><td>21 / 22</td><td>COMP1 / COMP2 output</td><td>IMR1/RTSR1 bits 21/22</td></tr>
+        <tr><td>23+</td><td>I2Cx / USARTx / LPUART1 / LPTIMx / PVMx / USB wakeups</td><td>see RM0432 §EXTI (some in IMR2/RTSR2)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout warn">
+    <div class="label">STOP NEEDS THE EXTI UNMASK</div>
+    <p>For a peripheral to wake the core from Stop, its EXTI line must be unmasked in <code>EXTI_IMR1</code> (interrupt) and given a trigger edge in <code>EXTI_RTSR1/FTSR1</code>. Enabling only the peripheral interrupt (e.g. <code>RTC_CR.WUTIE</code>) is <em>not</em> enough — without line 20 unmasked the core stays asleep forever. Standby/Shutdown wakeups do not use the configurable EXTI mask; they go through the internal wakeup line and always reset.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 09 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">09</span> Gotchas &amp; common mistakes</h2>
+  <p class="section-lead">Almost every "it won't sleep / won't wake / draws too much" bug is one of these.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">SLEEPDEEP not set</span><span class="desc">Forgetting <code>SCB-&gt;SCR |= SLEEPDEEP</code> makes <code>WFI</code> do plain Sleep instead of Stop/Standby — current stays high and nothing "went to sleep". Conversely, leaving it set turns a later intended Sleep into a Stop.</span></div>
+    <div class="param"><span class="name">PWR clock off</span><span class="desc">Writes to PWR registers are ignored until <code>RCC-&gt;APB1ENR1 |= RCC_APB1ENR1_PWREN</code>. Enable it once at startup.</span></div>
+    <div class="param"><span class="name">DBP not set</span><span class="desc">RTC, backup registers, LSE and RTCSEL are write-protected until <code>PWR_CR1.DBP = 1</code>. Without it your RTC config silently no-ops.</span></div>
+    <div class="param"><span class="name">Stale wakeup flags</span><span class="desc">If <code>WUFn</code> (or the RTC <code>WUTF</code>, or <code>EXTI_PR1</code>) is still set, <code>WFI</code> returns immediately. Clear flags as the LAST step before sleeping — and clear <code>EXTI_PR1</code> and <code>WUTF</code> inside the ISR.</span></div>
+    <div class="param"><span class="name">RTC won't wake from Stop</span><span class="desc">You enabled <code>WUTIE</code> but not EXTI line 20. Set <code>EXTI_IMR1</code> bit 20 + <code>EXTI_RTSR1</code> bit 20 (rising) and enable <code>RTC_WKUP_IRQn</code> in the NVIC.</span></div>
+    <div class="param"><span class="name">Running at 4 MHz after Stop</span><span class="desc">Stop returns on MSI (or HSI16 if <code>STOPWUCK</code>=1); PLL/HSE are off. Re-run <code>SystemClock_Config()</code> or you unknowingly execute 30× slower.</span></div>
+    <div class="param"><span class="name">Expecting SRAM to survive Standby</span><span class="desc">Standby/Shutdown reset the core: SRAM1 and SRAM3 are lost. Only backup registers survive (and SRAM2 if <code>RRS=1</code>). Detect the wake with <code>PWR_SR1.SBF</code> and restore from backup registers.</span></div>
+    <div class="param"><span class="name">WUTWF ignored</span><span class="desc">After clearing <code>WUTE</code> you must poll <code>RTC_ISR.WUTWF</code> = 1 before writing <code>WUTR</code>/<code>WUCKSEL</code>. Writing early is dropped and the period is wrong (often "wakes once, then never").</span></div>
+    <div class="param"><span class="name">Floating GPIOs</span><span class="desc">In Stop/Standby a floating input can leak more than the whole core budget. Terminate externally or hold pins with <code>PWR_PUCRx</code>/<code>PDCRx</code> + <code>APC=1</code>.</span></div>
+    <div class="param"><span class="name">Shutdown has no LSI / BOR</span><span class="desc">Only LSE survives Shutdown. An RTC/IWDG on LSI cannot wake you; brown-out reset is disabled. Use LSE-clocked RTC (or a WKUP pin) for Shutdown wakeup.</span></div>
+    <div class="param"><span class="name">Low-power run entered wrong</span><span class="desc">Set VOS = Range 2 and drop SYSCLK ≤ 2 MHz BEFORE setting <code>LPR</code>. Doing it out of order gives undefined behaviour; to leave, clear <code>LPR</code>, wait <code>REGLPF=0</code>, then raise the clock.</span></div>
+    <div class="param"><span class="name">Debugger drops in low power</span><span class="desc">SWD disconnects in Stop/Standby, so breakpoints "vanish". During bring-up set <code>DBGMCU_CR</code> DBG_STOP/DBG_STANDBY to keep debug alive — but clear them in production, they add current.</span></div>
+    <div class="param"><span class="name">WFE returns instantly</span><span class="desc">A latched event makes <code>WFE</code> fall through. The idiom is <code>__SEV(); __WFE(); __WFE();</code> — the first WFE consumes the self-posted event, the second actually waits.</span></div>
+  </div>
+
+  <div class="callout">
+    <div class="label">MINIMAL RELIABLE STOP-2 CHECKLIST</div>
+    <p>1) <code>PWREN</code> clock on · 2) wakeup source armed (RTC/EXTI) with its EXTI line unmasked + NVIC enabled · 3) all flags cleared · 4) <code>LPMS = 010</code> · 5) <code>SLEEPDEEP = 1</code> · 6) <code>__DSB(); __WFI();</code> · 7) on return clear <code>SLEEPDEEP</code> and rebuild the clock.</p>
+  </div>
+</section>
+
+</main>

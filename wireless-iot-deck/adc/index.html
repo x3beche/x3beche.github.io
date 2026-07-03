@@ -1,0 +1,518 @@
+---
+layout: tutorial
+title: "STM32L4R5 — ADC Configuration (DMA, Oversampling)"
+back_url: "../index.html"
+back_label: "All guides"
+---
+<header class="header">
+  <div class="meta">
+    <span>TECHNICAL GUIDE</span><span>STM32L4R5</span><span>ADC</span><span>2026</span>
+  </div>
+  <h1>STM32L4R5 ADC<br><em>DMA, Oversampling &amp; Calibration</em></h1>
+  <p class="subtitle">Register-level and HAL configuration of the STM32L4R5 12-bit SAR ADCs — clock &amp; calibration, channel sequencing, sampling time, hardware oversampling to 16-bit, and circular DMA for multi-channel acquisition.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">Contents</div>
+  <ol>
+    <li><a href="#s0">ADC architecture &amp; register map</a></li>
+    <li><a href="#s1">Clock, power-up &amp; calibration</a></li>
+    <li><a href="#s2">GPIO analog, channels (SQRx) &amp; sampling (SMPRx)</a></li>
+    <li><a href="#s3">Internal channels: VREFINT, temperature, VBAT</a></li>
+    <li><a href="#s4">Hardware oversampling (CFGR2)</a></li>
+    <li><a href="#s5">Single, continuous, scan &amp; circular DMA</a></li>
+    <li><a href="#s6">HAL variant (STM32Cube)</a></li>
+    <li><a href="#s7">Gotchas &amp; common mistakes</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ SECTION 01 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">01</span> ADC architecture &amp; register map</h2>
+  <p class="section-lead">The STM32L4R5 (Cortex-M4F, RM0432) integrates <strong>two independent 12-bit successive-approximation ADCs</strong> — <code class="inline">ADC1</code> and <code class="inline">ADC2</code> — on the AHB2 bus. Each converts up to 5 Msps at 12-bit and supports selectable 12/10/8/6-bit resolution, a hardware oversampling engine (up to 16-bit effective), a 16-entry regular sequencer, an injected group, analog watchdogs, and DMA output.</p>
+
+  <p>Registers split into two groups. <strong>Per-ADC</strong> registers (one set for <code class="inline">ADC1</code>, one for <code class="inline">ADC2</code>) hold everything about one converter: enable/calibration (<code class="inline">CR</code>), configuration (<code class="inline">CFGR</code>/<code class="inline">CFGR2</code>), sampling time (<code class="inline">SMPRx</code>), sequence (<code class="inline">SQRx</code>) and data (<code class="inline">DR</code>). The <strong>common</strong> block <code class="inline">ADC12_COMMON</code> holds settings shared by both: the clock source/prescaler (<code class="inline">CCR.CKMODE</code>/<code class="inline">PRESC</code>), internal-channel enables (VREFINT, temperature, VBAT), dual-mode and the combined status/data registers.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">ADC1 base</span><span class="desc">0x5004_0000 — per-ADC registers for converter 1</span></div>
+    <div class="param"><span class="name">ADC2 base</span><span class="desc">0x5004_0100 — per-ADC registers for converter 2</span></div>
+    <div class="param"><span class="name">ADC12_COMMON</span><span class="desc">0x5004_0300 — shared CSR / CCR / CDR</span></div>
+  </div>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Offset</th><th>Register</th><th>Purpose (key fields)</th></tr></thead>
+      <tbody>
+        <tr><td>0x00</td><td>ADC_ISR</td><td>Status: ADRDY, EOSMP, EOC, EOS, OVR (write-1-to-clear)</td></tr>
+        <tr><td>0x04</td><td>ADC_IER</td><td>Interrupt enables mirroring ISR flags</td></tr>
+        <tr><td>0x08</td><td>ADC_CR</td><td>ADEN, ADDIS, ADSTART, ADSTP, ADCAL, ADCALDIF, ADVREGEN, DEEPPWD</td></tr>
+        <tr><td>0x0C</td><td>ADC_CFGR</td><td>RES, CONT, DMAEN, DMACFG, OVRMOD, EXTEN, EXTSEL, ALIGN, DISCEN</td></tr>
+        <tr><td>0x10</td><td>ADC_CFGR2</td><td>ROVSE, JOVSE, OVSR[2:0], OVSS[3:0], TROVS, ROVSM (oversampling)</td></tr>
+        <tr><td>0x14 / 0x18</td><td>ADC_SMPR1 / SMPR2</td><td>Sampling time SMP0..SMP9 / SMP10..SMP18 (3 bits each)</td></tr>
+        <tr><td>0x30..0x3C</td><td>ADC_SQR1..SQR4</td><td>Regular sequence length L and channels SQ1..SQ16 (5 bits each)</td></tr>
+        <tr><td>0x40</td><td>ADC_DR</td><td>Regular data register (reading clears EOC)</td></tr>
+        <tr><td>0xB0 / 0xB4</td><td>ADC_DIFSEL / CALFACT</td><td>Differential select / calibration factors</td></tr>
+      </tbody>
+    </table>
+    <p class="dim">Common block (offset from 0x5004_0300): CSR 0x00, CCR 0x08, CDR 0x0C.</p>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — CMSIS register handles (from stm32l4r5xx.h)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* All symbols below ship in the CubeL4 CMSIS device header. */</span>
+<span class="keyword">#include</span> <span class="str">&lt;stdint.h&gt;</span>
+<span class="keyword">#include</span> <span class="str">"stm32l4r5xx.h"</span>
+
+ADC_TypeDef        *a1 = ADC1;          <span class="cmt">// 0x50040000</span>
+ADC_TypeDef        *a2 = ADC2;          <span class="cmt">// 0x50040100</span>
+ADC_Common_TypeDef *ac = ADC12_COMMON;  <span class="cmt">// 0x50040300 (shared CCR)</span></code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>This section</h4>
+    <ul>
+      <li>Two 12-bit SAR ADCs (ADC1/ADC2) on AHB2, up to 5 Msps, 6/8/10/12-bit + oversampling.</li>
+      <li>Per-ADC registers configure one converter; ADC12_COMMON.CCR configures the shared clock and internal channels.</li>
+      <li>Enable the peripheral clock via RCC_AHB2ENR.ADCEN before touching any ADC register.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ SECTION 02 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">02</span> Clock, power-up &amp; calibration</h2>
+  <p class="section-lead">The ADC needs a working <em>kernel</em> clock, an enabled internal voltage regulator, and a calibration pass before the first conversion. Skipping any of these is the most common reason an ADC "reads garbage" or never sets ADRDY.</p>
+
+  <h3>Choosing the ADC clock (CCR.CKMODE / PRESC)</h3>
+  <p>Two clocking modes exist. In <strong>asynchronous mode</strong> (<code class="inline">CKMODE=00</code>) the ADC runs from a dedicated kernel clock selected by <code class="inline">RCC_CCIPR.ADCSEL</code>, then divided by <code class="inline">PRESC</code>. In <strong>synchronous mode</strong> (<code class="inline">CKMODE=01/10/11</code>) it runs from the AHB clock (HCLK) divided by 1/2/4. Keep the resulting f<sub>ADC</sub> within the datasheet maximum (DS12023) — for 12-bit fast conversion this is on the order of tens of MHz, so at a 120 MHz SYSCLK use a prescaler.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>CKMODE[1:0]</th><th>ADC clock source</th></tr></thead>
+      <tbody>
+        <tr><td>00</td><td>Asynchronous: RCC_CCIPR.ADCSEL kernel clock ÷ PRESC</td></tr>
+        <tr><td>01</td><td>HCLK / 1 (synchronous — requires AHB prescaler = 1)</td></tr>
+        <tr><td>10</td><td>HCLK / 2 (synchronous)</td></tr>
+        <tr><td>11</td><td>HCLK / 4 (synchronous)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>ADCSEL[1:0] (RCC_CCIPR)</th><th>Async kernel clock</th></tr></thead>
+      <tbody>
+        <tr><td>00</td><td>No clock selected</td></tr>
+        <tr><td>01</td><td>PLLSAI1 "R" output (PLLADC1CLK)</td></tr>
+        <tr><td>11</td><td>SYSCLK</td></tr>
+      </tbody>
+    </table>
+    <p class="dim">PRESC[3:0] async divider: 0000=/1, 0001=/2, 0010=/4, 0011=/6, 0100=/8, 0101=/10 … 1011=/256.</p>
+  </div>
+
+  <h3>Power-up + calibration order (CR)</h3>
+  <div class="flow">
+    <pre><span class="step-num">01</span> RCC_AHB2ENR.ADCEN = 1   (enable ADC bus clock)
+<span class="step-num">02</span> CCR: CKMODE + PRESC / or ADCSEL for async kernel clock
+<span class="step-num">03</span> CR.DEEPPWD = 0          (leave deep-power-down)
+<span class="step-num">04</span> CR.ADVREGEN = 1  <span class="accent">then wait ~20 µs</span> (regulator start-up)
+<span class="step-num">05</span> CR.ADCALDIF = 0/1, CR.ADCAL = 1, poll until ADCAL == 0
+<span class="step-num">06</span> ISR.ADRDY = 1 (clear), CR.ADEN = 1, poll until ADRDY == 1</pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">ORDER MATTERS</div>
+    <p><code class="inline">ADEN</code> can only be written to 1 when <code class="inline">ADCAL=ADSTP=ADSTART=ADDIS=ADEN=0</code>. Enabling the ADC <em>before</em> calibration finishes is silently ignored. Calibration is only valid after the regulator has started, and single-ended vs differential use <strong>separate</strong> calibration factors — recalibrate if you change <code class="inline">ADCALDIF</code>.</p>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — register-level clock, power-up and calibration</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Crude blocking microsecond delay (replace with a timer/DWT in real code). */</span>
+<span class="keyword">static</span> <span class="keyword">void</span> delay_us(<span class="keyword">volatile</span> uint32_t n){ <span class="keyword">while</span>(n--) { <span class="keyword">for</span>(<span class="keyword">volatile</span> <span class="keyword">int</span> i=0;i&lt;20;i++){} } }
+
+<span class="keyword">void</span> adc1_init_clock_and_calibrate(<span class="keyword">void</span>)
+{
+    <span class="cmt">/* 1. ADC peripheral (bus) clock on AHB2 */</span>
+    RCC-&gt;AHB2ENR |= RCC_AHB2ENR_ADCEN;
+    (<span class="keyword">void</span>)RCC-&gt;AHB2ENR;                 <span class="cmt">// dummy read: RCC clock-enable settling</span>
+
+    <span class="cmt">/* 2. Async kernel clock = SYSCLK, common prescaler /4 */</span>
+    RCC-&gt;CCIPR |= (3U &lt;&lt; RCC_CCIPR_ADCSEL_Pos);       <span class="cmt">// 11 = SYSCLK</span>
+    ADC12_COMMON-&gt;CCR &amp;= ~ADC_CCR_CKMODE;             <span class="cmt">// 00 = asynchronous</span>
+    ADC12_COMMON-&gt;CCR &amp;= ~ADC_CCR_PRESC;
+    ADC12_COMMON-&gt;CCR |= (0x2U &lt;&lt; ADC_CCR_PRESC_Pos);  <span class="cmt">// 0010 = /4</span>
+
+    <span class="cmt">/* 3-4. Exit deep-power-down, enable regulator, wait start-up */</span>
+    ADC1-&gt;CR &amp;= ~ADC_CR_DEEPPWD;
+    ADC1-&gt;CR |= ADC_CR_ADVREGEN;
+    delay_us(20);                                     <span class="cmt">// t_ADCVREG_STUP</span>
+
+    <span class="cmt">/* 5. Single-ended calibration (ADEN must be 0 here) */</span>
+    ADC1-&gt;CR &amp;= ~ADC_CR_ADCALDIF;                     <span class="cmt">// single-ended factor</span>
+    ADC1-&gt;CR |= ADC_CR_ADCAL;
+    <span class="keyword">while</span> (ADC1-&gt;CR &amp; ADC_CR_ADCAL) { }                 <span class="cmt">// cleared by HW when done</span>
+    <span class="cmt">// calibration factor is now in ADC1-&gt;CALFACT</span>
+
+    <span class="cmt">/* 6. Enable the ADC and wait until it is ready */</span>
+    ADC1-&gt;ISR = ADC_ISR_ADRDY;                        <span class="cmt">// clear (write-1-to-clear)</span>
+    ADC1-&gt;CR |= ADC_CR_ADEN;
+    <span class="keyword">while</span> (!(ADC1-&gt;ISR &amp; ADC_ISR_ADRDY)) { }
+    ADC1-&gt;ISR = ADC_ISR_ADRDY;
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ SECTION 03 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">03</span> GPIO analog, channels (SQRx) &amp; sampling (SMPRx)</h2>
+  <p class="section-lead">A conversion is defined by three things: which physical pin is routed to the analog input, how long the sample-and-hold charges (<code class="inline">SMPRx</code>), and the sequence of channels to convert (<code class="inline">SQRx</code>) at the chosen resolution (<code class="inline">CFGR.RES</code>).</p>
+
+  <h3>GPIO: analog mode + the L4 analog switch (ASCR)</h3>
+  <p>Set the pin to analog mode (<code class="inline">MODER = 11</code>) and disable the pull-up/pull-down. On STM32L4/L4+, many ADC-capable pins sit behind a <strong>low-leakage analog switch</strong> that must be closed by setting the matching bit in <code class="inline">GPIOx_ASCR</code> (Analog Switch Control Register). Forgetting <code class="inline">ASCR</code> is a classic "why is my reading stuck?" bug.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Channel</th><th>Typical pin*</th><th>ADC(s)</th></tr></thead>
+      <tbody>
+        <tr><td>ADC12_IN5</td><td>PA0</td><td>ADC1, ADC2</td></tr>
+        <tr><td>ADC12_IN6</td><td>PA1</td><td>ADC1, ADC2</td></tr>
+        <tr><td>ADC12_IN7</td><td>PA2</td><td>ADC1, ADC2</td></tr>
+        <tr><td>ADC12_IN8</td><td>PA3</td><td>ADC1, ADC2</td></tr>
+        <tr><td>ADC12_IN9</td><td>PA4</td><td>ADC1, ADC2</td></tr>
+        <tr><td>ADC1_IN1</td><td>PC0</td><td>ADC1 (IN1)</td></tr>
+        <tr><td>ADC12_IN15</td><td>PB0</td><td>ADC1, ADC2</td></tr>
+        <tr><td>ADC12_IN16</td><td>PB1</td><td>ADC1, ADC2</td></tr>
+        <tr><td>VREFINT</td><td>internal</td><td>ADC1, ch 0</td></tr>
+        <tr><td>Temp sensor</td><td>internal</td><td>ADC1, ch 17</td></tr>
+        <tr><td>VBAT/3</td><td>internal</td><td>ADC1, ch 18</td></tr>
+      </tbody>
+    </table>
+    <p class="dim">*Pin↔channel routing varies by package — always confirm against the "Pin definitions / additional functions" table in DS12023 for your exact part. Internal-channel numbers (0/17/18) are fixed.</p>
+  </div>
+
+  <h3>Sampling time (SMPRx) and resolution (CFGR.RES)</h3>
+  <p>Each channel gets a 3-bit sampling time. Total conversion time = <em>sampling cycles + successive-approximation cycles</em> (12.5 cycles at 12-bit). High-impedance sources and internal channels need long sampling times.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>SMP[2:0]</th><th>Sampling</th><th></th><th>RES[1:0]</th><th>Resolution / SAR cycles</th></tr></thead>
+      <tbody>
+        <tr><td>000</td><td>2.5 cyc</td><td></td><td>00</td><td>12-bit / 12.5</td></tr>
+        <tr><td>001</td><td>6.5 cyc</td><td></td><td>01</td><td>10-bit / 10.5</td></tr>
+        <tr><td>010</td><td>12.5 cyc</td><td></td><td>10</td><td>8-bit / 8.5</td></tr>
+        <tr><td>011</td><td>24.5 cyc</td><td></td><td>11</td><td>6-bit / 6.5</td></tr>
+        <tr><td>100</td><td>47.5 cyc</td><td></td><td></td><td></td></tr>
+        <tr><td>101</td><td>92.5 cyc</td><td></td><td></td><td></td></tr>
+        <tr><td>110</td><td>247.5 cyc</td><td></td><td></td><td></td></tr>
+        <tr><td>111</td><td>640.5 cyc</td><td></td><td></td><td></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>The STM32L4 sequencer has <strong>no separate "scan enable" bit</strong> (unlike STM32F1). Scanning is implicit: set the sequence length <code class="inline">SQR1.L = N-1</code> and list the channels in <code class="inline">SQ1..SQ16</code>; the ADC walks the list automatically. Use <code class="inline">CFGR.DISCEN</code> only for discontinuous (chunked) sequencing.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — single-channel conversion (PA0 = ADC1_IN5)</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">uint16_t</span> adc1_read_pa0(<span class="keyword">void</span>)
+{
+    <span class="cmt">/* PA0 analog + close the analog switch (ASCR) */</span>
+    RCC-&gt;AHB2ENR |= RCC_AHB2ENR_GPIOAEN;
+    GPIOA-&gt;MODER |= (3U &lt;&lt; (0 * 2));       <span class="cmt">// PA0 = analog (11)</span>
+    GPIOA-&gt;PUPDR &amp;= ~(3U &lt;&lt; (0 * 2));      <span class="cmt">// no pull</span>
+    GPIOA-&gt;ASCR  |= GPIO_ASCR_ASC0;        <span class="cmt">// route analog signal to ADC</span>
+
+    ADC1-&gt;CFGR &amp;= ~ADC_CFGR_RES;           <span class="cmt">// 12-bit (RES = 00)</span>
+
+    <span class="cmt">/* channel 5 sampling = 47.5 cycles (SMP5 = 100) */</span>
+    ADC1-&gt;SMPR1 &amp;= ~(0x7U &lt;&lt; ADC_SMPR1_SMP5_Pos);
+    ADC1-&gt;SMPR1 |=  (0x4U &lt;&lt; ADC_SMPR1_SMP5_Pos);
+
+    <span class="cmt">/* sequence: 1 conversion, SQ1 = channel 5 */</span>
+    ADC1-&gt;SQR1 &amp;= ~ADC_SQR1_L;             <span class="cmt">// L = 0 -&gt; one conversion</span>
+    ADC1-&gt;SQR1 &amp;= ~ADC_SQR1_SQ1;
+    ADC1-&gt;SQR1 |= (5U &lt;&lt; ADC_SQR1_SQ1_Pos);
+
+    ADC1-&gt;CFGR &amp;= ~ADC_CFGR_CONT;          <span class="cmt">// single conversion</span>
+    ADC1-&gt;CFGR &amp;= ~ADC_CFGR_EXTEN;         <span class="cmt">// software trigger</span>
+
+    ADC1-&gt;CR |= ADC_CR_ADSTART;
+    <span class="keyword">while</span> (!(ADC1-&gt;ISR &amp; ADC_ISR_EOC)) { }
+    <span class="keyword">return</span> (uint16_t)ADC1-&gt;DR;              <span class="cmt">// reading DR clears EOC</span>
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ SECTION 04 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">04</span> Internal channels: VREFINT, temperature, VBAT</h2>
+  <p class="section-lead">Three internal analog sources are wired to fixed ADC1 channels. They only produce valid data after their path is enabled in <code class="inline">ADC12_COMMON.CCR</code> and sampled long enough. Factory calibration constants in system memory turn raw counts into volts and degrees.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Signal</th><th>ADC1 channel</th><th>CCR enable bit</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>VREFINT</td><td>IN0</td><td>VREFEN (bit 22)</td><td>~1.212 V bandgap; used to measure real V<sub>DDA</sub></td></tr>
+        <tr><td>Temp sensor</td><td>IN17</td><td>CH17SEL (bit 23)</td><td>needs long sampling + start-up time</td></tr>
+        <tr><td>VBAT/3</td><td>IN18</td><td>CH18SEL (bit 24)</td><td>VBAT divided by 3 internally</td></tr>
+      </tbody>
+    </table>
+    <p class="dim">On the STM32L4 CMSIS/SVD the temp/VBAT enables are named CH17SEL / CH18SEL (the RM refers to them as the temperature-sensor and VBAT enable bits).</p>
+  </div>
+
+  <div class="callout">
+    <div class="label">CALIBRATION CONSTANTS (STM32L4, measured @ V<sub>DDA</sub> = 3.0 V)</div>
+    <p><code class="inline">VREFINT_CAL</code> @ 0x1FFF75AA (30 °C). <code class="inline">TS_CAL1</code> @ 0x1FFF75A8 (30 °C) and <code class="inline">TS_CAL2</code> @ 0x1FFF75CA (130 °C). All are 16-bit right-aligned 12-bit values. Because they were taken at 3.0 V, scale live readings by the true V<sub>DDA</sub> you compute from VREFINT.</p>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — enable internal channels, compute VDDA and temperature</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Factory calibration values in system memory (STM32L4 addresses). */</span>
+<span class="keyword">#define</span> VREFINT_CAL   (*(uint16_t*)0x1FFF75AAUL)   <span class="cmt">// @3.0V, 30C</span>
+<span class="keyword">#define</span> TS_CAL1       (*(uint16_t*)0x1FFF75A8UL)   <span class="cmt">// 30C</span>
+<span class="keyword">#define</span> TS_CAL2       (*(uint16_t*)0x1FFF75CAUL)   <span class="cmt">// 130C</span>
+
+<span class="keyword">void</span> adc1_enable_internal_paths(<span class="keyword">void</span>)
+{
+    ADC12_COMMON-&gt;CCR |= ADC_CCR_VREFEN;    <span class="cmt">// VREFINT  (ch 0)</span>
+    ADC12_COMMON-&gt;CCR |= ADC_CCR_CH17SEL;   <span class="cmt">// temp     (ch 17)</span>
+    ADC12_COMMON-&gt;CCR |= ADC_CCR_CH18SEL;   <span class="cmt">// VBAT/3   (ch 18)</span>
+    <span class="cmt">// Use SMP = 111 (640.5 cyc) for these channels; the temp sensor</span>
+    <span class="cmt">// also needs its start-up time (~tens of µs) after CH17SEL = 1.</span>
+}
+
+<span class="cmt">/* vref_data / ts_data = raw 12-bit conversions of ch0 / ch17 */</span>
+<span class="keyword">float</span> vdda_millivolts(uint16_t vref_data)
+{
+    <span class="keyword">return</span> 3000.0f * (<span class="keyword">float</span>)VREFINT_CAL / (<span class="keyword">float</span>)vref_data;
+}
+
+<span class="keyword">float</span> temperature_celsius(uint16_t ts_data, <span class="keyword">float</span> vdda_mv)
+{
+    <span class="cmt">/* rescale the live reading to the 3.0 V calibration reference */</span>
+    <span class="keyword">float</span> ts = (<span class="keyword">float</span>)ts_data * vdda_mv / 3000.0f;
+    <span class="keyword">return</span> (130.0f - 30.0f) / (<span class="keyword">float</span>)(TS_CAL2 - TS_CAL1)
+         * (ts - (<span class="keyword">float</span>)TS_CAL1) + 30.0f;
+}</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ SECTION 05 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">05</span> Hardware oversampling (CFGR2)</h2>
+  <p class="section-lead">The oversampling engine accumulates <em>N</em> consecutive conversions, right-shifts the sum by <em>M</em> bits, and keeps the low 16 bits — all in hardware, no CPU load. It raises effective resolution (each ×4 in ratio adds ~1 ENOB) and averages out noise. Configure it entirely in <code class="inline">ADC_CFGR2</code>.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">ROVSE</span><span class="desc">bit 0 — enable regular-group oversampling</span></div>
+    <div class="param"><span class="name">JOVSE</span><span class="desc">bit 1 — enable injected-group oversampling</span></div>
+    <div class="param"><span class="name">OVSR[2:0]</span><span class="desc">bits 4:2 — oversampling ratio, 2× … 256×</span></div>
+    <div class="param"><span class="name">OVSS[3:0]</span><span class="desc">bits 8:5 — right bit-shift of the sum, 0 … 8</span></div>
+    <div class="param"><span class="name">TROVS</span><span class="desc">bit 9 — triggered mode (one trigger per oversampled sample)</span></div>
+    <div class="param"><span class="name">ROVSM</span><span class="desc">bit 10 — regular oversampling mode (continued / resumed)</span></div>
+  </div>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>OVSR</th><th>Ratio N</th><th>Sum max (12-bit)</th><th>OVSS shift for true resolution</th></tr></thead>
+      <tbody>
+        <tr><td>000</td><td>2×</td><td>~13-bit</td><td>1 → 12-bit avg</td></tr>
+        <tr><td>001</td><td>4×</td><td>~14-bit</td><td>1 → 13-bit</td></tr>
+        <tr><td>011</td><td>16×</td><td>~16-bit</td><td>0 → 16-bit / 4 → 12-bit avg</td></tr>
+        <tr><td>101</td><td>64×</td><td>~18-bit</td><td>3 → 15-bit</td></tr>
+        <tr><td>111</td><td>256×</td><td>~20-bit</td><td>4 → 16-bit</td></tr>
+      </tbody>
+    </table>
+    <p class="dim">Recipe for a true 16-bit result from 12-bit conversions: ratio 256× (OVSR=111) + shift 4 (OVSS=0100). For plain noise-averaging that keeps 12-bit scale, pick a ratio and shift equal in "bits" (e.g. 16× + shift 4).</p>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — 256× oversampling → 16-bit result in ADC1-&gt;DR</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">void</span> adc1_enable_16bit_oversampling(<span class="keyword">void</span>)
+{
+    ADC1-&gt;CFGR2 &amp;= ~(ADC_CFGR2_OVSR | ADC_CFGR2_OVSS);
+    ADC1-&gt;CFGR2 |= (0x7U &lt;&lt; ADC_CFGR2_OVSR_Pos);   <span class="cmt">// 111 = 256x ratio</span>
+    ADC1-&gt;CFGR2 |= (0x4U &lt;&lt; ADC_CFGR2_OVSS_Pos);   <span class="cmt">// shift right by 4 bits</span>
+    ADC1-&gt;CFGR2 |= ADC_CFGR2_ROVSE;               <span class="cmt">// enable regular oversampling</span>
+    <span class="cmt">// One ADSTART now yields ONE 16-bit oversampled sample in DR.</span>
+    <span class="cmt">// Configure CFGR2 while the ADC is enabled but NOT converting.</span>
+}</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">SHIFT vs OVERFLOW</div>
+    <p>The engine keeps only the 16 least-significant bits <em>after</em> the shift. If <code class="inline">OVSS</code> is too small for the ratio you choose, the accumulated sum overflows 16 bits and the result clips. Match the shift to the ratio (see table). Oversampling multiplies conversion time by N — budget it against your sample rate.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ SECTION 06 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">06</span> Single, continuous, scan &amp; circular DMA</h2>
+  <p class="section-lead">For steady multi-channel acquisition you combine a scanned sequence (<code class="inline">SQRx</code>) with <strong>continuous</strong> conversion (<code class="inline">CFGR.CONT</code>) and a <strong>circular</strong> DMA that copies each result out of the single <code class="inline">DR</code> before the next conversion overwrites it. Because <code class="inline">DR</code> is one register shared by all ranks, DMA is effectively mandatory for multi-channel scanning.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">CONT</span><span class="desc">CFGR bit 13 — 0: single sequence per trigger; 1: restart automatically</span></div>
+    <div class="param"><span class="name">DMAEN</span><span class="desc">CFGR bit 0 — issue a DMA request after every conversion</span></div>
+    <div class="param"><span class="name">DMACFG</span><span class="desc">CFGR bit 1 — 0: one-shot DMA; 1: circular DMA (for continuous)</span></div>
+    <div class="param"><span class="name">OVRMOD</span><span class="desc">CFGR bit 12 — 1: overrun overwrites DR (recommended with circular DMA)</span></div>
+  </div>
+
+  <h3>DMAMUX request routing</h3>
+  <p>On the STM32L4+ family DMA1/DMA2 channels are wired to peripherals through <strong>DMAMUX1</strong>. Program the peripheral's request ID into the DMAMUX channel that maps to your DMA channel. <code class="inline">DMAMUX1_Channel0</code> drives <code class="inline">DMA1_Channel1</code>, <code class="inline">DMAMUX1_Channel1</code> → <code class="inline">DMA1_Channel2</code>, and so on (DMA2 continues after DMA1's 7 channels).</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Peripheral</th><th>DMAMUX request ID (DMAREQ_ID)</th></tr></thead>
+      <tbody>
+        <tr><td>MEM2MEM</td><td>0</td></tr>
+        <tr><td>ADC1</td><td>5</td></tr>
+        <tr><td>ADC2</td><td>6</td></tr>
+        <tr><td>DAC1_CH1</td><td>6 (+shift on L4P5/L4Q5 only)</td></tr>
+      </tbody>
+    </table>
+    <p class="dim">Values from the CubeL4 LL DMAMUX header (LL_DMAMUX_REQ_ADC1 = 5, LL_DMAMUX_REQ_ADC2 = 6). Confirm the full list in RM0432's DMAMUX request-line table for your exact device.</p>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — 3-channel scan, continuous, circular DMA (register level)</span><span class="dot">●</span></div>
+    <pre><code><span class="keyword">#define</span> NCH 3
+<span class="keyword">static</span> <span class="keyword">volatile</span> uint16_t adc_buf[NCH];   <span class="cmt">// DMA target (half-words)</span>
+
+<span class="cmt">/* Assumes adc1_init_clock_and_calibrate() ran and ADC1 is DISABLED. */</span>
+<span class="keyword">void</span> adc1_start_scan_dma(<span class="keyword">void</span>)
+{
+    <span class="cmt">/* sequence: ch1, ch2, ch17(temp) -&gt; L = 2 (three conversions) */</span>
+    ADC1-&gt;SQR1 = (2U  &lt;&lt; ADC_SQR1_L_Pos)
+               | (1U  &lt;&lt; ADC_SQR1_SQ1_Pos)
+               | (2U  &lt;&lt; ADC_SQR1_SQ2_Pos)
+               | (17U &lt;&lt; ADC_SQR1_SQ3_Pos);
+
+    <span class="cmt">/* sampling: 247.5 cyc (110) for all three */</span>
+    ADC1-&gt;SMPR1 = (6U &lt;&lt; ADC_SMPR1_SMP1_Pos) | (6U &lt;&lt; ADC_SMPR1_SMP2_Pos);
+    ADC1-&gt;SMPR2 = (6U &lt;&lt; ADC_SMPR2_SMP17_Pos);
+    ADC12_COMMON-&gt;CCR |= ADC_CCR_CH17SEL;   <span class="cmt">// enable temp path (ch17)</span>
+
+    <span class="cmt">/* continuous + DMA + circular + overwrite on overrun */</span>
+    ADC1-&gt;CFGR |= ADC_CFGR_CONT | ADC_CFGR_DMAEN
+                | ADC_CFGR_DMACFG | ADC_CFGR_OVRMOD;
+
+    <span class="cmt">/* ---- DMA1 Channel1 via DMAMUX (request 5 = ADC1) ---- */</span>
+    RCC-&gt;AHB1ENR |= RCC_AHB1ENR_DMA1EN;
+    DMAMUX1_Channel0-&gt;CCR = 5U;                 <span class="cmt">// DMAREQ_ID = ADC1</span>
+
+    DMA1_Channel1-&gt;CCR   = 0;                   <span class="cmt">// disable while configuring</span>
+    DMA1_Channel1-&gt;CPAR  = (uint32_t)&amp;ADC1-&gt;DR; <span class="cmt">// source: ADC data reg</span>
+    DMA1_Channel1-&gt;CMAR  = (uint32_t)adc_buf;   <span class="cmt">// dest: RAM buffer</span>
+    DMA1_Channel1-&gt;CNDTR = NCH;
+    DMA1_Channel1-&gt;CCR   = DMA_CCR_MINC                  <span class="cmt">// increment memory</span>
+                        | (1U &lt;&lt; DMA_CCR_PSIZE_Pos)      <span class="cmt">// 16-bit peripheral</span>
+                        | (1U &lt;&lt; DMA_CCR_MSIZE_Pos)      <span class="cmt">// 16-bit memory</span>
+                        | DMA_CCR_CIRC                   <span class="cmt">// circular</span>
+                        | DMA_CCR_TCIE;                  <span class="cmt">// transfer-complete IRQ</span>
+    DMA1_Channel1-&gt;CCR  |= DMA_CCR_EN;
+
+    <span class="cmt">/* enable ADC, then start — it now free-runs into adc_buf[] */</span>
+    ADC1-&gt;ISR = ADC_ISR_ADRDY;
+    ADC1-&gt;CR |= ADC_CR_ADEN;
+    <span class="keyword">while</span> (!(ADC1-&gt;ISR &amp; ADC_ISR_ADRDY)) { }
+    ADC1-&gt;CR |= ADC_CR_ADSTART;
+}</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">CIRCULAR DMA CHECKLIST</div>
+    <p>Set <code class="inline">DMACFG=1</code> (circular) <em>and</em> <code class="inline">OVRMOD=1</code> so an overrun overwrites rather than stalls. Use 16-bit (half-word) transfer sizes on both sides — the meaningful ADC data is 16-bit even in 12-bit mode. Write <code class="inline">DMAEN</code> while <code class="inline">ADSTART=0</code>; to reconfigure a running stream, clear <code class="inline">DMAEN</code> then set it again.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ SECTION 07 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">07</span> HAL variant (STM32Cube)</h2>
+  <p class="section-lead">The STM32Cube HAL wraps the same registers. The handle's <code class="inline">Init</code> fields map one-to-one to <code class="inline">CFGR</code>/<code class="inline">CFGR2</code> bits, <code class="inline">HAL_ADCEx_Calibration_Start</code> performs the ADCAL sequence, and <code class="inline">HAL_ADC_Start_DMA</code> wires DR to your buffer. Clock enables, GPIO analog config and the DMA handle link live in the CubeMX-generated <code class="inline">HAL_ADC_MspInit</code>.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — multi-channel + oversampling + circular DMA (HAL)</span><span class="dot">●</span></div>
+    <pre><code>ADC_HandleTypeDef hadc1;
+<span class="keyword">static</span> uint16_t adc_buf[3];
+
+<span class="keyword">void</span> MX_ADC1_Init(<span class="keyword">void</span>)
+{
+    hadc1.Instance                   = ADC1;
+    hadc1.Init.ClockPrescaler        = ADC_CLOCK_ASYNC_DIV4;
+    hadc1.Init.Resolution            = ADC_RESOLUTION_12B;
+    hadc1.Init.ScanConvMode          = ADC_SCAN_ENABLE;
+    hadc1.Init.ContinuousConvMode    = ENABLE;
+    hadc1.Init.NbrOfConversion       = 3;
+    hadc1.Init.DiscontinuousConvMode = DISABLE;
+    hadc1.Init.ExternalTrigConv      = ADC_SOFTWARE_START;
+    hadc1.Init.DMAContinuousRequests = ENABLE;              <span class="cmt">// DMACFG = circular</span>
+    hadc1.Init.Overrun               = ADC_OVR_DATA_OVERWRITTEN;
+
+    <span class="cmt">/* hardware oversampling: 256x, shift 4 -&gt; true 16-bit */</span>
+    hadc1.Init.OversamplingMode                = ENABLE;
+    hadc1.Init.Oversampling.Ratio              = ADC_OVERSAMPLING_RATIO_256;
+    hadc1.Init.Oversampling.RightBitShift      = ADC_RIGHTBITSHIFT_4;
+    hadc1.Init.Oversampling.TriggeredMode      = ADC_TRIGGEREDMODE_SINGLE_TRIGGER;
+    hadc1.Init.Oversampling.OversamplingStopReset = ADC_REGOVERSAMPLING_CONTINUED_MODE;
+    HAL_ADC_Init(&amp;hadc1);
+
+    ADC_ChannelConfTypeDef s = {0};
+    s.SingleDiff   = ADC_SINGLE_ENDED;
+    s.OffsetNumber = ADC_OFFSET_NONE;
+    s.Offset       = 0;
+
+    s.Channel = ADC_CHANNEL_1; s.Rank = ADC_REGULAR_RANK_1;
+    s.SamplingTime = ADC_SAMPLETIME_247CYCLES_5;
+    HAL_ADC_ConfigChannel(&amp;hadc1, &amp;s);
+
+    s.Channel = ADC_CHANNEL_2; s.Rank = ADC_REGULAR_RANK_2;
+    HAL_ADC_ConfigChannel(&amp;hadc1, &amp;s);
+
+    s.Channel = ADC_CHANNEL_TEMPSENSOR; s.Rank = ADC_REGULAR_RANK_3;
+    s.SamplingTime = ADC_SAMPLETIME_640CYCLES_5;           <span class="cmt">// internal ch needs long SMP</span>
+    HAL_ADC_ConfigChannel(&amp;hadc1, &amp;s);
+
+    <span class="cmt">/* calibrate (single-ended) then start the circular DMA stream */</span>
+    HAL_ADCEx_Calibration_Start(&amp;hadc1, ADC_SINGLE_ENDED);
+    HAL_ADC_Start_DMA(&amp;hadc1, (uint32_t*)adc_buf, 3);
+}</code></pre>
+  </div>
+
+  <p>The HAL <code class="inline">ScanConvMode = ADC_SCAN_ENABLE</code> plus <code class="inline">NbrOfConversion = 3</code> simply program <code class="inline">SQR1.L = 2</code> and the three <code class="inline">SQ</code> ranks — there is no hardware scan bit behind it. <code class="inline">HAL_ADC_MspInit</code> (generated by CubeMX) must enable <code class="inline">ADCEN</code>, set the analog pins + <code class="inline">ASCR</code>, enable the temperature path, and initialise/link the DMA handle for <code class="inline">DMA_REQUEST_ADC1</code>.</p>
+</section>
+
+<!-- ═══════════════════ SECTION 08 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">08</span> Gotchas &amp; common mistakes</h2>
+  <p class="section-lead">Almost every "the ADC doesn't work" report on STM32L4 traces back to one of these. Check them in order.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Symptom</th><th>Cause / fix</th></tr></thead>
+      <tbody>
+        <tr><td>ADRDY never sets, ADEN "won't stick"</td><td>You set ADEN while another CR command bit was non-zero. ADEN is only accepted when ADCAL=ADSTP=ADSTART=ADDIS=ADEN=0. Also exit DEEPPWD and enable ADVREGEN + wait ~20 µs first.</td></tr>
+        <tr><td>Readings are noisy / offset</td><td>No calibration, or wrong calibration domain. Run ADCAL after the regulator is up; single-ended and differential need separate calibrations (ADCALDIF).</td></tr>
+        <tr><td>One specific pin reads garbage / floats</td><td>Missing the L4 analog switch: set the pin to analog mode <em>and</em> the matching <code class="inline">GPIOx_ASCR</code> bit (ASCn).</td></tr>
+        <tr><td>Internal channels read wrong</td><td>Enable the path (VREFEN / CH17SEL / CH18SEL), use a long SMP (247.5–640.5 cyc), and wait the temp-sensor start-up time after enabling CH17SEL.</td></tr>
+        <tr><td>Multi-channel buffer holds only one value / all identical</td><td>Only one DR exists; you must use DMA. Set DMAEN=1, DMACFG=1 (circular), CONT=1, and a scanned SQR sequence.</td></tr>
+        <tr><td>DMA stops after first pass / overrun (OVR)</td><td>Set OVRMOD=1 (overwrite) with circular DMA; verify DMAMUX request ID (ADC1=5, ADC2=6) and that DMAMUX1_ChannelN drives DMA1_Channel(N+1).</td></tr>
+        <tr><td>Oversampled result clips / saturates</td><td>OVSS shift too small for the ratio — the sum overflows 16 bits. Match shift to ratio (256× → shift 4 for true 16-bit).</td></tr>
+        <tr><td>Reconfig while running has no effect</td><td>Change SQR/SMPR/CFGR only with ADSTART=0. Use ADSTP to stop a regular conversion; ADDIS to disable the ADC.</td></tr>
+        <tr><td>EOC/DR behaves oddly with DMA</td><td>Reading DR clears EOC. In DMA mode the DMA reads DR — do not also read it in software.</td></tr>
+        <tr><td>ADC clock out of range / conversions wrong at high SYSCLK</td><td>Keep f<sub>ADC</sub> within the DS12023 limit: use CCR.PRESC in async mode or CKMODE=HCLK/2,/4 in sync mode.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Golden path</h4>
+    <ul>
+      <li>Clock (AHB2 ADCEN + CCR clock) → DEEPPWD=0 → ADVREGEN=1 + wait → ADCAL → ADEN + wait ADRDY.</li>
+      <li>Pins: analog mode + ASCR; sequence via SQR1.L and SQ ranks; long SMP for high-Z and internal channels.</li>
+      <li>Multi-channel = scan + CONT + circular DMA (DMAEN/DMACFG/OVRMOD, DMAMUX ADC1=5).</li>
+      <li>Oversampling in CFGR2: ROVSE + OVSR ratio + matched OVSS shift for the resolution you want.</li>
+    </ul>
+  </div>
+</section>
+
+</main>

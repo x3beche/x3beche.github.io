@@ -1,0 +1,620 @@
+---
+layout: tutorial
+title: "arm-none-eabi-gdb — Embedded Debugging Mastery"
+back_url: "../index.html"
+back_label: "All guides"
+---
+<header class="header">
+  <div class="meta">
+    <span>TECHNICAL GUIDE</span><span>STM32 DEBUG</span><span>GDB</span><span>2026</span>
+  </div>
+  <h1>arm-none-eabi-gdb<br><em>Embedded Debugging Mastery</em></h1>
+  <p class="subtitle">A field manual for driving the ARM cross-GDB on an STM32L4R5 (Cortex-M4F): connect to a GDB server, flash, set hardware breakpoints and watchpoints, poke peripheral registers by raw address, and dissect a HardFault from the SCB fault registers.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">Contents</div>
+  <ol>
+    <li><a href="#s0">Connecting: OpenOCD, st-util, J-Link GDB server</a></li>
+    <li><a href="#s1">Flashing &amp; loading firmware from GDB</a></li>
+    <li><a href="#s2">Breakpoints &amp; watchpoints (break, hbreak, watch)</a></li>
+    <li><a href="#s3">Stepping, backtrace &amp; frame navigation</a></li>
+    <li><a href="#s4">Examining memory &amp; core registers (x/, info registers)</a></li>
+    <li><a href="#s5">Peripheral registers by address (SVD-less)</a></li>
+    <li><a href="#s6">Catching HardFault: SCB CFSR / HFSR / BFAR</a></li>
+    <li><a href="#s7">TUI &amp; .gdbinit automation</a></li>
+    <li><a href="#s8">Gotchas &amp; common mistakes</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<section id="s0">
+  <h2><span class="num">01</span> Connecting: OpenOCD, st-util, J-Link GDB server</h2>
+  <p class="section-lead">GDB never talks to the chip directly. A <em>GDB server</em> owns the SWD/JTAG probe and exposes the GDB Remote Serial Protocol over a TCP port; <code>arm-none-eabi-gdb</code> is the client. Your whole workflow is: start a server, then <code>target extended-remote host:port</code>.</p>
+
+  <p>Use <code>target extended-remote</code> (not plain <code>target remote</code>) whenever the server supports it: the extended protocol lets you <code>kill</code>, re-<code>run</code> and reconnect without dropping the server, which is what you want for iterative flash-debug cycles.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>terminal 1 — start the server</span><span class="dot">&#9679;</span></div>
+    <pre><code># OpenOCD (ST-LINK v2/v3 on-board or standalone) — GDB port 3333
+openocd -f interface/stlink.cfg -f target/stm32l4x.cfg
+
+# texane/stlink st-util — GDB port 4242
+st-util
+
+# SEGGER J-Link — GDB port 2331, device name is mandatory
+JLinkGDBServer -device STM32L4R5ZI -if SWD -speed 4000
+
+# ST official ST-LINK GDB server (ships with STM32CubeIDE) — default port 61234
+# -cp points at the STM32CubeProgrammer bin dir it needs for flashing
+ST-LINK_gdbserver -p 61234 -e -d -cp /opt/st/stm32cubeide/.../tools/bin</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>terminal 2 — connect the client</span><span class="dot">&#9679;</span></div>
+    <pre><code>arm-none-eabi-gdb build/firmware.elf
+
+(gdb) target extended-remote localhost:3333   # OpenOCD
+# (gdb) target extended-remote localhost:4242   # st-util
+# (gdb) target extended-remote localhost:2331   # J-Link
+
+(gdb) monitor reset halt        # 'monitor' forwards a raw command to the server
+(gdb) info registers pc sp      # confirm the core is halted and reachable</code></pre>
+  </div>
+
+  <table class="file-table">
+    <thead><tr><th>Server</th><th>Launch command</th><th>GDB port</th><th>monitor dialect</th></tr></thead>
+    <tbody>
+      <tr><td>OpenOCD</td><td>openocd -f interface/stlink.cfg -f target/stm32l4x.cfg</td><td>3333</td><td>rich (reset halt, flash, semihosting)</td></tr>
+      <tr><td>st-util</td><td>st-util</td><td>4242</td><td>minimal</td></tr>
+      <tr><td>J-Link GDB server</td><td>JLinkGDBServer -device STM32L4R5ZI -if SWD</td><td>2331</td><td>J-Link (monitor reset, monitor halt)</td></tr>
+      <tr><td>ST-LINK_gdbserver</td><td>ST-LINK_gdbserver -p 61234 -cp &lt;progr-dir&gt;</td><td>61234</td><td>ST GDB server</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <div class="label">Key idea</div>
+    <p><code>monitor &lt;cmd&gt;</code> is a passthrough to the <em>server</em>, so the syntax differs per server. <code>monitor reset halt</code> is OpenOCD; J-Link splits it into <code>monitor reset</code> + <code>monitor halt</code>. Everything else in this guide (break, x/, info registers) is pure GDB and identical across servers.</p>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">SWD wiring</div>
+    <p>The STM32L4R5 debug port is SWD (SWDIO/PA13, SWCLK/PA14) plus optional SWO trace (PB3). If <code>monitor reset halt</code> fails with "target not halted", the firmware may be reconfiguring PA13/PA14 as GPIO or entering a low-power mode — attach with <code>monitor reset halt</code> under connect-under-reset (OpenOCD: add <code>-c "reset_config srst_only srst_nogate connect_assert_srst"</code>).</p>
+  </div>
+</section>
+
+<section id="s1">
+  <h2><span class="num">02</span> Flashing &amp; loading firmware from GDB</h2>
+  <p class="section-lead">GDB's <code>load</code> command downloads the ELF's loadable sections straight into flash through the server, then you verify and reset. You rarely need a separate flasher during a debug session.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>flash + verify + run cycle</span><span class="dot">&#9679;</span></div>
+    <pre><code>(gdb) monitor reset halt          # stop the core before touching flash
+(gdb) load                         # program all LOAD sections into flash @ 0x08000000
+Loading section .isr_vector, size 0x30c lma 0x8000000
+Loading section .text, size 0x5f14 lma 0x800030c
+Loading section .data, size 0x88   lma 0x8006220
+Start address 0x0800030c, load size 25228
+
+(gdb) compare-sections             # read back flash and diff against the ELF
+Section .text: matched.
+
+(gdb) monitor reset halt           # re-run the vector table / SP from the fresh image
+(gdb) break main
+(gdb) continue</code></pre>
+  </div>
+
+  <p>Flashing outside a debug session (build pipelines, quick reflash) is faster with the dedicated tools:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>standalone flashing</span><span class="dot">&#9679;</span></div>
+    <pre><code># st-flash writes a raw binary at an absolute address (flash base = 0x08000000)
+arm-none-eabi-objcopy -O binary firmware.elf firmware.bin
+st-flash write firmware.bin 0x08000000
+
+# OpenOCD one-shot: program + verify + reset + exit
+openocd -f interface/stlink.cfg -f target/stm32l4x.cfg \
+        -c "program firmware.elf verify reset exit"
+
+# J-Link via GDB script (see .gdbinit section) or J-Flash</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">Symbols vs. image</div>
+    <p><code>load</code> writes bytes <em>and</em> refreshes symbols. If the target was already flashed by another tool and you only need the debug symbols, use <code>file firmware.elf</code> (or start GDB with the ELF) and <em>skip</em> <code>load</code>. Debugging with an ELF that does not match the flashed image gives you wrong source lines and phantom breakpoints — the classic "why is it stepping into the wrong function" bug.</p>
+  </div>
+
+  <div class="callout">
+    <div class="label">Run from RAM</div>
+    <p>If your linker script places code in SRAM1 (0x20000000), <code>load</code> writes directly to RAM (no flash-erase latency) and you set <code>$pc</code>/<code>$sp</code> manually or via a RAM vector table. Handy for fast edit-compile-debug loops. For flash images, always <code>monitor reset halt</code> after <code>load</code> so the Cortex-M reloads MSP and the reset vector from 0x08000000.</p>
+  </div>
+</section>
+
+<section id="s2">
+  <h2><span class="num">03</span> Breakpoints &amp; watchpoints (break, hbreak, watch)</h2>
+  <p class="section-lead">The Cortex-M4 has finite debug hardware: a Flash Patch &amp; Breakpoint (FPB) unit with a handful of instruction comparators (typically 6 on STM32 Cortex-M4) and a Data Watchpoint &amp; Trace (DWT) unit with 4 comparators. GDB juggles these for you, but you hit hard limits fast.</p>
+
+  <h3>Breakpoints</h3>
+  <div class="code-block">
+    <div class="code-header"><span>setting breakpoints</span><span class="dot">&#9679;</span></div>
+    <pre><code>(gdb) break main                 # by symbol
+(gdb) break usart.c:142          # by file:line
+(gdb) break *0x08001a3c          # by absolute address
+(gdb) break HardFault_Handler    # by handler name
+
+(gdb) tbreak SystemInit          # temporary: auto-deletes after first hit
+(gdb) hbreak process_packet      # FORCE a hardware (FPB) breakpoint
+
+(gdb) info breakpoints           # list, with hit counts
+(gdb) delete 2                   # remove breakpoint #2
+(gdb) disable 3                  # keep but deactivate
+
+# conditional + counted breakpoints (evaluated on-target each pass)
+(gdb) break adc_isr if channel == 7
+(gdb) condition 4 count &gt; 100
+(gdb) ignore 4 50                # skip the next 50 hits of bp #4
+
+# run a command list automatically at a breakpoint
+(gdb) commands 1
+&gt; printf "tick=%u sp=0x%08x\n", g_ticks, $sp
+&gt; continue
+&gt; end</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">break vs. hbreak on flash</div>
+    <p>A software breakpoint replaces the instruction with <code>BKPT</code>, which means <em>writing</em> the target memory. In flash that is expensive and not always possible per-instruction, so OpenOCD transparently promotes flash breakpoints to the FPB hardware anyway. Use <code>hbreak</code> explicitly when: (a) debugging code executing from flash/ROM and plain <code>break</code> silently fails to stop, or (b) the code region is not yet loaded. Every <code>hbreak</code> consumes one of the ~6 FPB slots — GDB reports <code>Cannot insert hardware breakpoint N</code> when they run out.</p>
+  </div>
+
+  <h3>Watchpoints (DWT data breakpoints)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>watchpoints halt on data access</span><span class="dot">&#9679;</span></div>
+    <pre><code>(gdb) watch  g_state            # break on WRITE to g_state
+(gdb) rwatch g_state            # break on READ
+(gdb) awatch g_state            # break on READ or WRITE (access)
+
+# watch a raw address — perfect for "who is corrupting this?"
+(gdb) watch *(uint32_t*)0x20000100
+
+# scope-limited: only while a local is live
+(gdb) watch buf[i] if i == 3
+
+(gdb) continue
+Hardware watchpoint 2: g_state
+Old value = 0
+New value = 3
+process_event () at events.c:88</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">4 watchpoints, hardware-enforced</div>
+    <p>Watchpoints map to DWT comparators (4 on Cortex-M4), and each can cover 1/2/4/8/16... bytes but must be size- and alignment-compatible. Watching a large struct or a 64-byte buffer can fail with <code>Cannot insert hardware watchpoints</code> because it needs more comparators than exist. Watch a single word or a specific field instead. Never rely on GDB "software watchpoints" on a Cortex-M — single-stepping every instruction to check a value is unusably slow.</p>
+  </div>
+</section>
+
+<section id="s3">
+  <h2><span class="num">04</span> Stepping, backtrace &amp; frame navigation</h2>
+  <p class="section-lead">Once halted, you drive execution one source line, one instruction, or one function at a time, and you climb the call stack to read locals in any frame.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>execution control</span><span class="dot">&#9679;</span></div>
+    <pre><code>(gdb) next        / n     # step over — do not descend into calls
+(gdb) step        / s     # step into — descend into called function
+(gdb) nexti       / ni    # step over one machine instruction
+(gdb) stepi       / si    # step into one machine instruction
+(gdb) finish              # run until current function returns, print retval
+(gdb) until 210           # run until source line 210 (skips loop iterations)
+(gdb) continue    / c     # resume until next breakpoint / fault
+(gdb) return 0            # force-return from current frame (careful!)</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>the call stack</span><span class="dot">&#9679;</span></div>
+    <pre><code>(gdb) backtrace   / bt     # full call chain, innermost first
+#0  i2c_wait_flag (tmo=1000) at i2c.c:73
+#1  0x08002c1a in i2c_write (addr=80) at i2c.c:120
+#2  0x08003044 in sensor_read () at bme280.c:55
+#3  0x080008e0 in main () at main.c:64
+
+(gdb) bt full             # backtrace + every frame's local variables
+(gdb) frame 2   / f 2     # select frame #2 (sensor_read)
+(gdb) up                  # move one frame toward main
+(gdb) down                # move one frame toward the fault
+(gdb) info args           # arguments of the selected frame
+(gdb) info locals         # locals of the selected frame
+(gdb) info frame          # CFA, saved regs, return address of this frame</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">Optimized code caveat</div>
+    <p>With <code>-O2</code> the backtrace can look wrong: inlined functions collapse, locals show <code>&lt;optimized out&gt;</code>, and stepping jumps around. Build the code under test with <code>-Og -g3</code> for faithful stepping while keeping realistic timing. <code>-g3</code> additionally gives you macro expansion in GDB.</p>
+  </div>
+</section>
+
+<section id="s4">
+  <h2><span class="num">05</span> Examining memory &amp; core registers (x/, info registers)</h2>
+  <p class="section-lead">The two workhorses: <code>x/</code> (examine memory) reads arbitrary addresses in any format; <code>info registers</code> dumps the core state. On a Cortex-M, OpenOCD also exposes the special registers (MSP, PSP, PRIMASK, CONTROL...) as GDB convenience registers.</p>
+
+  <h3>x/ — examine memory</h3>
+  <p>Syntax is <code>x/NFU addr</code>: <strong>N</strong> = count, <strong>F</strong> = format letter, <strong>U</strong> = unit size.</p>
+
+  <table class="file-table">
+    <thead><tr><th>Format F</th><th>Meaning</th><th>Unit U</th><th>Size</th></tr></thead>
+    <tbody>
+      <tr><td>x</td><td>hex</td><td>b</td><td>byte (1)</td></tr>
+      <tr><td>d / u</td><td>signed / unsigned decimal</td><td>h</td><td>halfword (2)</td></tr>
+      <tr><td>t</td><td>binary</td><td>w</td><td>word (4)</td></tr>
+      <tr><td>c / s</td><td>char / string</td><td>g</td><td>giant (8)</td></tr>
+      <tr><td>i</td><td>disassembled instruction</td><td>&nbsp;</td><td>&nbsp;</td></tr>
+      <tr><td>f / a</td><td>float / address (with symbol)</td><td>&nbsp;</td><td>&nbsp;</td></tr>
+    </tbody>
+  </table>
+
+  <div class="code-block">
+    <div class="code-header"><span>x/ recipes</span><span class="dot">&#9679;</span></div>
+    <pre><code>(gdb) x/8xw 0x20000000        # 8 words of SRAM1 in hex
+(gdb) x/16xb &amp;rx_buffer       # 16 raw bytes of a buffer
+(gdb) x/s device_name         # a C string
+(gdb) x/t 0x48000010          # GPIOA_IDR as binary
+(gdb) x/8i $pc                # disassemble 8 instructions at PC
+(gdb) x/i $pc                 # the exact instruction about to execute
+
+# print expressions with explicit format
+(gdb) p/x $lr                 # link register in hex
+(gdb) p/t status_reg          # a variable in binary
+(gdb) p (rx_len * 2) + 1      # arithmetic on target values
+(gdb) p sizeof(struct config) # types resolved from DWARF</code></pre>
+  </div>
+
+  <h3>Registers</h3>
+  <div class="code-block">
+    <div class="code-header"><span>core &amp; special registers</span><span class="dot">&#9679;</span></div>
+    <pre><code>(gdb) info registers          # r0-r12, sp, lr, pc, xpsr
+(gdb) info all-registers      # + FPU s0-s31, fpscr, and special regs
+(gdb) info registers pc sp lr # just these three
+
+# Cortex-M special registers (exposed by OpenOCD)
+(gdb) p/x $msp                # Main stack pointer
+(gdb) p/x $psp                # Process stack pointer
+(gdb) p/x $primask            # global IRQ mask (1 = IRQs off)
+(gdb) p/x $basepri            # priority threshold mask
+(gdb) p/x $faultmask
+(gdb) p/x $control            # bit0 nPRIV, bit1 SPSEL, bit2 FPCA
+
+# write a register (e.g. redirect execution or fix a stuck flag)
+(gdb) set $pc = 0x08001a3c
+(gdb) set $r0 = 0
+(gdb) set var g_error_flag = 0
+(gdb) set *(uint32_t*)0x20000100 = 0xDEADBEEF</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">xPSR decoding</div>
+    <p><code>$xpsr</code> low 9 bits are <code>ISR_NUMBER</code>: 0 = thread mode, 3 = HardFault, 11 = SVCall, 15 = SysTick, and <code>16 + IRQn</code> for peripheral IRQs. So a non-zero low byte in <code>$xpsr</code> means you are inside an exception handler — decode which one before trusting the stack.</p>
+  </div>
+</section>
+
+<section id="s5">
+  <h2><span class="num">06</span> Peripheral registers by address (SVD-less)</h2>
+  <p class="section-lead">No SVD, no CMSIS headers, no problem. Every STM32 peripheral is memory-mapped: compute <code>base + offset</code> from RM0432 and read/write it with <code>x/</code> or a cast. This is how you debug bring-up before any driver exists.</p>
+
+  <table class="file-table">
+    <thead><tr><th>Peripheral</th><th>Base address</th><th>Bus</th></tr></thead>
+    <tbody>
+      <tr><td>Flash memory</td><td>0x08000000</td><td>&mdash;</td></tr>
+      <tr><td>SRAM1</td><td>0x20000000</td><td>&mdash;</td></tr>
+      <tr><td>GPIOA / GPIOB / GPIOC</td><td>0x48000000 / 0x48000400 / 0x48000800</td><td>AHB2</td></tr>
+      <tr><td>RCC</td><td>0x40021000</td><td>AHB1</td></tr>
+      <tr><td>PWR</td><td>0x40007000</td><td>APB1</td></tr>
+      <tr><td>USART2</td><td>0x40004400</td><td>APB1</td></tr>
+      <tr><td>USART1</td><td>0x40013800</td><td>APB2</td></tr>
+      <tr><td>NVIC ISER0</td><td>0xE000E100</td><td>PPB</td></tr>
+      <tr><td>SysTick CTRL</td><td>0xE000E010</td><td>PPB</td></tr>
+      <tr><td>DWT CYCCNT</td><td>0xE0001004</td><td>PPB</td></tr>
+      <tr><td>SCB base</td><td>0xE000ED00</td><td>PPB</td></tr>
+    </tbody>
+  </table>
+
+  <p>GPIO port register offsets (add to the port base, e.g. GPIOA_ODR = 0x48000000 + 0x14 = 0x48000014):</p>
+  <table class="file-table">
+    <thead><tr><th>Offset</th><th>Register</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td>0x00</td><td>MODER</td><td>2 bits/pin: 00 input, 01 output, 10 alt-func, 11 analog</td></tr>
+      <tr><td>0x08</td><td>OSPEEDR</td><td>output speed</td></tr>
+      <tr><td>0x0C</td><td>PUPDR</td><td>pull-up / pull-down</td></tr>
+      <tr><td>0x10</td><td>IDR</td><td>input data (read pin levels)</td></tr>
+      <tr><td>0x14</td><td>ODR</td><td>output data</td></tr>
+      <tr><td>0x18</td><td>BSRR</td><td>atomic set (low 16) / reset (high 16)</td></tr>
+      <tr><td>0x20 / 0x24</td><td>AFRL / AFRH</td><td>alternate-function select, 4 bits/pin</td></tr>
+    </tbody>
+  </table>
+
+  <div class="code-block">
+    <div class="code-header"><span>live peripheral poking</span><span class="dot">&#9679;</span></div>
+    <pre><code># Is the GPIOA clock even enabled? RCC_AHB2ENR = 0x40021000 + 0x4C, bit0 = GPIOAEN
+(gdb) p/t *(uint32_t*)0x4002104C
+$1 = 1                          # bit0 set -> GPIOA clocked. If 0, your writes do nothing.
+
+# Read GPIOA_MODER, check PA5 (LED) is output (bits [11:10] = 01)
+(gdb) x/t 0x48000000
+
+# Read the pin levels on port A
+(gdb) x/t 0x48000010            # GPIOA_IDR
+
+# Toggle PA5 atomically via BSRR (set bit 5)
+(gdb) set *(uint32_t*)0x48000018 = (1 &lt;&lt; 5)      # BS5: drive high
+(gdb) set *(uint32_t*)0x48000018 = (1 &lt;&lt; 21)     # BR5: drive low
+
+# Read a USART2 status/data register set (base 0x40004400)
+(gdb) x/8xw 0x40004400          # ISR/RDR/TDR/BRR... dump the block
+
+# Free-running cycle counter for micro-benchmarks (must enable DWT first)
+(gdb) p/d *(uint32_t*)0xE0001004   # DWT_CYCCNT</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">Make it readable with a convenience type</div>
+    <p>Casting to <code>volatile uint32_t*</code> everywhere is noisy. In your <code>.gdbinit</code> define helpers like <code>define gpioa</code> that print MODER/IDR/ODR by name (see the automation section). GDB also honors <code>set $g = (uint32_t*)0x48000000</code>, after which <code>p/x $g[5]</code> reads offset 0x14.</p>
+  </div>
+
+  <div class="callout danger">
+    <div class="label">Read side effects</div>
+    <p>Some registers clear flags or pop FIFOs on read (e.g. a UART RDR read consumes a byte, reading certain status registers clears sticky bits). Using <code>x/</code> on those from GDB will silently change device state and hide the bug you are chasing. Know which registers are read-to-clear before you examine them.</p>
+  </div>
+</section>
+
+<section id="s6">
+  <h2><span class="num">07</span> Catching HardFault: SCB CFSR / HFSR / BFAR</h2>
+  <p class="section-lead">When a Cortex-M4 faults, it stacks 8 words and vectors to a handler. The <em>why</em> lives in the System Control Block fault status registers. These addresses are architectural (ARMv7-M), identical on every Cortex-M4 including the STM32L4R5.</p>
+
+  <table class="file-table">
+    <thead><tr><th>Register</th><th>Address</th><th>Tells you</th></tr></thead>
+    <tbody>
+      <tr><td>CFSR</td><td>0xE000ED28</td><td>Configurable Fault Status = UFSR[31:16] | BFSR[15:8] | MMFSR[7:0]</td></tr>
+      <tr><td>HFSR</td><td>0xE000ED2C</td><td>HardFault Status: FORCED (escalated) / VECTTBL</td></tr>
+      <tr><td>MMFAR</td><td>0xE000ED34</td><td>faulting data address (valid if MMFSR.MMARVALID)</td></tr>
+      <tr><td>BFAR</td><td>0xE000ED38</td><td>faulting bus address (valid if BFSR.BFARVALID)</td></tr>
+      <tr><td>SHCSR</td><td>0xE000ED24</td><td>enable bits for the separate fault handlers</td></tr>
+      <tr><td>CCR</td><td>0xE000ED14</td><td>DIV_0_TRP (bit4), UNALIGN_TRP (bit3)</td></tr>
+    </tbody>
+  </table>
+
+  <table class="file-table">
+    <thead><tr><th>Sub-reg</th><th>Bit</th><th>Flag</th><th>Cause</th></tr></thead>
+    <tbody>
+      <tr><td>MMFSR</td><td>0 / 1</td><td>IACCVIOL / DACCVIOL</td><td>MPU instruction / data access violation</td></tr>
+      <tr><td>MMFSR</td><td>7</td><td>MMARVALID</td><td>MMFAR holds the faulting address</td></tr>
+      <tr><td>BFSR</td><td>0 / 1</td><td>IBUSERR / PRECISERR</td><td>instruction bus err / precise data bus err (BFAR valid)</td></tr>
+      <tr><td>BFSR</td><td>2</td><td>IMPRECISERR</td><td>imprecise (buffered write) bus error — BFAR NOT valid</td></tr>
+      <tr><td>BFSR</td><td>7</td><td>BFARVALID</td><td>BFAR holds the faulting address</td></tr>
+      <tr><td>UFSR</td><td>0 / 1</td><td>UNDEFINSTR / INVSTATE</td><td>undefined instruction / illegal EPSR (Thumb bit cleared)</td></tr>
+      <tr><td>UFSR</td><td>2 / 3</td><td>INVPC / NOCP</td><td>bad EXC_RETURN / coprocessor (FPU) disabled or absent</td></tr>
+      <tr><td>UFSR</td><td>8 / 9</td><td>UNALIGNED / DIVBYZERO</td><td>unaligned access / divide-by-zero (needs trap enabled in CCR)</td></tr>
+      <tr><td>HFSR</td><td>30 / 1</td><td>FORCED / VECTTBL</td><td>escalated from a lower fault / bad vector table read</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Recipe A — decode a live fault from GDB</h3>
+  <p>You are stopped in <code>HardFault_Handler</code> (set <code>break HardFault_Handler</code> beforehand). Read the fault registers and recover the stacked frame:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>gdb — post-mortem in the handler</span><span class="dot">&#9679;</span></div>
+    <pre><code>(gdb) p/x *(uint32_t*)0xE000ED28      # CFSR
+$1 = 0x00000082                        # MMFSR: DACCVIOL(1) + MMARVALID(7) -> bad data access
+(gdb) p/x *(uint32_t*)0xE000ED2C      # HFSR
+$2 = 0x40000000                        # FORCED -> escalated from the config fault above
+(gdb) p/x *(uint32_t*)0xE000ED34      # MMFAR = the address that faulted
+$3 = 0x00000000                        # NULL-pointer write
+
+# Which SP was in use on entry? EXC_RETURN (in $lr) bit 2: 0 = MSP, 1 = PSP
+(gdb) p/x $lr
+$4 = 0xfffffff9                        # ...9 -> returns to MSP, thread mode
+
+# The 8-word exception frame sits at that SP. Dump it:
+(gdb) x/8xw $msp
+(gdb) set $frame = (uint32_t*)$msp
+(gdb) printf "stacked PC  = 0x%08x\n", $frame[6]   # the faulting instruction
+(gdb) printf "stacked LR  = 0x%08x\n", $frame[5]
+(gdb) printf "stacked xPSR= 0x%08x\n", $frame[7]
+(gdb) list *$frame[6]                  # jump to the guilty source line</code></pre>
+  </div>
+
+  <table class="file-table">
+    <thead><tr><th>SP offset</th><th>Stacked reg</th><th>Note</th></tr></thead>
+    <tbody>
+      <tr><td>+0x00</td><td>R0</td><td>frame[0]</td></tr>
+      <tr><td>+0x04</td><td>R1</td><td>frame[1]</td></tr>
+      <tr><td>+0x08</td><td>R2</td><td>frame[2]</td></tr>
+      <tr><td>+0x0C</td><td>R3</td><td>frame[3]</td></tr>
+      <tr><td>+0x10</td><td>R12</td><td>frame[4]</td></tr>
+      <tr><td>+0x14</td><td>LR (R14)</td><td>frame[5] — caller return addr</td></tr>
+      <tr><td>+0x18</td><td>Return address (PC)</td><td>frame[6] — the faulting instruction</td></tr>
+      <tr><td>+0x1C</td><td>xPSR</td><td>frame[7]</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Recipe B — a handler that captures the frame</h3>
+  <p>Put this in firmware so faults are dissectable even without a debugger attached (log <code>ctx</code> to flash/RTT). The naked prologue picks the correct stack pointer from EXC_RETURN and hands it to C.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>fault_handler.c</span><span class="dot">&#9679;</span></div>
+    <pre><code>#include &lt;stdint.h&gt;
+
+/* Fault sub-registers, architectural addresses (ARMv7-M). */
+#define SCB_CFSR  (*(volatile uint32_t*)0xE000ED28u)
+#define SCB_HFSR  (*(volatile uint32_t*)0xE000ED2Cu)
+#define SCB_MMFAR (*(volatile uint32_t*)0xE000ED34u)
+#define SCB_BFAR  (*(volatile uint32_t*)0xE000ED38u)
+
+typedef struct {
+    uint32_t r0, r1, r2, r3, r12, lr, pc, xpsr;
+} ExcFrame;
+
+/* Set a GDB breakpoint here, or log the fields, then inspect. */
+void hard_fault_report(ExcFrame *ctx)
+{
+    volatile uint32_t cfsr  = SCB_CFSR;   /* why */
+    volatile uint32_t hfsr  = SCB_HFSR;   /* escalated? */
+    volatile uint32_t mmfar = SCB_MMFAR;  /* valid iff CFSR bit7  */
+    volatile uint32_t bfar  = SCB_BFAR;   /* valid iff CFSR bit15 */
+    (void)cfsr; (void)hfsr; (void)mmfar; (void)bfar;
+    (void)ctx;                            /* ctx-&gt;pc = faulting instruction */
+    __asm volatile ("bkpt #0");           /* trap into the debugger */
+    for (;;) { }
+}
+
+__attribute__((naked)) void HardFault_Handler(void)
+{
+    __asm volatile (
+        "tst  lr, #4          \n"   /* EXC_RETURN bit2: 0=MSP, 1=PSP  */
+        "ite  eq              \n"
+        "mrseq r0, msp        \n"
+        "mrsne r0, psp        \n"
+        "b    hard_fault_report\n"
+    );
+}</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">Enable the specific faults first</div>
+    <p>By default MemManage, BusFault and UsageFault are disabled and everything escalates to HardFault (that is why <code>HFSR.FORCED</code> is so common). To fault precisely: set <code>SHCSR</code> (0xE000ED24) bits MEMFAULTENA(16)/BUSFAULTENA(17)/USGFAULTENA(18), and set <code>CCR</code> (0xE000ED14) DIV_0_TRP(4) to trap divide-by-zero. Imprecise bus faults (<code>IMPRECISERR</code>) point nowhere useful — insert a <code>DSB</code> after suspect writes to force precision, or set <code>ACTLR.DISDEFWBUF</code> (0xE000E008 bit1) to make all bus faults precise.</p>
+  </div>
+</section>
+
+<section id="s7">
+  <h2><span class="num">08</span> TUI &amp; .gdbinit automation</h2>
+  <p class="section-lead">The Text User Interface turns GDB into a split-pane debugger in your terminal; <code>.gdbinit</code> scripts collapse the connect-flash-inspect ritual into one command and give you named helpers for peripherals and fault registers.</p>
+
+  <h3>TUI layouts</h3>
+  <div class="code-block">
+    <div class="code-header"><span>tui commands</span><span class="dot">&#9679;</span></div>
+    <pre><code>(gdb) tui enable            # or start gdb with:  arm-none-eabi-gdb -tui
+(gdb) layout src           # source + command panes
+(gdb) layout asm           # disassembly pane
+(gdb) layout regs          # registers pane on top of src/asm
+(gdb) layout split         # source AND disassembly together
+(gdb) focus cmd            # send arrow keys to the command window
+(gdb) focus src            # scroll the source window instead
+
+# keybindings
+#   Ctrl-x a   toggle TUI on/off
+#   Ctrl-x 1   single window
+#   Ctrl-x 2   two windows (cycle)
+#   Ctrl-l     redraw (fixes a garbled screen)
+#   Ctrl-p/Ctrl-n  command history while a non-cmd window has focus</code></pre>
+  </div>
+
+  <h3>A project .gdbinit</h3>
+  <div class="code-block">
+    <div class="code-header"><span>.gdbinit (or debug.gdb via: gdb -x debug.gdb firmware.elf)</span><span class="dot">&#9679;</span></div>
+    <pre><code>set pagination off
+set confirm off
+set print pretty on
+set history save on
+
+# --- connect + reset + flash in one word ---
+define reload
+  monitor reset halt
+  load
+  monitor reset halt
+end
+document reload
+  Reset target, reflash the current ELF, reset again.
+end
+
+# --- dump the Cortex-M fault registers by name ---
+define faultregs
+  printf "CFSR  = 0x%08x\n", *(unsigned int*)0xE000ED28
+  printf "HFSR  = 0x%08x\n", *(unsigned int*)0xE000ED2C
+  printf "MMFAR = 0x%08x\n", *(unsigned int*)0xE000ED34
+  printf "BFAR  = 0x%08x\n", *(unsigned int*)0xE000ED38
+  printf "SHCSR = 0x%08x\n", *(unsigned int*)0xE000ED24
+end
+
+# --- decode GPIOA by name (base 0x48000000) ---
+define gpioa
+  printf "MODER=0x%08x  IDR=0x%04x  ODR=0x%04x\n", \
+    *(unsigned int*)0x48000000, \
+    *(unsigned int*)0x48000010, \
+    *(unsigned int*)0x48000014
+end
+
+# --- auto-print PC + instruction every time we stop ---
+define hook-stop
+  printf "-- stopped @ 0x%08x --\n", $pc
+  x/i $pc
+end
+
+# --- connect on startup ---
+target extended-remote localhost:3333
+monitor reset halt
+load
+break main
+tui enable
+layout src</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">GDB will not auto-load ./.gdbinit by default</div>
+    <p>For security, modern GDB refuses to source a <code>.gdbinit</code> from the current directory unless the path is trusted. Either run <code>arm-none-eabi-gdb -x debug.gdb firmware.elf</code> explicitly, or add to your <code>~/.gdbinit</code>: <code>add-auto-load-safe-path /path/to/project</code> (or the blunt <code>set auto-load safe-path /</code>). Otherwise you will see "<em>File ... auto-loading has been declined</em>" and your defines never register.</p>
+  </div>
+
+  <div class="callout">
+    <div class="label">Semihosting &amp; SWO for printf</div>
+    <p>To route target <code>printf</code> to the GDB console via semihosting (OpenOCD): <code>monitor arm semihosting enable</code>, then link with the semihosting stubs. For lower overhead, use the SWO/ITM trace pin (PB3) with <code>monitor tpiu ...</code> in OpenOCD, or SEGGER RTT with J-Link. Semihosting halts the core on each I/O call, so never leave it enabled in timing-sensitive code.</p>
+  </div>
+</section>
+
+<section id="s8">
+  <h2><span class="num">09</span> Gotchas &amp; common mistakes</h2>
+  <p class="section-lead">The bugs that eat an afternoon are almost never in the code you are stepping through — they are in the debug setup itself.</p>
+
+  <div class="callout danger">
+    <div class="label">ELF is not the flash</div>
+    <p>Debugging with an ELF that does not match the image on the chip is the number-one time sink. Symptoms: breakpoints that never hit, stepping into the "wrong" function, garbage locals. Always <code>load</code> (or <code>compare-sections</code>) before you trust source lines. If another tool flashed the board, reflash from GDB or confirm with <code>compare-sections</code>.</p>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">Out of hardware breakpoints/watchpoints</div>
+    <p><code>Cannot insert hardware breakpoint N</code> / <code>Cannot insert hardware watchpoints</code> means you exhausted the FPB (~6) or DWT (4) comparators. <code>delete</code> stale breakpoints, watch a single word instead of a whole struct, and remember every <code>hbreak</code> and every <code>watch</code>/<code>rwatch</code>/<code>awatch</code> permanently holds a slot until deleted.</p>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">"Cannot access memory at 0x..."</div>
+    <p>Reading a peripheral whose clock is gated returns a bus error, not zeros. Check <code>RCC_AHBxENR/APBxENR</code> first. Also: the core must be <em>halted</em> to read most memory over SWD; if <code>x/</code> fails, you are probably running — <code>Ctrl-C</code> or <code>monitor halt</code>. And you cannot read flash addresses that the linker never populated.</p>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">Imprecise bus faults lie about the address</div>
+    <p>If <code>BFSR.IMPRECISERR</code> is set, <code>BFARVALID</code> is 0 and the stacked PC points <em>past</em> the real culprit because the write was buffered. Force precision: insert a <code>DSB</code> after suspect stores, or set <code>ACTLR.DISDEFWBUF</code> (0xE000E008 bit1). Then re-run and the fault becomes <code>PRECISERR</code> with a valid <code>BFAR</code>.</p>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">Optimization &amp; the missing symbols</div>
+    <p><code>&lt;optimized out&gt;</code> and jumpy stepping come from <code>-O2</code>/<code>-Os</code> with inlining. Rebuild with <code>-Og -g3</code> for debugging. Also make sure you did not strip symbols and that <code>-g</code> reached the linker; a Release ELF with no DWARF gives you address-only debugging.</p>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">Stepping through WFI / low-power / the SysTick storm</div>
+    <p>Single-stepping into <code>__WFI()</code> or a STOP-mode entry can hang the debug connection because the core stops clocking the debug logic. Set the <code>DBGMCU_CR</code> DBG_STOP/DBG_STANDBY bits (or the OpenOCD keep-alive options) to keep the debug clock alive in low-power modes. Conversely, if <code>continue</code> immediately re-breaks in <code>SysTick_Handler</code>, you set a breakpoint in a 1 kHz ISR — use a condition or delete it.</p>
+  </div>
+
+  <div class="callout">
+    <div class="label">monitor is server-specific</div>
+    <p>Copy-pasting <code>monitor reset halt</code> against J-Link fails — it wants <code>monitor reset</code> then <code>monitor halt</code>. When a "monitor" command is rejected, you are aiming an OpenOCD idiom at a different server. The GDB-side commands (break, x/, info registers, watch) are identical everywhere; only <code>monitor</code> changes.</p>
+  </div>
+
+  <div class="summary">
+    <h4>One-screen cheat sheet</h4>
+    <ul>
+      <li><strong>Connect:</strong> <code>target extended-remote :3333</code> (OpenOCD) / <code>:4242</code> (st-util) / <code>:2331</code> (J-Link)</li>
+      <li><strong>Flash:</strong> <code>monitor reset halt</code> &rarr; <code>load</code> &rarr; <code>compare-sections</code> &rarr; <code>monitor reset halt</code></li>
+      <li><strong>Stop:</strong> <code>hbreak fn</code>, <code>watch *(uint32_t*)0xADDR</code>, <code>break fn if cond</code></li>
+      <li><strong>Look:</strong> <code>x/8xw addr</code>, <code>x/i $pc</code>, <code>info registers</code>, <code>p/x $msp</code>, <code>bt full</code></li>
+      <li><strong>Fault:</strong> CFSR 0xE000ED28, HFSR 0xE000ED2C, MMFAR 0xE000ED34, BFAR 0xE000ED38; stacked PC = <code>((uint32_t*)$msp)[6]</code></li>
+    </ul>
+  </div>
+</section>
+
+</main>

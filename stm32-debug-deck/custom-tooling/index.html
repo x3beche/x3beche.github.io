@@ -1,0 +1,671 @@
+---
+layout: tutorial
+title: "Writing Your Own Flash/Debug Tools & Automation"
+back_url: "../index.html"
+back_label: "All guides"
+---
+<header class="header">
+  <div class="meta">
+    <span>TECHNICAL GUIDE</span>
+    <span>STM32 DEBUG</span>
+    <span>TOOLING</span>
+    <span>2026</span>
+  </div>
+  <h1>Roll Your Own Flash &amp; Debug Tools<br><em>Scripting OpenOCD, GDB, pyOCD, pylink &amp; bootloaders</em></h1>
+  <p class="subtitle">Build reproducible, CI-friendly flash + verify + reset automation for the STM32L4R5 from OpenOCD Tcl, GDB batch scripts, Python (pyOCD / pylink), and the on-chip USART/USB-DFU bootloader.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">Contents</div>
+  <ol>
+    <li><a href="#s0">Why roll your own — L4R5 memory, boot &amp; flash registers</a></li>
+    <li><a href="#s1">OpenOCD Tcl scripting: procs for flash + verify + reset</a></li>
+    <li><a href="#s2">GDB batch &amp; command scripts (--batch -x / -ex)</a></li>
+    <li><a href="#s3">pyOCD: Python flashing, gdbserver &amp; scripting API</a></li>
+    <li><a href="#s4">pylink: driving a J-Link from Python</a></li>
+    <li><a href="#s5">Serial &amp; USB bootloader: stm32flash, DFU, pyserial/pyusb</a></li>
+    <li><a href="#s6">CI flashing &amp; a reusable flash.sh wrapper</a></li>
+    <li><a href="#s7">Gotchas &amp; common mistakes</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ 01 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">01</span> Why roll your own — L4R5 memory, boot &amp; flash registers</h2>
+  <p class="section-lead">A GUI programmer is fine on your desk. But automation — CI hardware-in-the-loop, board-bring-up scripts, field updates, batch programming — needs a deterministic, headless, exit-code-returning command. Every tool below reduces to the same three primitives: <strong>erase</strong>, <strong>program+verify</strong>, <strong>reset</strong>. To script them safely you must know the target's memory map and the FLASH controller it drives.</p>
+
+  <p>The STM32L4R5 is a Cortex-M4F (RM0432 reference manual, DS12023 datasheet) with up to <strong>2 MB Flash</strong> (e.g. STM32L4R5ZI = 2 MB) and <strong>640 KB SRAM</strong>. Flash is programmed as 72-bit words (a 64-bit double-word + 8 ECC bits), erased per page. Page size and bank layout depend on the <code>DBANK</code> option bit.</p>
+
+  <h3>Memory map — the addresses your scripts pass</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Region</th><th>Base address</th><th>Size</th><th>Notes</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Main Flash (user code)</td><td><span class="path">0x0800 0000</span></td><td>up to 2 MB</td><td>Programming/flash offset for every tool</td></tr>
+        <tr><td>System memory (ST bootloader)</td><td><span class="path">0x1FFF 0000</span></td><td>28 KB</td><td>Factory USART/USB-DFU loader; entered via BOOT0</td></tr>
+        <tr><td>OTP area</td><td><span class="path">0x1FFF 7000</span></td><td>1 KB</td><td>One-time-programmable</td></tr>
+        <tr><td>Option bytes</td><td><span class="path">0x1FFF 7800</span></td><td>—</td><td>RDP, BOOT config, DBANK, WRP</td></tr>
+        <tr><td>SRAM1</td><td><span class="path">0x2000 0000</span></td><td>192 KB</td><td>Default stack/heap; flash-loader RAM</td></tr>
+        <tr><td>SRAM2</td><td><span class="path">0x1000 0000</span> (also aliased at 0x2003 0000)</td><td>64 KB</td><td>Parity-protected, retained</td></tr>
+        <tr><td>SRAM3</td><td><span class="path">0x2004 0000</span></td><td>384 KB</td><td>Large buffer RAM</td></tr>
+        <tr><td>Peripherals</td><td><span class="path">0x4000 0000</span></td><td>—</td><td>FLASH ctrl at 0x4002 2000</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>FLASH controller registers (base 0x4002 2000)</h3>
+  <p>Every host tool that writes flash either (a) drives these registers directly over SWD, or (b) uploads a tiny <em>flash-loader</em> into SRAM that drives them. Knowing them lets you debug a stuck program cycle from the OpenOCD/pyOCD console.</p>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Register</th><th>Offset</th><th>Purpose / key fields</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>FLASH_ACR</td><td>0x00</td><td>LATENCY wait-states, prefetch, caches</td></tr>
+        <tr><td>FLASH_KEYR</td><td>0x08</td><td>Unlock CR: write <span class="field">0x45670123</span> then <span class="field">0xCDEF89AB</span></td></tr>
+        <tr><td>FLASH_OPTKEYR</td><td>0x0C</td><td>Unlock option bytes: <span class="field">0x08192A3B</span> then <span class="field">0x4C5D6E7F</span></td></tr>
+        <tr><td>FLASH_SR</td><td>0x10</td><td>BSY(16), EOP(0), PROGERR(3), WRPERR(4), PGSERR(7), OPTVERR(15)</td></tr>
+        <tr><td>FLASH_CR</td><td>0x14</td><td>PG(0), PER(1), MER1(2), PNB[10:3], BKER(11), MER2(15), STRT(16), OPTSTRT(17), OBL_LAUNCH(27), OPTLOCK(30), LOCK(31)</td></tr>
+        <tr><td>FLASH_ECCR</td><td>0x18</td><td>ECC error address &amp; flags</td></tr>
+        <tr><td>FLASH_OPTR</td><td>0x20</td><td>RDP[7:0], BFB2(20), DBANK(22), nBOOT1(23), nSWBOOT0(26), nBOOT0(27)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Boot selection — how your script forces the ROM bootloader</h3>
+  <p>With the default option bytes (<code>nSWBOOT0 = 1</code>) the physical <strong>BOOT0 pin</strong> chooses the boot source at reset. This is the mechanism serial/DFU flashing relies on.</p>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>BOOT0 pin</th><th>nBOOT0 (if nSWBOOT0=0)</th><th>Boot source</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>0 (GND)</td><td>1</td><td>Main Flash @ 0x0800 0000 — your app</td></tr>
+        <tr><td>1 (VDD)</td><td>0</td><td>System memory @ 0x1FFF 0000 — ST bootloader (USART/USB-DFU)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout">
+    <div class="label">NOTE</div>
+    <p>Empty-flash detection: if the first Flash word is 0xFFFF FFFF the ROM may fall through to the bootloader anyway. In dual-bank mode the <code>BFB2</code> option bit and the bank-swap logic decide which bank maps to 0x0800 0000 — keep that in mind when a "successful" flash still boots the wrong image.</p>
+  </div>
+
+  <div class="summary">
+    <h4>In this section</h4>
+    <ul>
+      <li>Flash offset for every tool is <strong>0x0800 0000</strong>; ROM bootloader lives at <strong>0x1FFF 0000</strong>.</li>
+      <li>Erase = per page; program = 64-bit double-words; FLASH_CR/SR/KEYR drive the cycle.</li>
+      <li>BOOT0 high + reset = enter the factory USART/USB-DFU loader.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ 02 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">02</span> OpenOCD Tcl scripting: procs for flash + verify + reset</h2>
+  <p class="section-lead">OpenOCD is a full Tcl interpreter. Anything you can type at the <code>telnet localhost 4444</code> prompt can live in a <code>.cfg</code>/<code>.tcl</code> file as a reusable <code>proc</code>. Start every project with one committed config file so the whole team (and CI) flashes identically.</p>
+
+  <h3>A reusable target config</h3>
+  <div class="code-block">
+    <div class="code-header"><span>stm32l4r5.cfg — ST-Link over SWD</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># --- probe: ST-Link v2/v3 (Nucleo/Discovery on-board or standalone) ---</span>
+source [find interface/stlink.cfg]
+<span class="cmt"># stlink.cfg defaults to SWD via the high-level adapter (hla_swd).</span>
+<span class="cmt"># For a v3 in DAP mode use: source [find interface/stlink-dap.cfg]</span>
+
+<span class="cmt"># --- target: STM32L4 family (covers L4R5) ---</span>
+source [find target/stm32l4x.cfg]
+
+adapter speed 1800          <span class="cmt"># kHz; drop to 480 for long/flaky wiring</span>
+reset_config srst_nogate    <span class="cmt"># use SRST for reliable reset-halt</span></code></pre>
+  </div>
+
+  <h3>Custom procs: erase → program → verify → run</h3>
+  <p>The built-in <code>program</code> helper already does reset+verify+exit, but a hand-written <code>proc</code> gives you full control (mass-erase, option bytes, memory pokes). Append these to the config above.</p>
+  <div class="code-block">
+    <div class="code-header"><span>stm32l4r5.cfg (continued) — helper procs</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># One-shot: full-chip erase, program ELF, verify, run, then quit OpenOCD.</span>
+proc flash_run {image} {
+    reset init                       <span class="cmt"># halt + init clocks for the flash loader</span>
+    stm32l4x mass_erase 0            <span class="cmt"># erase bank 0 (use 1 for bank 2)</span>
+    flash write_image erase "$image" 0 elf
+    verify_image "$image"
+    reset run
+    shutdown                         <span class="cmt"># exit with code 0 on success</span>
+}
+
+<span class="cmt"># Program a raw binary at a chosen offset (default main flash).</span>
+proc flash_bin {image {offset 0x08000000}} {
+    program "$image" verify reset exit "$offset"
+}
+
+<span class="cmt"># Read a 32-bit word / poke memory from a script.</span>
+proc peek {addr}       { mem2array v 32 $addr 1; return $v(0) }
+proc poke {addr val}   { mww $addr $val }</code></pre>
+  </div>
+
+  <h3>Invoking it headlessly (returns a shell exit code)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — batch flashing</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># ELF: verify + reset + exit in one line, no separate GDB needed</span>
+openocd -f stm32l4r5.cfg -c "flash_run build/app.elf"
+
+<span class="cmt"># Built-in helper (equivalent for most cases)</span>
+openocd -f interface/stlink.cfg -f target/stm32l4x.cfg \
+        -c "program build/app.elf verify reset exit"
+
+<span class="cmt"># Raw binary at the flash base</span>
+openocd -f stm32l4r5.cfg -c "flash_bin build/app.bin 0x08000000"
+
+<span class="cmt"># Chain arbitrary commands with -c; each is one Tcl line</span>
+openocd -f stm32l4r5.cfg \
+  -c "init" -c "reset halt" \
+  -c "stm32l4x mass_erase 0" \
+  -c "flash write_image erase build/app.bin 0x08000000 bin" \
+  -c "reset run" -c "shutdown"</code></pre>
+  </div>
+
+  <h3>stm32l4x flash-driver command reference</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Command</th><th>Effect</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>stm32l4x mass_erase 0</code></td><td>Erase entire bank (0 = first flash bank object)</td></tr>
+        <tr><td><code>stm32l4x unlock 0</code></td><td>Remove read/write protection (triggers RDP regression, wipes flash)</td></tr>
+        <tr><td><code>stm32l4x lock 0</code></td><td>Re-enable protection</td></tr>
+        <tr><td><code>stm32l4x option_read 0 0x20</code></td><td>Read option register at offset (0x20 = FLASH_OPTR)</td></tr>
+        <tr><td><code>stm32l4x option_write 0 0x20 val mask</code></td><td>Modify option bits (e.g. flip DBANK / nBOOT0)</td></tr>
+        <tr><td><code>stm32l4x option_load 0</code></td><td>Reload option bytes (OBL_LAUNCH — forces a reset)</td></tr>
+        <tr><td><code>flash write_image erase F 0 elf</code></td><td>Erase-as-needed then write ELF file F</td></tr>
+        <tr><td><code>verify_image F</code></td><td>Read-back compare against file F</td></tr>
+        <tr><td><code>dump_image F 0x08000000 0x1000</code></td><td>Read 4 KB of flash to a file (backup)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout warn">
+    <div class="label">WATCH OUT</div>
+    <p>OpenOCD default ports: <strong>gdb 3333</strong>, <strong>telnet 4444</strong>, <strong>tcl 6666</strong>. If a leftover <code>openocd</code> holds the ST-Link you get "LIBUSB_ERROR_BUSY". Always <code>shutdown</code> (or <code>kill %1</code>) at the end of a script.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 03 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">03</span> GDB batch &amp; command scripts (--batch -x / -ex)</h2>
+  <p class="section-lead">When you need to flash <em>and</em> inspect — dump a variable, hit a breakpoint, compare-sections after load — script GDB itself. <code>--batch</code> runs a script and exits with a status code, making it CI-safe; <code>-x file</code> loads a command file; <code>-ex "cmd"</code> injects single commands inline.</p>
+
+  <h3>A committed GDB command file</h3>
+  <div class="code-block">
+    <div class="code-header"><span>flash.gdb</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Assumes a gdbserver (OpenOCD/pyOCD) is already listening on :3333</span>
+target extended-remote :3333
+monitor reset halt          <span class="cmt"># "monitor" forwards to OpenOCD/pyOCD</span>
+load                        <span class="cmt"># download the ELF sections into flash</span>
+compare-sections            <span class="cmt"># read-back verify every loadable section</span>
+monitor reset run
+detach
+quit</code></pre>
+  </div>
+
+  <h3>Running it — server + client, then all-inline</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — GDB batch flashing</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># 1) Start the gdbserver in the background</span>
+openocd -f stm32l4r5.cfg &amp;
+OCD_PID=$!
+
+<span class="cmt"># 2) Run the command file in batch mode (exit code propagates)</span>
+arm-none-eabi-gdb --batch -x flash.gdb build/app.elf
+
+<span class="cmt"># 3) Clean up the server</span>
+kill $OCD_PID
+
+<span class="cmt"># --- or: everything inline, no .gdb file needed ---</span>
+arm-none-eabi-gdb --batch \
+  -ex "target extended-remote :3333" \
+  -ex "monitor reset halt" \
+  -ex "load" \
+  -ex "compare-sections" \
+  -ex "monitor reset run" \
+  -ex "detach" -ex "quit" \
+  build/app.elf</code></pre>
+  </div>
+
+  <h3>Useful in-GDB commands for embedded scripting</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Command</th><th>What it does</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>load</code></td><td>Write all loadable ELF sections to their addresses (flash on M4)</td></tr>
+        <tr><td><code>compare-sections</code></td><td>CRC-compare each section vs. target — the built-in verify</td></tr>
+        <tr><td><code>monitor reset halt</code></td><td>Pass <code>reset halt</code> to the underlying probe server</td></tr>
+        <tr><td><code>monitor flash write_image erase f 0x08000000</code></td><td>Drive OpenOCD's flash command from GDB</td></tr>
+        <tr><td><code>x/4xw 0x08000000</code></td><td>Examine 4 words at the flash base (check vector table)</td></tr>
+        <tr><td><code>p/x $pc</code></td><td>Print the program counter — sanity after reset-halt</td></tr>
+        <tr><td><code>set confirm off</code></td><td>Suppress y/n prompts — mandatory in <code>--batch</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout">
+    <div class="label">TIP</div>
+    <p>GDB reads <code>.gdbinit</code> from the CWD only if you opt in. In batch/CI use explicit <code>-x</code>/<code>-ex</code> and pass <code>-nx</code> to ignore stray init files, so the flash result is reproducible regardless of the developer's home config.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 04 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">04</span> pyOCD: Python flashing, gdbserver &amp; scripting API</h2>
+  <p class="section-lead">pyOCD is a pure-Python programmer/debugger for Cortex-M over CMSIS-DAP, ST-Link and J-Link. It ships a CLI (<code>flash</code>, <code>erase</code>, <code>reset</code>, <code>gdbserver</code>, <code>commander</code>, <code>pack</code>, <code>list</code>) and a scriptable Python API — ideal for test rigs.</p>
+
+  <h3>Install and add L4R5 device support (CMSIS-Pack)</h3>
+  <p>The L4R5 isn't in the tiny built-in target set, so pull its device family pack. The <em>exact</em> target type string comes from the pack — don't guess it, list it.</p>
+  <div class="code-block">
+    <div class="code-header"><span>bash — pyOCD setup</span><span class="dot">●</span></div>
+    <pre><code>pip install pyocd
+
+pyocd pack update                      <span class="cmt"># refresh the pack index</span>
+pyocd pack find stm32l4r5              <span class="cmt"># show matching devices</span>
+pyocd pack install stm32l4r5          <span class="cmt"># download + register the DFP</span>
+
+<span class="cmt"># Confirm the precise target type (e.g. stm32l4r5xg / stm32l4r5xi)</span>
+pyocd list --targets | grep -i l4r5
+pyocd list --probes                    <span class="cmt"># show connected probes + unique IDs</span></code></pre>
+  </div>
+
+  <h3>CLI flashing</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — pyocd flash / erase / gdbserver</span><span class="dot">●</span></div>
+    <pre><code>TGT=stm32l4r5xi        <span class="cmt"># use the string printed by "pyocd list --targets"</span>
+
+<span class="cmt"># ELF/HEX carry their own addresses; program + verify are automatic</span>
+pyocd flash -t $TGT build/app.elf
+
+<span class="cmt"># Raw .bin needs an explicit base address</span>
+pyocd flash -t $TGT --base-address 0x08000000 build/app.bin
+
+pyocd erase -t $TGT --chip              <span class="cmt"># full mass erase (or --sector A B)</span>
+pyocd reset -t $TGT                      <span class="cmt"># hardware reset the target</span>
+
+<span class="cmt"># GDB server on :3333; --persist survives client disconnects (CI reuse)</span>
+pyocd gdbserver -t $TGT --persist --frequency 4000000
+
+<span class="cmt"># Pick a specific probe when several are attached</span>
+pyocd flash -t $TGT -u 066EFF... build/app.elf</code></pre>
+  </div>
+
+  <h3>The Python API — full programmatic control</h3>
+  <div class="code-block">
+    <div class="code-header"><span>flash_l4r5.py — pyOCD scripting</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">#!/usr/bin/env python3</span>
+<span class="cmt"># pip install pyocd ; requires the L4R5 pack installed (see above)</span>
+from pyocd.core.helpers import ConnectHelper
+from pyocd.flash.file_programmer import FileProgrammer
+
+TARGET = "stm32l4r5xi"
+FLASH_BASE = 0x08000000
+
+<span class="cmt"># session_with_chosen_probe picks the only probe, or prompts / honours -u</span>
+with ConnectHelper.session_with_chosen_probe(
+        target_override=TARGET,
+        options={"frequency": 4_000_000}) as session:
+
+    target = session.target
+
+    <span class="cmt"># Program a file (chip_erase: "sector" | "chip" | "auto")</span>
+    prog = FileProgrammer(session, chip_erase="sector")
+    prog.program("build/app.hex")          <span class="cmt"># .elf/.hex/.bin all supported</span>
+    <span class="cmt"># For .bin: prog.program("app.bin", base_address=FLASH_BASE, file_format="bin")</span>
+
+    <span class="cmt"># Inspect / poke memory directly over SWD</span>
+    target.reset_and_halt()
+    sp    = target.read32(FLASH_BASE)      <span class="cmt"># initial stack pointer</span>
+    reset = target.read32(FLASH_BASE + 4)  <span class="cmt"># reset handler address</span>
+    print(f"SP=0x{sp:08x}  Reset=0x{reset:08x}")
+
+    target.write32(0x20000000, 0xDEADBEEF) <span class="cmt"># scribble RAM for a test</span>
+    assert target.read32(0x20000000) == 0xDEADBEEF
+
+    target.reset_and_halt()
+    target.resume()                        <span class="cmt"># let the app run</span></code></pre>
+  </div>
+
+  <h3>pyOCD CLI subcommand reference</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Subcommand</th><th>Use</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>pyocd flash</code></td><td>Program + verify an image (elf/hex/bin)</td></tr>
+        <tr><td><code>pyocd erase</code></td><td><code>--chip</code> mass erase or <code>--sector</code> ranges</td></tr>
+        <tr><td><code>pyocd reset</code></td><td>Reset (and optionally halt) the target</td></tr>
+        <tr><td><code>pyocd gdbserver</code></td><td>GDB remote on :3333 (add <code>--persist</code>)</td></tr>
+        <tr><td><code>pyocd commander</code></td><td>Interactive REPL: <code>read32</code>, <code>write32</code>, <code>reg</code>, <code>halt</code>…</td></tr>
+        <tr><td><code>pyocd pack</code></td><td><code>find</code> / <code>install</code> / <code>update</code> CMSIS device packs</td></tr>
+        <tr><td><code>pyocd list</code></td><td><code>--targets</code>, <code>--probes</code>, <code>--boards</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ 05 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">05</span> pylink: driving a J-Link from Python</h2>
+  <p class="section-lead">If your bench uses a SEGGER J-Link, <code>pylink-square</code> wraps the official J-Link DLL in Python. It's the go-to for test infrastructure: connect by serial number, flash, and poke memory with a clean object API. The J-Link DLL must be installed; the device name is SEGGER's string, e.g. <code>STM32L4R5ZI</code>.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — install</span><span class="dot">●</span></div>
+    <pre><code>pip install pylink-square          <span class="cmt"># import name is still "pylink"</span>
+<span class="cmt"># Requires SEGGER J-Link Software &amp; Documentation Pack (provides the DLL)</span></code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>flash_jlink.py — pylink</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">#!/usr/bin/env python3</span>
+import pylink
+
+DEVICE = "STM32L4R5ZI"             <span class="cmt"># SEGGER device string (case-insensitive)</span>
+FLASH_BASE = 0x08000000
+
+jlink = pylink.JLink()
+jlink.open()                       <span class="cmt"># or JLink().open(serial_no=504302020)</span>
+jlink.set_tif(pylink.enums.JLinkInterfaces.SWD)
+jlink.connect(DEVICE, speed="auto", verbose=True)
+
+print("Core ID: 0x%08x" % jlink.core_id())
+
+<span class="cmt"># flash_file() erases the needed sectors, programs, and verifies</span>
+jlink.reset(halt=True)
+jlink.flash_file("build/app.bin", FLASH_BASE)
+
+<span class="cmt"># Direct memory access mirrors pyOCD</span>
+sp = jlink.memory_read32(FLASH_BASE, 1)[0]
+print("Initial SP: 0x%08x" % sp)
+jlink.memory_write32(0x20000000, [0xDEADBEEF])
+
+jlink.reset(halt=False)            <span class="cmt"># reset and let the app run</span>
+jlink.close()</code></pre>
+  </div>
+
+  <h3>Key JLink methods</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Method</th><th>Purpose</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>open(serial_no=None, ip_addr=None)</code></td><td>Open USB or IP J-Link connection</td></tr>
+        <tr><td><code>set_tif(JLinkInterfaces.SWD)</code></td><td>Select SWD (or <code>.JTAG</code>) transport</td></tr>
+        <tr><td><code>connect(chip_name, speed, verbose)</code></td><td>Attach to the target; speed in kHz or <code>"auto"</code>/<code>"adaptive"</code></td></tr>
+        <tr><td><code>flash_file(path, addr)</code></td><td>Erase + program + verify a binary at <code>addr</code></td></tr>
+        <tr><td><code>flash(data, addr)</code></td><td>Program an in-memory byte list</td></tr>
+        <tr><td><code>erase()</code></td><td>Mass-erase; returns bytes erased</td></tr>
+        <tr><td><code>reset(halt=False)</code> / <code>halt()</code> / <code>restart()</code></td><td>Reset control; <code>reset(halt=True)</code> stops at the vector</td></tr>
+        <tr><td><code>memory_read32 / memory_write32(addr, ...)</code></td><td>32-bit word memory access</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout warn">
+    <div class="label">WATCH OUT</div>
+    <p>If <code>erase()</code>/<code>flash()</code> throws an "unspecified error", the core wasn't halted. Set a reset strategy before connecting, e.g. <code>jlink.set_reset_strategy(pylink.enums.JLinkResetStrategyCortexM3.RESETPIN)</code>, then <code>reset(halt=True)</code>.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 06 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">06</span> Serial &amp; USB bootloader: stm32flash, DFU, pyserial/pyusb</h2>
+  <p class="section-lead">No SWD probe? Every L4R5 ships a factory ROM bootloader at <strong>0x1FFF 0000</strong> reachable over USART (AN3155 protocol) and USB Full-Speed DFU (DfuSe). This is how field updates and gang programmers work. Force it by holding <strong>BOOT0 high</strong> at reset.</p>
+
+  <h3>Bootloader interfaces &amp; pins (STM32L4Rxxx, AN2606)</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Interface</th><th>Pins</th><th>Host tool</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>USART1</td><td>PA9 (TX) / PA10 (RX)</td><td><code>stm32flash</code></td></tr>
+        <tr><td>USART3</td><td>PB10/PB11 or PC10/PC11</td><td><code>stm32flash</code></td></tr>
+        <tr><td>USB FS DFU</td><td>PA11 (DM) / PA12 (DP)</td><td><code>dfu-util</code></td></tr>
+        <tr><td>I2C1/2/3, SPI1/2</td><td>see AN2606 table for L4Rxxx/Sxxx</td><td>custom / STM32CubeProgrammer</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout">
+    <div class="label">NOTE</div>
+    <p>The USART bootloader runs at <strong>8 data bits, even parity, 1 stop (8e1)</strong> and auto-detects baud from the initial <code>0x7F</code> byte. The USB DFU device enumerates as <strong>VID:PID 0483:DF11</strong>, alternate setting <strong>0 = "Internal Flash"</strong>.</p>
+  </div>
+
+  <h3>stm32flash — USART bootloader</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — stm32flash</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Probe: reads chip PID + bootloader version (confirms wiring/BOOT0)</span>
+stm32flash /dev/ttyUSB0
+
+<span class="cmt"># Write + verify + jump to the app at the flash base</span>
+stm32flash -w build/app.bin -v -g 0x08000000 /dev/ttyUSB0
+
+<span class="cmt"># Faster link (bootloader auto-bauds), .hex also accepted</span>
+stm32flash -b 115200 -w build/app.hex -v /dev/ttyUSB0
+
+stm32flash -o /dev/ttyUSB0        <span class="cmt"># mass erase only</span>
+stm32flash -r backup.bin -S 0x08000000:0x1000 /dev/ttyUSB0  <span class="cmt"># read back 4 KB</span>
+
+<span class="cmt"># Auto-toggle BOOT0/RESET via DTR/RTS, then reset out via RTS after write</span>
+stm32flash -R -i '-dtr,rts,:dtr,-rts' -w build/app.bin -v /dev/ttyUSB0</code></pre>
+  </div>
+
+  <h3>dfu-util — USB DFU (system memory)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>bash — dfu-util</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># With BOOT0 high + reset, the L4R5 appears as 0483:df11</span>
+dfu-util -l                        <span class="cmt"># list DFU devices + alt settings</span>
+
+<span class="cmt"># Program raw binary at the flash base, then leave DFU and run</span>
+dfu-util -a 0 -d 0483:df11 -s 0x08000000:leave -D build/app.bin
+
+<span class="cmt"># DFU wants a .bin (or DfuSe .dfu): convert from ELF first</span>
+arm-none-eabi-objcopy -O binary build/app.elf build/app.bin</code></pre>
+  </div>
+
+  <h3>Roll your own: pyserial handshake (AN3155)</h3>
+  <p>When you need a bespoke protocol (custom baud, encrypted payload, production log), talk the bootloader yourself. This minimal handshake confirms entry and reads the command set — the foundation for a full programmer.</p>
+  <div class="code-block">
+    <div class="code-header"><span>boot_probe.py — pyserial + AN3155</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">#!/usr/bin/env python3</span>
+<span class="cmt"># pip install pyserial ; usage: boot_probe.py /dev/ttyUSB0</span>
+import serial, sys
+
+INIT, ACK, NACK = 0x7F, 0x79, 0x1F
+
+port = serial.Serial(sys.argv[1], 57600,
+                     parity=serial.PARITY_EVEN,   <span class="cmt"># 8e1 — required</span>
+                     stopbits=serial.STOPBITS_ONE,
+                     timeout=1)
+
+<span class="cmt"># 1) Auto-baud + enter: single 0x7F, expect ACK</span>
+port.write(bytes([INIT]))
+if port.read(1) != bytes([ACK]):
+    sys.exit("no ACK - is BOOT0 high and the part in bootloader mode?")
+
+<span class="cmt"># 2) Get command: 0x00 + its complement 0xFF (every cmd is checksummed)</span>
+port.write(bytes([0x00, 0xFF]))
+if port.read(1) != bytes([ACK]):
+    sys.exit("Get command rejected")
+
+n    = port.read(1)[0]              <span class="cmt"># number of bytes that follow (minus 1)</span>
+body = port.read(n + 1)            <span class="cmt"># [bootloader_version, cmd0, cmd1, ...]</span>
+port.read(1)                        <span class="cmt"># trailing ACK</span>
+
+print("Bootloader version: 0x%02x" % body[0])
+print("Supported cmds:", body[1:].hex())</code></pre>
+  </div>
+
+  <h3>pyusb: raw DFU enumeration</h3>
+  <p>For USB DFU you can go under dfu-util with <code>pyusb</code> — useful to detect the device, read its interface string (the memory layout), or script a factory jig. For real transfers, dfu-util is still the pragmatic choice.</p>
+  <div class="code-block">
+    <div class="code-header"><span>dfu_find.py — pyusb</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">#!/usr/bin/env python3</span>
+<span class="cmt"># pip install pyusb   (needs libusb backend)</span>
+import usb.core, usb.util
+
+dev = usb.core.find(idVendor=0x0483, idProduct=0xDF11)
+if dev is None:
+    raise SystemExit("STM32 DFU device not found (BOOT0 high + reset?)")
+
+print("Found STM32 bootloader:", usb.util.get_string(dev, dev.iProduct))
+for cfg in dev:
+    for intf in cfg:
+        s = usb.util.get_string(dev, intf.iInterface)
+        print(f"  alt {intf.bAlternateSetting}: {s}")   <span class="cmt"># e.g. "@Internal Flash /0x08000000/..."</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ 07 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">07</span> CI flashing &amp; a reusable flash.sh wrapper</h2>
+  <p class="section-lead">Automation's payoff: a self-hosted CI runner with a probe attached that flashes and smoke-tests real hardware on every push. Wrap all methods behind one script so CI, bring-up, and production share the same command.</p>
+
+  <h3>flash.sh — one wrapper, four backends</h3>
+  <div class="code-block">
+    <div class="code-header"><span>flash.sh — openocd / pyocd / dfu / serial</span><span class="dot">●</span></div>
+    <pre><code>#!/usr/bin/env bash
+<span class="cmt"># flash.sh &lt;firmware.elf|.bin&gt; [method]   method: openocd|pyocd|dfu|serial</span>
+set -euo pipefail
+
+FW="${1:?usage: flash.sh &lt;firmware&gt; [openocd|pyocd|dfu|serial]}"
+METHOD="${2:-${FLASH_METHOD:-openocd}}"
+FLASH_ADDR="${FLASH_ADDR:-0x08000000}"
+CFG="${OOCD_CFG:-stm32l4r5.cfg}"
+PORT="${PORT:-/dev/ttyUSB0}"
+TGT="${PYOCD_TARGET:-stm32l4r5xi}"
+
+<span class="cmt"># Return a .bin path (objcopy if the input is an ELF)</span>
+to_bin() {
+  case "$1" in
+    *.bin) printf '%s' "$1" ;;
+    *) arm-none-eabi-objcopy -O binary "$1" /tmp/fw.bin; printf '%s' /tmp/fw.bin ;;
+  esac
+}
+
+echo "==&gt; flashing $FW via $METHOD"
+case "$METHOD" in
+  openocd)
+    openocd -f "$CFG" -c "program $FW verify reset exit" ;;
+  pyocd)
+    pyocd flash -t "$TGT" "$FW"
+    pyocd reset -t "$TGT" ;;
+  dfu)
+    BIN="$(to_bin "$FW")"
+    dfu-util -a 0 -d 0483:df11 -s "${FLASH_ADDR}:leave" -D "$BIN" ;;
+  serial)
+    BIN="$(to_bin "$FW")"
+    stm32flash -w "$BIN" -v -g "$FLASH_ADDR" "$PORT" ;;
+  *)
+    echo "unknown method: $METHOD" &gt;&amp;2; exit 2 ;;
+esac
+echo "==&gt; done"</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — using the wrapper</span><span class="dot">●</span></div>
+    <pre><code>chmod +x flash.sh
+./flash.sh build/app.elf                 <span class="cmt"># default: openocd</span>
+./flash.sh build/app.elf pyocd
+FLASH_METHOD=serial PORT=/dev/ttyUSB0 ./flash.sh build/app.bin
+./flash.sh build/app.elf dfu             <span class="cmt"># auto-objcopy to .bin</span></code></pre>
+  </div>
+
+  <h3>GitHub Actions — hardware-in-the-loop on a self-hosted runner</h3>
+  <p>Attach the ST-Link to a machine registered as a self-hosted runner (label it, e.g. <code>stm32l4r5</code>). The workflow builds, flashes with the wrapper, then runs a smoke test over the virtual COM port.</p>
+  {%- raw -%}
+  <div class="code-block">
+    <div class="code-header"><span>.github/workflows/flash.yml</span><span class="dot">●</span></div>
+    <pre><code>name: hil-flash
+on: [push]
+
+jobs:
+  flash:
+    runs-on: [self-hosted, stm32l4r5]      # runner with a probe attached
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build firmware
+        run: make -j$(nproc)
+
+      - name: Flash + verify
+        env:
+          OOCD_CFG: ci/stm32l4r5.cfg
+          PROBE_SERIAL: ${{ secrets.PROBE_SERIAL }}
+        run: ./flash.sh build/app.elf openocd
+
+      - name: Smoke test over UART
+        run: ./scripts/smoke_test.py --port /dev/ttyACM0 --timeout 10
+
+      - name: Save flash log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: flash-log
+          path: build/flash.log</code></pre>
+  </div>
+  {%- endraw -%}
+  <div class="callout">
+    <div class="label">TIP</div>
+    <p>Pin the probe by serial number in CI (<code>pyocd -u SERIAL</code>, <code>openocd -c "adapter serial SERIAL"</code>, or <code>hla_serial</code>) so a runner with several boards flashes the right one. Gate merges on the smoke-test job's exit code — that's your hardware regression net.</p>
+  </div>
+
+  <h3>Which tool for which job?</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Tool</th><th>Probe / link</th><th>gdbserver</th><th>Language</th><th>Best for</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>OpenOCD</td><td>ST-Link, CMSIS-DAP, J-Link, FTDI</td><td>:3333</td><td>Tcl</td><td>Universal, CI, custom procs</td></tr>
+        <tr><td>GDB batch</td><td>via any gdbserver</td><td>client</td><td>gdb script</td><td>Flash + inspect + assert</td></tr>
+        <tr><td>pyOCD</td><td>CMSIS-DAP, ST-Link, J-Link</td><td>:3333</td><td>Python</td><td>Pure-Python test rigs</td></tr>
+        <tr><td>pylink</td><td>SEGGER J-Link only</td><td>via JLinkGDBServer</td><td>Python</td><td>J-Link benches</td></tr>
+        <tr><td>dfu-util</td><td>USB (no probe)</td><td>—</td><td>C / CLI</td><td>USB field updates</td></tr>
+        <tr><td>stm32flash</td><td>USART (no probe)</td><td>—</td><td>C / CLI</td><td>Serial / gang programming</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ 08 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">08</span> Gotchas &amp; common mistakes</h2>
+  <p class="section-lead">The failure modes below account for most "it flashed but won't run" and "probe busy" tickets. Bake the fixes into your scripts.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Binary flashed at offset 0</span><span class="desc">A raw <code>.bin</code> has no address. If you pass it without <code>0x08000000</code> (OpenOCD/pyOCD <code>--base-address</code>/DfuSe <code>-s</code>), it lands at address 0 (or is rejected). ELF/HEX carry addresses; prefer them.</span></div>
+    <div class="param"><span class="name">Forgetting to verify</span><span class="desc">Program without verify silently tolerates a flaky link. Always add <code>verify</code> (OpenOCD), <code>compare-sections</code> (GDB), or rely on <code>flash_file</code>'s built-in read-back (pylink/pyOCD).</span></div>
+    <div class="param"><span class="name">Probe left busy</span><span class="desc">A lingering OpenOCD/pyocd gdbserver holds the ST-Link ("LIBUSB_ERROR_BUSY"). End scripts with <code>shutdown</code> / kill the PID; in CI use <code>--persist</code> deliberately or tear it down in a cleanup step.</span></div>
+    <div class="param"><span class="name">Wrong or missing pyOCD target</span><span class="desc">The L4R5 needs its CMSIS-Pack (<code>pyocd pack install stm32l4r5</code>). Don't hard-code a guessed type — read it from <code>pyocd list --targets</code>. A wrong type mis-sizes flash and erases the wrong pages.</span></div>
+    <div class="param"><span class="name">BOOT0 not asserted for serial/DFU</span><span class="desc">stm32flash/dfu-util fail with no ACK / no device unless BOOT0 is high at reset. Wire BOOT0 to a runner GPIO or use RTS/DTR (<code>stm32flash -i</code>) so CI can toggle it automatically.</span></div>
+    <div class="param"><span class="name">USART parity wrong</span><span class="desc">The ROM USART loader is <strong>8e1</strong> (even parity). Opening the port as 8n1 in pyserial gives intermittent NACKs. Set <code>parity=serial.PARITY_EVEN</code>.</span></div>
+    <div class="param"><span class="name">Read/RDP protection</span><span class="desc">If RDP level 1 is set, reads return zeros and programming fails. <code>stm32l4x unlock 0</code> regresses RDP but <strong>mass-erases</strong> the chip — never run it blindly in a "reflash" script.</span></div>
+    <div class="param"><span class="name">Dual-bank / BFB2 surprise</span><span class="desc">In dual-bank mode the bank mapped to 0x0800 0000 depends on <code>BFB2</code> and bank-swap state. A "successful" flash to bank 1 can still boot bank 2's stale image. Fix the boot bank in your bring-up option-byte step.</span></div>
+    <div class="param"><span class="name">GDB batch hangs on a prompt</span><span class="desc">Confirmation prompts stall <code>--batch</code> forever in CI. Add <code>set confirm off</code> and pass <code>-nx</code> to ignore developer <code>.gdbinit</code> files.</span></div>
+    <div class="param"><span class="name">GitHub Actions <code>${{ }}</code> in code blocks</span><span class="desc">Not an MCU bug but a docs one: Jekyll/Liquid eats <code>{% raw %}{{ }}{% endraw %}</code>. Wrap any Actions YAML you publish in <code>{% raw %}{%- raw -%}{%- endraw -%}{% endraw %}</code> or the workflow renders blank.</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>Golden rules</h4>
+    <ul>
+      <li>Commit one config (<code>stm32l4r5.cfg</code>) + one wrapper (<code>flash.sh</code>); everyone flashes identically.</li>
+      <li>Always <strong>verify</strong> and always <strong>free the probe</strong> at the end.</li>
+      <li>ELF/HEX over raw BIN; when you must use BIN, always pass <code>0x08000000</code>.</li>
+      <li>For serial/DFU: BOOT0 high, 8e1 parity, VID:PID 0483:DF11 — then reset to run.</li>
+    </ul>
+  </div>
+</section>
+
+</main>

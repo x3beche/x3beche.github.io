@@ -1,0 +1,793 @@
+---
+layout: tutorial
+title: "STM32L4R5 — Timers (PWM, Input Capture, Encoder)"
+back_url: "../index.html"
+back_label: "All guides"
+---
+<header class="header">
+  <div class="meta">
+    <span>TECHNICAL GUIDE</span><span>STM32L4R5</span><span>TIMERS</span><span>2026</span>
+  </div>
+  <h1>STM32L4R5 Timers<br><em>PWM, input capture, encoder &amp; low-power.</em></h1>
+  <p class="subtitle">Register-accurate map of every TIMx and LPTIMx on the STM32L4R5 (RM0432 / DS12023): time-base math, PWM edge/center, complementary outputs with dead-time, input capture, quadrature encoder and one-pulse — with copy-pasteable bare-metal and HAL code.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">Contents</div>
+  <ol>
+    <li><a href="#s0">Timer landscape &amp; clock tree</a></li>
+    <li><a href="#s1">Time-base engine: PSC / ARR / CNT / RCR</a></li>
+    <li><a href="#s2">PWM generation (edge &amp; center-aligned)</a></li>
+    <li><a href="#s3">Advanced control: complementary + dead-time</a></li>
+    <li><a href="#s4">Input capture</a></li>
+    <li><a href="#s5">Encoder interface mode</a></li>
+    <li><a href="#s6">One-pulse mode</a></li>
+    <li><a href="#s7">LPTIM — low-power timer</a></li>
+    <li><a href="#s8">Gotchas / common mistakes</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">01</span> Timer landscape &amp; clock tree</h2>
+  <p class="section-lead">The STM32L4R5 (Cortex-M4F, up to 120&nbsp;MHz) carries two advanced-control timers, five general-purpose timers, two basic timers and two low-power timers. Picking the right one is the first design decision: only TIM1/TIM8 do complementary outputs with dead-time, only TIM2/TIM5 are 32-bit, and only LPTIM keeps running in Stop mode.</p>
+
+  <h3>Complete timer map</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Timer</th><th>Class</th><th>Width</th><th>Channels</th><th>Comp. out</th><th>Dead-time / Break</th><th>Rep. cnt (RCR)</th><th>Bus</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>TIM1</code></td><td>Advanced</td><td>16-bit</td><td>4 (CH1–CH4)</td><td>CH1N–CH3N</td><td>Yes</td><td>16-bit</td><td>APB2</td></tr>
+        <tr><td><code>TIM8</code></td><td>Advanced</td><td>16-bit</td><td>4 (CH1–CH4)</td><td>CH1N–CH3N</td><td>Yes</td><td>16-bit</td><td>APB2</td></tr>
+        <tr><td><code>TIM2</code></td><td>General</td><td><strong>32-bit</strong></td><td>4</td><td>—</td><td>—</td><td>—</td><td>APB1</td></tr>
+        <tr><td><code>TIM3</code></td><td>General</td><td>16-bit</td><td>4</td><td>—</td><td>—</td><td>—</td><td>APB1</td></tr>
+        <tr><td><code>TIM4</code></td><td>General</td><td>16-bit</td><td>4</td><td>—</td><td>—</td><td>—</td><td>APB1</td></tr>
+        <tr><td><code>TIM5</code></td><td>General</td><td><strong>32-bit</strong></td><td>4</td><td>—</td><td>—</td><td>—</td><td>APB1</td></tr>
+        <tr><td><code>TIM6</code></td><td>Basic</td><td>16-bit</td><td>0 (time-base / DAC trig)</td><td>—</td><td>—</td><td>—</td><td>APB1</td></tr>
+        <tr><td><code>TIM7</code></td><td>Basic</td><td>16-bit</td><td>0 (time-base / DAC trig)</td><td>—</td><td>—</td><td>—</td><td>APB1</td></tr>
+        <tr><td><code>TIM15</code></td><td>General</td><td>16-bit</td><td>2 (CH1, CH2)</td><td>CH1N</td><td>Break only</td><td>8-bit</td><td>APB2</td></tr>
+        <tr><td><code>TIM16</code></td><td>General</td><td>16-bit</td><td>1 (CH1)</td><td>CH1N</td><td>Break only</td><td>8-bit</td><td>APB2</td></tr>
+        <tr><td><code>TIM17</code></td><td>General</td><td>16-bit</td><td>1 (CH1)</td><td>CH1N</td><td>Break only</td><td>8-bit</td><td>APB2</td></tr>
+        <tr><td><code>LPTIM1</code></td><td>Low-power</td><td>16-bit</td><td>1 out</td><td>—</td><td>—</td><td>—</td><td>APB1</td></tr>
+        <tr><td><code>LPTIM2</code></td><td>Low-power</td><td>16-bit</td><td>1 out</td><td>—</td><td>—</td><td>—</td><td>APB1</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Timer clock derivation (the doubling rule)</h3>
+  <p>The counter clock <code class="inline">CK_INT</code> is <em>not</em> simply PCLK. STM32L4 applies the classic APB doubling rule: if the APB prescaler is 1, the timer clock equals PCLKx; if the APB prescaler is greater than 1, the timer clock is <strong>2&nbsp;×&nbsp;PCLKx</strong>. There is no <code class="inline">TIMPRE</code> bit on L4 (that is an F7/H7 feature).</p>
+  <div class="params">
+    <div class="param"><span class="name">SYSCLK</span><span class="desc">≤ 120 MHz on STM32L4R5 (needs Range 1 boost, Flash 5 WS, and the on-chip or external SMPS path).</span></div>
+    <div class="param"><span class="name">APB1 presc = 1</span><span class="desc">PCLK1 = 120 MHz → TIM2–7 clock = 120 MHz.</span></div>
+    <div class="param"><span class="name">APB1 presc = 2</span><span class="desc">PCLK1 = 60 MHz → TIM2–7 clock = 2 × 60 = 120 MHz (doubling kicks in).</span></div>
+    <div class="param"><span class="name">APB2 presc</span><span class="desc">Same rule for TIM1/8/15/16/17 fed from PCLK2.</span></div>
+  </div>
+  <p>Confirm the exact numbers at runtime instead of hard-coding: <code class="inline">HAL_RCC_GetPCLK1Freq()</code> / <code class="inline">HAL_RCC_GetPCLK2Freq()</code> return PCLK, and the HAL <code class="inline">RCC_ClkInitTypeDef</code> path already accounts for the doubling when it programs peripherals.</p>
+
+  <h3>Enable the clock first — always</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Timer</th><th>RCC enable bit</th></tr></thead>
+      <tbody>
+        <tr><td>TIM1</td><td><code>RCC-&gt;APB2ENR |= RCC_APB2ENR_TIM1EN</code></td></tr>
+        <tr><td>TIM8</td><td><code>RCC-&gt;APB2ENR |= RCC_APB2ENR_TIM8EN</code></td></tr>
+        <tr><td>TIM15 / 16 / 17</td><td><code>RCC-&gt;APB2ENR |= RCC_APB2ENR_TIM15EN / _TIM16EN / _TIM17EN</code></td></tr>
+        <tr><td>TIM2 … TIM7</td><td><code>RCC-&gt;APB1ENR1 |= RCC_APB1ENR1_TIM2EN … _TIM7EN</code></td></tr>
+        <tr><td>LPTIM1</td><td><code>RCC-&gt;APB1ENR1 |= RCC_APB1ENR1_LPTIM1EN</code></td></tr>
+        <tr><td>LPTIM2</td><td><code>RCC-&gt;APB1ENR2 |= RCC_APB1ENR2_LPTIM2EN</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout warn">
+    <div class="label">DELAY AFTER CLOCK ENABLE</div>
+    <p>On STM32L4 a peripheral register may still read the old value one or two cycles after the <code class="inline">RCC_...ENR</code> write. Insert a dummy read-back (<code class="inline">volatile uint32_t tmp = RCC-&gt;APB1ENR1; (void)tmp;</code>) before touching the timer registers, exactly as the HAL <code class="inline">__HAL_RCC_TIMx_CLK_ENABLE()</code> macro does internally.</p>
+  </div>
+
+  <h3>GPIO alternate-function map (representative)</h3>
+  <p>Timer pins need <code class="inline">MODER = 10</code> (alternate function) plus the correct AF number in <code class="inline">AFRL/AFRH</code>. AF is per-timer-family, so the same pin can be two different channels depending on the AF you select (e.g. PC6 = TIM3_CH1 @AF2 or TIM8_CH1 @AF3). Always confirm the exact pin/package combination in DS12023 Table&nbsp;27 (Alternate function mapping).</p>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Timer family</th><th>AF</th><th>Example pins</th></tr></thead>
+      <tbody>
+        <tr><td>TIM1</td><td><code>AF1</code></td><td>PA8/9/10/11 = CH1–4; PB13/14/15 = CH1N/2N/3N; PA7=CH1N; PA6=BKIN</td></tr>
+        <tr><td>TIM2</td><td><code>AF1</code></td><td>PA0/1/2/3 = CH1–4; PA5 or PA15 = CH1</td></tr>
+        <tr><td>TIM3</td><td><code>AF2</code></td><td>PA6/7=CH1/2, PB0/1=CH3/4; PC6/7/8/9 = CH1–4</td></tr>
+        <tr><td>TIM4</td><td><code>AF2</code></td><td>PB6/7/8/9 = CH1–4; PD12/13/14/15 = CH1–4</td></tr>
+        <tr><td>TIM5</td><td><code>AF2</code></td><td>PA0/1/2/3 = CH1–4</td></tr>
+        <tr><td>TIM8</td><td><code>AF3</code></td><td>PC6/7/8/9 = CH1–4; PA7=CH1N, PB0=CH2N, PB1=CH3N</td></tr>
+        <tr><td>TIM15</td><td><code>AF14</code></td><td>PA2/3 = CH1/2; PB14/15 = CH1/2; PB13=CH1N</td></tr>
+        <tr><td>TIM16</td><td><code>AF14</code></td><td>PA6 or PB8 = CH1; PB6=CH1N</td></tr>
+        <tr><td>TIM17</td><td><code>AF14</code></td><td>PA7 or PB9 = CH1; PB7=CH1N</td></tr>
+        <tr><td>LPTIM1</td><td><code>AF1</code></td><td>PC1=OUT, PB5/PC0=OUT, PB6=ETR, PB7=IN1</td></tr>
+        <tr><td>LPTIM2</td><td><code>AF14</code></td><td>PA4/PA8=OUT, PB1=IN1, PC3=ETR</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>DMAMUX request lines (STM32L4+ has a DMAMUX)</h3>
+  <p>On the STM32L4R5 the two DMA controllers are decoupled from peripherals by <strong>DMAMUX1</strong>: you write the request-line number into <code class="inline">DMAMUX1_CxCR.DMAREQ_ID</code> (or pass <code class="inline">DMA_REQUEST_TIMx_yy</code> to the HAL). The timer block is contiguous:</p>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Timer</th><th>CH1</th><th>CH2</th><th>CH3</th><th>CH4</th><th>UP</th><th>TRIG</th><th>COM</th></tr></thead>
+      <tbody>
+        <tr><td>TIM1</td><td>42</td><td>43</td><td>44</td><td>45</td><td>46</td><td>47</td><td>48</td></tr>
+        <tr><td>TIM8</td><td>49</td><td>50</td><td>51</td><td>52</td><td>53</td><td>54</td><td>55</td></tr>
+        <tr><td>TIM2</td><td>56</td><td>57</td><td>58</td><td>59</td><td>60</td><td>—</td><td>—</td></tr>
+        <tr><td>TIM3</td><td>61</td><td>62</td><td>63</td><td>64</td><td>65</td><td>66</td><td>—</td></tr>
+        <tr><td>TIM4</td><td>67</td><td>68</td><td>69</td><td>70</td><td>71</td><td>—</td><td>—</td></tr>
+        <tr><td>TIM5</td><td>72</td><td>73</td><td>74</td><td>75</td><td>76</td><td>77</td><td>—</td></tr>
+        <tr><td>TIM15</td><td>78</td><td>—</td><td>—</td><td>—</td><td>79</td><td>80</td><td>81</td></tr>
+        <tr><td>TIM16</td><td>82</td><td>—</td><td>—</td><td>—</td><td>83</td><td>—</td><td>—</td></tr>
+        <tr><td>TIM17</td><td>84</td><td>—</td><td>—</td><td>—</td><td>85</td><td>—</td><td>—</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p><code class="inline">TIM6_UP</code> and <code class="inline">TIM7_UP</code> (used to pace the DAC) sit in the low-numbered part of the DMAMUX table; prefer the symbolic <code class="inline">DMA_REQUEST_TIM6_UP</code> / <code class="inline">DMA_REQUEST_TIM7_UP</code> constants rather than a hand-typed number. To fire a DMA request the channel must set its DMA-enable bit in <code class="inline">TIMx_DIER</code> (<code class="inline">UDE</code>, <code class="inline">CC1DE</code>…<code class="inline">CC4DE</code>, <code class="inline">TDE</code>, <code class="inline">COMDE</code>).</p>
+</section>
+
+<!-- ═══════════════════ 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">02</span> Time-base engine: PSC / ARR / CNT / RCR</h2>
+  <p class="section-lead">Every TIMx is a prescaler feeding a counter that wraps at an auto-reload value. Master the three-register triangle (PSC, ARR, CNT) and the update event, and PWM/capture/encoder become thin layers on top.</p>
+
+  <h3>The datapath</h3>
+  <div class="flow">
+<pre>
+ CK_INT ──►[ PSC 16-bit ]──► CK_CNT ──►[ CNT ]──► compare vs ARR ──► Update Event (UEV)
+           divide by (PSC+1)          up/down             │
+                                                          ├─► sets UIF in TIMx_SR
+                                                          ├─► reloads shadow PSC/ARR/CCRx
+                                                          └─► every (RCR+1) overflows (adv. timers)
+
+ f_CK_CNT = f_CK_INT / (PSC + 1)
+ f_UEV    = f_CK_INT / ((PSC + 1) × (ARR + 1))        ; edge-aligned, up- or down-counting
+ f_UEV    = f_CK_INT / ((PSC + 1) × 2 × ARR)          ; center-aligned (up then down)
+</pre>
+  </div>
+
+  <h3>Core registers</h3>
+  <div class="params">
+    <div class="param"><span class="name">TIMx_PSC</span><span class="desc">16-bit prescaler (all timers). Counter clock = CK_INT / (PSC+1). Preloaded: takes effect at next update.</span></div>
+    <div class="param"><span class="name">TIMx_ARR</span><span class="desc">Auto-reload. 16-bit for most, <strong>32-bit for TIM2 &amp; TIM5</strong>. Preload gated by CR1.ARPE.</span></div>
+    <div class="param"><span class="name">TIMx_CNT</span><span class="desc">Live counter. UIFCPY (bit 31) can mirror the update flag when CR1.UIFREMAP=1 for atomic 32-bit reads.</span></div>
+    <div class="param"><span class="name">TIMx_RCR</span><span class="desc">Repetition counter (TIM1/8 16-bit, TIM15/16/17 8-bit). UEV occurs only every RCR+1 counter cycles.</span></div>
+    <div class="param"><span class="name">TIMx_CR1</span><span class="desc">CEN(0) enable · UDIS(1) · URS(2) · OPM(3) · DIR(4) · CMS[1:0](6:5) · ARPE(7) · CKD[1:0](9:8) · UIFREMAP(11).</span></div>
+    <div class="param"><span class="name">TIMx_EGR</span><span class="desc">Software event generation. UG(0) forces an update (reloads PSC/ARR/RCR now) without waiting for overflow.</span></div>
+    <div class="param"><span class="name">TIMx_SR / DIER</span><span class="desc">Status flags (UIF, CCxIF, CCxOF, TIF) and their interrupt/DMA enables (UIE, CCxIE, UDE, CCxDE, TIE).</span></div>
+  </div>
+
+  <h3>Counting modes (CR1.DIR &amp; CR1.CMS)</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Mode</th><th>CMS[1:0]</th><th>DIR</th><th>Period (ticks)</th><th>Compare flag set on</th></tr></thead>
+      <tbody>
+        <tr><td>Edge, up</td><td>00</td><td>0</td><td>ARR + 1</td><td>—</td></tr>
+        <tr><td>Edge, down</td><td>00</td><td>1</td><td>ARR + 1</td><td>—</td></tr>
+        <tr><td>Center, mode 1</td><td>01</td><td>—</td><td>2 × ARR</td><td>counting <em>down</em> only</td></tr>
+        <tr><td>Center, mode 2</td><td>10</td><td>—</td><td>2 × ARR</td><td>counting <em>up</em> only</td></tr>
+        <tr><td>Center, mode 3</td><td>11</td><td>—</td><td>2 × ARR</td><td>counting up <em>and</em> down</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Worked frequency example</h3>
+  <p>Target: exactly 1&nbsp;kHz update on TIM3 with a 120&nbsp;MHz timer clock. Choose a prescaler so the counter runs at a round rate, e.g. PSC = 119 → CK_CNT = 1&nbsp;MHz. Then ARR + 1 = 1&nbsp;MHz / 1&nbsp;kHz = 1000 → <strong>ARR = 999</strong>. A 16-bit timer can reach much lower frequencies via a larger PSC; the 32-bit TIM2/TIM5 can time a full 35.8&nbsp;s window at 120&nbsp;MHz without any prescaler.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>timebase_1khz.c — bare-metal 1 kHz tick interrupt on TIM3</span><span class="dot">●</span></div>
+    <pre><code class="language-c">#include "stm32l4r5xx.h"   /* CMSIS device header (via stm32l4xx.h) */
+
+void TIM3_timebase_1kHz(void)
+{
+    /* 1. Clock the timer, then read-back so the enable settles */
+    RCC-&gt;APB1ENR1 |= RCC_APB1ENR1_TIM3EN;
+    (void)RCC-&gt;APB1ENR1;
+
+    /* 2. CK_CNT = 120 MHz / (119+1) = 1 MHz */
+    TIM3-&gt;PSC = 120 - 1;
+
+    /* 3. UEV = 1 MHz / (999+1) = 1 kHz */
+    TIM3-&gt;ARR = 1000 - 1;
+
+    /* 4. Buffer ARR so mid-flight changes are glitch-free */
+    TIM3-&gt;CR1 |= TIM_CR1_ARPE;
+
+    /* 5. Force an update NOW so PSC/ARR shadow registers load
+     *    before the counter starts (otherwise first period is wrong) */
+    TIM3-&gt;EGR  = TIM_EGR_UG;
+    TIM3-&gt;SR  &amp;= ~TIM_SR_UIF;          /* clear the flag UG just set */
+
+    /* 6. Enable update interrupt and start counting */
+    TIM3-&gt;DIER |= TIM_DIER_UIE;
+    TIM3-&gt;CR1  |= TIM_CR1_CEN;
+
+    NVIC_SetPriority(TIM3_IRQn, 5);
+    NVIC_EnableIRQ(TIM3_IRQn);
+}
+
+volatile uint32_t g_ticks;
+void TIM3_IRQHandler(void)
+{
+    if (TIM3-&gt;SR &amp; TIM_SR_UIF) {
+        TIM3-&gt;SR = ~TIM_SR_UIF;        /* rc_w0: write 0 to clear */
+        g_ticks++;
+    }
+}
+</code></pre>
+  </div>
+  <div class="callout">
+    <div class="label">WHY THE UG PULSE MATTERS</div>
+    <p>PSC and ARR are shadowed. If you set them and immediately enable the counter without generating an update event, the counter uses the <em>reset</em> shadow values (PSC=0, ARR=0xFFFF) for the very first period. Writing <code class="inline">TIM_EGR_UG</code> copies the preload values into the active registers instantly — do it before <code class="inline">CEN</code>.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">03</span> PWM generation (edge &amp; center-aligned)</h2>
+  <p class="section-lead">PWM is a capture/compare channel in <em>output</em> mode. The counter sweeps 0→ARR; a comparator against CCRx toggles the output. Frequency lives in ARR, duty lives in CCRx.</p>
+
+  <h3>The output-compare registers</h3>
+  <div class="params">
+    <div class="param"><span class="name">TIMx_CCMR1/2</span><span class="desc">Per-channel mode. CCxS[1:0]=00 → output. OCxM[2:0] in bits 6:4 (12:14 for the 2nd channel of the pair), plus OCxM[3] in bit 16/24. OCxPE = preload enable, OCxFE = fast enable.</span></div>
+    <div class="param"><span class="name">TIMx_CCER</span><span class="desc">CCxE enables the OCx pin, CCxP sets polarity (0 = active-high). For TIM1/8: CCxNE/CCxNP control the complementary OCxN pin.</span></div>
+    <div class="param"><span class="name">TIMx_CCRx</span><span class="desc">Compare value = duty. 16-bit (32-bit on TIM2/TIM5). Buffered when OCxPE=1.</span></div>
+  </div>
+
+  <h3>PWM mode &amp; duty math</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>OCxM[3:0]</th><th>Mode</th><th>Up-counting output (channel active while…)</th></tr></thead>
+      <tbody>
+        <tr><td><code>0110</code></td><td>PWM mode 1</td><td>CNT &lt; CCRx → active; CNT ≥ CCRx → inactive</td></tr>
+        <tr><td><code>0111</code></td><td>PWM mode 2</td><td>CNT &lt; CCRx → inactive; CNT ≥ CCRx → active</td></tr>
+        <tr><td><code>0100</code></td><td>Force inactive</td><td>output held low (software)</td></tr>
+        <tr><td><code>0101</code></td><td>Force active</td><td>output held high (software)</td></tr>
+        <tr><td><code>1000</code></td><td>Retrig. OPM 1</td><td>one-pulse variants (OCxM[3]=1 extended modes)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="flow">
+<pre>
+ EDGE-ALIGNED, PWM mode 1, up-counting:
+   f_PWM = f_CK_INT / ((PSC+1) × (ARR+1))
+   Duty  = CCRx / (ARR+1)                    ; CCRx=0 → 0% ; CCRx=ARR+1 → 100%
+
+ CENTER-ALIGNED (CMS≠00):
+   f_PWM = f_CK_INT / ((PSC+1) × 2 × ARR)    ; half the edge-aligned frequency
+   Duty  = CCRx / ARR
+   → symmetric edges about the counter peak; preferred for motor / audio.
+</pre>
+  </div>
+
+  <h3>Bare-metal: 20 kHz, 25 % PWM on TIM3_CH1 (PC6, AF2)</h3>
+  <p>120&nbsp;MHz / (1 × 6000) = 20&nbsp;kHz with PSC=0, ARR=5999; 25&nbsp;% → CCR1 = 1500.</p>
+  <div class="code-block">
+    <div class="code-header"><span>pwm_tim3_ll.c — register-level PWM</span><span class="dot">●</span></div>
+    <pre><code class="language-c">#include "stm32l4r5xx.h"
+
+void TIM3_CH1_pwm_20kHz_25pct(void)
+{
+    /* ---- GPIO: PC6 as AF2 (TIM3_CH1) ---- */
+    RCC-&gt;AHB2ENR |= RCC_AHB2ENR_GPIOCEN;
+    (void)RCC-&gt;AHB2ENR;
+
+    GPIOC-&gt;MODER  &amp;= ~GPIO_MODER_MODE6;         /* clear pin 6 mode  */
+    GPIOC-&gt;MODER  |=  (0x2u &lt;&lt; GPIO_MODER_MODE6_Pos); /* 10 = alt func */
+    GPIOC-&gt;OSPEEDR |= (0x3u &lt;&lt; GPIO_OSPEEDR_OSPEED6_Pos); /* high speed */
+    GPIOC-&gt;AFR[0] &amp;= ~GPIO_AFRL_AFSEL6;
+    GPIOC-&gt;AFR[0] |=  (2u &lt;&lt; GPIO_AFRL_AFSEL6_Pos);  /* AF2 = TIM3     */
+
+    /* ---- Timer time-base ---- */
+    RCC-&gt;APB1ENR1 |= RCC_APB1ENR1_TIM3EN;
+    (void)RCC-&gt;APB1ENR1;
+
+    TIM3-&gt;PSC = 1 - 1;                 /* no prescale, CK_CNT = 120 MHz */
+    TIM3-&gt;ARR = 6000 - 1;             /* 120e6/6000 = 20 kHz            */
+    TIM3-&gt;CCR1 = 1500;               /* 1500/6000 = 25 % duty          */
+
+    /* ---- Channel 1 as PWM mode 1, preload on ---- */
+    TIM3-&gt;CCMR1 &amp;= ~TIM_CCMR1_CC1S;   /* CC1S=00 → output              */
+    TIM3-&gt;CCMR1 &amp;= ~TIM_CCMR1_OC1M;
+    TIM3-&gt;CCMR1 |=  (TIM_CCMR1_OC1M_2 | TIM_CCMR1_OC1M_1); /* 0110      */
+    TIM3-&gt;CCMR1 |=  TIM_CCMR1_OC1PE;  /* buffer CCR1                    */
+
+    TIM3-&gt;CCER  &amp;= ~TIM_CCER_CC1P;    /* active-high                    */
+    TIM3-&gt;CCER  |=  TIM_CCER_CC1E;    /* enable OC1 pin                 */
+
+    TIM3-&gt;CR1   |=  TIM_CR1_ARPE;     /* buffer ARR                     */
+    TIM3-&gt;EGR    =  TIM_EGR_UG;       /* load shadows                   */
+    TIM3-&gt;CR1   |=  TIM_CR1_CEN;      /* GO                             */
+}
+
+/* Change duty at runtime (safe because CCR1 is buffered): */
+static inline void TIM3_CH1_set_duty(uint16_t permille)  /* 0..1000 */
+{
+    TIM3-&gt;CCR1 = (uint16_t)(((uint32_t)(TIM3-&gt;ARR + 1) * permille) / 1000u);
+}
+</code></pre>
+  </div>
+
+  <h3>HAL: the same PWM channel</h3>
+  <div class="code-block">
+    <div class="code-header"><span>pwm_tim3_hal.c — HAL PWM</span><span class="dot">●</span></div>
+    <pre><code class="language-c">#include "stm32l4xx_hal.h"
+
+TIM_HandleTypeDef htim3;
+
+void TIM3_CH1_pwm_hal(void)
+{
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_TIM3_CLK_ENABLE();
+
+    GPIO_InitTypeDef g = {0};
+    g.Pin       = GPIO_PIN_6;
+    g.Mode      = GPIO_MODE_AF_PP;
+    g.Pull      = GPIO_NOPULL;
+    g.Speed     = GPIO_SPEED_FREQ_HIGH;
+    g.Alternate = GPIO_AF2_TIM3;
+    HAL_GPIO_Init(GPIOC, &amp;g);
+
+    htim3.Instance           = TIM3;
+    htim3.Init.Prescaler     = 1 - 1;
+    htim3.Init.CounterMode   = TIM_COUNTERMODE_UP;
+    htim3.Init.Period        = 6000 - 1;          /* ARR → 20 kHz */
+    htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+    HAL_TIM_PWM_Init(&amp;htim3);
+
+    TIM_OC_InitTypeDef oc = {0};
+    oc.OCMode     = TIM_OCMODE_PWM1;
+    oc.Pulse      = 1500;                          /* 25 % duty */
+    oc.OCPolarity = TIM_OCPOLARITY_HIGH;
+    oc.OCFastMode = TIM_OCFAST_DISABLE;
+    HAL_TIM_PWM_ConfigChannel(&amp;htim3, &amp;oc, TIM_CHANNEL_1);
+
+    HAL_TIM_PWM_Start(&amp;htim3, TIM_CHANNEL_1);
+}
+
+/* Runtime duty update: */
+/*   __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, new_ccr); */
+</code></pre>
+  </div>
+  <p>For center-aligned PWM in HAL, set <code class="inline">CounterMode = TIM_COUNTERMODE_CENTERALIGNED1/2/3</code> (mirrors CMS[1:0]) and remember the frequency halves for a given ARR.</p>
+</section>
+
+<!-- ═══════════════════ 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">04</span> Advanced control: complementary + dead-time</h2>
+  <p class="section-lead">Only TIM1 and TIM8 drive a channel and its inverted twin (OCx / OCxN) with a hardware-inserted dead-time — the feature that makes half-bridge and 3-phase inverter drive safe. It hinges on one register the general-purpose timers do not have: <code class="inline">TIMx_BDTR</code>.</p>
+
+  <h3>BDTR — break and dead-time register</h3>
+  <div class="params">
+    <div class="param"><span class="name">MOE (15)</span><span class="desc">Main Output Enable. <strong>Outputs are dead until this is 1.</strong> Cleared by a break event.</span></div>
+    <div class="param"><span class="name">AOE (14)</span><span class="desc">Automatic Output Enable: MOE re-asserts at the next update after a break clears (else set MOE by software).</span></div>
+    <div class="param"><span class="name">BKP (13) / BKE (12)</span><span class="desc">Break input polarity / enable. BK2 fields (bits 24–25 etc.) are the second break input.</span></div>
+    <div class="param"><span class="name">OSSR (11) / OSSI (10)</span><span class="desc">Off-state selection in Run / Idle: what the pin does when the channel is disabled.</span></div>
+    <div class="param"><span class="name">LOCK[1:0] (9:8)</span><span class="desc">Write-once lock level protecting critical bits — set last, cannot be cleared without reset.</span></div>
+    <div class="param"><span class="name">DTG[7:0] (7:0)</span><span class="desc">Dead-time generator setup (see formula below).</span></div>
+  </div>
+
+  <h3>Dead-time formula</h3>
+  <p><code class="inline">t_DTS</code> is the dead-time/sampling clock, derived from CK_INT by <code class="inline">CR1.CKD[1:0]</code> (00 → t_DTS = t_CK_INT, 01 → ×2, 10 → ×4). DTG is decoded piecewise so you can reach both fine and coarse dead-times from one 8-bit field:</p>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>DTG[7:5]</th><th>Dead-time (DT)</th><th>Step</th></tr></thead>
+      <tbody>
+        <tr><td><code>0xx</code></td><td>DTG[7:0] × t_DTS</td><td>t_DTS</td></tr>
+        <tr><td><code>10x</code></td><td>(64 + DTG[5:0]) × 2 × t_DTS</td><td>2 × t_DTS</td></tr>
+        <tr><td><code>110</code></td><td>(32 + DTG[4:0]) × 8 × t_DTS</td><td>8 × t_DTS</td></tr>
+        <tr><td><code>111</code></td><td>(32 + DTG[4:0]) × 16 × t_DTS</td><td>16 × t_DTS</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Example at CK_INT = 120&nbsp;MHz, CKD=00 → t_DTS = 8.33&nbsp;ns. For ~500&nbsp;ns dead-time: 500 / 8.33 ≈ 60 → DTG = 60 (0x3C, in the 0xx range). For ~1&nbsp;µs you would use the 10x range: (64 + n) × 2 × 8.33&nbsp;ns.</p>
+
+  <h3>Bare-metal: TIM1_CH1 + CH1N complementary PWM with dead-time</h3>
+  <div class="code-block">
+    <div class="code-header"><span>tim1_complementary_ll.c</span><span class="dot">●</span></div>
+    <pre><code class="language-c">#include "stm32l4r5xx.h"
+
+/* PA8 = TIM1_CH1 (AF1), PB13 = TIM1_CH1N (AF1) */
+void TIM1_complementary_pwm(void)
+{
+    RCC-&gt;AHB2ENR |= RCC_AHB2ENR_GPIOAEN | RCC_AHB2ENR_GPIOBEN;
+    RCC-&gt;APB2ENR |= RCC_APB2ENR_TIM1EN;
+    (void)RCC-&gt;APB2ENR;
+
+    /* PA8 → AF1 */
+    GPIOA-&gt;MODER  &amp;= ~GPIO_MODER_MODE8;
+    GPIOA-&gt;MODER  |=  (0x2u &lt;&lt; GPIO_MODER_MODE8_Pos);
+    GPIOA-&gt;AFR[1] &amp;= ~GPIO_AFRH_AFSEL8;
+    GPIOA-&gt;AFR[1] |=  (1u &lt;&lt; GPIO_AFRH_AFSEL8_Pos);
+    /* PB13 → AF1 */
+    GPIOB-&gt;MODER  &amp;= ~GPIO_MODER_MODE13;
+    GPIOB-&gt;MODER  |=  (0x2u &lt;&lt; GPIO_MODER_MODE13_Pos);
+    GPIOB-&gt;AFR[1] &amp;= ~GPIO_AFRH_AFSEL13;
+    GPIOB-&gt;AFR[1] |=  (1u &lt;&lt; GPIO_AFRH_AFSEL13_Pos);
+
+    /* 120 MHz / 6000 = 20 kHz, 50 % duty */
+    TIM1-&gt;PSC  = 0;
+    TIM1-&gt;ARR  = 6000 - 1;
+    TIM1-&gt;CCR1 = 3000;
+
+    TIM1-&gt;CCMR1 &amp;= ~(TIM_CCMR1_CC1S | TIM_CCMR1_OC1M);
+    TIM1-&gt;CCMR1 |=  (TIM_CCMR1_OC1M_2 | TIM_CCMR1_OC1M_1) /* PWM1 */
+                 |   TIM_CCMR1_OC1PE;
+
+    /* Enable BOTH OC1 and OC1N, both active-high */
+    TIM1-&gt;CCER  |= TIM_CCER_CC1E | TIM_CCER_CC1NE;
+
+    /* Dead-time = 60 × t_DTS ≈ 500 ns; MOE must be set on advanced timers */
+    TIM1-&gt;CR1  &amp;= ~TIM_CR1_CKD;                 /* CKD=00 → t_DTS = 8.33 ns */
+    TIM1-&gt;BDTR  = (60u &lt;&lt; TIM_BDTR_DTG_Pos)     /* DTG field                */
+                | TIM_BDTR_OSSR                 /* drive off-state in run   */
+                | TIM_BDTR_MOE;                 /* MAIN OUTPUT ENABLE       */
+
+    TIM1-&gt;CR1  |= TIM_CR1_ARPE;
+    TIM1-&gt;EGR   = TIM_EGR_UG;
+    TIM1-&gt;CR1  |= TIM_CR1_CEN;
+}
+</code></pre>
+  </div>
+
+  <h3>HAL: dead-time via TIM_BreakDeadTimeConfigTypeDef</h3>
+  <div class="code-block">
+    <div class="code-header"><span>tim1_complementary_hal.c</span><span class="dot">●</span></div>
+    <pre><code class="language-c">TIM_HandleTypeDef htim1;
+
+void TIM1_complementary_hal(void)
+{
+    /* ...clock + PA8/PB13 GPIO AF1 init as above... */
+    htim1.Instance = TIM1;
+    htim1.Init.Prescaler   = 0;
+    htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim1.Init.Period      = 6000 - 1;
+    htim1.Init.RepetitionCounter = 0;
+    htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+    HAL_TIM_PWM_Init(&amp;htim1);
+
+    TIM_OC_InitTypeDef oc = {0};
+    oc.OCMode      = TIM_OCMODE_PWM1;
+    oc.Pulse       = 3000;                    /* 50 % */
+    oc.OCPolarity  = TIM_OCPOLARITY_HIGH;
+    oc.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+    oc.OCIdleState = TIM_OCIDLESTATE_RESET;
+    oc.OCNIdleState= TIM_OCNIDLESTATE_RESET;
+    HAL_TIM_PWM_ConfigChannel(&amp;htim1, &amp;oc, TIM_CHANNEL_1);
+
+    TIM_BreakDeadTimeConfigTypeDef bd = {0};
+    bd.OffStateRunMode  = TIM_OSSR_ENABLE;
+    bd.OffStateIDLEMode = TIM_OSSI_DISABLE;
+    bd.LockLevel        = TIM_LOCKLEVEL_OFF;
+    bd.DeadTime         = 60;                 /* raw DTG value */
+    bd.BreakState       = TIM_BREAK_DISABLE;
+    bd.AutomaticOutput  = TIM_AUTOMATICOUTPUT_DISABLE;
+    HAL_TIMEx_ConfigBreakDeadTime(&amp;htim1, &amp;bd);
+
+    HAL_TIM_PWM_Start(&amp;htim1, TIM_CHANNEL_1);     /* OC1  */
+    HAL_TIMEx_PWMN_Start(&amp;htim1, TIM_CHANNEL_1);  /* OC1N */
+}
+</code></pre>
+  </div>
+  <div class="callout warn">
+    <div class="label">MOE IS THE #1 GOTCHA</div>
+    <p>On TIM1/TIM8/TIM15/16/17 nothing appears on the pins until <code class="inline">BDTR.MOE = 1</code>. HAL sets it inside <code class="inline">HAL_TIM_PWM_Start</code>/<code class="inline">PWMN_Start</code>; at register level you must set it yourself. A break event (or <code class="inline">AOE=0</code> after break) clears MOE — the PWM will silently stop until you re-arm it.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">05</span> Input capture</h2>
+  <p class="section-lead">Input capture latches CNT into CCRx on an edge of the mapped input — the tool for measuring an external signal's period, frequency, pulse width or phase. Use a 32-bit timer (TIM2/TIM5) when the input can be slow, to avoid counter wrap headaches.</p>
+
+  <h3>Input-side CCMR / CCER fields</h3>
+  <div class="params">
+    <div class="param"><span class="name">CCxS[1:0]</span><span class="desc">01 → ICx mapped to TIx (direct); 10 → mapped to the other TI (indirect, for PWM-input); 11 → mapped to TRC.</span></div>
+    <div class="param"><span class="name">ICxF[3:0]</span><span class="desc">Digital input filter — N consecutive samples at f_DTS-derived rate before an edge is accepted (debounce).</span></div>
+    <div class="param"><span class="name">ICxPSC[1:0]</span><span class="desc">Capture prescaler: capture every 1/2/4/8 edges.</span></div>
+    <div class="param"><span class="name">CCxP / CCxNP</span><span class="desc">Edge select: 00 rising, 01 falling, 11 both edges. CCxE arms the capture.</span></div>
+    <div class="param"><span class="name">CCxIF / CCxOF</span><span class="desc">Capture flag (in SR) / over-capture flag (a second capture arrived before you read CCRx).</span></div>
+  </div>
+
+  <h3>Frequency / period math</h3>
+  <div class="flow">
+<pre>
+ Δ = (capture_N − capture_N-1) mod (ARR+1)     ; ticks between two same-edge captures
+ t_period = Δ / f_CK_CNT ,   f_CK_CNT = f_CK_INT / (PSC+1)
+ f_signal = f_CK_CNT / Δ
+
+ Pulse-width (PWM input): use TWO channels on the SAME TI —
+   CH1 captures rising (period),  CH2 captures falling (high time),
+   via slave-mode reset on TI1FP1. Duty = CCR2 / CCR1.
+</pre>
+  </div>
+
+  <h3>Bare-metal: measure input frequency on TIM2_CH1 (PA0, AF1)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>tim2_capture_ll.c — 32-bit period capture with IRQ</span><span class="dot">●</span></div>
+    <pre><code class="language-c">#include "stm32l4r5xx.h"
+
+volatile uint32_t g_period_ticks;    /* CK_CNT ticks between rising edges */
+volatile uint8_t  g_valid;
+
+void TIM2_CH1_capture_init(void)
+{
+    RCC-&gt;AHB2ENR |= RCC_AHB2ENR_GPIOAEN;
+    RCC-&gt;APB1ENR1 |= RCC_APB1ENR1_TIM2EN;
+    (void)RCC-&gt;APB1ENR1;
+
+    /* PA0 → AF1 (TIM2_CH1) input */
+    GPIOA-&gt;MODER  &amp;= ~GPIO_MODER_MODE0;
+    GPIOA-&gt;MODER  |=  (0x2u &lt;&lt; GPIO_MODER_MODE0_Pos);
+    GPIOA-&gt;AFR[0] &amp;= ~GPIO_AFRL_AFSEL0;
+    GPIOA-&gt;AFR[0] |=  (1u &lt;&lt; GPIO_AFRL_AFSEL0_Pos);
+
+    /* Free-running 1 MHz time base (PSC=119), full 32-bit range */
+    TIM2-&gt;PSC = 120 - 1;
+    TIM2-&gt;ARR = 0xFFFFFFFFu;
+
+    /* CH1 = input, mapped to TI1 (CC1S=01), light filter (ICxF=0011) */
+    TIM2-&gt;CCMR1 &amp;= ~(TIM_CCMR1_CC1S | TIM_CCMR1_IC1F);
+    TIM2-&gt;CCMR1 |=  (1u &lt;&lt; TIM_CCMR1_CC1S_Pos)
+                 |  (3u &lt;&lt; TIM_CCMR1_IC1F_Pos);
+
+    /* Rising edge (CC1P=0, CC1NP=0), enable capture */
+    TIM2-&gt;CCER  &amp;= ~(TIM_CCER_CC1P | TIM_CCER_CC1NP);
+    TIM2-&gt;CCER  |=  TIM_CCER_CC1E;
+
+    TIM2-&gt;DIER  |=  TIM_DIER_CC1IE;      /* capture interrupt */
+    TIM2-&gt;EGR    =  TIM_EGR_UG;
+    TIM2-&gt;CR1   |=  TIM_CR1_CEN;
+
+    NVIC_SetPriority(TIM2_IRQn, 5);
+    NVIC_EnableIRQ(TIM2_IRQn);
+}
+
+void TIM2_IRQHandler(void)
+{
+    static uint32_t last;
+    if (TIM2-&gt;SR &amp; TIM_SR_CC1IF) {
+        uint32_t now = TIM2-&gt;CCR1;       /* reading CCR1 clears CC1IF */
+        g_period_ticks = now - last;    /* 32-bit wrap is automatic   */
+        last = now;
+        g_valid = 1;
+        /* if (TIM2->SR & TIM_SR_CC1OF) { overcapture — ISR too slow } */
+    }
+}
+/* f_signal[Hz] = 1e6 / g_period_ticks   (because CK_CNT = 1 MHz) */
+</code></pre>
+  </div>
+  <p>HAL equivalent: <code class="inline">HAL_TIM_IC_Init</code> + <code class="inline">HAL_TIM_IC_ConfigChannel</code> (<code class="inline">ICPolarity = RISING</code>, <code class="inline">ICSelection = DIRECTTI</code>), start with <code class="inline">HAL_TIM_IC_Start_IT</code>, and read <code class="inline">HAL_TIM_ReadCapturedValue</code> inside <code class="inline">HAL_TIM_IC_CaptureCallback</code>.</p>
+</section>
+
+<!-- ═══════════════════ 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">06</span> Encoder interface mode</h2>
+  <p class="section-lead">In encoder mode the timer becomes a quadrature counter: CNT tracks position, counting up or down automatically from the phase relationship of two inputs (TI1/TI2). No interrupts per edge — you just read CNT. Available on TIM1/8 and TIM2/3/4/5.</p>
+
+  <h3>SMS encoder modes (TIMx_SMCR)</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>SMS[2:0]</th><th>Mode</th><th>Counts on</th><th>Resolution</th></tr></thead>
+      <tbody>
+        <tr><td><code>001</code></td><td>Encoder mode 1</td><td>TI2FP2 edges (dir. from TI1FP1 level)</td><td>×2</td></tr>
+        <tr><td><code>010</code></td><td>Encoder mode 2</td><td>TI1FP1 edges (dir. from TI2FP2 level)</td><td>×2</td></tr>
+        <tr><td><code>011</code></td><td>Encoder mode 3</td><td>both TI1FP1 &amp; TI2FP2 edges</td><td>×4</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>For a standard quadrature encoder use <strong>mode 3</strong> (SMS=011) for full ×4 resolution. Swapping the two channel wires (or toggling one CCxP polarity) reverses the counting direction. Note SMS is a 4-bit field on L4 (SMS[3] lives in SMCR bit 16) but encoder modes only use the low 3 bits.</p>
+
+  <h3>Bare-metal: TIM3 quadrature encoder (PA6=CH1, PA7=CH2, AF2)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>tim3_encoder_ll.c</span><span class="dot">●</span></div>
+    <pre><code class="language-c">#include "stm32l4r5xx.h"
+
+void TIM3_encoder_init(uint16_t counts_per_rev_x4)
+{
+    RCC-&gt;AHB2ENR |= RCC_AHB2ENR_GPIOAEN;
+    RCC-&gt;APB1ENR1 |= RCC_APB1ENR1_TIM3EN;
+    (void)RCC-&gt;APB1ENR1;
+
+    /* PA6, PA7 → AF2 inputs */
+    GPIOA-&gt;MODER  &amp;= ~(GPIO_MODER_MODE6 | GPIO_MODER_MODE7);
+    GPIOA-&gt;MODER  |=  (0x2u &lt;&lt; GPIO_MODER_MODE6_Pos)
+                  |   (0x2u &lt;&lt; GPIO_MODER_MODE7_Pos);
+    GPIOA-&gt;AFR[0] &amp;= ~(GPIO_AFRL_AFSEL6 | GPIO_AFRL_AFSEL7);
+    GPIOA-&gt;AFR[0] |=  (2u &lt;&lt; GPIO_AFRL_AFSEL6_Pos)
+                  |   (2u &lt;&lt; GPIO_AFRL_AFSEL7_Pos);
+
+    /* CH1=TI1, CH2=TI2, both direct inputs, with input filters */
+    TIM3-&gt;CCMR1 = (1u &lt;&lt; TIM_CCMR1_CC1S_Pos)   /* CC1S=01 → IC1 on TI1 */
+                | (1u &lt;&lt; TIM_CCMR1_CC2S_Pos)   /* CC2S=01 → IC2 on TI2 */
+                | (5u &lt;&lt; TIM_CCMR1_IC1F_Pos)   /* filter               */
+                | (5u &lt;&lt; TIM_CCMR1_IC2F_Pos);
+
+    /* Non-inverted; CCxP selects the counting direction reference */
+    TIM3-&gt;CCER &amp;= ~(TIM_CCER_CC1P | TIM_CCER_CC1NP
+                  | TIM_CCER_CC2P | TIM_CCER_CC2NP);
+    TIM3-&gt;CCER |=  TIM_CCER_CC1E | TIM_CCER_CC2E;
+
+    /* Encoder mode 3 (×4): SMS = 011 */
+    TIM3-&gt;SMCR &amp;= ~TIM_SMCR_SMS;
+    TIM3-&gt;SMCR |=  (TIM_SMCR_SMS_1 | TIM_SMCR_SMS_0);
+
+    /* Wrap at one mechanical revolution so CNT reads absolute position */
+    TIM3-&gt;ARR = counts_per_rev_x4 - 1;
+    TIM3-&gt;CNT = 0;
+    TIM3-&gt;CR1 |= TIM_CR1_CEN;
+}
+
+/* Read anywhere, no IRQ needed: */
+static inline uint16_t enc_position(void) { return (uint16_t)TIM3-&gt;CNT; }
+static inline int enc_direction(void) {                 /* 1=down, 0=up */
+    return (TIM3-&gt;CR1 &amp; TIM_CR1_DIR) ? 1 : 0;
+}
+</code></pre>
+  </div>
+  <p>HAL: fill a <code class="inline">TIM_Encoder_InitTypeDef</code> with <code class="inline">EncoderMode = TIM_ENCODERMODE_TI12</code> (×4), <code class="inline">HAL_TIM_Encoder_Init</code>, then <code class="inline">HAL_TIM_Encoder_Start(&amp;htim, TIM_CHANNEL_ALL)</code> and poll <code class="inline">__HAL_TIM_GET_COUNTER(&amp;htim)</code>. For velocity, sample CNT on a periodic tick and take the wrap-corrected delta.</p>
+</section>
+
+<!-- ═══════════════════ 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">07</span> One-pulse mode</h2>
+  <p class="section-lead">One-pulse mode (OPM) makes the counter run exactly one cycle then stop — perfect for a precise programmable delay-then-pulse triggered by an external event (ultrasonic trigger, camera strobe, gate driver interlock).</p>
+
+  <h3>How it works</h3>
+  <div class="params">
+    <div class="param"><span class="name">CR1.OPM</span><span class="desc">1 → CEN is auto-cleared at the next update event; the counter fires one period and halts.</span></div>
+    <div class="param"><span class="name">OCxM = PWM mode 2</span><span class="desc">With up-counting, the output is inactive until CNT reaches CCRx, then active until ARR → a delay followed by a pulse.</span></div>
+    <div class="param"><span class="name">Slave trigger (SMCR)</span><span class="desc">SMS=110 (Trigger mode) starts the counter on a TIx edge; TS selects the trigger. Combined with OPM this yields a hardware-timed single shot.</span></div>
+  </div>
+  <div class="flow">
+<pre>
+ Up-counting, PWM mode 2, OPM:
+   t_DELAY = CCRx        / f_CK_CNT       ; idle time before the edge
+   t_PULSE = (ARR+1−CCRx)/ f_CK_CNT       ; width of the single pulse
+   ( f_CK_CNT = f_CK_INT / (PSC+1) )
+</pre>
+  </div>
+
+  <h3>Bare-metal: 10 µs delay then 5 µs pulse on TIM16_CH1</h3>
+  <p>PSC=119 → CK_CNT = 1&nbsp;MHz (1&nbsp;tick = 1&nbsp;µs). Delay 10&nbsp;µs → CCR1 = 10; total 15&nbsp;µs → ARR = 15−1 = 14; pulse = (15−10) = 5&nbsp;µs.</p>
+  <div class="code-block">
+    <div class="code-header"><span>tim16_onepulse_ll.c</span><span class="dot">●</span></div>
+    <pre><code class="language-c">#include "stm32l4r5xx.h"
+
+/* PB8 = TIM16_CH1 (AF14) */
+void TIM16_one_pulse(void)
+{
+    RCC-&gt;AHB2ENR |= RCC_AHB2ENR_GPIOBEN;
+    RCC-&gt;APB2ENR |= RCC_APB2ENR_TIM16EN;
+    (void)RCC-&gt;APB2ENR;
+
+    GPIOB-&gt;MODER  &amp;= ~GPIO_MODER_MODE8;
+    GPIOB-&gt;MODER  |=  (0x2u &lt;&lt; GPIO_MODER_MODE8_Pos);
+    GPIOB-&gt;AFR[1] &amp;= ~GPIO_AFRH_AFSEL8;
+    GPIOB-&gt;AFR[1] |=  (14u &lt;&lt; GPIO_AFRH_AFSEL8_Pos);
+
+    TIM16-&gt;PSC  = 120 - 1;      /* 1 MHz  */
+    TIM16-&gt;ARR  = 15  - 1;      /* total 15 us */
+    TIM16-&gt;CCR1 = 10;           /* 10 us delay, then 5 us pulse */
+
+    /* PWM mode 2 (0111) so output goes high only after CCR1 */
+    TIM16-&gt;CCMR1 &amp;= ~(TIM_CCMR1_CC1S | TIM_CCMR1_OC1M);
+    TIM16-&gt;CCMR1 |=  (TIM_CCMR1_OC1M_2 | TIM_CCMR1_OC1M_1 | TIM_CCMR1_OC1M_0)
+                  |   TIM_CCMR1_OC1PE;
+    TIM16-&gt;CCER  |= TIM_CCER_CC1E;
+
+    /* TIM16 is a break-capable timer → MOE required */
+    TIM16-&gt;BDTR  |= TIM_BDTR_MOE;
+
+    TIM16-&gt;CR1   |= TIM_CR1_OPM;    /* single shot */
+    TIM16-&gt;EGR    = TIM_EGR_UG;
+}
+
+/* Fire one pulse (software trigger). For a hardware trigger, program
+ * SMCR: SMS=110 (trigger) + TS=<source> instead of setting CEN here. */
+void TIM16_fire(void) { TIM16-&gt;CR1 |= TIM_CR1_CEN; }
+</code></pre>
+  </div>
+  <div class="callout">
+    <div class="label">HAL PATH</div>
+    <p><code class="inline">HAL_TIM_OnePulse_Init(&amp;htim, TIM_OPMODE_SINGLE)</code>, then <code class="inline">HAL_TIM_OnePulse_ConfigChannel</code> and <code class="inline">HAL_TIM_OnePulse_Start(&amp;htim, TIM_CHANNEL_1)</code>. For trigger-started pulses configure the slave mode with <code class="inline">HAL_TIM_SlaveConfigSynchro</code> (<code class="inline">SlaveMode = TIM_SLAVEMODE_TRIGGER</code>).</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">08</span> LPTIM — low-power timer</h2>
+  <p class="section-lead">LPTIM1/LPTIM2 are 16-bit timers that keep counting in <strong>Stop&nbsp;0/1/2</strong> when the main timers are frozen — clocked from LSE/LSI/HSI16 rather than the APB. They do PWM, one-shot, timeout and pulse-counting with microamp-level power. The register set and, critically, the write protocol differ from TIMx.</p>
+
+  <h3>Register set (note: not TIMx-compatible)</h3>
+  <div class="params">
+    <div class="param"><span class="name">LPTIM_CFGR</span><span class="desc">CKSEL (internal/external clock), PRESC[2:0] (÷1…÷128), WAVE / WAVPOL (waveform &amp; polarity), TRIGEN/TRIGSEL, ENC (encoder), COUNTMODE.</span></div>
+    <div class="param"><span class="name">LPTIM_CR</span><span class="desc">ENABLE (must be set before writing ARR/CMP), CNTSTRT (continuous), SNGSTRT (single-shot), plus RSTARE / COUNTRST.</span></div>
+    <div class="param"><span class="name">LPTIM_ARR / CMP</span><span class="desc">Auto-reload (period) and compare (duty). Writes need synchronization — see below.</span></div>
+    <div class="param"><span class="name">LPTIM_ISR / ICR / IER</span><span class="desc">Flags: ARRM, CMPM, and the <strong>ARROK / CMPOK</strong> "write accepted" flags; ICR clears them; IER enables interrupts.</span></div>
+    <div class="param"><span class="name">LPTIM_CNT</span><span class="desc">Counter — being in another clock domain, read it twice and accept the value only when two reads match.</span></div>
+  </div>
+
+  <h3>Clock selection (RCC_CCIPR)</h3>
+  <p>LPTIM does not use the APB timer clock for counting. Pick its kernel clock with <code class="inline">RCC_CCIPR.LPTIM1SEL[1:0]</code> / <code class="inline">LPTIM2SEL[1:0]</code>: 00 = PCLK, 01 = LSI, 10 = HSI16, 11 = LSE. Use LSE (32.768&nbsp;kHz) or LSI for Stop-mode operation.</p>
+
+  <h3>PWM frequency / duty</h3>
+  <div class="flow">
+<pre>
+ f_LPTIM_out = f_lptim_ker / ( PRESC × (ARR + 1) )
+ Duty is set by CMP relative to ARR (WAVPOL selects polarity).
+ e.g. LSE = 32768 Hz, PRESC=1, ARR=255  → ~128 Hz PWM, CMP=128 → ~50 %.
+</pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>lptim1_pwm_ll.c — PWM that survives Stop mode</span><span class="dot">●</span></div>
+    <pre><code class="language-c">#include "stm32l4r5xx.h"
+
+void LPTIM1_pwm_from_LSE(void)
+{
+    /* Assume LSE already started (RCC_BDCR.LSEON, LSERDY). */
+    RCC-&gt;CCIPR = (RCC-&gt;CCIPR &amp; ~RCC_CCIPR_LPTIM1SEL)
+               | (0x3u &lt;&lt; RCC_CCIPR_LPTIM1SEL_Pos);   /* 11 = LSE */
+    RCC-&gt;APB1ENR1 |= RCC_APB1ENR1_LPTIM1EN;
+    (void)RCC-&gt;APB1ENR1;
+
+    /* Config MUST be written while DISABLED */
+    LPTIM1-&gt;CR = 0;
+    LPTIM1-&gt;CFGR = (0u &lt;&lt; LPTIM_CFGR_PRESC_Pos);  /* PRESC=÷1, internal clk */
+    /* WAVE=0, WAVPOL=0 → standard PWM, active per compare */
+
+    /* Enable the peripheral BEFORE loading ARR/CMP */
+    LPTIM1-&gt;CR |= LPTIM_CR_ENABLE;
+
+    /* Write period, wait for ARROK, then compare, wait for CMPOK */
+    LPTIM1-&gt;ARR = 256 - 1;
+    while (!(LPTIM1-&gt;ISR &amp; LPTIM_ISR_ARROK)) { }
+    LPTIM1-&gt;ICR = LPTIM_ICR_ARROKCF;
+
+    LPTIM1-&gt;CMP = 128;                    /* ~50 % */
+    while (!(LPTIM1-&gt;ISR &amp; LPTIM_ISR_CMPOK)) { }
+    LPTIM1-&gt;ICR = LPTIM_ICR_CMPOKCF;
+
+    /* Start continuous counting → PWM appears on LPTIM1_OUT */
+    LPTIM1-&gt;CR |= LPTIM_CR_CNTSTRT;
+}
+</code></pre>
+  </div>
+  <div class="callout danger">
+    <div class="label">LPTIM WRITE PROTOCOL — DO NOT SKIP</div>
+    <p>ARR and CMP live in the low-power clock domain. You must (1) set <code class="inline">ENABLE</code> first, (2) write ARR/CMP, (3) <strong>poll ARROK/CMPOK</strong> before writing them again or starting. Writing a new value before the previous one is acknowledged is discarded and corrupts the waveform. Also: with the internal clock you cannot change PRESC while enabled — reconfigure only after clearing ENABLE.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 08 ═══════════════════ -->
+<section id="s8">
+  <h2><span class="num">09</span> Gotchas / common mistakes</h2>
+  <p class="section-lead">The bugs that eat afternoons on STM32L4 timers are almost always one of these.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">Forgot the RCC enable / read-back</span><span class="desc">Writing timer registers before the clock is enabled (and settled) silently does nothing. Always enable in RCC and add the dummy read-back.</span></div>
+    <div class="param"><span class="name">No UG before CEN</span><span class="desc">First PWM/tick period is wrong because PSC/ARR shadows were not loaded. Write TIMx_EGR = UG (then clear the UIF it raises) before starting.</span></div>
+    <div class="param"><span class="name">MOE not set (TIM1/8/15/16/17)</span><span class="desc">Advanced &amp; break-capable timers keep outputs Hi-Z until BDTR.MOE=1. A break event also clears MOE and silently stops PWM.</span></div>
+    <div class="param"><span class="name">Wrong timer-clock assumption</span><span class="desc">Because of the ×2 APB rule, the timer clock is often double PCLK. Derive it from HAL_RCC_GetPCLKxFreq() instead of hard-coding 120 MHz.</span></div>
+    <div class="param"><span class="name">Duty math off-by-one</span><span class="desc">Edge-aligned period is ARR+1 ticks, not ARR. 100 % duty needs CCRx ≥ ARR+1. Center-aligned uses 2×ARR and CCRx/ARR.</span></div>
+    <div class="param"><span class="name">16-bit overflow in capture</span><span class="desc">Measuring a slow signal on a 16-bit timer: the counter wraps between edges and your delta is garbage. Use TIM2/TIM5 (32-bit) or count overflows in the update IRQ.</span></div>
+    <div class="param"><span class="name">CCRx not buffered</span><span class="desc">Changing duty on the fly without OCxPE (preload) can glitch mid-period. Set OCxPE=1 (and ARPE for ARR) so updates apply at the next cycle boundary.</span></div>
+    <div class="param"><span class="name">Reading CCRx does not equal reading CNT</span><span class="desc">In input capture, reading TIMx_CCRx clears CCxIF; reading CNT does not. Read CCRx in the ISR, and watch CCxOF for over-capture (ISR too slow).</span></div>
+    <div class="param"><span class="name">Encoder direction reversed</span><span class="desc">Swap the two input wires, flip one CCxP polarity, or switch encoder mode 1↔2 to reverse counting — do not negate in software.</span></div>
+    <div class="param"><span class="name">Wrong AF number</span><span class="desc">PC6 is TIM3_CH1 at AF2 but TIM8_CH1 at AF3. Selecting the wrong AF routes the pin to the wrong timer. Cross-check DS12023 Table 27 for your exact package.</span></div>
+    <div class="param"><span class="name">LPTIM ARROK/CMPOK skipped</span><span class="desc">Writing LPTIM ARR/CMP without polling the OK flags (or writing before ENABLE) corrupts the waveform. Follow the LPTIM write protocol exactly.</span></div>
+    <div class="param"><span class="name">32-bit CNT torn read</span><span class="desc">On TIM2/TIM5 an async CNT read can tear. Use CR1.UIFREMAP + the UIFCPY bit, or read in a loop until two reads agree, when precise 32-bit values matter.</span></div>
+  </div>
+
+  <div class="callout">
+    <div class="label">QUICK REFERENCE</div>
+    <p>Frequency: <code class="inline">f = f_CK_INT / ((PSC+1)(ARR+1))</code> edge · <code class="inline">/(2·ARR)</code> center. Duty: <code class="inline">CCRx/(ARR+1)</code>. Dead-time low range: <code class="inline">DTG × t_DTS</code>, <code class="inline">t_DTS = t_CK_INT × 2^CKD</code>. Encoder ×4 = SMS 011. LPTIM PWM: <code class="inline">f = f_ker/(PRESC·(ARR+1))</code>. Primary sources: RM0432 (timer chapters, DMAMUX table), DS12023 (AF map, clock tree).</p>
+  </div>
+</section>
+
+</main>

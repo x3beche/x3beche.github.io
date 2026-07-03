@@ -1,0 +1,432 @@
+---
+layout: tutorial
+title: "STM32L4R5 — NVIC, EXTI & Interrupt Handling"
+back_url: "../index.html"
+back_label: "All guides"
+---
+<header class="header">
+  <div class="meta">
+    <span>TECHNICAL GUIDE</span><span>STM32L4R5</span><span>INTERRUPTS</span><span>2026</span>
+  </div>
+  <h1>Interrupts on the STM32L4R5<br><em>NVIC, EXTI &amp; ISR handling</em></h1>
+  <p class="subtitle">The full external-interrupt signal chain — GPIO edge to SYSCFG mux to EXTI to NVIC to your ISR — with exact RM0432 register names, CMSIS macros, a compilable bare-metal button example and the HAL equivalent.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">Contents</div>
+  <ol>
+    <li><a href="#s0">The interrupt signal path</a></li>
+    <li><a href="#s1">NVIC: enable, priority &amp; grouping</a></li>
+    <li><a href="#s2">Vector table &amp; ISR naming</a></li>
+    <li><a href="#s3">EXTI: edges, line mux &amp; pending</a></li>
+    <li><a href="#s4">Bare-metal button example (PA0)</a></li>
+    <li><a href="#s5">The HAL path &amp; callbacks</a></li>
+    <li><a href="#s6">Pending, clearing &amp; shared handlers</a></li>
+    <li><a href="#s7">Gotchas &amp; common mistakes</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">00</span> The interrupt signal path</h2>
+  <p class="section-lead">On the STM32L4R5 (Cortex-M4F core, RM0432 reference manual) a GPIO pin cannot interrupt the CPU directly. The edge travels through four blocks. Understanding this chain is the whole game — every bug is a missing step in it.</p>
+
+  <div class="flow">
+    <pre>GPIO pin edge → SYSCFG_EXTICR (pin→line mux) → EXTI (edge detect + mask + pending) → NVIC (enable + priority) → Cortex-M4 core → your *_IRQHandler</pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">GPIO</span><span class="desc">The pin must be an input (MODER = 00) with a defined level (pull-up/down or external). Clock: <code>RCC-&gt;AHB2ENR</code>.</span></div>
+    <div class="param"><span class="name">SYSCFG_EXTICR</span><span class="desc">Selects which port (A..I) drives EXTI line <em>y</em>. All PxY pins share one line number <em>y</em>; only one port at a time. Clock: <code>RCC-&gt;APB2ENR</code>.</span></div>
+    <div class="param"><span class="name">EXTI</span><span class="desc">Detects rising/falling edges (RTSR1/FTSR1), masks the line to the NVIC (IMR1) or to an event (EMR1), and latches a pending flag (PR1).</span></div>
+    <div class="param"><span class="name">NVIC</span><span class="desc">Nested Vectored Interrupt Controller inside the Cortex-M4: per-IRQ enable bit and an 8-bit priority (top 4 bits implemented → 16 levels).</span></div>
+  </div>
+
+  <p>Two independent switches must both be on for an ISR to fire: the <strong>EXTI mask</strong> (<code>IMR1</code>) and the <strong>NVIC enable</strong> (<code>ISER</code>). Miss either and nothing happens; the pending flag may still latch in <code>PR1</code>, so once you finally unmask, a stale edge can fire immediately.</p>
+
+  <div class="summary">
+    <h4>This section</h4>
+    <ul>
+      <li>Edge path: GPIO → SYSCFG mux → EXTI → NVIC → core → ISR.</li>
+      <li>Two enables required: EXTI <code>IMR1</code> bit <em>and</em> NVIC <code>ISER</code> bit.</li>
+      <li>Three clocks to enable: the GPIO port (AHB2), SYSCFG (APB2), and — implicitly — the core is always clocked.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">01</span> NVIC: enable, priority &amp; grouping</h2>
+  <p class="section-lead">The NVIC is memory-mapped inside the Cortex-M4 System Control Space. You rarely poke its registers directly — CMSIS (<code>core_cm4.h</code>, pulled in by <code>stm32l4r5xx.h</code>) gives you inline helpers. But knowing the registers explains exactly what those helpers write.</p>
+
+  <h3>The CMSIS helpers you actually call</h3>
+  <div class="code-block">
+    <div class="code-header"><span>c — enabling an IRQ line</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Order matters: set priority BEFORE enabling, so the first
+ * interrupt is already at the priority you intended.          */</span>
+NVIC_SetPriority(EXTI0_IRQn, 5);   <span class="cmt">/* 0 = highest, 15 = lowest */</span>
+NVIC_EnableIRQ(EXTI0_IRQn);        <span class="cmt">/* unmask in the NVIC       */</span>
+
+<span class="cmt">/* Mirror operations */</span>
+NVIC_DisableIRQ(EXTI0_IRQn);
+NVIC_ClearPendingIRQ(EXTI0_IRQn);  <span class="cmt">/* clears the NVIC latch, NOT EXTI-&gt;PR1 */</span>
+uint32_t p = NVIC_GetPriority(EXTI0_IRQn);</code></pre>
+  </div>
+
+  <h3>What those calls write, register-level</h3>
+  <div class="code-block">
+    <div class="code-header"><span>c — NVIC register equivalents (IRQn 6 = EXTI0)</span><span class="dot">●</span></div>
+    <pre><code>#define IRQ  EXTI0_IRQn                       <span class="cmt">/* = 6 */</span>
+
+<span class="cmt">/* Enable: 32 IRQs per 32-bit word */</span>
+NVIC-&gt;ISER[IRQ &gt;&gt; 5] = (1u &lt;&lt; (IRQ &amp; 0x1F));   <span class="cmt">/* ISER[0], bit 6 */</span>
+
+<span class="cmt">/* Priority: one 8-bit IPR byte per IRQ; STM32 uses the TOP 4 bits,
+ * so the value is left-shifted by (8 - __NVIC_PRIO_BITS) = 4.        */</span>
+NVIC-&gt;IPR[IRQ] = (uint8_t)(5u &lt;&lt; (8 - __NVIC_PRIO_BITS)); <span class="cmt">/* 5&lt;&lt;4 = 0x50 */</span>
+
+<span class="cmt">/* Disable / clear-pending use the mirror arrays */</span>
+NVIC-&gt;ICER[IRQ &gt;&gt; 5] = (1u &lt;&lt; (IRQ &amp; 0x1F));   <span class="cmt">/* Clear-Enable  */</span>
+NVIC-&gt;ICPR[IRQ &gt;&gt; 5] = (1u &lt;&lt; (IRQ &amp; 0x1F));   <span class="cmt">/* Clear-Pending */</span></code></pre>
+  </div>
+  <p><code>__NVIC_PRIO_BITS</code> is <code>4U</code> on the STM32L4R5. Because only the four most-significant bits are implemented, raw <code>IPR</code> writes must be pre-shifted; <code>NVIC_SetPriority()</code> does that shift for you, so you pass the plain 0..15 value.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>NVIC register</th><th>CMSIS access</th><th>Function</th></tr></thead>
+      <tbody>
+        <tr><td>ISER[]</td><td><code>NVIC-&gt;ISER[n]</code></td><td>Set-Enable (write 1 to enable)</td></tr>
+        <tr><td>ICER[]</td><td><code>NVIC-&gt;ICER[n]</code></td><td>Clear-Enable (write 1 to disable)</td></tr>
+        <tr><td>ISPR[]</td><td><code>NVIC-&gt;ISPR[n]</code></td><td>Set-Pending (force pending)</td></tr>
+        <tr><td>ICPR[]</td><td><code>NVIC-&gt;ICPR[n]</code></td><td>Clear-Pending</td></tr>
+        <tr><td>IABR[]</td><td><code>NVIC-&gt;IABR[n]</code></td><td>Active bit (read-only)</td></tr>
+        <tr><td>IPR[]</td><td><code>NVIC-&gt;IPR[irq]</code></td><td>8-bit priority per IRQ (top 4 bits used)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Priority grouping (pre-emption vs sub-priority)</h3>
+  <p>The 4 priority bits are split by the <strong>PRIGROUP</strong> field in <code>SCB-&gt;AIRCR[10:8]</code> into a <em>pre-emption</em> (group) part and a <em>sub-priority</em> part. Only pre-emption priority decides whether one ISR can interrupt another; sub-priority only orders two <em>pending</em> IRQs of the same group. Higher pre-emption (lower number) wins.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>CMSIS / HAL group</th><th>PRIGROUP</th><th>Pre-empt bits</th><th>Sub bits</th><th>Pre-empt levels</th><th>Sub levels</th></tr></thead>
+      <tbody>
+        <tr><td>NVIC_PRIORITYGROUP_0</td><td>0b111 (7)</td><td>0</td><td>4</td><td>1</td><td>16</td></tr>
+        <tr><td>NVIC_PRIORITYGROUP_1</td><td>0b110 (6)</td><td>1</td><td>3</td><td>2</td><td>8</td></tr>
+        <tr><td>NVIC_PRIORITYGROUP_2</td><td>0b101 (5)</td><td>2</td><td>2</td><td>4</td><td>4</td></tr>
+        <tr><td>NVIC_PRIORITYGROUP_3</td><td>0b100 (4)</td><td>3</td><td>1</td><td>8</td><td>2</td></tr>
+        <tr><td>NVIC_PRIORITYGROUP_4</td><td>0b011 (3)</td><td>4</td><td>0</td><td>16</td><td>1</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p><strong>Key fact:</strong> <code>HAL_Init()</code> selects <code>NVIC_PRIORITYGROUP_4</code> — all four bits are pre-emption, zero sub-priority. Under HAL the sub-priority argument you pass is silently ignored.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — grouping: raw CMSIS vs HAL</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Raw CMSIS: choose 2 group bits + 2 sub bits (PRIGROUP = 5) */</span>
+NVIC_SetPriorityGrouping(5u);
+uint32_t prio = NVIC_EncodePriority(NVIC_GetPriorityGrouping(),
+                                    2,   <span class="cmt">/* pre-emption level 0..3 */</span>
+                                    1);  <span class="cmt">/* sub-priority      0..3 */</span>
+NVIC_SetPriority(EXTI0_IRQn, prio);
+
+<span class="cmt">/* HAL: HAL_Init() already forced group 4, so 'sub' does nothing */</span>
+HAL_NVIC_SetPriority(EXTI0_IRQn, 5, 0);  <span class="cmt">/* (IRQn, preempt, sub) */</span>
+HAL_NVIC_EnableIRQ(EXTI0_IRQn);</code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">02</span> Vector table &amp; ISR naming</h2>
+  <p class="section-lead">The Cortex-M4 fetches the ISR address from a table at the base of flash (<code>0x0800_0000</code>, pointed to by <code>SCB-&gt;VTOR</code>). Entry <em>N</em> holds the address for IRQ <em>N</em>. ST's <code>startup_stm32l4r5xx.s</code> fills that table with <strong>weak</strong> symbols aliased to <code>Default_Handler</code> (an infinite loop). You override one by defining a plain C function with the <em>exact</em> same name.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>asm — startup_stm32l4r5xx.s (GCC), excerpt</span><span class="dot">●</span></div>
+    <pre><code>g_pfnVectors:
+  .word  _estack
+  .word  Reset_Handler
+  <span class="cmt">/* ... core exceptions ... */</span>
+  .word  EXTI0_IRQHandler        <span class="cmt">/* IRQ  6 */</span>
+  .word  EXTI1_IRQHandler        <span class="cmt">/* IRQ  7 */</span>
+  <span class="cmt">/* ... */</span>
+  .word  EXTI9_5_IRQHandler      <span class="cmt">/* IRQ 23 */</span>
+  <span class="cmt">/* ... */</span>
+  .word  EXTI15_10_IRQHandler    <span class="cmt">/* IRQ 40 */</span>
+
+  <span class="cmt">/* Each handler is a WEAK alias of Default_Handler: */</span>
+  .weak      EXTI0_IRQHandler
+  .thumb_set EXTI0_IRQHandler, Default_Handler</code></pre>
+  </div>
+
+  <p>Define a non-weak (strong) symbol of the same name in your C and the linker uses yours instead. A <strong>typo</strong> (<code>EXTI_0_IRQHandler</code>, wrong case, missing underscore) does not error — it silently leaves the weak <code>Default_Handler</code> in the table, and your interrupt appears to "do nothing" while the core spins in the default loop.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>GPIO pin(s)</th><th>EXTI line</th><th>EXTICR reg</th><th>IRQn (value)</th><th>ISR symbol name</th></tr></thead>
+      <tbody>
+        <tr><td>Px0</td><td>EXTI0</td><td>EXTICR[0]</td><td>EXTI0_IRQn (6)</td><td>EXTI0_IRQHandler</td></tr>
+        <tr><td>Px1</td><td>EXTI1</td><td>EXTICR[0]</td><td>EXTI1_IRQn (7)</td><td>EXTI1_IRQHandler</td></tr>
+        <tr><td>Px2</td><td>EXTI2</td><td>EXTICR[0]</td><td>EXTI2_IRQn (8)</td><td>EXTI2_IRQHandler</td></tr>
+        <tr><td>Px3</td><td>EXTI3</td><td>EXTICR[0]</td><td>EXTI3_IRQn (9)</td><td>EXTI3_IRQHandler</td></tr>
+        <tr><td>Px4</td><td>EXTI4</td><td>EXTICR[1]</td><td>EXTI4_IRQn (10)</td><td>EXTI4_IRQHandler</td></tr>
+        <tr><td>Px5 – Px9</td><td>EXTI5 – EXTI9</td><td>EXTICR[1..2]</td><td>EXTI9_5_IRQn (23)</td><td>EXTI9_5_IRQHandler</td></tr>
+        <tr><td>Px10 – Px15</td><td>EXTI10 – EXTI15</td><td>EXTICR[2..3]</td><td>EXTI15_10_IRQn (40)</td><td>EXTI15_10_IRQHandler</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Lines 0–4 each own a dedicated vector; lines 5–9 share <code>EXTI9_5</code> and lines 10–15 share <code>EXTI15_10</code>. Shared handlers must demultiplex via <code>PR1</code> (see section 06). IRQn values above come straight from <code>stm32l4r5xx.h</code>.</p>
+</section>
+
+<!-- ═══════════════════ 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">03</span> EXTI: edges, line mux &amp; pending</h2>
+  <p class="section-lead">The EXTI controller owns the edge detection. On the STM32L4R5, configurable GPIO lines are 0–15; higher line numbers are internal sources (PVD, RTC, USB wakeup, COMP, …). Lines 0–31 use the <code>*1</code> registers; lines 32+ use the <code>*2</code> registers.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Register (lines 0–31)</th><th>Meaning</th><th>Behaviour</th></tr></thead>
+      <tbody>
+        <tr><td><code>EXTI_IMR1</code></td><td>Interrupt mask</td><td>1 = line delivers an IRQ to the NVIC</td></tr>
+        <tr><td><code>EXTI_EMR1</code></td><td>Event mask</td><td>1 = line generates a CPU event/wakeup, <em>no</em> ISR</td></tr>
+        <tr><td><code>EXTI_RTSR1</code></td><td>Rising trigger select</td><td>1 = detect 0→1 transition</td></tr>
+        <tr><td><code>EXTI_FTSR1</code></td><td>Falling trigger select</td><td>1 = detect 1→0 transition</td></tr>
+        <tr><td><code>EXTI_SWIER1</code></td><td>Software interrupt event</td><td>write 1 = force the line pending (self-test)</td></tr>
+        <tr><td><code>EXTI_PR1</code></td><td>Pending register</td><td>1 = selected edge occurred; <strong>write 1 to clear</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The matching bit macros in <code>stm32l4r5xx.h</code> are <code>EXTI_IMR1_IMx</code>, <code>EXTI_RTSR1_RTx</code>, <code>EXTI_FTSR1_FTx</code>, <code>EXTI_SWIER1_SWIx</code> and <code>EXTI_PR1_PIFx</code> (for line <em>x</em>). Set both <code>RTSR1</code> and <code>FTSR1</code> for either-edge triggering.</p>
+
+  <h3>Muxing the pin to the line: SYSCFG_EXTICR</h3>
+  <p>Line number <em>y</em> can be driven by <code>PA</code><em>y</em>, <code>PB</code><em>y</em>, … but only one at a time. The 4-bit selector lives in <code>SYSCFG-&gt;EXTICR[k]</code>, where <code>k = y / 4</code> and the field starts at bit <code>4 * (y % 4)</code>.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>EXTICR value</th><th>Port</th><th>EXTICR value</th><th>Port</th></tr></thead>
+      <tbody>
+        <tr><td>0x0</td><td>PA</td><td>0x5</td><td>PF</td></tr>
+        <tr><td>0x1</td><td>PB</td><td>0x6</td><td>PG</td></tr>
+        <tr><td>0x2</td><td>PC</td><td>0x7</td><td>PH</td></tr>
+        <tr><td>0x3</td><td>PD</td><td>0x8</td><td>PI</td></tr>
+        <tr><td>0x4</td><td>PE</td><td colspan="2">(availability depends on package pin-out)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Mapping which register holds which line: <code>EXTICR[0]</code> → lines 0–3, <code>EXTICR[1]</code> → 4–7, <code>EXTICR[2]</code> → 8–11, <code>EXTICR[3]</code> → 12–15. The header also provides ready-made value macros such as <code>SYSCFG_EXTICR4_EXTI13_PC</code> (= <code>0x20</code>) for the common cases.</p>
+
+  <div class="callout">
+    <p><strong>Interrupt vs event.</strong> Unmask via <code>IMR1</code> to run an ISR. Unmask via <code>EMR1</code> instead and the edge sets a CPU event (wakes a <code>__WFE()</code> / pulses a peripheral trigger) but <em>never</em> vectors to a handler. Using <code>EMR1</code> when you wanted a callback is a classic silent failure.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">04</span> Bare-metal button example (PA0)</h2>
+  <p class="section-lead">A complete, compilable register-level program (CMSIS device header only, no HAL). Wiring: a push-button from <strong>PA0</strong> to GND (internal pull-up, so idle = high, press = falling edge), toggling the green LED <strong>LD1 (PC7)</strong> on the NUCLEO-L4R5ZI. PA0 → EXTI0 → dedicated <code>EXTI0_IRQn</code>.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — main.c (register/LL level, fully self-contained)</span><span class="dot">●</span></div>
+    <pre><code>#include "stm32l4r5xx.h"   <span class="cmt">/* CMSIS: EXTI, GPIOx, RCC, SYSCFG, NVIC_*, IRQn */</span>
+
+<span class="cmt">/* Shared with main loop -&gt; MUST be volatile or the compiler may cache it */</span>
+volatile uint32_t g_presses = 0;
+
+<span class="cmt">/* Vector-table symbol: name MUST match startup_stm32l4r5xx.s EXACTLY */</span>
+void EXTI0_IRQHandler(void)
+{
+    if (EXTI-&gt;PR1 &amp; EXTI_PR1_PIF0) {   <span class="cmt">/* did line 0 fire?         */</span>
+        EXTI-&gt;PR1 = EXTI_PR1_PIF0;     <span class="cmt">/* clear pending: write 1   */</span>
+        GPIOC-&gt;ODR ^= GPIO_ODR_OD7;    <span class="cmt">/* toggle LD1               */</span>
+        g_presses++;
+    }
+}
+
+int main(void)
+{
+    <span class="cmt">/* 1) Clocks: GPIOA + GPIOC on AHB2, SYSCFG on APB2 */</span>
+    RCC-&gt;AHB2ENR |= RCC_AHB2ENR_GPIOAEN | RCC_AHB2ENR_GPIOCEN;
+    RCC-&gt;APB2ENR |= RCC_APB2ENR_SYSCFGEN;   <span class="cmt">/* WITHOUT this, EXTICR stays PA */</span>
+    (void)RCC-&gt;APB2ENR;                      <span class="cmt">/* read-back: let the clock settle */</span>
+
+    <span class="cmt">/* 2) PA0 = input (MODER 00) with pull-up (PUPDR 01) */</span>
+    GPIOA-&gt;MODER &amp;= ~GPIO_MODER_MODE0;
+    GPIOA-&gt;PUPDR = (GPIOA-&gt;PUPDR &amp; ~GPIO_PUPDR_PUPD0)
+                 | (1u &lt;&lt; GPIO_PUPDR_PUPD0_Pos);
+
+    <span class="cmt">/* 3) PC7 = general-purpose output (MODER 01), push-pull default */</span>
+    GPIOC-&gt;MODER = (GPIOC-&gt;MODER &amp; ~GPIO_MODER_MODE7)
+                 | (1u &lt;&lt; GPIO_MODER_MODE7_Pos);
+
+    <span class="cmt">/* 4) Route EXTI0 to port A (EXTICR1 field EXTI0 = 0x0 = PA) */</span>
+    SYSCFG-&gt;EXTICR[0] &amp;= ~SYSCFG_EXTICR1_EXTI0;
+
+    <span class="cmt">/* 5) EXTI line 0: falling edge only, clear stale, then unmask */</span>
+    EXTI-&gt;RTSR1 &amp;= ~EXTI_RTSR1_RT0;   <span class="cmt">/* no rising edge   */</span>
+    EXTI-&gt;FTSR1 |=  EXTI_FTSR1_FT0;   <span class="cmt">/* falling edge     */</span>
+    EXTI-&gt;PR1    =  EXTI_PR1_PIF0;    <span class="cmt">/* clear stale flag BEFORE unmask */</span>
+    EXTI-&gt;IMR1  |=  EXTI_IMR1_IM0;    <span class="cmt">/* unmask -&gt; reaches NVIC */</span>
+
+    <span class="cmt">/* 6) NVIC: priority (0..15) THEN enable */</span>
+    NVIC_SetPriority(EXTI0_IRQn, 5);
+    NVIC_EnableIRQ(EXTI0_IRQn);
+
+    while (1) {
+        __WFI();   <span class="cmt">/* sleep until any interrupt wakes the core */</span>
+    }
+}</code></pre>
+  </div>
+
+  <p>Every write above maps 1:1 to the signal path in section 00. Drop the identical logic in with a different pin by changing the <code>MODE</code>/<code>PUPD</code>/<code>EXTICR</code>/<code>IM</code>/<code>FT</code> index and the <code>IRQn</code>/handler name from the table in section 02.</p>
+</section>
+
+<!-- ═══════════════════ 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">05</span> The HAL path &amp; callbacks</h2>
+  <p class="section-lead">STM32Cube HAL hides the registers behind three moving parts: <code>HAL_GPIO_Init()</code> (with an <code>IT</code> mode) programs SYSCFG + EXTI; the <code>*_IRQHandler</code> in <code>stm32l4xx_it.c</code> calls <code>HAL_GPIO_EXTI_IRQHandler()</code> which clears <code>PR1</code> and dispatches; and you override the weak <code>HAL_GPIO_EXTI_Callback()</code>. Same result as section 04 — but you must not forget to wire all three.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — main.c : GPIO + NVIC init</span><span class="dot">●</span></div>
+    <pre><code>void MX_GPIO_Init(void)
+{
+    GPIO_InitTypeDef g = {0};
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_SYSCFG_CLK_ENABLE();   <span class="cmt">/* required for EXTI line muxing */</span>
+
+    <span class="cmt">/* PA0 -&gt; external interrupt, falling edge, pull-up */</span>
+    g.Pin  = GPIO_PIN_0;
+    g.Mode = GPIO_MODE_IT_FALLING;   <span class="cmt">/* IT = interrupt (EVT = event, no ISR) */</span>
+    g.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(GPIOA, &amp;g);
+
+    <span class="cmt">/* PC7 -&gt; push-pull output (LED) */</span>
+    g.Pin   = GPIO_PIN_7;
+    g.Mode  = GPIO_MODE_OUTPUT_PP;
+    g.Pull  = GPIO_NOPULL;
+    g.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOC, &amp;g);
+
+    <span class="cmt">/* NVIC (HAL_Init selected NVIC_PRIORITYGROUP_4 -&gt; sub-priority ignored) */</span>
+    HAL_NVIC_SetPriority(EXTI0_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — stm32l4xx_it.c : the vector-table ISR</span><span class="dot">●</span></div>
+    <pre><code>void EXTI0_IRQHandler(void)
+{
+    <span class="cmt">/* Clears EXTI-&gt;PR1 for pin 0 AND calls HAL_GPIO_EXTI_Callback() */</span>
+    HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_0);
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — your file : override the weak callback</span><span class="dot">●</span></div>
+    <pre><code>void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == GPIO_PIN_0) {
+        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_7);   <span class="cmt">/* toggle LD1 */</span>
+    }
+}</code></pre>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">HAL_GPIO_Init (IT mode)</span><span class="desc">Programs <code>SYSCFG_EXTICR</code>, <code>RTSR1/FTSR1</code> and unmasks <code>IMR1</code>. It does <em>not</em> touch the NVIC.</span></div>
+    <div class="param"><span class="name">HAL_NVIC_* </span><span class="desc">You still call these yourself — CubeMX puts them right after <code>HAL_GPIO_Init</code>.</span></div>
+    <div class="param"><span class="name">HAL_GPIO_EXTI_IRQHandler</span><span class="desc">The only thing your <code>*_IRQHandler</code> body should contain; it clears the pending flag for you.</span></div>
+    <div class="param"><span class="name">HAL_GPIO_EXTI_Callback</span><span class="desc">Weak, shared by all pins — branch on <code>GPIO_Pin</code> to tell lines apart.</span></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">06</span> Pending, clearing &amp; shared handlers</h2>
+  <p class="section-lead">There are two separate pending latches. Confusing them causes the two most common EXTI bugs: an interrupt that fires forever, and a shared handler that reacts to the wrong pin.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Latch</th><th>Set when</th><th>Cleared by</th><th>If you forget</th></tr></thead>
+      <tbody>
+        <tr><td><code>EXTI-&gt;PR1</code> bit</td><td>the selected edge occurs</td><td>writing 1 to that bit</td><td>ISR re-enters immediately → interrupt storm</td></tr>
+        <tr><td>NVIC pending (<code>ISPR</code>)</td><td>the EXTI request asserts</td><td>entering the ISR (or <code>NVIC_ClearPendingIRQ</code>)</td><td>usually auto-handled; only matters after disabling</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The rule: <strong>clear the EXTI source (<code>PR1</code>) inside the handler.</strong> The NVIC latch clears itself on ISR entry, but the EXTI flag is the persistent source — leave it set and the core re-vectors the moment the handler returns.</p>
+
+  <h3>Shared handlers must demultiplex</h3>
+  <p>Lines 10–15 all vector to <code>EXTI15_10_IRQHandler</code>. Inside it you must test each <code>PR1</code> bit you care about and clear only the ones you handled. Example: the NUCLEO-L4R5ZI user button <strong>B1 is on PC13</strong> → EXTI13 → <code>EXTI15_10_IRQn</code>.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — PC13 button on a shared line</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* Mux EXTI13 -&gt; port C. Line 13 lives in EXTICR[3], field bits [7:4]. */</span>
+SYSCFG-&gt;EXTICR[3] = (SYSCFG-&gt;EXTICR[3] &amp; ~SYSCFG_EXTICR4_EXTI13)
+                 | SYSCFG_EXTICR4_EXTI13_PC;   <span class="cmt">/* 0x20 selects PC */</span>
+EXTI-&gt;FTSR1 |= EXTI_FTSR1_FT13;
+EXTI-&gt;PR1   =  EXTI_PR1_PIF13;                  <span class="cmt">/* clear stale */</span>
+EXTI-&gt;IMR1  |= EXTI_IMR1_IM13;
+NVIC_SetPriority(EXTI15_10_IRQn, 6);
+NVIC_EnableIRQ(EXTI15_10_IRQn);
+
+<span class="cmt">/* One handler serves lines 10..15 -&gt; you MUST check which line fired */</span>
+void EXTI15_10_IRQHandler(void)
+{
+    if (EXTI-&gt;PR1 &amp; EXTI_PR1_PIF13) {
+        EXTI-&gt;PR1 = EXTI_PR1_PIF13;   <span class="cmt">/* clear ONLY the line handled */</span>
+        <span class="cmt">/* ... service the button ... */</span>
+    }
+    <span class="cmt">/* other lines (10,11,12,14,15) would each test their own PIF bit */</span>
+}</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — force a line pending in software (self-test)</span><span class="dot">●</span></div>
+    <pre><code>EXTI-&gt;SWIER1 = EXTI_SWIER1_SWI0;   <span class="cmt">/* sets PR1 bit 0 -&gt; runs EXTI0_IRQHandler */</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">07</span> Gotchas &amp; common mistakes</h2>
+  <p class="section-lead">Almost every "my interrupt doesn't fire" (or "fires forever") report on the ST forums is one of these. Scan the table first.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Mistake</th><th>Symptom</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td>SYSCFG clock not enabled</td><td>EXTICR writes have no effect; line stays mapped to PA — a different port's pin appears "dead" or PA fires unexpectedly</td><td><code>RCC-&gt;APB2ENR |= RCC_APB2ENR_SYSCFGEN;</code> before writing <code>EXTICR</code></td></tr>
+        <tr><td>Not clearing <code>EXTI-&gt;PR1</code> in the ISR</td><td>Handler re-enters endlessly; app appears frozen (interrupt storm)</td><td>Write 1 to the pending bit: <code>EXTI-&gt;PR1 = EXTI_PR1_PIFx;</code></td></tr>
+        <tr><td>Handler name typo / wrong case</td><td>Interrupt "does nothing"; core silently spins in <code>Default_Handler</code></td><td>Copy the exact symbol from section 02; it is case-sensitive</td></tr>
+        <tr><td>Two pins, same line number</td><td>PA0 and PB0 can't both use EXTI0 — only the last <code>EXTICR</code> port wins</td><td>Use different pin numbers; one EXTI line = one port at a time</td></tr>
+        <tr><td>Wrong priority direction</td><td>ISR never pre-empts as expected</td><td>Lower number = higher priority; only 0..15 are meaningful (4 bits)</td></tr>
+        <tr><td>Raw <code>IPR</code> write not shifted</td><td>Priority looks off by 16×</td><td><code>NVIC-&gt;IPR[n] = prio &lt;&lt; 4;</code> — or just use <code>NVIC_SetPriority()</code></td></tr>
+        <tr><td>Expecting sub-priority under HAL</td><td>Two ISRs at same preempt level don't order as hoped</td><td>HAL uses group 4 (0 sub bits); use a different <code>NVIC_SetPriorityGrouping</code> if you need sub-priority</td></tr>
+        <tr><td>Used <code>EMR1</code> instead of <code>IMR1</code></td><td>CPU wakes / peripheral triggers but no ISR runs</td><td>Set <code>IMR1</code> for an interrupt; <code>EMR1</code> is for events only</td></tr>
+        <tr><td>GPIO port clock off</td><td>Pin config writes are ignored; pin stays analog/input</td><td>Enable <code>RCC-&gt;AHB2ENR</code> bit for the port first</td></tr>
+        <tr><td>Shared flag not <code>volatile</code></td><td>Main loop never sees the ISR's update (optimized away)</td><td>Declare cross-ISR variables <code>volatile</code></td></tr>
+        <tr><td>Switch bounce</td><td>One press → many interrupts / double-toggle</td><td>Debounce: ignore edges within ~10–20 ms, or read the pin after a short delay</td></tr>
+        <tr><td>RTOS ISR calls <code>*FromISR</code> at too-high priority</td><td>Hard fault / assert inside FreeRTOS</td><td>Keep numeric priority ≥ <code>configMAX_SYSCALL_INTERRUPT_PRIORITY</code> (i.e. logically lower)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Checklist for a working GPIO interrupt</h4>
+    <ul>
+      <li>Enable GPIO port clock (AHB2) <strong>and</strong> SYSCFG clock (APB2).</li>
+      <li>Pin = input, with pull-up/down or an external reference.</li>
+      <li><code>SYSCFG-&gt;EXTICR[y/4]</code> selects the correct port for line <em>y</em>.</li>
+      <li>Set <code>RTSR1</code> and/or <code>FTSR1</code>, clear stale <code>PR1</code>, unmask <code>IMR1</code>.</li>
+      <li><code>NVIC_SetPriority()</code> then <code>NVIC_EnableIRQ()</code> with the right <code>IRQn</code>.</li>
+      <li>Define the exact <code>*_IRQHandler</code>; clear <code>PR1</code> first thing inside it.</li>
+    </ul>
+  </div>
+</section>
+
+</main>

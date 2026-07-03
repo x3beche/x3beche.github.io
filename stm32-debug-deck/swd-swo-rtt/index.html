@@ -1,0 +1,545 @@
+---
+layout: tutorial
+title: "SWD, SWO Trace & RTT — printf-Debug over the Probe"
+back_url: "../index.html"
+back_label: "All guides"
+---
+<header class="header">
+  <div class="meta">
+    <span>TECHNICAL GUIDE</span><span>STM32 DEBUG</span><span>SWO/RTT</span><span>2026</span>
+  </div>
+  <h1>SWD, SWO Trace &amp; RTT<br><em>printf-Debug over the Probe</em></h1>
+  <p class="subtitle">Get real, non-intrusive logging out of an STM32L4R5 over the debug probe — SWD wiring, ITM/SWO stimulus printf, SEGGER RTT, and the exact host-side CLI capture commands.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">Contents</div>
+  <ol>
+    <li><a href="#s0">SWD pins &amp; protocol basics</a></li>
+    <li><a href="#s1">The CoreSight trace path: DEMCR, ITM, DWT, TPIU</a></li>
+    <li><a href="#s2">SWO/ITM printf on the STM32L4R5 (register-level + HAL)</a></li>
+    <li><a href="#s3">Reading SWO on the host: OpenOCD, itmdump, orbuculum, st-trace</a></li>
+    <li><a href="#s4">SEGGER RTT: concept &amp; target setup</a></li>
+    <li><a href="#s5">Reading RTT: OpenOCD, probe-rs, JLinkRTTClient</a></li>
+    <li><a href="#s6">SWO vs RTT vs semihosting — when to use which</a></li>
+    <li><a href="#s7">Gotchas &amp; common mistakes</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ 01 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">01</span> SWD pins &amp; protocol basics</h2>
+  <p class="section-lead">Serial Wire Debug (SWD) is ARM's two-wire replacement for JTAG on Cortex-M. Everything in this guide rides on the same physical link the debugger already uses to halt, single-step and flash the STM32L4R5 (Cortex-M4F).</p>
+
+  <p>SWD replaces JTAG's TCK/TMS/TDI/TDO with a bidirectional data line and a clock. It talks to the Debug Access Port (DAP) inside the core, which in turn reaches the Advanced High-performance Bus (AHB) and the CoreSight debug components. SWO is a <em>third, optional</em> pin: a one-way trace output that shares the physical JTDO/TRACESWO ball.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Signal</th><th>Direction</th><th>Purpose</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>SWDIO</td><td>Bidirectional</td><td>Serial data (host ↔ DAP), sampled/driven on SWCLK edges</td></tr>
+        <tr><td>SWCLK</td><td>Host → target</td><td>Debug clock supplied by the probe (up to a few MHz)</td></tr>
+        <tr><td>SWO</td><td>Target → host</td><td>Single-Wire Output: ITM/DWT trace stream (async UART or Manchester)</td></tr>
+        <tr><td>NRST</td><td>Host ↔ target</td><td>Optional hardware reset (connect-under-reset, recovery)</td></tr>
+        <tr><td>VTref</td><td>Target → host</td><td>Reference voltage so the probe matches target I/O levels</td></tr>
+        <tr><td>GND</td><td>—</td><td>Common ground; keep it short for clean high-speed SWO</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>STM32L4R5 debug pin / alternate-function map</h3>
+  <p>On the STM32L4R5 (RM0432, DS12023) the SW/JTAG pins default to alternate function <strong>AF0</strong> (the SYS_AF). After reset PA13/PA14 are already in SWD mode; PA15/PB3/PB4 come up as JTAG pins and can be freed for GPIO if you use SWD-only — but keep <strong>PB3 in AF0</strong> if you want SWO.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Pin</th><th>Default function</th><th>AF</th><th>Role for this guide</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>PA13</td><td>JTMS / SWDIO</td><td>AF0</td><td>SWD data — required</td></tr>
+        <tr><td>PA14</td><td>JTCK / SWCLK</td><td>AF0</td><td>SWD clock — required</td></tr>
+        <tr><td>PB3</td><td>JTDO / <strong>TRACESWO</strong></td><td>AF0</td><td>SWO trace output — required for ITM/SWO</td></tr>
+        <tr><td>PA15</td><td>JTDI</td><td>AF0</td><td>JTAG only; free as GPIO in SWD mode</td></tr>
+        <tr><td>PB4</td><td>NJTRST</td><td>AF0</td><td>JTAG only; free as GPIO in SWD mode</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <div class="label">BOARD NOTE — NUCLEO-L4R5ZI</div>
+    <p>On the NUCLEO-L4R5ZI, PA13/PA14 (SWD) and PB3 (SWO) are wired to the on-board ST-LINK, so no external probe or extra jumper wire is needed for SWO. On custom boards, break out SWDIO, SWCLK, GND, VTref, NRST and — if you want SWO — PB3 on the standard 10-pin Cortex Debug connector.</p>
+  </div>
+
+  <h3>Standard 10-pin Cortex Debug (SWD) connector</h3>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Pin</th><th>Signal</th><th>Pin</th><th>Signal</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>1</td><td>VTref</td><td>2</td><td>SWDIO</td></tr>
+        <tr><td>3</td><td>GND</td><td>4</td><td>SWCLK</td></tr>
+        <tr><td>5</td><td>GND</td><td>6</td><td>SWO</td></tr>
+        <tr><td>7</td><td>KEY (n/c)</td><td>8</td><td>NC / TDI</td></tr>
+        <tr><td>9</td><td>GNDDetect</td><td>10</td><td>NRST</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ 02 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">02</span> The CoreSight trace path: DEMCR, ITM, DWT, TPIU</h2>
+  <p class="section-lead">SWO printf is not a UART. Bytes travel through four CoreSight blocks: the DWT/ITM generate trace packets, the TPIU serialises them onto the SWO pin, and DEMCR.TRCENA is the master power switch. Know these registers and you can bring up SWO on any Cortex-M without a wizard.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Block</th><th>Register</th><th>Address</th><th>Key fields</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>SCB/DCB</td><td>DEMCR</td><td>0xE000EDFC</td><td>TRCENA (bit 24) — master enable for DWT/ITM/TPIU</td></tr>
+        <tr><td>ITM</td><td>ITM_STIM0..31</td><td>0xE0000000 + 4·n</td><td>Stimulus ports; write byte/half/word to emit trace</td></tr>
+        <tr><td>ITM</td><td>ITM_TER</td><td>0xE0000E00</td><td>Trace Enable Register — one bit per stimulus port</td></tr>
+        <tr><td>ITM</td><td>ITM_TPR</td><td>0xE0000E40</td><td>Trace Privilege — allow unprivileged writes to ports</td></tr>
+        <tr><td>ITM</td><td>ITM_TCR</td><td>0xE0000E80</td><td>ITMENA(0), TSENA(1), SYNCENA(2), TXENA(3), SWOENA(4), TraceBusID[22:16]</td></tr>
+        <tr><td>ITM</td><td>ITM_LAR</td><td>0xE0000FB0</td><td>Lock Access — write 0xC5ACCE55 to unlock ITM regs</td></tr>
+        <tr><td>DWT</td><td>DWT_CTRL</td><td>0xE0001000</td><td>Cycle counter, PC sampling, exception trace</td></tr>
+        <tr><td>DWT</td><td>DWT_CYCCNT</td><td>0xE0001004</td><td>32-bit cycle counter (profiling / timestamps)</td></tr>
+        <tr><td>TPIU</td><td>TPIU_ACPR</td><td>0xE0040010</td><td>Async Clock Prescaler — sets SWO bit rate divider</td></tr>
+        <tr><td>TPIU</td><td>TPIU_SPPR</td><td>0xE00400F0</td><td>Pin protocol: 1 = Manchester, 2 = NRZ (UART)</td></tr>
+        <tr><td>TPIU</td><td>TPIU_FFCR</td><td>0xE0040304</td><td>Formatter &amp; Flush Control — turn formatter OFF for single-source SWO</td></tr>
+        <tr><td>DBGMCU</td><td>DBGMCU_CR</td><td>0xE0042004</td><td>TRACE_IOEN (bit 5), TRACE_MODE[7:6] — STM32-specific pin muxing</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>DBGMCU_CR.TRACE_MODE (STM32L4R5-specific)</h3>
+  <p>ARM defines TPIU; ST adds a small mux on top via <code>DBGMCU_CR</code>. You must set <strong>TRACE_IOEN</strong> to route the trace signals to package pins, and pick a <strong>TRACE_MODE</strong>. For SWO you want asynchronous mode.</p>
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>TRACE_MODE[1:0]</th><th>Mode</th><th>Pins used</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>0b00</td><td>Asynchronous (SWO)</td><td>TRACESWO only (PB3) — this is what you want</td></tr>
+        <tr><td>0b01</td><td>Synchronous, 1-bit</td><td>TRACECK + TRACED0</td></tr>
+        <tr><td>0b10</td><td>Synchronous, 2-bit</td><td>TRACECK + TRACED0..1</td></tr>
+        <tr><td>0b11</td><td>Synchronous, 4-bit</td><td>TRACECK + TRACED0..3</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>The SWO baud-rate formula</h3>
+  <p>In async NRZ mode the SWO line rate is the trace clock divided by the prescaler. On STM32 the TPIU trace clock (TRACECLKIN) is <strong>HCLK</strong>. So:</p>
+  <div class="flow">
+    <pre>SWO_baud = TRACECLK / (TPIU_ACPR + 1)     →     TPIU_ACPR = (HCLK / SWO_baud) - 1
+
+Example (default L4R5, HCLK = 80 MHz, target SWO = 2 MHz):
+  TPIU_ACPR = 80 000 000 / 2 000 000 - 1 = 39</pre>
+  </div>
+  <div class="callout">
+    <div class="label">THE #1 SWO BUG</div>
+    <p>The host decoder must be told the <em>same</em> TRACECLK you actually run. If firmware boosts the PLL from 80 MHz to 120 MHz after SWO is set up (or the host assumes 72 MHz), every character is garbled. TRACECLK == current HCLK == what you pass to OpenOCD/st-trace. No exceptions.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 03 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">03</span> SWO/ITM printf on the STM32L4R5 (register-level + HAL)</h2>
+  <p class="section-lead">Two jobs: (1) mux PB3 to TRACESWO and program the TPIU/ITM once at boot, (2) push characters into a stimulus port. Below is a complete, compilable CMSIS bring-up with no HAL dependency, plus the HAL/GPIO variant and a newlib <code>printf</code> retarget.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>swo.c — complete register-level SWO/ITM init (CMSIS)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt">/* SWO printf for STM32L4R5 (Cortex-M4F).  No HAL required.
+ * Emits ITM stimulus-port-0 bytes on PB3 / TRACESWO, async NRZ (UART) encoding.
+ * Call SWO_Init(SystemCoreClock, 2000000) once after the clock tree is final. */</span>
+#include <span class="str">&lt;stdint.h&gt;</span>
+#include <span class="str">"stm32l4xx.h"</span>   <span class="cmt">/* CMSIS device header: defines ITM, TPI, DWT, CoreDebug, DBGMCU, GPIOB, RCC */</span>
+
+<span class="keyword">void</span> SWO_Init(uint32_t hclk_hz, uint32_t swo_baud)
+{
+    <span class="cmt">/* --- 1. Route PB3 to TRACESWO (AF0), very-high speed --------------- */</span>
+    RCC-&gt;AHB2ENR |= RCC_AHB2ENR_GPIOBEN;              <span class="cmt">/* clock GPIOB */</span>
+    GPIOB-&gt;MODER   = (GPIOB-&gt;MODER   &amp; ~(3u &lt;&lt; (3*2))) | (2u &lt;&lt; (3*2)); <span class="cmt">/* PB3 = AF mode */</span>
+    GPIOB-&gt;OSPEEDR |=  (3u &lt;&lt; (3*2));                  <span class="cmt">/* very-high output speed */</span>
+    GPIOB-&gt;AFR[0]  = (GPIOB-&gt;AFR[0] &amp; ~(0xFu &lt;&lt; (3*4))) | (0u &lt;&lt; (3*4)); <span class="cmt">/* AF0 = TRACESWO */</span>
+
+    <span class="cmt">/* --- 2. STM32 debug mux: async trace, drive the trace IO --------- */</span>
+    DBGMCU-&gt;CR &amp;= ~DBGMCU_CR_TRACE_MODE;              <span class="cmt">/* TRACE_MODE = 00 -&gt; async SWO */</span>
+    DBGMCU-&gt;CR |=  DBGMCU_CR_TRACE_IOEN;              <span class="cmt">/* enable trace pin(s) */</span>
+
+    <span class="cmt">/* --- 3. Master trace enable ------------------------------------- */</span>
+    CoreDebug-&gt;DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;   <span class="cmt">/* DEMCR bit 24 */</span>
+
+    <span class="cmt">/* --- 4. TPIU: NRZ encoding, prescaler, formatter OFF ------------ */</span>
+    TPI-&gt;ACPR = (hclk_hz / swo_baud) - 1u;            <span class="cmt">/* SWO_baud = HCLK/(ACPR+1) */</span>
+    TPI-&gt;SPPR = 2u;                                   <span class="cmt">/* 2 = NRZ/UART, 1 = Manchester */</span>
+    TPI-&gt;FFCR = 0x100u;                               <span class="cmt">/* formatter off (single ITM source) */</span>
+
+    <span class="cmt">/* --- 5. ITM: unlock, enable, open stimulus port 0 --------------- */</span>
+    ITM-&gt;LAR = 0xC5ACCE55u;                           <span class="cmt">/* unlock ITM registers */</span>
+    ITM-&gt;TCR = ITM_TCR_ITMENA_Msk                     <span class="cmt">/* enable ITM */</span>
+             | ITM_TCR_SYNCENA_Msk                   <span class="cmt">/* sync packets */</span>
+             | ITM_TCR_TSENA_Msk                     <span class="cmt">/* local timestamps */</span>
+             | (1u &lt;&lt; ITM_TCR_TraceBusID_Pos);       <span class="cmt">/* ATB ID = 1 */</span>
+    ITM-&gt;TPR = 0x00000001u;                           <span class="cmt">/* allow unpriv. access to port 0 */</span>
+    ITM-&gt;TER = 0x00000001u;                           <span class="cmt">/* enable stimulus port 0 */</span>
+}
+
+<span class="cmt">/* Blocking single-char write. Spins only while the FIFO is full AND a
+ * debugger is draining it; if no probe is attached the port stays "ready"
+ * because writes are simply dropped by hardware. */</span>
+<span class="keyword">void</span> SWO_PutChar(uint8_t c)
+{
+    <span class="keyword">if</span> ((ITM-&gt;TCR &amp; ITM_TCR_ITMENA_Msk) == 0u) <span class="keyword">return</span>;      <span class="cmt">/* ITM off */</span>
+    <span class="keyword">if</span> ((ITM-&gt;TER &amp; 1u) == 0u) <span class="keyword">return</span>;                       <span class="cmt">/* port 0 disabled */</span>
+    <span class="keyword">while</span> (ITM-&gt;PORT[0].u32 == 0u) { <span class="cmt">/* wait for FIFO ready */</span> }
+    ITM-&gt;PORT[0].u8 = c;                                   <span class="cmt">/* 8-bit write = 1 byte packet */</span>
+}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">SHORTCUT</div>
+    <p>CMSIS <code>core_cm4.h</code> already ships <code>ITM_SendChar(int c)</code>, which does exactly the "wait-for-ready then write PORT[0].u8" dance. You still need steps 1–5 above (CMSIS does <em>not</em> set up TPIU pins, DBGMCU or the prescaler for you). Use <code>ITM_SendChar</code> for the byte loop and keep your own <code>SWO_Init</code>.</p>
+  </div>
+
+  <h3>HAL/CMSIS-mixed variant (STM32Cube)</h3>
+  <p>If you generate the project with STM32CubeMX/HAL, do the pin mux with HAL and the CoreSight setup with CMSIS registers. STM32CubeMX will <em>not</em> configure ITM/TPIU for you — you must add this.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>swo_hal.c — PB3 via HAL, trace via CMSIS</span><span class="dot">●</span></div>
+    <pre><code>#include <span class="str">"main.h"</span>
+
+<span class="keyword">void</span> SWO_Init_HAL(uint32_t hclk_hz, uint32_t swo_baud)
+{
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    GPIO_InitTypeDef g = {0};
+    g.Pin       = GPIO_PIN_3;
+    g.Mode      = GPIO_MODE_AF_PP;
+    g.Pull      = GPIO_NOPULL;
+    g.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+    g.Alternate = GPIO_AF0_TRACE;               <span class="cmt">/* PB3 -&gt; TRACESWO */</span>
+    HAL_GPIO_Init(GPIOB, &amp;g);
+
+    DBGMCU-&gt;CR &amp;= ~DBGMCU_CR_TRACE_MODE;
+    DBGMCU-&gt;CR |=  DBGMCU_CR_TRACE_IOEN;
+    CoreDebug-&gt;DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+
+    TPI-&gt;ACPR = (hclk_hz / swo_baud) - 1u;
+    TPI-&gt;SPPR = 2u;
+    TPI-&gt;FFCR = 0x100u;
+    ITM-&gt;LAR  = 0xC5ACCE55u;
+    ITM-&gt;TCR  = ITM_TCR_ITMENA_Msk | ITM_TCR_SYNCENA_Msk |
+               ITM_TCR_TSENA_Msk   | (1u &lt;&lt; ITM_TCR_TraceBusID_Pos);
+    ITM-&gt;TPR  = 1u;
+    ITM-&gt;TER  = 1u;
+}</code></pre>
+  </div>
+
+  <h3>Retarget <code>printf</code> to SWO (newlib)</h3>
+  <p>GCC/newlib calls <code>_write()</code> under the hood for <code>printf</code>/<code>puts</code>. Point it at the ITM and every standard-library print goes out SWO.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>retarget.c — printf → ITM stimulus 0</span><span class="dot">●</span></div>
+    <pre><code>#include <span class="str">&lt;unistd.h&gt;</span>
+#include <span class="str">"stm32l4xx.h"</span>
+
+<span class="cmt">/* newlib syscall stub; STDOUT (fd 1) and STDERR (fd 2) go to SWO */</span>
+<span class="keyword">int</span> _write(<span class="keyword">int</span> fd, <span class="keyword">char</span> *buf, <span class="keyword">int</span> len)
+{
+    (<span class="keyword">void</span>)fd;
+    <span class="keyword">for</span> (<span class="keyword">int</span> i = 0; i &lt; len; i++)
+        ITM_SendChar((uint8_t)buf[i]);      <span class="cmt">/* CMSIS helper */</span>
+    <span class="keyword">return</span> len;
+}
+
+<span class="cmt">/* Usage in main():
+ *   SWO_Init(SystemCoreClock, 2000000);
+ *   setvbuf(stdout, NULL, _IONBF, 0);    // no buffering -> lines appear live
+ *   printf("boot ok, HCLK=%lu\r\n", SystemCoreClock);
+ */</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ 04 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">04</span> Reading SWO on the host: OpenOCD, itmdump, orbuculum, st-trace</h2>
+  <p class="section-lead">The MCU is now spitting ITM packets onto PB3; the probe captures them and the host must decode the framing back into your bytes. Three battle-tested paths: OpenOCD + itmdump, the orbuculum suite, and ST's own st-trace / GDB server.</p>
+
+  <h3>Path A — OpenOCD (0.12) tpiu/itm + itmdump</h3>
+  <p>Modern OpenOCD models the trace port as a <code>tpiu</code> object. The stock <code>target/stm32l4x.cfg</code> already creates one named <code>stm32l4x.tpiu</code>. You <code>configure</code> it (protocol, TRACECLK, pin rate, output sink), <code>enable</code> it, then open ITM ports.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>openocd-swo.cfg — SWO to a named pipe (formatter off)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Run:  openocd -f interface/stlink.cfg -f target/stm32l4x.cfg -f openocd-swo.cfg</span>
+<span class="field">init</span>
+
+<span class="cmt"># protocol uart = async NRZ; traceclk MUST equal the running HCLK (80 MHz here)</span>
+<span class="cmt"># pin-freq = SWO line rate you programmed into TPIU_ACPR (2 MHz here)</span>
+<span class="cmt"># -output can be:  filename | :port (TCP) | - (Tcl) | external</span>
+stm32l4x.tpiu <span class="field">configure</span> <span class="flag">-protocol</span> uart <span class="flag">-traceclk</span> 80000000 \
+    <span class="flag">-pin-freq</span> 2000000 <span class="flag">-output</span> /tmp/swo.fifo <span class="flag">-formatter</span> 0
+stm32l4x.tpiu <span class="field">enable</span>
+
+itm <span class="field">ports</span> off                      <span class="cmt"># mask all first</span>
+itm <span class="field">port</span> 0 on                       <span class="cmt"># enable only stimulus 0</span>
+
+<span class="field">reset</span> run</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — decode the ITM stream with itmdump</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># itmdump from the Rust 'itm' crate:  cargo install itm --features cli</span>
+<span class="cmt"># -f/--file: file OR named pipe   -F/--follow: tail -f   -s/--stimulus: port (default 0)</span>
+
+<span class="cmd">mkfifo</span> /tmp/swo.fifo                <span class="cmt"># create the pipe BEFORE starting OpenOCD</span>
+<span class="cmd">itmdump</span> <span class="flag">-f</span> /tmp/swo.fifo <span class="flag">-F</span> <span class="flag">-s</span> 0   <span class="cmt"># prints your printf() text live</span>
+
+<span class="cmt"># Windows / no-FIFO alternative: let OpenOCD write a real file, then tail it</span>
+<span class="cmt">#   stm32l4x.tpiu configure ... -output swo.log ...</span>
+<span class="cmd">itmdump</span> <span class="flag">-f</span> swo.log <span class="flag">-F</span></code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">LEGACY OPENOCD (≤ 0.11)</div>
+    <p>Older scripts use the single-line form instead of the <code>tpiu</code> object:
+    <code>tpiu config internal /tmp/swo.fifo uart off 80000000 2000000</code> then <code>itm port 0 on</code>. Same effect; <code>internal</code> = OpenOCD decodes, <code>off</code> = no formatter, the two trailing numbers are TRACECLK and SWO rate.</p>
+  </div>
+
+  <h3>Path B — orbuculum suite (orbcat / orbtop)</h3>
+  <p>The <a>orbuculum</a> project is the Swiss-army knife for SWO/SWV. <code>orbuculum</code> is the mux daemon; <code>orbcat</code> prints ITM channel text; <code>orbtop</code> is a live PC-sampling profiler; <code>orbdump</code> saves raw trace. It shines with a SEGGER J-Link (which exports a raw SWO TCP port on 2332) or an ORBTrace Mini.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — orbuculum against a J-Link SWO port</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># J-Link exports SWO on TCP 2332 (start JLinkGDBServer or JLinkExe first).</span>
+<span class="cmt"># orbcat: -s server:port  -c CHANNEL,FORMAT   (%c = raw char)</span>
+<span class="cmd">orbcat</span> <span class="flag">-s</span> localhost:2332 <span class="flag">-c</span> <span class="str">0,"%c"</span>
+
+<span class="cmt"># Statistical PC profiler over SWO — needs the ELF for symbol names</span>
+<span class="cmd">orbtop</span> <span class="flag">-s</span> localhost:2332 <span class="flag">-e</span> build/firmware.elf
+
+<span class="cmt"># Or run the mux once and attach many clients to it:</span>
+<span class="cmd">orbuculum</span> <span class="flag">-s</span> localhost:2332          <span class="cmt"># daemon; then orbcat/orbtop connect to it</span></code></pre>
+  </div>
+
+  <h3>Path C — ST-LINK native tools (st-trace, GDB server)</h3>
+  <p>The open-source <code>stlink-tools</code> ship <code>st-trace</code>, a zero-config ITM reader for on-board ST-LINKs. STM32CubeIDE's "SWV ITM Data Console" does the same through the ST-LINK GDB server. Both need the correct core clock.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — st-trace (stlink-tools)</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># The clock value MUST equal the running HCLK. Check exact flag with: st-trace --help</span>
+<span class="cmd">st-trace</span> <span class="flag">--clock</span>=80000000        <span class="cmt"># reads stimulus port 0, prints to stdout</span>
+
+<span class="cmt"># ST-LINK GDB server route: it opens a raw SWO TCP port you can pipe to itmdump</span>
+<span class="cmd">nc</span> localhost 3344 | <span class="cmd">itmdump</span> <span class="flag">-f</span> /dev/stdin <span class="flag">-F</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ 05 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">05</span> SEGGER RTT: concept &amp; target setup</h2>
+  <p class="section-lead">Real-Time Transfer (RTT) needs <em>no trace pin at all</em>. The target keeps ring buffers in RAM; the debugger reads/writes them over ordinary SWD memory accesses while the CPU runs. It is bidirectional, fast (hundreds of kB/s to MB/s), and works on any probe that can do background memory reads.</p>
+
+  <h3>How it works</h3>
+  <p>A <strong>control block</strong> — a C struct starting with the ASCII marker <code>"SEGGER RTT"</code> — lives in RAM. It describes N "up" buffers (target → host) and M "down" buffers (host → target), each a lock-free ring buffer with write/read indices. The host scans target RAM for the marker string, then polls the buffers.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Element</th><th>Meaning</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>ID = "SEGGER RTT"</td><td>16-byte marker the host searches RAM for</td></tr>
+        <tr><td>Up buffer 0</td><td>Default terminal: target → host (your <code>SEGGER_RTT_printf</code>)</td></tr>
+        <tr><td>Down buffer 0</td><td>Default terminal: host → target (keyboard input to firmware)</td></tr>
+        <tr><td>WrOff / RdOff</td><td>Ring indices; target writes WrOff, host advances RdOff (and vice-versa)</td></tr>
+        <tr><td>Flags/mode</td><td>SKIP (drop on full, real-time safe) · TRIM · BLOCK_IF_FIFO_FULL</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Target setup (C)</h3>
+  <p>Grab <code>SEGGER_RTT.c</code>, <code>SEGGER_RTT.h</code> and <code>SEGGER_RTT_Conf.h</code> from the J-Link SDK (redistributable), add them to your build, and call the API. No linker changes are needed for the default single control block — but placing it at a fixed RAM address (below) makes host attach instant.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.c — RTT logging on STM32L4R5</span><span class="dot">●</span></div>
+    <pre><code>#include <span class="str">"SEGGER_RTT.h"</span>
+#include <span class="str">"stm32l4xx.h"</span>
+
+<span class="keyword">int</span> main(<span class="keyword">void</span>)
+{
+    <span class="cmt">/* No clocks, no pins, no ITM — RTT rides the SWD link the probe already owns */</span>
+    SEGGER_RTT_Init();
+
+    <span class="cmt">/* Default up-channel 0 is BLOCK-if-full; switch to NO-BLOCK for real-time safety
+     * so logging never stalls the CPU when no debugger is draining the buffer. */</span>
+    SEGGER_RTT_ConfigUpBuffer(0, <span class="str">"Terminal"</span>, NULL, 0,
+                              SEGGER_RTT_MODE_NO_BLOCK_SKIP);
+
+    uint32_t n = 0;
+    <span class="keyword">while</span> (1) {
+        SEGGER_RTT_printf(0, <span class="str">"tick %u  HCLK=%u\r\n"</span>,
+                          (<span class="keyword">unsigned</span>)n++, (<span class="keyword">unsigned</span>)SystemCoreClock);
+
+        <span class="cmt">/* Optional: read a byte the host typed into down-channel 0 */</span>
+        <span class="keyword">if</span> (SEGGER_RTT_HasKey()) {
+            <span class="keyword">int</span> key = SEGGER_RTT_GetKey();
+            SEGGER_RTT_printf(0, <span class="str">"got key: %c\r\n"</span>, key);
+        }
+        HAL_Delay(250);
+    }
+}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">PIN CONTROL BLOCK ADDRESS (optional but recommended)</div>
+    <p>By default the host searches a RAM window for the "SEGGER RTT" marker, which can be slow or ambiguous. Force a known address by placing <code>_SEGGER_RTT</code> in a dedicated linker section, then hand that exact address to the host tool (OpenOCD <code>rtt setup</code>, probe-rs, JLinkRTTViewer). The STM32L4R5 has SRAM at <code>0x20000000</code>, so a control block near the start of RAM is a safe target for a bounded search.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 06 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">06</span> Reading RTT: OpenOCD, probe-rs, JLinkRTTClient</h2>
+  <p class="section-lead">Same firmware, three host front-ends. OpenOCD polls the control block and re-exports each channel as a TCP socket; probe-rs has a built-in RTT terminal (and defmt decoder); the SEGGER stack gives you JLinkRTTClient/Viewer.</p>
+
+  <h3>OpenOCD RTT</h3>
+  <p>OpenOCD locates the control block (either at an address you give or by searching a RAM range for the <code>"SEGGER RTT"</code> ID), starts polling, and exposes channel 0 as a raw TCP server you connect to with <code>nc</code>/<code>telnet</code>.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>openocd-rtt.cfg</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># openocd -f interface/stlink.cfg -f target/stm32l4x.cfg -f openocd-rtt.cfg</span>
+<span class="field">init</span>
+<span class="field">reset</span> run
+
+<span class="cmt"># Search 0x20000000..+2048 for a control block named "SEGGER RTT".</span>
+<span class="cmt"># If you pinned the address, pass that exact value as the first arg.</span>
+rtt <span class="field">setup</span> 0x20000000 2048 <span class="str">"SEGGER RTT"</span>
+rtt <span class="field">start</span>
+
+<span class="cmt"># Re-export up/down channel 0 as a TCP server on port 9090</span>
+rtt <span class="field">server</span> start 9090 0
+
+<span class="cmt"># Optional tuning</span>
+rtt <span class="field">polling_interval</span> 20        <span class="cmt"># ms between buffer polls (default 100)</span>
+rtt <span class="field">channels</span>                   <span class="cmt"># list discovered channels</span></code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — attach to the OpenOCD RTT socket</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Bidirectional: your terminal sees up-channel 0, typing goes to down-channel 0</span>
+<span class="cmd">nc</span> localhost 9090
+
+<span class="cmt"># Or drive it from a GDB/Tcl session:  monitor rtt start / monitor rtt channels</span></code></pre>
+  </div>
+
+  <h3>probe-rs / cargo-embed (Rust, but works for any ELF)</h3>
+  <p>probe-rs has first-class RTT. <code>probe-rs run</code> flashes and opens an RTT terminal; <code>probe-rs attach</code> connects without resetting/flashing. <code>cargo embed</code> reads an <code>Embed.toml</code> and opens an RTT UI. It also decodes <code>defmt</code> if the firmware uses <code>defmt-rtt</code>.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — probe-rs RTT</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Flash + run + live RTT terminal (chip name from `probe-rs chip list`)</span>
+<span class="cmd">probe-rs</span> run <span class="flag">--chip</span> STM32L4R5ZITx target/thumbv7em-none-eabihf/release/app
+
+<span class="cmt"># Attach to an already-running target WITHOUT reset/flash (preserve state)</span>
+<span class="cmd">probe-rs</span> attach <span class="flag">--chip</span> STM32L4R5ZITx build/firmware.elf</code></pre>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header"><span>Embed.toml — cargo-embed RTT config</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Run with:  cargo embed --release      (uses the [default] profile)</span>
+[default.general]
+chip = <span class="str">"STM32L4R5ZITx"</span>
+
+[default.rtt]
+enabled = <span class="keyword">true</span>          <span class="cmt"># open the RTT terminal UI</span>
+
+[default.gdb]
+enabled = <span class="keyword">false</span>         <span class="cmt"># set true to also start a GDB server</span></code></pre>
+  </div>
+
+  <h3>SEGGER stack (J-Link only)</h3>
+  <p>With a J-Link, RTT is native and fastest. Start any J-Link server (JLinkExe, JLinkGDBServer, or JLinkRTTViewer) — it auto-detects the control block. JLinkExe opens an RTT telnet server on port <strong>19021</strong>; <code>JLinkRTTClient</code> connects to it.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>bash — J-Link RTT</span><span class="dot">●</span></div>
+    <pre><code><span class="cmt"># Terminal 1: open a J-Link session (SWD, our target). RTT auto-starts.</span>
+<span class="cmd">JLinkExe</span> <span class="flag">-device</span> STM32L4R5ZI <span class="flag">-if</span> SWD <span class="flag">-speed</span> 4000 <span class="flag">-autoconnect</span> 1
+
+<span class="cmt"># Terminal 2: text client to the RTT telnet server on 127.0.0.1:19021</span>
+<span class="cmd">JLinkRTTClient</span>
+
+<span class="cmt"># GUI alternative (multi-channel, logging to file):</span>
+<span class="cmd">JLinkRTTViewer</span></code></pre>
+  </div>
+</section>
+
+<!-- ═══════════════════ 07 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">07</span> SWO vs RTT vs semihosting — when to use which</h2>
+  <p class="section-lead">All three get text off the chip through the probe, but they trade differently between speed, pin cost, and how badly they disturb real-time behaviour. Pick deliberately.</p>
+
+  <div class="file-table">
+    <table>
+      <thead>
+        <tr><th>Aspect</th><th>SWO / ITM</th><th>SEGGER RTT</th><th>Semihosting</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Direction</td><td>Target → host (out only)</td><td>Bidirectional</td><td>Bidirectional (full stdio, file I/O)</td></tr>
+        <tr><td>Extra pin</td><td>Needs SWO (PB3)</td><td>None — SWD only</td><td>None — SWD only</td></tr>
+        <tr><td>Throughput</td><td>Good (~SWO baud, ~2–6 Mbit/s)</td><td>Very high (RAM ring over SWD)</td><td>Very low</td></tr>
+        <tr><td>CPU intrusion</td><td>Low (few cycles/byte, HW FIFO)</td><td>Low (memcpy to RAM ring)</td><td>Severe — CPU HALTS on every call</td></tr>
+        <tr><td>Real-time safe</td><td>Yes</td><td>Yes (NO_BLOCK_SKIP mode)</td><td>No — breaks timing hard</td></tr>
+        <tr><td>Needs debugger attached</td><td>Yes (else bytes dropped)</td><td>Yes (else buffer fills/skips)</td><td>Yes (BKPT hangs with no host)</td></tr>
+        <tr><td>Probe support</td><td>Any with SWO capture</td><td>J-Link native; OpenOCD/probe-rs poll</td><td>Any (OpenOCD/J-Link/pyOCD)</td></tr>
+        <tr><td>Target code</td><td>~30 lines of ITM/TPIU init</td><td>SEGGER_RTT.c (drop-in)</td><td>newlib syscalls + <code>monitor arm semihosting on</code></td></tr>
+        <tr><td>Bonus data</td><td>DWT PC-sampling, exception &amp; event trace, HW timestamps</td><td>Multiple channels, host→target input</td><td>Real host file/console access</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="params">
+    <div class="param"><span class="name">Use SWO/ITM</span><span class="desc">when you also want statistical profiling (orbtop), exception/interrupt trace, or hardware timestamps — and you can spare PB3. Best "observability for free" once configured.</span></div>
+    <div class="param"><span class="name">Use RTT</span><span class="desc">when the SWO pin is unavailable or too slow, when you need host→target input, or when you want the highest log throughput with minimal jitter. Default choice for J-Link users and Rust/defmt.</span></div>
+    <div class="param"><span class="name">Use semihosting</span><span class="desc">only for bring-up convenience (host <code>fopen</code>, reading test vectors from a PC file) on a halted/bench target. Never in timing-critical or field code — each printf stops the core at a BKPT.</span></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ 08 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">08</span> Gotchas &amp; common mistakes</h2>
+  <p class="section-lead">Ninety percent of "SWO shows nothing" and "RTT: no control block" tickets are one of these.</p>
+
+  <div class="params">
+    <div class="param"><span class="name">TRCENA not set</span><span class="desc">Forgot <code>DEMCR.TRCENA</code> (bit 24). Without the master trace enable, ITM/DWT/TPIU are dead and every register write silently no-ops.</span></div>
+    <div class="param"><span class="name">TRACECLK ≠ HCLK</span><span class="desc">The host baud is derived from TRACECLK. If you pass the wrong clock to OpenOCD/st-trace, or the firmware changes the PLL after SWO init, output is garbage. Re-init SWO after any clock change; keep TRACECLK == current HCLK.</span></div>
+    <div class="param"><span class="name">DBGMCU_CR.TRACE_IOEN missing</span><span class="desc">ITM/TPIU can be perfect but the trace signal never reaches PB3. Set TRACE_IOEN and TRACE_MODE=00 (async). This is the STM32 mux ARM's docs never mention.</span></div>
+    <div class="param"><span class="name">PB3 not in AF0</span><span class="desc">PB3 defaults to JTDO; if your GPIO init reclaimed it as plain GPIO (or an analog default), no SWO. Set AF0 + very-high speed.</span></div>
+    <div class="param"><span class="name">Formatter left ON</span><span class="desc">For a single SWO source, the TPIU formatter must be OFF (<code>-formatter 0</code> / <code>TPI-&gt;FFCR = 0x100</code>). With it on, itmdump sees framed data it can't parse.</span></div>
+    <div class="param"><span class="name">SWO baud too high for the probe</span><span class="desc">ST-LINK/V2-1 tops out well below J-Link. 2 MHz is a safe start; if characters drop, halve the rate (raise ACPR).</span></div>
+    <div class="param"><span class="name">ITM_SendChar hangs with no debugger</span><span class="desc">If you drive the FIFO in BLOCK mode with nothing draining SWO, the wait-for-ready loop can spin. Guard with the ITMENA/TER checks (see §03) so logging is a no-op when unattached.</span></div>
+    <div class="param"><span class="name">RTT: "no control block found"</span><span class="desc">The host searched the wrong RAM window, or <code>-O2</code> stripped/moved <code>_SEGGER_RTT</code>. Pin the control block to a known address (linker section) and pass that exact address to <code>rtt setup</code> / probe-rs / JLinkRTTViewer.</span></div>
+    <div class="param"><span class="name">RTT block mode stalls the CPU</span><span class="desc">Default up-buffer 0 is BLOCK_IF_FIFO_FULL. In a real-time loop with no host reading, that blocks. Use <code>SEGGER_RTT_MODE_NO_BLOCK_SKIP</code> for field/RT code.</span></div>
+    <div class="param"><span class="name">SWO and JTAG conflict</span><span class="desc">SWO shares JTDO. If your OpenOCD/probe uses JTAG transport instead of SWD (<code>hla_swd</code>/<code>swd</code>), PB3 is JTDO, not TRACESWO. Use SWD transport for SWO.</span></div>
+    <div class="param"><span class="name">defmt + rtt-target mixed</span><span class="desc">In probe-rs, you cannot mix <code>defmt</code> and raw <code>rtt-target</code> channels in one binary. Pick one logging framework.</span></div>
+    <div class="param"><span class="name">Long/ungrounded SWO wire</span><span class="desc">SWO at MHz rates over a flying lead with a far-away ground corrupts easily. Keep GND adjacent and the SWO lead short; drop the baud on flaky rigs.</span></div>
+  </div>
+
+  <div class="summary">
+    <h4>In this guide</h4>
+    <ul>
+      <li>SWD = SWDIO+SWCLK; SWO is a third one-way trace pin on PB3/TRACESWO (AF0) of the STM32L4R5.</li>
+      <li>Trace path: DEMCR.TRCENA → ITM (stimulus ports) → TPIU (ACPR/SPPR/FFCR) → SWO; ST mux via DBGMCU_CR.</li>
+      <li>SWO baud = HCLK/(ACPR+1); the host must be told the same TRACECLK.</li>
+      <li>Capture SWO with OpenOCD <code>tpiu configure</code> + itmdump, orbuculum/orbcat/orbtop, or st-trace.</li>
+      <li>RTT needs no pin: RAM ring buffers marked "SEGGER RTT", read by OpenOCD <code>rtt</code>, probe-rs, or JLinkRTTClient.</li>
+      <li>SWO for profiling/timestamps, RTT for speed + bidirectional, semihosting only on a halted bench target.</li>
+    </ul>
+  </div>
+</section>
+
+</main>

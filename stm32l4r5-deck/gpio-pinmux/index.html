@@ -1,0 +1,537 @@
+---
+layout: tutorial
+title: "STM32L4R5 &mdash; GPIO & Alternate-Function Pin Mux"
+back_url: "../index.html"
+back_label: "All guides"
+---
+<header class="header">
+  <div class="meta">
+    <span>TECHNICAL GUIDE</span><span>STM32L4R5</span><span>GPIO</span><span>2026</span>
+  </div>
+  <h1>GPIO Pin Mux<br><em>Alternate Functions on the STM32L4R5</em></h1>
+  <p class="subtitle">Register-accurate reference for MODER/OTYPER/OSPEEDR/PUPDR/IDR/ODR/BSRR/AFRL/AFRH on the STM32L4R5 (Cortex-M4F, RM0432) — with LL and HAL variants, AF maps, and fast BSRR toggling.</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">Contents</div>
+  <ol>
+    <li><a href="#s0">Why GPIO on the L4R5 works this way</a></li>
+    <li><a href="#s1">The GPIO register block</a></li>
+    <li><a href="#s2">Configuring a pin: input / output / AF / analog</a></li>
+    <li><a href="#s3">Alternate-function &amp; peripheral pin maps</a></li>
+    <li><a href="#s4">Register-level example: blink + USART2 AF</a></li>
+    <li><a href="#s5">Fast toggle (BSRR/BRR), LL &amp; HAL variants</a></li>
+    <li><a href="#s6">Gotchas &amp; common mistakes</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ 01 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">01</span> Why GPIO on the L4R5 works this way</h2>
+  <p class="section-lead">Every pin on the STM32L4R5 is a mux. Each I/O can be driven as a general-purpose input, a general-purpose output, one of up to sixteen alternate functions (USART, SPI, I2C, timers, …), or an analog input. Getting a peripheral onto real copper is always the same two-step: pick the pin's <em>mode</em>, then — for a peripheral — pick which <em>alternate function number</em> that pin should route.</p>
+
+  <p>GPIO ports live on the <strong>AHB2</strong> bus. The port base is <code>0x48000000</code> and each port is a 1&nbsp;KB register block, so port addresses are simply spaced 0x400 apart. HCLK on the L4R5 runs up to 120&nbsp;MHz, and because GPIO sits directly on AHB2 (not behind an APB bridge), single-cycle register access and very fast toggling are possible.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Port</th><th>Base address</th><th>RCC_AHB2ENR bit</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>GPIOA</td><td>0x48000000</td><td>GPIOAEN (bit 0)</td><td>PA13/PA14/PA15 reset to SWD/JTAG</td></tr>
+        <tr><td>GPIOB</td><td>0x48000400</td><td>GPIOBEN (bit 1)</td><td>PB3/PB4 reset to JTAG (TDO/NJTRST)</td></tr>
+        <tr><td>GPIOC</td><td>0x48000800</td><td>GPIOCEN (bit 2)</td><td>PC13 = user button B1 on Nucleo</td></tr>
+        <tr><td>GPIOD</td><td>0x48000C00</td><td>GPIODEN (bit 3)</td><td></td></tr>
+        <tr><td>GPIOE</td><td>0x48001000</td><td>GPIOEEN (bit 4)</td><td></td></tr>
+        <tr><td>GPIOF</td><td>0x48001400</td><td>GPIOFEN (bit 5)</td><td></td></tr>
+        <tr><td>GPIOG</td><td>0x48001800</td><td>GPIOGEN (bit 6)</td><td>PG[15:2] need VDDIO2 (PWR_CR2.IOSV)</td></tr>
+        <tr><td>GPIOH</td><td>0x48001C00</td><td>GPIOHEN (bit 7)</td><td>PH0/PH1 = OSC in/out</td></tr>
+        <tr><td>GPIOI</td><td>0x48002000</td><td>GPIOIEN (bit 8)</td><td>Only on large BGA packages</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">CLOCK FIRST</div>
+    <p>A GPIO port is dead until its clock is enabled in <code>RCC_AHB2ENR</code>. Before it, register reads return 0 and writes are dropped — the classic "my LED won't light" bug. <code>RCC_AHB2ENR</code> is at RCC offset <code>0x4C</code> (absolute <code>0x4002104C</code>).</p>
+  </div>
+
+  <div class="callout">
+    <div class="label">L4+ DIFFERENCE — NO ASCR</div>
+    <p>Unlike the original STM32L47x/L48x devices, the STM32L4R5 (an L4+ part) has <strong>no <code>GPIOx_ASCR</code> analog-switch register</strong>. Its <code>GPIO_TypeDef</code> ends at <code>BRR</code> (offset 0x28). For an analog input you only set <code>MODER = 11</code> — there is no analog switch bit to toggle. Code ported from an L476 that writes <code>ASCR</code> will not compile against <code>stm32l4r5xx.h</code>.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 02 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">02</span> The GPIO register block</h2>
+  <p class="section-lead">Eleven 32-bit registers per port. Two-bits-per-pin registers (MODER, OSPEEDR, PUPDR) use field <code>2n..2n+1</code> for pin <em>n</em>; one-bit-per-pin registers (OTYPER, IDR, ODR) use bit <em>n</em>; the AF registers use a 4-bit nibble per pin split across two words.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Offset</th><th>Register</th><th>Width/pin</th><th>Access</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td>0x00</td><td>MODER</td><td>2 bits</td><td>rw</td><td>00 input · 01 output · 10 alternate · 11 analog</td></tr>
+        <tr><td>0x04</td><td>OTYPER</td><td>1 bit</td><td>rw</td><td>0 push-pull · 1 open-drain</td></tr>
+        <tr><td>0x08</td><td>OSPEEDR</td><td>2 bits</td><td>rw</td><td>00 low · 01 medium · 10 high · 11 very-high</td></tr>
+        <tr><td>0x0C</td><td>PUPDR</td><td>2 bits</td><td>rw</td><td>00 none · 01 pull-up · 10 pull-down · 11 reserved</td></tr>
+        <tr><td>0x10</td><td>IDR</td><td>1 bit</td><td>r</td><td>Live input level of each pin (read-only)</td></tr>
+        <tr><td>0x14</td><td>ODR</td><td>1 bit</td><td>rw</td><td>Output latch; prefer BSRR for atomic writes</td></tr>
+        <tr><td>0x18</td><td>BSRR</td><td>1 bit ×2</td><td>w</td><td>[15:0] set-to-1 · [31:16] reset-to-0 (atomic)</td></tr>
+        <tr><td>0x1C</td><td>LCKR</td><td>1 bit</td><td>rw</td><td>Config lock (needs magic sequence); frozen until reset</td></tr>
+        <tr><td>0x20</td><td>AFRL / AFR[0]</td><td>4 bits</td><td>rw</td><td>Alternate function select for pins 0–7</td></tr>
+        <tr><td>0x24</td><td>AFRH / AFR[1]</td><td>4 bits</td><td>rw</td><td>Alternate function select for pins 8–15</td></tr>
+        <tr><td>0x28</td><td>BRR</td><td>1 bit</td><td>w</td><td>Reset-only shortcut: write 1 to clear a pin</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>This is exactly the layout in the official CMSIS device header, which you can rely on for pointer arithmetic:</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>stm32l4r5xx.h — GPIO_TypeDef</span><span class="dot">●</span></div>
+    <pre><code class="language-c">typedef struct {
+    volatile uint32_t MODER;    /* 0x00  mode        (2 bits/pin) */
+    volatile uint32_t OTYPER;   /* 0x04  output type (1 bit/pin)  */
+    volatile uint32_t OSPEEDR;  /* 0x08  speed       (2 bits/pin) */
+    volatile uint32_t PUPDR;    /* 0x0C  pull up/dn  (2 bits/pin) */
+    volatile uint32_t IDR;      /* 0x10  input data  (read-only)  */
+    volatile uint32_t ODR;      /* 0x14  output data              */
+    volatile uint32_t BSRR;     /* 0x18  bit set/reset (atomic)   */
+    volatile uint32_t LCKR;     /* 0x1C  config lock              */
+    volatile uint32_t AFR[2];   /* 0x20 AFRL (0-7), 0x24 AFRH (8-15) */
+    volatile uint32_t BRR;      /* 0x28  bit reset                */
+    /* NOTE: no ASCR on L4R5 (L4+) — struct ends here */
+} GPIO_TypeDef;</code></pre>
+  </div>
+
+  <p><strong>Field math you will use constantly.</strong> For pin <code>n</code>:</p>
+  <div class="code-block">
+    <div class="code-header"><span>bit-field helpers</span><span class="dot">●</span></div>
+    <pre><code class="language-c">/* 2-bit fields (MODER / OSPEEDR / PUPDR): shift = 2*n, mask = 0x3 */
+#define MODE_MASK(n)   (0x3UL &lt;&lt; ((n) * 2))
+#define MODE_VAL(n,v)  (((uint32_t)(v)) &lt;&lt; ((n) * 2))
+
+/* 1-bit fields (OTYPER / IDR / ODR): shift = n */
+#define BIT(n)         (1UL &lt;&lt; (n))
+
+/* BSRR: set pin n -> bit n ; reset pin n -> bit n+16 */
+#define BSRR_SET(n)    (1UL &lt;&lt; (n))
+#define BSRR_RST(n)    (1UL &lt;&lt; ((n) + 16))
+
+/* AFR nibble: pins 0-7 use AFR[0], pins 8-15 use AFR[1] */
+#define AFR_IDX(n)     ((n) &gt;&gt; 3)          /* 0 or 1            */
+#define AFR_SH(n)      (((n) &amp; 7) * 4)      /* nibble position  */
+#define AFR_MASK(n)    (0xFUL &lt;&lt; AFR_SH(n))
+#define AFR_VAL(n,af)  (((uint32_t)(af)) &lt;&lt; AFR_SH(n))</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">RESET STATE</div>
+    <p>To save power most pins reset to <strong>analog</strong> mode. Documented <code>MODER</code> reset values: <code>GPIOA = 0xABFFFFFF</code> (PA13/14/15 = SWD AF), <code>GPIOB = 0xFFFFFEBF</code> (PB3 = TDO AF, PB4 = NJTRST input), all other ports <code>= 0xFFFFFFFF</code> (fully analog). You must therefore <em>explicitly</em> program output/AF mode — never assume input.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 03 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">03</span> Configuring a pin: input / output / AF / analog</h2>
+  <p class="section-lead">Four modes, four recipes. Each is: clock the port, clear the 2-bit MODER field, write the new mode, then set the mode-specific extras.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Mode</th><th>MODER</th><th>Also set</th><th>Ignored</th></tr></thead>
+      <tbody>
+        <tr><td>Digital input</td><td>00</td><td>PUPDR (opt.)</td><td>OTYPER, OSPEEDR</td></tr>
+        <tr><td>Digital output</td><td>01</td><td>OTYPER, OSPEEDR, PUPDR</td><td>AFR</td></tr>
+        <tr><td>Alternate function</td><td>10</td><td>AFRL/AFRH nibble, OTYPER, OSPEEDR, PUPDR</td><td>—</td></tr>
+        <tr><td>Analog</td><td>11</td><td>nothing (no ASCR on L4R5)</td><td>OTYPER, OSPEEDR, PUPDR</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Input — read a button (PC13, active-low)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>input.c</span><span class="dot">●</span></div>
+    <pre><code class="language-c">RCC-&gt;AHB2ENR |= (1UL &lt;&lt; 2);          /* GPIOCEN */
+(void)RCC-&gt;AHB2ENR;                   /* sync read after clock enable */
+
+GPIOC-&gt;MODER &amp;= ~(0x3UL &lt;&lt; (13*2));   /* 00 = input */
+GPIOC-&gt;PUPDR &amp;= ~(0x3UL &lt;&lt; (13*2));
+GPIOC-&gt;PUPDR |=  (0x1UL &lt;&lt; (13*2));   /* 01 = pull-up */
+
+int pressed = (GPIOC-&gt;IDR &amp; (1UL &lt;&lt; 13)) == 0;  /* B1 is active-low */</code></pre>
+  </div>
+
+  <h3>Output — push-pull LED (PB7)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>output.c</span><span class="dot">●</span></div>
+    <pre><code class="language-c">RCC-&gt;AHB2ENR |= (1UL &lt;&lt; 1);           /* GPIOBEN */
+(void)RCC-&gt;AHB2ENR;
+
+GPIOB-&gt;MODER   &amp;= ~(0x3UL &lt;&lt; (7*2));
+GPIOB-&gt;MODER   |=  (0x1UL &lt;&lt; (7*2));  /* 01 = output */
+GPIOB-&gt;OTYPER  &amp;= ~(1UL   &lt;&lt; 7);      /* 0  = push-pull */
+GPIOB-&gt;OSPEEDR &amp;= ~(0x3UL &lt;&lt; (7*2)); /* 00 = low speed (LED needs nothing more) */
+GPIOB-&gt;PUPDR   &amp;= ~(0x3UL &lt;&lt; (7*2)); /* no pull */
+
+GPIOB-&gt;BSRR = (1UL &lt;&lt; 7);             /* drive high */</code></pre>
+  </div>
+
+  <h3>Alternate function — route a peripheral (PA5 = SPI1_SCK, AF5)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>af.c</span><span class="dot">●</span></div>
+    <pre><code class="language-c">RCC-&gt;AHB2ENR |= (1UL &lt;&lt; 0);           /* GPIOAEN */
+(void)RCC-&gt;AHB2ENR;
+
+GPIOA-&gt;MODER   &amp;= ~(0x3UL &lt;&lt; (5*2));
+GPIOA-&gt;MODER   |=  (0x2UL &lt;&lt; (5*2));  /* 10 = alternate function */
+GPIOA-&gt;OTYPER  &amp;= ~(1UL   &lt;&lt; 5);      /* push-pull (SPI clock) */
+GPIOA-&gt;OSPEEDR |=  (0x3UL &lt;&lt; (5*2)); /* 11 = very-high for clean SPI edges */
+
+/* AF5 into AFRL nibble for pin 5 (pins 0-7 -&gt; AFR[0]) */
+GPIOA-&gt;AFR[0] &amp;= ~(0xFUL &lt;&lt; (5*4));
+GPIOA-&gt;AFR[0] |=  (5UL   &lt;&lt; (5*4));   /* 5 = AF5 = SPI1 */</code></pre>
+  </div>
+
+  <h3>Analog — feed the ADC (PA0 = ADC1_IN5)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>analog.c</span><span class="dot">●</span></div>
+    <pre><code class="language-c">RCC-&gt;AHB2ENR |= (1UL &lt;&lt; 0);           /* GPIOAEN */
+(void)RCC-&gt;AHB2ENR;
+
+GPIOA-&gt;MODER |= (0x3UL &lt;&lt; (0*2));     /* 11 = analog. That is all — */
+                                     /* the L4R5 has no ASCR to set. */
+GPIOA-&gt;PUPDR &amp;= ~(0x3UL &lt;&lt; (0*2));    /* disable pulls on an analog pin */</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">OPEN-DRAIN FOR I2C</div>
+    <p>I2C lines must be open-drain: set the pin to AF mode <em>and</em> <code>OTYPER = 1</code>, then rely on external pull-ups (typ. 4.7&nbsp;kΩ). The internal <code>PUPDR</code> pull-up (~30–50&nbsp;kΩ) is far too weak for standard/fast-mode bus edges.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 04 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">04</span> Alternate-function &amp; peripheral pin maps</h2>
+  <p class="section-lead">The AF number you write into AFRL/AFRH decides which internal peripheral a pin connects to. The 16 AF slots are grouped by peripheral family and are consistent across the STM32L4 line. The authoritative per-pin table is "Alternate function mapping" in datasheet DS12023 — the maps below cover the pins you use daily.</p>
+
+  <h3>AF number → peripheral family</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>AF</th><th>Peripherals</th><th>AF</th><th>Peripherals</th></tr></thead>
+      <tbody>
+        <tr><td>AF0</td><td>SYS (SWD/JTAG, MCO, LSCO, RTC_REFIN)</td><td>AF8</td><td>UART4, UART5, LPUART1</td></tr>
+        <tr><td>AF1</td><td>TIM1, TIM2, TIM5, TIM8_BKIN, LPTIM1, IR</td><td>AF9</td><td>CAN1, TSC</td></tr>
+        <tr><td>AF2</td><td>TIM1, TIM2, TIM3, TIM4, TIM5</td><td>AF10</td><td>OCTOSPI1, OTG_FS</td></tr>
+        <tr><td>AF3</td><td>SAI1, TIM8</td><td>AF11</td><td>Device-specific (see DS12023)</td></tr>
+        <tr><td>AF4</td><td>I2C1, I2C2, I2C3, I2C4</td><td>AF12</td><td>SDMMC1, COMP1/2, FMC, SWPMI1</td></tr>
+        <tr><td>AF5</td><td>SPI1, SPI2, DFSDM1</td><td>AF13</td><td>SAI1, SAI2</td></tr>
+        <tr><td>AF6</td><td>SPI3, DFSDM1</td><td>AF14</td><td>TIM2, TIM15, TIM16, TIM17, LPTIM2</td></tr>
+        <tr><td>AF7</td><td>USART1, USART2, USART3</td><td>AF15</td><td>EVENTOUT</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>USART / UART pins</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Signal</th><th>Pins</th><th>AF</th></tr></thead>
+      <tbody>
+        <tr><td>USART1_TX / _RX</td><td>PA9 / PA10 &nbsp;· &nbsp;PB6 / PB7</td><td>AF7</td></tr>
+        <tr><td>USART1_CTS / _RTS-DE / _CK</td><td>PA11 / PA12 / PA8</td><td>AF7</td></tr>
+        <tr><td>USART2_TX / _RX</td><td>PA2 / PA3 &nbsp;· &nbsp;PD5 / PD6</td><td>AF7</td></tr>
+        <tr><td>USART3_TX / _RX</td><td>PB10 / PB11 · PC4 / PC5 · PD8 / PD9</td><td>AF7</td></tr>
+        <tr><td>UART4_TX / _RX</td><td>PA0 / PA1 &nbsp;· &nbsp;PC10 / PC11</td><td>AF8</td></tr>
+        <tr><td>LPUART1_TX / _RX</td><td>PB11 / PB10 · PC1 / PC0 · PG7 / PG8</td><td>AF8</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>SPI pins</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Bus</th><th>NSS</th><th>SCK</th><th>MISO</th><th>MOSI</th><th>AF</th></tr></thead>
+      <tbody>
+        <tr><td>SPI1</td><td>PA4 / PA15</td><td>PA5 / PB3</td><td>PA6 / PB4</td><td>PA7 / PB5</td><td>AF5</td></tr>
+        <tr><td>SPI2</td><td>PB12 / PB9</td><td>PB13 / PB10</td><td>PB14 / PC2</td><td>PB15 / PC3</td><td>AF5</td></tr>
+        <tr><td>SPI3</td><td>PA4 / PA15</td><td>PB3 / PC10</td><td>PB4 / PC11</td><td>PB5 / PC12</td><td>AF6</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>I2C pins (open-drain, need external pull-ups)</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Bus</th><th>SCL</th><th>SDA</th><th>AF</th></tr></thead>
+      <tbody>
+        <tr><td>I2C1</td><td>PB6 / PB8</td><td>PB7 / PB9</td><td>AF4</td></tr>
+        <tr><td>I2C2</td><td>PB10 / PF1</td><td>PB11 / PF0</td><td>AF4</td></tr>
+        <tr><td>I2C3</td><td>PC0 / PG7</td><td>PC1 / PG8</td><td>AF4</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Timer channel pins</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Timer</th><th>CH1 / CH2 / CH3 / CH4</th><th>AF</th></tr></thead>
+      <tbody>
+        <tr><td>TIM1 (adv.)</td><td>PA8 / PA9 / PA10 / PA11 &nbsp;(CHxN: PA7,PB13 / PB0,PB14 / PB1,PB15)</td><td>AF1</td></tr>
+        <tr><td>TIM2</td><td>PA0,PA5,PA15 / PA1,PB3 / PA2,PB10 / PA3,PB11</td><td>AF1</td></tr>
+        <tr><td>TIM3</td><td>PA6,PB4,PC6 / PA7,PB5,PC7 / PB0,PC8 / PB1,PC9</td><td>AF2</td></tr>
+        <tr><td>TIM4</td><td>PB6,PD12 / PB7,PD13 / PB8,PD14 / PB9,PD15</td><td>AF2</td></tr>
+        <tr><td>TIM15 / 16 / 17</td><td>TIM15: PA2/PA3 · TIM16: PA6/PB8 · TIM17: PA7/PB9</td><td>AF14</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>ADC external channels (ADC1 &amp; ADC2 share these pins)</h3>
+  <p>Set the pin to analog (<code>MODER = 11</code>); no AF nibble applies to analog. Channel numbering matches ADC1/ADC2 on the L4R5:</p>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Pin</th><th>Channel</th><th>Pin</th><th>Channel</th><th>Pin</th><th>Channel</th></tr></thead>
+      <tbody>
+        <tr><td>PC0</td><td>IN1</td><td>PA2</td><td>IN7</td><td>PA7</td><td>IN12</td></tr>
+        <tr><td>PC1</td><td>IN2</td><td>PA3</td><td>IN8</td><td>PC4</td><td>IN13</td></tr>
+        <tr><td>PC2</td><td>IN3</td><td>PA4</td><td>IN9</td><td>PC5</td><td>IN14</td></tr>
+        <tr><td>PC3</td><td>IN4</td><td>PA5</td><td>IN10</td><td>PB0</td><td>IN15</td></tr>
+        <tr><td>PA0</td><td>IN5</td><td>PA6</td><td>IN11</td><td>PB1</td><td>IN16</td></tr>
+        <tr><td>PA1</td><td>IN6</td><td></td><td></td><td></td><td></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">A PIN HAS MANY AFs</div>
+    <p>Most pins list a function on several AF numbers. PB7, for example, is USART1_RX on AF7 <em>and</em> I2C1_SDA on AF4 — you choose by the nibble you write. Always confirm the exact package/pin against the DS12023 alternate-function table before committing a board layout; a few signals move between L4 variants.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 05 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">05</span> Register-level example: blink + USART2 AF</h2>
+  <p class="section-lead">A complete, self-contained <code>main.c</code> — no CMSIS/HAL headers required, only raw addresses — that blinks the Nucleo-L4R5ZI blue LED (PB7) and brings up USART2 on PA2/PA3 (AF7). Runs on the reset default MSI clock (4&nbsp;MHz).</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>main.c — bare-metal (no vendor headers)</span><span class="dot">●</span></div>
+    <pre><code class="language-c">#include &lt;stdint.h&gt;
+
+/* ---- minimal register model (RM0432 addresses) ---- */
+typedef struct {
+    volatile uint32_t MODER, OTYPER, OSPEEDR, PUPDR;
+    volatile uint32_t IDR, ODR, BSRR, LCKR;
+    volatile uint32_t AFR[2];        /* AFRL @0x20, AFRH @0x24 */
+    volatile uint32_t BRR;           /* @0x28  (no ASCR on L4R5) */
+} GPIO_TypeDef;
+
+typedef struct {
+    volatile uint32_t CR1, CR2, CR3, BRR, GTPR, RTOR, RQR, ISR, ICR, RDR, TDR;
+} USART_TypeDef;
+
+#define GPIOA   ((GPIO_TypeDef *)0x48000000UL)
+#define GPIOB   ((GPIO_TypeDef *)0x48000400UL)
+#define USART2  ((USART_TypeDef *)0x40004400UL)
+
+#define RCC_AHB2ENR   (*(volatile uint32_t *)0x4002104CUL)
+#define RCC_APB1ENR1  (*(volatile uint32_t *)0x40021058UL)
+
+#define GPIOAEN   (1UL &lt;&lt; 0)
+#define GPIOBEN   (1UL &lt;&lt; 1)
+#define USART2EN  (1UL &lt;&lt; 17)          /* RCC_APB1ENR1 bit 17 */
+
+#define USART_CR1_UE  (1UL &lt;&lt; 0)
+#define USART_CR1_RE  (1UL &lt;&lt; 2)
+#define USART_CR1_TE  (1UL &lt;&lt; 3)
+#define USART_ISR_TXE (1UL &lt;&lt; 7)
+
+#define LED_PIN   7                    /* PB7 = blue LED (LD2) */
+
+static void delay(volatile uint32_t n) { while (n--) __asm__ volatile("nop"); }
+
+static void led_init(void)
+{
+    RCC_AHB2ENR |= GPIOBEN;
+    (void)RCC_AHB2ENR;                 /* sync after clock enable */
+
+    GPIOB-&gt;MODER   &amp;= ~(0x3UL &lt;&lt; (LED_PIN * 2));
+    GPIOB-&gt;MODER   |=  (0x1UL &lt;&lt; (LED_PIN * 2));   /* output */
+    GPIOB-&gt;OTYPER  &amp;= ~(1UL   &lt;&lt; LED_PIN);         /* push-pull */
+    GPIOB-&gt;OSPEEDR &amp;= ~(0x3UL &lt;&lt; (LED_PIN * 2));   /* low speed */
+    GPIOB-&gt;PUPDR   &amp;= ~(0x3UL &lt;&lt; (LED_PIN * 2));   /* no pull */
+}
+
+static void usart2_init(void)
+{
+    RCC_AHB2ENR  |= GPIOAEN;
+    RCC_APB1ENR1 |= USART2EN;
+    (void)RCC_APB1ENR1;
+
+    /* PA2 (TX) and PA3 (RX) -&gt; AF mode */
+    GPIOA-&gt;MODER &amp;= ~((0x3UL &lt;&lt; (2*2)) | (0x3UL &lt;&lt; (3*2)));
+    GPIOA-&gt;MODER |=  ((0x2UL &lt;&lt; (2*2)) | (0x2UL &lt;&lt; (3*2)));   /* 10 = AF */
+
+    /* AF7 for pins 2 and 3, both in AFRL (AFR[0]) */
+    GPIOA-&gt;AFR[0] &amp;= ~((0xFUL &lt;&lt; (2*4)) | (0xFUL &lt;&lt; (3*4)));
+    GPIOA-&gt;AFR[0] |=  ((7UL   &lt;&lt; (2*4)) | (7UL   &lt;&lt; (3*4)));
+
+    /* 9600 8N1, PCLK1 = 4 MHz (MSI reset default), OVER8=0 */
+    USART2-&gt;BRR = 4000000UL / 9600UL;              /* ~416 */
+    USART2-&gt;CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;
+}
+
+static void usart2_putc(char c)
+{
+    while (!(USART2-&gt;ISR &amp; USART_ISR_TXE)) { }
+    USART2-&gt;TDR = (uint8_t)c;
+}
+
+int main(void)
+{
+    led_init();
+    usart2_init();
+
+    for (;;) {
+        GPIOB-&gt;BSRR = (1UL &lt;&lt; LED_PIN);            /* LED on  (atomic) */
+        usart2_putc('*');
+        delay(400000);
+        GPIOB-&gt;BSRR = (1UL &lt;&lt; (LED_PIN + 16));     /* LED off (atomic) */
+        delay(400000);
+    }
+}</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">BUILD</div>
+    <p>Compile with <code>arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16 -nostdlib -T link.ld startup.s main.c -o fw.elf</code>. You still need a vector table / startup and a linker script placing <code>.text</code> at <code>0x08000000</code> and stack at top of SRAM. The USART VCP routing on the Nucleo-L4R5ZI is board-specific (solder bridges, see UM2179) — for a guaranteed link, wire a USB-serial adapter to PA2/PA3.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 06 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">06</span> Fast toggle (BSRR/BRR), LL &amp; HAL variants</h2>
+  <p class="section-lead">Never read-modify-write <code>ODR</code> from more than one context. <code>BSRR</code> is a write-only "command" register: the lower 16 bits set pins, the upper 16 reset them, in a single atomic bus write with no lock and no interference between pins on the same port.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>fast-toggle.c</span><span class="dot">●</span></div>
+    <pre><code class="language-c">/* Atomic, ISR-safe — preferred */
+GPIOB-&gt;BSRR = (1UL &lt;&lt; 7);          /* PB7 = 1  (lower half = SET)   */
+GPIOB-&gt;BSRR = (1UL &lt;&lt; (7 + 16));   /* PB7 = 0  (upper half = RESET) */
+GPIOB-&gt;BRR  = (1UL &lt;&lt; 7);          /* PB7 = 0  (BRR is reset-only)  */
+
+/* Set several pins, clear others, in ONE write: */
+GPIOB-&gt;BSRR = (1UL &lt;&lt; 0) | (1UL &lt;&lt; 1) | (1UL &lt;&lt; (2 + 16));
+/* -&gt; PB0=1, PB1=1, PB2=0 simultaneously */
+
+/* Software toggle needs a read of ODR — NOT atomic vs. an ISR
+   touching another pin on the same port: */
+GPIOB-&gt;ODR ^= (1UL &lt;&lt; 7);
+
+/* Maximum square-wave: back-to-back BSRR stores.
+   GPIO is on AHB2, so the rate is limited by store latency at HCLK. */
+for (;;) {
+    GPIOB-&gt;BSRR = (1UL &lt;&lt; 7);
+    GPIOB-&gt;BSRR = (1UL &lt;&lt; (7 + 16));
+}</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">BSRR PRIORITY</div>
+    <p>If, in the same <code>BSRR</code> write, you set both the set-bit (<code>n</code>) and reset-bit (<code>n+16</code>) for one pin, the <strong>set action wins</strong> (RM0432). Use <code>BRR</code> when you only ever clear a pin.</p>
+  </div>
+
+  <h3>Same thing with ST LL (stm32l4xx_ll_gpio.h)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>ll.c</span><span class="dot">●</span></div>
+    <pre><code class="language-c">#include "stm32l4xx_ll_bus.h"
+#include "stm32l4xx_ll_gpio.h"
+
+LL_AHB2_GRP1_EnableClock(LL_AHB2_GRP1_PERIPH_GPIOB);
+
+LL_GPIO_SetPinMode(GPIOB, LL_GPIO_PIN_7, LL_GPIO_MODE_OUTPUT);
+LL_GPIO_SetPinOutputType(GPIOB, LL_GPIO_PIN_7, LL_GPIO_OUTPUT_PUSHPULL);
+LL_GPIO_SetPinSpeed(GPIOB, LL_GPIO_PIN_7, LL_GPIO_SPEED_FREQ_LOW);
+LL_GPIO_SetPinPull(GPIOB, LL_GPIO_PIN_7, LL_GPIO_PULL_NO);
+
+LL_GPIO_SetOutputPin(GPIOB, LL_GPIO_PIN_7);     /* -&gt; BSRR set   */
+LL_GPIO_ResetOutputPin(GPIOB, LL_GPIO_PIN_7);   /* -&gt; BRR / BSRR */
+LL_GPIO_TogglePin(GPIOB, LL_GPIO_PIN_7);        /* reads ODR, writes BSRR */
+
+/* AF pin: PA2 = USART2_TX (AF7). AFRL helper for pins 0-7: */
+LL_AHB2_GRP1_EnableClock(LL_AHB2_GRP1_PERIPH_GPIOA);
+LL_GPIO_SetPinMode(GPIOA, LL_GPIO_PIN_2, LL_GPIO_MODE_ALTERNATE);
+LL_GPIO_SetAFPin_0_7(GPIOA, LL_GPIO_PIN_2, LL_GPIO_AF_7);
+/* pins 8-15 would use LL_GPIO_SetAFPin_8_15() for AFRH */</code></pre>
+  </div>
+
+  <h3>Same thing with the HAL (stm32l4xx_hal_gpio.h)</h3>
+  <div class="code-block">
+    <div class="code-header"><span>hal.c</span><span class="dot">●</span></div>
+    <pre><code class="language-c">#include "stm32l4xx_hal.h"
+
+__HAL_RCC_GPIOB_CLK_ENABLE();
+
+GPIO_InitTypeDef led = {0};
+led.Pin   = GPIO_PIN_7;
+led.Mode  = GPIO_MODE_OUTPUT_PP;
+led.Pull  = GPIO_NOPULL;
+led.Speed = GPIO_SPEED_FREQ_LOW;
+HAL_GPIO_Init(GPIOB, &amp;led);
+
+HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);   /* uses BSRR */
+HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_7);
+
+/* Alternate function: USART2 TX/RX on PA2/PA3 */
+__HAL_RCC_GPIOA_CLK_ENABLE();
+GPIO_InitTypeDef af = {0};
+af.Pin       = GPIO_PIN_2 | GPIO_PIN_3;
+af.Mode      = GPIO_MODE_AF_PP;
+af.Pull      = GPIO_PULLUP;
+af.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+af.Alternate = GPIO_AF7_USART2;        /* the AF7 nibble, chosen by macro */
+HAL_GPIO_Init(GPIOA, &amp;af);</code></pre>
+  </div>
+
+  <div class="callout">
+    <div class="label">WHY THREE APIs</div>
+    <p>Register code is smallest and clearest about what the silicon does; <strong>LL</strong> gives you named helpers that still map 1:1 to registers (great for performance-sensitive drivers); the <strong>HAL</strong> validates parameters and handles clock/AF bookkeeping (fastest to bring up, larger footprint). All three ultimately write the same MODER/AFR/BSRR bits shown above.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ 07 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">07</span> Gotchas &amp; common mistakes</h2>
+  <p class="section-lead">Almost every "GPIO doesn't work" ticket is one of these. Scan this list before you reach for a scope.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td>Writes to a port do nothing; reads return 0</td><td>Port clock not enabled</td><td>Set the bit in <code>RCC_AHB2ENR</code> first, then a dummy read to let the clock domain sync</td></tr>
+        <tr><td>Other pins on the port stopped working</td><td>Used <code>=</code> instead of <code>|=</code>/<code>&amp;=</code> on MODER/AFR</td><td>Read-modify-write the field: clear with <code>&amp;= ~mask</code>, then <code>|=</code> the value</td></tr>
+        <tr><td>Pin picks up the wrong mode value</td><td>Forgot to clear the old 2-bit field</td><td>Always <code>MODER &amp;= ~(0x3&lt;&lt;2n)</code> before OR-ing</td></tr>
+        <tr><td>Peripheral wired but silent</td><td>MODER left as output, or wrong AF nibble</td><td>MODER = 10 <em>and</em> correct AF in AFRL (0-7) / AFRH (8-15)</td></tr>
+        <tr><td>PG2–PG15 dead</td><td>VDDIO2 domain not powered</td><td>Enable PWR clock, then <code>PWR-&gt;CR2 |= PWR_CR2_IOSV</code> (bit 9)</td></tr>
+        <tr><td>Debugger drops after configuring PA13/14/15 or PB3/PB4</td><td>Reprogrammed the SWD/JTAG pins</td><td>Leave PA13 (SWDIO) / PA14 (SWCLK) alone; free PB3/PB4/PA15 only if you don't need JTAG</td></tr>
+        <tr><td>I2C bus stuck / no ACK</td><td>Push-pull instead of open-drain, or no pull-ups</td><td>OTYPER = 1 on SCL/SDA + external ~4.7&nbsp;kΩ pull-ups</td></tr>
+        <tr><td>SPI/OCTOSPI edges too slow, data corrupt</td><td>OSPEEDR left low</td><td>Set high or very-high speed on clock/data lines</td></tr>
+        <tr><td>Overheating / EMI / extra current</td><td>Very-high speed on pins that don't need it</td><td>Use the lowest OSPEEDR that meets the rise-time budget</td></tr>
+        <tr><td>ADC reads garbage</td><td>Pin not in analog mode, or pull still enabled</td><td>MODER = 11 and PUPDR = 00 (L4R5 needs no ASCR)</td></tr>
+        <tr><td>ISR and main both toggle a pin, glitches</td><td>Read-modify-write on ODR races</td><td>Use BSRR/BRR — single atomic write, no read</td></tr>
+        <tr><td>3.3V logic damaged by 5V input</td><td>Drove 5V into a non-FT pin</td><td>Check the pin's I/O type in DS12023; only FT pins tolerate 5V</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout danger">
+    <div class="label">TWO EASY-TO-MISS L4R5 SPECIFICS</div>
+    <p><strong>1. No ASCR.</strong> Do not copy analog-input code from an STM32L476 project — the L4R5 has no <code>GPIOx_ASCR</code>; setting MODER = 11 is sufficient and <code>ASCR</code> will not even exist in the header.<br>
+    <strong>2. VDDIO2 gate.</strong> Port G bits 2–15 are on the independent VDDIO2 supply. Even with the GPIOG clock on, those pins stay Hi-Z until you enable the PWR peripheral clock and set <code>PWR_CR2.IOSV</code>. This bites anyone using PG7/PG8 for LPUART1 or I2C3.</p>
+  </div>
+
+  <div class="callout">
+    <div class="label">LOCKING CONFIG</div>
+    <p><code>LCKR</code> freezes a pin's MODER/OTYPER/OSPEEDR/PUPDR/AFR until the next reset. The lock only takes effect after the documented write sequence (write 1+bits, write 0+bits, write 1+bits, then read twice). Use it to protect a critical pin from a runaway write — but remember it is one-way until reset.</p>
+  </div>
+</section>
+
+</main>

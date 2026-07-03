@@ -229,6 +229,10 @@ def core_search(query, deck=None, limit=5):
         f = resolve_deck(deck)
         if not f:
             return {"error": f"deck bulunamadı: '{deck}'. list_decks()."}
+        if not is_enabled(deck_id(f)):
+            return {"error": f"'{deck_id(f)}' deck'i KAPALI — kapalı deck'te arama yapılmaz. "
+                             f"Panelden (127.0.0.1:8765) aç ya da açık deck kullan.",
+                    "disabled_deck": deck_id(f)}
         folders = [f]
     else:
         folders = enabled_folders()
@@ -257,6 +261,8 @@ def core_get_article(deck, slug):
     f = resolve_deck(deck)
     if not f:
         return {"error": f"deck bulunamadı: '{deck}'.", "deck": deck, "slug": slug}
+    if not is_enabled(deck_id(f)):
+        return {"error": f"'{deck_id(f)}' deck'i KAPALI.", "deck": deck, "slug": slug}
     idx = load_index(f)
     if not idx:
         return {"error": f"'{f}' index.json yok.", "deck": deck, "slug": slug}
@@ -277,6 +283,8 @@ def core_related(deck, slug, limit=6):
     f = resolve_deck(deck)
     if not f:
         return {"error": f"deck bulunamadı: '{deck}'."}
+    if not is_enabled(deck_id(f)):
+        return {"error": f"'{deck_id(f)}' deck'i KAPALI."}
     key = f"{deck_id(f)}/{slug}"
     g = load_graph()
     lst = g.get("related", {}).get(key)
@@ -290,6 +298,8 @@ def core_graph_around(deck, slug, depth=1, limit=15):
     f = resolve_deck(deck)
     if not f:
         return {"error": f"deck bulunamadı: '{deck}'."}
+    if not is_enabled(deck_id(f)):
+        return {"error": f"'{deck_id(f)}' deck'i KAPALI."}
     start = f"{deck_id(f)}/{slug}"
     g = load_graph()
     adj, nodes = g.get("adj", {}), g.get("nodes", {})
@@ -321,6 +331,8 @@ def core_path(a_deck, a_slug, b_deck, b_slug, max_hops=6):
     fa, fb = resolve_deck(a_deck), resolve_deck(b_deck)
     if not fa or not fb:
         return {"error": "deck bulunamadı."}
+    if not is_enabled(deck_id(fa)) or not is_enabled(deck_id(fb)):
+        return {"error": "başlangıç/hedef deck KAPALI."}
     start = f"{deck_id(fa)}/{a_slug}"
     goal = f"{deck_id(fb)}/{b_slug}"
     g = load_graph()
@@ -359,14 +371,16 @@ mcp = FastMCP(name="x3beche-decks")
 
 
 @mcp.tool
-def list_decks() -> list:
+def list_decks(limit: int = 0) -> list:
     """Tüm deck'leri (konu setlerini) + AÇIK/KAPALI durumlarını + rehber sayısını
     listeler. search yalnızca AÇIK deck'lerde arar. Deck'ler kullanıcı tarafından
     kontrol panelinden (http://127.0.0.1:8765) açılıp kapatılır.
 
+    Argümanlar: limit (opsiyonel) — >0 ise ilk N deck; 0/boş = hepsi.
     Döner: {deck, title, summary, count, enabled} listesi.
     """
-    return core_list_decks()
+    decks = core_list_decks()
+    return decks[:limit] if limit and limit > 0 else decks
 
 
 @mcp.tool

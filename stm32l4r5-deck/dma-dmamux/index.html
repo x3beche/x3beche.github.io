@@ -1,0 +1,620 @@
+---
+layout: tutorial
+title: "STM32L4R5 — DMA & DMAMUX Request Routing"
+back_url: "../index.html"
+back_label: "All guides"
+---
+<header class="header">
+  <div class="meta">
+    <span>TECHNICAL GUIDE</span><span>STM32L4R5</span><span>DMA</span><span>2026</span>
+  </div>
+  <h1>DMA &amp; DMAMUX<br><em>Request Routing on STM32L4+</em></h1>
+  <p class="subtitle">Two 7-channel DMA controllers plus the DMAMUX1 request router — CCR/CNDTR/CPAR/CMAR, mem2periph &amp; periph2mem, circular streaming, the full request-line table, and complete ADC+DMA and UART+DMA examples for the STM32L4R5 (RM0432).</p>
+</header>
+
+<nav class="toc">
+  <div class="toc-label">Contents</div>
+  <ol>
+    <li><a href="#s0">DMA + DMAMUX architecture on STM32L4+</a></li>
+    <li><a href="#s1">DMA channel registers: CCR / CNDTR / CPAR / CMAR</a></li>
+    <li><a href="#s2">DMAMUX1 request routing &amp; request-line table</a></li>
+    <li><a href="#s3">Programming sequence: the transfer recipe</a></li>
+    <li><a href="#s4">Worked example: ADC1 + DMA (circular scan)</a></li>
+    <li><a href="#s5">Worked example: USART/UART + DMA (TX &amp; RX)</a></li>
+    <li><a href="#s6">Interrupts: TC / HT / TE, flags &amp; ping-pong</a></li>
+    <li><a href="#s7">Gotchas &amp; common mistakes</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- ═══════════════════ SECTION 00 ═══════════════════ -->
+<section id="s0">
+  <h2><span class="num">01</span> DMA + DMAMUX architecture on STM32L4+</h2>
+  <p class="section-lead">The STM32L4R5 (Cortex-M4F, RM0432) has <strong>two general-purpose DMA controllers</strong>, DMA1 and DMA2, each with <strong>7 independent channels</strong> (14 channels total). On this L4+ device the channels are decoupled from the peripherals by a request router called <strong>DMAMUX1</strong>.</p>
+
+  <h3>Why DMAMUX exists</h3>
+  <p>On classic STM32F1/F4 parts every peripheral DMA request was hard-wired to one fixed DMA channel (or picked from a tiny <code>CxS</code> set), so two peripherals that wanted the same channel could not both use DMA. STM32L4+ inserts <strong>DMAMUX1</strong> between the ~94 peripheral request lines and the 14 DMA channels: <em>any</em> request line can be routed to <em>any</em> channel. You no longer look up "which channel does USART1_TX live on" — you pick a free channel and program its DMAMUX request ID.</p>
+
+  <div class="flow">
+    <pre>Peripheral (ADC1, USART2, SPI1 …)
+        │  request line  (fixed ID, e.g. ADC1 = 5)
+        ▼
+   DMAMUX1  ──  one CxCR per DMA channel selects DMAREQ_ID
+        │  routed request
+        ▼
+   DMA1 / DMA2 channel  ──  CCR/CNDTR/CPAR/CMAR move the data
+        │  AHB master
+        ▼
+   SRAM  ⇄  Peripheral data register</pre>
+  </div>
+
+  <h3>Memory map (AHB1)</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Block</th><th>Base address</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>DMA1</td><td>0x4002 0000</td><td>ISR @+0x00, IFCR @+0x04, Ch1 regs @+0x08</td></tr>
+        <tr><td>DMA2</td><td>0x4002 0400</td><td>same layout as DMA1</td></tr>
+        <tr><td>DMAMUX1</td><td>0x4002 0800</td><td>C0CR @+0x00 … C13CR @+0x34</td></tr>
+        <tr><td>RCC</td><td>0x4002 1000</td><td>AHB1ENR gates DMA1/DMA2/DMAMUX1 clocks</td></tr>
+        <tr><td>DMA1_Channel1</td><td>0x4002 0008</td><td>each channel block = 0x14 bytes</td></tr>
+        <tr><td>ADC1</td><td>0x5004 0000</td><td>DR @+0x40 → 0x5004 0040 (DMA source)</td></tr>
+        <tr><td>USART2</td><td>0x4000 4400</td><td>RDR @+0x24, TDR @+0x28</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>DMAMUX channel ↔ DMA channel mapping</h3>
+  <p>DMAMUX1 has one control register (<code>CxCR</code>) per DMA channel. The index is fixed:</p>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>DMAMUX channel</th><th>Drives</th><th>Register</th></tr></thead>
+      <tbody>
+        <tr><td>0 … 6</td><td>DMA1 Channel 1 … 7</td><td>DMAMUX1_Channel0 … 6</td></tr>
+        <tr><td>7 … 13</td><td>DMA2 Channel 1 … 7</td><td>DMAMUX1_Channel7 … 13</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Formula: <code>dmamux_index = (dma == DMA2 ? 7 : 0) + (channel - 1)</code>, with <code>channel</code> in 1…7.</p>
+
+  <h3>Enable the clocks (register level)</h3>
+  <p>Three clock bits live in <code>RCC-&gt;AHB1ENR</code>. Forgetting <code>DMAMUX1EN</code> is the single most common "my DMA does nothing" bug.</p>
+  <div class="code-block">
+    <div class="code-header"><span>c — clock enable</span><span class="dot">●</span></div>
+    <pre><code>#include "stm32l4r5xx.h"
+
+/* RCC-&gt;AHB1ENR: DMA1EN=bit0, DMA2EN=bit1, DMAMUX1EN=bit2 */
+RCC-&gt;AHB1ENR |= RCC_AHB1ENR_DMA1EN      /* controller  */
+             |  RCC_AHB1ENR_DMAMUX1EN;  /* the router — do NOT forget */
+(void)RCC-&gt;AHB1ENR;                     /* read-back: let the clock settle */</code></pre>
+  </div>
+
+  <div class="summary">
+    <h4>This section</h4>
+    <ul>
+      <li>DMA1 &amp; DMA2, 7 channels each; DMAMUX1 routes any of ~94 request lines to any channel.</li>
+      <li>DMAMUX channel index = (DMA2?7:0) + (channel−1); DMA1.Ch1→mux0, DMA2.Ch7→mux13.</li>
+      <li>Enable DMA1/DMA2 <em>and</em> DMAMUX1 in RCC→AHB1ENR (bits 0/1/2).</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ═══════════════════ SECTION 01 ═══════════════════ -->
+<section id="s1">
+  <h2><span class="num">02</span> DMA channel registers: CCR / CNDTR / CPAR / CMAR</h2>
+  <p class="section-lead">Each channel is described by exactly four 32-bit registers. The controller adds two shared registers, <code>ISR</code> (status) and <code>IFCR</code> (flag clear). Channel <em>n</em> registers sit at <code>DMAx_BASE + 0x08 + 0x14·(n−1)</code>.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Register</th><th>Offset</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td>CCR</td><td>+0x00</td><td>Channel configuration (direction, sizes, increment, circular, IRQ enables, EN)</td></tr>
+        <tr><td>CNDTR</td><td>+0x04</td><td>Number of data <em>items</em> to transfer (0…65535). Counts down; read-only while EN=1</td></tr>
+        <tr><td>CPAR</td><td>+0x08</td><td>Peripheral address — usually <code>&amp;PERIPH-&gt;DR</code> (source for P2M, dest for M2P)</td></tr>
+        <tr><td>CMAR</td><td>+0x0C</td><td>Memory address — your SRAM buffer</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>CCR bit fields</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Bits</th><th>Field</th><th>Function</th></tr></thead>
+      <tbody>
+        <tr><td>0</td><td>EN</td><td>Channel enable. Set <em>last</em>. Most other fields are read-only while EN=1</td></tr>
+        <tr><td>1</td><td>TCIE</td><td>Transfer-complete interrupt enable</td></tr>
+        <tr><td>2</td><td>HTIE</td><td>Half-transfer interrupt enable</td></tr>
+        <tr><td>3</td><td>TEIE</td><td>Transfer-error interrupt enable</td></tr>
+        <tr><td>4</td><td>DIR</td><td>Direction: <strong>0 = read from peripheral</strong> (P2M), <strong>1 = read from memory</strong> (M2P)</td></tr>
+        <tr><td>5</td><td>CIRC</td><td>Circular mode — CNDTR auto-reloads, transfer never stops</td></tr>
+        <tr><td>6</td><td>PINC</td><td>Peripheral address increment (normally 0 for a data register)</td></tr>
+        <tr><td>7</td><td>MINC</td><td>Memory address increment (normally 1 to walk a buffer)</td></tr>
+        <tr><td>9:8</td><td>PSIZE</td><td>Peripheral data size: 00=8-bit, 01=16-bit, 10=32-bit</td></tr>
+        <tr><td>11:10</td><td>MSIZE</td><td>Memory data size: 00=8-bit, 01=16-bit, 10=32-bit</td></tr>
+        <tr><td>13:12</td><td>PL</td><td>Priority: 00=low, 01=medium, 10=high, 11=very high</td></tr>
+        <tr><td>14</td><td>MEM2MEM</td><td>Memory-to-memory mode (channel runs freely, no hardware request)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Sizes, direction and CNDTR — the practical rules</h3>
+  <div class="params">
+    <div class="param"><span class="name">PSIZE = width of the peripheral register</span><span class="desc">ADC_DR and USART_RDR/TDR are read as configured: ADC = 16-bit (halfword), UART = 8-bit (byte). Mismatch corrupts data or faults.</span></div>
+    <div class="param"><span class="name">MSIZE = width of one buffer element</span><span class="desc"><code>uint16_t buf[]</code> → MSIZE=01; <code>uint8_t buf[]</code> → MSIZE=00. If PSIZE≠MSIZE the DMA packs/unpacks.</span></div>
+    <div class="param"><span class="name">CNDTR = element count, not bytes</span><span class="desc">For a 3-sample ADC scan CNDTR=3; for a 64-byte UART frame CNDTR=64. It is decremented once per transfer and reloaded in circular mode.</span></div>
+    <div class="param"><span class="name">DIR is about the READ source</span><span class="desc">P2M (RX / ADC in): DIR=0. M2P (TX / DAC out): DIR=1. Getting this backwards is a classic silent failure.</span></div>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">Write order</div>
+    <p>CPAR, CMAR and CNDTR are writable only while the channel is disabled (EN=0). Writing them with EN=1 is ignored. Always clear EN and spin until it reads back 0 before reprogramming.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ SECTION 02 ═══════════════════ -->
+<section id="s2">
+  <h2><span class="num">03</span> DMAMUX1 request routing &amp; request-line table</h2>
+  <p class="section-lead">To connect a peripheral to a channel you write the peripheral's <strong>request ID</strong> into the <code>DMAREQ_ID[7:0]</code> field of the DMAMUX <code>CxCR</code> register that corresponds to that channel. That single write is the whole "routing" step.</p>
+
+  <h3>DMAMUX CxCR bit fields</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Bits</th><th>Field</th><th>Function</th></tr></thead>
+      <tbody>
+        <tr><td>7:0</td><td>DMAREQ_ID</td><td>Selected request line (see table below). This is all you need for plain peripheral DMA</td></tr>
+        <tr><td>8</td><td>SOIE</td><td>Synchronization overrun interrupt enable</td></tr>
+        <tr><td>9</td><td>EGE</td><td>Event generation enable (drive a request-generator trigger)</td></tr>
+        <tr><td>16</td><td>SE</td><td>Synchronization enable — gate requests on a sync input</td></tr>
+        <tr><td>18:17</td><td>SPOL</td><td>Sync edge polarity (00 none, 01 rising, 10 falling, 11 both)</td></tr>
+        <tr><td>23:19</td><td>NBREQ</td><td>Number of requests to forward per sync event (minus 1)</td></tr>
+        <tr><td>28:24</td><td>SYNC_ID</td><td>Sync input selection (used only when SE=1)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>For the vast majority of transfers you leave SE=0 and EGE=0 and write only <code>DMAREQ_ID</code>, i.e. <code>DMAMUX1_ChannelN-&gt;CCR = request;</code>.</p>
+
+  <h3>DMAMUX1 request-line numbers (STM32L4R5)</h3>
+  <p>The L4R5 has a single ADC (ADC1 only), so the request IDs are <em>not</em> shifted by the optional ADC2 slot. IDs run 0…93. Request 0 is memory-to-memory (no hardware trigger); 1–4 are the DMAMUX request-generator outputs; 5 and up are peripherals.</p>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>ID</th><th>Request line</th><th>ID</th><th>Request line</th></tr></thead>
+      <tbody>
+        <tr><td>0</td><td>MEM2MEM (no request)</td><td>25</td><td>USART1_TX</td></tr>
+        <tr><td>1–4</td><td>DMAMUX req generator 0–3</td><td>26</td><td>USART2_RX</td></tr>
+        <tr><td>5</td><td>ADC1</td><td>27</td><td>USART2_TX</td></tr>
+        <tr><td>6</td><td>DAC1_CH1</td><td>28</td><td>USART3_RX</td></tr>
+        <tr><td>7</td><td>DAC1_CH2</td><td>29</td><td>USART3_TX</td></tr>
+        <tr><td>8</td><td>TIM6_UP</td><td>30</td><td>UART4_RX</td></tr>
+        <tr><td>9</td><td>TIM7_UP</td><td>31</td><td>UART4_TX</td></tr>
+        <tr><td>10</td><td>SPI1_RX</td><td>32</td><td>UART5_RX</td></tr>
+        <tr><td>11</td><td>SPI1_TX</td><td>33</td><td>UART5_TX</td></tr>
+        <tr><td>12</td><td>SPI2_RX</td><td>34</td><td>LPUART1_RX</td></tr>
+        <tr><td>13</td><td>SPI2_TX</td><td>35</td><td>LPUART1_TX</td></tr>
+        <tr><td>14</td><td>SPI3_RX</td><td>36–37</td><td>SAI1_A / SAI1_B</td></tr>
+        <tr><td>15</td><td>SPI3_TX</td><td>38–39</td><td>SAI2_A / SAI2_B</td></tr>
+        <tr><td>16</td><td>I2C1_RX</td><td>40–41</td><td>OCTOSPI1 / OCTOSPI2</td></tr>
+        <tr><td>17</td><td>I2C1_TX</td><td>42–48</td><td>TIM1 CH1..4/UP/TRIG/COM</td></tr>
+        <tr><td>18</td><td>I2C2_RX</td><td>49–55</td><td>TIM8 CH1..4/UP/TRIG/COM</td></tr>
+        <tr><td>19</td><td>I2C2_TX</td><td>56–60</td><td>TIM2 CH1..4/UP</td></tr>
+        <tr><td>20</td><td>I2C3_RX</td><td>61–66</td><td>TIM3 CH1..4/UP/TRIG</td></tr>
+        <tr><td>21</td><td>I2C3_TX</td><td>67–71</td><td>TIM4 CH1..4/UP</td></tr>
+        <tr><td>22</td><td>I2C4_RX</td><td>72–77</td><td>TIM5 CH1..4/UP/TRIG</td></tr>
+        <tr><td>23</td><td>I2C4_TX</td><td>78–85</td><td>TIM15/16/17</td></tr>
+        <tr><td>24</td><td>USART1_RX</td><td>86–89</td><td>DFSDM1_FLT0..3</td></tr>
+        <tr><td>90</td><td>DCMI / PSSI</td><td>91–93</td><td>AES_IN / AES_OUT / HASH_IN</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>These IDs match the CMSIS macros <code>DMA_REQUEST_ADC1</code> (5), <code>DMA_REQUEST_USART2_TX</code> (27), etc., and the RM0432 DMAMUX assignment table. Always cross-check against the exact reference manual for your part number.</p>
+
+  <h3>Sync &amp; request generator (brief)</h3>
+  <p><strong>Synchronization</strong> (SE=1) forwards a batch of <code>NBREQ+1</code> requests only after an edge on <code>SYNC_ID</code> — useful to align a DMA burst to a timer or external event. The <strong>request generator</strong> (IDs 1–4) turns an external signal into periodic DMA requests for peripherals that have no native DMA line. Both are configured in the DMAMUX request-generator block at <code>DMAMUX1 + 0x100</code>; leave them off for ordinary peripheral streaming.</p>
+</section>
+
+<!-- ═══════════════════ SECTION 03 ═══════════════════ -->
+<section id="s3">
+  <h2><span class="num">04</span> Programming sequence: the transfer recipe</h2>
+  <p class="section-lead">Every DMA setup on this device follows the same ten steps. Do them in order and the transfer just works; skip step 2 or step 10 and it silently does nothing.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>#</th><th>Step</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>Enable clocks: DMAx + DMAMUX1 + the peripheral</td></tr>
+        <tr><td>2</td><td>Disable the channel (CCR.EN=0) and spin until EN reads 0</td></tr>
+        <tr><td>3</td><td>Clear this channel's flags in DMAx→IFCR</td></tr>
+        <tr><td>4</td><td>Write CPAR (peripheral data-register address)</td></tr>
+        <tr><td>5</td><td>Write CMAR (buffer address)</td></tr>
+        <tr><td>6</td><td>Write CNDTR (element count)</td></tr>
+        <tr><td>7</td><td>Route the request: DMAMUX1_ChannelN→CCR = request ID</td></tr>
+        <tr><td>8</td><td>Write CCR: DIR, PINC/MINC, PSIZE/MSIZE, PL, CIRC, IRQ enables (EN still 0)</td></tr>
+        <tr><td>9</td><td>Set CCR.EN = 1</td></tr>
+        <tr><td>10</td><td>Enable the peripheral's DMA request bit (ADC DMAEN, USART DMAT/DMAR, SPI TXDMAEN/RXDMAEN)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Reusable register-level helper</h3>
+  <div class="code-block">
+    <div class="code-header"><span>c — generic DMA channel setup</span><span class="dot">●</span></div>
+    <pre><code>#include "stm32l4r5xx.h"
+#include &lt;stdint.h&gt;
+
+/* DMAMUX CxCR that drives a given DMA channel (ch = 1..7).
+ *   DMA1 Ch1..7 -&gt; DMAMUX1 Channel 0..6
+ *   DMA2 Ch1..7 -&gt; DMAMUX1 Channel 7..13                     */
+static inline DMAMUX_Channel_TypeDef *dmamux_for(DMA_TypeDef *dma, uint8_t ch)
+{
+    uint32_t idx = (dma == DMA2 ? 7u : 0u) + (uint32_t)(ch - 1u);
+    return DMAMUX1_Channel0 + idx;      /* 4 bytes per CxCR */
+}
+
+/* Register block for DMA channel ch (1..7). */
+static inline DMA_Channel_TypeDef *dma_ch(DMA_TypeDef *dma, uint8_t ch)
+{
+    uint32_t base = (uint32_t)dma + 0x08u + 0x14u * (uint32_t)(ch - 1u);
+    return (DMA_Channel_TypeDef *)base;
+}
+
+/* One-shot or circular transfer setup. `ccr_flags` carries DIR, MINC,
+ * PSIZE/MSIZE, PL, CIRC and any *IE bits — but NOT the EN bit.        */
+void dma_setup(DMA_TypeDef *dma, uint8_t ch, uint8_t request,
+               volatile void *periph, void *mem, uint16_t count,
+               uint32_t ccr_flags)
+{
+    DMA_Channel_TypeDef *c = dma_ch(dma, ch);
+
+    c-&gt;CCR &amp;= ~DMA_CCR_EN;                     /* (2) disable   */
+    while (c-&gt;CCR &amp; DMA_CCR_EN) { }            /*     wait off  */
+
+    dma-&gt;IFCR = 0xFu &lt;&lt; (4u * (ch - 1u));      /* (3) clear GIF/TCIF/HTIF/TEIF */
+
+    c-&gt;CPAR  = (uint32_t)periph;               /* (4) periph addr */
+    c-&gt;CMAR  = (uint32_t)mem;                  /* (5) buffer addr */
+    c-&gt;CNDTR = count;                          /* (6) item count  */
+
+    dmamux_for(dma, ch)-&gt;CCR = request;        /* (7) route request */
+
+    c-&gt;CCR = ccr_flags;                        /* (8) config, EN=0   */
+    c-&gt;CCR |= DMA_CCR_EN;                       /* (9) go             */
+}</code></pre>
+  </div>
+  <div class="callout">
+    <div class="label">Note</div>
+    <p>Step 10 (the peripheral's own DMA-request enable) lives in the peripheral driver, not in <code>dma_setup()</code> — the two examples below show exactly where it goes.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ SECTION 04 ═══════════════════ -->
+<section id="s4">
+  <h2><span class="num">05</span> Worked example: ADC1 + DMA (circular scan)</h2>
+  <p class="section-lead">Continuously scan three ADC channels into an SRAM buffer with zero CPU involvement. ADC1 raises request ID 5, routed to DMA1 Channel 1 (DMAMUX channel 0). Circular DMA + continuous conversion means the buffer stays fresh forever.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — ADC1 + DMA1 Ch1, circular (CMSIS register level)</span><span class="dot">●</span></div>
+    <pre><code>#include "stm32l4r5xx.h"
+#include &lt;stdint.h&gt;
+
+#define NUM_CH   3u
+static volatile uint16_t adc_buf[NUM_CH];   /* 12-bit samples, halfwords */
+
+static void clocks_init(void)
+{
+    RCC-&gt;AHB1ENR |= RCC_AHB1ENR_DMA1EN | RCC_AHB1ENR_DMAMUX1EN;
+    RCC-&gt;AHB2ENR |= RCC_AHB2ENR_ADCEN;       /* ADC is on AHB2 */
+    (void)RCC-&gt;AHB2ENR;
+
+    /* Clock the ADC synchronously from HCLK/4 (CKMODE=11) so no
+       RCC ADCSEL kernel-clock selection is required.                */
+    ADC1_COMMON-&gt;CCR |= ADC_CCR_CKMODE_0 | ADC_CCR_CKMODE_1;  /* 11 */
+}
+
+static void adc_enable(void)
+{
+    ADC1-&gt;CR &amp;= ~ADC_CR_DEEPPWD;             /* leave deep-power-down   */
+    ADC1-&gt;CR |= ADC_CR_ADVREGEN;             /* turn on ADC regulator   */
+    for (volatile int i = 0; i &lt; 4000; i++) { }  /* &gt; t_ADCVREG_STUP (~20us) */
+
+    ADC1-&gt;CR &amp;= ~ADC_CR_ADCALDIF;            /* single-ended calibration */
+    ADC1-&gt;CR |= ADC_CR_ADCAL;
+    while (ADC1-&gt;CR &amp; ADC_CR_ADCAL) { }      /* wait for cal to finish   */
+
+    ADC1-&gt;ISR = ADC_ISR_ADRDY;              /* clear ADRDY (rc_w1)      */
+    ADC1-&gt;CR |= ADC_CR_ADEN;                 /* enable the ADC           */
+    while (!(ADC1-&gt;ISR &amp; ADC_ISR_ADRDY)) { }
+}
+
+static void adc_dma_init(void)
+{
+    /* --- regular sequence: 3 conversions, channels 1,2,3 --- */
+    ADC1-&gt;SQR1 = ((NUM_CH - 1u) &lt;&lt; ADC_SQR1_L_Pos)  /* L = length-1 */
+               | (1u &lt;&lt; ADC_SQR1_SQ1_Pos)
+               | (2u &lt;&lt; ADC_SQR1_SQ2_Pos)
+               | (3u &lt;&lt; ADC_SQR1_SQ3_Pos);
+    ADC1-&gt;SMPR1 = 0x3FFFFFFFu;               /* long sample time, ch0..9 */
+
+    /* continuous + DMA + circular DMA (DMACFG=1) + overrun overwrite */
+    ADC1-&gt;CFGR = ADC_CFGR_CONT | ADC_CFGR_DMAEN
+               | ADC_CFGR_DMACFG | ADC_CFGR_OVRMOD;
+
+    /* --- DMA1 Channel 1: ADC1-&gt;DR (16-bit) -&gt; adc_buf, circular --- */
+    DMA_Channel_TypeDef *c = DMA1_Channel1;
+    c-&gt;CCR &amp;= ~DMA_CCR_EN;
+    while (c-&gt;CCR &amp; DMA_CCR_EN) { }
+    DMA1-&gt;IFCR = 0xFu;                        /* clear ch1 flags */
+
+    c-&gt;CPAR  = (uint32_t)&amp;ADC1-&gt;DR;          /* source: ADC data reg */
+    c-&gt;CMAR  = (uint32_t)adc_buf;             /* dest: SRAM buffer    */
+    c-&gt;CNDTR = NUM_CH;                        /* 3 halfword items     */
+
+    DMAMUX1_Channel0-&gt;CCR = 5u;              /* DMA1 Ch1 = mux0, req = ADC1 */
+
+    c-&gt;CCR = DMA_CCR_MINC                     /* walk the buffer        */
+           | DMA_CCR_CIRC                     /* wrap forever           */
+           | DMA_CCR_PSIZE_0                  /* PSIZE=01 -&gt; 16-bit     */
+           | DMA_CCR_MSIZE_0                  /* MSIZE=01 -&gt; 16-bit     */
+           | DMA_CCR_PL_1;                    /* priority = high (10)   */
+    /* DIR left 0 = read from peripheral (P2M); PINC left 0 */
+    c-&gt;CCR |= DMA_CCR_EN;                      /* enable channel         */
+}
+
+int main(void)
+{
+    clocks_init();
+    adc_enable();
+    adc_dma_init();
+
+    ADC1-&gt;CR |= ADC_CR_ADSTART;               /* start regular conversions */
+
+    for (;;) {
+        /* adc_buf[0..2] refreshed continuously by DMA — read anytime. */
+    }
+}</code></pre>
+  </div>
+
+  <div class="callout warn">
+    <div class="label">Order matters</div>
+    <p><code>ADC_CFGR_DMAEN</code> (step 10) is set <em>before</em> <code>ADSTART</code>, and the DMA channel is enabled before the ADC starts converting. If the ADC produces a result before DMA is armed you lose the first sample (or set OVRMOD=1, as above, so the ADC overwrites rather than stalls).</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ SECTION 05 ═══════════════════ -->
+<section id="s5">
+  <h2><span class="num">06</span> Worked example: USART/UART + DMA (TX &amp; RX)</h2>
+  <p class="section-lead">UART is the canonical mem2periph (TX) and periph2mem (RX) case. TX = memory→peripheral (DIR=1), RX = peripheral→memory (DIR=0). Bytes, so PSIZE=MSIZE=8-bit (the CCR reset value). Here RX runs circular into a ring buffer while TX is fired on demand.</p>
+
+  <div class="code-block">
+    <div class="code-header"><span>c — USART2 TX (Ch7) + RX circular (Ch6), register level</span><span class="dot">●</span></div>
+    <pre><code>#include "stm32l4r5xx.h"
+#include &lt;stdint.h&gt;
+
+#define RX_LEN 64u
+static volatile uint8_t rx_buf[RX_LEN];   /* circular RX ring */
+
+/* Assumes USART2 already has baud/framing set and UE/TE/RE enabled. */
+void uart_dma_init(void)
+{
+    RCC-&gt;AHB1ENR |= RCC_AHB1ENR_DMA1EN | RCC_AHB1ENR_DMAMUX1EN;
+
+    /* ---- RX: USART2-&gt;RDR -&gt; rx_buf, circular ----
+       DMA1 Ch6 == DMAMUX1 Channel 5, request 26 = USART2_RX */
+    DMA1_Channel6-&gt;CCR &amp;= ~DMA_CCR_EN;
+    while (DMA1_Channel6-&gt;CCR &amp; DMA_CCR_EN) { }
+    DMA1-&gt;IFCR = 0xFu &lt;&lt; (4u * (6u - 1u));    /* clear ch6 flags */
+
+    DMA1_Channel6-&gt;CPAR  = (uint32_t)&amp;USART2-&gt;RDR;
+    DMA1_Channel6-&gt;CMAR  = (uint32_t)rx_buf;
+    DMA1_Channel6-&gt;CNDTR = RX_LEN;
+    DMAMUX1_Channel5-&gt;CCR = 26u;             /* USART2_RX */
+    DMA1_Channel6-&gt;CCR = DMA_CCR_MINC | DMA_CCR_CIRC; /* 8-bit sizes = reset */
+    DMA1_Channel6-&gt;CCR |= DMA_CCR_EN;
+
+    /* ---- TX: only route the channel now (armed per message) ----
+       DMA1 Ch7 == DMAMUX1 Channel 6, request 27 = USART2_TX */
+    DMAMUX1_Channel6-&gt;CCR = 27u;             /* USART2_TX */
+
+    /* Step 10: let USART generate DMA requests in both directions */
+    USART2-&gt;CR3 |= USART_CR3_DMAT | USART_CR3_DMAR;
+}
+
+/* Fire a memory-to-peripheral transfer of `len` bytes. */
+void uart_send_dma(const uint8_t *data, uint16_t len)
+{
+    DMA_Channel_TypeDef *c = DMA1_Channel7;
+
+    c-&gt;CCR &amp;= ~DMA_CCR_EN;
+    while (c-&gt;CCR &amp; DMA_CCR_EN) { }
+    DMA1-&gt;IFCR = 0xFu &lt;&lt; (4u * (7u - 1u));    /* clear ch7 flags */
+
+    c-&gt;CPAR  = (uint32_t)&amp;USART2-&gt;TDR;
+    c-&gt;CMAR  = (uint32_t)data;
+    c-&gt;CNDTR = len;
+    c-&gt;CCR   = DMA_CCR_DIR                     /* memory -&gt; peripheral */
+            | DMA_CCR_MINC                     /* walk the buffer      */
+            | DMA_CCR_TCIE;                    /* IRQ when done        */
+    c-&gt;CCR  |= DMA_CCR_EN;
+}
+
+/* TX-complete: DMA1 Channel 7 (IRQn = 17). */
+void DMA1_Channel7_IRQHandler(void)
+{
+    if (DMA1-&gt;ISR &amp; DMA_ISR_TCIF7) {
+        DMA1-&gt;IFCR = DMA_IFCR_CTCIF7;         /* ack TC */
+        DMA1_Channel7-&gt;CCR &amp;= ~DMA_CCR_EN;    /* stop the channel */
+        /* For half-duplex/RS-485 wait for USART2-&gt;ISR &amp; USART_ISR_TC
+           before releasing the driver-enable line. */
+    }
+}
+
+/* Bytes received so far into the ring = RX_LEN - remaining. */
+uint16_t uart_rx_count(void)
+{
+    return (uint16_t)(RX_LEN - DMA1_Channel6-&gt;CNDTR);
+}</code></pre>
+  </div>
+
+  <h3>HAL variant (same USART2 TX via DMA)</h3>
+  <p>The HAL hides the channel and DMAMUX writes behind a <code>DMA_HandleTypeDef</code>. You still choose the channel (<code>Instance</code>) and the request (<code>Init.Request = DMA_REQUEST_USART2_TX</code>, which is 27), then link it to the UART handle.</p>
+  <div class="code-block">
+    <div class="code-header"><span>c — STM32L4xx HAL: HAL_UART_Transmit_DMA</span><span class="dot">●</span></div>
+    <pre><code>#include "stm32l4xx_hal.h"
+
+extern UART_HandleTypeDef huart2;   /* configured elsewhere (baud, pins) */
+DMA_HandleTypeDef hdma_usart2_tx;
+
+void uart2_tx_dma_init(void)
+{
+    __HAL_RCC_DMA1_CLK_ENABLE();
+    __HAL_RCC_DMAMUX1_CLK_ENABLE();
+
+    hdma_usart2_tx.Instance                 = DMA1_Channel7;
+    hdma_usart2_tx.Init.Request             = DMA_REQUEST_USART2_TX; /* 27 */
+    hdma_usart2_tx.Init.Direction           = DMA_MEMORY_TO_PERIPH;
+    hdma_usart2_tx.Init.PeriphInc           = DMA_PINC_DISABLE;
+    hdma_usart2_tx.Init.MemInc              = DMA_MINC_ENABLE;
+    hdma_usart2_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_usart2_tx.Init.MemDataAlignment    = DMA_MDATAALIGN_BYTE;
+    hdma_usart2_tx.Init.Mode                = DMA_NORMAL;
+    hdma_usart2_tx.Init.Priority            = DMA_PRIORITY_HIGH;
+    HAL_DMA_Init(&amp;hdma_usart2_tx);
+
+    __HAL_LINKDMA(&amp;huart2, hdmatx, hdma_usart2_tx);  /* wire handle to UART */
+
+    HAL_NVIC_SetPriority(DMA1_Channel7_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(DMA1_Channel7_IRQn);
+}
+
+/* Route the channel IRQ into the HAL DMA state machine. */
+void DMA1_Channel7_IRQHandler(void)
+{
+    HAL_DMA_IRQHandler(huart2.hdmatx);
+}
+
+void app_send(const uint8_t *buf, uint16_t n)
+{
+    HAL_UART_Transmit_DMA(&amp;huart2, (uint8_t *)buf, n);
+}</code></pre>
+  </div>
+  <div class="callout">
+    <div class="label">TX vs RX peripheral address</div>
+    <p>RX reads <code>USART2-&gt;RDR</code> (offset 0x24); TX writes <code>USART2-&gt;TDR</code> (offset 0x28). They are different registers — pointing CPAR at the wrong one is a frequent copy-paste bug.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ SECTION 06 ═══════════════════ -->
+<section id="s6">
+  <h2><span class="num">07</span> Interrupts: TC / HT / TE, flags &amp; ping-pong</h2>
+  <p class="section-lead">Each channel can raise three events — <strong>transfer complete (TC)</strong>, <strong>half transfer (HT)</strong> and <strong>transfer error (TE)</strong> — enabled by TCIE/HTIE/TEIE in CCR. Status is read from <code>DMAx-&gt;ISR</code> and cleared by writing 1 to the matching bit in <code>DMAx-&gt;IFCR</code>.</p>
+
+  <h3>ISR / IFCR flag layout</h3>
+  <p>Each channel owns a nibble; the same bit positions are used in ISR (read) and IFCR (write-1-to-clear, prefixed C).</p>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Channel</th><th>GIF (global)</th><th>TCIF</th><th>HTIF</th><th>TEIF</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>bit 0</td><td>bit 1</td><td>bit 2</td><td>bit 3</td></tr>
+        <tr><td>2</td><td>bit 4</td><td>bit 5</td><td>bit 6</td><td>bit 7</td></tr>
+        <tr><td>3</td><td>bit 8</td><td>bit 9</td><td>bit 10</td><td>bit 11</td></tr>
+        <tr><td>n</td><td>4(n−1)</td><td>4(n−1)+1</td><td>4(n−1)+2</td><td>4(n−1)+3</td></tr>
+        <tr><td>7</td><td>bit 24</td><td>bit 25</td><td>bit 26</td><td>bit 27</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>NVIC interrupt numbers (RM0432 / DS12023)</h3>
+  <div class="file-table">
+    <table>
+      <thead><tr><th>IRQ</th><th>Position</th><th>IRQ</th><th>Position</th></tr></thead>
+      <tbody>
+        <tr><td>DMA1_Channel1..7</td><td>11 … 17</td><td>DMA2_Channel1..5</td><td>56 … 60</td></tr>
+        <tr><td>DMA2_Channel6</td><td>68</td><td>DMA2_Channel7</td><td>69</td></tr>
+        <tr><td>ADC1</td><td>18</td><td>DMAMUX1_OVR</td><td>94</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Note the DMA2 vector table is <em>not</em> contiguous: channels 1–5 are 56–60 but channels 6–7 jump to 68–69. Use the enum names (<code>DMA2_Channel6_IRQn</code>) from the CMSIS header, never a hand-computed number.</p>
+
+  <h3>Ping-pong double buffering with HT + TC</h3>
+  <p>In circular mode HT fires at the midpoint and TC at the end. Process the first half on HT and the second half on TC while the DMA keeps filling the other half — continuous streaming with no gaps and no data loss.</p>
+  <div class="code-block">
+    <div class="code-header"><span>c — half/full-buffer streaming (DMA1 Ch1)</span><span class="dot">●</span></div>
+    <pre><code>#include "stm32l4r5xx.h"
+#include &lt;stdint.h&gt;
+
+#define BLK 128u
+static volatile uint16_t stream[2u * BLK];   /* two half-buffers */
+extern void process(const volatile uint16_t *half, uint32_t n);
+
+void stream_irq_enable(void)
+{
+    /* CNDTR must be 2*BLK and CIRC set when the channel was configured. */
+    DMA1_Channel1-&gt;CCR |= DMA_CCR_HTIE | DMA_CCR_TCIE | DMA_CCR_TEIE;
+    NVIC_SetPriority(DMA1_Channel1_IRQn, 5);
+    NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+}
+
+void DMA1_Channel1_IRQHandler(void)
+{
+    uint32_t isr = DMA1-&gt;ISR;
+
+    if (isr &amp; DMA_ISR_HTIF1) {               /* first half ready  */
+        DMA1-&gt;IFCR = DMA_IFCR_CHTIF1;         /* ack BEFORE work    */
+        process(&amp;stream[0], BLK);
+    }
+    if (isr &amp; DMA_ISR_TCIF1) {               /* second half ready */
+        DMA1-&gt;IFCR = DMA_IFCR_CTCIF1;
+        process(&amp;stream[BLK], BLK);
+    }
+    if (isr &amp; DMA_ISR_TEIF1) {               /* bus / config error */
+        DMA1-&gt;IFCR = DMA_IFCR_CTEIF1;
+        /* channel auto-disables on TE — clear cause and re-init here */
+    }
+}</code></pre>
+  </div>
+  <div class="callout warn">
+    <div class="label">Always clear the flag</div>
+    <p>Clear TCIF/HTIF/TEIF in IFCR at the top of the handler. If you forget, the pending bit stays set and the ISR re-fires immediately, hanging the CPU in the handler.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ SECTION 07 ═══════════════════ -->
+<section id="s7">
+  <h2><span class="num">08</span> Gotchas &amp; common mistakes</h2>
+  <p class="section-lead">The DMA controller gives almost no feedback when it is misconfigured — it simply does nothing. These are the failure modes that cost the most debugging time on STM32L4+.</p>
+
+  <div class="file-table">
+    <table>
+      <thead><tr><th>Symptom</th><th>Cause &amp; fix</th></tr></thead>
+      <tbody>
+        <tr><td>DMA does absolutely nothing</td><td><strong>DMAMUX1 clock not enabled.</strong> Set <code>RCC_AHB1ENR_DMAMUX1EN</code> (bit 2) as well as the DMA1/DMA2 clock. Without it the request never reaches the channel.</td></tr>
+        <tr><td>Channel ignores new CPAR/CMAR/CNDTR</td><td>Those registers are read-only while <code>EN=1</code>. Clear EN and spin until it reads 0 <em>before</em> rewriting them.</td></tr>
+        <tr><td>Transfer runs but no peripheral data moves</td><td><strong>Step 10 missing:</strong> the peripheral's own DMA-request enable (ADC <code>DMAEN</code>, USART <code>DMAT</code>/<code>DMAR</code>, SPI <code>TXDMAEN</code>/<code>RXDMAEN</code>) is separate from the channel EN bit. Both are required.</td></tr>
+        <tr><td>Only ~half the bytes appear, or garbage</td><td><strong>PSIZE/MSIZE mismatch.</strong> ADC_DR is 16-bit → PSIZE=01 into a <code>uint16_t</code> buffer; UART RDR/TDR is 8-bit → PSIZE=00 into a <code>uint8_t</code> buffer. A byte DMA into a halfword register truncates.</td></tr>
+        <tr><td>Wrong direction / no movement</td><td><strong>DIR is about the read source.</strong> RX/ADC-in = read peripheral = DIR=0. TX/DAC-out = read memory = DIR=1. It is easy to invert.</td></tr>
+        <tr><td>CNDTR seems off by a factor</td><td>CNDTR is an <strong>element count, not a byte count</strong>. 32 halfwords → CNDTR=32, not 64.</td></tr>
+        <tr><td>ISR fires forever / CPU stuck in handler</td><td>You did not clear the flag. Write the matching <code>CTCIFn</code>/<code>CHTIFn</code>/<code>CTEIFn</code> bit to IFCR at the top of the handler.</td></tr>
+        <tr><td>First sample lost / ADC overrun (OVR)</td><td>DMA armed after the peripheral produced data. Enable the channel first, or set ADC <code>OVRMOD=1</code> so it overwrites instead of stalling.</td></tr>
+        <tr><td>Data updates but a stale copy is used</td><td>The Cortex-M4 in the L4 has <em>no</em> data cache (no cache maintenance needed, unlike Cortex-M7), but the compiler can still cache the buffer in a register. Declare DMA buffers <code>volatile</code>.</td></tr>
+        <tr><td>Occasional corruption / hard fault</td><td>Buffer misaligned for 16/32-bit transfers, or placed in a region the DMA master cannot reach. Keep DMA buffers word-aligned in SRAM1/SRAM2.</td></tr>
+        <tr><td>Two channels, one starves the other</td><td>DMAMUX lets any channel serve any request, but bus arbitration is still per-channel: higher <code>PL</code> wins, and on a tie the <strong>lower channel number</strong> wins. Raise PL on the latency-critical stream.</td></tr>
+        <tr><td>Re-used channel behaves oddly</td><td>When you repurpose a channel for a different peripheral, rewrite <code>DMAMUX1_ChannelN-&gt;CCR</code> with the new request ID. A leftover ID from the previous use keeps routing the old peripheral.</td></tr>
+        <tr><td>Channel only runs in mem2mem</td><td>DMAMUX request ID 0 = MEM2MEM (no hardware trigger). If you leave CxCR at its reset value (0) the channel waits for a request that never comes unless CCR.MEM2MEM is set.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="summary">
+    <h4>Checklist before you flash</h4>
+    <ul>
+      <li>Clocks: DMA1/DMA2 <em>and</em> DMAMUX1 <em>and</em> the peripheral.</li>
+      <li>Channel disabled while writing CPAR/CMAR/CNDTR; EN set last.</li>
+      <li>DMAMUX CxCR = correct request ID for the target channel.</li>
+      <li>PSIZE/MSIZE match the register and buffer widths; DIR matches the direction.</li>
+      <li>Peripheral DMA-request enable bit set; buffer <code>volatile</code>, aligned, in SRAM.</li>
+      <li>IRQ handler clears its IFCR flag first; NVIC enabled with the right IRQn enum.</li>
+    </ul>
+  </div>
+</section>
+
+</main>
