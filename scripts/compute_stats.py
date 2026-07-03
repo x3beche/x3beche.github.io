@@ -24,7 +24,34 @@ from html.parser import HTMLParser
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DECKS = ["embedded-deck", "ai-deck", "rust-deck", "project-deck"]
+
+# Deck'ler otomatik keşfedilir: içinde en az bir `layout: tutorial` HTML olan
+# kök dizinler (gen-deck-index.py ile aynı mantık). Sabitlemek istersen liste ver.
+_SKIP = {"_site", ".jekyll-cache", ".git", ".github", ".claude",
+         "_layouts", "assets", "scripts", "mcp", "node_modules", "deck-assets"}
+
+
+def _has_tutorial(path):
+    for root, dirs, files in os.walk(path):
+        dirs[:] = [d for d in dirs if d not in _SKIP]
+        for f in files:
+            if f.endswith(".html"):
+                try:
+                    with open(os.path.join(root, f), encoding="utf-8", errors="replace") as fh:
+                        if "layout: tutorial" in fh.read(400):
+                            return True
+                except OSError:
+                    pass
+    return False
+
+
+def _discover_decks():
+    return [e.name for e in sorted(os.scandir(REPO_ROOT), key=lambda e: e.name)
+            if e.is_dir() and e.name not in _SKIP and not e.name.startswith(".")
+            and _has_tutorial(e.path)]
+
+
+DECKS = _discover_decks()
 
 # Katalog sayfaları (kart gridi) — bölüm/kelime sayımından dışlanır
 CATALOG_PAGES = {"index.html"}
